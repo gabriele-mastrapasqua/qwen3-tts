@@ -1,0 +1,10 @@
+*.o
+qwen_tts
+venv/
+venv312/
+qwen3-tts-0.6b/
+qwen3-tts-1.7b/
+__pycache__/
+.DS_Store
+samples/
+TODO.md
