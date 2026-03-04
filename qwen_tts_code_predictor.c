@@ -1,0 +1,311 @@
+/*
+ * qwen_tts_code_predictor.c - Code Predictor (MTP) forward pass
+ * Generates codebooks 1-15 for each audio frame.
+ *
+ * Architecture: 5-layer Qwen3 transformer with GQA, QK-norm, NeoX RoPE.
+ * Per frame: prefill (talker_hidden, code0_embed), then 14 autoregressive steps.
+ */
+
+#include "qwen_tts.h"
+#include "qwen_tts_kernels.h"
+#include "qwen_tts_safetensors.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+/* ========================================================================
+ * bf16 helpers
+ * ======================================================================== */
+
+static inline float bf16_to_f32(uint16_t bf) {
+    uint32_t bits = (uint32_t)bf << 16;
+    float val; memcpy(&val, &bits, sizeof(float));
+    return val;
+}
+
+static uint16_t *get_bf16(void *ms, const char *name) {
+    safetensors_file_t *sf = NULL;
+    const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
+    return (t && sf) ? (uint16_t *)safetensors_get_bf16_direct(sf, t) : NULL;
+}
+
+static float *get_f32(void *ms, const char *name) {
+    safetensors_file_t *sf = NULL;
+    const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
+    return (t && sf) ? (float *)safetensors_get_f32(sf, t) : NULL;
+}
+
+/* Use centralized NEON+multi-threaded matvec from qwen_tts_kernels.c */
+#define matvec_bf16 qwen_matvec_bf16
+
+/* ========================================================================
+ * RoPE - NeoX split-half
+ * ======================================================================== */
+
+static void apply_rope_neox(float *x, int n_heads, int head_dim,
+                            const float *cos_cache, const float *sin_cache, int pos) {
+    int half = head_dim / 2;
+    const float *cos_ptr = cos_cache + (int64_t)pos * half;
+    const float *sin_ptr = sin_cache + (int64_t)pos * half;
+    for (int h = 0; h < n_heads; h++) {
+        float *xh = x + h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float x1 = xh[i];
+            float x2 = xh[i + half];
+            xh[i]        = x1 * cos_ptr[i] - x2 * sin_ptr[i];
+            xh[i + half] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
+        }
+    }
+}
+
+/* ========================================================================
+ * Weight Loading
+ * ======================================================================== */
+
+int qwen_cp_load(qwen_tts_ctx_t *ctx) {
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h = c->cp_hidden_size;
+    int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
+    int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
+
+    if (!ctx->silent)
+        fprintf(stderr, "Loading Code Predictor weights (hidden=%d, layers=%d)...\n",
+                cp_h, c->cp_num_layers);
+
+    /* Final norm */
+    ctx->cp_norm = get_f32(ctx->safetensors, "talker.code_predictor.model.norm.weight");
+
+    /* Per-layer weights */
+    for (int i = 0; i < c->cp_num_layers; i++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        char name[256];
+        #define CP_LOAD_BF16(field, fmt, ...) do { \
+            snprintf(name, sizeof(name), fmt, ##__VA_ARGS__); \
+            l->field = get_bf16(ctx->safetensors, name); \
+        } while(0)
+        #define CP_LOAD_F32(field, fmt, ...) do { \
+            snprintf(name, sizeof(name), fmt, ##__VA_ARGS__); \
+            l->field = get_f32(ctx->safetensors, name); \
+        } while(0)
+
+        CP_LOAD_BF16(wq_bf16, "talker.code_predictor.model.layers.%d.self_attn.q_proj.weight", i);
+        CP_LOAD_BF16(wk_bf16, "talker.code_predictor.model.layers.%d.self_attn.k_proj.weight", i);
+        CP_LOAD_BF16(wv_bf16, "talker.code_predictor.model.layers.%d.self_attn.v_proj.weight", i);
+        CP_LOAD_BF16(wo_bf16, "talker.code_predictor.model.layers.%d.self_attn.o_proj.weight", i);
+        CP_LOAD_F32(q_norm, "talker.code_predictor.model.layers.%d.self_attn.q_norm.weight", i);
+        CP_LOAD_F32(k_norm, "talker.code_predictor.model.layers.%d.self_attn.k_norm.weight", i);
+        CP_LOAD_F32(input_norm, "talker.code_predictor.model.layers.%d.input_layernorm.weight", i);
+        CP_LOAD_F32(post_attn_norm, "talker.code_predictor.model.layers.%d.post_attention_layernorm.weight", i);
+        CP_LOAD_BF16(gate_bf16, "talker.code_predictor.model.layers.%d.mlp.gate_proj.weight", i);
+        CP_LOAD_BF16(up_bf16, "talker.code_predictor.model.layers.%d.mlp.up_proj.weight", i);
+        CP_LOAD_BF16(down_bf16, "talker.code_predictor.model.layers.%d.mlp.down_proj.weight", i);
+
+        /* Fuse gate+up: interleave rows [gate_row0, up_row0, gate_row1, ...] */
+        {
+            size_t row_bytes = (size_t)cp_h * sizeof(uint16_t);
+            l->gate_up_fused_bf16 = (uint16_t *)malloc(2 * (size_t)c->cp_intermediate_size * row_bytes);
+            for (int r = 0; r < c->cp_intermediate_size; r++) {
+                memcpy(l->gate_up_fused_bf16 + (size_t)(2 * r) * cp_h,
+                       l->gate_bf16 + (size_t)r * cp_h, row_bytes);
+                memcpy(l->gate_up_fused_bf16 + (size_t)(2 * r + 1) * cp_h,
+                       l->up_bf16 + (size_t)r * cp_h, row_bytes);
+            }
+        }
+
+        #undef CP_LOAD_BF16
+        #undef CP_LOAD_F32
+    }
+
+    /* LM heads and codec embeddings for codebooks 1-15 */
+    for (int g = 0; g < 15; g++) {
+        char name[256];
+        snprintf(name, sizeof(name), "talker.code_predictor.lm_head.%d.weight", g);
+        ctx->cp_lm_head_bf16[g] = get_bf16(ctx->safetensors, name);
+        snprintf(name, sizeof(name), "talker.code_predictor.model.codec_embedding.%d.weight", g);
+        ctx->cp_codec_emb_bf16[g] = get_bf16(ctx->safetensors, name);
+    }
+
+    /* Allocate CP KV cache (needs 17 positions max: 2 prefill + 14 steps + margin) */
+    int cp_kv_max = 64;
+    int64_t cp_kv_size = (int64_t)c->cp_num_layers * cp_kv_max * cp_kv_dim;
+    ctx->cp_kv_k = (float *)calloc(cp_kv_size, sizeof(float));
+    ctx->cp_kv_v = (float *)calloc(cp_kv_size, sizeof(float));
+    ctx->cp_kv_max = cp_kv_max;
+    ctx->cp_kv_len = 0;
+
+    /* Allocate CP decode buffers */
+    ctx->cp_dec_x = (float *)malloc(cp_h * sizeof(float));
+    ctx->cp_dec_q = (float *)malloc(cp_q_dim * sizeof(float));
+    ctx->cp_dec_k = (float *)malloc(cp_kv_dim * sizeof(float));
+    ctx->cp_dec_v = (float *)malloc(cp_kv_dim * sizeof(float));
+    ctx->cp_dec_attn_out = (float *)malloc(cp_q_dim * sizeof(float));
+    ctx->cp_dec_gate = (float *)malloc(2 * c->cp_intermediate_size * sizeof(float));
+    ctx->cp_dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
+    ctx->cp_dec_ffn_out = (float *)malloc(cp_h * sizeof(float));
+
+    /* CP RoPE cache (same theta as talker) */
+    int half_dim = c->cp_head_dim / 2;
+    ctx->cp_rope_cos = (float *)malloc((int64_t)cp_kv_max * half_dim * sizeof(float));
+    ctx->cp_rope_sin = (float *)malloc((int64_t)cp_kv_max * half_dim * sizeof(float));
+    for (int pos = 0; pos < cp_kv_max; pos++) {
+        for (int i = 0; i < half_dim; i++) {
+            float angle = (float)pos * (1.0f / powf(c->rope_theta, (float)(2*i) / c->cp_head_dim));
+            ctx->cp_rope_cos[pos * half_dim + i] = cosf(angle);
+            ctx->cp_rope_sin[pos * half_dim + i] = sinf(angle);
+        }
+    }
+    ctx->cp_rope_cache_len = cp_kv_max;
+
+    if (!ctx->silent)
+        fprintf(stderr, "  Code Predictor: %d layers loaded, q_dim=%d kv_dim=%d\n",
+                c->cp_num_layers, cp_q_dim, cp_kv_dim);
+
+    return 0;
+}
+
+/* ========================================================================
+ * Single CP transformer step at given position
+ * ======================================================================== */
+
+static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, int pos) {
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h = c->cp_hidden_size;
+    int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
+    int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
+    int cp_inter = c->cp_intermediate_size;
+    float eps = c->rms_norm_eps;
+
+    float *x_norm = (float *)malloc(cp_h * sizeof(float));
+
+    for (int layer = 0; layer < c->cp_num_layers; layer++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[layer];
+
+        /* 1. Input RMSNorm */
+        qwen_rms_norm(x_norm, x, l->input_norm, 1, cp_h, eps);
+
+        /* 2. QKV projections (unified dispatch — single barrier for all 3) */
+        qwen_matvec_bf16_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                              l->wq_bf16, l->wk_bf16, l->wv_bf16,
+                              x_norm, cp_h, cp_q_dim, cp_kv_dim);
+
+        /* 3. Q/K RMSNorm per-head */
+        qwen_rms_norm_per_head(ctx->cp_dec_q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
+        qwen_rms_norm_per_head(ctx->cp_dec_k, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
+
+        /* 4. NeoX RoPE */
+        apply_rope_neox(ctx->cp_dec_q, c->cp_num_heads, c->cp_head_dim,
+                        ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
+        apply_rope_neox(ctx->cp_dec_k, c->cp_num_kv_heads, c->cp_head_dim,
+                        ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
+
+        /* 5. Store KV in cache */
+        int64_t kv_off = (int64_t)layer * ctx->cp_kv_max * cp_kv_dim + (int64_t)pos * cp_kv_dim;
+        memcpy(ctx->cp_kv_k + kv_off, ctx->cp_dec_k, cp_kv_dim * sizeof(float));
+        memcpy(ctx->cp_kv_v + kv_off, ctx->cp_dec_v, cp_kv_dim * sizeof(float));
+
+        /* 6. Causal GQA attention */
+        float scale = 1.0f / sqrtf((float)c->cp_head_dim);
+        float *layer_k = ctx->cp_kv_k + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
+        float *layer_v = ctx->cp_kv_v + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
+        qwen_causal_attention(ctx->cp_dec_attn_out, ctx->cp_dec_q, layer_k, layer_v,
+                              1, pos + 1, c->cp_num_heads, c->cp_num_kv_heads,
+                              c->cp_head_dim, scale, pos);
+
+        /* 7. Output projection + residual */
+        float *proj = ctx->cp_dec_ffn_out; /* reuse buffer */
+        matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+        for (int i = 0; i < cp_h; i++) x[i] += proj[i];
+
+        /* 8. Post-attention RMSNorm */
+        qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, cp_h, eps);
+
+        /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
+        matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
+        for (int o = 0; o < cp_inter; o++) {
+            float g = ctx->cp_dec_gate[2 * o];
+            float u = ctx->cp_dec_gate[2 * o + 1];
+            ctx->cp_dec_gate[o] = g / (1.0f + expf(-g)) * u;
+        }
+
+        /* Down projection + residual */
+        matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
+        for (int i = 0; i < cp_h; i++) x[i] += proj[i];
+    }
+
+    free(x_norm);
+}
+
+/* ========================================================================
+ * Code Predictor: generate codebooks 1-15
+ *
+ * For each frame:
+ * - Prefill: pos=0 = talker_hidden, pos=1 = codec_embed(code0)
+ * - Then 14 autoregressive steps (pos=2..15), each feeding the previous codebook embed
+ * - After each step: apply final norm, compute logits via lm_head, sample
+ * ======================================================================== */
+
+int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes) {
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h = c->cp_hidden_size;
+
+    /* Reset CP KV cache for this frame */
+    ctx->cp_kv_len = 0;
+
+    float *cp_x = (float *)malloc(cp_h * sizeof(float));
+    float *cp_normed = (float *)malloc(cp_h * sizeof(float));
+    float *logits = (float *)malloc(c->codebook_size * sizeof(float));
+
+    /* Step 0: process talker hidden state */
+    memcpy(cp_x, talker_hidden, cp_h * sizeof(float));
+    cp_transformer_step(ctx, cp_x, 0);
+
+    /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's).
+     * Python: inputs_embeds = cat(past_hidden, talker.get_input_embeddings()(code0))
+     * The talker's codec_embedding is [3072, hidden], shared with the main generation loop. */
+    float *code0_emb = (float *)malloc(cp_h * sizeof(float));
+    if (ctx->codec_embedding_bf16 && code0 >= 0 && code0 < c->codec_vocab_size) {
+        const uint16_t *e = ctx->codec_embedding_bf16 + (int64_t)code0 * cp_h;
+        for (int i = 0; i < cp_h; i++) code0_emb[i] = bf16_to_f32(e[i]);
+    } else {
+        memset(code0_emb, 0, cp_h * sizeof(float));
+    }
+    memcpy(cp_x, code0_emb, cp_h * sizeof(float));
+    cp_transformer_step(ctx, cp_x, 1);
+
+    /* Predict codebook 1 from position 1 output */
+    qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
+    matvec_bf16(logits, ctx->cp_lm_head_bf16[0], cp_normed, c->codebook_size, cp_h);
+    int best = 0; float best_v = logits[0];
+    for (int i = 1; i < c->codebook_size; i++) if (logits[i] > best_v) { best_v = logits[i]; best = i; }
+    out_codes[0] = best;
+
+    /* Steps 2-15: generate codebooks 2-15.
+     * Python: codec_embedding[generation_steps - 1](input_ids) with generation_steps starting at 1
+     * So step g (1-14) → cp_codec_emb[g-1](prev_code), lm_head[g] */
+    for (int g = 1; g < 15; g++) {
+        int prev_code = out_codes[g - 1];
+        int pos = g + 1; /* positions: 0=talker, 1=code0, 2=code1, ... */
+
+        /* Embed previous code using CP codec_emb[g-1] (NOT [g]) */
+        if (ctx->cp_codec_emb_bf16[g - 1] && prev_code >= 0 && prev_code < c->codebook_size) {
+            const uint16_t *e = ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev_code * cp_h;
+            for (int i = 0; i < cp_h; i++) cp_x[i] = bf16_to_f32(e[i]);
+        } else {
+            memset(cp_x, 0, cp_h * sizeof(float));
+        }
+
+        cp_transformer_step(ctx, cp_x, pos);
+
+        /* Compute logits and sample */
+        qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
+        matvec_bf16(logits, ctx->cp_lm_head_bf16[g], cp_normed, c->codebook_size, cp_h);
+        best = 0; best_v = logits[0];
+        for (int i = 1; i < c->codebook_size; i++) if (logits[i] > best_v) { best_v = logits[i]; best = i; }
+        out_codes[g] = best;
+    }
+
+    free(cp_x); free(cp_normed); free(logits); free(code0_emb);
+    return 0;
+}

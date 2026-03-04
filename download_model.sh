@@ -75,13 +75,17 @@ case "$MODEL_CHOICE" in
         FILES=(
             "config.json"
             "generation_config.json"
+            "tokenizer_config.json"
+            "preprocessor_config.json"
             "model.safetensors"
             "vocab.json"
             "merges.txt"
         )
         SPEECH_TOKENIZER_FILES=(
             "config.json"
+            "configuration.json"
             "model.safetensors"
+            "preprocessor_config.json"
         )
         ;;
     large|1.7b|1.7B)
@@ -90,6 +94,8 @@ case "$MODEL_CHOICE" in
         FILES=(
             "config.json"
             "generation_config.json"
+            "tokenizer_config.json"
+            "preprocessor_config.json"
             "model.safetensors.index.json"
             "model-00001-of-00002.safetensors"
             "model-00002-of-00002.safetensors"
@@ -98,7 +104,9 @@ case "$MODEL_CHOICE" in
         )
         SPEECH_TOKENIZER_FILES=(
             "config.json"
+            "configuration.json"
             "model.safetensors"
+            "preprocessor_config.json"
         )
         ;;
     *)
