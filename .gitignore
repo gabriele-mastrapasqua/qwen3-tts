@@ -1,10 +1,15 @@
 *.o
+*.wav
+*.py
 qwen_tts
+qwen_tts_bin
 venv/
 venv312/
+.venv/
 qwen3-tts-0.6b/
 qwen3-tts-1.7b/
 __pycache__/
 .DS_Store
 samples/
 TODO.md
+weights.bin

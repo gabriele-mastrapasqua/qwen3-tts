@@ -27,8 +27,8 @@ aplay hello.wav
 
 - **Almost zero dependencies**: Pure C implementation. Only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
 - **Both models**: Automatically detects 0.6B or 1.7B from the weight files.
-- **CustomVoice speakers**: 9 preset speakers selectable via `--speaker 0..8`.
-- **Language control**: `--language English` sets the target language.
+- **CustomVoice speakers**: 9 preset voices selectable by name (`-s ryan`, `-s vivian`, etc.).
+- **Multilingual**: 10 languages supported, selectable with `-l English`, `-l Italian`, etc.
 - **Sampling control**: Temperature, top-k, top-p, and repetition penalty are configurable.
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors files — loading is near-instant.
 - **WAV output**: 24 kHz, 16-bit PCM, mono.
@@ -42,8 +42,8 @@ Options:
   -d, --model-dir <path>     Model directory (required)
   --text <string>            Text to synthesize (required)
   -o, --output <path>        Output WAV file (default: output.wav)
-  --speaker <id>             Speaker ID 0-8 (default: 0, CustomVoice only)
-  --language <lang>          Target language (default: auto from text)
+  -s, --speaker <name>       Speaker name (ryan, vivian, serena, aiden, etc.)
+  -l, --language <lang>      Target language (English, Italian, Chinese, etc.)
   --temperature <f>          Sampling temperature (default: 0.9)
   --top-k <n>                Top-k sampling (default: 50)
   --top-p <f>                Top-p nucleus sampling (default: 1.0)
@@ -56,18 +56,28 @@ Options:
 ### Examples
 
 ```bash
-# Basic synthesis
+# Basic English synthesis
 ./qwen_tts -d qwen3-tts-0.6b --text "The quick brown fox jumps over the lazy dog." -o fox.wav
 
-# Different speaker
-./qwen_tts -d qwen3-tts-1.7b --text "Good morning!" --speaker 3 -o morning.wav
+# Choose a speaker by name (-s) and language (-l)
+./qwen_tts -d qwen3-tts-0.6b -s ryan -l English \
+    --text "Hello, this is a test of the text to speech system." -o test_en.wav
 
-# Italian with specific language
-./qwen_tts -d qwen3-tts-1.7b --text "Buongiorno, come stai?" --language Italian -o ciao.wav
+# Italian with a specific speaker
+./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian \
+    --text "Ciao, questa è una prova del sistema di sintesi vocale." -o test_it.wav
+
+# Switch voice: same text, different speaker (female)
+./qwen_tts -d qwen3-tts-0.6b -s vivian -l Italian \
+    --text "Buongiorno, come state oggi? Spero tutto bene." -o test_it_vivian.wav
 
 # Lower temperature for more deterministic output
 ./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --temperature 0.7 -o hello.wav
 ```
+
+Available speakers: `serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`, `eric`, `dylan`.
+
+You can also use `make test-en`, `make test-it-ryan`, `make test-it-vivian`, or `make test-all` to quickly run pre-configured tests.
 
 ## Building
 
