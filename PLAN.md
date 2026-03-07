@@ -83,32 +83,29 @@ chunked processing (`qwen_transcribe_stream`). We can use a similar pattern.
 
 ### 2.1 Chunked Generation + WAV Streaming
 
-- [ ] `[HIGH]` Implement `--stream` CLI flag:
+- [x] `[HIGH]` Implement `--stream` CLI flag:
   - Generate frames in chunks (e.g., 10 frames = 0.8s audio per chunk)
   - Decode each chunk through speech decoder immediately
   - Write WAV header with unknown length, update at end
   - First audio heard within ~1-2 seconds of starting
-- [ ] `[HIGH]` Speech decoder state carry-over between chunks:
-  - Pre-transformer KV cache: accumulate across chunks
-  - Causal ConvNet: carry left-padding state from previous chunk
-  - ConvNeXt upsample: carry conv_transpose boundary state
-- [ ] `[MED]` Configurable chunk size: `--stream-chunk <frames>` (default: 10)
+- [ ] `[MED]` Speech decoder incremental decode (optimization):
+  - Current implementation re-runs full decoder on all frames each chunk (O(n²))
+  - Since all operations are causal, only NEW audio samples differ
+  - Future: carry pre-transformer KV cache + conv padding state for O(n) incremental decode
+- [x] `[MED]` Configurable chunk size: `--stream-chunk <frames>` (default: 10)
 
 ### 2.2 Raw PCM to stdout
 
-- [ ] `[MED]` `--stdout` flag: output raw s16le 24kHz mono PCM to stdout
+- [x] `[MED]` `--stdout` flag: output raw s16le 24kHz mono PCM to stdout
   ```bash
   ./qwen_tts -d model --text "Hello" --stdout | aplay -f S16_LE -r 24000 -c 1
   # macOS: ... --stdout | play -t raw -r 24000 -e signed -b 16 -c 1 -
   ```
-- [ ] `[MED]` Combine with `--stream` for real-time playback:
-  ```bash
-  ./qwen_tts -d model --text "Hello" --stream --stdout | aplay ...
-  ```
+- [x] `[MED]` `--stdout` implies `--stream` and forces silent mode (stderr only)
 
 ### 2.3 Callback API (for embedding)
 
-- [ ] `[LOW]` Add `qwen_tts_set_audio_callback(ctx, fn, userdata)`:
+- [x] `[LOW]` Add `qwen_tts_set_audio_callback(ctx, fn, userdata)`:
   - Called with each decoded audio chunk (float* samples, int n_samples)
   - Enables embedding in other applications without file I/O
 

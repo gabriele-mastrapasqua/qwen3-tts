@@ -113,6 +113,9 @@ Optional:
   --rep-penalty <f>          Repetition penalty (default: 1.05)
   --max-tokens <n>           Max audio tokens (default: 8192)
   -j, --threads <n>          Worker threads (default: 4)
+  --stream                   Stream audio (decode chunks during generation)
+  --stdout                   Output raw s16le PCM to stdout (implies --stream)
+  --stream-chunk <n>         Frames per stream chunk (default: 10 = 0.8s)
   --silent                   Suppress status output
   --debug                    Verbose diagnostics
 ```
@@ -153,6 +156,28 @@ Optional:
 
 > **Note:** The `--instruct` flag only works with the 1.7B model. The 0.6B model does not
 > support style control and will ignore the instruction.
+
+### Streaming
+
+```bash
+# Stream to WAV file (audio written progressively during generation)
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --stream -o hello.wav
+
+# Pipe raw PCM to audio player for real-time playback
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --stdout | \
+    play -t raw -r 24000 -e signed -b 16 -c 1 -   # macOS (requires sox)
+
+# Linux real-time playback
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --stdout | \
+    aplay -f S16_LE -r 24000 -c 1
+
+# Adjust chunk size (larger = fewer decodes, smaller = lower latency)
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --stream --stream-chunk 5 -o hello.wav
+```
+
+> **Note:** Streaming decodes audio progressively every N frames (default: 10 = 0.8s).
+> First audio is available within ~1 second. `--stdout` outputs raw signed 16-bit
+> little-endian mono PCM at 24 kHz — pipe it to any audio player.
 
 ## How It Works
 

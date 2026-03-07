@@ -11,6 +11,60 @@
 #include <string.h>
 #include <getopt.h>
 
+/* Streaming callback state */
+typedef struct {
+    FILE *file;            /* WAV file or stdout */
+    int is_stdout;         /* 1 = raw PCM to stdout, 0 = WAV file */
+    int total_samples;     /* running count of samples written */
+} stream_state_t;
+
+static int stream_audio_callback(const float *samples, int n_samples, void *userdata) {
+    stream_state_t *st = (stream_state_t *)userdata;
+    if (!st->file) return -1;
+    for (int i = 0; i < n_samples; i++) {
+        float s = samples[i];
+        if (s < -1.0f) s = -1.0f;
+        if (s > 1.0f) s = 1.0f;
+        int16_t sample = (int16_t)(s * 32767);
+        fwrite(&sample, 2, 1, st->file);
+    }
+    fflush(st->file);
+    st->total_samples += n_samples;
+    return 0;
+}
+
+/* Write a WAV header with placeholder data size (will be updated at end) */
+static void write_wav_header(FILE *f, int sample_rate) {
+    int bits = 16, channels = 1;
+    int data_size = 0x7FFFFFFF;  /* placeholder for unknown length */
+    int file_size = 36 + data_size;
+    int byte_rate = sample_rate * channels * (bits/8);
+    short block_align = channels * (bits/8);
+    int fmt_size = 16; short audio_fmt = 1;
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&file_size, 4, 1, f);
+    fwrite("WAVEfmt ", 1, 8, f);
+    fwrite(&fmt_size, 4, 1, f);
+    fwrite(&audio_fmt, 2, 1, f);
+    fwrite(&channels, 2, 1, f);
+    fwrite(&sample_rate, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block_align, 2, 1, f);
+    fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&data_size, 4, 1, f);
+}
+
+/* Update WAV header with actual data size */
+static void finalize_wav_header(FILE *f, int total_samples) {
+    int data_size = total_samples * 2;  /* 16-bit mono */
+    int file_size = 36 + data_size;
+    fseek(f, 4, SEEK_SET);
+    fwrite(&file_size, 4, 1, f);
+    fseek(f, 40, SEEK_SET);
+    fwrite(&data_size, 4, 1, f);
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *text = NULL;
@@ -26,23 +80,29 @@ int main(int argc, char **argv) {
     int silent = 0;
     int debug = 0;
     int threads = 0;  /* 0 = auto-detect */
+    int do_stream = 0;
+    int do_stdout = 0;
+    int stream_chunk = 10;
 
     static struct option long_options[] = {
-        {"model-dir",   required_argument, 0, 'd'},
-        {"text",        required_argument, 0, 't'},
-        {"output",      required_argument, 0, 'o'},
-        {"speaker",     required_argument, 0, 's'},
-        {"language",    required_argument, 0, 'l'},
-        {"temperature", required_argument, 0, 'T'},
-        {"top-k",       required_argument, 0, 'k'},
-        {"top-p",       required_argument, 0, 'p'},
-        {"rep-penalty", required_argument, 0, 'r'},
-        {"max-tokens",  required_argument, 0, 'm'},
-        {"threads",     required_argument, 0, 'j'},
-        {"instruct",    required_argument, 0, 'I'},
-        {"silent",      no_argument,       0, 'S'},
-        {"debug",       no_argument,       0, 'D'},
-        {"help",        no_argument,       0, 'h'},
+        {"model-dir",     required_argument, 0, 'd'},
+        {"text",          required_argument, 0, 't'},
+        {"output",        required_argument, 0, 'o'},
+        {"speaker",       required_argument, 0, 's'},
+        {"language",      required_argument, 0, 'l'},
+        {"temperature",   required_argument, 0, 'T'},
+        {"top-k",         required_argument, 0, 'k'},
+        {"top-p",         required_argument, 0, 'p'},
+        {"rep-penalty",   required_argument, 0, 'r'},
+        {"max-tokens",    required_argument, 0, 'm'},
+        {"threads",       required_argument, 0, 'j'},
+        {"instruct",      required_argument, 0, 'I'},
+        {"stream",        no_argument,       0, 1001},
+        {"stdout",        no_argument,       0, 1002},
+        {"stream-chunk",  required_argument, 0, 1003},
+        {"silent",        no_argument,       0, 'S'},
+        {"debug",         no_argument,       0, 'D'},
+        {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
@@ -61,6 +121,9 @@ int main(int argc, char **argv) {
             case 'm': max_tokens = atoi(optarg); break;
             case 'j': threads = atoi(optarg); break;
             case 'I': instruct = optarg; break;
+            case 1001: do_stream = 1; break;
+            case 1002: do_stdout = 1; do_stream = 1; break;  /* --stdout implies --stream */
+            case 1003: stream_chunk = atoi(optarg); break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -80,6 +143,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  -j, --threads <int>        Number of threads (0=auto)\n");
                 fprintf(stderr, "  -I, --instruct <text>      Style instruction (1.7B only)\n");
                 fprintf(stderr, "                             e.g. \"Speak in an angry tone\"\n");
+                fprintf(stderr, "  --stream                   Stream audio (decode during generation)\n");
+                fprintf(stderr, "  --stdout                   Output raw s16le PCM to stdout (implies --stream)\n");
+                fprintf(stderr, "  --stream-chunk <n>         Frames per stream chunk (default: 10)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -127,30 +193,72 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Streaming setup */
+    stream_state_t stream_state = {0};
+    ctx->stream = do_stream;
+    ctx->stream_chunk_frames = stream_chunk;
+
+    if (do_stream) {
+        if (do_stdout) {
+            /* Raw s16le 24kHz mono PCM to stdout */
+            stream_state.file = stdout;
+            stream_state.is_stdout = 1;
+            /* Force silent mode — all status goes to stderr, audio to stdout */
+            silent = 1;
+            ctx->silent = 1;
+        } else {
+            /* Streaming WAV: write header now, update at end */
+            stream_state.file = fopen(output, "wb");
+            if (!stream_state.file) {
+                fprintf(stderr, "Error: cannot open %s for writing\n", output);
+                qwen_tts_unload(ctx);
+                return 1;
+            }
+            write_wav_header(stream_state.file, QWEN_TTS_SAMPLE_RATE);
+        }
+        qwen_tts_set_audio_callback(ctx, stream_audio_callback, &stream_state);
+        if (!silent)
+            fprintf(stderr, "Streaming: chunk=%d frames (%.1fs), %s\n",
+                    stream_chunk, stream_chunk / 12.5f,
+                    do_stdout ? "raw PCM to stdout" : output);
+    }
+
     /* Generate */
     float *audio = NULL;
     int n_samples = 0;
 
-    fprintf(stderr, "[MAIN] Starting generation...\n");
+    if (!silent) fprintf(stderr, "Starting generation...\n");
     if (qwen_tts_generate(ctx, text, &audio, &n_samples) != 0) {
-        fprintf(stderr, "[MAIN] Generation failed\n");
+        fprintf(stderr, "Generation failed\n");
+        if (do_stream && !do_stdout && stream_state.file) fclose(stream_state.file);
         qwen_tts_unload(ctx);
         return 1;
     }
-    fprintf(stderr, "[MAIN] Generation done, n_samples=%d, audio=%p\n", n_samples, (void *)audio);
 
-    /* Write WAV */
-    if (audio && n_samples > 0) {
-        fprintf(stderr, "[MAIN] Writing WAV (%d samples)...\n", n_samples);
-        if (qwen_tts_write_wav(output, audio, n_samples, QWEN_TTS_SAMPLE_RATE) == 0) {
+    if (do_stream) {
+        /* Finalize streaming output */
+        if (!do_stdout && stream_state.file) {
+            finalize_wav_header(stream_state.file, stream_state.total_samples);
+            fclose(stream_state.file);
             if (!silent)
-                fprintf(stderr, "Wrote %s (%d samples, %.2fs)\n", output, n_samples, (float)n_samples / QWEN_TTS_SAMPLE_RATE);
-        } else {
-            fprintf(stderr, "[MAIN] Failed to write WAV\n");
+                fprintf(stderr, "Wrote %s (%d samples, %.2fs) [streamed]\n",
+                        output, stream_state.total_samples,
+                        (float)stream_state.total_samples / QWEN_TTS_SAMPLE_RATE);
         }
+        /* Free the full decode output (streaming already wrote everything) */
         free(audio);
     } else {
-        fprintf(stderr, "[MAIN] No audio to write (audio=%p, n_samples=%d)\n", (void *)audio, n_samples);
+        /* Non-streaming: write WAV from full decode */
+        if (audio && n_samples > 0) {
+            if (qwen_tts_write_wav(output, audio, n_samples, QWEN_TTS_SAMPLE_RATE) == 0) {
+                if (!silent)
+                    fprintf(stderr, "Wrote %s (%d samples, %.2fs)\n", output, n_samples,
+                            (float)n_samples / QWEN_TTS_SAMPLE_RATE);
+            } else {
+                fprintf(stderr, "Failed to write WAV\n");
+            }
+            free(audio);
+        }
     }
 
     qwen_tts_unload(ctx);
