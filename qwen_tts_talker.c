@@ -16,6 +16,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -83,12 +87,29 @@ static void apply_rope_neox_inplace(float *x, int n_heads, int head_dim,
 
     for (int h = 0; h < n_heads; h++) {
         float *xh = x + h * head_dim;
+#ifdef __ARM_NEON
+        int i = 0;
+        for (; i + 3 < half; i += 4) {
+            float32x4_t c = vld1q_f32(cos_ptr + i);
+            float32x4_t s = vld1q_f32(sin_ptr + i);
+            float32x4_t v1 = vld1q_f32(xh + i);
+            float32x4_t v2 = vld1q_f32(xh + i + half);
+            vst1q_f32(xh + i,        vmlsq_f32(vmulq_f32(v1, c), v2, s));
+            vst1q_f32(xh + i + half, vmlaq_f32(vmulq_f32(v2, c), v1, s));
+        }
+        for (; i < half; i++) {
+            float x1 = xh[i], x2 = xh[i + half];
+            xh[i]        = x1 * cos_ptr[i] - x2 * sin_ptr[i];
+            xh[i + half] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
+        }
+#else
         for (int i = 0; i < half; i++) {
             float x1 = xh[i];
             float x2 = xh[i + half];
             xh[i]        = x1 * cos_ptr[i] - x2 * sin_ptr[i];
             xh[i + half] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
         }
+#endif
     }
 }
 
@@ -495,27 +516,28 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 #endif
 
-        /* SiLU(gate) * up on interleaved pairs */
+        /* SiLU(gate) * up on interleaved pairs, compact to stride=inter */
         for (int s = 0; s < seq_len; s++) {
-            float *out = pref_gate + (int64_t)s * 2 * inter;
+            float *src = pref_gate + (int64_t)s * 2 * inter;
+            float *dst = pref_gate + (int64_t)s * inter;
             for (int o = 0; o < inter; o++) {
-                float g = out[2 * o];
-                float u = out[2 * o + 1];
-                out[o] = g / (1.0f + expf(-g)) * u;
+                float g = src[2 * o];
+                float u = src[2 * o + 1];
+                dst[o] = g / (1.0f + expf(-g)) * u;
             }
         }
 
-        /* Down projection + residual (lda=2*inter due to interleaved layout) */
+        /* Down projection + residual (compacted: lda=inter) */
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     seq_len, h, inter, 1.0f,
-                    pref_gate, 2 * inter, down_f32, inter, 0.0f, pref_proj, h);
+                    pref_gate, inter, down_f32, inter, 0.0f, pref_proj, h);
         for (int64_t i = 0; i < (int64_t)seq_len * h; i++)
             residual[i] += pref_proj[i];
 #else
         for (int s = 0; s < seq_len; s++) {
             float *xs = residual + (int64_t)s * h;
-            const float *gs = pref_gate + (int64_t)s * 2 * inter;
+            const float *gs = pref_gate + (int64_t)s * inter;
             for (int o = 0; o < h; o++) {
                 float sum = 0.0f;
                 const float *row = down_f32 + (int64_t)o * inter;

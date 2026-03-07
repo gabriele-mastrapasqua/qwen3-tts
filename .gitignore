@@ -1,5 +1,6 @@
 *.o
 *.wav
+!samples/*.wav
 *.py
 qwen_tts
 qwen_tts_bin
@@ -10,6 +11,5 @@ qwen3-tts-0.6b/
 qwen3-tts-1.7b/
 __pycache__/
 .DS_Store
-samples/
 TODO.md
 weights.bin
