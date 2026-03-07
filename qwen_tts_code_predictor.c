@@ -15,6 +15,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 /* ========================================================================
  * bf16 helpers
  * ======================================================================== */
@@ -51,12 +55,29 @@ static void apply_rope_neox(float *x, int n_heads, int head_dim,
     const float *sin_ptr = sin_cache + (int64_t)pos * half;
     for (int h = 0; h < n_heads; h++) {
         float *xh = x + h * head_dim;
+#ifdef __ARM_NEON
+        int i = 0;
+        for (; i + 3 < half; i += 4) {
+            float32x4_t c = vld1q_f32(cos_ptr + i);
+            float32x4_t s = vld1q_f32(sin_ptr + i);
+            float32x4_t v1 = vld1q_f32(xh + i);
+            float32x4_t v2 = vld1q_f32(xh + i + half);
+            vst1q_f32(xh + i,        vmlsq_f32(vmulq_f32(v1, c), v2, s));
+            vst1q_f32(xh + i + half, vmlaq_f32(vmulq_f32(v2, c), v1, s));
+        }
+        for (; i < half; i++) {
+            float x1 = xh[i], x2 = xh[i + half];
+            xh[i]        = x1 * cos_ptr[i] - x2 * sin_ptr[i];
+            xh[i + half] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
+        }
+#else
         for (int i = 0; i < half; i++) {
             float x1 = xh[i];
             float x2 = xh[i + half];
             xh[i]        = x1 * cos_ptr[i] - x2 * sin_ptr[i];
             xh[i + half] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
         }
+#endif
     }
 }
 
@@ -169,15 +190,13 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
  * Single CP transformer step at given position
  * ======================================================================== */
 
-static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, int pos) {
+static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos) {
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
     int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
     int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
     int cp_inter = c->cp_intermediate_size;
     float eps = c->rms_norm_eps;
-
-    float *x_norm = (float *)malloc(cp_h * sizeof(float));
 
     for (int layer = 0; layer < c->cp_num_layers; layer++) {
         qwen_cp_layer_t *l = &ctx->cp_layers[layer];
@@ -233,8 +252,6 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, int pos) {
         matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
     }
-
-    free(x_norm);
 }
 
 /* ========================================================================
@@ -253,40 +270,32 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     /* Reset CP KV cache for this frame */
     ctx->cp_kv_len = 0;
 
-    float *cp_x = (float *)malloc(cp_h * sizeof(float));
-    float *cp_normed = (float *)malloc(cp_h * sizeof(float));
-    float *logits = (float *)malloc(c->codebook_size * sizeof(float));
+    /* Pre-allocated buffers reused across frames (avoid per-frame malloc) */
+    float *cp_x = ctx->cp_dec_x;
+    float *cp_normed = ctx->cp_dec_attn_out; /* reuse: not overlapping with transformer step output */
+    float *x_norm = ctx->cp_dec_ffn_out;     /* reuse: scratch for transformer step */
 
     /* Step 0: process talker hidden state */
     memcpy(cp_x, talker_hidden, cp_h * sizeof(float));
-    cp_transformer_step(ctx, cp_x, 0);
+    cp_transformer_step(ctx, cp_x, x_norm, 0);
 
-    /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's).
-     * Python: inputs_embeds = cat(past_hidden, talker.get_input_embeddings()(code0))
-     * The talker's codec_embedding is [3072, hidden], shared with the main generation loop. */
-    float *code0_emb = (float *)malloc(cp_h * sizeof(float));
+    /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's). */
     if (ctx->codec_embedding_bf16 && code0 >= 0 && code0 < c->codec_vocab_size) {
         const uint16_t *e = ctx->codec_embedding_bf16 + (int64_t)code0 * cp_h;
-        for (int i = 0; i < cp_h; i++) code0_emb[i] = bf16_to_f32(e[i]);
+        for (int i = 0; i < cp_h; i++) cp_x[i] = bf16_to_f32(e[i]);
     } else {
-        memset(code0_emb, 0, cp_h * sizeof(float));
+        memset(cp_x, 0, cp_h * sizeof(float));
     }
-    memcpy(cp_x, code0_emb, cp_h * sizeof(float));
-    cp_transformer_step(ctx, cp_x, 1);
+    cp_transformer_step(ctx, cp_x, x_norm, 1);
 
-    /* Predict codebook 1 from position 1 output */
+    /* Predict codebook 1: fused argmax+matvec (greedy — avoids writing 2048 logits) */
     qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
-    matvec_bf16(logits, ctx->cp_lm_head_bf16[0], cp_normed, c->codebook_size, cp_h);
-    int best = 0; float best_v = logits[0];
-    for (int i = 1; i < c->codebook_size; i++) if (logits[i] > best_v) { best_v = logits[i]; best = i; }
-    out_codes[0] = best;
+    out_codes[0] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[0], cp_h, c->codebook_size);
 
-    /* Steps 2-15: generate codebooks 2-15.
-     * Python: codec_embedding[generation_steps - 1](input_ids) with generation_steps starting at 1
-     * So step g (1-14) → cp_codec_emb[g-1](prev_code), lm_head[g] */
+    /* Steps 2-15: generate codebooks 2-15. */
     for (int g = 1; g < 15; g++) {
         int prev_code = out_codes[g - 1];
-        int pos = g + 1; /* positions: 0=talker, 1=code0, 2=code1, ... */
+        int pos = g + 1;
 
         /* Embed previous code using CP codec_emb[g-1] (NOT [g]) */
         if (ctx->cp_codec_emb_bf16[g - 1] && prev_code >= 0 && prev_code < c->codebook_size) {
@@ -296,16 +305,12 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
             memset(cp_x, 0, cp_h * sizeof(float));
         }
 
-        cp_transformer_step(ctx, cp_x, pos);
+        cp_transformer_step(ctx, cp_x, x_norm, pos);
 
-        /* Compute logits and sample */
+        /* Fused argmax+matvec (greedy) */
         qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
-        matvec_bf16(logits, ctx->cp_lm_head_bf16[g], cp_normed, c->codebook_size, cp_h);
-        best = 0; best_v = logits[0];
-        for (int i = 1; i < c->codebook_size; i++) if (logits[i] > best_v) { best_v = logits[i]; best = i; }
-        out_codes[g] = best;
+        out_codes[g] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[g], cp_h, c->codebook_size);
     }
 
-    free(cp_x); free(cp_normed); free(logits); free(code0_emb);
     return 0;
 }
