@@ -1,5 +1,6 @@
 /*
- * qwen_tts_safetensors.h - Simple binary weights loader
+ * qwen_tts_safetensors.h - Safetensors file format reader (multi-shard support)
+ * Standard HuggingFace safetensors format with memory-mapped I/O.
  */
 
 #ifndef QWEN_TTS_SAFETENSORS_H
@@ -32,8 +33,10 @@ typedef struct {
 
 typedef struct {
     char *path;
-    int fd;
-    void *data;  /* Cached data section */
+    void *data;
+    size_t file_size;
+    size_t header_size;
+    char *header_json;
     int num_tensors;
     safetensor_t tensors[SAFETENSORS_MAX_TENSORS];
 } safetensors_file_t;
@@ -44,26 +47,26 @@ typedef struct {
     int num_shards;
 } multi_safetensors_t;
 
-/* Open a single safetensors file */
+/* Open a single safetensors file (memory-mapped) */
 safetensors_file_t *safetensors_open(const char *path);
 void safetensors_close(safetensors_file_t *sf);
 
-/* Open model from directory */
+/* Open model from directory (auto-detects single file or multi-shard) */
 multi_safetensors_t *multi_safetensors_open(const char *model_dir);
 void multi_safetensors_close(multi_safetensors_t *ms);
 
-/* Find a tensor by name */
+/* Find a tensor by name across all shards */
 const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
                                             const char *name,
                                             safetensors_file_t **out_sf);
 
-/* Get raw pointer to tensor data */
+/* Get raw pointer to tensor data (within mmap'd region) */
 const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t);
 
 /* Get tensor data as float32 (allocates, caller must free) */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
 
-/* Get direct pointer to bf16 data */
+/* Get direct pointer to bf16 data in mmap'd region (no copy) */
 uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t);
 
 int safetensor_is_bf16(const safetensor_t *t);

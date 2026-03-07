@@ -276,14 +276,22 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         fprintf(stderr, "Error: Failed to load model from %s\n", ctx->model_dir);
         free(ctx); return NULL;
     }
-    ctx->speech_safetensors = ctx->safetensors; /* Same file for now */
+    /* Speech tokenizer is in a separate subdirectory */
+    char speech_dir[4096];
+    snprintf(speech_dir, sizeof(speech_dir), "%s/speech_tokenizer", ctx->model_dir);
+    ctx->speech_safetensors = multi_safetensors_open(speech_dir);
+    if (!ctx->speech_safetensors) {
+        fprintf(stderr, "Error: Failed to load speech tokenizer from %s\n", speech_dir);
+        multi_safetensors_close(ctx->safetensors);
+        free(ctx); return NULL;
+    }
 
     if (!ctx->silent) fprintf(stderr, "Threads: %d\n", qwen_get_threads());
 
     double t0 = time_ms();
     if (qwen_talker_load(ctx) != 0 || qwen_cp_load(ctx) != 0 || qwen_speech_decoder_load(ctx) != 0) {
         multi_safetensors_close(ctx->safetensors);
-        if (ctx->speech_safetensors != ctx->safetensors) multi_safetensors_close(ctx->speech_safetensors);
+        multi_safetensors_close(ctx->speech_safetensors);
         free(ctx); return NULL;
     }
     if (!ctx->silent) fprintf(stderr, "Model loaded in %.0f ms\n", time_ms() - t0);
@@ -301,8 +309,8 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->speech_dec.rope_cos); free(ctx->speech_dec.rope_sin);
     /* Close safetensors (all get_bf16/get_f32 pointers point into this data) */
     multi_safetensors_close(ctx->safetensors);
-    if (ctx->speech_safetensors != ctx->safetensors)
-        multi_safetensors_close(ctx->speech_safetensors);
+    multi_safetensors_close(ctx->speech_safetensors);
+    free(ctx->instruct);
     /* Free runtime buffers */
     free(ctx->kv_cache_k); free(ctx->kv_cache_v); free(ctx->cp_kv_k); free(ctx->cp_kv_v);
     free(ctx->dec_x); free(ctx->dec_x_norm); free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
@@ -364,6 +372,25 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     int h = ctx->config.hidden_size;
     qwen_set_seed(ctx->seed);
 
+    /* Tokenize instruct if provided (1.7B only).
+     * Format: "<|im_start|>user\n{instruct}<|im_end|>\n"
+     * These tokens get embedded via text_projection and prepended to input_embeds. */
+    int32_t *instruct_tokens = NULL;
+    int instruct_token_len = 0;
+    qwen_tokenizer_t *tok = qwen_tokenizer_load(ctx->model_dir);
+
+    if (ctx->instruct && ctx->instruct[0] && tok) {
+        /* Build instruct template: <|im_start|>user\n{instruct}<|im_end|>\n */
+        int inst_len = (int)strlen(ctx->instruct);
+        int tmpl_len = inst_len + 64;
+        char *instruct_tmpl = (char *)malloc(tmpl_len);
+        snprintf(instruct_tmpl, tmpl_len, "<|im_start|>user\n%s<|im_end|>\n", ctx->instruct);
+        instruct_tokens = qwen_tokenizer_encode(tok, instruct_tmpl, &instruct_token_len);
+        free(instruct_tmpl);
+        if (!ctx->silent && instruct_tokens)
+            fprintf(stderr, "Instruct: \"%s\" (%d tokens)\n", ctx->instruct, instruct_token_len);
+    }
+
     /* Build token sequence matching Python:
      * [<|im_start|>, assistant, \n, ...BPE(text)..., <|im_end|>, \n, <|im_start|>, assistant, \n]
      * Special tokens use their IDs directly; only the user text is BPE-encoded.
@@ -371,7 +398,6 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      */
     int32_t *text_tokens = NULL;
     int text_token_len = 0;
-    qwen_tokenizer_t *tok = qwen_tokenizer_load(ctx->model_dir);
     if (tok) {
         text_tokens = qwen_tokenizer_encode(tok, text, &text_token_len);
         qwen_tokenizer_free(tok);
@@ -441,8 +467,10 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_BOS, codec_bos_embed);
 
     /*
-     * Build prefill: role(3) + pad_codec(codec_len-1) + text_content+eos(N+1) + final(1)
+     * Build prefill:
+     *   [instruct(I)] + role(3) + pad_codec(codec_len-1) + text_content+eos(N+1) + final(1)
      *
+     * Section 0: Instruct tokens (text-only, NO codec pairing) — only if instruct provided
      * Section 1: Role prefix (3 positions) - text-only, NO codec pairing
      * Section 2: tts_pad*(codec_len-2) + tts_bos  paired with  codec[0..codec_len-2]
      * Section 3: text_content[0..N-1] + tts_eos  paired with  codec_pad * (N+1)
@@ -450,11 +478,19 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      */
     int sec2_len = codec_len - 1;  /* codec tokens without the last (BOS) */
     int sec3_len = text_content_len + 1;  /* text tokens + tts_eos */
-    int prefill_len = role_len + sec2_len + sec3_len + 1;
+    int inst_len = instruct_tokens ? instruct_token_len : 0;
+    int prefill_len = inst_len + role_len + sec2_len + sec3_len + 1;
 
     float *input_embeds = (float *)calloc((int64_t)prefill_len * h, sizeof(float));
     float *tmp_embed = (float *)malloc(h * sizeof(float));
     int pos = 0;
+
+    /* Section 0: Instruct tokens (text-only, no codec) */
+    for (int i = 0; i < inst_len; i++) {
+        embed_one_text_token(ctx, instruct_tokens[i], input_embeds + (int64_t)pos * h);
+        pos++;
+    }
+    free(instruct_tokens);
 
     /* Section 1: Role prefix (text-only, no codec) */
     for (int i = 0; i < role_len; i++) {
@@ -515,8 +551,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     if (!ctx->silent) {
         fprintf(stderr, "Speaker: %d, Language: %d\n", ctx->speaker_id, ctx->language_id);
-        fprintf(stderr, "Prefill: %d positions (role=%d, codec=%d, text+eos=%d, final=1)\n",
-                prefill_len, role_len, sec2_len, sec3_len);
+        fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, text+eos=%d, final=1)\n",
+                prefill_len, inst_len, role_len, sec2_len, sec3_len);
     }
 
     /* Debug: check speech decoder weights before prefill */
