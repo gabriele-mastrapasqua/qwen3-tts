@@ -13,6 +13,7 @@ All samples generated with the 0.6B model on Apple M1 at ~0.7x realtime:
 | Spanish | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.wav) | *Hola, esta es una demostración del sistema de síntesis de voz.* |
 | Portuguese | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.wav) | *Olá, esta é uma demonstração do sistema de síntese de voz.* |
 | French | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.wav) | *Bonjour à tous, ceci est une démonstration du système de synthèse vocale.* |
+| German | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/german_ryan.wav) | *Guten Tag, dies ist eine Demonstration des Sprachsynthesesystems.* |
 
 > Or clone and play locally: `afplay samples/english_ryan.wav` (macOS) / `aplay samples/english_ryan.wav` (Linux)
 
@@ -146,6 +147,15 @@ Supported languages: Chinese, English, Japanese, Korean, German, French, Russian
 
 Safetensors are memory-mapped. Large weights (Talker, Code Predictor) remain as BF16 mmapped.
 Speech decoder weights are loaded to F32.
+
+## Credits & Acknowledgments
+
+This project builds on the work of several teams and individuals:
+
+- **[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)** by the Qwen team at Alibaba — the model architecture, weights, and research behind the text-to-speech system. Models available on [Hugging Face](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice).
+  - *Qwen3-TTS Technical Report* — [arXiv:2505.08reduced](https://arxiv.org/abs/2505.15894)
+- **[qwen-asr](https://github.com/antirez/qwen-asr)** by [antirez](https://github.com/antirez) — a pure C implementation of Qwen2-Audio ASR that directly inspired this project's architecture: mmap'd safetensors, BF16 NEON kernels, threading via `dispatch_apply`, and the overall approach of writing minimal C inference engines. Much of the safetensors loader and kernel scaffolding is derived from qwen-asr.
+- **[Qwen2.5](https://github.com/QwenLM/Qwen2.5)** by the Qwen team — the base LLM architecture (GQA, RoPE, SwiGLU) used in the Talker and Code Predictor components.
 
 ## License
 
