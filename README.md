@@ -8,23 +8,23 @@ All samples generated with the 0.6B model on Apple M1 at ~0.7x realtime. Click p
 
 **English** (ryan) — *"Hello, this is a test of the text to speech system. The quick brown fox jumps over the lazy dog."*
 
-https://github.com/user-attachments/assets/6a21460f-4976-4488-8a0a-bd2022efe826
+https://github.com/user-attachments/assets/e51ef610-157f-4084-8635-d0e2613c30ab
 
 **Italian** (vivian) — *"Buongiorno a tutti, questa è una dimostrazione del sistema di sintesi vocale."*
 
-https://github.com/user-attachments/assets/4514cf2d-e93b-489c-95aa-ab51d5d53c15
+https://github.com/user-attachments/assets/3e99e55a-de6a-44cd-b6fb-3b56fae157e7
 
 **Spanish** (ryan) — *"Hola, esta es una demostración del sistema de síntesis de voz."*
 
-https://github.com/user-attachments/assets/b67b89bb-ce64-4d1d-b96e-a477105e5903
+https://github.com/user-attachments/assets/ac2ae7ca-20ee-4a66-b260-582b05f4e142
 
 **Portuguese** (ryan) — *"Olá, esta é uma demonstração do sistema de síntese de voz."*
 
-https://github.com/user-attachments/assets/8aa68ef5-a9e0-404e-b2b1-88e977481841
+https://github.com/user-attachments/assets/41456515-3778-40d9-88b1-b03bf2cab1d0
 
 **French** (ryan) — *"Bonjour à tous, ceci est une démonstration du système de synthèse vocale."*
 
-https://github.com/user-attachments/assets/6ad100be-2ccd-4ddc-83a7-287e1b5096f4
+https://github.com/user-attachments/assets/c2e17644-b23f-422e-96bd-058db817d0fd
 
 > WAV downloads: [English](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.wav) · [Italian](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.wav) · [Spanish](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.wav) · [Portuguese](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.wav) · [French](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.wav)
 >
