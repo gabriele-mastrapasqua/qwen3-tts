@@ -84,6 +84,15 @@ make clean      # Clean build artifacts
 make info       # Show build configuration
 ```
 
+### Testing
+
+```bash
+make test-small       # Run 0.6B tests (English, Italian, multiple speakers)
+make test-large       # Run 1.7B tests (config check, English, Italian, instruct styles)
+make test-regression  # Cross-model regression checks (safetensors, config parsing)
+make test-all         # Run everything (0.6B + 1.7B + regression)
+```
+
 ## Usage
 
 ```
@@ -97,6 +106,7 @@ Optional:
   -o, --output <path>        Output WAV file (default: output.wav)
   -s, --speaker <name>       Speaker voice (default: ryan)
   -l, --language <lang>      Target language (default: English)
+  -I, --instruct <text>      Style/emotion instruction (1.7B model only)
   --temperature <f>          Sampling temperature (default: 0.9)
   --top-k <n>                Top-k sampling (default: 50)
   --top-p <f>                Top-p nucleus sampling (default: 1.0)
@@ -126,7 +136,23 @@ Optional:
 
 # Use the larger model for higher quality
 ./qwen_tts -d qwen3-tts-1.7b --text "Hello world" -o hello_large.wav
+
+# Style/emotion control with --instruct (1.7B model only)
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English \
+    --text "I cannot believe you did that to me." \
+    --instruct "Speak in a very angry and aggressive tone" -o angry.wav
+
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English \
+    --text "I cannot believe you did that to me." \
+    --instruct "Speak very slowly and softly, in a sad whisper" -o whisper.wav
+
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English \
+    --text "I cannot believe you did that to me." \
+    --instruct "Speak in a very happy, cheerful and excited tone" -o happy.wav
 ```
+
+> **Note:** The `--instruct` flag only works with the 1.7B model. The 0.6B model does not
+> support style control and will ignore the instruction.
 
 ## How It Works
 

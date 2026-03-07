@@ -300,6 +300,9 @@ typedef struct {
     /* Speaker and language */
     int speaker_id;
     int language_id;
+
+    /* Instruct text (style/emotion control, 1.7B only) */
+    char *instruct;
     
     /* Random seed */
     uint32_t seed;

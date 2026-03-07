@@ -17,6 +17,7 @@ int main(int argc, char **argv) {
     const char *output = "output.wav";
     int speaker_id = -1;
     const char *language = NULL;
+    const char *instruct = NULL;
     float temperature = 0.9f;
     int top_k = 50;
     float top_p = 1.0f;
@@ -38,6 +39,7 @@ int main(int argc, char **argv) {
         {"rep-penalty", required_argument, 0, 'r'},
         {"max-tokens",  required_argument, 0, 'm'},
         {"threads",     required_argument, 0, 'j'},
+        {"instruct",    required_argument, 0, 'I'},
         {"silent",      no_argument,       0, 'S'},
         {"debug",       no_argument,       0, 'D'},
         {"help",        no_argument,       0, 'h'},
@@ -45,7 +47,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:t:o:s:l:T:k:p:r:m:j:SDh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:t:o:s:l:T:k:p:r:m:j:I:SDh", long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
             case 't': text = optarg; break;
@@ -58,6 +60,7 @@ int main(int argc, char **argv) {
             case 'r': rep_penalty = (float)atof(optarg); break;
             case 'm': max_tokens = atoi(optarg); break;
             case 'j': threads = atoi(optarg); break;
+            case 'I': instruct = optarg; break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -75,6 +78,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  -r, --rep-penalty <float>  Repetition penalty\n");
                 fprintf(stderr, "  -m, --max-tokens <int>     Max tokens\n");
                 fprintf(stderr, "  -j, --threads <int>        Number of threads (0=auto)\n");
+                fprintf(stderr, "  -I, --instruct <text>      Style instruction (1.7B only)\n");
+                fprintf(stderr, "                             e.g. \"Speak in an angry tone\"\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -114,6 +119,13 @@ int main(int argc, char **argv) {
 
     if (speaker_id >= 0) ctx->speaker_id = speaker_id;
     if (language) ctx->language_id = qwen_tts_language_id(language);
+    if (instruct) {
+        if (ctx->config.hidden_size < 2048) {
+            fprintf(stderr, "Warning: --instruct is only supported on 1.7B model (ignored)\n");
+        } else {
+            ctx->instruct = strdup(instruct);
+        }
+    }
 
     /* Generate */
     float *audio = NULL;

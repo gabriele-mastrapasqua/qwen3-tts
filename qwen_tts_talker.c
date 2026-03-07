@@ -396,6 +396,13 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 
     memcpy(residual, input_embeds, (int64_t)seq_len * h * sizeof(float));
 
+    if (ctx->debug) {
+        /* Debug: print first position embedding values */
+        fprintf(stderr, "[PREFILL] input_embeds[0][:8]:");
+        for (int j = 0; j < 8 && j < h; j++) fprintf(stderr, " %.6f", residual[j]);
+        fprintf(stderr, "\n");
+    }
+
     for (int layer = 0; layer < c->num_layers; layer++) {
         qwen_talker_layer_t *l = &ctx->layers[layer];
 
@@ -549,13 +556,29 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 
         if (ctx->debug) {
             fprintf(stderr, "  Layer %d/%d done", layer + 1, c->num_layers);
-            if (ctx->speech_dec.pre_conv_weight)
-                fprintf(stderr, " (pre_conv_w[0]=%.6f)", ctx->speech_dec.pre_conv_weight[0]);
+            /* Print first position residual to detect NaN */
+            fprintf(stderr, " res[:4]=[%.4f,%.4f,%.4f,%.4f]",
+                    residual[0], residual[1], residual[2], residual[3]);
             fprintf(stderr, "\n");
         }
     }
 
     ctx->kv_len = seq_len;
+
+    if (ctx->debug) {
+        /* Debug: print last position hidden state before and after norm */
+        float *last_pos = residual + (int64_t)(seq_len - 1) * h;
+        fprintf(stderr, "[PREFILL] last_hidden[:8]:");
+        for (int j = 0; j < 8 && j < h; j++) fprintf(stderr, " %.6f", last_pos[j]);
+        fprintf(stderr, "\n");
+        /* Apply norm temporarily for debug */
+        float *normed_tmp = (float *)malloc(h * sizeof(float));
+        qwen_rms_norm(normed_tmp, last_pos, ctx->talker_norm, 1, h, c->rms_norm_eps);
+        fprintf(stderr, "[PREFILL] after_norm[:8]:");
+        for (int j = 0; j < 8 && j < h; j++) fprintf(stderr, " %.6f", normed_tmp[j]);
+        fprintf(stderr, "\n");
+        free(normed_tmp);
+    }
 
     /* Copy last position to dec_x for use in generation */
     memcpy(ctx->dec_x, residual + (int64_t)(seq_len - 1) * h, h * sizeof(float));

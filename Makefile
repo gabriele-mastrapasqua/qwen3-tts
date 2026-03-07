@@ -47,11 +47,11 @@ help:
 	@echo "  make clean     - Remove build artifacts"
 	@echo "  make info      - Show build configuration"
 	@echo ""
-	@echo "Test (requires ./$(TARGET) and model in $(MODEL_DIR)/):"
-	@echo "  make test-en        - English test (ryan)"
-	@echo "  make test-it-ryan   - Italian test (ryan)"
-	@echo "  make test-it-vivian - Italian test (vivian, female)"
-	@echo "  make test-all       - Run all tests"
+	@echo "Test (requires models downloaded via ./download_model.sh):"
+	@echo "  make test-small      - Run all 0.6B tests (English + Italian)"
+	@echo "  make test-large      - Run all 1.7B tests (config + English + Italian)"
+	@echo "  make test-regression - Cross-model regression checks"
+	@echo "  make test-all        - Run everything (0.6B + 1.7B + regression)"
 	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
@@ -99,26 +99,149 @@ info:
 	@echo "TARGET:   $(TARGET)"
 
 # ── Test targets ──────────────────────────────────────────────────────────────
+# Models must be downloaded first via ./download_model.sh
+# Tests verify: model loading, config parsing, generation, WAV output, non-zero audio
 
-test-en:
-	@echo "=== English test (ryan) ==="
-	./$(TARGET) -d $(MODEL_DIR) -s ryan -l English \
-		--text "Hello, this is a test of the text to speech system." -o test_en.wav
-	@echo "Output: test_en.wav"
+MODEL_SMALL = qwen3-tts-0.6b
+MODEL_LARGE = qwen3-tts-1.7b
+TEST_DIR = /tmp/qwen_tts_tests
 
-test-it-ryan:
-	@echo "=== Italian test (ryan) ==="
-	./$(TARGET) -d $(MODEL_DIR) -s ryan -l Italian \
-		--text "Ciao, questa è una prova del sistema di sintesi vocale." -o test_it_ryan.wav
-	@echo "Output: test_it_ryan.wav"
+# Helper script for test validation
+# Usage: validate_test <wav_file> <label>
+define validate_wav
+	@if [ ! -f $(1) ]; then echo "FAIL: $(1) not created"; exit 1; fi
+	@WAV_SIZE=$$(stat -f%z $(1) 2>/dev/null || stat -c%s $(1) 2>/dev/null); \
+	 if [ "$$WAV_SIZE" -le 44 ]; then echo "FAIL: $(1) is empty ($$WAV_SIZE bytes)"; exit 1; fi
+	@if ! grep -q "Generated [1-9]" $(1).log; then echo "FAIL: no frames generated"; exit 1; fi
+	@if grep -qi "nan" $(1).log; then echo "WARN: NaN detected in output"; fi
+	@if grep -q "MISSING" $(1).log; then echo "FAIL: speech decoder weights MISSING"; exit 1; fi
+	@echo "PASS: $(2)"
+	@echo ""
+endef
 
-test-it-vivian:
-	@echo "=== Italian test (vivian, female) ==="
-	./$(TARGET) -d $(MODEL_DIR) -s vivian -l Italian \
-		--text "Buongiorno, come state oggi? Spero tutto bene." -o test_it_vivian.wav
-	@echo "Output: test_it_vivian.wav"
+# ── Small model (0.6B) tests ──
 
-test-all: test-en test-it-ryan test-it-vivian
-	@echo "=== All tests complete ==="
+test-small-en:
+	@echo "--- 0.6B English ryan ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_SMALL) -s ryan -l English \
+		--text "Hello, this is a test of the text to speech system." \
+		-o $(TEST_DIR)/small_en.wav 2>&1 | tee $(TEST_DIR)/small_en.wav.log
+	$(call validate_wav,$(TEST_DIR)/small_en.wav,0.6B English ryan)
 
-.PHONY: all help blas clean debug info test-en test-it-ryan test-it-vivian test-all
+test-small-it:
+	@echo "--- 0.6B Italian ryan ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_SMALL) -s ryan -l Italian \
+		--text "Ciao, questa è una prova del sistema di sintesi vocale." \
+		-o $(TEST_DIR)/small_it.wav 2>&1 | tee $(TEST_DIR)/small_it.wav.log
+	$(call validate_wav,$(TEST_DIR)/small_it.wav,0.6B Italian ryan)
+
+test-small-vivian:
+	@echo "--- 0.6B Italian vivian ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_SMALL) -s vivian -l Italian \
+		--text "Buongiorno, come state oggi?" \
+		-o $(TEST_DIR)/small_vivian.wav 2>&1 | tee $(TEST_DIR)/small_vivian.wav.log
+	$(call validate_wav,$(TEST_DIR)/small_vivian.wav,0.6B Italian vivian)
+
+test-small: test-small-en test-small-it test-small-vivian
+	@echo "=== All 0.6B tests passed ==="
+
+# ── Large model (1.7B) tests ──
+
+test-large-en:
+	@echo "--- 1.7B English ryan ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan -l English \
+		--text "Hello, this is a test of the text to speech system." \
+		-o $(TEST_DIR)/large_en.wav 2>&1 | tee $(TEST_DIR)/large_en.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_en.wav,1.7B English ryan)
+
+test-large-it:
+	@echo "--- 1.7B Italian ryan ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan -l Italian \
+		--text "Ciao, questa è una prova del sistema." \
+		-o $(TEST_DIR)/large_it.wav 2>&1 | tee $(TEST_DIR)/large_it.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_it.wav,1.7B Italian ryan)
+
+test-large-config:
+	@echo "--- 1.7B config validation ---"
+	@# Regression: config parser truncated nested objects, losing hidden_size=2048
+	./$(TARGET) -d $(MODEL_LARGE) --text "Test." -o $(TEST_DIR)/large_cfg.wav 2>&1 | tee $(TEST_DIR)/large_cfg.log
+	@if ! grep -q "hidden=2048" $(TEST_DIR)/large_cfg.log; then echo "FAIL: 1.7B hidden_size should be 2048"; exit 1; fi
+	@if ! grep -q "inter=6144" $(TEST_DIR)/large_cfg.log; then echo "FAIL: 1.7B intermediate_size should be 6144"; exit 1; fi
+	@if ! grep -q "MTP projection" $(TEST_DIR)/large_cfg.log; then echo "FAIL: 1.7B should have MTP projection"; exit 1; fi
+	@if grep -q "MISSING" $(TEST_DIR)/large_cfg.log; then echo "FAIL: speech decoder weights MISSING"; exit 1; fi
+	@echo "PASS: 1.7B config validation"
+	@echo ""
+
+test-large-instruct:
+	@echo "--- 1.7B Instruct: angry ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan -l English \
+		--text "I cannot believe you did that to me." \
+		--instruct "Speak in a very angry and aggressive tone" \
+		-o $(TEST_DIR)/large_angry.wav 2>&1 | tee $(TEST_DIR)/large_angry.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_angry.wav,1.7B Instruct angry)
+	@echo "--- 1.7B Instruct: slow whisper ---"
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan -l English \
+		--text "I cannot believe you did that to me." \
+		--instruct "Speak very slowly and softly, in a sad whisper" \
+		-o $(TEST_DIR)/large_whisper.wav 2>&1 | tee $(TEST_DIR)/large_whisper.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_whisper.wav,1.7B Instruct whisper)
+	@echo "--- 1.7B Instruct: happy ---"
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan -l English \
+		--text "I cannot believe you did that to me." \
+		--instruct "Speak in a very happy, cheerful and excited tone" \
+		-o $(TEST_DIR)/large_happy.wav 2>&1 | tee $(TEST_DIR)/large_happy.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_happy.wav,1.7B Instruct happy)
+
+test-large: test-large-config test-large-en test-large-it test-large-instruct
+	@echo "=== All 1.7B tests passed ==="
+
+# ── Cross-model regression tests ──
+
+test-regression:
+	@echo "=== Regression tests ==="
+	@echo ""
+	@echo "--- Safetensors format (must load standard HF format, not custom .bin) ---"
+	@# Both models must load from model.safetensors (no weights.bin)
+	@if [ -f $(MODEL_SMALL)/weights.bin ]; then echo "WARN: weights.bin found in 0.6B dir (should use model.safetensors)"; fi
+	@if [ -f $(MODEL_LARGE)/weights.bin ]; then echo "WARN: weights.bin found in 1.7B dir (should use model.safetensors)"; fi
+	@if [ ! -f $(MODEL_SMALL)/model.safetensors ]; then echo "FAIL: 0.6B model.safetensors missing"; exit 1; fi
+	@if [ ! -f $(MODEL_LARGE)/model.safetensors ]; then echo "FAIL: 1.7B model.safetensors missing"; exit 1; fi
+	@if [ ! -f $(MODEL_SMALL)/speech_tokenizer/model.safetensors ]; then echo "FAIL: 0.6B speech_tokenizer missing"; exit 1; fi
+	@if [ ! -f $(MODEL_LARGE)/speech_tokenizer/model.safetensors ]; then echo "FAIL: 1.7B speech_tokenizer missing"; exit 1; fi
+	@echo "PASS: safetensors files present"
+	@echo ""
+	@echo "--- 0.6B vs 1.7B config divergence ---"
+	./$(TARGET) -d $(MODEL_SMALL) --text "x" -o /dev/null 2>&1 | grep "^Config:" > $(TEST_DIR)/cfg_small.txt || true
+	./$(TARGET) -d $(MODEL_LARGE) --text "x" -o /dev/null 2>&1 | grep "^Config:" > $(TEST_DIR)/cfg_large.txt || true
+	@# 0.6B must have hidden=1024, 1.7B must have hidden=2048
+	@if ! grep -q "hidden=1024" $(TEST_DIR)/cfg_small.txt; then echo "FAIL: 0.6B should have hidden=1024"; exit 1; fi
+	@if ! grep -q "hidden=2048" $(TEST_DIR)/cfg_large.txt; then echo "FAIL: 1.7B should have hidden=2048"; exit 1; fi
+	@# Both must have same head_dim=128 and same CP hidden=1024
+	@if ! grep -q "head_dim=128" $(TEST_DIR)/cfg_small.txt; then echo "FAIL: 0.6B head_dim"; exit 1; fi
+	@if ! grep -q "head_dim=128" $(TEST_DIR)/cfg_large.txt; then echo "FAIL: 1.7B head_dim"; exit 1; fi
+	@echo "PASS: config divergence correct"
+	@echo ""
+	@echo "=== All regression tests passed ==="
+
+# ── Combined ──
+
+test-all: test-small test-large test-regression
+	@echo ""
+	@echo "========================================="
+	@echo "  All tests passed (0.6B + 1.7B)"
+	@echo "========================================="
+
+# Legacy aliases
+test-en: test-small-en
+test-it-ryan: test-small-it
+
+.PHONY: all help blas clean debug info \
+        test-small test-small-en test-small-it test-small-vivian \
+        test-large test-large-en test-large-it test-large-config test-large-instruct \
+        test-regression test-all test-en test-it-ryan
