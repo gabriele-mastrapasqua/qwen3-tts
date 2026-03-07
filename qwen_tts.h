@@ -274,6 +274,15 @@ typedef struct {
 } qwen_speech_decoder_t;
 
 /* ========================================================================
+ * Audio Callback (for streaming)
+ * ======================================================================== */
+
+/* Called with each decoded audio chunk during streaming generation.
+ * samples: float PCM in [-1, 1], n_samples: count, userdata: opaque pointer.
+ * Return 0 to continue, non-zero to abort generation. */
+typedef int (*qwen_tts_audio_cb)(const float *samples, int n_samples, void *userdata);
+
+/* ========================================================================
  * Main Context Structure
  * ======================================================================== */
 
@@ -303,7 +312,13 @@ typedef struct {
 
     /* Instruct text (style/emotion control, 1.7B only) */
     char *instruct;
-    
+
+    /* Streaming */
+    int stream;                  /* Enable streaming (decode chunks during generation) */
+    int stream_chunk_frames;     /* Frames per chunk (default: 10 = 0.8s audio) */
+    qwen_tts_audio_cb audio_cb;  /* Audio callback for streaming */
+    void *audio_cb_userdata;
+
     /* Random seed */
     uint32_t seed;
     
@@ -429,6 +444,9 @@ int qwen_tts_language_id(const char *name);
 
 /* Get speaker ID from name */
 int qwen_tts_speaker_id(const char *name);
+
+/* Set audio callback for streaming (called with each decoded chunk) */
+void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata);
 
 /* Generate speech from text */
 int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text,

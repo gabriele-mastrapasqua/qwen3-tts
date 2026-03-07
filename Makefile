@@ -145,7 +145,26 @@ test-small-vivian:
 		-o $(TEST_DIR)/small_vivian.wav 2>&1 | tee $(TEST_DIR)/small_vivian.wav.log
 	$(call validate_wav,$(TEST_DIR)/small_vivian.wav,0.6B Italian vivian)
 
-test-small: test-small-en test-small-it test-small-vivian
+test-small-stream:
+	@echo "--- 0.6B Streaming WAV ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_SMALL) -s ryan -l English \
+		--text "Hello, this is a streaming test of the system." \
+		--stream -o $(TEST_DIR)/small_stream.wav 2>&1 | tee $(TEST_DIR)/small_stream.wav.log
+	$(call validate_wav,$(TEST_DIR)/small_stream.wav,0.6B Streaming WAV)
+
+test-small-stdout:
+	@echo "--- 0.6B Raw PCM stdout ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_SMALL) -s ryan -l English \
+		--text "Hello, this is a stdout test." \
+		--stdout > $(TEST_DIR)/small_stdout.raw 2>$(TEST_DIR)/small_stdout.log
+	@RAW_SIZE=$$(stat -f%z $(TEST_DIR)/small_stdout.raw 2>/dev/null || stat -c%s $(TEST_DIR)/small_stdout.raw 2>/dev/null); \
+	 if [ "$$RAW_SIZE" -le 0 ]; then echo "FAIL: stdout produced no data"; exit 1; fi
+	@echo "PASS: 0.6B Raw PCM stdout"
+	@echo ""
+
+test-small: test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout
 	@echo "=== All 0.6B tests passed ==="
 
 # ── Large model (1.7B) tests ──
@@ -242,6 +261,6 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: all help blas clean debug info \
-        test-small test-small-en test-small-it test-small-vivian \
+        test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
         test-regression test-all test-en test-it-ryan

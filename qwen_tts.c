@@ -247,6 +247,7 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
     ctx->temperature = 0.9f; ctx->top_k = 50; ctx->top_p = 1.0f; ctx->rep_penalty = 1.05f;
     ctx->max_tokens = 8192; ctx->cp_temperature = 0.0f; ctx->cp_top_k = 1;
+    ctx->stream_chunk_frames = 10; /* default: 10 frames = 0.8s audio per chunk */
     /* Default speaker: Ryan (3061) - native English speaker
      * Serena (3066) and others are Chinese speakers which may cause issues with English */
     ctx->speaker_id = 3061; ctx->language_id = -1; ctx->seed = (uint32_t)time(NULL);
@@ -323,6 +324,11 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->cp_rope_cos); free(ctx->cp_rope_sin);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     free(ctx);
+}
+
+void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata) {
+    ctx->audio_cb = cb;
+    ctx->audio_cb_userdata = userdata;
 }
 
 void qwen_tts_set_speaker(qwen_tts_ctx_t *ctx, int speaker_id) { ctx->speaker_id = speaker_id; }
@@ -588,6 +594,9 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     double t_cp_total = 0;
     float *step_embed = (float *)malloc(h * sizeof(float));
+    int stream_samples_emitted = 0;  /* audio samples already sent to callback */
+    int stream_chunk = ctx->stream_chunk_frames > 0 ? ctx->stream_chunk_frames : 10;
+    int stream_aborted = 0;
 
     for (int frame = 0; frame < max_frames; frame++) {
         /* Codec head: logits = codec_head @ last_hidden */
@@ -651,6 +660,27 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         if (!ctx->silent && frame % 50 == 0 && frame > 0)
             fprintf(stderr, "\r  Frame %d/%d (%.1fs audio)...", frame, max_frames, frame / 12.5);
 
+        /* Streaming: decode accumulated frames and emit delta audio */
+        if (ctx->stream && ctx->audio_cb && ctx->codec_frames % stream_chunk == 0) {
+            float *chunk_audio = NULL; int chunk_samples = 0;
+            if (qwen_speech_decoder_decode(ctx, ctx->codec_codes, ctx->codec_frames,
+                                            &chunk_audio, &chunk_samples) == 0) {
+                /* Emit only the NEW samples (delta from previous decode) */
+                if (chunk_samples > stream_samples_emitted) {
+                    int delta = chunk_samples - stream_samples_emitted;
+                    int ret = ctx->audio_cb(chunk_audio + stream_samples_emitted, delta,
+                                            ctx->audio_cb_userdata);
+                    stream_samples_emitted = chunk_samples;
+                    if (ret != 0) {
+                        if (!ctx->silent) fprintf(stderr, "\n  Streaming aborted by callback\n");
+                        stream_aborted = 1;
+                    }
+                }
+                free(chunk_audio);
+            }
+            if (stream_aborted) break;
+        }
+
         /* Build next input embedding (non-streaming mode):
          * codec_side: codec_embed(code0) + sum of CP codec_embeds(codes 1-15)
          * text_side: always tts_pad (all text was in prefill)
@@ -691,10 +721,18 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         return 0;
     }
 
+    /* Final decode: emit remaining samples via streaming callback, then produce full output */
     double t_dec_start = time_ms();
     float *audio; int n_samples;
     if (qwen_speech_decoder_decode(ctx, ctx->codec_codes, ctx->codec_frames, &audio, &n_samples) != 0)
         return -1;
+
+    /* Streaming: emit any remaining samples not yet sent */
+    if (ctx->stream && ctx->audio_cb && !stream_aborted && n_samples > stream_samples_emitted) {
+        int delta = n_samples - stream_samples_emitted;
+        ctx->audio_cb(audio + stream_samples_emitted, delta, ctx->audio_cb_userdata);
+    }
+
     if (!ctx->silent)
         fprintf(stderr, "  Speech decoder: %.0f ms\n", time_ms() - t_dec_start);
 
