@@ -96,9 +96,7 @@ case "$MODEL_CHOICE" in
             "generation_config.json"
             "tokenizer_config.json"
             "preprocessor_config.json"
-            "model.safetensors.index.json"
-            "model-00001-of-00002.safetensors"
-            "model-00002-of-00002.safetensors"
+            "model.safetensors"
             "vocab.json"
             "merges.txt"
         )

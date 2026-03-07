@@ -1,161 +1,169 @@
 # Qwen3-TTS Pure C Implementation
 
-This is a C implementation of the inference pipeline for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) text-to-speech models (both 0.6B and 1.7B). It has zero external dependencies beyond the C standard library and a BLAS implementation (Accelerate on macOS, OpenBLAS on Linux). Audio is generated frame by frame as the model runs.
+A lightweight, cross-platform C inference engine for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) text-to-speech models (0.6B and 1.7B). No Python, no PyTorch, no ONNX runtime — just C, a BLAS library, and raw model weights.
+
+The engine runs the complete TTS pipeline: BPE tokenization, a 28-layer causal transformer (Talker), a multi-pass code predictor, and a convolutional speech decoder. Weights are memory-mapped directly from safetensors files in BF16, so loading is near-instant and memory usage stays low.
 
 ## Audio Samples
 
-All samples generated with the 0.6B model on Apple M1 at ~0.7x realtime:
+All samples generated with the 0.6B model at ~0.7x realtime:
 
 | Language | Speaker | Sample | Text |
 |----------|---------|--------|------|
-| English | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.wav) | *Hello, this is a test of the text to speech system.* |
-| Italian | vivian | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.wav) | *Buongiorno a tutti, questa è una dimostrazione del sistema di sintesi vocale.* |
-| Spanish | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.wav) | *Hola, esta es una demostración del sistema de síntesis de voz.* |
-| Portuguese | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.wav) | *Olá, esta é uma demonstração do sistema de síntese de voz.* |
-| French | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.wav) | *Bonjour à tous, ceci est une démonstration du système de synthèse vocale.* |
-| German | ryan | [▶ listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/german_ryan.wav) | *Guten Tag, dies ist eine Demonstration des Sprachsynthesesystems.* |
+| English | ryan | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.wav) | *Hello, this is a test of the text to speech system.* |
+| Italian | ryan | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_ryan.wav) | *Buongiorno a tutti, questa e una dimostrazione del sistema di sintesi vocale.* |
+| Italian | vivian | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.wav) | *Buongiorno a tutti, questa e una dimostrazione del sistema di sintesi vocale.* |
+| Spanish | ryan | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.wav) | *Hola, esta es una demostracion del sistema de sintesis de voz.* |
+| Portuguese | ryan | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.wav) | *Ola, esta e uma demonstracao do sistema de sintese de voz.* |
+| French | ryan | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.wav) | *Bonjour a tous, ceci est une demonstration du systeme de synthese vocale.* |
+| German | ryan | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/german_ryan.wav) | *Guten Tag, dies ist eine Demonstration des Sprachsynthesesystems.* |
 
-> Or clone and play locally: `afplay samples/english_ryan.wav` (macOS) / `aplay samples/english_ryan.wav` (Linux)
-
-**Important**: this implementation explicitly **avoids implementing support for MPS**. Following the same philosophy as [qwen-asr](https://github.com/antirez/qwen-asr): TTS systems are important pieces of infrastructure often run on remote Linux servers. Adding the MPS target would focus efforts too much on Apple hardware, so for now it is skipped. The code runs well on Apple hardware anyway (NEON optimized). MPS support may be added later when other optimizations are mature.
+> Clone and play locally: `afplay samples/english_ryan.wav` (macOS) or `aplay samples/english_ryan.wav` (Linux)
 
 ## Quick Start
 
 ```bash
-# Build
+# Clone and build
+git clone https://github.com/gabriele-mastrapasqua/qwen3-tts.git
+cd qwen3-tts
 make blas
 
-# Download a model (interactive selector: small=0.6B, large=1.7B)
+# Download a model (interactive: small=0.6B, large=1.7B)
 ./download_model.sh
 
 # Synthesize speech
 ./qwen_tts -d qwen3-tts-0.6b --text "Hello, how are you today?" -o hello.wav
-
-# Play the output (macOS)
-afplay hello.wav
-
-# Play the output (Linux)
-aplay hello.wav
 ```
 
 ## Features
 
-- **Almost zero dependencies**: Pure C implementation. Only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
-- **Both models**: Automatically detects 0.6B or 1.7B from the weight files.
-- **CustomVoice speakers**: 9 preset voices selectable by name (`-s ryan`, `-s vivian`, etc.).
-- **Multilingual**: 10 languages supported, selectable with `-l English`, `-l Italian`, etc.
-- **Sampling control**: Temperature, top-k, top-p, and repetition penalty are configurable.
-- **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors files — loading is near-instant.
-- **WAV output**: 24 kHz, 16-bit PCM, mono.
-
-## Usage
-
-```bash
-./qwen_tts [options]
-
-Options:
-  -d, --model-dir <path>     Model directory (required)
-  --text <string>            Text to synthesize (required)
-  -o, --output <path>        Output WAV file (default: output.wav)
-  -s, --speaker <name>       Speaker name (ryan, vivian, serena, aiden, etc.)
-  -l, --language <lang>      Target language (English, Italian, Chinese, etc.)
-  --temperature <f>          Sampling temperature (default: 0.9)
-  --top-k <n>                Top-k sampling (default: 50)
-  --top-p <f>                Top-p nucleus sampling (default: 1.0)
-  --rep-penalty <f>          Repetition penalty (default: 1.05)
-  --max-tokens <n>           Max audio tokens to generate (default: 8192)
-  --silent                   Suppress status output on stderr
-  --debug                    Verbose internal diagnostics
-```
-
-### Examples
-
-```bash
-# Basic English synthesis
-./qwen_tts -d qwen3-tts-0.6b --text "The quick brown fox jumps over the lazy dog." -o fox.wav
-
-# Choose a speaker by name (-s) and language (-l)
-./qwen_tts -d qwen3-tts-0.6b -s ryan -l English \
-    --text "Hello, this is a test of the text to speech system." -o test_en.wav
-
-# Italian with a specific speaker
-./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian \
-    --text "Ciao, questa è una prova del sistema di sintesi vocale." -o test_it.wav
-
-# Switch voice: same text, different speaker (female)
-./qwen_tts -d qwen3-tts-0.6b -s vivian -l Italian \
-    --text "Buongiorno, come state oggi? Spero tutto bene." -o test_it_vivian.wav
-
-# Lower temperature for more deterministic output
-./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --temperature 0.7 -o hello.wav
-```
-
-Available speakers: `serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`, `eric`, `dylan`.
-
-You can also use `make test-en`, `make test-it-ryan`, `make test-it-vivian`, or `make test-all` to quickly run pre-configured tests.
+- **Pure C, minimal dependencies** — Only requires a C compiler and BLAS (Accelerate on macOS, OpenBLAS on Linux). No Python runtime needed.
+- **Cross-platform** — Runs on macOS (ARM/x86) and Linux (ARM/x86). NEON and AVX SIMD paths included. See [Windows (WSL2)](#windows-wsl2) for Windows support.
+- **Both model sizes** — Automatically detects 0.6B or 1.7B from weight files.
+- **9 preset voices** — Selectable by name: `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
+- **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
+- **Memory-mapped weights** — BF16 safetensors are mmap'd directly. The 0.6B model needs ~3 GB, the 1.7B needs ~8 GB.
+- **Configurable sampling** — Temperature, top-k, top-p, and repetition penalty.
+- **24 kHz WAV output** — 16-bit PCM, mono.
 
 ## Building
 
+### macOS
+
 ```bash
-make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
+make blas    # Uses Accelerate framework (ships with Xcode)
+```
+
+### Linux
+
+```bash
+# Install OpenBLAS
+sudo apt install libopenblas-dev    # Ubuntu/Debian
+sudo dnf install openblas-devel     # Fedora/RHEL
+
+make blas
+```
+
+### Windows (WSL2)
+
+```bash
+# Open a WSL2 terminal (Ubuntu recommended)
+sudo apt update && sudo apt install build-essential libopenblas-dev
+git clone https://github.com/gabriele-mastrapasqua/qwen3-tts.git
+cd qwen3-tts
+make blas
+./download_model.sh --model small
+./qwen_tts -d qwen3-tts-0.6b --text "Hello from Windows!" -o hello.wav
+```
+
+### Other build targets
+
+```bash
 make debug      # Debug build with AddressSanitizer
 make clean      # Clean build artifacts
 make info       # Show build configuration
 ```
 
-For Linux, install OpenBLAS first:
+## Usage
+
+```
+./qwen_tts [options]
+
+Required:
+  -d, --model-dir <path>     Model directory
+  --text <string>            Text to synthesize
+
+Optional:
+  -o, --output <path>        Output WAV file (default: output.wav)
+  -s, --speaker <name>       Speaker voice (default: ryan)
+  -l, --language <lang>      Target language (default: English)
+  --temperature <f>          Sampling temperature (default: 0.9)
+  --top-k <n>                Top-k sampling (default: 50)
+  --top-p <f>                Top-p nucleus sampling (default: 1.0)
+  --rep-penalty <f>          Repetition penalty (default: 1.05)
+  --max-tokens <n>           Max audio tokens (default: 8192)
+  -j, --threads <n>          Worker threads (default: 4)
+  --silent                   Suppress status output
+  --debug                    Verbose diagnostics
+```
+
+### Examples
+
 ```bash
-# Ubuntu/Debian
-sudo apt install libopenblas-dev
+# Basic English
+./qwen_tts -d qwen3-tts-0.6b --text "The quick brown fox jumps over the lazy dog." -o fox.wav
 
-# Fedora
-sudo dnf install openblas-devel
+# Italian with a male voice
+./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian \
+    --text "Ciao, questa e una prova del sistema di sintesi vocale." -o test_it.wav
+
+# French with a female voice
+./qwen_tts -d qwen3-tts-0.6b -s vivian -l French \
+    --text "Bonjour, comment allez-vous aujourd'hui?" -o test_fr.wav
+
+# Lower temperature for more deterministic output
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --temperature 0.7 -o hello.wav
+
+# Use the larger model for higher quality
+./qwen_tts -d qwen3-tts-1.7b --text "Hello world" -o hello_large.wav
 ```
 
-## Model Architecture
+## How It Works
 
-Qwen3-TTS is a text-to-speech model available in 0.6B and 1.7B parameter variants:
-
-**Pipeline:**
 ```
-Text → BPE Tokenizer → Talker (LLM) → Code Predictor (MTP) → Speech Decoder (ConvNet) → 24 kHz WAV
+Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --> 24 kHz WAV
 ```
 
-| Component | Architecture |
+| Component | What it does |
 |-----------|-------------|
-| Talker | 28-layer Qwen3 with GQA, per-head Q/K RMSNorm, NeoX RoPE, SwiGLU |
-| Code Predictor | 5-layer transformer, 15 sequential passes per audio frame |
-| Speech Decoder | Causal ConvNet, 16 codebook RVQ, 480x upsampling to 24 kHz |
+| **Talker** | 28-layer Qwen3 transformer with GQA, RoPE, SwiGLU. Generates one audio frame token per step. |
+| **Code Predictor** | 5-layer transformer running 15 sequential passes per frame. Predicts the remaining 15 codebook entries for each frame. |
+| **Speech Decoder** | Causal ConvNet with 16-codebook RVQ dequantization and 480x upsampling. Converts discrete codes to raw audio waveform. |
 
-| Parameter | 0.6B | 1.7B |
+| | 0.6B | 1.7B |
 |-----------|------|------|
-| Talker layers | 28 | 28 |
-| Talker dim | 1024 | 2048 |
-| Code Predictor layers | 5 | 5 |
-| Codebooks | 16 × 2048 entries | 16 × 2048 entries |
-| Frame rate | 12.5 Hz | 12.5 Hz |
-| Output sample rate | 24 kHz | 24 kHz |
+| Talker hidden dim | 1024 | 2048 |
+| Talker heads (Q/KV) | 16/8 | 32/8 |
+| Parameters | ~600M | ~1.7B |
+| Memory usage | ~3 GB | ~8 GB |
 | Weight format | BF16 | BF16 |
-| Languages | 10 | 10 |
 
-Supported languages: Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
+All model dimensions are read from the weight files at load time — no recompilation needed to switch between 0.6B and 1.7B.
 
-## Memory Requirements
+## Performance
 
-- **0.6B**: ~3 GB total (model weights + runtime buffers)
-- **1.7B**: ~8 GB total (model weights + runtime buffers)
+Benchmarked with 4 threads on CPU:
 
-Safetensors are memory-mapped. Large weights (Talker, Code Predictor) remain as BF16 mmapped.
-Speech decoder weights are loaded to F32.
+- **0.6B**: ~0.7x realtime (generates 1 second of audio in ~1.4 seconds)
+- Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
+- SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
+- Multi-threaded inference via GCD (`dispatch_apply`) on macOS, pthreads on Linux
 
 ## Credits & Acknowledgments
 
-This project builds on the work of several teams and individuals:
-
-- **[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)** by the Qwen team at Alibaba — the model architecture, weights, and research behind the text-to-speech system. Models available on [Hugging Face](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice).
-  - *Qwen3-TTS Technical Report* — [arXiv:2505.08reduced](https://arxiv.org/abs/2505.15894)
-- **[qwen-asr](https://github.com/antirez/qwen-asr)** by [antirez](https://github.com/antirez) — a pure C implementation of Qwen2-Audio ASR that directly inspired this project's architecture: mmap'd safetensors, BF16 NEON kernels, threading via `dispatch_apply`, and the overall approach of writing minimal C inference engines. Much of the safetensors loader and kernel scaffolding is derived from qwen-asr.
-- **[Qwen2.5](https://github.com/QwenLM/Qwen2.5)** by the Qwen team — the base LLM architecture (GQA, RoPE, SwiGLU) used in the Talker and Code Predictor components.
+- **[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)** by the Qwen team at Alibaba — the model architecture, weights, and research. Models on [Hugging Face](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice). [Paper](https://arxiv.org/abs/2505.15894).
+- **[qwen-asr](https://github.com/antirez/qwen-asr)** by [antirez](https://github.com/antirez) — a pure C Qwen2-Audio ASR engine that directly inspired this project's architecture: mmap'd safetensors, BF16 NEON kernels, and the overall approach of writing minimal C inference engines.
+- **[Qwen2.5](https://github.com/QwenLM/Qwen2.5)** by the Qwen team — the base LLM architecture (GQA, RoPE, SwiGLU) used in the Talker and Code Predictor.
 
 ## License
 

@@ -322,8 +322,11 @@ typedef struct {
     /* Code Predictor weights */
     float *cp_norm;
     qwen_cp_layer_t cp_layers[QWEN_TTS_MAX_CP_LAYERS];
-    uint16_t *cp_codec_emb_bf16[15];  /* 15 × [codebook_size, cp_hidden] */
+    uint16_t *cp_codec_emb_bf16[15];  /* 15 × [codebook_size, emb_dim] */
     uint16_t *cp_lm_head_bf16[15];    /* 15 × [codebook_size, cp_hidden] */
+    int cp_emb_dim;                   /* embedding dim: talker_hidden for 1.7B, cp_hidden for 0.6B */
+    uint16_t *cp_mtp_proj_bf16;       /* [cp_hidden, talker_hidden] or NULL if same size */
+    float *cp_mtp_proj_bias;          /* [cp_hidden] or NULL */
     
     /* Speech decoder */
     qwen_speech_decoder_t speech_dec;

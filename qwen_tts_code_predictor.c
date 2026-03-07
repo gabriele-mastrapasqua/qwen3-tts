@@ -148,6 +148,27 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
         ctx->cp_codec_emb_bf16[g] = get_bf16(ctx->safetensors, name);
     }
 
+    /* small_to_mtp_projection: projects talker_hidden -> cp_hidden (only when they differ) */
+    int talker_h = c->hidden_size;
+    if (talker_h != cp_h) {
+        ctx->cp_mtp_proj_bf16 = get_bf16(ctx->safetensors, "talker.code_predictor.small_to_mtp_projection.weight");
+        /* Bias is BF16 in safetensors — convert to f32 */
+        uint16_t *bias_bf16 = get_bf16(ctx->safetensors, "talker.code_predictor.small_to_mtp_projection.bias");
+        if (bias_bf16) {
+            ctx->cp_mtp_proj_bias = (float *)malloc(cp_h * sizeof(float));
+            for (int i = 0; i < cp_h; i++) ctx->cp_mtp_proj_bias[i] = bf16_to_f32(bias_bf16[i]);
+        } else {
+            ctx->cp_mtp_proj_bias = NULL;
+        }
+        ctx->cp_emb_dim = talker_h;  /* CP embeddings have talker_hidden dim */
+        if (!ctx->silent)
+            fprintf(stderr, "  MTP projection: %d -> %d\n", talker_h, cp_h);
+    } else {
+        ctx->cp_mtp_proj_bf16 = NULL;
+        ctx->cp_mtp_proj_bias = NULL;
+        ctx->cp_emb_dim = cp_h;      /* CP embeddings have cp_hidden dim (same as talker) */
+    }
+
     /* Allocate CP KV cache (needs 17 positions max: 2 prefill + 14 steps + margin) */
     int cp_kv_max = 64;
     int64_t cp_kv_size = (int64_t)c->cp_num_layers * cp_kv_max * cp_kv_dim;
@@ -263,9 +284,27 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
  * - After each step: apply final norm, compute logits via lm_head, sample
  * ======================================================================== */
 
+/* Apply small_to_mtp_projection: projects from emb_dim to cp_hidden.
+ * If no projection needed (0.6B), just copies the first cp_h elements.
+ * src has dim=emb_dim, dst has dim=cp_h. */
+static void cp_mtp_project(qwen_tts_ctx_t *ctx, float *dst, const float *src) {
+    int cp_h = ctx->config.cp_hidden_size;
+    if (ctx->cp_mtp_proj_bf16) {
+        /* Linear: dst = W @ src + bias, W is [cp_h, emb_dim] in bf16 */
+        int emb_dim = ctx->cp_emb_dim;
+        matvec_bf16(dst, ctx->cp_mtp_proj_bf16, src, cp_h, emb_dim);
+        if (ctx->cp_mtp_proj_bias) {
+            for (int i = 0; i < cp_h; i++) dst[i] += ctx->cp_mtp_proj_bias[i];
+        }
+    } else {
+        memcpy(dst, src, cp_h * sizeof(float));
+    }
+}
+
 int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes) {
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
+    int emb_dim = ctx->cp_emb_dim;  /* talker_hidden for 1.7B, cp_hidden for 0.6B */
 
     /* Reset CP KV cache for this frame */
     ctx->cp_kv_len = 0;
@@ -275,16 +314,22 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     float *cp_normed = ctx->cp_dec_attn_out; /* reuse: not overlapping with transformer step output */
     float *x_norm = ctx->cp_dec_ffn_out;     /* reuse: scratch for transformer step */
 
-    /* Step 0: process talker hidden state */
-    memcpy(cp_x, talker_hidden, cp_h * sizeof(float));
+    /* Step 0: process talker hidden state (project if needed) */
+    cp_mtp_project(ctx, cp_x, talker_hidden);
     cp_transformer_step(ctx, cp_x, x_norm, 0);
 
-    /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's). */
-    if (ctx->codec_embedding_bf16 && code0 >= 0 && code0 < c->codec_vocab_size) {
-        const uint16_t *e = ctx->codec_embedding_bf16 + (int64_t)code0 * cp_h;
-        for (int i = 0; i < cp_h; i++) cp_x[i] = bf16_to_f32(e[i]);
-    } else {
-        memset(cp_x, 0, cp_h * sizeof(float));
+    /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's).
+     * The embedding has dim=hidden_size (talker), so project to cp_hidden. */
+    {
+        int h = c->hidden_size;  /* talker hidden = embedding dim for talker codec emb */
+        float emb_buf[4096];  /* max talker_hidden is 2048, but use 4096 for safety */
+        if (ctx->codec_embedding_bf16 && code0 >= 0 && code0 < c->codec_vocab_size) {
+            const uint16_t *e = ctx->codec_embedding_bf16 + (int64_t)code0 * h;
+            for (int i = 0; i < h; i++) emb_buf[i] = bf16_to_f32(e[i]);
+        } else {
+            memset(emb_buf, 0, h * sizeof(float));
+        }
+        cp_mtp_project(ctx, cp_x, emb_buf);
     }
     cp_transformer_step(ctx, cp_x, x_norm, 1);
 
@@ -297,10 +342,13 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
         int prev_code = out_codes[g - 1];
         int pos = g + 1;
 
-        /* Embed previous code using CP codec_emb[g-1] (NOT [g]) */
+        /* Embed previous code using CP codec_emb[g-1] (NOT [g]).
+         * CP embeddings have dim=emb_dim (talker_hidden for 1.7B), project to cp_hidden. */
+        float emb_buf[4096];
         if (ctx->cp_codec_emb_bf16[g - 1] && prev_code >= 0 && prev_code < c->codebook_size) {
-            const uint16_t *e = ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev_code * cp_h;
-            for (int i = 0; i < cp_h; i++) cp_x[i] = bf16_to_f32(e[i]);
+            const uint16_t *e = ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev_code * emb_dim;
+            for (int i = 0; i < emb_dim; i++) emb_buf[i] = bf16_to_f32(e[i]);
+            cp_mtp_project(ctx, cp_x, emb_buf);
         } else {
             memset(cp_x, 0, cp_h * sizeof(float));
         }

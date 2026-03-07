@@ -92,17 +92,43 @@ static int load_config(qwen_tts_ctx_t *ctx) {
     long tc_len = tc_end - p; char *tc_json = (char *)malloc(tc_len + 1);
     memcpy(tc_json, p, tc_len); tc_json[tc_len] = '\0';
     
-    /* Parse talker config values FIRST (before code_predictor_config which is nested) */
-    /* Find the code_predictor_config marker to limit talker-only parsing */
-    const char *cp_marker = strstr(tc_json, "\"code_predictor_config\"");
-    char *talker_only_json = NULL;
-    if (cp_marker) {
-        long talker_only_len = cp_marker - tc_json;
-        talker_only_json = (char *)malloc(talker_only_len + 1);
-        memcpy(talker_only_json, tc_json, talker_only_len);
-        talker_only_json[talker_only_len] = '\0';
-    } else {
-        talker_only_json = strdup(tc_json);
+    /* Build a flat version of talker_config with nested objects removed.
+     * This prevents json_find_key from matching keys inside nested objects
+     * like code_predictor_config (whose fields shadow talker-level fields). */
+    char *talker_only_json = strdup(tc_json);
+    {
+        /* Repeatedly find and blank out nested {...} blocks */
+        char *scan = talker_only_json;
+        while (1) {
+            /* Find next key whose value is an object (opening brace) */
+            char *q = scan;
+            char *nested_open = NULL;
+            while (*q) {
+                if (*q == '"') {
+                    /* Skip string */
+                    q++;
+                    while (*q && *q != '"') { if (*q == '\\') q++; q++; }
+                    if (*q) q++;
+                    /* After key string, skip whitespace and colon */
+                    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r' || *q == ':') q++;
+                    if (*q == '{') { nested_open = q; break; }
+                } else {
+                    q++;
+                }
+            }
+            if (!nested_open) break;
+            /* Find matching close brace */
+            int depth = 1;
+            char *r = nested_open + 1;
+            while (*r && depth > 0) {
+                if (*r == '{') depth++;
+                else if (*r == '}') depth--;
+                r++;
+            }
+            /* Blank out the nested object (replace with spaces) */
+            memset(nested_open, ' ', r - nested_open);
+            scan = r;
+        }
     }
     
     c->text_hidden_size = json_get_int(talker_only_json, "text_hidden_size", 2048);
