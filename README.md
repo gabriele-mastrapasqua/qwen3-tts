@@ -4,17 +4,31 @@ This is a C implementation of the inference pipeline for [Qwen3-TTS](https://git
 
 ## Audio Samples
 
-All samples generated with the 0.6B model on Apple M1 at ~0.7x realtime:
+All samples generated with the 0.6B model on Apple M1 at ~0.7x realtime. Click play to listen:
 
-| Language | Speaker | Text | Audio |
-|----------|---------|------|-------|
-| English | ryan | *"Hello, this is a test of the text to speech system. The quick brown fox jumps over the lazy dog."* | [▶ english_ryan.wav](samples/english_ryan.wav) |
-| Italian | vivian | *"Buongiorno a tutti, questa è una dimostrazione del sistema di sintesi vocale. La qualità audio è davvero impressionante."* | [▶ italian_vivian.wav](samples/italian_vivian.wav) |
-| Spanish | ryan | *"Hola, esta es una demostración del sistema de síntesis de voz. El zorro marrón rápido salta sobre el perro perezoso."* | [▶ spanish_ryan.wav](samples/spanish_ryan.wav) |
-| Portuguese | ryan | *"Olá, esta é uma demonstração do sistema de síntese de voz. A qualidade do áudio é realmente impressionante."* | [▶ portuguese_ryan.wav](samples/portuguese_ryan.wav) |
-| French | ryan | *"Bonjour à tous, ceci est une démonstration du système de synthèse vocale. Le renard brun rapide saute par-dessus le chien paresseux."* | [▶ french_ryan.wav](samples/french_ryan.wav) |
+**English** (ryan) — *"Hello, this is a test of the text to speech system. The quick brown fox jumps over the lazy dog."*
 
-> Clone the repo and play with `afplay samples/english_ryan.wav` (macOS) or `aplay samples/english_ryan.wav` (Linux).
+https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.mp4
+
+**Italian** (vivian) — *"Buongiorno a tutti, questa è una dimostrazione del sistema di sintesi vocale."*
+
+https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.mp4
+
+**Spanish** (ryan) — *"Hola, esta es una demostración del sistema de síntesis de voz."*
+
+https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.mp4
+
+**Portuguese** (ryan) — *"Olá, esta é uma demonstração do sistema de síntese de voz."*
+
+https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.mp4
+
+**French** (ryan) — *"Bonjour à tous, ceci est une démonstration du système de synthèse vocale."*
+
+https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.mp4
+
+> WAV originals: [English](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.wav) · [Italian](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.wav) · [Spanish](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.wav) · [Portuguese](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.wav) · [French](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.wav)
+>
+> Or clone and play locally: `afplay samples/english_ryan.wav` (macOS) / `aplay samples/english_ryan.wav` (Linux)
 
 **Important**: this implementation explicitly **avoids implementing support for MPS**. Following the same philosophy as [qwen-asr](https://github.com/antirez/qwen-asr): TTS systems are important pieces of infrastructure often run on remote Linux servers. Adding the MPS target would focus efforts too much on Apple hardware, so for now it is skipped. The code runs well on Apple hardware anyway (NEON optimized). MPS support may be added later when other optimizations are mature.
 
