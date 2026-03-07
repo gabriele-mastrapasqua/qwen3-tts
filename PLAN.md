@@ -37,17 +37,17 @@ This is tokenized and prepended to the generation prompt before the assistant tu
 
 ### Tasks
 
-- [ ] `[HIGH]` Add `--instruct <text>` CLI flag
+- [x] `[HIGH]` Add `--instruct <text>` CLI flag
   - Only effective with 1.7B model; warn/ignore for 0.6B
   - Example: `--instruct "Speak in an angry tone"`
   - Example: `--instruct "Speak slowly and softly"`
   - Example: `--instruct "用特别愤怒的语气说"` (Chinese style instructions work too)
-- [ ] `[HIGH]` Implement instruct prompt injection in `qwen_tts.c`:
+- [x] `[HIGH]` Implement instruct prompt injection in `qwen_tts.c`:
   - Tokenize instruct text as `<|im_start|>user\n{instruct}<|im_end|>\n`
   - Insert these tokens into the prefill sequence before the assistant turn
   - The rest of the prompt (role + codec + text) remains unchanged
-- [ ] `[MED]` Add `make test-instruct` target to validate instruct works on 1.7B
-- [ ] `[MED]` Update README with instruct examples and speaker descriptions:
+- [x] `[MED]` Add `make test-instruct` target to validate instruct works on 1.7B
+- [x] `[MED]` Update README with instruct examples and speaker descriptions:
 
 **Known speaker characteristics** (from HuggingFace model card):
 

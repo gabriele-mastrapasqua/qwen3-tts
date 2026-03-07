@@ -128,18 +128,30 @@ lookahead. Not implemented in phase 1.
 - If you optimize one path, verify no regression on others.
 - Favor meaningful speedups; avoid complexity for tiny wins.
 
+## Git Workflow
+
+**New features MUST be developed on feature branches, NOT on main.**
+
+- Branch naming: `feature/<short-name>` (e.g., `feature/streaming`, `feature/voice-clone`, `feature/http-server`)
+- Open a PR to merge into main when ready
+- Run `make test-all` before merging (both 0.6B and 1.7B must pass)
+- Main branch must always build and pass tests
+
+Roadmap and next steps are tracked in `PLAN.md`.
+
 ## Change Checklist For Agents
 
 Before editing:
 1. Identify behavioral contract impacted (CLI, output, speed, quality, memory).
 2. Read corresponding source-of-truth file(s).
+3. Create a feature branch if adding new functionality (NOT on main).
 
 After editing:
 1. Build: `make blas`
-2. Run smoke test with a short text input.
+2. Run `make test-small` and `make test-large` (if model available).
 3. Verify WAV output plays correctly and sounds reasonable.
 4. Update `README.md` if CLI/runtime behavior changed.
-5. Keep `AGENT.md` aligned if workflow/test defaults changed.
+5. Keep `PLAN.md` aligned if roadmap items completed or changed.
 
 ## Local-Only Artifacts (Do Not Depend On In Commits)
 
