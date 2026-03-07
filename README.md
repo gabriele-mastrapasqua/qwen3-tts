@@ -8,25 +8,25 @@ All samples generated with the 0.6B model on Apple M1 at ~0.7x realtime. Click p
 
 **English** (ryan) — *"Hello, this is a test of the text to speech system. The quick brown fox jumps over the lazy dog."*
 
-https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.mp4
+https://github.com/user-attachments/assets/6a21460f-4976-4488-8a0a-bd2022efe826
 
 **Italian** (vivian) — *"Buongiorno a tutti, questa è una dimostrazione del sistema di sintesi vocale."*
 
-https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.mp4
+https://github.com/user-attachments/assets/4514cf2d-e93b-489c-95aa-ab51d5d53c15
 
 **Spanish** (ryan) — *"Hola, esta es una demostración del sistema de síntesis de voz."*
 
-https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.mp4
+https://github.com/user-attachments/assets/b67b89bb-ce64-4d1d-b96e-a477105e5903
 
 **Portuguese** (ryan) — *"Olá, esta é uma demonstração do sistema de síntese de voz."*
 
-https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.mp4
+https://github.com/user-attachments/assets/8aa68ef5-a9e0-404e-b2b1-88e977481841
 
 **French** (ryan) — *"Bonjour à tous, ceci est une démonstration du système de synthèse vocale."*
 
-https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.mp4
+https://github.com/user-attachments/assets/6ad100be-2ccd-4ddc-83a7-287e1b5096f4
 
-> WAV originals: [English](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.wav) · [Italian](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.wav) · [Spanish](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.wav) · [Portuguese](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.wav) · [French](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.wav)
+> WAV downloads: [English](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/english_ryan.wav) · [Italian](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/italian_vivian.wav) · [Spanish](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/spanish_ryan.wav) · [Portuguese](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/portuguese_ryan.wav) · [French](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/french_ryan.wav)
 >
 > Or clone and play locally: `afplay samples/english_ryan.wav` (macOS) / `aplay samples/english_ryan.wav` (Linux)
 
