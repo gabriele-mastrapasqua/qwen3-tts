@@ -59,17 +59,40 @@ void qwen_rms_norm(float *out, const float *x, const float *weight,
     for (int s = 0; s < seq; s++) {
         const float *xs = x + s * dim;
         float *os = out + s * dim;
-        
-        /* Compute RMS */
+
+#ifdef __ARM_NEON
+        /* NEON: compute sum of squares */
+        float32x4_t vsum0 = vdupq_n_f32(0), vsum1 = vdupq_n_f32(0);
+        int i = 0;
+        for (; i + 7 < dim; i += 8) {
+            float32x4_t v0 = vld1q_f32(xs + i);
+            float32x4_t v1 = vld1q_f32(xs + i + 4);
+            vsum0 = vfmaq_f32(vsum0, v0, v0);
+            vsum1 = vfmaq_f32(vsum1, v1, v1);
+        }
+        float sum = vaddvq_f32(vaddq_f32(vsum0, vsum1));
+        for (; i < dim; i++) sum += xs[i] * xs[i];
+
+        float inv_rms = 1.0f / sqrtf(sum / dim + eps);
+        float32x4_t vinv = vdupq_n_f32(inv_rms);
+
+        /* NEON: normalize and scale */
+        i = 0;
+        for (; i + 7 < dim; i += 8) {
+            float32x4_t v0 = vld1q_f32(xs + i);
+            float32x4_t v1 = vld1q_f32(xs + i + 4);
+            float32x4_t w0 = vld1q_f32(weight + i);
+            float32x4_t w1 = vld1q_f32(weight + i + 4);
+            vst1q_f32(os + i,     vmulq_f32(vmulq_f32(v0, vinv), w0));
+            vst1q_f32(os + i + 4, vmulq_f32(vmulq_f32(v1, vinv), w1));
+        }
+        for (; i < dim; i++) os[i] = xs[i] * inv_rms * weight[i];
+#else
         float sum = 0.0f;
-        for (int i = 0; i < dim; i++)
-            sum += xs[i] * xs[i];
-        float rms = sqrtf(sum / dim + eps);
-        float inv_rms = 1.0f / rms;
-        
-        /* Normalize and scale */
-        for (int i = 0; i < dim; i++)
-            os[i] = xs[i] * inv_rms * weight[i];
+        for (int i = 0; i < dim; i++) sum += xs[i] * xs[i];
+        float inv_rms = 1.0f / sqrtf(sum / dim + eps);
+        for (int i = 0; i < dim; i++) os[i] = xs[i] * inv_rms * weight[i];
+#endif
     }
 }
 
@@ -80,17 +103,38 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
         float *xs = x + s * dim;
         for (int h = 0; h < n_heads; h++) {
             float *hs = xs + h * head_dim;
-            
-            /* Compute RMS for this head */
+
+#ifdef __ARM_NEON
+            float32x4_t vsum0 = vdupq_n_f32(0), vsum1 = vdupq_n_f32(0);
+            int i = 0;
+            for (; i + 7 < head_dim; i += 8) {
+                float32x4_t v0 = vld1q_f32(hs + i);
+                float32x4_t v1 = vld1q_f32(hs + i + 4);
+                vsum0 = vfmaq_f32(vsum0, v0, v0);
+                vsum1 = vfmaq_f32(vsum1, v1, v1);
+            }
+            float sum = vaddvq_f32(vaddq_f32(vsum0, vsum1));
+            for (; i < head_dim; i++) sum += hs[i] * hs[i];
+
+            float inv_rms = 1.0f / sqrtf(sum / head_dim + eps);
+            float32x4_t vinv = vdupq_n_f32(inv_rms);
+
+            i = 0;
+            for (; i + 7 < head_dim; i += 8) {
+                float32x4_t v0 = vld1q_f32(hs + i);
+                float32x4_t v1 = vld1q_f32(hs + i + 4);
+                float32x4_t w0 = vld1q_f32(weight + i);
+                float32x4_t w1 = vld1q_f32(weight + i + 4);
+                vst1q_f32(hs + i,     vmulq_f32(vmulq_f32(v0, vinv), w0));
+                vst1q_f32(hs + i + 4, vmulq_f32(vmulq_f32(v1, vinv), w1));
+            }
+            for (; i < head_dim; i++) hs[i] *= inv_rms * weight[i];
+#else
             float sum = 0.0f;
-            for (int i = 0; i < head_dim; i++)
-                sum += hs[i] * hs[i];
-            float rms = sqrtf(sum / head_dim + eps);
-            float inv_rms = 1.0f / rms;
-            
-            /* Normalize and scale */
-            for (int i = 0; i < head_dim; i++)
-                hs[i] *= inv_rms * weight[i];
+            for (int i = 0; i < head_dim; i++) sum += hs[i] * hs[i];
+            float inv_rms = 1.0f / sqrtf(sum / head_dim + eps);
+            for (int i = 0; i < head_dim; i++) hs[i] *= inv_rms * weight[i];
+#endif
         }
     }
 }
@@ -321,30 +365,91 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                 const float *v_row = V + j * kv_hidden + kv_h * head_dim;
 
                 /* Dot product */
-                float score = 0.0f;
+                float score;
+#ifdef __ARM_NEON
+                {
+                    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+                    float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+                    int d = 0;
+                    for (; d + 15 < head_dim; d += 16) {
+                        a0 = vfmaq_f32(a0, vld1q_f32(q_row + d),     vld1q_f32(k_row + d));
+                        a1 = vfmaq_f32(a1, vld1q_f32(q_row + d + 4), vld1q_f32(k_row + d + 4));
+                        a2 = vfmaq_f32(a2, vld1q_f32(q_row + d + 8), vld1q_f32(k_row + d + 8));
+                        a3 = vfmaq_f32(a3, vld1q_f32(q_row + d + 12),vld1q_f32(k_row + d + 12));
+                    }
+                    score = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3)));
+                    for (; d < head_dim; d++) score += q_row[d] * k_row[d];
+                }
+#else
+                score = 0.0f;
                 for (int d = 0; d < head_dim; d++)
                     score += q_row[d] * k_row[d];
+#endif
                 score *= scale;
 
                 /* Softmax with numerical stability */
                 if (score > max_score) {
                     float correction = expf(max_score - score);
                     sum_exp = sum_exp * correction + 1.0f;
+#ifdef __ARM_NEON
+                    {
+                        float32x4_t vc = vdupq_n_f32(correction);
+                        int d = 0;
+                        for (; d + 15 < head_dim; d += 16) {
+                            vst1q_f32(o_row + d,      vaddq_f32(vmulq_f32(vld1q_f32(o_row + d),      vc), vld1q_f32(v_row + d)));
+                            vst1q_f32(o_row + d + 4,  vaddq_f32(vmulq_f32(vld1q_f32(o_row + d + 4),  vc), vld1q_f32(v_row + d + 4)));
+                            vst1q_f32(o_row + d + 8,  vaddq_f32(vmulq_f32(vld1q_f32(o_row + d + 8),  vc), vld1q_f32(v_row + d + 8)));
+                            vst1q_f32(o_row + d + 12, vaddq_f32(vmulq_f32(vld1q_f32(o_row + d + 12), vc), vld1q_f32(v_row + d + 12)));
+                        }
+                        for (; d < head_dim; d++)
+                            o_row[d] = o_row[d] * correction + v_row[d];
+                    }
+#else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] = o_row[d] * correction + v_row[d];
+#endif
                     max_score = score;
                 } else {
                     float wt = expf(score - max_score);
                     sum_exp += wt;
+#ifdef __ARM_NEON
+                    {
+                        float32x4_t vw = vdupq_n_f32(wt);
+                        int d = 0;
+                        for (; d + 15 < head_dim; d += 16) {
+                            vst1q_f32(o_row + d,      vfmaq_f32(vld1q_f32(o_row + d),      vld1q_f32(v_row + d),      vw));
+                            vst1q_f32(o_row + d + 4,  vfmaq_f32(vld1q_f32(o_row + d + 4),  vld1q_f32(v_row + d + 4),  vw));
+                            vst1q_f32(o_row + d + 8,  vfmaq_f32(vld1q_f32(o_row + d + 8),  vld1q_f32(v_row + d + 8),  vw));
+                            vst1q_f32(o_row + d + 12, vfmaq_f32(vld1q_f32(o_row + d + 12), vld1q_f32(v_row + d + 12), vw));
+                        }
+                        for (; d < head_dim; d++)
+                            o_row[d] += v_row[d] * wt;
+                    }
+#else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] += v_row[d] * wt;
+#endif
                 }
             }
 
             if (sum_exp > 0.0f) {
                 float inv_sum = 1.0f / sum_exp;
+#ifdef __ARM_NEON
+                {
+                    float32x4_t vi = vdupq_n_f32(inv_sum);
+                    int d = 0;
+                    for (; d + 15 < head_dim; d += 16) {
+                        vst1q_f32(o_row + d,      vmulq_f32(vld1q_f32(o_row + d),      vi));
+                        vst1q_f32(o_row + d + 4,  vmulq_f32(vld1q_f32(o_row + d + 4),  vi));
+                        vst1q_f32(o_row + d + 8,  vmulq_f32(vld1q_f32(o_row + d + 8),  vi));
+                        vst1q_f32(o_row + d + 12, vmulq_f32(vld1q_f32(o_row + d + 12), vi));
+                    }
+                    for (; d < head_dim; d++) o_row[d] *= inv_sum;
+                }
+#else
                 for (int d = 0; d < head_dim; d++)
                     o_row[d] *= inv_sum;
+#endif
             }
         }
     }
