@@ -30,7 +30,8 @@ SRCS = main.c \
        qwen_tts_sampling.c \
        qwen_tts_tokenizer.c \
        qwen_tts_safetensors.c \
-       qwen_tts_server.c
+       qwen_tts_server.c \
+       qwen_tts_voice_clone.c
 
 OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts_bin
@@ -81,6 +82,7 @@ qwen_tts_sampling.o: qwen_tts_sampling.c qwen_tts.h
 qwen_tts_tokenizer.o: qwen_tts_tokenizer.c qwen_tts_tokenizer.h
 qwen_tts_safetensors.o: qwen_tts_safetensors.c qwen_tts_safetensors.h
 qwen_tts_server.o: qwen_tts_server.c qwen_tts_server.h qwen_tts.h
+qwen_tts_voice_clone.o: qwen_tts_voice_clone.c qwen_tts_voice_clone.h qwen_tts.h qwen_tts_safetensors.h
 
 # Clean
 clean:

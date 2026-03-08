@@ -184,41 +184,38 @@ Two modes:
 
 ### 4.1 Download Base Models
 
-- [ ] `[HIGH]` Extend `download_model.sh` for Base model variants:
-  - `Qwen/Qwen3-TTS-12Hz-0.6B` (Base 0.6B)
-  - `Qwen/Qwen3-TTS-12Hz-1.7B` (Base 1.7B)
-  - Additional weight files: speaker encoder weights
+- [x] `[HIGH]` Extend `download_model.sh` for Base model variants:
+  - `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (Base 0.6B)
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-Base` (Base 1.7B)
+  - Speaker encoder weights are in the main model.safetensors (76 tensors)
 
-### 4.2 Speech Tokenizer Encoder
+### 4.2 Speech Tokenizer Encoder (for ICL mode)
 
-- [ ] `[HIGH]` Implement speech tokenizer encoder (inverse of decoder):
-  - Input: raw 24 kHz float audio
-  - Downsampling ConvNet (mirror of upsampling decoder)
-  - Transformer encoder layers
-  - RVQ quantization: for each of 16 codebooks, find nearest codebook entry
-  - Output: [N_frames, 16] codec tokens
-- [ ] `[HIGH]` RVQ quantization:
-  - For each codebook level: L2 nearest-neighbor search in codebook
-  - Subtract quantized entry from signal → residual for next level
+- [ ] `[MED]` Implement speech tokenizer encoder (Mimi-based):
+  - Conv encoder + 8-layer transformer + downsample + Split RVQ
+  - Required for ICL mode (ref_text + ref_code)
+  - NOT required for x_vector_only mode (which works now)
 
 ### 4.3 Speaker Encoder
 
-- [ ] `[HIGH]` Implement speaker encoder:
-  - Mel spectrogram extraction (n_fft=1024, n_mels=128, hop=256, sr=24kHz)
-  - Process through speaker encoder network (architecture TBD from Base model weights)
-  - Output: speaker embedding tensor
-- [ ] `[MED]` Reference audio loading: WAV file → float32 samples → resample to 24kHz
+- [x] `[HIGH]` Implement ECAPA-TDNN speaker encoder:
+  - WAV reader (16/32-bit PCM, mono/stereo)
+  - Mel spectrogram extraction (n_fft=1024, n_mels=128, hop=256, sr=24kHz, slaney norm)
+  - Full ECAPA-TDNN: initial TDNN → 3× SE-Res2Net blocks → MFA → ASP → FC
+  - Output: 1024-dim speaker embedding
+  - Verified bit-exact match with Python reference
+- [x] `[MED]` Reference audio loading: WAV file → float32 samples (24kHz required)
 
 ### 4.4 Voice Clone Pipeline
 
-- [ ] `[HIGH]` Implement voice clone prompt format:
-  - Encode reference audio → ref_code via speech tokenizer encoder
-  - Extract speaker embedding via speaker encoder
-  - Build prompt: speaker_emb + ref_text_tokens + ref_code + target_text + codec_bos
-- [ ] `[MED]` CLI flags:
+- [x] `[HIGH]` Implement x_vector_only voice clone prompt format:
+  - Extract speaker embedding via ECAPA-TDNN speaker encoder
+  - Inject speaker embedding into codec prefix (replaces discrete speaker token)
+  - Base model auto-detected from config (`tts_model_type: "base"`)
+- [x] `[MED]` CLI flags:
   - `--ref-audio <path.wav>` — reference audio file
-  - `--ref-text <string>` — transcript of reference audio
-  - `--xvector-only` — use speaker embedding only (no ref_text needed)
+  - `--xvector-only` — use speaker embedding only (default when no --ref-text)
+- [ ] `[MED]` ICL mode (ref_text + ref_code): requires speech tokenizer encoder (4.2)
 - [ ] `[MED]` `make test-clone` target
 
 ### 4.5 Reusable Voice Prompts
