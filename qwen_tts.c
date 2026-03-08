@@ -631,7 +631,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     if (!ctx->silent) {
         if (ctx->voice_clone)
             fprintf(stderr, "Voice clone: %s (x-vector%s)\n",
-                    ctx->ref_audio_path ? ctx->ref_audio_path : "?",
+                    ctx->ref_audio_path ? ctx->ref_audio_path : "(loaded from file)",
                     ctx->xvector_only ? " only" : " + ICL");
         else
             fprintf(stderr, "Speaker: %d, Language: %d\n", ctx->speaker_id, ctx->language_id);
@@ -692,6 +692,19 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
         /* Suppress EOS for first 2 frames */
         if (frame < 2) ctx->logits[QWEN_TTS_CODEC_EOS] = -1e30f;
+
+        /* EOS boosting: after 2x expected duration, gently boost EOS logit.
+         * Heuristic: ~3 frames per BPE token. Start boosting at 2x expected,
+         * linearly increasing by 0.5 per frame beyond that threshold. */
+        {
+            int expected_frames = text_content_len * 3;
+            int boost_start = expected_frames * 2;
+            if (expected_frames > 0 && frame > boost_start) {
+                float boost = 0.5f * (frame - boost_start);
+                if (boost > 10.0f) boost = 10.0f;  /* cap at +10 */
+                ctx->logits[QWEN_TTS_CODEC_EOS] += boost;
+            }
+        }
 
         /* Debug logging */
         if (ctx->debug && frame < 30) {
