@@ -263,12 +263,36 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     }
     
     qwen_tts_config_t *c = &ctx->config;
+
+    /* Auto-detect VoiceDesign model: check if spk_id is empty in config */
+    if (!ctx->voice_design) {
+        char cfg_path[1024];
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", ctx->model_dir);
+        long cfg_len;
+        char *cfg_raw = read_file(cfg_path, &cfg_len);
+        if (cfg_raw) {
+            /* VoiceDesign has "spk_id": {} (empty object) */
+            const char *spk = strstr(cfg_raw, "\"spk_id\"");
+            if (spk) {
+                const char *p = spk + 8;
+                while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n') p++;
+                if (*p == '{') {
+                    p++;
+                    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+                    if (*p == '}') ctx->voice_design = 1;
+                }
+            }
+            free(cfg_raw);
+        }
+    }
+
     if (!ctx->silent) {
         fprintf(stderr, "Config: hidden=%d text_hidden=%d layers=%d heads=%d/%d head_dim=%d inter=%d\n",
                 c->hidden_size, c->text_hidden_size, c->num_layers, c->num_heads, c->num_kv_heads, c->head_dim, c->intermediate_size);
         fprintf(stderr, "  Code Predictor: hidden=%d layers=%d heads=%d head_dim=%d\n",
                 c->cp_hidden_size, c->cp_num_layers, c->cp_num_heads, c->cp_head_dim);
         fprintf(stderr, "  Codec: vocab=%d codebooks=%d entries=%d\n", c->codec_vocab_size, c->dec_num_quantizers, c->codebook_size);
+        if (ctx->voice_design) fprintf(stderr, "  Mode: VoiceDesign (no preset speakers)\n");
     }
 
     /* Load safetensors using qwen-asr loader (mmap-based, working) */
@@ -440,8 +464,10 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     }
 
     /* Build codec-side prefix:
-     * With language: [THINK, THINK_BOS, language_id, THINK_EOS, speaker, PAD, BOS]
-     * Without language: [NO_THINK, THINK_BOS, THINK_EOS, speaker, PAD, BOS]
+     * CustomVoice with language: [THINK, THINK_BOS, language_id, THINK_EOS, speaker, PAD, BOS]
+     * CustomVoice without language: [NO_THINK, THINK_BOS, THINK_EOS, speaker, PAD, BOS]
+     * VoiceDesign with language: [THINK, THINK_BOS, language_id, THINK_EOS, PAD, BOS]
+     * VoiceDesign without language: [NO_THINK, THINK_BOS, THINK_EOS, PAD, BOS]
      */
     int codec_tokens[16];
     int codec_len = 0;
@@ -455,7 +481,10 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         codec_tokens[codec_len++] = QWEN_TTS_CODEC_THINK_BOS;
         codec_tokens[codec_len++] = QWEN_TTS_CODEC_THINK_EOS;
     }
-    codec_tokens[codec_len++] = ctx->speaker_id;
+    /* VoiceDesign: no speaker token (voice created from instruct description) */
+    if (!ctx->voice_design) {
+        codec_tokens[codec_len++] = ctx->speaker_id;
+    }
     codec_tokens[codec_len++] = QWEN_TTS_CODEC_PAD;
     codec_tokens[codec_len++] = QWEN_TTS_CODEC_BOS;
 

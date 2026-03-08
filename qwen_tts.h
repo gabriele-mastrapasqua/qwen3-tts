@@ -310,8 +310,11 @@ typedef struct {
     int speaker_id;
     int language_id;
 
-    /* Instruct text (style/emotion control, 1.7B only) */
+    /* Instruct text (style/emotion control, 1.7B only; required for VoiceDesign) */
     char *instruct;
+
+    /* VoiceDesign mode (no preset speakers, voice created from instruct) */
+    int voice_design;
 
     /* Streaming */
     int stream;                  /* Enable streaming (decode chunks during generation) */

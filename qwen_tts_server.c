@@ -265,6 +265,13 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
     free(ctx->instruct);
     ctx->instruct = json_extract_string(body, "instruct");
 
+    /* Voice design mode */
+    char *vd = json_extract_string(body, "voice_design");
+    if (vd) {
+        if (strcmp(vd, "true") == 0 || strcmp(vd, "1") == 0) ctx->voice_design = 1;
+        free(vd);
+    }
+
     /* Sampling params */
     ctx->temperature = (float)json_extract_number(body, "temperature", ctx->temperature);
     ctx->top_k = (int)json_extract_number(body, "top_k", ctx->top_k);
