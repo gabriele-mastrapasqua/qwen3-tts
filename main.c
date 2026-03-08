@@ -88,6 +88,9 @@ int main(int argc, char **argv) {
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
+    const char *ref_audio = NULL;
+    const char *ref_text_str = NULL;
+    int xvector_only = 0;
 
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
@@ -109,6 +112,9 @@ int main(int argc, char **argv) {
         {"seed",          required_argument, 0, 1005},
         {"max-duration",  required_argument, 0, 1006},
         {"voice-design",  no_argument,       0, 1007},
+        {"ref-audio",     required_argument, 0, 1008},
+        {"ref-text",      required_argument, 0, 1009},
+        {"xvector-only",  no_argument,       0, 1010},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"help",          no_argument,       0, 'h'},
@@ -137,6 +143,9 @@ int main(int argc, char **argv) {
             case 1005: seed = atoi(optarg); break;
             case 1006: max_duration = (float)atof(optarg); break;
             case 1007: voice_design = 1; break;
+            case 1008: ref_audio = optarg; break;
+            case 1009: ref_text_str = optarg; break;
+            case 1010: xvector_only = 1; break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -163,6 +172,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
                 fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
+                fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model)\n");
+                fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -217,6 +228,40 @@ int main(int argc, char **argv) {
         }
         ctx->voice_design = 1;
     }
+    /* Voice cloning setup */
+    if (ref_audio) {
+        if (!ctx->is_base_model) {
+            fprintf(stderr, "Error: --ref-audio requires a Base model (not CustomVoice)\n");
+            fprintf(stderr, "Download it with: ./download_model.sh --model base-small\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        ctx->voice_clone = 1;
+        ctx->xvector_only = xvector_only ? 1 : (ref_text_str ? 0 : 1);
+        ctx->ref_audio_path = strdup(ref_audio);
+        if (ref_text_str) ctx->ref_text = strdup(ref_text_str);
+
+        /* Extract speaker embedding from reference audio */
+        ctx->speaker_embedding = (float *)malloc(ctx->speaker_enc.enc_dim * sizeof(float));
+        if (!ctx->speaker_embedding) {
+            fprintf(stderr, "Error: failed to allocate speaker embedding\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        if (qwen_extract_speaker_embedding(ctx, ref_audio, ctx->speaker_embedding) != 0) {
+            fprintf(stderr, "Error: failed to extract speaker embedding from %s\n", ref_audio);
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        if (!silent) {
+            fprintf(stderr, "Voice clone: extracted speaker embedding from %s\n", ref_audio);
+            if (ctx->xvector_only)
+                fprintf(stderr, "Mode: x-vector only (no reference transcription)\n");
+            else
+                fprintf(stderr, "Mode: ICL with ref text: \"%s\"\n", ref_text_str);
+        }
+    }
+
     if (instruct) {
         if (ctx->config.hidden_size < 2048) {
             fprintf(stderr, "Warning: --instruct is only supported on 1.7B model (ignored)\n");
