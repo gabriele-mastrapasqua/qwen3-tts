@@ -33,3 +33,16 @@ void qwen_metal_matvec_bf16_qkv(qwen_metal_ctx_t *ctx,
     (void)ctx; (void)wq_handle; (void)wk_handle; (void)wv_handle;
     (void)q; (void)k; (void)v; (void)x; (void)in_dim; (void)q_dim; (void)kv_dim;
 }
+
+void qwen_metal_begin(qwen_metal_ctx_t *ctx) { (void)ctx; }
+void qwen_metal_encode_matvec(qwen_metal_ctx_t *ctx, int weight_handle,
+                               int y_offset, int x_offset,
+                               int rows, int cols) {
+    (void)ctx; (void)weight_handle; (void)y_offset; (void)x_offset; (void)rows; (void)cols;
+}
+void qwen_metal_sync(qwen_metal_ctx_t *ctx) { (void)ctx; }
+float *qwen_metal_get_x(qwen_metal_ctx_t *ctx) { (void)ctx; return NULL; }
+float *qwen_metal_get_y(qwen_metal_ctx_t *ctx) { (void)ctx; return NULL; }
+void qwen_metal_ensure_workspace(qwen_metal_ctx_t *ctx, int x_bytes, int y_bytes) {
+    (void)ctx; (void)x_bytes; (void)y_bytes;
+}

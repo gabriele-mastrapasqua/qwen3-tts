@@ -111,11 +111,11 @@ make metal
 ./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --gpu -o hello.wav
 ```
 
-> **Experimental:** The Metal backend is functional and produces correct audio, but
-> per-dispatch overhead currently makes it slower than the optimized NEON CPU path
-> for the 0.6B model. It may show benefits on the 1.7B model (4x larger matrices).
-> Without `--gpu`, the CPU path is always used regardless of build type.
-> Future work: batch GPU dispatches to reduce overhead.
+> **Experimental:** The Metal backend produces correct audio, but per-dispatch
+> command buffer overhead currently makes it **slower** than the optimized NEON CPU
+> path (~3x slower on 0.6B, ~2x slower on 1.7B). The matrix sizes are too small
+> to amortize Metal's dispatch cost. Without `--gpu`, the CPU path is always used.
+> Future work: batch GPU dispatches or move the full transformer step to GPU.
 
 ### Other build targets
 
