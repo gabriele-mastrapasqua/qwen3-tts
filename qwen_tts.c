@@ -220,6 +220,9 @@ extern int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq
 extern int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out);
 extern int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes);
 extern int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_frames, float **audio_out, int *n_samples);
+extern int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx, const int *new_codes, int new_frames, float **audio_out, int *n_samples);
+extern void qwen_sd_stream_init(qwen_sd_stream_state_t *st);
+extern void qwen_sd_stream_free(qwen_sd_stream_state_t *st);
 extern int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float top_p, float rep_penalty, int *prev_tokens, int n_prev);
 extern void qwen_set_seed(uint32_t seed);
 
@@ -672,9 +675,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     double t_cp_total = 0;
     float *step_embed = (float *)malloc(h * sizeof(float));
-    int stream_samples_emitted = 0;  /* audio samples already sent to callback */
     int stream_chunk = ctx->stream_chunk_frames > 0 ? ctx->stream_chunk_frames : 10;
     int stream_aborted = 0;
+    int stream_frames_decoded = 0;   /* frames sent to incremental decoder */
+
+    /* Initialize streaming decoder state */
+    if (ctx->stream && ctx->audio_cb) {
+        qwen_sd_stream_init(&ctx->sd_stream);
+    }
 
     for (int frame = 0; frame < max_frames; frame++) {
         /* Codec head: logits = codec_head @ last_hidden */
@@ -751,23 +759,25 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         if (!ctx->silent && frame % 50 == 0 && frame > 0)
             fprintf(stderr, "\r  Frame %d/%d (%.1fs audio)...", frame, max_frames, frame / 12.5);
 
-        /* Streaming: decode accumulated frames and emit delta audio */
+        /* Streaming: incremental decode — only process NEW frames */
         if (ctx->stream && ctx->audio_cb && ctx->codec_frames % stream_chunk == 0) {
-            float *chunk_audio = NULL; int chunk_samples = 0;
-            if (qwen_speech_decoder_decode(ctx, ctx->codec_codes, ctx->codec_frames,
-                                            &chunk_audio, &chunk_samples) == 0) {
-                /* Emit only the NEW samples (delta from previous decode) */
-                if (chunk_samples > stream_samples_emitted) {
-                    int delta = chunk_samples - stream_samples_emitted;
-                    int ret = ctx->audio_cb(chunk_audio + stream_samples_emitted, delta,
-                                            ctx->audio_cb_userdata);
-                    stream_samples_emitted = chunk_samples;
-                    if (ret != 0) {
-                        if (!ctx->silent) fprintf(stderr, "\n  Streaming aborted by callback\n");
-                        stream_aborted = 1;
+            int new_chunk_frames = ctx->codec_frames - stream_frames_decoded;
+            if (new_chunk_frames > 0) {
+                const int *new_codes = ctx->codec_codes + stream_frames_decoded * 16;
+                float *chunk_audio = NULL; int chunk_samples = 0;
+                if (qwen_speech_decoder_decode_streaming(ctx, new_codes, new_chunk_frames,
+                                                          &chunk_audio, &chunk_samples) == 0) {
+                    if (chunk_samples > 0 && chunk_audio) {
+                        int ret = ctx->audio_cb(chunk_audio, chunk_samples,
+                                                ctx->audio_cb_userdata);
+                        if (ret != 0) {
+                            if (!ctx->silent) fprintf(stderr, "\n  Streaming aborted by callback\n");
+                            stream_aborted = 1;
+                        }
                     }
+                    free(chunk_audio);
                 }
-                free(chunk_audio);
+                stream_frames_decoded = ctx->codec_frames;
             }
             if (stream_aborted) break;
         }
@@ -812,17 +822,31 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         return 0;
     }
 
-    /* Final decode: emit remaining samples via streaming callback, then produce full output */
+    /* Streaming: emit remaining frames via incremental decoder */
+    if (ctx->stream && ctx->audio_cb && !stream_aborted) {
+        int remaining = ctx->codec_frames - stream_frames_decoded;
+        if (remaining > 0) {
+            const int *new_codes = ctx->codec_codes + stream_frames_decoded * 16;
+            float *chunk_audio = NULL; int chunk_samples = 0;
+            if (qwen_speech_decoder_decode_streaming(ctx, new_codes, remaining,
+                                                      &chunk_audio, &chunk_samples) == 0) {
+                if (chunk_samples > 0 && chunk_audio)
+                    ctx->audio_cb(chunk_audio, chunk_samples, ctx->audio_cb_userdata);
+                free(chunk_audio);
+            }
+        }
+    }
+
+    /* Free streaming state */
+    if (ctx->stream && ctx->audio_cb) {
+        qwen_sd_stream_free(&ctx->sd_stream);
+    }
+
+    /* Full decode for file output */
     double t_dec_start = time_ms();
     float *audio; int n_samples;
     if (qwen_speech_decoder_decode(ctx, ctx->codec_codes, ctx->codec_frames, &audio, &n_samples) != 0)
         return -1;
-
-    /* Streaming: emit any remaining samples not yet sent */
-    if (ctx->stream && ctx->audio_cb && !stream_aborted && n_samples > stream_samples_emitted) {
-        int delta = n_samples - stream_samples_emitted;
-        ctx->audio_cb(audio + stream_samples_emitted, delta, ctx->audio_cb_userdata);
-    }
 
     if (!ctx->silent)
         fprintf(stderr, "  Speech decoder: %.0f ms\n", time_ms() - t_dec_start);

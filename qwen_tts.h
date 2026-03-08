@@ -275,6 +275,32 @@ typedef struct {
     } final_snake;
 } qwen_speech_decoder_t;
 
+/* Speech decoder streaming state (incremental decode) */
+#define QWEN_SD_STREAM_MAX_LAYERS 8
+#define QWEN_SD_STREAM_CONV_RF 20  /* Conv decoder receptive field in latent frames */
+
+typedef struct {
+    /* Pre-transformer KV cache: [n_layers][alloc × qkv_dim], row-major */
+    float *k_cache[QWEN_SD_STREAM_MAX_LAYERS];
+    float *v_cache[QWEN_SD_STREAM_MAX_LAYERS];
+    int kv_len;         /* frames in KV cache */
+    int kv_alloc;       /* allocated capacity */
+
+    /* Pre-transformer output cache (latent_out): row-major [alloc × latent_dim] */
+    float *latent_cache;   /* [latent_alloc, 1024] */
+    int latent_frames;
+    int latent_alloc;
+
+    /* Pre-conv left padding: last 2 timesteps of VQ output, channel-first [512, 2] */
+    float *vq_pad;
+    int vq_pad_valid;
+
+    /* Tracking */
+    int frames_decoded;    /* total codec frames processed */
+    int samples_produced;  /* total audio samples produced */
+    int initialized;       /* 1 after first call */
+} qwen_sd_stream_state_t;
+
 /* ========================================================================
  * Audio Callback (for streaming)
  * ======================================================================== */
@@ -363,6 +389,7 @@ typedef struct qwen_tts_ctx {
     
     /* Speech decoder */
     qwen_speech_decoder_t speech_dec;
+    qwen_sd_stream_state_t sd_stream;  /* Streaming incremental decode state */
 
     /* Speaker encoder (ECAPA-TDNN, Base model only) */
     qwen_speaker_encoder_t speaker_enc;
