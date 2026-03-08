@@ -88,10 +88,11 @@ chunked processing (`qwen_transcribe_stream`). We can use a similar pattern.
   - Decode each chunk through speech decoder immediately
   - Write WAV header with unknown length, update at end
   - First audio heard within ~1-2 seconds of starting
-- [ ] `[MED]` Speech decoder incremental decode (optimization):
-  - Current implementation re-runs full decoder on all frames each chunk (O(n²))
-  - Since all operations are causal, only NEW audio samples differ
-  - Future: carry pre-transformer KV cache + conv padding state for O(n) incremental decode
+- [x] `[MED]` Speech decoder incremental decode (optimization):
+  - Pre-transformer KV cache (8 layers, sliding window 72) + cached latent output
+  - Windowed conv decoder (RF=20 frames context) for O(chunk_size) per call
+  - Bit-accurate: correlation 1.000000, max diff 1 LSB vs full decode
+  - PR #8 merged
 - [x] `[MED]` Configurable chunk size: `--stream-chunk <frames>` (default: 10)
 
 ### 2.2 Raw PCM to stdout
@@ -277,8 +278,15 @@ timbre from the description instead of using a preset speaker.
 
 ### 7.2 Further CPU Optimizations
 
-- [ ] `[MED]` Profile 1.7B model bottlenecks (Talker prefill is slow: ~4s for 24 tokens)
-- [ ] `[MED]` NEON/AVX snake activation kernels
+- [x] `[MED]` Profile 1.7B model bottlenecks:
+  - Talker step 92.2ms/f (3.9× slower than 0.6B, hidden 2048 vs 1024)
+  - CP 74.9ms/f (same architecture, cp_hidden=1024)
+  - Total 167ms/f = 0.48× realtime. CP still bottleneck for both models
+  - PR #10 merged
+- [x] `[MED]` NEON/AVX snake activation kernels:
+  - macOS: vDSP_vsmul → vvsinf → vDSP_vsq → vDSP_vsma (Accelerate)
+  - ARM: 4-wide NEON SIMD with scalar sinf per lane
+  - PR #9 merged
 - [ ] `[LOW]` Persistent BF16 KV cache (avoid bf16→f32 conversion)
 
 ---
