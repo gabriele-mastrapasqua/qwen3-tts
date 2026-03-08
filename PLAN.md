@@ -309,15 +309,15 @@ don't add Windows-specific #ifdefs throughout the codebase if avoidable.
 
 WSL2 is the simplest path — our codebase is already Linux-compatible.
 
-- [ ] `[MED]` Add Windows/WSL2 build instructions to README:
+- [x] `[MED]` Add Windows/WSL2 build instructions to README:
   ```
   # In WSL2 (Ubuntu):
   sudo apt install build-essential libopenblas-dev
   make blas
   ./qwen_tts_bin -d qwen3-tts-0.6b --text "Hello" -o output.wav
   ```
-- [ ] `[MED]` Test full flow on WSL2: download → build → generate → play
-- [ ] `[LOW]` Add WSL2 audio playback instructions (aplay, or copy WAV to Windows)
+- [x] `[MED]` Test full flow on WSL2: download → build → generate → play
+- [x] `[LOW]` Add WSL2 audio playback instructions (aplay, or copy WAV to Windows)
 
 ### Option B: Native MSVC/MinGW (Lower priority)
 
