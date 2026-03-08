@@ -651,7 +651,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         return -1;
     }
     free(input_embeds);
-    if (!ctx->silent) fprintf(stderr, "  Prefill: %.0f ms\n", time_ms() - t_prefill);
+    double prefill_ms = time_ms() - t_prefill;
+    if (!ctx->silent) fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
 
     /* Debug: check speech decoder weights after prefill */
     if (ctx->debug && ctx->speech_dec.pre_conv_weight) {
@@ -670,7 +671,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     ctx->n_prev_tokens = 0;
     ctx->logits = (float *)realloc(ctx->logits, ctx->config.codec_vocab_size * sizeof(float));
 
-    double t_cp_total = 0;
+    double t_cp_total = 0, t_talker_step_total = 0, t_embed_total = 0;
     float *step_embed = (float *)malloc(h * sizeof(float));
     int stream_samples_emitted = 0;  /* audio samples already sent to callback */
     int stream_chunk = ctx->stream_chunk_frames > 0 ? ctx->stream_chunk_frames : 10;
@@ -776,6 +777,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
          * codec_side: codec_embed(code0) + sum of CP codec_embeds(codes 1-15)
          * text_side: always tts_pad (all text was in prefill)
          */
+        double t_embed_start = time_ms();
         lookup_codec_embed(ctx, code0, step_embed);
         for (int g = 0; g < 15; g++) {
             int code_g = codes[g + 1];
@@ -787,12 +789,15 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
         /* Text side: always tts_pad in non-streaming mode */
         for (int j = 0; j < h; j++) step_embed[j] += tts_pad_embed[j];
+        t_embed_total += time_ms() - t_embed_start;
 
         /* Talker step */
+        double t_step_start = time_ms();
         if (qwen_talker_step(ctx, step_embed, last_hidden) != 0) {
             free(step_embed); free(last_hidden); free(tts_pad_embed);
             return -1;
         }
+        t_talker_step_total += time_ms() - t_step_start;
     }
 
     free(step_embed);
@@ -800,10 +805,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(tts_pad_embed);
 
     double t_talker_end = time_ms();
+    double t_total_gen = t_talker_end - t_prefill - prefill_ms;
+    double t_codec_head = t_total_gen - t_talker_step_total - t_cp_total - t_embed_total;
     if (!ctx->silent) {
         fprintf(stderr, "\n  Generated %d frames (%.1fs audio)\n", ctx->codec_frames, ctx->codec_frames / 12.5);
-        fprintf(stderr, "  Talker: %.0f ms, Code Predictor: %.0f ms\n",
-                t_talker_end - t_prefill - t_cp_total, t_cp_total);
+        fprintf(stderr, "  Talker step: %.0f ms (%.1f ms/f), Code Predictor: %.0f ms (%.1f ms/f)\n",
+                t_talker_step_total, ctx->codec_frames > 0 ? t_talker_step_total / ctx->codec_frames : 0,
+                t_cp_total, ctx->codec_frames > 0 ? t_cp_total / ctx->codec_frames : 0);
+        fprintf(stderr, "  Embed: %.0f ms, Codec head+sampling: %.0f ms\n", t_embed_total, t_codec_head);
     }
 
     /* Speech decoder */
