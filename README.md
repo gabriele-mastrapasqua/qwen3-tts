@@ -38,7 +38,7 @@ make blas
 ## Features
 
 - **Pure C, minimal dependencies** — Only requires a C compiler and BLAS (Accelerate on macOS, OpenBLAS on Linux). No Python runtime needed.
-- **Cross-platform** — Runs on macOS (ARM/x86) and Linux (ARM/x86). NEON and AVX SIMD paths included. See [Windows (WSL2)](#windows-wsl2) for Windows support.
+- **Cross-platform** — Runs on macOS (ARM/x86) and Linux (ARM/x86). NEON and AVX SIMD paths included. See [Windows (WSL2)](#windows-wsl2--beta) for Windows support (beta).
 - **Both model sizes** — Automatically detects 0.6B or 1.7B from weight files.
 - **9 preset voices** — Selectable by name: `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
 - **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
@@ -64,10 +64,14 @@ sudo dnf install openblas-devel     # Fedora/RHEL
 make blas
 ```
 
-### Windows (WSL2)
+### Windows (WSL2) — Beta
 
 WSL2 runs a real Linux kernel, so the build is identical to native Linux.
 Install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu if you haven't already.
+
+> **Beta:** These instructions have not been tested on a Windows machine yet.
+> The codebase builds and runs on native Linux, so WSL2 should work out of the box.
+> Please open an issue if you run into problems.
 
 ```bash
 # In a WSL2 terminal (Ubuntu)
