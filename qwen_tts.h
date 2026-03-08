@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <pthread.h>
 
+#include "qwen_tts_voice_clone.h"
+
 /* ========================================================================
  * Constants
  * ======================================================================== */
@@ -286,7 +288,7 @@ typedef int (*qwen_tts_audio_cb)(const float *samples, int n_samples, void *user
  * Main Context Structure
  * ======================================================================== */
 
-typedef struct {
+typedef struct qwen_tts_ctx {
     /* Model directory */
     char model_dir[512];
     
@@ -315,6 +317,16 @@ typedef struct {
 
     /* VoiceDesign mode (no preset speakers, voice created from instruct) */
     int voice_design;
+
+    /* Voice clone mode (Base model only) */
+    int voice_clone;             /* 1 = voice clone active */
+    int xvector_only;            /* 1 = x-vector only (no ICL), 0 = ICL mode */
+    float *speaker_embedding;    /* [hidden_size] speaker embedding from ref audio */
+    char *ref_audio_path;        /* Path to reference audio file */
+    char *ref_text;              /* Reference text for ICL mode */
+
+    /* Base model type */
+    int is_base_model;           /* 1 = Base model, 0 = CustomVoice/VoiceDesign */
 
     /* Streaming */
     int stream;                  /* Enable streaming (decode chunks during generation) */
@@ -351,6 +363,9 @@ typedef struct {
     
     /* Speech decoder */
     qwen_speech_decoder_t speech_dec;
+
+    /* Speaker encoder (ECAPA-TDNN, Base model only) */
+    qwen_speaker_encoder_t speaker_enc;
     
     /* KV cache (Talker) */
     float *kv_cache_k;

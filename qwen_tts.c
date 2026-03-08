@@ -4,6 +4,7 @@
  */
 
 #include "qwen_tts.h"
+#include "qwen_tts_voice_clone.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_safetensors.h"
 #include "qwen_tts_tokenizer.h"
@@ -264,22 +265,34 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     
     qwen_tts_config_t *c = &ctx->config;
 
-    /* Auto-detect VoiceDesign model: check if spk_id is empty in config */
-    if (!ctx->voice_design) {
+    /* Auto-detect model type from config.json */
+    {
         char cfg_path[1024];
         snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", ctx->model_dir);
         long cfg_len;
         char *cfg_raw = read_file(cfg_path, &cfg_len);
         if (cfg_raw) {
-            /* VoiceDesign has "spk_id": {} (empty object) */
-            const char *spk = strstr(cfg_raw, "\"spk_id\"");
-            if (spk) {
-                const char *p = spk + 8;
-                while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n') p++;
-                if (*p == '{') {
-                    p++;
-                    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
-                    if (*p == '}') ctx->voice_design = 1;
+            /* Detect Base model: "tts_model_type": "base" */
+            const char *mt = strstr(cfg_raw, "\"tts_model_type\"");
+            if (mt) {
+                const char *val = strchr(mt + 16, '"');
+                if (val) {
+                    val++;  /* skip opening quote */
+                    if (strncmp(val, "base", 4) == 0) ctx->is_base_model = 1;
+                }
+            }
+
+            /* VoiceDesign: "spk_id": {} (empty object) */
+            if (!ctx->voice_design && !ctx->is_base_model) {
+                const char *spk = strstr(cfg_raw, "\"spk_id\"");
+                if (spk) {
+                    const char *p = spk + 8;
+                    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n') p++;
+                    if (*p == '{') {
+                        p++;
+                        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+                        if (*p == '}') ctx->voice_design = 1;
+                    }
                 }
             }
             free(cfg_raw);
@@ -323,6 +336,16 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         multi_safetensors_close(ctx->speech_safetensors);
         free(ctx); return NULL;
     }
+
+    /* Load speaker encoder for Base models */
+    if (ctx->is_base_model) {
+        if (qwen_speaker_encoder_load(&ctx->speaker_enc, ctx->safetensors) != 0) {
+            fprintf(stderr, "Warning: failed to load speaker encoder (voice cloning unavailable)\n");
+        } else if (!ctx->silent) {
+            fprintf(stderr, "  Speaker encoder: ECAPA-TDNN (enc_dim=%d)\n", ctx->speaker_enc.enc_dim);
+        }
+    }
+
     if (!ctx->silent) fprintf(stderr, "Model loaded in %.0f ms\n", time_ms() - t0);
     return ctx;
 }
@@ -340,6 +363,9 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     multi_safetensors_close(ctx->safetensors);
     multi_safetensors_close(ctx->speech_safetensors);
     free(ctx->instruct);
+    free(ctx->speaker_embedding);
+    free(ctx->ref_audio_path);
+    free(ctx->ref_text);
     /* Free runtime buffers */
     free(ctx->kv_cache_k); free(ctx->kv_cache_v); free(ctx->cp_kv_k); free(ctx->cp_kv_v);
     free(ctx->dec_x); free(ctx->dec_x_norm); free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
@@ -485,8 +511,17 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         codec_tokens[codec_len++] = QWEN_TTS_CODEC_THINK_BOS;
         codec_tokens[codec_len++] = QWEN_TTS_CODEC_THINK_EOS;
     }
-    /* VoiceDesign: no speaker token (voice created from instruct description) */
-    if (!ctx->voice_design) {
+    /* Speaker position in codec prefix:
+     * - CustomVoice: discrete speaker token from spk_id
+     * - VoiceDesign: no speaker (voice from instruct)
+     * - Voice Clone: continuous speaker embedding replaces token
+     *   We use -1 as sentinel; the embedding loop handles it specially. */
+    int speaker_embed_pos = -1;  /* codec_tokens index where speaker goes */
+    (void)speaker_embed_pos;
+    if (ctx->voice_clone && ctx->speaker_embedding) {
+        speaker_embed_pos = codec_len;
+        codec_tokens[codec_len++] = -1;  /* placeholder — will use speaker_embedding */
+    } else if (!ctx->voice_design) {
         codec_tokens[codec_len++] = ctx->speaker_id;
     }
     codec_tokens[codec_len++] = QWEN_TTS_CODEC_PAD;
@@ -551,9 +586,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         } else {
             memcpy(dst, tts_bos_embed, h * sizeof(float));
         }
-        /* Codec side: codec_tokens[i] */
-        lookup_codec_embed(ctx, codec_tokens[i], tmp_embed);
-        for (int j = 0; j < h; j++) dst[j] += tmp_embed[j];
+        /* Codec side: codec_tokens[i] or speaker embedding for voice clone */
+        if (codec_tokens[i] == -1 && ctx->voice_clone && ctx->speaker_embedding) {
+            /* Voice clone: use continuous speaker embedding directly */
+            for (int j = 0; j < h; j++) dst[j] += ctx->speaker_embedding[j];
+        } else {
+            lookup_codec_embed(ctx, codec_tokens[i], tmp_embed);
+            for (int j = 0; j < h; j++) dst[j] += tmp_embed[j];
+        }
         pos++;
     }
 
@@ -589,7 +629,12 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(codec_bos_embed);
 
     if (!ctx->silent) {
-        fprintf(stderr, "Speaker: %d, Language: %d\n", ctx->speaker_id, ctx->language_id);
+        if (ctx->voice_clone)
+            fprintf(stderr, "Voice clone: %s (x-vector%s)\n",
+                    ctx->ref_audio_path ? ctx->ref_audio_path : "?",
+                    ctx->xvector_only ? " only" : " + ICL");
+        else
+            fprintf(stderr, "Speaker: %d, Language: %d\n", ctx->speaker_id, ctx->language_id);
         fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, text+eos=%d, final=1)\n",
                 prefill_len, inst_len, role_len, sec2_len, sec3_len);
     }

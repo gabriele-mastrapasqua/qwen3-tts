@@ -28,7 +28,7 @@ git clone https://github.com/gabriele-mastrapasqua/qwen3-tts.git
 cd qwen3-tts
 make blas
 
-# Download a model (interactive: small=0.6B, large=1.7B, voice-design)
+# Download a model (interactive: small, large, voice-design, base-small, base-large)
 ./download_model.sh
 
 # Synthesize speech
@@ -117,6 +117,8 @@ Optional:
   --max-duration <secs>      Max audio duration in seconds
   --seed <n>                 Random seed for reproducible output
   --voice-design             VoiceDesign mode (create voice from --instruct)
+  --ref-audio <path>         Reference audio for voice cloning (Base model)
+  --xvector-only             Use speaker embedding only (no ref text/codes)
   -j, --threads <n>          Worker threads (default: 4)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
@@ -190,6 +192,28 @@ Create entirely new voices from natural language descriptions using the VoiceDes
 > It does **not** work with the 0.6B model — the engine will refuse to run if you try.
 > The model type is auto-detected from the config. `--instruct` is required
 > to describe the desired voice. No `--speaker` is needed.
+
+### Voice Cloning
+
+Clone any voice from a short reference audio clip using the Base model:
+
+```bash
+# Download the Base model (has speaker encoder for voice cloning)
+./download_model.sh --model base-small
+
+# Clone a voice from a WAV file
+./qwen_tts -d qwen3-tts-0.6b-base --text "Hello, this is my cloned voice." \
+    --ref-audio reference.wav -o cloned.wav
+
+# Clone with Italian text
+./qwen_tts -d qwen3-tts-0.6b-base --text "Ciao, questa e la mia voce clonata." \
+    --ref-audio reference.wav -o cloned_it.wav
+```
+
+> **Note:** Voice cloning requires a **Base** model (`Qwen3-TTS-12Hz-0.6B-Base` or `1.7B-Base`),
+> not the CustomVoice model. The Base model includes an ECAPA-TDNN speaker encoder that extracts
+> a voice embedding from the reference audio. Reference audio must be 24 kHz WAV (mono or stereo,
+> 16-bit or 32-bit PCM). A few seconds of clear speech is sufficient.
 
 ### Streaming
 
