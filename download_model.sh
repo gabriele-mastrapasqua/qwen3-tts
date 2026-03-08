@@ -6,9 +6,11 @@
 #   ./download_model.sh --model small
 #   ./download_model.sh --model large --dir my-model-dir
 #   ./download_model.sh --model voice-design
+#   ./download_model.sh --model base-small
+#   ./download_model.sh --model base-large
 #
 # Options:
-#   --model small|large|voice-design   Choose 0.6B, 1.7B, or VoiceDesign
+#   --model small|large|voice-design|base-small|base-large
 #   --dir DIR             Override output directory
 
 set -e
@@ -47,9 +49,11 @@ choose_model_interactive() {
     echo "  1) small (Qwen3-TTS-12Hz-0.6B-CustomVoice)"
     echo "  2) large (Qwen3-TTS-12Hz-1.7B-CustomVoice)"
     echo "  3) voice-design (Qwen3-TTS-12Hz-1.7B-VoiceDesign)"
+    echo "  4) base-small (Qwen3-TTS-12Hz-0.6B-Base, for voice cloning)"
+    echo "  5) base-large (Qwen3-TTS-12Hz-1.7B-Base, for voice cloning)"
     echo ""
     while true; do
-        read -r -p "Enter choice [1/2/3]: " ans
+        read -r -p "Enter choice [1/2/3/4/5]: " ans
         case "$ans" in
             1|small|Small|SMALL)
                 MODEL_CHOICE="small"
@@ -63,8 +67,16 @@ choose_model_interactive() {
                 MODEL_CHOICE="voice-design"
                 return
                 ;;
+            4|base-small)
+                MODEL_CHOICE="base-small"
+                return
+                ;;
+            5|base-large)
+                MODEL_CHOICE="base-large"
+                return
+                ;;
             *)
-                echo "Please choose 1 (small), 2 (large), or 3 (voice-design)."
+                echo "Please choose 1-5."
                 ;;
         esac
     done
@@ -132,9 +144,47 @@ case "$MODEL_CHOICE" in
             "preprocessor_config.json"
         )
         ;;
+    base-small|base-0.6b|base-0.6B)
+        MODEL_ID="Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+        if [[ -z "$MODEL_DIR" ]]; then MODEL_DIR="qwen3-tts-0.6b-base"; fi
+        FILES=(
+            "config.json"
+            "generation_config.json"
+            "tokenizer_config.json"
+            "preprocessor_config.json"
+            "model.safetensors"
+            "vocab.json"
+            "merges.txt"
+        )
+        SPEECH_TOKENIZER_FILES=(
+            "config.json"
+            "configuration.json"
+            "model.safetensors"
+            "preprocessor_config.json"
+        )
+        ;;
+    base-large|base-1.7b|base-1.7B)
+        MODEL_ID="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+        if [[ -z "$MODEL_DIR" ]]; then MODEL_DIR="qwen3-tts-1.7b-base"; fi
+        FILES=(
+            "config.json"
+            "generation_config.json"
+            "tokenizer_config.json"
+            "preprocessor_config.json"
+            "model.safetensors"
+            "vocab.json"
+            "merges.txt"
+        )
+        SPEECH_TOKENIZER_FILES=(
+            "config.json"
+            "configuration.json"
+            "model.safetensors"
+            "preprocessor_config.json"
+        )
+        ;;
     *)
         echo "Invalid --model value: $MODEL_CHOICE"
-        echo "Use: --model small, --model large, or --model voice-design"
+        echo "Use: --model small|large|voice-design|base-small|base-large"
         exit 1
         ;;
 esac

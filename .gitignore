@@ -9,6 +9,9 @@ venv312/
 .venv/
 qwen3-tts-0.6b/
 qwen3-tts-1.7b/
+qwen3-tts-0.6b-base/
+qwen3-tts-1.7b-base/
+qwen3-tts-voice-design/
 __pycache__/
 .DS_Store
 TODO.md
