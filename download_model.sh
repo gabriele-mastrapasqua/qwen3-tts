@@ -5,9 +5,10 @@
 #   ./download_model.sh
 #   ./download_model.sh --model small
 #   ./download_model.sh --model large --dir my-model-dir
+#   ./download_model.sh --model voice-design
 #
 # Options:
-#   --model small|large   Choose 0.6B (small) or 1.7B (large)
+#   --model small|large|voice-design   Choose 0.6B, 1.7B, or VoiceDesign
 #   --dir DIR             Override output directory
 
 set -e
@@ -45,9 +46,10 @@ choose_model_interactive() {
     echo "Select model size to download:"
     echo "  1) small (Qwen3-TTS-12Hz-0.6B-CustomVoice)"
     echo "  2) large (Qwen3-TTS-12Hz-1.7B-CustomVoice)"
+    echo "  3) voice-design (Qwen3-TTS-12Hz-1.7B-VoiceDesign)"
     echo ""
     while true; do
-        read -r -p "Enter choice [1/2]: " ans
+        read -r -p "Enter choice [1/2/3]: " ans
         case "$ans" in
             1|small|Small|SMALL)
                 MODEL_CHOICE="small"
@@ -57,8 +59,12 @@ choose_model_interactive() {
                 MODEL_CHOICE="large"
                 return
                 ;;
+            3|voice-design|VoiceDesign)
+                MODEL_CHOICE="voice-design"
+                return
+                ;;
             *)
-                echo "Please choose 1 (small) or 2 (large)."
+                echo "Please choose 1 (small), 2 (large), or 3 (voice-design)."
                 ;;
         esac
     done
@@ -107,9 +113,28 @@ case "$MODEL_CHOICE" in
             "preprocessor_config.json"
         )
         ;;
+    voice-design|voicedesign|VoiceDesign)
+        MODEL_ID="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+        if [[ -z "$MODEL_DIR" ]]; then MODEL_DIR="qwen3-tts-voice-design"; fi
+        FILES=(
+            "config.json"
+            "generation_config.json"
+            "tokenizer_config.json"
+            "preprocessor_config.json"
+            "model.safetensors"
+            "vocab.json"
+            "merges.txt"
+        )
+        SPEECH_TOKENIZER_FILES=(
+            "config.json"
+            "configuration.json"
+            "model.safetensors"
+            "preprocessor_config.json"
+        )
+        ;;
     *)
         echo "Invalid --model value: $MODEL_CHOICE"
-        echo "Use: --model small or --model large"
+        echo "Use: --model small, --model large, or --model voice-design"
         exit 1
         ;;
 esac
