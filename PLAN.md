@@ -287,7 +287,7 @@ timbre from the description instead of using a preset speaker.
   - macOS: vDSP_vsmul → vvsinf → vDSP_vsq → vDSP_vsma (Accelerate)
   - ARM: 4-wide NEON SIMD with scalar sinf per lane
   - PR #9 merged
-- [ ] `[LOW]` Persistent BF16 KV cache (avoid bf16→f32 conversion)
+- [x] `[LOW]` Persistent BF16 KV cache (halves KV memory, bf16 stored/read in attention)
 
 ---
 
