@@ -66,14 +66,33 @@ make blas
 
 ### Windows (WSL2)
 
+WSL2 runs a real Linux kernel, so the build is identical to native Linux.
+Install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu if you haven't already.
+
 ```bash
-# Open a WSL2 terminal (Ubuntu recommended)
+# In a WSL2 terminal (Ubuntu)
 sudo apt update && sudo apt install build-essential libopenblas-dev
+
 git clone https://github.com/gabriele-mastrapasqua/qwen3-tts.git
 cd qwen3-tts
 make blas
+
+# Download a model and generate speech
 ./download_model.sh --model small
 ./qwen_tts -d qwen3-tts-0.6b --text "Hello from Windows!" -o hello.wav
+```
+
+Playing audio from WSL2:
+
+```bash
+# Option 1: Open with Windows media player (works out of the box)
+powershell.exe Start-Process "$(wslpath -w hello.wav)"
+
+# Option 2: Use aplay if PulseAudio/PipeWire is configured in WSL2
+aplay hello.wav
+
+# Option 3: Copy to Windows and play manually
+cp hello.wav /mnt/c/Users/$USER/Desktop/
 ```
 
 ### Other build targets
