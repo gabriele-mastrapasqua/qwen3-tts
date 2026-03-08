@@ -28,7 +28,7 @@ git clone https://github.com/gabriele-mastrapasqua/qwen3-tts.git
 cd qwen3-tts
 make blas
 
-# Download a model (interactive: small=0.6B, large=1.7B)
+# Download a model (interactive: small=0.6B, large=1.7B, voice-design)
 ./download_model.sh
 
 # Synthesize speech
@@ -116,6 +116,7 @@ Optional:
   --max-tokens <n>           Max audio tokens (default: 8192)
   --max-duration <secs>      Max audio duration in seconds
   --seed <n>                 Random seed for reproducible output
+  --voice-design             VoiceDesign mode (create voice from --instruct)
   -j, --threads <n>          Worker threads (default: 4)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
@@ -160,6 +161,34 @@ Optional:
 
 > **Note:** The `--instruct` flag only works with the 1.7B model. The 0.6B model does not
 > support style control and will ignore the instruction.
+
+### VoiceDesign
+
+Create entirely new voices from natural language descriptions using the VoiceDesign model:
+
+```bash
+# Download the VoiceDesign model
+./download_model.sh --model voice-design
+
+# Deep British male
+./qwen_tts -d qwen3-tts-voice-design -l English \
+    --instruct "A deep male voice with a British accent, speaking slowly and calmly" \
+    --text "Hello, this is a test of the voice design system." -o british.wav
+
+# Young energetic female
+./qwen_tts -d qwen3-tts-voice-design -l English \
+    --instruct "Young energetic female, cheerful and fast-paced" \
+    --text "Oh my gosh, this is so exciting!" -o cheerful.wav
+
+# Chinese loli voice
+./qwen_tts -d qwen3-tts-voice-design -l Chinese \
+    --instruct "萝莉女声，撒娇稚嫩" \
+    --text "你好，这是一个语音设计的测试。" -o loli.wav
+```
+
+> **Note:** VoiceDesign requires the `Qwen3-TTS-12Hz-1.7B-VoiceDesign` model.
+> The model type is auto-detected from the config. `--instruct` is required
+> to describe the desired voice. No `--speaker` is needed.
 
 ### Streaming
 

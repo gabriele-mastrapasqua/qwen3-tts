@@ -242,13 +242,13 @@ timbre from the description instead of using a preset speaker.
 
 ### Tasks
 
-- [ ] `[MED]` Extend `download_model.sh` for VoiceDesign model:
+- [x] `[MED]` Extend `download_model.sh` for VoiceDesign model:
   - `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
-- [ ] `[MED]` Implement VoiceDesign prompt format:
-  - Uses `generate_voice_design(text, language, instruct)` in Python
+- [x] `[MED]` Implement VoiceDesign prompt format:
+  - Same as CustomVoice but without speaker token in codec prefix
+  - Auto-detected from config (empty `spk_id`)
   - Instruct describes the desired voice characteristics
-  - No speaker ID needed — the model creates a voice from the description
-- [ ] `[MED]` CLI: `--voice-design <description>` (mutually exclusive with `--speaker`)
+- [x] `[MED]` CLI: `--voice-design` flag (auto-detected, or force with flag)
 - [ ] `[LOW]` Add `make test-voice-design` target
 
 ---
