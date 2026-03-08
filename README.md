@@ -186,7 +186,8 @@ Create entirely new voices from natural language descriptions using the VoiceDes
     --text "你好，这是一个语音设计的测试。" -o loli.wav
 ```
 
-> **Note:** VoiceDesign requires the `Qwen3-TTS-12Hz-1.7B-VoiceDesign` model.
+> **Note:** VoiceDesign requires a 1.7B model (`Qwen3-TTS-12Hz-1.7B-VoiceDesign`).
+> It does **not** work with the 0.6B model — the engine will refuse to run if you try.
 > The model type is auto-detected from the config. `--instruct` is required
 > to describe the desired voice. No `--speaker` is needed.
 
