@@ -119,12 +119,12 @@ lightweight, zero-dependency alternative.
 
 ### 3.1 Minimal HTTP Server
 
-- [ ] `[HIGH]` Implement embedded HTTP server (single-threaded, no external deps):
+- [x] `[HIGH]` Implement embedded HTTP server (single-threaded, no external deps):
   - Minimal HTTP/1.1 parser (enough for POST + headers)
   - Listen on configurable port: `--serve <port>` (default: 8080)
   - JSON request/response using simple hand-rolled parser
   - Model loaded once at startup, shared across requests
-- [ ] `[HIGH]` POST `/v1/tts` endpoint:
+- [x] `[HIGH]` POST `/v1/tts` endpoint:
   ```json
   {
     "text": "Hello world",
@@ -136,16 +136,16 @@ lightweight, zero-dependency alternative.
   }
   ```
   Response: WAV file (Content-Type: audio/wav)
-- [ ] `[MED]` POST `/v1/tts/stream` endpoint:
+- [x] `[MED]` POST `/v1/tts/stream` endpoint:
   - Same request format
-  - Response: chunked transfer encoding with raw PCM or WAV chunks
+  - Response: chunked transfer encoding with raw PCM
   - Client receives audio progressively as it's generated
-- [ ] `[MED]` GET `/v1/speakers` — list available speakers
-- [ ] `[MED]` GET `/v1/health` — status check
+- [x] `[MED]` GET `/v1/speakers` — list available speakers
+- [x] `[MED]` GET `/v1/health` — status check
 
 ### 3.2 OpenAI-Compatible API (optional)
 
-- [ ] `[LOW]` POST `/v1/audio/speech` (OpenAI TTS API format):
+- [x] `[LOW]` POST `/v1/audio/speech` (OpenAI TTS API format):
   ```json
   {
     "model": "qwen-tts",
@@ -160,8 +160,8 @@ lightweight, zero-dependency alternative.
 
 ### 3.3 Makefile Targets
 
-- [ ] `[MED]` `make serve` — build + start server on default port
-- [ ] `[MED]` `make test-serve` — start server, send test request, validate response
+- [x] `[MED]` `make serve` — build + start server on default port
+- [x] `[MED]` `make test-serve` — start server, send test request, validate response
 
 ---
 
