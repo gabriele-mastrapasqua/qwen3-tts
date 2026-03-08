@@ -110,6 +110,7 @@ info:
 MODEL_SMALL = qwen3-tts-0.6b
 MODEL_LARGE = qwen3-tts-1.7b
 MODEL_BASE_SMALL = qwen3-tts-0.6b-base
+MODEL_VOICE_DESIGN = qwen3-tts-voice-design
 TEST_DIR = /tmp/qwen_tts_tests
 
 # Helper script for test validation
@@ -331,11 +332,37 @@ test-clone: $(TARGET)
 	@echo "  Cloned:     afplay $(TEST_DIR)/clone_output.wav"
 	@echo "  Streamed:   afplay $(TEST_DIR)/clone_stream.wav"
 
+# ── VoiceDesign test ──
+
+test-voice-design: $(TARGET)
+	@echo "=== VoiceDesign test ==="
+	@if [ ! -d $(MODEL_VOICE_DESIGN) ]; then echo "SKIP: $(MODEL_VOICE_DESIGN) not found (run ./download_model.sh --model voice-design)"; exit 0; fi
+	@mkdir -p $(TEST_DIR)
+	@echo ""
+	@echo "--- VoiceDesign: British male ---"
+	./$(TARGET) -d $(MODEL_VOICE_DESIGN) -l English \
+		--voice-design \
+		--instruct "A deep male voice with a British accent, speaking slowly and calmly" \
+		--text "Good evening, welcome to the broadcast." \
+		-o $(TEST_DIR)/vd_british.wav 2>&1 | tee $(TEST_DIR)/vd_british.wav.log
+	$(call validate_wav,$(TEST_DIR)/vd_british.wav,VoiceDesign: British male)
+	@echo "--- VoiceDesign: energetic female ---"
+	./$(TARGET) -d $(MODEL_VOICE_DESIGN) -l English \
+		--voice-design \
+		--instruct "Young energetic female, cheerful and fast-paced" \
+		--text "Oh my gosh, this is so exciting!" \
+		-o $(TEST_DIR)/vd_cheerful.wav 2>&1 | tee $(TEST_DIR)/vd_cheerful.wav.log
+	$(call validate_wav,$(TEST_DIR)/vd_cheerful.wav,VoiceDesign: energetic female)
+	@echo "=== VoiceDesign test passed ==="
+	@echo "Listen:"
+	@echo "  British:   afplay $(TEST_DIR)/vd_british.wav"
+	@echo "  Cheerful:  afplay $(TEST_DIR)/vd_cheerful.wav"
+
 # Legacy aliases
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve test-serve test-clone \
+.PHONY: all help blas clean debug info serve test-serve test-clone test-voice-design \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
         test-regression test-all test-en test-it-ryan

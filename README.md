@@ -119,6 +119,8 @@ Optional:
   --voice-design             VoiceDesign mode (create voice from --instruct)
   --ref-audio <path>         Reference audio for voice cloning (Base model)
   --xvector-only             Use speaker embedding only (no ref text/codes)
+  --save-voice <path>        Save speaker embedding to file for reuse
+  --load-voice <path>        Load speaker embedding (skip extraction)
   -j, --threads <n>          Worker threads (default: 4)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
@@ -164,6 +166,24 @@ Optional:
 > **Note:** The `--instruct` flag only works with the 1.7B model. The 0.6B model does not
 > support style control and will ignore the instruction.
 
+### Seed & Reproducibility
+
+By default, each run uses a time-based random seed, so the same text produces slightly different audio each time. Use `--seed` for reproducible output:
+
+```bash
+# Same seed → same audio every time
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --seed 42 -o hello.wav
+
+# Different seeds → different prosody, pacing, and intonation
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --seed 1 -o v1.wav
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --seed 2 -o v2.wav
+```
+
+> **Note:** Audio quality varies across seeds — this is inherent to the model's sampling
+> process (temperature=0.9 by default). Some seeds sound better than others. If a particular
+> generation sounds off, try a different seed or lower the temperature. Duration also varies
+> significantly (3-7x range for the same text), which is normal model behavior.
+
 ### VoiceDesign
 
 Create entirely new voices from natural language descriptions using the VoiceDesign model:
@@ -208,6 +228,14 @@ Clone any voice from a short reference audio clip using the Base model:
 # Clone with Italian text
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Ciao, questa e la mia voce clonata." \
     --ref-audio reference.wav -o cloned_it.wav
+
+# Save voice embedding for reuse (avoids re-extracting each time)
+./qwen_tts -d qwen3-tts-0.6b-base --text "Hello" \
+    --ref-audio reference.wav --save-voice my_voice.bin -o out.wav
+
+# Load saved voice (faster — skips mel spectrogram + speaker encoder)
+./qwen_tts -d qwen3-tts-0.6b-base --text "Another sentence" \
+    --load-voice my_voice.bin -o out2.wav
 ```
 
 > **Note:** Voice cloning requires a **Base** model (`Qwen3-TTS-12Hz-0.6B-Base` or `1.7B-Base`),

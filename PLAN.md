@@ -216,13 +216,12 @@ Two modes:
   - `--ref-audio <path.wav>` — reference audio file
   - `--xvector-only` — use speaker embedding only (default when no --ref-text)
 - [ ] `[MED]` ICL mode (ref_text + ref_code): requires speech tokenizer encoder (4.2)
-- [ ] `[MED]` `make test-clone` target
+- [x] `[MED]` `make test-clone` target (e2e: generate ref → clone → stream)
 
 ### 4.5 Reusable Voice Prompts
 
-- [ ] `[LOW]` `--save-voice <path>` — save computed ref_code + speaker embedding to file
-- [ ] `[LOW]` `--load-voice <path>` — load pre-computed voice prompt (skip re-encoding)
-  - Avoids re-encoding reference audio on every generation
+- [x] `[LOW]` `--save-voice <path>` — save speaker embedding to binary file
+- [x] `[LOW]` `--load-voice <path>` — load pre-computed speaker embedding (skip extraction)
 
 ---
 
@@ -246,7 +245,7 @@ timbre from the description instead of using a preset speaker.
   - Auto-detected from config (empty `spk_id`)
   - Instruct describes the desired voice characteristics
 - [x] `[MED]` CLI: `--voice-design` flag (auto-detected, or force with flag)
-- [ ] `[LOW]` Add `make test-voice-design` target
+- [x] `[LOW]` Add `make test-voice-design` target
 
 ---
 
@@ -258,12 +257,12 @@ timbre from the description instead of using a preset speaker.
   - Convert to max frames: seconds × 12.5
   - Default: no limit (use max_new_tokens=8192)
   - Prevents runaway generation with bad seeds
-- [ ] `[LOW]` Investigate EOS boosting after expected duration
+- [x] `[LOW]` EOS boosting after expected duration (gentle logit boost at 2x expected frames)
 
 ### 6.2 Seed / Reproducibility
 
 - [x] `[LOW]` Add `--seed <n>` flag for reproducible generation
-- [ ] `[LOW]` Document seed behavior and output variability
+- [x] `[LOW]` Document seed behavior and output variability (README section)
 
 ---
 
