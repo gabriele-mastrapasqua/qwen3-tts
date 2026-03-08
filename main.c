@@ -208,7 +208,15 @@ int main(int argc, char **argv) {
     if (language) ctx->language_id = qwen_tts_language_id(language);
     if (seed >= 0) ctx->seed = (uint32_t)seed;
     if (max_duration > 0) ctx->max_tokens = (int)(max_duration * 12.5f);
-    if (voice_design) ctx->voice_design = 1;
+    if (voice_design) {
+        if (ctx->config.hidden_size < 2048) {
+            fprintf(stderr, "Error: --voice-design requires the 1.7B VoiceDesign model\n");
+            fprintf(stderr, "Download it with: ./download_model.sh --model voice-design\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        ctx->voice_design = 1;
+    }
     if (instruct) {
         if (ctx->config.hidden_size < 2048) {
             fprintf(stderr, "Warning: --instruct is only supported on 1.7B model (ignored)\n");

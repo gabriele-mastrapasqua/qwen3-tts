@@ -292,7 +292,11 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         fprintf(stderr, "  Code Predictor: hidden=%d layers=%d heads=%d head_dim=%d\n",
                 c->cp_hidden_size, c->cp_num_layers, c->cp_num_heads, c->cp_head_dim);
         fprintf(stderr, "  Codec: vocab=%d codebooks=%d entries=%d\n", c->codec_vocab_size, c->dec_num_quantizers, c->codebook_size);
-        if (ctx->voice_design) fprintf(stderr, "  Mode: VoiceDesign (no preset speakers)\n");
+        if (ctx->voice_design) {
+            fprintf(stderr, "  Mode: VoiceDesign (no preset speakers)\n");
+            if (c->hidden_size < 2048)
+                fprintf(stderr, "  Warning: VoiceDesign requires a 1.7B model; results may be incorrect\n");
+        }
     }
 
     /* Load safetensors using qwen-asr loader (mmap-based, working) */

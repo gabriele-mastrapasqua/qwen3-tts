@@ -287,6 +287,11 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         send_error(fd, 400, "missing 'text' field");
         return;
     }
+    if (ctx->voice_design && ctx->config.hidden_size < 2048) {
+        send_error(fd, 400, "voice_design requires the 1.7B VoiceDesign model");
+        free(text);
+        return;
+    }
 
     fprintf(stderr, "[HTTP] TTS: \"%s\"\n", text);
 
@@ -320,6 +325,11 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     char *text = parse_tts_request(ctx, body);
     if (!text) {
         send_error(fd, 400, "missing 'text' field");
+        return;
+    }
+    if (ctx->voice_design && ctx->config.hidden_size < 2048) {
+        send_error(fd, 400, "voice_design requires the 1.7B VoiceDesign model");
+        free(text);
         return;
     }
 
