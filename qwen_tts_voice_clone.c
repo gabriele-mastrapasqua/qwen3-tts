@@ -857,16 +857,4 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
 }
 
 
-/* ════════════════════════════════════════════════════════════════════════
- * Speech Tokenizer Encoder (stub for future ICL mode)
- * ════════════════════════════════════════════════════════════════════════ */
-
-int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx,
-                               const float *audio, int n_samples,
-                               int **out_codes, int *out_n_frames) {
-    (void)ctx; (void)audio; (void)n_samples;
-    (void)out_codes; (void)out_n_frames;
-    fprintf(stderr, "Error: speech tokenizer encoder not yet implemented (ICL mode)\n");
-    fprintf(stderr, "Use --xvector-only mode instead (no reference text needed)\n");
-    return -1;
-}
+/* Speech tokenizer encoder moved to qwen_tts_speech_encoder.c */

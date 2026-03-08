@@ -192,10 +192,15 @@ Two modes:
 
 ### 4.2 Speech Tokenizer Encoder (for ICL mode)
 
-- [ ] `[MED]` Implement speech tokenizer encoder (Mimi-based):
-  - Conv encoder + 8-layer transformer + downsample + Split RVQ
-  - Required for ICL mode (ref_text + ref_code)
-  - NOT required for x_vector_only mode (which works now)
+- [x] `[MED]` Implement speech tokenizer encoder (Mimi-based):
+  - Conv encoder (4 stages: ResBlock + ELU + stride conv, rates [4,5,6,8])
+  - 8-layer transformer (LayerNorm, GELU MLP, sliding window 250, NeoX RoPE)
+  - Downsample conv (stride=2, k=4)
+  - Split RVQ: separate semantic (1 codebook) + acoustic (15 codebooks) quantizers
+  - Encoder-specific input projections loaded from speech_tokenizer safetensors
+  - Codebooks shared with decoder (verified bit-identical)
+  - Note: 0.6B Base model ICL mode generates very short output (~2 frames);
+    same behavior in Python reference. x_vector_only mode works well.
 
 ### 4.3 Speaker Encoder
 
@@ -216,7 +221,11 @@ Two modes:
 - [x] `[MED]` CLI flags:
   - `--ref-audio <path.wav>` — reference audio file
   - `--xvector-only` — use speaker embedding only (default when no --ref-text)
-- [ ] `[MED]` ICL mode (ref_text + ref_code): requires speech tokenizer encoder (4.2)
+- [x] `[MED]` ICL mode (ref_text + ref_code):
+  - Speech encoder encodes ref audio → 16 codebook codes per frame
+  - ICL prompt: ref_text + target_text + EOS paired with codec_pad,
+    then codec_bos + ref_code embeddings (sum of 16 codebook lookups) paired with tts_pad
+  - Matches Python reference implementation behavior exactly
 - [x] `[MED]` `make test-clone` target (e2e: generate ref → clone → stream)
 
 ### 4.5 Reusable Voice Prompts
