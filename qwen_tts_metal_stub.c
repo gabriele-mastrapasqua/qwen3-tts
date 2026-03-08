@@ -20,6 +20,10 @@ int qwen_metal_upload_weight(qwen_metal_ctx_t *ctx,
     (void)ctx; (void)data; (void)rows; (void)cols; return -1;
 }
 
+int qwen_metal_upload_f32(qwen_metal_ctx_t *ctx, const float *data, int count) {
+    (void)ctx; (void)data; (void)count; return -1;
+}
+
 void qwen_metal_matvec_bf16(qwen_metal_ctx_t *ctx, int weight_handle,
                             float *y, const float *x, int rows, int cols) {
     (void)ctx; (void)weight_handle; (void)y; (void)x; (void)rows; (void)cols;
@@ -46,3 +50,34 @@ float *qwen_metal_get_y(qwen_metal_ctx_t *ctx) { (void)ctx; return NULL; }
 void qwen_metal_ensure_workspace(qwen_metal_ctx_t *ctx, int x_bytes, int y_bytes) {
     (void)ctx; (void)x_bytes; (void)y_bytes;
 }
+
+/* Full GPU step stubs */
+int qwen_metal_alloc_kv_cache(qwen_metal_ctx_t *ctx, int kv_id,
+                               int n_layers, int kv_max, int kv_dim) {
+    (void)ctx; (void)kv_id; (void)n_layers; (void)kv_max; (void)kv_dim; return -1;
+}
+
+void qwen_metal_sync_kv_cache(qwen_metal_ctx_t *ctx, int kv_id,
+                               const uint16_t *k, const uint16_t *v,
+                               int n_layers, int kv_max, int kv_dim, int kv_len) {
+    (void)ctx; (void)kv_id; (void)k; (void)v; (void)n_layers; (void)kv_max; (void)kv_dim; (void)kv_len;
+}
+
+int qwen_metal_alloc_work_buffers(qwen_metal_ctx_t *ctx,
+                                   int max_hidden, int max_q_dim,
+                                   int max_kv_dim, int max_inter) {
+    (void)ctx; (void)max_hidden; (void)max_q_dim; (void)max_kv_dim; (void)max_inter; return -1;
+}
+
+int qwen_metal_transformer_step(qwen_metal_ctx_t *ctx,
+                                 const qwen_metal_step_config_t *cfg,
+                                 const qwen_metal_layer_config_t *layers,
+                                 float *x_inout,
+                                 float *normed_out,
+                                 int pos,
+                                 int kv_id) {
+    (void)ctx; (void)cfg; (void)layers; (void)x_inout; (void)normed_out; (void)pos; (void)kv_id;
+    return -1;
+}
+
+int qwen_metal_has_full_step(qwen_metal_ctx_t *ctx) { (void)ctx; return 0; }
