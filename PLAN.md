@@ -257,7 +257,7 @@ timbre from the description instead of using a preset speaker.
 
 ### 6.1 EOS Reliability
 
-- [ ] `[MED]` Add `--max-duration <seconds>` flag:
+- [x] `[MED]` Add `--max-duration <seconds>` flag:
   - Convert to max frames: seconds × 12.5
   - Default: no limit (use max_new_tokens=8192)
   - Prevents runaway generation with bad seeds
@@ -265,7 +265,7 @@ timbre from the description instead of using a preset speaker.
 
 ### 6.2 Seed / Reproducibility
 
-- [ ] `[LOW]` Add `--seed <n>` flag for reproducible generation
+- [x] `[LOW]` Add `--seed <n>` flag for reproducible generation
 - [ ] `[LOW]` Document seed behavior and output variability
 
 ---
