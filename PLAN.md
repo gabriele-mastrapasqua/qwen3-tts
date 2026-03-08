@@ -233,6 +233,14 @@ Two modes:
 - [x] `[LOW]` `--save-voice <path>` — save speaker embedding to binary file
 - [x] `[LOW]` `--load-voice <path>` — load pre-computed speaker embedding (skip extraction)
 
+### 4.6 Voice Clone Demo (Makefile)
+
+- [x] `[MED]` `make demo-clone` target:
+  - Accepts custom reference audio: `make demo-clone REF=my_voice.wav`
+  - Supports WAV/OGG/MP3 input (any format the pipeline accepts)
+  - Generates English + Italian cloned samples to `samples/`
+  - Customizable text via `TEXT=` and `TEXT_IT=` variables
+
 ---
 
 ## Phase 5: VoiceDesign
@@ -278,12 +286,24 @@ timbre from the description instead of using a preset speaker.
 
 ## Phase 7: Performance
 
-### 7.1 Metal GPU Offload (biggest remaining win)
+### 7.1 Metal GPU Offload
 
-- [ ] `[HIGH]` Metal compute shaders for bf16 matvec (Talker + CP)
-  - Expected 3-5x speedup from GPU memory bandwidth
-  - Only for macOS / Apple Silicon
-- [ ] `[MED]` Metal for speech decoder convolutions
+- [x] `[HIGH]` Metal compute shaders for bf16 matvec (Talker + CP)
+  - `make metal` build target, `--gpu` CLI flag, CPU fallback when not enabled
+  - Weights uploaded to GPU at init (200 matrices for 0.6B)
+  - Correct audio output verified on Apple Silicon M1
+  - **Benchmark results (Apple M1)**:
+    - 0.6B: GPU ~3.3x **slower** than CPU NEON (0.2x vs 0.7x realtime)
+    - 1.7B: GPU ~2x **slower** than CPU NEON (0.1-0.2x vs 0.2-0.4x realtime)
+  - Root cause: per-matvec command buffer overhead (~50-100μs × ~200 dispatches/step)
+    dominates over compute savings for these matrix sizes
+- [ ] `[HIGH]` Optimize Metal: batch dispatches to reduce overhead
+  - Option A: Batch all matvecs per transformer layer into 1 command buffer
+  - Option B: Move entire transformer step to GPU (attention + FFN + RMSNorm shaders)
+  - Option C: Use Metal shared events / indirect command buffers for pipelining
+  - This is the key blocker for GPU speedup
+- [ ] `[LOW]` Metal for speech decoder convolutions
+- [ ] `[LOW]` CUDA/HIP backend stubs (for future NVIDIA/AMD support)
 
 ### 7.2 Further CPU Optimizations
 

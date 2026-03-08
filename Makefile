@@ -38,6 +38,18 @@ OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts_bin
 MODEL_DIR = qwen3-tts-0.6b
 
+# Metal GPU support (macOS Apple Silicon only, opt-in via make metal)
+ifdef ENABLE_METAL
+ifeq ($(UNAME_S),Darwin)
+    CFLAGS_BASE += -DENABLE_METAL
+    LDLIBS += -framework Metal -framework Foundation -framework MetalPerformanceShaders
+    OBJS += qwen_tts_metal.o
+endif
+else
+    # Stubs (no-op) — compiled as regular C
+    SRCS += qwen_tts_metal_stub.c
+endif
+
 # Default: show help
 all: help
 
@@ -46,6 +58,7 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  make blas      - Build with BLAS acceleration (Accelerate/OpenBLAS)"
+	@echo "  make metal     - Build with Metal GPU acceleration (macOS Apple Silicon)"
 	@echo "  make debug     - Debug build with AddressSanitizer"
 	@echo "  make clean     - Remove build artifacts"
 	@echo "  make info      - Show build configuration"
@@ -54,6 +67,7 @@ help:
 	@echo "  make test-small      - Run all 0.6B tests (English + Italian)"
 	@echo "  make test-large      - Run all 1.7B tests (config + English + Italian)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
+	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
 	@echo "  make test-all        - Run everything (0.6B + 1.7B + regression)"
 	@echo ""
@@ -65,9 +79,18 @@ $(TARGET): $(OBJS)
 
 blas: $(TARGET)
 
-# Compile
+# Metal build: BLAS + Metal GPU acceleration (macOS Apple Silicon)
+metal: ENABLE_METAL=1
+metal:
+	$(MAKE) blas ENABLE_METAL=1
+
+# Compile C sources
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Compile Objective-C (Metal backend)
+qwen_tts_metal.o: qwen_tts_metal.m qwen_tts_metal.h
+	clang $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 # Header dependencies
 main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_kernels.h qwen_tts_server.h
@@ -88,7 +111,7 @@ qwen_tts_voice_clone.o: qwen_tts_voice_clone.c qwen_tts_voice_clone.h qwen_tts.h
 
 # Clean
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) qwen_tts_metal.o $(TARGET)
 
 # Debug build
 debug: CFLAGS = $(CFLAGS_BASE) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
@@ -359,11 +382,65 @@ test-voice-design: $(TARGET)
 	@echo "  British:   afplay $(TEST_DIR)/vd_british.wav"
 	@echo "  Cheerful:  afplay $(TEST_DIR)/vd_cheerful.wav"
 
+# ── Voice Clone Demo ──
+# Uses an existing sample WAV as reference to clone a voice with new text.
+# Requires: Base model (download with ./download_model.sh --model base-small)
+
+# Voice Clone Demo
+# Usage:
+#   make demo-clone                              (uses default sample)
+#   make demo-clone REF=my_voice.wav             (use your own audio)
+#   make demo-clone REF=my_voice.wav TEXT="Hi!"  (custom text too)
+# Output saved to samples/ for easy listening.
+
+REF ?= samples/voice_clone_english.wav
+TEXT ?= I love programming in C, it gives you complete control over the machine.
+TEXT_IT ?= Buongiorno, questa e una dimostrazione della clonazione vocale.
+
+demo-clone: $(TARGET)
+	@echo "=== Voice Clone Demo ==="
+	@if [ ! -d $(MODEL_BASE_SMALL) ]; then \
+		echo "Error: $(MODEL_BASE_SMALL) not found"; \
+		echo "Download it with: ./download_model.sh --model base-small"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(REF)" ]; then \
+		echo "Error: $(REF) not found"; \
+		echo "Usage: make demo-clone REF=your_audio.wav"; \
+		exit 1; \
+	fi
+	@mkdir -p samples
+	@echo ""
+	@echo "Reference audio: $(REF)"
+	@echo ""
+	@echo "--- Cloning voice (English) ---"
+	./$(TARGET) -d $(MODEL_BASE_SMALL) -l English \
+		--text "$(TEXT)" \
+		--ref-audio "$(REF)" \
+		--xvector-only \
+		-o samples/clone_output_en.wav
+	@echo ""
+	@echo "--- Cloning voice (Italian) ---"
+	./$(TARGET) -d $(MODEL_BASE_SMALL) -l Italian \
+		--text "$(TEXT_IT)" \
+		--ref-audio "$(REF)" \
+		--xvector-only \
+		-o samples/clone_output_it.wav
+	@echo ""
+	@echo "=== Demo complete ==="
+	@echo "Output saved to samples/"
+	@echo ""
+	@echo "Listen:"
+	@echo "  Reference:  afplay $(REF)"
+	@echo "  English:    afplay samples/clone_output_en.wav"
+	@echo "  Italian:    afplay samples/clone_output_it.wav"
+
 # Legacy aliases
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve test-serve test-clone test-voice-design \
+.PHONY: all help blas metal clean debug info serve test-serve test-clone test-voice-design \
+        demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
         test-regression test-all test-en test-it-ryan

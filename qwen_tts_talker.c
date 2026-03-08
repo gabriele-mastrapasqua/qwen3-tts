@@ -9,6 +9,7 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_metal.h"
 #include "qwen_tts_safetensors.h"
 
 #include <stdio.h>
@@ -317,9 +318,16 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, l->input_norm, 1, h, eps);
 
         /* 2. QKV projections (unified dispatch — single barrier for all 3) */
-        qwen_matvec_bf16_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
-                              l->wq_bf16, l->wk_bf16, l->wv_bf16,
-                              ctx->dec_x_norm, h, q_dim, kv_dim);
+        if (ctx->metal) {
+            qwen_metal_matvec_bf16_qkv(ctx->metal,
+                                        l->gpu_wq, l->gpu_wk, l->gpu_wv,
+                                        ctx->dec_q, ctx->dec_k, ctx->dec_v,
+                                        ctx->dec_x_norm, h, q_dim, kv_dim);
+        } else {
+            qwen_matvec_bf16_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
+                                  l->wq_bf16, l->wk_bf16, l->wv_bf16,
+                                  ctx->dec_x_norm, h, q_dim, kv_dim);
+        }
 
         /* 3. Q/K RMSNorm per-head */
         qwen_rms_norm_per_head(ctx->dec_q, l->q_norm, 1, c->num_heads, c->head_dim, eps);
@@ -345,15 +353,21 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
                                      c->head_dim, scale, pos);
 
         /* 7. Output projection + residual */
-        matvec_bf16_local(ctx->dec_proj_out, l->wo_bf16, ctx->dec_attn_out, h, q_dim);
+        if (ctx->metal)
+            qwen_metal_matvec_bf16(ctx->metal, l->gpu_wo, ctx->dec_proj_out, ctx->dec_attn_out, h, q_dim);
+        else
+            matvec_bf16_local(ctx->dec_proj_out, l->wo_bf16, ctx->dec_attn_out, h, q_dim);
         for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
 
         /* 8. Post-attention RMSNorm */
         qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, l->post_attn_norm, 1, h, eps);
 
         /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-        qwen_matvec_bf16(ctx->dec_gate, l->gate_up_fused_bf16, ctx->dec_x_norm,
-                          2 * inter, h);
+        if (ctx->metal)
+            qwen_metal_matvec_bf16(ctx->metal, l->gpu_gate_up_fused, ctx->dec_gate, ctx->dec_x_norm, 2 * inter, h);
+        else
+            qwen_matvec_bf16(ctx->dec_gate, l->gate_up_fused_bf16, ctx->dec_x_norm,
+                              2 * inter, h);
         /* In-place SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, ...] */
         for (int o = 0; o < inter; o++) {
             float g = ctx->dec_gate[2 * o];
@@ -362,7 +376,10 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         }
 
         /* Down projection + residual */
-        qwen_matvec_bf16(ctx->dec_proj_out, l->down_bf16, ctx->dec_gate, h, inter);
+        if (ctx->metal)
+            qwen_metal_matvec_bf16(ctx->metal, l->gpu_down, ctx->dec_proj_out, ctx->dec_gate, h, inter);
+        else
+            qwen_matvec_bf16(ctx->dec_proj_out, l->down_bf16, ctx->dec_gate, h, inter);
         for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
     }
 
