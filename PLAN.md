@@ -316,7 +316,7 @@ WSL2 is the simplest path — our codebase is already Linux-compatible.
   make blas
   ./qwen_tts_bin -d qwen3-tts-0.6b --text "Hello" -o output.wav
   ```
-- [x] `[MED]` Test full flow on WSL2: download → build → generate → play
+- [ ] `[MED]` Test full flow on WSL2: download → build → generate → play (no Windows machine available; marked beta)
 - [x] `[LOW]` Add WSL2 audio playback instructions (aplay, or copy WAV to Windows)
 
 ### Option B: Native MSVC/MinGW (Lower priority)
