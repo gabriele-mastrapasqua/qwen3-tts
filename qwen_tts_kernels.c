@@ -150,6 +150,7 @@ static inline float bf16_to_f32(uint16_t bf) {
     return val;
 }
 
+
 /* Fused bf16 matvec: processes 2 output rows at a time to amortize x vector loads.
  * On NEON: 32 elements/iter, 8 accumulators per row pair (from qwen-asr). */
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
@@ -428,6 +429,144 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
 #else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] += v_row[d] * wt;
+#endif
+                }
+            }
+
+            if (sum_exp > 0.0f) {
+                float inv_sum = 1.0f / sum_exp;
+#ifdef __ARM_NEON
+                {
+                    float32x4_t vi = vdupq_n_f32(inv_sum);
+                    int d = 0;
+                    for (; d + 15 < head_dim; d += 16) {
+                        vst1q_f32(o_row + d,      vmulq_f32(vld1q_f32(o_row + d),      vi));
+                        vst1q_f32(o_row + d + 4,  vmulq_f32(vld1q_f32(o_row + d + 4),  vi));
+                        vst1q_f32(o_row + d + 8,  vmulq_f32(vld1q_f32(o_row + d + 8),  vi));
+                        vst1q_f32(o_row + d + 12, vmulq_f32(vld1q_f32(o_row + d + 12), vi));
+                    }
+                    for (; d < head_dim; d++) o_row[d] *= inv_sum;
+                }
+#else
+                for (int d = 0; d < head_dim; d++)
+                    o_row[d] *= inv_sum;
+#endif
+            }
+        }
+    }
+}
+
+/* Causal GQA attention with bf16 KV cache.
+ * K_bf16/V_bf16 are stored as uint16_t (bf16), converted to f32 inline. */
+void qwen_causal_attention_bf16kv(float *out, const float *Q,
+                                  const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                  int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                  int head_dim, float scale, int q_offset) {
+    int heads_per_kv = n_heads / n_kv_heads;
+    int q_hidden = n_heads * head_dim;
+    int kv_hidden = n_kv_heads * head_dim;
+
+    for (int h = 0; h < n_heads; h++) {
+        int kv_h = h / heads_per_kv;
+
+        for (int i = 0; i < seq_q; i++) {
+            const float *q_row = Q + i * q_hidden + h * head_dim;
+            float *o_row = out + i * q_hidden + h * head_dim;
+            int k_end = q_offset + i + 1;
+            if (k_end > seq_k) k_end = seq_k;
+
+            float max_score = -1e30f;
+            float sum_exp = 0.0f;
+            memset(o_row, 0, head_dim * sizeof(float));
+
+            for (int j = 0; j < k_end; j++) {
+                const uint16_t *k_row_bf16 = K_bf16 + j * kv_hidden + kv_h * head_dim;
+                const uint16_t *v_row_bf16 = V_bf16 + j * kv_hidden + kv_h * head_dim;
+
+                /* Dot product: Q (f32) . K (bf16→f32) */
+                float score;
+#ifdef __ARM_NEON
+                {
+                    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+                    float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+                    int d = 0;
+                    for (; d + 15 < head_dim; d += 16) {
+                        /* Convert bf16 K to f32 inline */
+                        uint16x8_t bk0 = vld1q_u16(k_row_bf16 + d);
+                        uint16x8_t bk1 = vld1q_u16(k_row_bf16 + d + 8);
+                        float32x4_t k0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bk0), 16));
+                        float32x4_t k1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bk0), 16));
+                        float32x4_t k2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bk1), 16));
+                        float32x4_t k3 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bk1), 16));
+                        a0 = vfmaq_f32(a0, vld1q_f32(q_row + d),      k0);
+                        a1 = vfmaq_f32(a1, vld1q_f32(q_row + d + 4),  k1);
+                        a2 = vfmaq_f32(a2, vld1q_f32(q_row + d + 8),  k2);
+                        a3 = vfmaq_f32(a3, vld1q_f32(q_row + d + 12), k3);
+                    }
+                    score = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3)));
+                    for (; d < head_dim; d++)
+                        score += q_row[d] * bf16_to_f32(k_row_bf16[d]);
+                }
+#else
+                score = 0.0f;
+                for (int d = 0; d < head_dim; d++)
+                    score += q_row[d] * bf16_to_f32(k_row_bf16[d]);
+#endif
+                score *= scale;
+
+                /* Softmax with numerical stability + V accumulation (bf16→f32) */
+                if (score > max_score) {
+                    float correction = expf(max_score - score);
+                    sum_exp = sum_exp * correction + 1.0f;
+#ifdef __ARM_NEON
+                    {
+                        float32x4_t vc = vdupq_n_f32(correction);
+                        int d = 0;
+                        for (; d + 15 < head_dim; d += 16) {
+                            uint16x8_t bv0 = vld1q_u16(v_row_bf16 + d);
+                            uint16x8_t bv1 = vld1q_u16(v_row_bf16 + d + 8);
+                            float32x4_t v0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bv0), 16));
+                            float32x4_t v1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bv0), 16));
+                            float32x4_t v2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bv1), 16));
+                            float32x4_t v3 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bv1), 16));
+                            vst1q_f32(o_row + d,      vaddq_f32(vmulq_f32(vld1q_f32(o_row + d),      vc), v0));
+                            vst1q_f32(o_row + d + 4,  vaddq_f32(vmulq_f32(vld1q_f32(o_row + d + 4),  vc), v1));
+                            vst1q_f32(o_row + d + 8,  vaddq_f32(vmulq_f32(vld1q_f32(o_row + d + 8),  vc), v2));
+                            vst1q_f32(o_row + d + 12, vaddq_f32(vmulq_f32(vld1q_f32(o_row + d + 12), vc), v3));
+                        }
+                        for (; d < head_dim; d++)
+                            o_row[d] = o_row[d] * correction + bf16_to_f32(v_row_bf16[d]);
+                    }
+#else
+                    for (int d = 0; d < head_dim; d++)
+                        o_row[d] = o_row[d] * correction + bf16_to_f32(v_row_bf16[d]);
+#endif
+                    max_score = score;
+                } else {
+                    float wt = expf(score - max_score);
+                    sum_exp += wt;
+#ifdef __ARM_NEON
+                    {
+                        float32x4_t vw = vdupq_n_f32(wt);
+                        int d = 0;
+                        for (; d + 15 < head_dim; d += 16) {
+                            uint16x8_t bv0 = vld1q_u16(v_row_bf16 + d);
+                            uint16x8_t bv1 = vld1q_u16(v_row_bf16 + d + 8);
+                            float32x4_t v0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bv0), 16));
+                            float32x4_t v1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bv0), 16));
+                            float32x4_t v2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bv1), 16));
+                            float32x4_t v3 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bv1), 16));
+                            vst1q_f32(o_row + d,      vfmaq_f32(vld1q_f32(o_row + d),      v0, vw));
+                            vst1q_f32(o_row + d + 4,  vfmaq_f32(vld1q_f32(o_row + d + 4),  v1, vw));
+                            vst1q_f32(o_row + d + 8,  vfmaq_f32(vld1q_f32(o_row + d + 8),  v2, vw));
+                            vst1q_f32(o_row + d + 12, vfmaq_f32(vld1q_f32(o_row + d + 12), v3, vw));
+                        }
+                        for (; d < head_dim; d++)
+                            o_row[d] += bf16_to_f32(v_row_bf16[d]) * wt;
+                    }
+#else
+                    for (int d = 0; d < head_dim; d++)
+                        o_row[d] += bf16_to_f32(v_row_bf16[d]) * wt;
 #endif
                 }
             }

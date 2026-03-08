@@ -38,6 +38,12 @@ static inline float bf16_to_f32(uint16_t bf) {
     return val;
 }
 
+static inline uint16_t f32_to_bf16(float val) {
+    uint32_t bits;
+    memcpy(&bits, &val, sizeof(float));
+    return (uint16_t)(bits >> 16);
+}
+
 static uint16_t *get_bf16(void *ms, const char *name) {
     safetensors_file_t *sf = NULL;
     const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
@@ -50,6 +56,24 @@ static float *get_f32(void *ms, const char *name) {
     const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
     if (!t || !sf) return NULL;
     return safetensors_get_f32(sf, t);
+}
+
+/* Convert f32 vector to bf16 (NEON-vectorized) */
+static void f32_to_bf16_vec(uint16_t *dst, const float *src, int64_t n) {
+#ifdef __ARM_NEON
+    int64_t i = 0;
+    for (; i + 7 < n; i += 8) {
+        /* Load 8 f32 values, extract upper 16 bits (bf16 truncation) */
+        uint32x4_t u0 = vreinterpretq_u32_f32(vld1q_f32(src + i));
+        uint32x4_t u1 = vreinterpretq_u32_f32(vld1q_f32(src + i + 4));
+        uint16x4_t lo = vshrn_n_u32(u0, 16);
+        uint16x4_t hi = vshrn_n_u32(u1, 16);
+        vst1q_u16(dst + i, vcombine_u16(lo, hi));
+    }
+    for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
+#else
+    for (int64_t i = 0; i < n; i++) dst[i] = f32_to_bf16(src[i]);
+#endif
 }
 
 /* Convert bf16 matrix to f32 (NEON-vectorized, multi-threaded) */
@@ -125,15 +149,15 @@ static int kv_cache_grow(qwen_tts_ctx_t *ctx, int required) {
 
     int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
 
-    float *new_k = (float *)malloc((int64_t)ctx->config.num_layers * new_max * kv_dim * sizeof(float));
-    float *new_v = (float *)malloc((int64_t)ctx->config.num_layers * new_max * kv_dim * sizeof(float));
+    uint16_t *new_k = (uint16_t *)malloc((int64_t)ctx->config.num_layers * new_max * kv_dim * sizeof(uint16_t));
+    uint16_t *new_v = (uint16_t *)malloc((int64_t)ctx->config.num_layers * new_max * kv_dim * sizeof(uint16_t));
     if (!new_k || !new_v) { free(new_k); free(new_v); return -1; }
 
     for (int layer = 0; layer < ctx->config.num_layers; layer++) {
         int64_t old_off = (int64_t)layer * ctx->kv_max * kv_dim;
         int64_t new_off = (int64_t)layer * new_max * kv_dim;
-        memcpy(new_k + new_off, ctx->kv_cache_k + old_off, (int64_t)ctx->kv_len * kv_dim * sizeof(float));
-        memcpy(new_v + new_off, ctx->kv_cache_v + old_off, (int64_t)ctx->kv_len * kv_dim * sizeof(float));
+        memcpy(new_k + new_off, ctx->kv_cache_k + old_off, (int64_t)ctx->kv_len * kv_dim * sizeof(uint16_t));
+        memcpy(new_v + new_off, ctx->kv_cache_v + old_off, (int64_t)ctx->kv_len * kv_dim * sizeof(uint16_t));
     }
     free(ctx->kv_cache_k); free(ctx->kv_cache_v);
     ctx->kv_cache_k = new_k; ctx->kv_cache_v = new_v;
@@ -221,11 +245,11 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
         #undef LOAD_F32
     }
 
-    /* Allocate KV cache */
+    /* Allocate KV cache (bf16 — halves memory vs f32) */
     int initial_kv_max = 2048;
     int64_t kv_size = (int64_t)c->num_layers * initial_kv_max * kv_dim;
-    ctx->kv_cache_k = (float *)calloc(kv_size, sizeof(float));
-    ctx->kv_cache_v = (float *)calloc(kv_size, sizeof(float));
+    ctx->kv_cache_k = (uint16_t *)calloc(kv_size, sizeof(uint16_t));
+    ctx->kv_cache_v = (uint16_t *)calloc(kv_size, sizeof(uint16_t));
     ctx->kv_max = initial_kv_max;
     ctx->kv_len = 0;
 
@@ -307,18 +331,18 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         apply_rope_neox_inplace(ctx->dec_k, c->num_kv_heads, c->head_dim,
                                 ctx->rope_cos, ctx->rope_sin, pos);
 
-        /* 5. Append KV to cache */
+        /* 5. Append KV to cache (convert f32→bf16) */
         int64_t kv_offset = (int64_t)layer * ctx->kv_max * kv_dim + (int64_t)pos * kv_dim;
-        memcpy(ctx->kv_cache_k + kv_offset, ctx->dec_k, kv_dim * sizeof(float));
-        memcpy(ctx->kv_cache_v + kv_offset, ctx->dec_v, kv_dim * sizeof(float));
+        f32_to_bf16_vec(ctx->kv_cache_k + kv_offset, ctx->dec_k, kv_dim);
+        f32_to_bf16_vec(ctx->kv_cache_v + kv_offset, ctx->dec_v, kv_dim);
 
-        /* 6. Causal GQA attention */
+        /* 6. Causal GQA attention (bf16 KV cache) */
         float scale = 1.0f / sqrtf((float)c->head_dim);
-        float *layer_k = ctx->kv_cache_k + (int64_t)layer * ctx->kv_max * kv_dim;
-        float *layer_v = ctx->kv_cache_v + (int64_t)layer * ctx->kv_max * kv_dim;
-        qwen_causal_attention(ctx->dec_attn_out, ctx->dec_q, layer_k, layer_v,
-                              1, pos + 1, c->num_heads, c->num_kv_heads,
-                              c->head_dim, scale, pos);
+        uint16_t *layer_k = ctx->kv_cache_k + (int64_t)layer * ctx->kv_max * kv_dim;
+        uint16_t *layer_v = ctx->kv_cache_v + (int64_t)layer * ctx->kv_max * kv_dim;
+        qwen_causal_attention_bf16kv(ctx->dec_attn_out, ctx->dec_q, layer_k, layer_v,
+                                     1, pos + 1, c->num_heads, c->num_kv_heads,
+                                     c->head_dim, scale, pos);
 
         /* 7. Output projection + residual */
         matvec_bf16_local(ctx->dec_proj_out, l->wo_bf16, ctx->dec_attn_out, h, q_dim);
@@ -468,16 +492,15 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                                     ctx->rope_cos, ctx->rope_sin, s);
         }
 
-        /* 5. Store KV into cache */
+        /* 5. Store KV into cache (convert f32→bf16) */
         int64_t cache_base = (int64_t)layer * ctx->kv_max * kv_dim;
-        memcpy(ctx->kv_cache_k + cache_base, pref_k, (int64_t)seq_len * kv_dim * sizeof(float));
-        memcpy(ctx->kv_cache_v + cache_base, pref_v, (int64_t)seq_len * kv_dim * sizeof(float));
+        f32_to_bf16_vec(ctx->kv_cache_k + cache_base, pref_k, (int64_t)seq_len * kv_dim);
+        f32_to_bf16_vec(ctx->kv_cache_v + cache_base, pref_v, (int64_t)seq_len * kv_dim);
 
-        /* 6. Causal GQA attention */
+        /* 6. Causal GQA attention — prefill uses f32 Q/K/V directly (not from cache)
+         * since we just computed them. This avoids bf16 roundtrip during prefill. */
         float scale = 1.0f / sqrtf((float)c->head_dim);
-        float *layer_k = ctx->kv_cache_k + cache_base;
-        float *layer_v = ctx->kv_cache_v + cache_base;
-        qwen_causal_attention(pref_attn_out, pref_q, layer_k, layer_v,
+        qwen_causal_attention(pref_attn_out, pref_q, pref_k, pref_v,
                               seq_len, seq_len, c->num_heads, c->num_kv_heads,
                               c->head_dim, scale, 0);
 

@@ -29,6 +29,29 @@ static inline float bf16_to_f32(uint16_t bf) {
     return val;
 }
 
+static inline uint16_t f32_to_bf16(float val) {
+    uint32_t bits;
+    memcpy(&bits, &val, sizeof(float));
+    return (uint16_t)(bits >> 16);
+}
+
+/* Convert f32 vector to bf16 (NEON-vectorized) */
+static void f32_to_bf16_vec(uint16_t *dst, const float *src, int64_t n) {
+#ifdef __ARM_NEON
+    int64_t i = 0;
+    for (; i + 7 < n; i += 8) {
+        uint32x4_t u0 = vreinterpretq_u32_f32(vld1q_f32(src + i));
+        uint32x4_t u1 = vreinterpretq_u32_f32(vld1q_f32(src + i + 4));
+        uint16x4_t lo = vshrn_n_u32(u0, 16);
+        uint16x4_t hi = vshrn_n_u32(u1, 16);
+        vst1q_u16(dst + i, vcombine_u16(lo, hi));
+    }
+    for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
+#else
+    for (int64_t i = 0; i < n; i++) dst[i] = f32_to_bf16(src[i]);
+#endif
+}
+
 static uint16_t *get_bf16(void *ms, const char *name) {
     safetensors_file_t *sf = NULL;
     const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
@@ -169,11 +192,11 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
         ctx->cp_emb_dim = cp_h;      /* CP embeddings have cp_hidden dim (same as talker) */
     }
 
-    /* Allocate CP KV cache (needs 17 positions max: 2 prefill + 14 steps + margin) */
+    /* Allocate CP KV cache (bf16 — needs 17 positions max: 2 prefill + 14 steps + margin) */
     int cp_kv_max = 64;
     int64_t cp_kv_size = (int64_t)c->cp_num_layers * cp_kv_max * cp_kv_dim;
-    ctx->cp_kv_k = (float *)calloc(cp_kv_size, sizeof(float));
-    ctx->cp_kv_v = (float *)calloc(cp_kv_size, sizeof(float));
+    ctx->cp_kv_k = (uint16_t *)calloc(cp_kv_size, sizeof(uint16_t));
+    ctx->cp_kv_v = (uint16_t *)calloc(cp_kv_size, sizeof(uint16_t));
     ctx->cp_kv_max = cp_kv_max;
     ctx->cp_kv_len = 0;
 
@@ -240,18 +263,18 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
         apply_rope_neox(ctx->cp_dec_k, c->cp_num_kv_heads, c->cp_head_dim,
                         ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
 
-        /* 5. Store KV in cache */
+        /* 5. Store KV in cache (convert f32→bf16) */
         int64_t kv_off = (int64_t)layer * ctx->cp_kv_max * cp_kv_dim + (int64_t)pos * cp_kv_dim;
-        memcpy(ctx->cp_kv_k + kv_off, ctx->cp_dec_k, cp_kv_dim * sizeof(float));
-        memcpy(ctx->cp_kv_v + kv_off, ctx->cp_dec_v, cp_kv_dim * sizeof(float));
+        f32_to_bf16_vec(ctx->cp_kv_k + kv_off, ctx->cp_dec_k, cp_kv_dim);
+        f32_to_bf16_vec(ctx->cp_kv_v + kv_off, ctx->cp_dec_v, cp_kv_dim);
 
-        /* 6. Causal GQA attention */
+        /* 6. Causal GQA attention (bf16 KV cache) */
         float scale = 1.0f / sqrtf((float)c->cp_head_dim);
-        float *layer_k = ctx->cp_kv_k + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
-        float *layer_v = ctx->cp_kv_v + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
-        qwen_causal_attention(ctx->cp_dec_attn_out, ctx->cp_dec_q, layer_k, layer_v,
-                              1, pos + 1, c->cp_num_heads, c->cp_num_kv_heads,
-                              c->cp_head_dim, scale, pos);
+        uint16_t *layer_k = ctx->cp_kv_k + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
+        uint16_t *layer_v = ctx->cp_kv_v + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
+        qwen_causal_attention_bf16kv(ctx->cp_dec_attn_out, ctx->cp_dec_q, layer_k, layer_v,
+                                     1, pos + 1, c->cp_num_heads, c->cp_num_kv_heads,
+                                     c->cp_head_dim, scale, pos);
 
         /* 7. Output projection + residual */
         float *proj = ctx->cp_dec_ffn_out; /* reuse buffer */
