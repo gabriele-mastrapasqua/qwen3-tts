@@ -52,6 +52,7 @@ help:
 	@echo "Test (requires models downloaded via ./download_model.sh):"
 	@echo "  make test-small      - Run all 0.6B tests (English + Italian)"
 	@echo "  make test-large      - Run all 1.7B tests (config + English + Italian)"
+	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make test-regression - Cross-model regression checks"
 	@echo "  make test-all        - Run everything (0.6B + 1.7B + regression)"
 	@echo ""
@@ -108,6 +109,7 @@ info:
 
 MODEL_SMALL = qwen3-tts-0.6b
 MODEL_LARGE = qwen3-tts-1.7b
+MODEL_BASE_SMALL = qwen3-tts-0.6b-base
 TEST_DIR = /tmp/qwen_tts_tests
 
 # Helper script for test validation
@@ -288,11 +290,52 @@ test-serve: $(TARGET)
 	 echo "PASS: HTTP Server test"
 	@echo ""
 
+# ── Voice Clone e2e test ──
+# Step 1: Generate reference audio with CustomVoice model
+# Step 2: Use that audio as voice clone reference with Base model (different text)
+# Step 3: Also test streaming + voice clone
+
+test-clone: $(TARGET)
+	@echo "=== Voice Clone e2e test ==="
+	@if [ ! -d $(MODEL_SMALL) ]; then echo "SKIP: $(MODEL_SMALL) not found (run ./download_model.sh --model small)"; exit 0; fi
+	@if [ ! -d $(MODEL_BASE_SMALL) ]; then echo "SKIP: $(MODEL_BASE_SMALL) not found (run ./download_model.sh --model base-small)"; exit 0; fi
+	@mkdir -p $(TEST_DIR)
+	@echo ""
+	@echo "--- Step 1: Generate reference audio (CustomVoice) ---"
+	./$(TARGET) -d $(MODEL_SMALL) -s ryan -l English \
+		--text "The weather is beautiful today, perfect for a walk in the park." \
+		--seed 42 \
+		-o $(TEST_DIR)/clone_ref.wav 2>&1 | tee $(TEST_DIR)/clone_ref.wav.log
+	$(call validate_wav,$(TEST_DIR)/clone_ref.wav,Voice Clone: reference generation)
+	@echo "--- Step 2: Clone voice with different text ---"
+	./$(TARGET) -d $(MODEL_BASE_SMALL) \
+		--text "I love programming in C, it gives you complete control over the machine." \
+		--ref-audio $(TEST_DIR)/clone_ref.wav \
+		--xvector-only \
+		-o $(TEST_DIR)/clone_output.wav 2>&1 | tee $(TEST_DIR)/clone_output.wav.log
+	$(call validate_wav,$(TEST_DIR)/clone_output.wav,Voice Clone: cloned output)
+	@if ! grep -q "Voice clone:" $(TEST_DIR)/clone_output.wav.log; then echo "FAIL: voice clone not active"; exit 1; fi
+	@if ! grep -q "speaker embedding" $(TEST_DIR)/clone_output.wav.log; then echo "FAIL: no speaker embedding extracted"; exit 1; fi
+	@echo "--- Step 3: Clone voice + streaming ---"
+	./$(TARGET) -d $(MODEL_BASE_SMALL) \
+		--text "Streaming also works perfectly with voice cloning mode." \
+		--ref-audio $(TEST_DIR)/clone_ref.wav \
+		--xvector-only \
+		--stream \
+		-o $(TEST_DIR)/clone_stream.wav 2>&1 | tee $(TEST_DIR)/clone_stream.wav.log
+	$(call validate_wav,$(TEST_DIR)/clone_stream.wav,Voice Clone: streaming)
+	@if ! grep -q "streamed" $(TEST_DIR)/clone_stream.wav.log; then echo "FAIL: not streamed"; exit 1; fi
+	@echo "=== Voice Clone e2e test passed ==="
+	@echo "Listen:"
+	@echo "  Reference:  afplay $(TEST_DIR)/clone_ref.wav"
+	@echo "  Cloned:     afplay $(TEST_DIR)/clone_output.wav"
+	@echo "  Streamed:   afplay $(TEST_DIR)/clone_stream.wav"
+
 # Legacy aliases
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve test-serve \
+.PHONY: all help blas clean debug info serve test-serve test-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
         test-regression test-all test-en test-it-ryan
