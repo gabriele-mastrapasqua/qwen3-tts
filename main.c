@@ -91,6 +91,8 @@ int main(int argc, char **argv) {
     const char *ref_audio = NULL;
     const char *ref_text_str = NULL;
     int xvector_only = 0;
+    const char *save_voice = NULL;
+    const char *load_voice = NULL;
 
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
@@ -115,6 +117,8 @@ int main(int argc, char **argv) {
         {"ref-audio",     required_argument, 0, 1008},
         {"ref-text",      required_argument, 0, 1009},
         {"xvector-only",  no_argument,       0, 1010},
+        {"save-voice",    required_argument, 0, 1011},
+        {"load-voice",    required_argument, 0, 1012},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"help",          no_argument,       0, 'h'},
@@ -146,6 +150,8 @@ int main(int argc, char **argv) {
             case 1008: ref_audio = optarg; break;
             case 1009: ref_text_str = optarg; break;
             case 1010: xvector_only = 1; break;
+            case 1011: save_voice = optarg; break;
+            case 1012: load_voice = optarg; break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -174,6 +180,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
                 fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model)\n");
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
+                fprintf(stderr, "  --save-voice <path>        Save speaker embedding to file\n");
+                fprintf(stderr, "  --load-voice <path>        Load speaker embedding from file (skip extraction)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -229,32 +237,68 @@ int main(int argc, char **argv) {
         ctx->voice_design = 1;
     }
     /* Voice cloning setup */
-    if (ref_audio) {
+    if (ref_audio || load_voice) {
         if (!ctx->is_base_model) {
-            fprintf(stderr, "Error: --ref-audio requires a Base model (not CustomVoice)\n");
+            fprintf(stderr, "Error: --ref-audio/--load-voice requires a Base model (not CustomVoice)\n");
             fprintf(stderr, "Download it with: ./download_model.sh --model base-small\n");
             qwen_tts_unload(ctx);
             return 1;
         }
         ctx->voice_clone = 1;
         ctx->xvector_only = xvector_only ? 1 : (ref_text_str ? 0 : 1);
-        ctx->ref_audio_path = strdup(ref_audio);
+        if (ref_audio) ctx->ref_audio_path = strdup(ref_audio);
         if (ref_text_str) ctx->ref_text = strdup(ref_text_str);
 
-        /* Extract speaker embedding from reference audio */
-        ctx->speaker_embedding = (float *)malloc(ctx->speaker_enc.enc_dim * sizeof(float));
+        int enc_dim = ctx->speaker_enc.enc_dim;
+        ctx->speaker_embedding = (float *)malloc(enc_dim * sizeof(float));
         if (!ctx->speaker_embedding) {
             fprintf(stderr, "Error: failed to allocate speaker embedding\n");
             qwen_tts_unload(ctx);
             return 1;
         }
-        if (qwen_extract_speaker_embedding(ctx, ref_audio, ctx->speaker_embedding) != 0) {
-            fprintf(stderr, "Error: failed to extract speaker embedding from %s\n", ref_audio);
-            qwen_tts_unload(ctx);
-            return 1;
+
+        if (load_voice) {
+            /* Load pre-computed speaker embedding from file */
+            FILE *vf = fopen(load_voice, "rb");
+            if (!vf) {
+                fprintf(stderr, "Error: cannot open voice file %s\n", load_voice);
+                qwen_tts_unload(ctx);
+                return 1;
+            }
+            size_t n = fread(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
+            fclose(vf);
+            if ((int)n != enc_dim) {
+                fprintf(stderr, "Error: voice file has %zu floats, expected %d\n", n, enc_dim);
+                qwen_tts_unload(ctx);
+                return 1;
+            }
+            if (!silent)
+                fprintf(stderr, "Voice clone: loaded speaker embedding from %s\n", load_voice);
+        } else {
+            /* Extract speaker embedding from reference audio */
+            if (qwen_extract_speaker_embedding(ctx, ref_audio, ctx->speaker_embedding) != 0) {
+                fprintf(stderr, "Error: failed to extract speaker embedding from %s\n", ref_audio);
+                qwen_tts_unload(ctx);
+                return 1;
+            }
+            if (!silent)
+                fprintf(stderr, "Voice clone: extracted speaker embedding from %s\n", ref_audio);
         }
+
+        /* Save embedding if requested */
+        if (save_voice) {
+            FILE *vf = fopen(save_voice, "wb");
+            if (!vf) {
+                fprintf(stderr, "Error: cannot write voice file %s\n", save_voice);
+            } else {
+                fwrite(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
+                fclose(vf);
+                if (!silent)
+                    fprintf(stderr, "Saved speaker embedding to %s (%d floats)\n", save_voice, enc_dim);
+            }
+        }
+
         if (!silent) {
-            fprintf(stderr, "Voice clone: extracted speaker embedding from %s\n", ref_audio);
             if (ctx->xvector_only)
                 fprintf(stderr, "Mode: x-vector only (no reference transcription)\n");
             else
