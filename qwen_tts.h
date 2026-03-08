@@ -367,15 +367,15 @@ typedef struct qwen_tts_ctx {
     /* Speaker encoder (ECAPA-TDNN, Base model only) */
     qwen_speaker_encoder_t speaker_enc;
     
-    /* KV cache (Talker) */
-    float *kv_cache_k;
-    float *kv_cache_v;
+    /* KV cache (Talker) — stored as bf16 to halve memory and improve cache utilization */
+    uint16_t *kv_cache_k;
+    uint16_t *kv_cache_v;
     int kv_max;
     int kv_len;
-    
-    /* KV cache (Code Predictor) */
-    float *cp_kv_k;
-    float *cp_kv_v;
+
+    /* KV cache (Code Predictor) — stored as bf16 */
+    uint16_t *cp_kv_k;
+    uint16_t *cp_kv_v;
     int cp_kv_max;
     int cp_kv_len;
     
