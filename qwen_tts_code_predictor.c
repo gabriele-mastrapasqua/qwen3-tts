@@ -249,9 +249,16 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
         qwen_rms_norm(x_norm, x, l->input_norm, 1, cp_h, eps);
 
         /* 2. QKV projections (unified dispatch — single barrier for all 3) */
-        qwen_matvec_bf16_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
-                              l->wq_bf16, l->wk_bf16, l->wv_bf16,
-                              x_norm, cp_h, cp_q_dim, cp_kv_dim);
+        if (ctx->metal) {
+            qwen_metal_matvec_bf16_qkv(ctx->metal,
+                                        l->gpu_wq, l->gpu_wk, l->gpu_wv,
+                                        ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                                        x_norm, cp_h, cp_q_dim, cp_kv_dim);
+        } else {
+            qwen_matvec_bf16_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                                  l->wq_bf16, l->wk_bf16, l->wv_bf16,
+                                  x_norm, cp_h, cp_q_dim, cp_kv_dim);
+        }
 
         /* 3. Q/K RMSNorm per-head */
         qwen_rms_norm_per_head(ctx->cp_dec_q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
@@ -278,14 +285,20 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
 
         /* 7. Output projection + residual */
         float *proj = ctx->cp_dec_ffn_out; /* reuse buffer */
-        matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+        if (ctx->metal)
+            qwen_metal_matvec_bf16(ctx->metal, l->gpu_wo, proj, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+        else
+            matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
 
         /* 8. Post-attention RMSNorm */
         qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, cp_h, eps);
 
         /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-        matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
+        if (ctx->metal)
+            qwen_metal_matvec_bf16(ctx->metal, l->gpu_gate_up_fused, ctx->cp_dec_gate, x_norm, 2 * cp_inter, cp_h);
+        else
+            matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
         for (int o = 0; o < cp_inter; o++) {
             float g = ctx->cp_dec_gate[2 * o];
             float u = ctx->cp_dec_gate[2 * o + 1];
@@ -293,7 +306,10 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
         }
 
         /* Down projection + residual */
-        matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
+        if (ctx->metal)
+            qwen_metal_matvec_bf16(ctx->metal, l->gpu_down, proj, ctx->cp_dec_gate, cp_h, cp_inter);
+        else
+            matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
     }
 }

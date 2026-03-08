@@ -93,6 +93,7 @@ int main(int argc, char **argv) {
     int xvector_only = 0;
     const char *save_voice = NULL;
     const char *load_voice = NULL;
+    int use_gpu = 0;
 
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
@@ -119,6 +120,7 @@ int main(int argc, char **argv) {
         {"xvector-only",  no_argument,       0, 1010},
         {"save-voice",    required_argument, 0, 1011},
         {"load-voice",    required_argument, 0, 1012},
+        {"gpu",           no_argument,       0, 1013},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"help",          no_argument,       0, 'h'},
@@ -152,6 +154,7 @@ int main(int argc, char **argv) {
             case 1010: xvector_only = 1; break;
             case 1011: save_voice = optarg; break;
             case 1012: load_voice = optarg; break;
+            case 1013: use_gpu = 1; break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -182,6 +185,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
                 fprintf(stderr, "  --save-voice <path>        Save speaker embedding to file\n");
                 fprintf(stderr, "  --load-voice <path>        Load speaker embedding from file (skip extraction)\n");
+                fprintf(stderr, "  --gpu                      Use Metal GPU acceleration (Apple Silicon only)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -212,6 +216,15 @@ int main(int argc, char **argv) {
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
+    }
+
+    /* Metal GPU init (opt-in) */
+    if (use_gpu) {
+        if (qwen_tts_init_metal(ctx) == 0) {
+            if (!silent) fprintf(stderr, "GPU: Metal acceleration enabled\n");
+        } else {
+            fprintf(stderr, "Warning: Metal GPU not available, using CPU\n");
+        }
     }
 
     /* Set parameters */
