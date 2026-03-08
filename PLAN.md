@@ -278,7 +278,10 @@ timbre from the description instead of using a preset speaker.
 ### 7.2 Further CPU Optimizations
 
 - [ ] `[MED]` Profile 1.7B model bottlenecks (Talker prefill is slow: ~4s for 24 tokens)
-- [ ] `[MED]` NEON/AVX snake activation kernels
+- [x] `[MED]` NEON/AVX snake activation kernels
+  - macOS: Accelerate vvsinf + vDSP for vectorized sin/mul/add
+  - ARM NEON: 4-wide SIMD with scalar sinf per lane + fma
+  - Generic fallback for non-SIMD platforms
 - [ ] `[LOW]` Persistent BF16 KV cache (avoid bf16→f32 conversion)
 
 ---
