@@ -386,7 +386,16 @@ test-voice-design: $(TARGET)
 # Uses an existing sample WAV as reference to clone a voice with new text.
 # Requires: Base model (download with ./download_model.sh --model base-small)
 
-DEMO_REF = samples/voice_clone_english.wav
+# Voice Clone Demo
+# Usage:
+#   make demo-clone                              (uses default sample)
+#   make demo-clone REF=my_voice.wav             (use your own audio)
+#   make demo-clone REF=my_voice.wav TEXT="Hi!"  (custom text too)
+# Output saved to samples/ for easy listening.
+
+REF ?= samples/voice_clone_english.wav
+TEXT ?= I love programming in C, it gives you complete control over the machine.
+TEXT_IT ?= Buongiorno, questa e una dimostrazione della clonazione vocale.
 
 demo-clone: $(TARGET)
 	@echo "=== Voice Clone Demo ==="
@@ -395,33 +404,36 @@ demo-clone: $(TARGET)
 		echo "Download it with: ./download_model.sh --model base-small"; \
 		exit 1; \
 	fi
-	@if [ ! -f $(DEMO_REF) ]; then \
-		echo "Error: $(DEMO_REF) not found"; \
+	@if [ ! -f "$(REF)" ]; then \
+		echo "Error: $(REF) not found"; \
+		echo "Usage: make demo-clone REF=your_audio.wav"; \
 		exit 1; \
 	fi
-	@mkdir -p $(TEST_DIR)
+	@mkdir -p samples
 	@echo ""
-	@echo "Reference audio: $(DEMO_REF)"
+	@echo "Reference audio: $(REF)"
 	@echo ""
 	@echo "--- Cloning voice (English) ---"
 	./$(TARGET) -d $(MODEL_BASE_SMALL) -l English \
-		--text "I love programming in C, it gives you complete control over the machine." \
-		--ref-audio $(DEMO_REF) \
+		--text "$(TEXT)" \
+		--ref-audio "$(REF)" \
 		--xvector-only \
-		-o $(TEST_DIR)/demo_clone_en.wav
+		-o samples/clone_output_en.wav
 	@echo ""
 	@echo "--- Cloning voice (Italian) ---"
 	./$(TARGET) -d $(MODEL_BASE_SMALL) -l Italian \
-		--text "Buongiorno, questa e una dimostrazione della clonazione vocale." \
-		--ref-audio $(DEMO_REF) \
+		--text "$(TEXT_IT)" \
+		--ref-audio "$(REF)" \
 		--xvector-only \
-		-o $(TEST_DIR)/demo_clone_it.wav
+		-o samples/clone_output_it.wav
 	@echo ""
 	@echo "=== Demo complete ==="
+	@echo "Output saved to samples/"
+	@echo ""
 	@echo "Listen:"
-	@echo "  Reference:  afplay $(DEMO_REF)"
-	@echo "  English:    afplay $(TEST_DIR)/demo_clone_en.wav"
-	@echo "  Italian:    afplay $(TEST_DIR)/demo_clone_it.wav"
+	@echo "  Reference:  afplay $(REF)"
+	@echo "  English:    afplay samples/clone_output_en.wav"
+	@echo "  Italian:    afplay samples/clone_output_it.wav"
 
 # Legacy aliases
 test-en: test-small-en

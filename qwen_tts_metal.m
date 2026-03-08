@@ -34,11 +34,15 @@ struct qwen_metal_ctx {
     int weight_cols[MAX_WEIGHT_BUFFERS];
     int n_weights;
 
-    /* Workspace buffers (reused across calls) */
+    /* Workspace buffers (reused across calls, shared memory) */
     id<MTLBuffer> x_buf;       /* input vector */
     id<MTLBuffer> y_buf;       /* output vector */
     int x_buf_size;            /* current capacity in bytes */
     int y_buf_size;
+
+    /* Batched dispatch state */
+    id<MTLCommandBuffer> batch_cmd;
+    id<MTLComputeCommandEncoder> batch_encoder;
 };
 
 /* ========================================================================
@@ -207,7 +211,8 @@ typedef struct {
     int cols;
 } matvec_params_t;
 
-#define THREADS_PER_GROUP 256
+/* Simdgroup shader: 32 threads per row, one simdgroup per row */
+#define SIMD_SIZE 32
 
 static void dispatch_matvec(qwen_metal_ctx_t *ctx,
                             id<MTLComputeCommandEncoder> encoder,
@@ -223,38 +228,39 @@ static void dispatch_matvec(qwen_metal_ctx_t *ctx,
     [encoder setBuffer:y_buf offset:y_offset * (int)sizeof(float) atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-    /* One thread per output row, grouped in blocks of 256 */
-    MTLSize grid = MTLSizeMake(rows, 1, 1);
-    MTLSize group = MTLSizeMake(THREADS_PER_GROUP < rows ? THREADS_PER_GROUP : rows, 1, 1);
+    /* rows simdgroups × 32 threads each */
+    MTLSize grid = MTLSizeMake(rows * SIMD_SIZE, 1, 1);
+    MTLSize group = MTLSizeMake(SIMD_SIZE, 1, 1);
 
     [encoder dispatchThreads:grid threadsPerThreadgroup:group];
 }
+
+/* ── Single matvec with direct shared-memory I/O ────────────────────── */
 
 void qwen_metal_matvec_bf16(qwen_metal_ctx_t *ctx, int weight_handle,
                             float *y, const float *x, int rows, int cols) {
     if (!ctx || weight_handle < 0 || weight_handle >= ctx->n_weights) return;
 
-    @autoreleasepool {
-        ensure_workspace(ctx, cols * sizeof(float), rows * sizeof(float));
+    ensure_workspace(ctx, cols * (int)sizeof(float), rows * (int)sizeof(float));
 
-        /* Copy input to GPU */
-        memcpy([ctx->x_buf contents], x, cols * sizeof(float));
+    /* Write input directly to shared buffer (unified memory — no DMA copy) */
+    memcpy([ctx->x_buf contents], x, cols * sizeof(float));
 
-        /* Encode and submit */
-        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
 
-        dispatch_matvec(ctx, encoder, ctx->weight_bufs[weight_handle],
-                        ctx->x_buf, ctx->y_buf, 0, rows, cols);
+    dispatch_matvec(ctx, encoder, ctx->weight_bufs[weight_handle],
+                    ctx->x_buf, ctx->y_buf, 0, rows, cols);
 
-        [encoder endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+    [encoder endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
 
-        /* Copy output back */
-        memcpy(y, [ctx->y_buf contents], rows * sizeof(float));
-    }
+    /* Read output directly from shared buffer */
+    memcpy(y, [ctx->y_buf contents], rows * sizeof(float));
 }
+
+/* ── Batched QKV: 3 matvecs in 1 command buffer ────────────────────── */
 
 void qwen_metal_matvec_bf16_qkv(qwen_metal_ctx_t *ctx,
                                  int wq_handle, int wk_handle, int wv_handle,
@@ -263,34 +269,79 @@ void qwen_metal_matvec_bf16_qkv(qwen_metal_ctx_t *ctx,
                                  int q_dim, int kv_dim) {
     if (!ctx) return;
 
-    @autoreleasepool {
-        int total_out = q_dim + 2 * kv_dim;
-        ensure_workspace(ctx, in_dim * sizeof(float), total_out * sizeof(float));
+    int total_out = q_dim + 2 * kv_dim;
+    ensure_workspace(ctx, in_dim * (int)sizeof(float), total_out * (int)sizeof(float));
 
-        /* Copy input once */
-        memcpy([ctx->x_buf contents], x, in_dim * sizeof(float));
+    memcpy([ctx->x_buf contents], x, in_dim * sizeof(float));
 
-        /* Encode all 3 matvecs in a single command buffer */
-        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
 
-        dispatch_matvec(ctx, encoder, ctx->weight_bufs[wq_handle],
-                        ctx->x_buf, ctx->y_buf, 0, q_dim, in_dim);
-        dispatch_matvec(ctx, encoder, ctx->weight_bufs[wk_handle],
-                        ctx->x_buf, ctx->y_buf, q_dim, kv_dim, in_dim);
-        dispatch_matvec(ctx, encoder, ctx->weight_bufs[wv_handle],
-                        ctx->x_buf, ctx->y_buf, q_dim + kv_dim, kv_dim, in_dim);
+    dispatch_matvec(ctx, encoder, ctx->weight_bufs[wq_handle],
+                    ctx->x_buf, ctx->y_buf, 0, q_dim, in_dim);
+    dispatch_matvec(ctx, encoder, ctx->weight_bufs[wk_handle],
+                    ctx->x_buf, ctx->y_buf, q_dim, kv_dim, in_dim);
+    dispatch_matvec(ctx, encoder, ctx->weight_bufs[wv_handle],
+                    ctx->x_buf, ctx->y_buf, q_dim + kv_dim, kv_dim, in_dim);
 
-        [encoder endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+    [encoder endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
 
-        /* Copy outputs */
-        const float *out = (const float *)[ctx->y_buf contents];
-        memcpy(q, out, q_dim * sizeof(float));
-        memcpy(k, out + q_dim, kv_dim * sizeof(float));
-        memcpy(v, out + q_dim + kv_dim, kv_dim * sizeof(float));
-    }
+    const float *out = (const float *)[ctx->y_buf contents];
+    memcpy(q, out, q_dim * sizeof(float));
+    memcpy(k, out + q_dim, kv_dim * sizeof(float));
+    memcpy(v, out + q_dim + kv_dim, kv_dim * sizeof(float));
+}
+
+/* ========================================================================
+ * Batched dispatch API
+ * ======================================================================== */
+
+void qwen_metal_begin(qwen_metal_ctx_t *ctx) {
+    if (!ctx) return;
+    ctx->batch_cmd = [ctx->queue commandBuffer];
+    ctx->batch_encoder = [ctx->batch_cmd computeCommandEncoder];
+}
+
+void qwen_metal_encode_matvec(qwen_metal_ctx_t *ctx, int weight_handle,
+                               int y_offset, int x_offset,
+                               int rows, int cols) {
+    if (!ctx || !ctx->batch_encoder) return;
+    if (weight_handle < 0 || weight_handle >= ctx->n_weights) return;
+
+    matvec_params_t params = { rows, cols };
+
+    [ctx->batch_encoder setComputePipelineState:ctx->matvec_pipeline];
+    [ctx->batch_encoder setBuffer:ctx->weight_bufs[weight_handle] offset:0 atIndex:0];
+    [ctx->batch_encoder setBuffer:ctx->x_buf offset:x_offset * sizeof(float) atIndex:1];
+    [ctx->batch_encoder setBuffer:ctx->y_buf offset:y_offset * sizeof(float) atIndex:2];
+    [ctx->batch_encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+    MTLSize grid = MTLSizeMake(rows * SIMD_SIZE, 1, 1);
+    MTLSize group = MTLSizeMake(SIMD_SIZE, 1, 1);
+    [ctx->batch_encoder dispatchThreads:grid threadsPerThreadgroup:group];
+}
+
+void qwen_metal_sync(qwen_metal_ctx_t *ctx) {
+    if (!ctx || !ctx->batch_encoder) return;
+    [ctx->batch_encoder endEncoding];
+    [ctx->batch_cmd commit];
+    [ctx->batch_cmd waitUntilCompleted];
+    ctx->batch_encoder = nil;
+    ctx->batch_cmd = nil;
+}
+
+float *qwen_metal_get_x(qwen_metal_ctx_t *ctx) {
+    return ctx ? (float *)[ctx->x_buf contents] : NULL;
+}
+
+float *qwen_metal_get_y(qwen_metal_ctx_t *ctx) {
+    return ctx ? (float *)[ctx->y_buf contents] : NULL;
+}
+
+void qwen_metal_ensure_workspace(qwen_metal_ctx_t *ctx, int x_bytes, int y_bytes) {
+    if (ctx) ensure_workspace(ctx, x_bytes, y_bytes);
 }
 
 #endif /* ENABLE_METAL */
