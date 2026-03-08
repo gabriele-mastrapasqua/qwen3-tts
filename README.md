@@ -99,6 +99,24 @@ aplay hello.wav
 cp hello.wav /mnt/c/Users/$USER/Desktop/
 ```
 
+### Metal GPU (Apple Silicon) — Experimental
+
+On macOS with Apple Silicon (M1/M2/M3/M4), you can enable Metal GPU acceleration
+for the matrix-vector operations in the Talker and Code Predictor:
+
+```bash
+make metal
+
+# Run with GPU acceleration
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --gpu -o hello.wav
+```
+
+> **Experimental:** The Metal backend is functional and produces correct audio, but
+> per-dispatch overhead currently makes it slower than the optimized NEON CPU path
+> for the 0.6B model. It may show benefits on the 1.7B model (4x larger matrices).
+> Without `--gpu`, the CPU path is always used regardless of build type.
+> Future work: batch GPU dispatches to reduce overhead.
+
 ### Other build targets
 
 ```bash
@@ -148,6 +166,7 @@ Optional:
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
   --stream-chunk <n>         Frames per stream chunk (default: 10 = 0.8s)
+  --gpu                      Use Metal GPU acceleration (Apple Silicon, requires make metal)
   --silent                   Suppress status output
   --debug                    Verbose diagnostics
 ```

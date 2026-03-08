@@ -278,12 +278,18 @@ timbre from the description instead of using a preset speaker.
 
 ## Phase 7: Performance
 
-### 7.1 Metal GPU Offload (biggest remaining win)
+### 7.1 Metal GPU Offload
 
-- [ ] `[HIGH]` Metal compute shaders for bf16 matvec (Talker + CP)
-  - Expected 3-5x speedup from GPU memory bandwidth
-  - Only for macOS / Apple Silicon
-- [ ] `[MED]` Metal for speech decoder convolutions
+- [x] `[HIGH]` Metal compute shaders for bf16 matvec (Talker + CP)
+  - `make metal` build target, `--gpu` CLI flag, CPU fallback when not enabled
+  - Weights uploaded to GPU at init (200 matrices for 0.6B)
+  - Correct output verified, but per-dispatch overhead makes 0.6B slower than NEON
+  - Needs batched dispatch or full GPU transformer step for actual speedup
+- [ ] `[MED]` Optimize Metal: batch dispatches per layer or full GPU transformer step
+  - Reduce command buffer overhead (currently one per matvec)
+  - Expected to unlock 3-5x speedup, especially for 1.7B
+- [ ] `[LOW]` Metal for speech decoder convolutions
+- [ ] `[LOW]` CUDA/HIP backend stubs (for future NVIDIA/AMD support)
 
 ### 7.2 Further CPU Optimizations
 

@@ -377,7 +377,59 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->rope_cos); free(ctx->rope_sin); free(ctx->rope_inv_freq);
     free(ctx->cp_rope_cos); free(ctx->cp_rope_sin);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
+    qwen_metal_free(ctx->metal);
     free(ctx);
+}
+
+int qwen_tts_init_metal(qwen_tts_ctx_t *ctx) {
+    if (!ctx) return -1;
+
+    ctx->metal = qwen_metal_init();
+    if (!ctx->metal) return -1;
+
+    int h = ctx->config.hidden_size;
+    int q_dim = ctx->config.num_heads * ctx->config.head_dim;
+    int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
+    int inter = ctx->config.intermediate_size;
+
+    /* Upload Talker layer weights */
+    for (int i = 0; i < ctx->config.num_layers; i++) {
+        qwen_talker_layer_t *l = &ctx->layers[i];
+        l->gpu_wq = qwen_metal_upload_weight(ctx->metal, l->wq_bf16, q_dim, h);
+        l->gpu_wk = qwen_metal_upload_weight(ctx->metal, l->wk_bf16, kv_dim, h);
+        l->gpu_wv = qwen_metal_upload_weight(ctx->metal, l->wv_bf16, kv_dim, h);
+        l->gpu_wo = qwen_metal_upload_weight(ctx->metal, l->wo_bf16, h, q_dim);
+        l->gpu_gate_up_fused = qwen_metal_upload_weight(ctx->metal, l->gate_up_fused_bf16, 2 * inter, h);
+        l->gpu_down = qwen_metal_upload_weight(ctx->metal, l->down_bf16, h, inter);
+    }
+
+    int cp_h = ctx->config.cp_hidden_size;
+    int cp_q_dim = ctx->config.cp_num_heads * ctx->config.cp_head_dim;
+    int cp_kv_dim = ctx->config.cp_num_kv_heads * ctx->config.cp_head_dim;
+    int cp_inter = ctx->config.cp_intermediate_size;
+
+    /* Upload Code Predictor layer weights */
+    for (int i = 0; i < ctx->config.cp_num_layers; i++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        l->gpu_wq = qwen_metal_upload_weight(ctx->metal, l->wq_bf16, cp_q_dim, cp_h);
+        l->gpu_wk = qwen_metal_upload_weight(ctx->metal, l->wk_bf16, cp_kv_dim, cp_h);
+        l->gpu_wv = qwen_metal_upload_weight(ctx->metal, l->wv_bf16, cp_kv_dim, cp_h);
+        l->gpu_wo = qwen_metal_upload_weight(ctx->metal, l->wo_bf16, cp_h, cp_q_dim);
+        l->gpu_gate_up_fused = qwen_metal_upload_weight(ctx->metal, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
+        l->gpu_down = qwen_metal_upload_weight(ctx->metal, l->down_bf16, cp_h, cp_inter);
+    }
+
+    /* Upload codec head and embedding */
+    ctx->gpu_codec_head = qwen_metal_upload_weight(ctx->metal, ctx->codec_head_bf16,
+                                                    ctx->config.codec_vocab_size, h);
+    ctx->gpu_codec_embedding = qwen_metal_upload_weight(ctx->metal, ctx->codec_embedding_bf16,
+                                                         ctx->config.codec_vocab_size, h);
+
+    if (!ctx->silent) {
+        int n_mats = (ctx->config.num_layers + ctx->config.cp_num_layers) * 6 + 2;
+        fprintf(stderr, "Metal: uploaded %d weight matrices to GPU\n", n_mats);
+    }
+    return 0;
 }
 
 void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata) {
