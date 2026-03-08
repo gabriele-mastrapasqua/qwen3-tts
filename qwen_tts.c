@@ -458,8 +458,16 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      */
     int32_t *text_tokens = NULL;
     int text_token_len = 0;
+    int32_t *ref_text_tokens = NULL;
+    int ref_text_token_len = 0;
     if (tok) {
         text_tokens = qwen_tokenizer_encode(tok, text, &text_token_len);
+        /* ICL mode: also tokenize reference text */
+        if (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text) {
+            ref_text_tokens = qwen_tokenizer_encode(tok, ctx->ref_text, &ref_text_token_len);
+            if (!ctx->silent && ref_text_tokens)
+                fprintf(stderr, "Ref text: \"%s\" (%d tokens)\n", ctx->ref_text, ref_text_token_len);
+        }
         qwen_tokenizer_free(tok);
     }
     if (!text_tokens || text_token_len == 0) {
@@ -540,20 +548,57 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_PAD, codec_pad_embed);
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_BOS, codec_bos_embed);
 
+    /* === ICL mode: encode reference audio === */
+    int *ref_codes = NULL;
+    int ref_n_frames = 0;
+    int icl_mode = (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text
+                    && ref_text_tokens && ref_text_token_len > 0);
+    if (icl_mode) {
+        float *ref_audio_samples = NULL;
+        int ref_n_samples = 0, ref_sr = 0;
+        if (qwen_read_wav(ctx->ref_audio_path, &ref_audio_samples, &ref_n_samples, &ref_sr) != 0) {
+            fprintf(stderr, "Error: failed to read reference audio %s\n", ctx->ref_audio_path);
+            icl_mode = 0;
+        } else {
+            if (ref_sr != QWEN_TTS_SAMPLE_RATE && !ctx->silent)
+                fprintf(stderr, "Warning: ref audio sample rate %d, expected %d\n",
+                        ref_sr, QWEN_TTS_SAMPLE_RATE);
+            if (qwen_speech_encoder_encode(ctx, ref_audio_samples, ref_n_samples,
+                                            &ref_codes, &ref_n_frames) != 0) {
+                fprintf(stderr, "Error: speech encoder failed\n");
+                icl_mode = 0;
+            }
+            free(ref_audio_samples);
+        }
+    }
+
     /*
      * Build prefill:
-     *   [instruct(I)] + role(3) + pad_codec(codec_len-1) + text_content+eos(N+1) + final(1)
      *
      * Section 0: Instruct tokens (text-only, NO codec pairing) — only if instruct provided
      * Section 1: Role prefix (3 positions) - text-only, NO codec pairing
      * Section 2: tts_pad*(codec_len-2) + tts_bos  paired with  codec[0..codec_len-2]
-     * Section 3: text_content[0..N-1] + tts_eos  paired with  codec_pad * (N+1)
-     * Section 4: tts_pad + codec_bos  (1 position)
+     *
+     * Normal mode (non-ICL):
+     *   Section 3: text_content[0..N-1] + tts_eos  paired with  codec_pad * (N+1)
+     *   Section 4: tts_pad + codec_bos  (1 position)
+     *
+     * ICL mode:
+     *   Section 3': ref_text + target_text + tts_eos  paired with  codec_pad
+     *   Section 4': tts_pad * (ref_n_frames+1)  paired with  codec_bos + ref_code_embeds
      */
     int sec2_len = codec_len - 1;  /* codec tokens without the last (BOS) */
-    int sec3_len = text_content_len + 1;  /* text tokens + tts_eos */
     int inst_len = instruct_tokens ? instruct_token_len : 0;
-    int prefill_len = inst_len + role_len + sec2_len + sec3_len + 1;
+
+    int sec3_len, sec4_len;
+    if (icl_mode) {
+        sec3_len = ref_text_token_len + text_content_len + 1;  /* ref_text + text + eos */
+        sec4_len = ref_n_frames + 1;                           /* bos + ref_codes */
+    } else {
+        sec3_len = text_content_len + 1;  /* text + eos */
+        sec4_len = 1;                     /* bos */
+    }
+    int prefill_len = inst_len + role_len + sec2_len + sec3_len + sec4_len;
 
     float *input_embeds = (float *)calloc((int64_t)prefill_len * h, sizeof(float));
     float *tmp_embed = (float *)malloc(h * sizeof(float));
@@ -597,33 +642,85 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         pos++;
     }
 
-    /* Section 3: text content + tts_eos, all paired with codec_pad */
-    for (int i = 0; i < sec3_len; i++) {
-        float *dst = input_embeds + (int64_t)pos * h;
-        /* Text side */
-        if (i < text_content_len) {
-            embed_one_text_token(ctx, all_tokens[role_len + i], dst);
-        } else {
-            /* Last position of section 3: tts_eos */
-            memcpy(dst, tts_eos_embed, h * sizeof(float));
+    if (icl_mode) {
+        /* Section 3' (ICL): ref_text + target_text + tts_eos, all paired with codec_pad */
+        for (int i = 0; i < sec3_len; i++) {
+            float *dst = input_embeds + (int64_t)pos * h;
+            if (i < ref_text_token_len) {
+                /* Reference text tokens */
+                embed_one_text_token(ctx, ref_text_tokens[i], dst);
+            } else if (i < ref_text_token_len + text_content_len) {
+                /* Target text tokens */
+                embed_one_text_token(ctx, all_tokens[role_len + (i - ref_text_token_len)], dst);
+            } else {
+                /* tts_eos at the end */
+                memcpy(dst, tts_eos_embed, h * sizeof(float));
+            }
+            for (int j = 0; j < h; j++) dst[j] += codec_pad_embed[j];
+            pos++;
         }
-        /* Codec side: codec_pad */
-        for (int j = 0; j < h; j++) dst[j] += codec_pad_embed[j];
-        pos++;
-    }
 
-    /* Section 4: tts_pad + codec_bos (final position) */
-    {
-        float *dst = input_embeds + (int64_t)pos * h;
-        memcpy(dst, tts_pad_embed, h * sizeof(float));
-        for (int j = 0; j < h; j++) dst[j] += codec_bos_embed[j];
-        pos++;
+        /* Section 4' (ICL): tts_pad + (codec_bos + ref_code_embeds) */
+        for (int i = 0; i < sec4_len; i++) {
+            float *dst = input_embeds + (int64_t)pos * h;
+            /* Text side: tts_pad */
+            memcpy(dst, tts_pad_embed, h * sizeof(float));
+            /* Codec side */
+            if (i == 0) {
+                /* First position: codec_bos */
+                for (int j = 0; j < h; j++) dst[j] += codec_bos_embed[j];
+            } else {
+                /* Ref code frame: sum 16 codebook embeddings */
+                int frame = i - 1;
+                /* Codebook 0: talker's codec_embedding */
+                int code0 = ref_codes[frame * 16];
+                lookup_codec_embed(ctx, code0, tmp_embed);
+                for (int j = 0; j < h; j++) dst[j] += tmp_embed[j];
+                /* Codebooks 1-15: CP codec embeddings */
+                for (int g = 0; g < 15; g++) {
+                    int code_g = ref_codes[frame * 16 + g + 1];
+                    if (ctx->cp_codec_emb_bf16[g] && code_g >= 0
+                        && code_g < ctx->config.codebook_size) {
+                        const uint16_t *emb = ctx->cp_codec_emb_bf16[g]
+                                              + (int64_t)code_g * h;
+                        for (int j = 0; j < h; j++)
+                            dst[j] += bf16_to_f32(emb[j]);
+                    }
+                }
+            }
+            pos++;
+        }
+    } else {
+        /* Section 3: text content + tts_eos, all paired with codec_pad */
+        for (int i = 0; i < sec3_len; i++) {
+            float *dst = input_embeds + (int64_t)pos * h;
+            /* Text side */
+            if (i < text_content_len) {
+                embed_one_text_token(ctx, all_tokens[role_len + i], dst);
+            } else {
+                /* Last position of section 3: tts_eos */
+                memcpy(dst, tts_eos_embed, h * sizeof(float));
+            }
+            /* Codec side: codec_pad */
+            for (int j = 0; j < h; j++) dst[j] += codec_pad_embed[j];
+            pos++;
+        }
+
+        /* Section 4: tts_pad + codec_bos (final position) */
+        {
+            float *dst = input_embeds + (int64_t)pos * h;
+            memcpy(dst, tts_pad_embed, h * sizeof(float));
+            for (int j = 0; j < h; j++) dst[j] += codec_bos_embed[j];
+            pos++;
+        }
     }
 
     free(all_tokens);
     free(tmp_embed);
     free(tts_bos_embed);
     free(tts_eos_embed);
+    free(ref_text_tokens);
+    free(ref_codes);
 
     free(codec_pad_embed);
     free(codec_bos_embed);
@@ -635,8 +732,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     ctx->xvector_only ? " only" : " + ICL");
         else
             fprintf(stderr, "Speaker: %d, Language: %d\n", ctx->speaker_id, ctx->language_id);
-        fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, text+eos=%d, final=1)\n",
-                prefill_len, inst_len, role_len, sec2_len, sec3_len);
+        if (icl_mode)
+            fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, "
+                    "icl_text=%d, icl_codes=%d)\n",
+                    prefill_len, inst_len, role_len, sec2_len, sec3_len, sec4_len);
+        else
+            fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, "
+                    "text+eos=%d, final=%d)\n",
+                    prefill_len, inst_len, role_len, sec2_len, sec3_len, sec4_len);
     }
 
     /* Debug: check speech decoder weights before prefill */

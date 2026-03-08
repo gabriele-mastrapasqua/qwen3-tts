@@ -31,7 +31,8 @@ SRCS = main.c \
        qwen_tts_tokenizer.c \
        qwen_tts_safetensors.c \
        qwen_tts_server.c \
-       qwen_tts_voice_clone.c
+       qwen_tts_voice_clone.c \
+       qwen_tts_speech_encoder.c
 
 OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts_bin

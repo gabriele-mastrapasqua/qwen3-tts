@@ -473,6 +473,11 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text,
 /* Write WAV file */
 int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate);
 
+/* Speech encoder: audio → codec codes (for ICL voice clone) */
+int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx);
+int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_samples,
+                                int **codes_out, int *n_frames_out);
+
 #ifdef __cplusplus
 }
 #endif

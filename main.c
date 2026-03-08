@@ -298,6 +298,14 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* If ICL mode (not xvector_only), load the speech encoder for ref audio encoding */
+        if (!ctx->xvector_only && ref_audio) {
+            if (qwen_speech_encoder_load(ctx) != 0) {
+                fprintf(stderr, "Warning: failed to load speech encoder, falling back to x-vector only\n");
+                ctx->xvector_only = 1;
+            }
+        }
+
         if (!silent) {
             if (ctx->xvector_only)
                 fprintf(stderr, "Mode: x-vector only (no reference transcription)\n");
