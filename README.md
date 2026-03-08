@@ -114,6 +114,8 @@ Optional:
   --top-p <f>                Top-p nucleus sampling (default: 1.0)
   --rep-penalty <f>          Repetition penalty (default: 1.05)
   --max-tokens <n>           Max audio tokens (default: 8192)
+  --max-duration <secs>      Max audio duration in seconds
+  --seed <n>                 Random seed for reproducible output
   -j, --threads <n>          Worker threads (default: 4)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)

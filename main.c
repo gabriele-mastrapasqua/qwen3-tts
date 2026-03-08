@@ -85,6 +85,8 @@ int main(int argc, char **argv) {
     int do_stdout = 0;
     int stream_chunk = 10;
     int serve_port = 0;  /* 0 = not serving */
+    int seed = -1;       /* -1 = use time-based seed */
+    float max_duration = 0;  /* 0 = no limit */
 
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
@@ -103,6 +105,8 @@ int main(int argc, char **argv) {
         {"stdout",        no_argument,       0, 1002},
         {"stream-chunk",  required_argument, 0, 1003},
         {"serve",         required_argument, 0, 1004},
+        {"seed",          required_argument, 0, 1005},
+        {"max-duration",  required_argument, 0, 1006},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"help",          no_argument,       0, 'h'},
@@ -128,6 +132,8 @@ int main(int argc, char **argv) {
             case 1002: do_stdout = 1; do_stream = 1; break;  /* --stdout implies --stream */
             case 1003: stream_chunk = atoi(optarg); break;
             case 1004: serve_port = atoi(optarg); break;
+            case 1005: seed = atoi(optarg); break;
+            case 1006: max_duration = (float)atof(optarg); break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -151,6 +157,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --stdout                   Output raw s16le PCM to stdout (implies --stream)\n");
                 fprintf(stderr, "  --stream-chunk <n>         Frames per stream chunk (default: 10)\n");
                 fprintf(stderr, "  --serve <port>             Start HTTP server on port\n");
+                fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
+                fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -194,6 +202,8 @@ int main(int argc, char **argv) {
 
     if (speaker_id >= 0) ctx->speaker_id = speaker_id;
     if (language) ctx->language_id = qwen_tts_language_id(language);
+    if (seed >= 0) ctx->seed = (uint32_t)seed;
+    if (max_duration > 0) ctx->max_tokens = (int)(max_duration * 12.5f);
     if (instruct) {
         if (ctx->config.hidden_size < 2048) {
             fprintf(stderr, "Warning: --instruct is only supported on 1.7B model (ignored)\n");
