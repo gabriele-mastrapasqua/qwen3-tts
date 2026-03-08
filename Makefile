@@ -29,7 +29,8 @@ SRCS = main.c \
        qwen_tts_audio.c \
        qwen_tts_sampling.c \
        qwen_tts_tokenizer.c \
-       qwen_tts_safetensors.c
+       qwen_tts_safetensors.c \
+       qwen_tts_server.c
 
 OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts_bin
@@ -66,7 +67,7 @@ blas: $(TARGET)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Header dependencies
-main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_kernels.h
+main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_kernels.h qwen_tts_server.h
 qwen_tts.o: qwen_tts.c qwen_tts.h qwen_tts_kernels.h qwen_tts_safetensors.h qwen_tts_tokenizer.h qwen_tts_audio.h
 qwen_tts_talker.o: qwen_tts_talker.c qwen_tts.h qwen_tts_kernels.h
 qwen_tts_code_predictor.o: qwen_tts_code_predictor.c qwen_tts.h qwen_tts_kernels.h
@@ -79,6 +80,7 @@ qwen_tts_audio.o: qwen_tts_audio.c qwen_tts_audio.h
 qwen_tts_sampling.o: qwen_tts_sampling.c qwen_tts.h
 qwen_tts_tokenizer.o: qwen_tts_tokenizer.c qwen_tts_tokenizer.h
 qwen_tts_safetensors.o: qwen_tts_safetensors.c qwen_tts_safetensors.h
+qwen_tts_server.o: qwen_tts_server.c qwen_tts_server.h qwen_tts.h
 
 # Clean
 clean:
@@ -256,11 +258,39 @@ test-all: test-small test-large test-regression
 	@echo "  All tests passed (0.6B + 1.7B)"
 	@echo "========================================="
 
+# ── HTTP Server ──
+
+serve: $(TARGET)
+	./$(TARGET) -d $(MODEL_SMALL) --serve 8080
+
+test-serve: $(TARGET)
+	@echo "--- HTTP Server test ---"
+	@mkdir -p $(TEST_DIR)
+	@./$(TARGET) -d $(MODEL_SMALL) --serve 8090 &>/dev/null & SERVER_PID=$$!; \
+	 sleep 4; \
+	 echo "  Testing /v1/health..."; \
+	 HEALTH=$$(curl -s http://localhost:8090/v1/health); \
+	 if ! echo "$$HEALTH" | grep -q '"ok"'; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: health check"; exit 1; fi; \
+	 echo "  Testing /v1/speakers..."; \
+	 SPEAKERS=$$(curl -s http://localhost:8090/v1/speakers); \
+	 if ! echo "$$SPEAKERS" | grep -q '"ryan"'; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: speakers"; exit 1; fi; \
+	 echo "  Testing /v1/tts..."; \
+	 curl -s -X POST http://localhost:8090/v1/tts \
+	   -H "Content-Type: application/json" \
+	   -d '{"text":"Test.","speaker":"ryan"}' \
+	   -o $(TEST_DIR)/serve_test.wav; \
+	 if [ ! -f $(TEST_DIR)/serve_test.wav ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: no WAV"; exit 1; fi; \
+	 WAV_SIZE=$$(stat -f%z $(TEST_DIR)/serve_test.wav 2>/dev/null || stat -c%s $(TEST_DIR)/serve_test.wav 2>/dev/null); \
+	 if [ "$$WAV_SIZE" -le 44 ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: empty WAV"; exit 1; fi; \
+	 kill $$SERVER_PID 2>/dev/null; \
+	 echo "PASS: HTTP Server test"
+	@echo ""
+
 # Legacy aliases
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info \
+.PHONY: all help blas clean debug info serve test-serve \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
         test-regression test-all test-en test-it-ryan

@@ -91,6 +91,8 @@ make test-small       # Run 0.6B tests (English, Italian, multiple speakers)
 make test-large       # Run 1.7B tests (config check, English, Italian, instruct styles)
 make test-regression  # Cross-model regression checks (safetensors, config parsing)
 make test-all         # Run everything (0.6B + 1.7B + regression)
+make test-serve       # HTTP server integration test
+make serve            # Start HTTP server on port 8080
 ```
 
 ## Usage
@@ -178,6 +180,51 @@ Optional:
 > **Note:** Streaming decodes audio progressively every N frames (default: 10 = 0.8s).
 > First audio is available within ~1 second. `--stdout` outputs raw signed 16-bit
 > little-endian mono PCM at 24 kHz — pipe it to any audio player.
+
+### HTTP Server
+
+```bash
+# Start server (model loaded once, shared across requests)
+./qwen_tts -d qwen3-tts-0.6b --serve 8080
+
+# Generate speech (returns WAV)
+curl -X POST http://localhost:8080/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world","speaker":"ryan","language":"English"}' \
+  -o output.wav
+
+# Streaming (returns chunked raw PCM as it generates)
+curl -X POST http://localhost:8080/v1/tts/stream \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world","speaker":"ryan"}' \
+  -o output.raw
+
+# OpenAI-compatible endpoint (drop-in replacement)
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"Hello world","voice":"ryan"}' \
+  -o output.wav
+
+# List speakers
+curl http://localhost:8080/v1/speakers
+
+# Health check
+curl http://localhost:8080/v1/health
+```
+
+The full request body for `/v1/tts`:
+```json
+{
+  "text": "Hello world",
+  "speaker": "ryan",
+  "language": "English",
+  "instruct": "Speak cheerfully",
+  "temperature": 0.9,
+  "top_k": 50,
+  "top_p": 1.0,
+  "rep_penalty": 1.05
+}
+```
 
 ## How It Works
 

@@ -5,6 +5,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_audio.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +84,7 @@ int main(int argc, char **argv) {
     int do_stream = 0;
     int do_stdout = 0;
     int stream_chunk = 10;
+    int serve_port = 0;  /* 0 = not serving */
 
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
@@ -100,6 +102,7 @@ int main(int argc, char **argv) {
         {"stream",        no_argument,       0, 1001},
         {"stdout",        no_argument,       0, 1002},
         {"stream-chunk",  required_argument, 0, 1003},
+        {"serve",         required_argument, 0, 1004},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"help",          no_argument,       0, 'h'},
@@ -124,6 +127,7 @@ int main(int argc, char **argv) {
             case 1001: do_stream = 1; break;
             case 1002: do_stdout = 1; do_stream = 1; break;  /* --stdout implies --stream */
             case 1003: stream_chunk = atoi(optarg); break;
+            case 1004: serve_port = atoi(optarg); break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -146,14 +150,19 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --stream                   Stream audio (decode during generation)\n");
                 fprintf(stderr, "  --stdout                   Output raw s16le PCM to stdout (implies --stream)\n");
                 fprintf(stderr, "  --stream-chunk <n>         Frames per stream chunk (default: 10)\n");
+                fprintf(stderr, "  --serve <port>             Start HTTP server on port\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
         }
     }
 
-    if (!model_dir || !text) {
-        fprintf(stderr, "Error: --model-dir and --text are required\n");
+    if (!model_dir) {
+        fprintf(stderr, "Error: --model-dir is required\n");
+        return 1;
+    }
+    if (!text && serve_port <= 0) {
+        fprintf(stderr, "Error: --text or --serve is required\n");
         return 1;
     }
 
@@ -191,6 +200,13 @@ int main(int argc, char **argv) {
         } else {
             ctx->instruct = strdup(instruct);
         }
+    }
+
+    /* Server mode: start HTTP server and block */
+    if (serve_port > 0) {
+        int ret = qwen_tts_serve(ctx, serve_port);
+        qwen_tts_unload(ctx);
+        return ret;
     }
 
     /* Streaming setup */
