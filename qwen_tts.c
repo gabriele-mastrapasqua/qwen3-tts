@@ -425,9 +425,56 @@ int qwen_tts_init_metal(qwen_tts_ctx_t *ctx) {
     ctx->gpu_codec_embedding = qwen_metal_upload_weight(ctx->metal, ctx->codec_embedding_bf16,
                                                          ctx->config.codec_vocab_size, h);
 
+    /* ── Full GPU step: upload norm weights ── */
+
+    /* Talker norm weights */
+    for (int i = 0; i < ctx->config.num_layers; i++) {
+        qwen_talker_layer_t *l = &ctx->layers[i];
+        l->gpu_input_norm = qwen_metal_upload_f32(ctx->metal, l->input_norm, h);
+        l->gpu_post_attn_norm = qwen_metal_upload_f32(ctx->metal, l->post_attn_norm, h);
+        l->gpu_q_norm = qwen_metal_upload_f32(ctx->metal, l->q_norm, ctx->config.head_dim);
+        l->gpu_k_norm = qwen_metal_upload_f32(ctx->metal, l->k_norm, ctx->config.head_dim);
+    }
+    ctx->gpu_talker_final_norm = qwen_metal_upload_f32(ctx->metal, ctx->talker_norm, h);
+
+    /* CP norm weights */
+    for (int i = 0; i < ctx->config.cp_num_layers; i++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        l->gpu_input_norm = qwen_metal_upload_f32(ctx->metal, l->input_norm, cp_h);
+        l->gpu_post_attn_norm = qwen_metal_upload_f32(ctx->metal, l->post_attn_norm, cp_h);
+        l->gpu_q_norm = qwen_metal_upload_f32(ctx->metal, l->q_norm, ctx->config.cp_head_dim);
+        l->gpu_k_norm = qwen_metal_upload_f32(ctx->metal, l->k_norm, ctx->config.cp_head_dim);
+    }
+    ctx->gpu_cp_norm = qwen_metal_upload_f32(ctx->metal, ctx->cp_norm, cp_h);
+
+    /* RoPE tables */
+    int half_dim = ctx->config.head_dim / 2;
+    ctx->gpu_rope_cos = qwen_metal_upload_f32(ctx->metal, ctx->rope_cos,
+                                               ctx->rope_cache_len * half_dim);
+    ctx->gpu_rope_sin = qwen_metal_upload_f32(ctx->metal, ctx->rope_sin,
+                                               ctx->rope_cache_len * half_dim);
+
+    int cp_half_dim = ctx->config.cp_head_dim / 2;
+    ctx->gpu_cp_rope_cos = qwen_metal_upload_f32(ctx->metal, ctx->cp_rope_cos,
+                                                   ctx->cp_rope_cache_len * cp_half_dim);
+    ctx->gpu_cp_rope_sin = qwen_metal_upload_f32(ctx->metal, ctx->cp_rope_sin,
+                                                   ctx->cp_rope_cache_len * cp_half_dim);
+
+    /* ── Allocate GPU KV caches ── */
+    int talker_kv_max = ctx->kv_max;  /* Use same initial size as CPU */
+    qwen_metal_alloc_kv_cache(ctx->metal, 0, ctx->config.num_layers, talker_kv_max, kv_dim);
+    qwen_metal_alloc_kv_cache(ctx->metal, 1, ctx->config.cp_num_layers, ctx->cp_kv_max, cp_kv_dim);
+
+    /* ── Allocate working buffers (max dims across talker and CP) ── */
+    int max_hidden = h > cp_h ? h : cp_h;
+    int max_q_dim = q_dim > cp_q_dim ? q_dim : cp_q_dim;
+    int max_kv_dim = kv_dim > cp_kv_dim ? kv_dim : cp_kv_dim;
+    int max_inter = inter > cp_inter ? inter : cp_inter;
+    qwen_metal_alloc_work_buffers(ctx->metal, max_hidden, max_q_dim, max_kv_dim, max_inter);
+
     if (!ctx->silent) {
-        int n_mats = (ctx->config.num_layers + ctx->config.cp_num_layers) * 6 + 2;
-        fprintf(stderr, "Metal: uploaded %d weight matrices to GPU\n", n_mats);
+        int n_bufs = (ctx->config.num_layers + ctx->config.cp_num_layers) * 10 + 7;
+        fprintf(stderr, "Metal: uploaded %d GPU buffers (weights + norms + RoPE)\n", n_bufs);
     }
     return 0;
 }
@@ -811,6 +858,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     /* Debug: check speech decoder weights after prefill */
     if (ctx->debug && ctx->speech_dec.pre_conv_weight) {
         fprintf(stderr, "[CORR] post-prefill: pre_conv_w[0]=%.6f\n", ctx->speech_dec.pre_conv_weight[0]);
+    }
+
+    /* Sync CPU KV cache to GPU after prefill (for full GPU decode) */
+    if (ctx->metal && qwen_metal_has_full_step(ctx->metal)) {
+        int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
+        qwen_metal_sync_kv_cache(ctx->metal, 0, ctx->kv_cache_k, ctx->kv_cache_v,
+                                  ctx->config.num_layers, ctx->kv_max, kv_dim, ctx->kv_len);
+        if (!ctx->silent) fprintf(stderr, "  Metal: synced %d KV entries to GPU\n", ctx->kv_len);
     }
 
     /* Get hidden state from last prefill position (apply final norm) */

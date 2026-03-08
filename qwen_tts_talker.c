@@ -309,6 +309,40 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
 
     if (kv_cache_grow(ctx, pos + 1) != 0) return -1;
 
+    /* ── Full GPU path: all layers in one command buffer ── */
+    if (ctx->metal && qwen_metal_has_full_step(ctx->metal)) {
+        qwen_metal_step_config_t cfg = {
+            .n_layers = c->num_layers,
+            .hidden_size = h,
+            .num_heads = c->num_heads,
+            .num_kv_heads = c->num_kv_heads,
+            .head_dim = c->head_dim,
+            .intermediate_size = inter,
+            .rms_norm_eps = eps,
+            .gpu_rope_cos = ctx->gpu_rope_cos,
+            .gpu_rope_sin = ctx->gpu_rope_sin,
+            .gpu_final_norm = ctx->gpu_talker_final_norm,
+        };
+        qwen_metal_layer_config_t layer_cfgs[QWEN_TTS_MAX_TALKER_LAYERS];
+        for (int i = 0; i < c->num_layers; i++) {
+            qwen_talker_layer_t *l = &ctx->layers[i];
+            layer_cfgs[i] = (qwen_metal_layer_config_t){
+                .gpu_wq = l->gpu_wq, .gpu_wk = l->gpu_wk,
+                .gpu_wv = l->gpu_wv, .gpu_wo = l->gpu_wo,
+                .gpu_gate_up_fused = l->gpu_gate_up_fused, .gpu_down = l->gpu_down,
+                .gpu_input_norm = l->gpu_input_norm, .gpu_post_attn_norm = l->gpu_post_attn_norm,
+                .gpu_q_norm = l->gpu_q_norm, .gpu_k_norm = l->gpu_k_norm,
+            };
+        }
+        int ret = qwen_metal_transformer_step(ctx->metal, &cfg, layer_cfgs,
+                                               embed, hidden_out, pos, 0);
+        if (ret == 0) {
+            ctx->kv_len = pos + 1;
+            return 0;
+        }
+        /* Fall through to CPU path on failure */
+    }
+
     memcpy(ctx->dec_x, embed, h * sizeof(float));
 
     for (int layer = 0; layer < c->num_layers; layer++) {
