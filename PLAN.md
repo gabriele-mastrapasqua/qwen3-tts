@@ -91,8 +91,8 @@ chunked processing (`qwen_transcribe_stream`). We can use a similar pattern.
 - [x] `[MED]` Speech decoder incremental decode (optimization):
   - Pre-transformer KV cache (8 layers, sliding window 72) + cached latent output
   - Windowed conv decoder (RF=20 frames context) for O(chunk_size) per call
+  - O(chunk_size) per streaming call instead of O(total_frames)
   - Bit-accurate: correlation 1.000000, max diff 1 LSB vs full decode
-  - PR #8 merged
 - [x] `[MED]` Configurable chunk size: `--stream-chunk <frames>` (default: 10)
 
 ### 2.2 Raw PCM to stdout
