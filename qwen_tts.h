@@ -322,6 +322,7 @@ typedef struct qwen_tts_ctx {
     int voice_clone;             /* 1 = voice clone active */
     int xvector_only;            /* 1 = x-vector only (no ICL), 0 = ICL mode */
     float *speaker_embedding;    /* [hidden_size] speaker embedding from ref audio */
+    float max_ref_seconds;       /* Max ref audio duration for embedding (0=all, default 15) */
     char *ref_audio_path;        /* Path to reference audio file */
     char *ref_text;              /* Reference text for ICL mode */
 

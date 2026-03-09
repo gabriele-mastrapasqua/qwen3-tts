@@ -144,6 +144,7 @@ Optional:
   --xvector-only             Use speaker embedding only (no ref text/codes)
   --save-voice <path>        Save speaker embedding to file for reuse
   --load-voice <path>        Load speaker embedding (skip extraction)
+  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)
   -j, --threads <n>          Worker threads (default: 4)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
@@ -278,6 +279,10 @@ make demo-clone REF=my_voice.wav TEXT="Hello from my cloned voice!"
 > not the CustomVoice model. The Base model includes an ECAPA-TDNN speaker encoder that extracts
 > a voice embedding from the reference audio. Reference audio must be 24 kHz WAV (mono or stereo,
 > 16-bit or 32-bit PCM). A few seconds of clear speech is sufficient.
+>
+> By default, only the first **15 seconds** of reference audio are used for the speaker embedding.
+> This is enough for high-quality cloning and keeps extraction fast. Use `--max-ref-duration 0`
+> to process the entire file, or set a custom limit (e.g., `--max-ref-duration 30`).
 
 ### Streaming
 

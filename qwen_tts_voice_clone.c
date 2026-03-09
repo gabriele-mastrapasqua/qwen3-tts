@@ -826,6 +826,17 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
         fprintf(stderr, "Reference audio: %s (%d samples, %d Hz, %.2fs)\n",
                 ref_audio_path, n_samples, sample_rate, (float)n_samples / sample_rate);
 
+    /* Truncate to max_ref_seconds if set (default 15s, 0=use all) */
+    if (ctx->max_ref_seconds > 0) {
+        int max_samples = (int)(ctx->max_ref_seconds * sample_rate);
+        if (n_samples > max_samples) {
+            if (!ctx->silent)
+                fprintf(stderr, "  Truncating to %.0fs (was %.1fs)\n",
+                        ctx->max_ref_seconds, (float)n_samples / sample_rate);
+            n_samples = max_samples;
+        }
+    }
+
     /* TODO: resample to 24kHz if needed. For now, require 24kHz input. */
     if (sample_rate != 24000) {
         fprintf(stderr, "Error: reference audio must be 24 kHz (got %d Hz)\n", sample_rate);

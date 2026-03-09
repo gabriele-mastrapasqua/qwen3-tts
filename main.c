@@ -93,6 +93,7 @@ int main(int argc, char **argv) {
     int xvector_only = 0;
     const char *save_voice = NULL;
     const char *load_voice = NULL;
+    float max_ref_duration = 15.0f;  /* default: use first 15s of ref audio */
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
         {"text",          required_argument, 0, 't'},
@@ -118,6 +119,7 @@ int main(int argc, char **argv) {
         {"xvector-only",  no_argument,       0, 1010},
         {"save-voice",    required_argument, 0, 1011},
         {"load-voice",    required_argument, 0, 1012},
+        {"max-ref-duration", required_argument, 0, 1013},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"help",          no_argument,       0, 'h'},
@@ -151,6 +153,7 @@ int main(int argc, char **argv) {
             case 1010: xvector_only = 1; break;
             case 1011: save_voice = optarg; break;
             case 1012: load_voice = optarg; break;
+            case 1013: max_ref_duration = (float)atof(optarg); break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -181,6 +184,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
                 fprintf(stderr, "  --save-voice <path>        Save speaker embedding to file\n");
                 fprintf(stderr, "  --load-voice <path>        Load speaker embedding from file (skip extraction)\n");
+                fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -245,6 +249,7 @@ int main(int argc, char **argv) {
         }
         ctx->voice_clone = 1;
         ctx->xvector_only = xvector_only ? 1 : (ref_text_str ? 0 : 1);
+        ctx->max_ref_seconds = max_ref_duration;
         if (ref_audio) ctx->ref_audio_path = strdup(ref_audio);
         if (ref_text_str) ctx->ref_text = strdup(ref_text_str);
 
