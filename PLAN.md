@@ -299,9 +299,15 @@ ceiling). The entire Metal backend was removed as dead code in commit history.
 ### 7.2 Further CPU Optimizations
 
 - [x] `[MED]` Profile 1.7B model bottlenecks:
-  - Talker step 92.2ms/f (3.9× slower than 0.6B, hidden 2048 vs 1024)
-  - CP 74.9ms/f (same architecture, cp_hidden=1024)
-  - Total 167ms/f = 0.48× realtime. CP still bottleneck for both models
+  - Per-frame timing added to generation loop (Talker step, CP, embed, codec head)
+  - **1.7B breakdown** (45 frames, Apple Silicon M-series, 4 threads):
+    - Prefill: 4218ms (169ms/tok) — 3.1× slower than 0.6B (55ms/tok)
+    - Talker step: 92.2ms/f — 3.9× slower (hidden 2048 vs 1024)
+    - Code Predictor: 74.9ms/f — ~same (both cp_hidden=1024)
+    - Speech decoder: 56ms/f — ~same
+    - **Total: 167ms/frame → 0.48× realtime** (need 80ms/f for 1.0×)
+  - **0.6B breakdown** (61 frames): Talker 23.6ms/f + CP 69.6ms/f = 93ms/f → 0.86× realtime
+  - **Conclusion**: CP is the bottleneck for both models (15 sequential passes)
 - [x] `[MED]` NEON/AVX snake activation kernels:
   - macOS: vDSP_vsmul → vvsinf → vDSP_vsq → vDSP_vsma (Accelerate)
   - ARM NEON: 4-wide SIMD with scalar sinf per lane + fma
