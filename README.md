@@ -275,14 +275,39 @@ make demo-clone REF=my_voice.wav
 make demo-clone REF=my_voice.wav TEXT="Hello from my cloned voice!"
 ```
 
+#### Voice Clone Samples
+
+| Input | Cloned Output | Text |
+|-------|---------------|------|
+| [reference](samples/voice_clone_english.wav) | [english](samples/clone_output_en.wav) | *I love programming in C, it gives you complete control over the machine.* |
+| [reference](samples/voice_clone_english.wav) | [italian](samples/clone_output_it.wav) | *Buongiorno, questa e una dimostrazione della clonazione vocale.* |
+
 > **Note:** Voice cloning requires a **Base** model (`Qwen3-TTS-12Hz-0.6B-Base` or `1.7B-Base`),
 > not the CustomVoice model. The Base model includes an ECAPA-TDNN speaker encoder that extracts
-> a voice embedding from the reference audio. Reference audio must be 24 kHz WAV (mono or stereo,
-> 16-bit or 32-bit PCM). A few seconds of clear speech is sufficient.
+> a voice embedding from the reference audio. A few seconds of clear speech is sufficient.
 >
 > By default, only the first **15 seconds** of reference audio are used for the speaker embedding.
 > This is enough for high-quality cloning and keeps extraction fast. Use `--max-ref-duration 0`
 > to process the entire file, or set a custom limit (e.g., `--max-ref-duration 30`).
+
+#### Reference Audio Format
+
+The reference audio **must be 24 kHz WAV** (PCM, mono or stereo, 16-bit or 32-bit).
+If your audio is in a different format (MP3, Opus, OGG, or a different sample rate),
+convert it first with ffmpeg:
+
+```bash
+# Convert any audio file to 24 kHz mono WAV
+ffmpeg -i input.mp3 -ar 24000 -ac 1 output.wav
+ffmpeg -i input.opus -ar 24000 -ac 1 output.wav
+
+# Even WAV files may need resampling (e.g., 16 kHz → 24 kHz)
+ffmpeg -i voice_16k.wav -ar 24000 output.wav
+```
+
+This is required because the ECAPA-TDNN speaker encoder uses a mel spectrogram
+computed at 24 kHz with specific FFT parameters (n_fft=1024, hop=256, 128 mels).
+A mismatched sample rate would produce incorrect mel features and a bad voice embedding.
 
 ### Streaming
 
