@@ -286,23 +286,14 @@ timbre from the description instead of using a preset speaker.
 
 ## Phase 7: Performance
 
-### 7.1 Metal GPU Offload
+### 7.1 Metal GPU Offload — REMOVED
 
-- [x] `[HIGH]` Metal compute shaders for bf16 matvec (Talker + CP)
-  - `make metal` build target, `--gpu` CLI flag, CPU fallback when not enabled
-  - Weights uploaded to GPU at init (200 matrices for 0.6B)
-  - Correct audio output verified on Apple Silicon M1
-  - **Benchmark results (Apple M1)**:
-    - 0.6B: GPU ~3.3x **slower** than CPU NEON (0.2x vs 0.7x realtime)
-    - 1.7B: GPU ~2x **slower** than CPU NEON (0.1-0.2x vs 0.2-0.4x realtime)
-  - Root cause: per-matvec command buffer overhead (~50-100μs × ~200 dispatches/step)
-    dominates over compute savings for these matrix sizes
-- [ ] `[HIGH]` Optimize Metal: batch dispatches to reduce overhead
-  - Option A: Batch all matvecs per transformer layer into 1 command buffer
-  - Option B: Move entire transformer step to GPU (attention + FFN + RMSNorm shaders)
-  - Option C: Use Metal shared events / indirect command buffers for pipelining
-  - This is the key blocker for GPU speedup
-- [ ] `[LOW]` Metal for speech decoder convolutions
+Metal GPU backend was implemented and benchmarked but turned out ~1.3x **slower**
+than the optimized NEON CPU path on Apple Silicon (unified memory = shared bandwidth
+ceiling). The entire Metal backend was removed as dead code in commit history.
+
+- [x] ~~Metal compute shaders~~ — removed (slower than CPU)
+- [x] ~~Full GPU transformer step~~ — removed (still slower than CPU)
 - [ ] `[LOW]` CUDA/HIP backend stubs (for future NVIDIA/AMD support)
 
 ### 7.2 Further CPU Optimizations
@@ -364,7 +355,7 @@ The README already mentions WSL2 as the recommended approach.
 | **P3** | Phase 4: Voice Cloning | Major new capability — clone any voice | High |
 | **P4** | Phase 5: VoiceDesign | Create custom voices from descriptions | Medium |
 | **P5** | Phase 6: Quality | EOS reliability, reproducibility | Low |
-| **P6** | Phase 7: Performance | Metal GPU, faster 1.7B | High |
+| **P6** | Phase 7: Performance | CPU optimizations, faster 1.7B | High |
 | **P7** | Phase 8: Windows | Broader platform support | Low |
 
 ---
