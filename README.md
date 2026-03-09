@@ -261,6 +261,19 @@ Clone any voice from a short reference audio clip using the Base model:
     --load-voice my_voice.bin -o out2.wav
 ```
 
+#### Quick Demo
+
+```bash
+# Clone from a sample WAV (outputs to samples/)
+make demo-clone
+
+# Clone from your own audio
+make demo-clone REF=my_voice.wav
+
+# Custom text too
+make demo-clone REF=my_voice.wav TEXT="Hello from my cloned voice!"
+```
+
 > **Note:** Voice cloning requires a **Base** model (`Qwen3-TTS-12Hz-0.6B-Base` or `1.7B-Base`),
 > not the CustomVoice model. The Base model includes an ECAPA-TDNN speaker encoder that extracts
 > a voice embedding from the reference audio. Reference audio must be 24 kHz WAV (mono or stereo,
