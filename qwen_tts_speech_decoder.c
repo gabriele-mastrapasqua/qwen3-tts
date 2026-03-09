@@ -1179,3 +1179,689 @@ int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_fram
 
     return 0;
 }
+
+/* ========================================================================
+ * Streaming Incremental Decode
+ *
+ * Instead of re-decoding ALL accumulated frames each streaming chunk (O(n²)),
+ * this processes only NEW frames through VQ → pre-transformer (with KV cache),
+ * caches the latent output, and runs the conv decoder on a small window
+ * (context + new frames) for O(1) per chunk.
+ *
+ * Audio output is exactly 1920 samples per codec frame (by design: 4×480× upsample).
+ * ======================================================================== */
+
+/* Initialize/reset streaming state */
+void qwen_sd_stream_init(qwen_sd_stream_state_t *st) {
+    memset(st, 0, sizeof(*st));
+}
+
+/* Free streaming state buffers */
+void qwen_sd_stream_free(qwen_sd_stream_state_t *st) {
+    for (int i = 0; i < QWEN_SD_STREAM_MAX_LAYERS; i++) {
+        free(st->k_cache[i]); st->k_cache[i] = NULL;
+        free(st->v_cache[i]); st->v_cache[i] = NULL;
+    }
+    free(st->latent_cache); st->latent_cache = NULL;
+    free(st->vq_pad); st->vq_pad = NULL;
+    memset(st, 0, sizeof(*st));
+}
+
+/* Run conv decoder (ConvNeXt + initial conv + upsample blocks + final conv)
+ * on a signal in channel-first format [latent_dim, n_frames].
+ * Returns audio samples. This is the same pipeline as steps 7-10 in the
+ * full decode, extracted as a helper to avoid duplication. */
+static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
+                                 float *signal, int cur_ch, int cur_len,
+                                 float **audio_out, int *n_samples_out) {
+    qwen_speech_decoder_t *sd = &ctx->speech_dec;
+
+    /* ConvNeXt upsample (2 blocks, 2x each → 4x total) */
+    for (int b = 0; b < 2; b++) {
+        qwen_sd_convnext_t *cn = &sd->convnext[b];
+        if (!cn->conv_weight) { free(signal); return -1; }
+
+        int new_len = conv_transpose1d_out_len(cur_len, 2, 2);
+        float *up_out = (float *)calloc((int64_t)cur_ch * new_len, sizeof(float));
+        causal_conv_transpose1d(up_out, signal, cn->conv_weight, cn->conv_bias,
+                                 cur_ch, cur_ch, cur_len, new_len, 2, 2);
+        free(signal); signal = up_out; cur_len = new_len;
+
+        /* Depthwise conv (k=7, pad=6) */
+        float *dw_out = (float *)calloc((int64_t)cur_ch * cur_len, sizeof(float));
+        for (int c = 0; c < cur_ch; c++) {
+            for (int t = 0; t < cur_len; t++) {
+                float sum = cn->dwconv_bias ? cn->dwconv_bias[c] : 0;
+                for (int k = 0; k < 7; k++) {
+                    int in_pos = t - 6 + k;
+                    if (in_pos >= 0 && in_pos < cur_len)
+                        sum += cn->dwconv_weight[c * 7 + k] * signal[(int64_t)c * cur_len + in_pos];
+                }
+                dw_out[(int64_t)c * cur_len + t] = sum;
+            }
+        }
+
+        float *residual = signal; signal = dw_out;
+
+        /* LayerNorm (per-timestep) */
+        for (int t = 0; t < cur_len; t++) {
+            float mean = 0, var = 0;
+            for (int c = 0; c < cur_ch; c++) mean += signal[(int64_t)c * cur_len + t];
+            mean /= cur_ch;
+            for (int c = 0; c < cur_ch; c++) {
+                float d = signal[(int64_t)c * cur_len + t] - mean;
+                var += d * d;
+            }
+            var = 1.0f / sqrtf(var / cur_ch + 1e-5f);
+            for (int c = 0; c < cur_ch; c++) {
+                float x = (signal[(int64_t)c * cur_len + t] - mean) * var;
+                signal[(int64_t)c * cur_len + t] = x * cn->norm_weight[c] + cn->norm_bias[c];
+            }
+        }
+
+        /* Pointwise convs: pw1 (1024→4096, GELU), pw2 (4096→1024) */
+        int pw_dim = 4096;
+        float *pw1_out = (float *)malloc((int64_t)pw_dim * cur_len * sizeof(float));
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    pw_dim, cur_len, cur_ch, 1.0f,
+                    cn->pwconv1_weight, cur_ch, signal, cur_len,
+                    0.0f, pw1_out, cur_len);
+        if (cn->pwconv1_bias)
+            for (int i = 0; i < pw_dim; i++)
+                for (int t = 0; t < cur_len; t++)
+                    pw1_out[(int64_t)i * cur_len + t] += cn->pwconv1_bias[i];
+#else
+        for (int o = 0; o < pw_dim; o++)
+            for (int t = 0; t < cur_len; t++) {
+                float sum = cn->pwconv1_bias ? cn->pwconv1_bias[o] : 0;
+                for (int i = 0; i < cur_ch; i++)
+                    sum += cn->pwconv1_weight[(int64_t)o * cur_ch + i] * signal[(int64_t)i * cur_len + t];
+                pw1_out[(int64_t)o * cur_len + t] = sum;
+            }
+#endif
+        /* Exact GELU */
+        for (int64_t i = 0; i < (int64_t)pw_dim * cur_len; i++)
+            pw1_out[i] = 0.5f * pw1_out[i] * (1.0f + erff(pw1_out[i] * 0.7071067811865476f));
+
+        /* pw2 */
+        memset(signal, 0, (int64_t)cur_ch * cur_len * sizeof(float));
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    cur_ch, cur_len, pw_dim, 1.0f,
+                    cn->pwconv2_weight, pw_dim, pw1_out, cur_len,
+                    0.0f, signal, cur_len);
+        if (cn->pwconv2_bias)
+            for (int o = 0; o < cur_ch; o++)
+                for (int t = 0; t < cur_len; t++)
+                    signal[(int64_t)o * cur_len + t] += cn->pwconv2_bias[o];
+#else
+        for (int o = 0; o < cur_ch; o++)
+            for (int t = 0; t < cur_len; t++) {
+                float sum = cn->pwconv2_bias ? cn->pwconv2_bias[o] : 0;
+                for (int i = 0; i < pw_dim; i++)
+                    sum += cn->pwconv2_weight[(int64_t)o * pw_dim + i] * pw1_out[(int64_t)i * cur_len + t];
+                signal[(int64_t)o * cur_len + t] = sum;
+            }
+#endif
+        free(pw1_out);
+
+        /* Gamma + residual */
+        for (int ci = 0; ci < cur_ch; ci++) {
+            float g = cn->gamma[ci];
+            for (int t = 0; t < cur_len; t++)
+                signal[(int64_t)ci * cur_len + t] = residual[(int64_t)ci * cur_len + t]
+                    + signal[(int64_t)ci * cur_len + t] * g;
+        }
+        free(residual);
+    }
+
+    /* Initial conv (1024→1536, k=7, pad_left=6) */
+    if (!sd->initial_conv_weight) { free(signal); return -1; }
+    int new_ch = 1536;
+    int new_len = conv1d_out_len(cur_len, 7, 1, 6);
+    float *conv_out = (float *)calloc((int64_t)new_ch * new_len, sizeof(float));
+    causal_conv1d(conv_out, signal, sd->initial_conv_weight, sd->initial_conv_bias,
+                  cur_ch, new_ch, cur_len, 7, 1);
+    free(signal); signal = conv_out; cur_ch = new_ch; cur_len = new_len;
+
+    /* 4 Decoder upsample blocks */
+    int up_rates[4] = {8, 5, 4, 3};
+    int out_channels[4] = {768, 384, 192, 96};
+
+    for (int b = 0; b < 4; b++) {
+        qwen_sd_upsample_block_t *ub = &sd->upsample_blocks[b];
+        int rate = up_rates[b];
+        int kernel = rate * 2;
+        int out_ch = out_channels[b];
+
+        if (!ub->upsample.conv_weight) { free(signal); return -1; }
+
+        if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
+            snake_activation(signal, cur_ch, cur_len, ub->upsample.snake_alpha, ub->upsample.snake_beta);
+
+        int up_len = conv_transpose1d_out_len(cur_len, kernel, rate);
+        float *up_out = (float *)calloc((int64_t)out_ch * up_len, sizeof(float));
+        causal_conv_transpose1d(up_out, signal, ub->upsample.conv_weight, ub->upsample.conv_bias,
+                                 cur_ch, out_ch, cur_len, up_len, kernel, rate);
+        free(signal); signal = up_out; cur_ch = out_ch; cur_len = up_len;
+
+        int dilations[3] = {1, 3, 9};
+        for (int r = 0; r < 3; r++) {
+            int dil = dilations[r];
+            float *res = (float *)malloc((int64_t)cur_ch * cur_len * sizeof(float));
+            memcpy(res, signal, (int64_t)cur_ch * cur_len * sizeof(float));
+
+            if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
+                snake_activation(signal, cur_ch, cur_len,
+                                  ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+
+            float *c1_out = (float *)calloc((int64_t)cur_ch * cur_len, sizeof(float));
+            causal_conv1d(c1_out, signal, ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias,
+                          cur_ch, cur_ch, cur_len, 7, dil);
+            memcpy(signal, c1_out, (int64_t)cur_ch * cur_len * sizeof(float));
+            free(c1_out);
+
+            if (ub->res_blocks[r].snake2_alpha && ub->res_blocks[r].snake2_beta)
+                snake_activation(signal, cur_ch, cur_len,
+                                  ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
+
+            float *c2_out = (float *)calloc((int64_t)cur_ch * cur_len, sizeof(float));
+            causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias,
+                          cur_ch, cur_ch, cur_len, 1, 1);
+
+            for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
+                signal[i] = res[i] + c2_out[i];
+            free(c2_out);
+            free(res);
+        }
+    }
+
+    /* Final Snake + Conv (96→1, k=7) */
+    if (!sd->final_snake.alpha || !sd->final_conv_weight) { free(signal); return -1; }
+    snake_activation(signal, cur_ch, cur_len, sd->final_snake.alpha, sd->final_snake.beta);
+
+    int audio_len = conv1d_out_len(cur_len, 7, 1, 6);
+    float *audio = (float *)calloc(audio_len, sizeof(float));
+    for (int t = 0; t < audio_len; t++) {
+        float sum = sd->final_conv_bias ? sd->final_conv_bias[0] : 0;
+        for (int ic = 0; ic < cur_ch; ic++) {
+            for (int k = 0; k < 7; k++) {
+                int in_pos = t - (6 - k);
+                if (in_pos >= 0 && in_pos < cur_len)
+                    sum += sd->final_conv_weight[(int64_t)ic * 7 + k] * signal[(int64_t)ic * cur_len + in_pos];
+            }
+        }
+        audio[t] = sum;
+    }
+    free(signal);
+
+    for (int i = 0; i < audio_len; i++) {
+        if (audio[i] < -1.0f) audio[i] = -1.0f;
+        if (audio[i] > 1.0f) audio[i] = 1.0f;
+    }
+
+    *audio_out = audio;
+    *n_samples_out = audio_len;
+    return 0;
+}
+
+/* Incremental streaming decode: process only new_frames through VQ→pre-transformer
+ * (using KV cache), cache latent output, run conv decoder on windowed latent.
+ * Returns only NEW audio samples (not previously emitted ones). */
+int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
+                                          const int *new_codes, int new_frames,
+                                          float **audio_out, int *n_samples) {
+    qwen_speech_decoder_t *sd = &ctx->speech_dec;
+    qwen_sd_stream_state_t *st = &ctx->sd_stream;
+    qwen_tts_config_t *c = &ctx->config;
+
+    int cb_dim = QWEN_TTS_CODEBOOK_DIM;
+    int vq_hidden = 512;
+    int latent_dim = 1024;
+    int dec_hidden = 512;
+    int dec_inter = 1024;
+    int n_heads = 16;
+    int head_dim = c->dec_head_dim;
+    int qkv_dim = n_heads * head_dim;
+    int window = 72;
+    float eps = c->dec_rms_norm_eps;
+    int half_hd = head_dim / 2;
+
+    /* === Step 1: VQ dequant for new frames only === */
+    /* Output: vq_out row-major [new_frames, 512] */
+    float *vq_out = (float *)calloc((int64_t)new_frames * vq_hidden, sizeof(float));
+    float *cb_sum = (float *)malloc(cb_dim * sizeof(float));
+
+    for (int f = 0; f < new_frames; f++) {
+        int code0 = new_codes[f * 16];
+        if (code0 >= 0 && code0 < c->codebook_size && sd->codebook[0]) {
+            const float *emb = sd->codebook[0] + (int64_t)code0 * cb_dim;
+            if (sd->rvq_first_output_proj) {
+                for (int o = 0; o < vq_hidden; o++) {
+                    float sum = 0;
+                    for (int i = 0; i < cb_dim; i++)
+                        sum += sd->rvq_first_output_proj[(int64_t)o * cb_dim + i] * emb[i];
+                    vq_out[(int64_t)f * vq_hidden + o] += sum;
+                }
+            }
+        }
+        memset(cb_sum, 0, cb_dim * sizeof(float));
+        for (int k = 1; k < 16; k++) {
+            int code = new_codes[f * 16 + k];
+            if (code >= 0 && code < c->codebook_size && sd->codebook[k]) {
+                const float *emb = sd->codebook[k] + (int64_t)code * cb_dim;
+                for (int d = 0; d < cb_dim; d++) cb_sum[d] += emb[d];
+            }
+        }
+        if (sd->rvq_rest_output_proj) {
+            for (int o = 0; o < vq_hidden; o++) {
+                float sum = 0;
+                for (int i = 0; i < cb_dim; i++)
+                    sum += sd->rvq_rest_output_proj[(int64_t)o * cb_dim + i] * cb_sum[i];
+                vq_out[(int64_t)f * vq_hidden + o] += sum;
+            }
+        }
+    }
+    free(cb_sum);
+
+    /* === Step 2: Pre-conv on new frames with padding from previous chunk === */
+    /* VQ output is row-major [new_frames, 512]. Transpose to channel-first [512, new_frames]
+     * for conv1d, prepending 2 frames of padding. */
+    int pad_frames = st->vq_pad_valid ? 2 : 0;
+    int conv_in_len = pad_frames + new_frames;
+    float *vq_cf = (float *)calloc((int64_t)vq_hidden * conv_in_len, sizeof(float));
+
+    /* Copy padding */
+    if (st->vq_pad_valid && st->vq_pad) {
+        for (int ch = 0; ch < vq_hidden; ch++)
+            for (int t = 0; t < 2; t++)
+                vq_cf[(int64_t)ch * conv_in_len + t] = st->vq_pad[(int64_t)ch * 2 + t];
+    }
+    /* Copy new VQ output (transpose row→channel-first) */
+    for (int f = 0; f < new_frames; f++)
+        for (int ch = 0; ch < vq_hidden; ch++)
+            vq_cf[(int64_t)ch * conv_in_len + pad_frames + f] = vq_out[(int64_t)f * vq_hidden + ch];
+
+    /* Save last 2 frames of VQ output (channel-first) as padding for next chunk */
+    if (!st->vq_pad) st->vq_pad = (float *)malloc(vq_hidden * 2 * sizeof(float));
+    int save_start = (conv_in_len >= 2) ? conv_in_len - 2 : 0;
+    int save_count = (conv_in_len >= 2) ? 2 : conv_in_len;
+    for (int ch = 0; ch < vq_hidden; ch++)
+        for (int t = 0; t < save_count; t++)
+            st->vq_pad[(int64_t)ch * 2 + (2 - save_count + t)] =
+                vq_cf[(int64_t)ch * conv_in_len + save_start + t];
+    if (save_count < 2) {
+        /* Zero-fill the earlier positions if we had fewer than 2 frames */
+        for (int ch = 0; ch < vq_hidden; ch++)
+            for (int t = 0; t < 2 - save_count; t++)
+                st->vq_pad[(int64_t)ch * 2 + t] = 0;
+    }
+    st->vq_pad_valid = 1;
+    free(vq_out);
+
+    /* Pre-conv (512→1024, k=3, causal, pad_left=2) */
+    float *pre_conv_out = (float *)calloc((int64_t)latent_dim * conv_in_len, sizeof(float));
+    causal_conv1d(pre_conv_out, vq_cf, sd->pre_conv_weight, sd->pre_conv_bias,
+                  vq_hidden, latent_dim, conv_in_len, 3, 1);
+    free(vq_cf);
+
+    /* Take only the last new_frames from pre_conv output */
+    /* The first pad_frames outputs may have been computed with actual previous context */
+
+    /* === Step 3: Input proj on new frames (1024→512, row-major) === */
+    float *hidden = (float *)malloc((int64_t)new_frames * dec_hidden * sizeof(float));
+#ifdef USE_BLAS
+    /* Transpose new portion [1024, new_frames] → [new_frames, 1024] */
+    float *pre_conv_rm = (float *)malloc((int64_t)new_frames * latent_dim * sizeof(float));
+    for (int f = 0; f < new_frames; f++)
+        for (int d = 0; d < latent_dim; d++)
+            pre_conv_rm[(int64_t)f * latent_dim + d] = pre_conv_out[(int64_t)d * conv_in_len + pad_frames + f];
+    free(pre_conv_out);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                new_frames, dec_hidden, latent_dim, 1.0f,
+                pre_conv_rm, latent_dim,
+                sd->input_proj_weight, latent_dim,
+                0.0f, hidden, dec_hidden);
+    free(pre_conv_rm);
+    if (sd->input_proj_bias)
+        for (int f = 0; f < new_frames; f++)
+            for (int o = 0; o < dec_hidden; o++)
+                hidden[(int64_t)f * dec_hidden + o] += sd->input_proj_bias[o];
+#else
+    for (int f = 0; f < new_frames; f++) {
+        for (int o = 0; o < dec_hidden; o++) {
+            float sum = sd->input_proj_bias ? sd->input_proj_bias[o] : 0;
+            for (int i = 0; i < latent_dim; i++)
+                sum += sd->input_proj_weight[(int64_t)o * latent_dim + i]
+                     * pre_conv_out[(int64_t)i * conv_in_len + pad_frames + f];
+            hidden[(int64_t)f * dec_hidden + o] = sum;
+        }
+    }
+    free(pre_conv_out);
+#endif
+
+    /* === Step 4: Pre-transformer with KV cache === */
+    /* Ensure KV cache is allocated */
+    int total_frames = st->kv_len + new_frames;
+    if (total_frames > st->kv_alloc) {
+        int new_alloc = total_frames + 256; /* grow with headroom */
+        for (int l = 0; l < c->dec_num_layers; l++) {
+            st->k_cache[l] = (float *)realloc(st->k_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
+            st->v_cache[l] = (float *)realloc(st->v_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
+        }
+        st->kv_alloc = new_alloc;
+    }
+
+    float *q = (float *)malloc((int64_t)new_frames * qkv_dim * sizeof(float));
+    float *new_k = (float *)malloc((int64_t)new_frames * qkv_dim * sizeof(float));
+    float *new_v = (float *)malloc((int64_t)new_frames * qkv_dim * sizeof(float));
+    float *x_norm = (float *)malloc((int64_t)new_frames * dec_hidden * sizeof(float));
+    float *attn_out = (float *)malloc((int64_t)new_frames * qkv_dim * sizeof(float));
+
+    for (int layer = 0; layer < c->dec_num_layers; layer++) {
+        qwen_sd_pre_layer_t *l = &sd->pre_layers[layer];
+
+        /* Input RMSNorm */
+        for (int s = 0; s < new_frames; s++) {
+            const float *xs = hidden + s * dec_hidden;
+            float *xn = x_norm + s * dec_hidden;
+            float sum_sq = 0;
+            for (int i = 0; i < dec_hidden; i++) sum_sq += xs[i] * xs[i];
+            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
+            for (int i = 0; i < dec_hidden; i++) xn[i] = xs[i] * inv_rms * l->attn_norm[i];
+        }
+
+        /* QKV projections for new frames */
+#ifdef USE_BLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    new_frames, qkv_dim, dec_hidden, 1.0f,
+                    x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    new_frames, qkv_dim, dec_hidden, 1.0f,
+                    x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, new_k, qkv_dim);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    new_frames, qkv_dim, dec_hidden, 1.0f,
+                    x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, new_v, qkv_dim);
+#else
+        for (int s = 0; s < new_frames; s++) {
+            const float *xs = x_norm + s * dec_hidden;
+            float *qs = q + s * qkv_dim;
+            float *ks = new_k + s * qkv_dim;
+            float *vs = new_v + s * qkv_dim;
+            for (int o = 0; o < qkv_dim; o++) {
+                float sum_q = 0, sum_k = 0, sum_v = 0;
+                for (int i = 0; i < dec_hidden; i++) {
+                    sum_q += l->attn_q[(int64_t)o * dec_hidden + i] * xs[i];
+                    sum_k += l->attn_k[(int64_t)o * dec_hidden + i] * xs[i];
+                    sum_v += l->attn_v[(int64_t)o * dec_hidden + i] * xs[i];
+                }
+                qs[o] = sum_q; ks[o] = sum_k; vs[o] = sum_v;
+            }
+        }
+#endif
+
+        /* NeoX split-half RoPE using absolute positions */
+        for (int s = 0; s < new_frames; s++) {
+            int abs_pos = st->kv_len + s;
+            const float *cos_ptr = sd->rope_cos + abs_pos * half_hd;
+            const float *sin_ptr = sd->rope_sin + abs_pos * half_hd;
+            for (int h = 0; h < n_heads; h++) {
+                float *qh = q + s * qkv_dim + h * head_dim;
+                float *kh = new_k + s * qkv_dim + h * head_dim;
+                for (int i = 0; i < half_hd; i++) {
+                    float q1 = qh[i], q2 = qh[i + half_hd];
+                    float k1 = kh[i], k2 = kh[i + half_hd];
+                    float co = cos_ptr[i], si = sin_ptr[i];
+                    qh[i]           = q1 * co - q2 * si;
+                    qh[i + half_hd] = q2 * co + q1 * si;
+                    kh[i]           = k1 * co - k2 * si;
+                    kh[i + half_hd] = k2 * co + k1 * si;
+                }
+            }
+        }
+
+        /* Append new K, V to cache for this layer */
+        memcpy(st->k_cache[layer] + (int64_t)st->kv_len * qkv_dim,
+               new_k, (int64_t)new_frames * qkv_dim * sizeof(float));
+        memcpy(st->v_cache[layer] + (int64_t)st->kv_len * qkv_dim,
+               new_v, (int64_t)new_frames * qkv_dim * sizeof(float));
+
+        /* Sliding window causal attention: Q from new frames, K/V from cache */
+        float scale = 1.0f / sqrtf((float)head_dim);
+        for (int sq = 0; sq < new_frames; sq++) {
+            int abs_sq = st->kv_len + sq;
+            float *out = attn_out + sq * qkv_dim;
+            memset(out, 0, qkv_dim * sizeof(float));
+            int sk_start = (abs_sq - window + 1 > 0) ? abs_sq - window + 1 : 0;
+            int sk_end = abs_sq; /* inclusive */
+
+            for (int h = 0; h < n_heads; h++) {
+                const float *qh = q + sq * qkv_dim + h * head_dim;
+                float *oh = out + h * head_dim;
+
+                int n_keys = sk_end - sk_start + 1;
+                float *scores = (float *)alloca(n_keys * sizeof(float));
+                float max_score = -1e30f;
+                for (int j = 0; j < n_keys; j++) {
+                    int sk = sk_start + j;
+                    const float *kh = st->k_cache[layer] + (int64_t)sk * qkv_dim + h * head_dim;
+                    float dot = 0;
+                    for (int d = 0; d < head_dim; d++) dot += qh[d] * kh[d];
+                    scores[j] = dot * scale;
+                    if (scores[j] > max_score) max_score = scores[j];
+                }
+
+                float sum_exp = 0;
+                for (int j = 0; j < n_keys; j++) {
+                    scores[j] = expf(scores[j] - max_score);
+                    sum_exp += scores[j];
+                }
+                float inv_sum = 1.0f / sum_exp;
+
+                for (int j = 0; j < n_keys; j++) {
+                    int sk = sk_start + j;
+                    const float *vh = st->v_cache[layer] + (int64_t)sk * qkv_dim + h * head_dim;
+                    float w = scores[j] * inv_sum;
+                    for (int d = 0; d < head_dim; d++) oh[d] += vh[d] * w;
+                }
+            }
+        }
+
+        /* Output proj + layer_scale + residual */
+#ifdef USE_BLAS
+        {
+            float *oproj = x_norm;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        new_frames, dec_hidden, qkv_dim, 1.0f,
+                        attn_out, qkv_dim, l->attn_o, qkv_dim,
+                        0.0f, oproj, dec_hidden);
+            for (int s = 0; s < new_frames; s++) {
+                float *xs = hidden + s * dec_hidden;
+                float *ps = oproj + s * dec_hidden;
+                if (l->attn_layer_scale) {
+                    for (int o = 0; o < dec_hidden; o++) xs[o] += ps[o] * l->attn_layer_scale[o];
+                } else {
+                    for (int o = 0; o < dec_hidden; o++) xs[o] += ps[o];
+                }
+            }
+        }
+#else
+        for (int s = 0; s < new_frames; s++) {
+            float *xs = hidden + s * dec_hidden;
+            const float *attn = attn_out + s * qkv_dim;
+            for (int o = 0; o < dec_hidden; o++) {
+                float sum = 0;
+                for (int i = 0; i < qkv_dim; i++)
+                    sum += l->attn_o[(int64_t)o * qkv_dim + i] * attn[i];
+                if (l->attn_layer_scale) sum *= l->attn_layer_scale[o];
+                xs[o] += sum;
+            }
+        }
+#endif
+
+        /* Post-attn RMSNorm */
+        for (int s = 0; s < new_frames; s++) {
+            const float *xs = hidden + s * dec_hidden;
+            float *xn = x_norm + s * dec_hidden;
+            float sum_sq = 0;
+            for (int i = 0; i < dec_hidden; i++) sum_sq += xs[i] * xs[i];
+            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
+            for (int i = 0; i < dec_hidden; i++) xn[i] = xs[i] * inv_rms * l->ffn_norm[i];
+        }
+
+        /* SwiGLU FFN */
+#ifdef USE_BLAS
+        {
+            float *ffn_gate = (float *)malloc((int64_t)new_frames * dec_inter * sizeof(float));
+            float *ffn_up = (float *)malloc((int64_t)new_frames * dec_inter * sizeof(float));
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        new_frames, dec_inter, dec_hidden, 1.0f,
+                        x_norm, dec_hidden, l->ffn_gate, dec_hidden,
+                        0.0f, ffn_gate, dec_inter);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        new_frames, dec_inter, dec_hidden, 1.0f,
+                        x_norm, dec_hidden, l->ffn_up, dec_hidden,
+                        0.0f, ffn_up, dec_inter);
+            for (int64_t i = 0; i < (int64_t)new_frames * dec_inter; i++)
+                ffn_gate[i] = (ffn_gate[i] / (1.0f + expf(-ffn_gate[i]))) * ffn_up[i];
+            free(ffn_up);
+            float *ffn_down_out = (float *)malloc((int64_t)new_frames * dec_hidden * sizeof(float));
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        new_frames, dec_hidden, dec_inter, 1.0f,
+                        ffn_gate, dec_inter, l->ffn_down, dec_inter,
+                        0.0f, ffn_down_out, dec_hidden);
+            free(ffn_gate);
+            for (int s = 0; s < new_frames; s++) {
+                float *hs = hidden + s * dec_hidden;
+                float *ds = ffn_down_out + s * dec_hidden;
+                if (l->ffn_layer_scale) {
+                    for (int o = 0; o < dec_hidden; o++) hs[o] += ds[o] * l->ffn_layer_scale[o];
+                } else {
+                    for (int o = 0; o < dec_hidden; o++) hs[o] += ds[o];
+                }
+            }
+            free(ffn_down_out);
+        }
+#else
+        for (int s = 0; s < new_frames; s++) {
+            const float *xs = x_norm + s * dec_hidden;
+            float *hs = hidden + s * dec_hidden;
+            float gate_up[dec_inter * 2];
+            for (int o = 0; o < dec_inter; o++) {
+                float sum_g = 0, sum_u = 0;
+                for (int i = 0; i < dec_hidden; i++) {
+                    sum_g += l->ffn_gate[(int64_t)o * dec_hidden + i] * xs[i];
+                    sum_u += l->ffn_up[(int64_t)o * dec_hidden + i] * xs[i];
+                }
+                gate_up[o] = (sum_g / (1.0f + expf(-sum_g))) * sum_u;
+            }
+            for (int o = 0; o < dec_hidden; o++) {
+                float sum = 0;
+                for (int i = 0; i < dec_inter; i++)
+                    sum += l->ffn_down[(int64_t)o * dec_inter + i] * gate_up[i];
+                if (l->ffn_layer_scale) sum *= l->ffn_layer_scale[o];
+                hs[o] += sum;
+            }
+        }
+#endif
+    }
+
+    /* Update KV cache length (after all layers processed) */
+    st->kv_len += new_frames;
+
+    free(q); free(new_k); free(new_v); free(x_norm); free(attn_out);
+
+    /* === Step 5: Final RMSNorm + Output proj (512→1024) on new frames === */
+    if (sd->final_norm_weight) {
+        for (int s = 0; s < new_frames; s++) {
+            float *hs = hidden + s * dec_hidden;
+            float sum_sq = 0;
+            for (int i = 0; i < dec_hidden; i++) sum_sq += hs[i] * hs[i];
+            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
+            for (int i = 0; i < dec_hidden; i++) hs[i] = hs[i] * inv_rms * sd->final_norm_weight[i];
+        }
+    }
+
+    /* Grow latent cache if needed */
+    if (st->latent_frames + new_frames > st->latent_alloc) {
+        int new_alloc = st->latent_frames + new_frames + 256;
+        st->latent_cache = (float *)realloc(st->latent_cache,
+            (int64_t)new_alloc * latent_dim * sizeof(float));
+        st->latent_alloc = new_alloc;
+    }
+
+    /* Output proj new frames → append to latent cache [row-major: frames × 1024] */
+    float *lat_dst = st->latent_cache + (int64_t)st->latent_frames * latent_dim;
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                new_frames, latent_dim, dec_hidden, 1.0f,
+                hidden, dec_hidden,
+                sd->output_proj_weight, dec_hidden,
+                0.0f, lat_dst, latent_dim);
+    if (sd->output_proj_bias)
+        for (int f = 0; f < new_frames; f++)
+            for (int o = 0; o < latent_dim; o++)
+                lat_dst[(int64_t)f * latent_dim + o] += sd->output_proj_bias[o];
+#else
+    for (int f = 0; f < new_frames; f++) {
+        for (int o = 0; o < latent_dim; o++) {
+            float sum = sd->output_proj_bias ? sd->output_proj_bias[o] : 0;
+            for (int i = 0; i < dec_hidden; i++)
+                sum += sd->output_proj_weight[(int64_t)o * dec_hidden + i] * hidden[(int64_t)f * dec_hidden + i];
+            lat_dst[(int64_t)f * latent_dim + o] = sum;
+        }
+    }
+#endif
+    st->latent_frames += new_frames;
+    free(hidden);
+
+    /* === Step 6: Windowed conv decoder === */
+    /* Take last (RF + new_frames) from latent cache, or all if fewer */
+    int conv_rf = QWEN_SD_STREAM_CONV_RF;
+    int window_frames = st->latent_frames;
+    int context_frames = 0;
+    if (window_frames > conv_rf + new_frames) {
+        context_frames = conv_rf;
+        window_frames = conv_rf + new_frames;
+    } else {
+        context_frames = window_frames - new_frames;
+    }
+    int window_start = st->latent_frames - window_frames;
+
+    /* Transpose window to channel-first [1024, window_frames] for conv decoder */
+    float *signal = (float *)malloc((int64_t)latent_dim * window_frames * sizeof(float));
+    const float *lat_src = st->latent_cache + (int64_t)window_start * latent_dim;
+    for (int f = 0; f < window_frames; f++)
+        for (int d = 0; d < latent_dim; d++)
+            signal[(int64_t)d * window_frames + f] = lat_src[(int64_t)f * latent_dim + d];
+
+    /* Run conv decoder (ConvNeXt + initial conv + upsample blocks + final conv) */
+    float *full_audio = NULL;
+    int full_samples = 0;
+    int ret = conv_decoder_forward(ctx, signal, latent_dim, window_frames,
+                                    &full_audio, &full_samples);
+    if (ret != 0) return ret;
+
+    /* Extract only the new audio (skip context portion) */
+    /* Audio is exactly 1920 samples per latent frame */
+    int context_samples = context_frames * 1920;
+    int new_samples = full_samples - context_samples;
+    if (new_samples <= 0) {
+        free(full_audio);
+        *audio_out = NULL;
+        *n_samples = 0;
+        return 0;
+    }
+
+    float *new_audio = (float *)malloc(new_samples * sizeof(float));
+    memcpy(new_audio, full_audio + context_samples, new_samples * sizeof(float));
+    free(full_audio);
+
+    st->frames_decoded += new_frames;
+    st->samples_produced += new_samples;
+
+    *audio_out = new_audio;
+    *n_samples = new_samples;
+    return 0;
+}
