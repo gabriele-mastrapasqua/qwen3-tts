@@ -624,6 +624,69 @@ void qwen_round_bf16(float *x, int n) {
 }
 
 /* ========================================================================
+ * Snake activation: x += (1/exp(beta)) * sin²(exp(alpha) * x)
+ * ======================================================================== */
+
+void qwen_snake_activation(float *data, int channels, int length,
+                            const float *log_alpha, const float *log_beta) {
+    for (int c = 0; c < channels; c++) {
+        float a = expf(log_alpha[c]);
+        float inv_b = expf(-log_beta[c]);
+        float *row = data + (int64_t)c * length;
+
+#if defined(__APPLE__) && defined(USE_BLAS)
+        /* Use Accelerate vForce for vectorized sin — fast on Apple Silicon */
+        {
+            int n = length;
+            float *temp = (float *)malloc(n * sizeof(float));
+
+            /* temp = a * row */
+            vDSP_vsmul(row, 1, &a, temp, 1, n);
+
+            /* temp = sin(temp) */
+            vvsinf(temp, temp, &n);
+
+            /* temp = temp * temp (sin²) */
+            vDSP_vsq(temp, 1, temp, 1, n);
+
+            /* row += inv_b * temp */
+            vDSP_vsma(temp, 1, &inv_b, row, 1, row, 1, n);
+
+            free(temp);
+        }
+#elif defined(__ARM_NEON)
+        {
+            float32x4_t va = vdupq_n_f32(a);
+            float32x4_t vinv_b = vdupq_n_f32(inv_b);
+            int t = 0;
+            for (; t + 3 < length; t += 4) {
+                float32x4_t x = vld1q_f32(row + t);
+                float32x4_t ax = vmulq_f32(va, x);
+                /* Scalar sinf for each lane (no NEON intrinsic for sin) */
+                float ax_s[4];
+                vst1q_f32(ax_s, ax);
+                float s_arr[4] = { sinf(ax_s[0]), sinf(ax_s[1]),
+                                   sinf(ax_s[2]), sinf(ax_s[3]) };
+                float32x4_t s = vld1q_f32(s_arr);
+                float32x4_t s2 = vmulq_f32(s, s);
+                x = vfmaq_f32(x, vinv_b, s2);
+                vst1q_f32(row + t, x);
+            }
+            for (; t < length; t++) {
+                float s = sinf(a * row[t]);
+                row[t] += inv_b * s * s;
+            }
+        }
+#else
+        for (int t = 0; t < length; t++) {
+            float s = sinf(a * row[t]);
+            row[t] += inv_b * s * s;
+        }
+#endif
+    }
+}
+
+/* ========================================================================
  * RoPE - Interleaved (already defined in talker.c, stub here)
  * ======================================================================== */
 

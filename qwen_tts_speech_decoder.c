@@ -57,21 +57,9 @@ static int conv_transpose1d_out_len(int in_len, int kernel, int stride) {
     return (in_len - 1) * stride + kernel - (kernel - stride);
 }
 
-/* Snake activation: x + (1/exp(beta)) * sin²(exp(alpha) * x)
- * Alpha and beta are stored in LOG SPACE.
- * Applied per-channel to channel-first data [channels, length]. */
-static void snake_activation(float *data, int channels, int length,
-                              const float *log_alpha, const float *log_beta) {
-    for (int c = 0; c < channels; c++) {
-        float a = expf(log_alpha[c]);
-        float inv_b = expf(-log_beta[c]);
-        float *row = data + (int64_t)c * length;
-        for (int t = 0; t < length; t++) {
-            float s = sinf(a * row[t]);
-            row[t] += inv_b * s * s;
-        }
-    }
-}
+/* Snake activation dispatched through qwen_snake_activation() kernel
+ * (NEON/Accelerate-optimized in qwen_tts_kernels.c) */
+#define snake_activation qwen_snake_activation
 
 #ifndef USE_BLAS
 /* Naive causal Conv1d: [out_ch, in_ch, kernel], pad_left=(kernel-1)*dilation */

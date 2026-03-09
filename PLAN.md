@@ -302,11 +302,10 @@ ceiling). The entire Metal backend was removed as dead code in commit history.
   - Talker step 92.2ms/f (3.9× slower than 0.6B, hidden 2048 vs 1024)
   - CP 74.9ms/f (same architecture, cp_hidden=1024)
   - Total 167ms/f = 0.48× realtime. CP still bottleneck for both models
-  - PR #10 merged
 - [x] `[MED]` NEON/AVX snake activation kernels:
   - macOS: vDSP_vsmul → vvsinf → vDSP_vsq → vDSP_vsma (Accelerate)
-  - ARM: 4-wide NEON SIMD with scalar sinf per lane
-  - PR #9 merged
+  - ARM NEON: 4-wide SIMD with scalar sinf per lane + fma
+  - Generic fallback for non-SIMD platforms
 - [x] `[LOW]` Persistent BF16 KV cache (halves KV memory, bf16 stored/read in attention)
 
 ---

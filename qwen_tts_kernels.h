@@ -99,6 +99,12 @@ void qwen_vec_scale_inplace(float *y, float s, int n);
 /* bf16 rounding */
 void qwen_round_bf16(float *x, int n);
 
+/* Snake activation: x += (1/exp(beta)) * sin²(exp(alpha) * x)
+ * Applied per-channel to channel-first data [channels, length].
+ * log_alpha/log_beta are per-channel params in LOG SPACE. */
+void qwen_snake_activation(float *data, int channels, int length,
+                            const float *log_alpha, const float *log_beta);
+
 /* ========================================================================
  * Argmax / Sampling
  * ======================================================================== */
