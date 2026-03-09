@@ -13,7 +13,6 @@
 #include <pthread.h>
 
 #include "qwen_tts_voice_clone.h"
-#include "qwen_tts_metal.h"
 
 /* ========================================================================
  * Constants
@@ -144,12 +143,6 @@ typedef struct {
 
     /* Fused gate+up for optimization */
     uint16_t *gate_up_fused_bf16; /* [2*inter, hidden] */
-
-    /* Metal GPU weight handles (-1 = not uploaded) */
-    int gpu_wq, gpu_wk, gpu_wv, gpu_wo;
-    int gpu_gate_up_fused, gpu_down;
-    int gpu_input_norm, gpu_post_attn_norm;
-    int gpu_q_norm, gpu_k_norm;
 } qwen_talker_layer_t;
 
 /* ========================================================================
@@ -178,12 +171,6 @@ typedef struct {
 
     /* Fused gate+up for optimization */
     uint16_t *gate_up_fused_bf16; /* [2*inter, hidden] */
-
-    /* Metal GPU weight handles (-1 = not uploaded) */
-    int gpu_wq, gpu_wk, gpu_wv, gpu_wo;
-    int gpu_gate_up_fused, gpu_down;
-    int gpu_input_norm, gpu_post_attn_norm;
-    int gpu_q_norm, gpu_k_norm;
 } qwen_cp_layer_t;
 
 /* ========================================================================
@@ -449,16 +436,6 @@ typedef struct qwen_tts_ctx {
     float *audio_buf;
     int audio_samples;
 
-    /* Metal GPU context (NULL if not using GPU) */
-    qwen_metal_ctx_t *metal;
-    int gpu_codec_head;         /* GPU handle for codec_head_bf16 */
-    int gpu_codec_embedding;    /* GPU handle for codec_embedding_bf16 */
-
-    /* Full GPU step handles */
-    int gpu_talker_final_norm;  /* handle for talker_norm */
-    int gpu_rope_cos, gpu_rope_sin;  /* talker RoPE tables */
-    int gpu_cp_norm;            /* handle for cp_norm */
-    int gpu_cp_rope_cos, gpu_cp_rope_sin;  /* CP RoPE tables */
 } qwen_tts_ctx_t;
 
 /* ========================================================================
@@ -496,10 +473,6 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text,
 
 /* Write WAV file */
 int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate);
-
-/* Initialize Metal GPU acceleration (upload weights to GPU).
- * Call after qwen_tts_load(). No-op if Metal unavailable. */
-int qwen_tts_init_metal(qwen_tts_ctx_t *ctx);
 
 /* Speech encoder: audio → codec codes (for ICL voice clone) */
 int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx);

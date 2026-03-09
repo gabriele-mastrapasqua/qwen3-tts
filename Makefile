@@ -38,18 +38,6 @@ OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts_bin
 MODEL_DIR = qwen3-tts-0.6b
 
-# Metal GPU support (macOS Apple Silicon only, opt-in via make metal)
-ifdef ENABLE_METAL
-ifeq ($(UNAME_S),Darwin)
-    CFLAGS_BASE += -DENABLE_METAL
-    LDLIBS += -framework Metal -framework Foundation -framework MetalPerformanceShaders
-    OBJS += qwen_tts_metal.o
-endif
-else
-    # Stubs (no-op) — compiled as regular C
-    SRCS += qwen_tts_metal_stub.c
-endif
-
 # Default: show help
 all: help
 
@@ -58,7 +46,6 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  make blas      - Build with BLAS acceleration (Accelerate/OpenBLAS)"
-	@echo "  make metal     - Build with Metal GPU acceleration (macOS Apple Silicon)"
 	@echo "  make debug     - Debug build with AddressSanitizer"
 	@echo "  make clean     - Remove build artifacts"
 	@echo "  make info      - Show build configuration"
@@ -79,18 +66,9 @@ $(TARGET): $(OBJS)
 
 blas: $(TARGET)
 
-# Metal build: BLAS + Metal GPU acceleration (macOS Apple Silicon)
-metal: ENABLE_METAL=1
-metal:
-	$(MAKE) blas ENABLE_METAL=1
-
 # Compile C sources
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Compile Objective-C (Metal backend)
-qwen_tts_metal.o: qwen_tts_metal.m qwen_tts_metal.h
-	clang $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 # Header dependencies
 main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_kernels.h qwen_tts_server.h
@@ -111,7 +89,7 @@ qwen_tts_voice_clone.o: qwen_tts_voice_clone.c qwen_tts_voice_clone.h qwen_tts.h
 
 # Clean
 clean:
-	rm -f $(OBJS) qwen_tts_metal.o $(TARGET)
+	rm -f $(OBJS) $(TARGET)
 
 # Debug build
 debug: CFLAGS = $(CFLAGS_BASE) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
@@ -439,7 +417,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas metal clean debug info serve test-serve test-clone test-voice-design \
+.PHONY: all help blas clean debug info serve test-serve test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
