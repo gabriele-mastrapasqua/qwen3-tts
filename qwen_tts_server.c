@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/time.h>
 
 /* ── Simple JSON helpers ─────────────────────────────────────────────── */
 
@@ -234,8 +235,34 @@ static void handle_speakers(int fd) {
     send_json(fd, 200, json);
 }
 
+/* Reset per-request context to clean defaults (prevents state leaking between requests) */
+static void reset_request_state(qwen_tts_ctx_t *ctx) {
+    /* Reset to default speaker (Ryan) and language (English) */
+    ctx->speaker_id = 3061;   /* ryan */
+    ctx->language_id = 2050;  /* English */
+
+    /* Reset sampling params to defaults */
+    ctx->temperature = 0.9f;
+    ctx->top_k = 50;
+    ctx->top_p = 1.0f;
+    ctx->rep_penalty = 1.05f;
+
+    /* Reset transient flags */
+    ctx->voice_design = 0;
+    free(ctx->instruct);
+    ctx->instruct = NULL;
+
+    /* Fresh seed per request (time-based) */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ctx->seed = (uint32_t)(tv.tv_sec ^ tv.tv_usec);
+}
+
 /* Apply TTS params from JSON body to context. Returns text (malloc'd) or NULL on error. */
 static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
+    /* Start from clean defaults — prevents state leaking between requests */
+    reset_request_state(ctx);
+
     char *text = json_extract_string(body, "text");
     if (!text) {
         /* Try OpenAI-compatible "input" field */
@@ -272,13 +299,23 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
         free(vd);
     }
 
-    /* Sampling params */
+    /* Sampling params (override defaults only if provided) */
     ctx->temperature = (float)json_extract_number(body, "temperature", ctx->temperature);
     ctx->top_k = (int)json_extract_number(body, "top_k", ctx->top_k);
     ctx->top_p = (float)json_extract_number(body, "top_p", ctx->top_p);
     ctx->rep_penalty = (float)json_extract_number(body, "rep_penalty", ctx->rep_penalty);
 
+    /* Seed (optional: 0 or negative = keep time-based from reset) */
+    int seed = (int)json_extract_number(body, "seed", -1);
+    if (seed >= 0) ctx->seed = (uint32_t)seed;
+
     return text;
+}
+
+static double server_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
 static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
@@ -293,7 +330,9 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         return;
     }
 
-    fprintf(stderr, "[HTTP] TTS: \"%s\"\n", text);
+    fprintf(stderr, "[HTTP] TTS: \"%s\" (speaker=%d, lang=%d, seed=%u)\n",
+            text, ctx->speaker_id, ctx->language_id, ctx->seed);
+    double t0 = server_time_ms();
 
     /* Disable streaming for this path — full decode */
     ctx->stream = 0;
@@ -317,8 +356,10 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     send_response(fd, 200, "audio/wav", wav, wav_size);
     free(wav);
 
-    fprintf(stderr, "[HTTP] Sent %d bytes WAV (%.2fs audio)\n",
-            wav_size, (float)n_samples / QWEN_TTS_SAMPLE_RATE);
+    double elapsed = server_time_ms() - t0;
+    float audio_secs = (float)n_samples / QWEN_TTS_SAMPLE_RATE;
+    fprintf(stderr, "[HTTP] Sent %d bytes WAV (%.2fs audio) in %.1fs (%.1fx realtime)\n",
+            wav_size, audio_secs, elapsed / 1000.0, audio_secs / (elapsed / 1000.0));
 }
 
 static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
@@ -333,7 +374,9 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         return;
     }
 
-    fprintf(stderr, "[HTTP] TTS stream: \"%s\"\n", text);
+    fprintf(stderr, "[HTTP] TTS stream: \"%s\" (speaker=%d, lang=%d, seed=%u)\n",
+            text, ctx->speaker_id, ctx->language_id, ctx->seed);
+    double t0 = server_time_ms();
 
     /* Set up streaming */
     stream_http_state_t state = { .fd = fd, .total_samples = 0 };
@@ -357,8 +400,10 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     ctx->stream = 0;
     ctx->audio_cb = NULL;
 
-    fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio)\n",
-            state.total_samples, (float)state.total_samples / QWEN_TTS_SAMPLE_RATE);
+    double elapsed = server_time_ms() - t0;
+    float audio_secs = (float)state.total_samples / QWEN_TTS_SAMPLE_RATE;
+    fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio) in %.1fs (%.1fx realtime)\n",
+            state.total_samples, audio_secs, elapsed / 1000.0, audio_secs / (elapsed / 1000.0));
 }
 
 /* ── Main server loop ────────────────────────────────────────────────── */
@@ -404,7 +449,16 @@ int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port) {
     fprintf(stderr, "  POST /v1/tts/stream   — generate speech (chunked PCM stream)\n");
     fprintf(stderr, "  POST /v1/audio/speech — OpenAI-compatible TTS\n");
     fprintf(stderr, "  GET  /v1/speakers     — list speakers\n");
-    fprintf(stderr, "  GET  /v1/health       — health check\n");
+    fprintf(stderr, "  GET  /v1/health       — health check\n\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  # Full WAV:\n");
+    fprintf(stderr, "  curl -s http://localhost:%d/v1/tts -d '{\"text\":\"Hello world\"}' -o out.wav\n\n", port);
+    fprintf(stderr, "  # Streaming playback (macOS):\n");
+    fprintf(stderr, "  curl -sN http://localhost:%d/v1/tts/stream -d '{\"text\":\"Hello world\"}' | "
+                    "ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -\n\n", port);
+    fprintf(stderr, "  # With options:\n");
+    fprintf(stderr, "  curl -s http://localhost:%d/v1/tts -d '{\"text\":\"Hello\",\"speaker\":\"ryan\","
+                    "\"language\":\"English\"}' -o out.wav\n\n", port);
     fprintf(stderr, "Press Ctrl+C to stop.\n\n");
 
     /* Suppress model output during request handling */
