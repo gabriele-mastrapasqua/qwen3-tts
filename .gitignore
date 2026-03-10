@@ -3,7 +3,7 @@
 !samples/*.wav
 *.py
 qwen_tts
-qwen_tts_bin
+qwen_tts_py/
 venv/
 venv312/
 .venv/

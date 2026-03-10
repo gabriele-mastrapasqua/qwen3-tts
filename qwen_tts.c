@@ -380,6 +380,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->rope_cos); free(ctx->rope_sin); free(ctx->rope_inv_freq);
     free(ctx->cp_rope_cos); free(ctx->cp_rope_sin);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
+    if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
 }
 
@@ -440,7 +441,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * These tokens get embedded via text_projection and prepended to input_embeds. */
     int32_t *instruct_tokens = NULL;
     int instruct_token_len = 0;
-    qwen_tokenizer_t *tok = qwen_tokenizer_load(ctx->model_dir);
+    /* Use cached tokenizer if available, otherwise load and cache */
+    qwen_tokenizer_t *tok = (qwen_tokenizer_t *)ctx->cached_tokenizer;
+    if (!tok) {
+        tok = qwen_tokenizer_load(ctx->model_dir);
+        /* Cache for future calls */
+        if (tok) ctx->cached_tokenizer = tok;
+    }
 
     if (ctx->instruct && ctx->instruct[0] && tok) {
         /* Build instruct template: <|im_start|>user\n{instruct}<|im_end|>\n */
@@ -471,7 +478,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             if (!ctx->silent && ref_text_tokens)
                 fprintf(stderr, "Ref text: \"%s\" (%d tokens)\n", ctx->ref_text, ref_text_token_len);
         }
-        qwen_tokenizer_free(tok);
+        /* tok is cached in ctx->cached_tokenizer — do not free */
     }
     if (!text_tokens || text_token_len == 0) {
         fprintf(stderr, "Error: text tokenization failed\n");
