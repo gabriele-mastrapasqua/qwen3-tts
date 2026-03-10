@@ -464,6 +464,9 @@ typedef struct qwen_tts_ctx {
     float *audio_buf;
     int audio_samples;
 
+    /* Cached tokenizer (avoid re-loading from disk each call) */
+    void *cached_tokenizer;
+
 } qwen_tts_ctx_t;
 
 /* ========================================================================

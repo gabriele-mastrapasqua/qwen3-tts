@@ -334,48 +334,100 @@ A mismatched sample rate would produce incorrect mel features and a bad voice em
 
 ### HTTP Server
 
+The server loads the model once at startup and keeps weights in memory across requests.
+The tokenizer is also cached after the first call, so **subsequent requests skip all loading
+overhead and go straight to inference** (~5-6s per short sentence on 0.6B, 4 threads, Apple Silicon).
+
 ```bash
 # Start server (model loaded once, shared across requests)
 ./qwen_tts -d qwen3-tts-0.6b --serve 8080
-
-# Generate speech (returns WAV)
-curl -X POST http://localhost:8080/v1/tts \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello world","speaker":"ryan","language":"English"}' \
-  -o output.wav
-
-# Streaming (returns chunked raw PCM as it generates)
-curl -X POST http://localhost:8080/v1/tts/stream \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello world","speaker":"ryan"}' \
-  -o output.raw
-
-# OpenAI-compatible endpoint (drop-in replacement)
-curl -X POST http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"input":"Hello world","voice":"ryan"}' \
-  -o output.wav
-
-# List speakers
-curl http://localhost:8080/v1/speakers
-
-# Health check
-curl http://localhost:8080/v1/health
 ```
 
-The full request body for `/v1/tts`:
+#### Generate speech (full WAV)
+
+```bash
+# Minimal — defaults to speaker=ryan, language=English
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"Hello, how are you today?"}' -o output.wav
+
+# With explicit options
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"Ciao, come stai?","speaker":"vivian","language":"Italian"}' \
+  -o ciao.wav
+
+# OpenAI-compatible endpoint (drop-in replacement)
+curl -s http://localhost:8080/v1/audio/speech \
+  -d '{"input":"Hello world","voice":"ryan"}' -o output.wav
+```
+
+#### Streaming playback
+
+The `/v1/tts/stream` endpoint returns chunked raw PCM (s16le, 24 kHz, mono) as it generates.
+First audio arrives within ~1 second; pipe it directly to an audio player for real-time playback:
+
+```bash
+# macOS — real-time playback via ffplay
+curl -sN http://localhost:8080/v1/tts/stream \
+  -d '{"text":"Hello, how are you today?"}' | \
+  ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -
+
+# macOS — real-time playback via sox
+curl -sN http://localhost:8080/v1/tts/stream \
+  -d '{"text":"Hello, how are you today?"}' | \
+  play -t raw -r 24000 -e signed -b 16 -c 1 -
+
+# Linux — real-time playback via aplay
+curl -sN http://localhost:8080/v1/tts/stream \
+  -d '{"text":"Hello, how are you today?"}' | \
+  aplay -f S16_LE -r 24000 -c 1
+
+# Save raw PCM to file
+curl -sN http://localhost:8080/v1/tts/stream \
+  -d '{"text":"Hello"}' -o output.raw
+# Convert to WAV: ffmpeg -f s16le -ar 24000 -ac 1 -i output.raw output.wav
+```
+
+#### Other endpoints
+
+```bash
+# List speakers
+curl -s http://localhost:8080/v1/speakers | python3 -m json.tool
+
+# Health check
+curl -s http://localhost:8080/v1/health
+```
+
+#### Server performance (0.6B, Apple Silicon, 4 threads)
+
+| | Wall time | Audio length | Realtime factor |
+|---|---|---|---|
+| **First call** | 7.3s | 2.6s | 0.3x |
+| **Second call** | 5.2s | 3.5s | 0.7x |
+
+The first request pays a one-time cost for tokenizer parsing (~200ms) and warming the
+OS page cache for mmap'd weights. Subsequent calls skip both: the tokenizer is cached
+in memory and weight pages are already resident. In CLI mode you pay model load + tokenizer
+on every invocation; the server eliminates that overhead entirely.
+
+#### Full request body
+
 ```json
 {
   "text": "Hello world",
   "speaker": "ryan",
   "language": "English",
   "instruct": "Speak cheerfully",
+  "seed": 42,
   "temperature": 0.9,
   "top_k": 50,
   "top_p": 1.0,
   "rep_penalty": 1.05
 }
 ```
+
+All fields except `text` are optional. Defaults: speaker=ryan, language=English,
+temperature=0.9, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
+Each request starts from clean defaults — parameters do not leak between requests.
 
 ## How It Works
 

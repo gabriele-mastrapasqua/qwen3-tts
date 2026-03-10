@@ -35,7 +35,7 @@ SRCS = main.c \
        qwen_tts_speech_encoder.c
 
 OBJS = $(SRCS:.c=.o)
-TARGET = qwen_tts_bin
+TARGET = qwen_tts
 MODEL_DIR = qwen3-tts-0.6b
 
 # Default: show help
