@@ -440,7 +440,11 @@ int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port) {
         return -1;
     }
 
-    signal(SIGINT, sigint_handler);
+    struct sigaction sa = { .sa_handler = sigint_handler };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* no SA_RESTART — let accept() return EINTR */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr, "Server listening on http://0.0.0.0:%d\n", port);
