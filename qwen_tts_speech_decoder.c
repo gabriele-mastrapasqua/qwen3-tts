@@ -497,45 +497,71 @@ int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_fram
                 sd->pre_conv_weight[3], sd->pre_conv_weight[4]);
     }
 
-    /* Step 1: VQ dequant + output projection */
+    /* Step 1: VQ dequant + output projection (batched with BLAS) */
     float *vq_out = (float *)aligned_calloc((int64_t)n_frames * vq_hidden, sizeof(float));
-    float *cb_sum = (float *)aligned_malloc(cb_dim * sizeof(float));
+
+    /* Gather codebook embeddings into matrices for batched projection */
+    float *emb_first = (float *)aligned_malloc((int64_t)n_frames * cb_dim * sizeof(float));
+    float *emb_rest = (float *)aligned_calloc((int64_t)n_frames * cb_dim, sizeof(float));
 
     for (int f = 0; f < n_frames; f++) {
         /* Codebook 0 (rvq_first) */
         int code0 = codes[f * 16];
         if (code0 >= 0 && code0 < c->codebook_size && sd->codebook[0]) {
-            const float *emb = sd->codebook[0] + (int64_t)code0 * cb_dim;
-            /* Output projection: [vq_hidden, cb_dim, 1] used as [vq_hidden, cb_dim] matmul */
-            if (sd->rvq_first_output_proj) {
-                for (int o = 0; o < vq_hidden; o++) {
-                    float sum = 0;
-                    for (int i = 0; i < cb_dim; i++)
-                        sum += sd->rvq_first_output_proj[(int64_t)o * cb_dim + i] * emb[i];
-                    vq_out[(int64_t)f * vq_hidden + o] += sum;
-                }
-            }
+            memcpy(emb_first + (int64_t)f * cb_dim,
+                   sd->codebook[0] + (int64_t)code0 * cb_dim, cb_dim * sizeof(float));
+        } else {
+            memset(emb_first + (int64_t)f * cb_dim, 0, cb_dim * sizeof(float));
         }
 
-        /* Codebooks 1-15 (rvq_rest): sum embeddings, then project */
-        memset(cb_sum, 0, cb_dim * sizeof(float));
+        /* Codebooks 1-15 (rvq_rest): sum embeddings */
+        float *rest_row = emb_rest + (int64_t)f * cb_dim;
         for (int k = 1; k < 16; k++) {
             int code = codes[f * 16 + k];
             if (code >= 0 && code < c->codebook_size && sd->codebook[k]) {
                 const float *emb = sd->codebook[k] + (int64_t)code * cb_dim;
-                for (int d = 0; d < cb_dim; d++) cb_sum[d] += emb[d];
+                for (int d = 0; d < cb_dim; d++) rest_row[d] += emb[d];
             }
         }
-        if (sd->rvq_rest_output_proj) {
+    }
+
+    /* Batched projection: vq_out[n_frames, vq_hidden] = emb[n_frames, cb_dim] × W^T[cb_dim, vq_hidden] */
+#ifdef USE_BLAS
+    if (sd->rvq_first_output_proj) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    n_frames, vq_hidden, cb_dim, 1.0f,
+                    emb_first, cb_dim, sd->rvq_first_output_proj, cb_dim,
+                    0.0f, vq_out, vq_hidden);
+    }
+    if (sd->rvq_rest_output_proj) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    n_frames, vq_hidden, cb_dim, 1.0f,
+                    emb_rest, cb_dim, sd->rvq_rest_output_proj, cb_dim,
+                    1.0f, vq_out, vq_hidden);  /* accumulate */
+    }
+#else
+    for (int f = 0; f < n_frames; f++) {
+        if (sd->rvq_first_output_proj) {
+            const float *emb = emb_first + (int64_t)f * cb_dim;
             for (int o = 0; o < vq_hidden; o++) {
                 float sum = 0;
                 for (int i = 0; i < cb_dim; i++)
-                    sum += sd->rvq_rest_output_proj[(int64_t)o * cb_dim + i] * cb_sum[i];
+                    sum += sd->rvq_first_output_proj[(int64_t)o * cb_dim + i] * emb[i];
+                vq_out[(int64_t)f * vq_hidden + o] += sum;
+            }
+        }
+        if (sd->rvq_rest_output_proj) {
+            const float *rest = emb_rest + (int64_t)f * cb_dim;
+            for (int o = 0; o < vq_hidden; o++) {
+                float sum = 0;
+                for (int i = 0; i < cb_dim; i++)
+                    sum += sd->rvq_rest_output_proj[(int64_t)o * cb_dim + i] * rest[i];
                 vq_out[(int64_t)f * vq_hidden + o] += sum;
             }
         }
     }
-    free(cb_sum);
+#endif
+    free(emb_first); free(emb_rest);
 
     /* Debug: dump first frame's RVQ output */
     if (ctx->debug) {
@@ -645,15 +671,8 @@ int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_fram
     for (int layer = 0; layer < c->dec_num_layers; layer++) {
         qwen_sd_pre_layer_t *l = &sd->pre_layers[layer];
 
-        /* Input RMSNorm */
-        for (int s = 0; s < n_frames; s++) {
-            const float *xs = hidden + s * dec_hidden;
-            float *xn = x_norm + s * dec_hidden;
-            float sum_sq = 0;
-            for (int i = 0; i < dec_hidden; i++) sum_sq += xs[i] * xs[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
-            for (int i = 0; i < dec_hidden; i++) xn[i] = xs[i] * inv_rms * l->attn_norm[i];
-        }
+        /* Input RMSNorm (NEON-optimized) */
+        qwen_rms_norm(x_norm, hidden, l->attn_norm, n_frames, dec_hidden, eps);
 
         /* Debug after input RMSNorm for layer 0 */
         if (ctx->debug && layer == 0) {
@@ -804,15 +823,8 @@ int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_fram
                     hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
         }
 
-        /* Post-attn RMSNorm */
-        for (int s = 0; s < n_frames; s++) {
-            const float *xs = hidden + s * dec_hidden;
-            float *xn = x_norm + s * dec_hidden;
-            float sum_sq = 0;
-            for (int i = 0; i < dec_hidden; i++) sum_sq += xs[i] * xs[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
-            for (int i = 0; i < dec_hidden; i++) xn[i] = xs[i] * inv_rms * l->ffn_norm[i];
-        }
+        /* Post-attn RMSNorm (NEON-optimized) */
+        qwen_rms_norm(x_norm, hidden, l->ffn_norm, n_frames, dec_hidden, eps);
 
         /* SwiGLU FFN: down_proj(SiLU(gate_proj(x)) * up_proj(x)) + layer_scale + residual */
 #ifdef USE_BLAS
@@ -899,13 +911,7 @@ int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_fram
 
     /* Step 5: Final RMSNorm + Output proj (512→1024) */
     if (sd->final_norm_weight) {
-        for (int s = 0; s < n_frames; s++) {
-            float *hs = hidden + s * dec_hidden;
-            float sum_sq = 0;
-            for (int i = 0; i < dec_hidden; i++) sum_sq += hs[i] * hs[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
-            for (int i = 0; i < dec_hidden; i++) hs[i] = hs[i] * inv_rms * sd->final_norm_weight[i];
-        }
+        qwen_rms_norm(hidden, hidden, sd->final_norm_weight, n_frames, dec_hidden, eps);
     }
 
     if (ctx->debug) {
@@ -1565,15 +1571,8 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
     for (int layer = 0; layer < c->dec_num_layers; layer++) {
         qwen_sd_pre_layer_t *l = &sd->pre_layers[layer];
 
-        /* Input RMSNorm */
-        for (int s = 0; s < new_frames; s++) {
-            const float *xs = hidden + s * dec_hidden;
-            float *xn = x_norm + s * dec_hidden;
-            float sum_sq = 0;
-            for (int i = 0; i < dec_hidden; i++) sum_sq += xs[i] * xs[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
-            for (int i = 0; i < dec_hidden; i++) xn[i] = xs[i] * inv_rms * l->attn_norm[i];
-        }
+        /* Input RMSNorm (NEON-optimized) */
+        qwen_rms_norm(x_norm, hidden, l->attn_norm, new_frames, dec_hidden, eps);
 
         /* QKV projections for new frames */
 #ifdef USE_BLAS
@@ -1703,15 +1702,8 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
         }
 #endif
 
-        /* Post-attn RMSNorm */
-        for (int s = 0; s < new_frames; s++) {
-            const float *xs = hidden + s * dec_hidden;
-            float *xn = x_norm + s * dec_hidden;
-            float sum_sq = 0;
-            for (int i = 0; i < dec_hidden; i++) sum_sq += xs[i] * xs[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
-            for (int i = 0; i < dec_hidden; i++) xn[i] = xs[i] * inv_rms * l->ffn_norm[i];
-        }
+        /* Post-attn RMSNorm (NEON-optimized) */
+        qwen_rms_norm(x_norm, hidden, l->ffn_norm, new_frames, dec_hidden, eps);
 
         /* SwiGLU FFN */
 #ifdef USE_BLAS
@@ -1777,13 +1769,7 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
 
     /* === Step 5: Final RMSNorm + Output proj (512→1024) on new frames === */
     if (sd->final_norm_weight) {
-        for (int s = 0; s < new_frames; s++) {
-            float *hs = hidden + s * dec_hidden;
-            float sum_sq = 0;
-            for (int i = 0; i < dec_hidden; i++) sum_sq += hs[i] * hs[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / dec_hidden + eps);
-            for (int i = 0; i < dec_hidden; i++) hs[i] = hs[i] * inv_rms * sd->final_norm_weight[i];
-        }
+        qwen_rms_norm(hidden, hidden, sd->final_norm_weight, new_frames, dec_hidden, eps);
     }
 
     /* Grow latent cache if needed */
