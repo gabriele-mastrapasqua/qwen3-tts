@@ -32,6 +32,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 /* Cache-line aligned allocation for BLAS/SIMD performance.
  * 64-byte alignment matches Apple M1/M2 cache line size.
  * Falls back to malloc if posix_memalign unavailable. */
@@ -720,66 +724,49 @@ int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_fram
                     vv[0], vv[1], vv[2], vv[3], vv[4]);
         }
 
-        /* NeoX split-half RoPE (NO QK-norm for pre-transformer) */
+        /* NeoX split-half RoPE (NEON-optimized, NO QK-norm for pre-transformer) */
         for (int s = 0; s < n_frames; s++) {
             const float *cos_ptr = sd->rope_cos + s * half_hd;
             const float *sin_ptr = sd->rope_sin + s * half_hd;
-            for (int h = 0; h < n_heads; h++) {
-                float *qh = q + s * qkv_dim + h * head_dim;
-                float *kh = kk + s * qkv_dim + h * head_dim;
+            for (int hh = 0; hh < n_heads; hh++) {
+                float *qh = q + s * qkv_dim + hh * head_dim;
+                float *kh = kk + s * qkv_dim + hh * head_dim;
+#ifdef __ARM_NEON
+                int i = 0;
+                for (; i + 3 < half_hd; i += 4) {
+                    float32x4_t c = vld1q_f32(cos_ptr + i);
+                    float32x4_t si = vld1q_f32(sin_ptr + i);
+                    float32x4_t q1 = vld1q_f32(qh + i), q2 = vld1q_f32(qh + i + half_hd);
+                    float32x4_t k1 = vld1q_f32(kh + i), k2 = vld1q_f32(kh + i + half_hd);
+                    vst1q_f32(qh + i,           vmlsq_f32(vmulq_f32(q1, c), q2, si));
+                    vst1q_f32(qh + i + half_hd, vmlaq_f32(vmulq_f32(q2, c), q1, si));
+                    vst1q_f32(kh + i,           vmlsq_f32(vmulq_f32(k1, c), k2, si));
+                    vst1q_f32(kh + i + half_hd, vmlaq_f32(vmulq_f32(k2, c), k1, si));
+                }
+                for (; i < half_hd; i++) {
+                    float qv1 = qh[i], qv2 = qh[i + half_hd];
+                    float kv1 = kh[i], kv2 = kh[i + half_hd];
+                    float co = cos_ptr[i], sn = sin_ptr[i];
+                    qh[i] = qv1 * co - qv2 * sn; qh[i + half_hd] = qv2 * co + qv1 * sn;
+                    kh[i] = kv1 * co - kv2 * sn; kh[i + half_hd] = kv2 * co + kv1 * sn;
+                }
+#else
                 for (int i = 0; i < half_hd; i++) {
                     float q1 = qh[i], q2 = qh[i + half_hd];
                     float k1 = kh[i], k2 = kh[i + half_hd];
                     float co = cos_ptr[i], si = sin_ptr[i];
-                    qh[i]           = q1 * co - q2 * si;
-                    qh[i + half_hd] = q2 * co + q1 * si;
-                    kh[i]           = k1 * co - k2 * si;
-                    kh[i + half_hd] = k2 * co + k1 * si;
+                    qh[i] = q1 * co - q2 * si; qh[i + half_hd] = q2 * co + q1 * si;
+                    kh[i] = k1 * co - k2 * si; kh[i + half_hd] = k2 * co + k1 * si;
                 }
+#endif
             }
         }
 
-        /* Sliding window causal attention with proper softmax */
+        /* Sliding window causal attention (NEON-optimized) */
         float scale = 1.0f / sqrtf((float)head_dim);
-        for (int sq = 0; sq < n_frames; sq++) {
-            float *out = attn_out + sq * qkv_dim;
-            memset(out, 0, qkv_dim * sizeof(float));
-            int sk_start = (sq - window + 1 > 0) ? sq - window + 1 : 0;
-
-            for (int h = 0; h < n_heads; h++) {
-                const float *qh = q + sq * qkv_dim + h * head_dim;
-                float *oh = out + h * head_dim;
-
-                /* Compute scores and find max for numerical stability */
-                int n_keys = sq - sk_start + 1;
-                float scores[n_keys];
-                float max_score = -1e30f;
-                for (int j = 0; j < n_keys; j++) {
-                    int sk = sk_start + j;
-                    const float *kh = kk + sk * qkv_dim + h * head_dim;
-                    float dot = 0;
-                    for (int d = 0; d < head_dim; d++) dot += qh[d] * kh[d];
-                    scores[j] = dot * scale;
-                    if (scores[j] > max_score) max_score = scores[j];
-                }
-
-                /* Softmax */
-                float sum_exp = 0;
-                for (int j = 0; j < n_keys; j++) {
-                    scores[j] = expf(scores[j] - max_score);
-                    sum_exp += scores[j];
-                }
-                float inv_sum = 1.0f / sum_exp;
-
-                /* Weighted sum of values */
-                for (int j = 0; j < n_keys; j++) {
-                    int sk = sk_start + j;
-                    const float *vh = vv + sk * qkv_dim + h * head_dim;
-                    float w = scores[j] * inv_sum;
-                    for (int d = 0; d < head_dim; d++) oh[d] += vh[d] * w;
-                }
-            }
-        }
+        qwen_causal_attention_windowed(attn_out, q, kk, vv,
+                                        n_frames, n_frames, n_heads, n_heads,
+                                        head_dim, scale, 0, window);
 
         /* Output proj + layer_scale + residual */
 #ifdef USE_BLAS
