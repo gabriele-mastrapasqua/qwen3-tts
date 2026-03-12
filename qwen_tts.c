@@ -982,9 +982,10 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     *out_n_samples = n_samples;
 
     if (!ctx->silent) {
-        fprintf(stderr, "Audio: %.1fs generated in %.1fs (%.1fx realtime)\n",
-                (float)n_samples / 24000.0f, (time_ms() - t_start) / 1000.0f,
-                (float)n_samples / 24000.0f / ((time_ms() - t_start) / 1000.0f));
+        float audio_dur = (float)n_samples / 24000.0f;
+        float proc_time = (time_ms() - t_start) / 1000.0f;
+        fprintf(stderr, "Audio: %.1fs generated in %.1fs (RTF %.2f)\n",
+                audio_dur, proc_time, proc_time / audio_dur);
     }
 
     return 0;

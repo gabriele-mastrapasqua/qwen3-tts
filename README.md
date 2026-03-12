@@ -412,13 +412,14 @@ Same text, same seed (`--seed 42`), identical output (bit-for-bit):
 
 | | Wall time | Audio length | RTF |
 |---|---|---|---|
-| **First call** | 10.4s | 5.5s | 1.9 |
-| **Warm call** | 7.3s | 5.5s | 1.3 |
+| **First call** | 14.5s | 8.2s | 1.77 |
+| **Warm call** | 11.4s | 8.2s | 1.39 |
 
 The first request pays a one-time cost for tokenizer parsing (~200ms) and warming the
-OS page cache for mmap'd weights. Subsequent calls skip both: the tokenizer is cached
-in memory and weight pages are already resident. In CLI mode you pay model load + tokenizer
-on every invocation; the server eliminates that overhead entirely.
+OS page cache for mmap'd weights. Warm calls are **22% faster**: the tokenizer is cached
+in memory, weight pages are already resident, and all prefill/sampling buffers are reused.
+In CLI mode you pay model load + tokenizer on every invocation; the server eliminates
+that overhead entirely.
 
 #### Full request body
 
