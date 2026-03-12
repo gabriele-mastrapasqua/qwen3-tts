@@ -1,6 +1,6 @@
 # PLAN.md — Qwen3-TTS C Engine Roadmap
 
-Updated: 2026-03-07
+Updated: 2026-03-12
 
 Core engine is **COMPLETE** and producing good audio for both 0.6B and 1.7B models.
 This document tracks all planned features, improvements, and known issues.
@@ -296,7 +296,20 @@ ceiling). The entire Metal backend was removed as dead code in commit history.
 - [x] ~~Full GPU transformer step~~ — removed (still slower than CPU)
 - [ ] `[LOW]` CUDA/HIP backend stubs (for future NVIDIA/AMD support)
 
-### 7.2 Further CPU Optimizations
+### 7.2 Generation Speed Variability
+
+The same text with different seeds (or same seed with different temperatures) produces
+audio of very different durations — up to 3-7x range. This is **inherent model behavior**
+(confirmed identical in Python). The Talker's autoregressive loop decides when to emit EOS,
+and sampling randomness (temp=0.9 default) heavily influences frame count.
+
+- Greedy (temp=0, top_k=1) produces consistent, short output
+- temp=0.9 + top_k=50 (defaults) gives natural-sounding but variable-length output
+- Lower temperature (0.6-0.7) is a good middle ground: less variability, still natural
+- **No single "sweet spot"** — it's a quality/consistency tradeoff the user should control
+- All sampling params remain user-configurable (--temperature, --top-k, --top-p, --seed)
+
+### 7.3 Further CPU Optimizations
 
 - [x] `[MED]` Profile 1.7B model bottlenecks:
   - Per-frame timing added to generation loop (Talker step, CP, embed, codec head)
@@ -313,6 +326,87 @@ ceiling). The entire Metal backend was removed as dead code in commit history.
   - ARM NEON: 4-wide SIMD with scalar sinf per lane + fma
   - Generic fallback for non-SIMD platforms
 - [x] `[LOW]` Persistent BF16 KV cache (halves KV memory, bf16 stored/read in attention)
+
+### 7.4 NEON SiLU for SwiGLU (feat/labs) — TESTED, NO GAIN
+
+SwiGLU activation (`silu(gate) * up`) uses scalar `expf()` in the hot loop.
+Called per-layer per-step: Talker (28 layers × 3072) + CP (5 layers × 15 passes × 3072)
+= ~316K scalar expf calls per frame.
+
+**Result**: No measurable speedup. SiLU is <1% of frame time (~0.2ms out of 80ms).
+With `-ffast-math`, clang already uses Apple Accelerate's optimized `expf`.
+The Schraudolph NEON approximation also caused autoregressive divergence
+(different frame count with same seed due to ~1e-4 error accumulating).
+
+- [x] `[MED]` ~~Implement NEON fused SiLU×up kernel~~ — tested, reverted (no gain + divergence)
+- [ ] ~~AVX equivalent~~ — not worth it
+- [ ] ~~Benchmark~~ — done: 0% speedup, quality risk
+
+### 7.5 INT8 Quantization for Code Predictor (feat/labs)
+
+CP is 55% of total time and NOT fully bandwidth-bound at hidden=1024.
+INT4 failed (unpack overhead > bandwidth gain on small matrices), but INT8 has
+much simpler unpack (vmovl_s8, 1 op per 8 weights) and halves bandwidth vs BF16.
+
+**Design**: BF16 remains the default. `--int8` CLI flag enables runtime quantization
+of CP weights (bf16→int8 at load time with per-row absmax scaling). This lets users
+choose quality (BF16) vs speed (INT8) without separate model files. The Talker stays
+BF16 regardless — it's only 35% of frame time and more sensitive to precision.
+
+- [x] `[HIGH]` `--int8` CLI flag: quantize CP weights at load time (bf16→int8 per-row absmax)
+- [x] `[MED]` NEON int8→f32 matvec kernel (dequant on the fly, 2-row fused, multi-threaded)
+- [x] `[MED]` Quality validation: same frame count (54), audio sounds correct
+- [ ] `[LOW]` AVX equivalent for x86
+
+**Result (Apple M1 8-core 16 GB, 4 threads):**
+
+| Model | BF16 CP ms/f | INT8 CP ms/f | Speedup |
+|-------|-------------|-------------|---------|
+| 0.6B | 63.8 | 63.6 | 0% |
+| 1.7B | 83.7 | 72.0 | ~14% |
+
+**0.6B**: No measurable speedup. Same root cause as INT4: cp_hidden=1024 matrices
+too small to be bandwidth-bound. INT8 dequant overhead (3 NEON ops/4 weights) cancels
+the halved bandwidth vs BF16 dequant (1 NEON op/4 weights via vshll).
+
+**1.7B**: ~14% CP speedup (median of 5 runs). CP still has hidden=1024 but the larger
+Talker creates more memory pressure, making bandwidth savings from INT8 more visible.
+High variance due to 16GB RAM pressure with 3.6GB mmap'd model.
+Note: Talker (hidden=2048) is NOT quantized — only CP.
+
+Code is correct (same frame count, audio sounds good) and kept as `--int8` opt-in.
+
+### 7.6 SDOT/I8MM Integer Dot Product Kernels (optional, future — needs M2+ or AVX-512 to test)
+
+Current INT8 matvec dequantizes weights to f32 then does f32 FMA — 3 NEON ops per
+4 weights for dequant alone. Native integer dot product instructions can do int8×int8
+multiplication directly in hardware, avoiding the f32 conversion entirely.
+
+**Available instructions (compile-time detection via preprocessor macros):**
+
+| Instruction | Macro | Min Arch | Apple Silicon | Op |
+|-------------|-------|----------|---------------|----|
+| SDOT | `__ARM_FEATURE_DOTPROD` | ARMv8.2 | M1+ | 4× int8·int8 → int32, 1 cycle |
+| SMMLA | `__ARM_FEATURE_MATMUL_INT8` | ARMv8.6 | M2+ | 8× int8·int8 → int32, 1 cycle |
+| VNNI | `__AVX512VNNI__` / `__AVXVNNI__` | AVX-512/AVX2 | N/A | 4× int8·int8 → int32 |
+
+**Design**: Quantize BOTH weights (int8, per-row absmax) AND activations (int8,
+per-tensor dynamic quantization of x vector before each matvec). Then use SDOT/SMMLA
+to compute dot products entirely in int8→int32, dequantize only the final accumulator.
+
+**Compile-time dispatch**: Use `#ifdef __ARM_FEATURE_DOTPROD` etc. to select the
+optimal kernel at compile time. With `-march=native`, the compiler defines the right
+macros automatically for the target CPU. For portable binaries, use runtime detection
+(`getauxval(AT_HWCAP)` on Linux, `sysctl` on macOS) with function pointers.
+
+**Status**: Optional/deferred — M1 has SDOT but not SMMLA; no M2+ or AVX-512
+hardware available to test. Propose when hardware becomes available, do not auto-implement.
+
+- [ ] `[LOW]` SDOT matvec kernel: int8 weights × int8 activations → int32 accumulate
+- [ ] `[LOW]` Dynamic per-tensor int8 quantization of activation vector x
+- [ ] `[LOW]` SMMLA kernel for M2+ (2× throughput vs SDOT)
+- [ ] `[LOW]` AVX VNNI kernel for x86
+- [ ] `[LOW]` Runtime CPU feature detection for portable binaries
 
 ---
 
@@ -350,6 +444,126 @@ The README already mentions WSL2 as the recommended approach.
 
 ---
 
+## Phase 9: GitHub Actions CI/CD
+
+**Goal**: Automated cross-platform builds, benchmarks, and release artifacts.
+Public repos get unlimited free CI minutes on GitHub-hosted runners.
+
+### 9.1 Build Matrix
+
+Trigger: **manual only** (`workflow_dispatch` button in Actions tab) on `main` branch.
+No automatic runs on every push — we decide when to launch.
+
+Target matrix:
+
+| Runner | OS | Arch | BLAS | Notes |
+|--------|-----|------|------|-------|
+| `ubuntu-latest` | Linux | x86_64 | OpenBLAS | Primary Linux target |
+| `ubuntu-24.04-arm` | Linux | aarch64 | OpenBLAS | ARM Linux (free for public repos) |
+| `macos-latest` | macOS | ARM64 (M-series) | Accelerate | Apple Silicon |
+| `macos-13` | macOS | x86_64 | Accelerate | Intel Mac |
+| `windows-latest` | Windows/WSL2 | x86_64 | OpenBLAS | Via WSL2 Ubuntu layer |
+
+Cross-compilation (stretch goal):
+- Linux x86 → Linux ARM via `aarch64-linux-gnu-gcc` + OpenBLAS ARM
+- Useful if native ARM runners are unavailable
+
+### 9.2 Build Verification
+
+Each runner must:
+- [ ] `[HIGH]` Install deps (`libopenblas-dev` on Linux, Xcode on macOS)
+- [ ] `[HIGH]` `make blas` — verify clean compile (zero warnings)
+- [ ] `[HIGH]` Binary exists and `./qwen_tts --help` returns 0
+
+### 9.3 Benchmark + Hardware Dump
+
+Each runner must dump system info and run a synthetic benchmark (no model needed):
+- [ ] `[MED]` Dump: OS version, CPU model, core count, RAM, BLAS version
+- [ ] `[MED]` Micro-benchmark: matvec throughput (bf16, various sizes), to compare
+  across runners without needing model files (models are too large for CI)
+- [ ] `[LOW]` If feasible: download 0.6B model + run a fixed-seed generation and
+  report ms/f breakdown. GitHub Actions has ~14GB RAM on Linux, enough for 0.6B (~3GB).
+  Model download adds ~2 min but gives real end-to-end numbers.
+- [ ] `[MED]` Upload benchmark results as workflow artifacts (JSON + human-readable summary)
+- [ ] `[LOW]` Optional: commit results to a `benchmarks/` dir or publish to GitHub Pages
+
+### 9.4 Release Artifacts
+
+On manual trigger (or tag push like `v1.0`):
+- [ ] `[HIGH]` Build static binaries per platform/arch
+- [ ] `[HIGH]` Upload as GitHub Release assets (`qwen_tts-linux-x86_64`,
+  `qwen_tts-linux-aarch64`, `qwen_tts-macos-arm64`, `qwen_tts-macos-x86_64`)
+- [ ] `[MED]` Include version string in binary (`--version` flag)
+- [ ] `[LOW]` Checksums (SHA256) for all release binaries
+
+### 9.5 Code Quality & Memory Safety (free, automated)
+
+#### CodeQL (GitHub native)
+- [ ] `[HIGH]` Enable CodeQL for C/C++ (Settings → Code security → CodeQL)
+  - Zero config: GitHub auto-detects `make blas` build
+  - Finds: buffer overflows, use-after-free, integer overflow, null deref
+  - Runs on every PR to main (free, ~5 min)
+  - Particularly useful for our mmap + raw pointer + bf16 cast patterns
+
+#### clang-tidy (static analysis)
+- [ ] `[MED]` Add `clang-tidy` job with `clang-analyzer-*` checks
+  - Complementary to CodeQL (different analysis engine, finds different bugs)
+  - Focus checks: `clang-analyzer-core.*`, `clang-analyzer-unix.*`,
+    `clang-analyzer-security.*`, `bugprone-*`
+  - Run on Linux runner only (clang-tidy pre-installed on ubuntu-latest)
+
+#### ASan/UBSan (runtime memory safety)
+- [ ] `[HIGH]` CI job: `make debug` (ASan + UBSan) + run 2-3 fixed-seed generations
+  - Short English phrase (seed 42) + longer multilingual phrase (seed 7)
+  - Catches: out-of-bounds, stack overflow, undefined behavior, alignment issues
+  - Needs 0.6B model download (~2 min) but catches real bugs in real paths
+  - ASan is 2x native speed — fast enough for CI (vs Valgrind at 20x)
+  - Run on Linux x86_64 only (ASan is best supported there)
+
+> **Why no Valgrind?** ASan covers 95% of memory bugs and runs 10x faster.
+> Valgrind nightly would add maintenance for marginal gain on a one-man project.
+> If a subtle leak surfaces that ASan misses, add Valgrind as a one-off debug step.
+
+### 9.6 Free Multi-CPU Testing Services (stretch)
+
+For public open-source repos, explore:
+- **GitHub-hosted runners**: Already cover x86_64 + ARM64 for Linux/macOS (free)
+- **Actuated.dev**: ARM runners for GitHub Actions (free tier for OSS)
+- **Cirrus CI**: Free for public repos, offers ARM64 Linux + FreeBSD
+- **builds.sr.ht**: Free for OSS, has various arch (amd64, arm64, riscv64)
+
+These would let us test on diverse CPUs (Graviton, Ampere, RISC-V) without hardware.
+
+### 9.7 Workflow Design
+
+```yaml
+# .github/workflows/build.yml
+name: Build & Benchmark
+on:
+  workflow_dispatch:        # Manual "Run workflow" button
+    inputs:
+      create_release:
+        description: 'Create GitHub Release with binaries'
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']            # Also trigger on version tags
+```
+
+Key design decisions:
+- **Manual trigger only** for build+bench (no auto-run on push to main)
+- Tag push (`v1.0`, `v1.1`) also triggers and creates a release automatically
+- `create_release` checkbox in manual trigger to optionally create release
+- Each job uploads its binary + benchmark JSON as artifacts
+- Final job collects all artifacts into a release (if requested)
+
+Separate workflows:
+- `.github/workflows/build.yml` — manual build matrix + bench + release
+- `.github/workflows/codeql.yml` — auto on PR to main (CodeQL + clang-tidy)
+- `.github/workflows/safety.yml` — auto on PR to main (ASan/UBSan test run)
+
+---
+
 ## Priority Summary
 
 | Priority | Phase | Impact | Effort |
@@ -362,6 +576,7 @@ The README already mentions WSL2 as the recommended approach.
 | **P5** | Phase 6: Quality | EOS reliability, reproducibility | Low |
 | **P6** | Phase 7: Performance | CPU optimizations, faster 1.7B | High |
 | **P7** | Phase 8: Windows | Broader platform support | Low |
+| **P8** | Phase 9: GH Actions | Cross-platform CI, benchmarks, releases | Medium |
 
 ---
 
