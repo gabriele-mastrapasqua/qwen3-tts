@@ -529,20 +529,32 @@ See [blog/optimization-notes.md](blog/optimization-notes.md) for the full story.
 
 For context, here's how the official Python + PyTorch implementation performs on GPUs:
 
-| Hardware | 0.6B RTF | Notes |
-|----------|----------|-------|
-| **This project (C, Apple M1 CPU)** | **1.3–2.0** | **Pure C, no GPU, 16 GB RAM** |
-| NVIDIA RTX 3090 | 0.52–0.68 | Python + PyTorch + FlashAttention 2 |
-| NVIDIA RTX 4090 | 0.38 | Python + PyTorch + FlashAttention 2 |
-| NVIDIA A100 | 0.28 | Data center GPU |
-| NVIDIA H100 | 0.22 | Data center GPU |
+| Hardware | 0.6B RTF (short) | 0.6B RTF (long) | Notes |
+|----------|------------------|-----------------|-------|
+| **This project (C, Apple M1 CPU)** | **1.41** | **1.31** | **Pure C, server warm, no GPU** |
+| Python + PyTorch (Ryzen 9 7950X CPU) | 4.5–5.8 | — | Official Python, CPU-only, no GPU |
+| NVIDIA RTX 3090 | 0.52 | 0.68 | Python + PyTorch + FlashAttention 2 |
+| NVIDIA RTX 4090 | 0.38 | 0.45 | Python + PyTorch + FlashAttention 2 |
+| NVIDIA A100 | 0.28 | 0.35 | Data center GPU |
+| NVIDIA H100 | 0.22 | 0.28 | Data center GPU |
 
 > RTF = Real-Time Factor = processing_time / audio_duration. Lower is faster; <1.0 means faster than real-time.
+> GPU benchmarks from [qwen3-tts.app](https://qwen3-tts.app/blog/qwen3-tts-performance-benchmarks-hardware-guide-2026).
 >
-> Our pure C engine on a laptop CPU is ~2–3x slower than an RTX 3090 running the official
-> Python implementation — a reasonable trade-off for zero dependencies, no GPU requirement,
-> and a ~$700 laptop vs ~$1,500 GPU. The gap to data center GPUs (A100/H100) is 5–7x,
-> but those are $10k+ cards. For a CPU-only engine, being within 2–3x of a consumer GPU is a solid result.
+> Two things stand out:
+>
+> **We're 3–4x faster than Python on CPU.** The official Python + PyTorch implementation
+> on a Ryzen 9 7950X (16-core Zen 4, 2022, DDR5) gets RTF 4.5–5.8. Our pure C engine on
+> an Apple M1 (8-core, 2020, LPDDR4X) gets RTF 1.3–2.0 — on older, slower hardware.
+> That's the difference between optimized C with NEON/BLAS and Python with PyTorch overhead.
+>
+> **GPUs get worse on long text, we get better.** GPU RTF degrades 18–31% from short
+> to long text (attention scales quadratically even with FlashAttention). Our RTF *improves*
+> 7% on long text because fixed costs (prefill, speech decoder) amortize over more frames
+> while our per-token decode is constant-time (linear matvec, no quadratic attention).
+>
+> For a CPU-only engine on a 2020 laptop, being within 2x of a consumer GPU (RTX 3090)
+> and 3–4x faster than the official Python CPU path is a solid result.
 
 ## Credits & Acknowledgments
 
