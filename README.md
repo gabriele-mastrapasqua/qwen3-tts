@@ -10,7 +10,7 @@ The engine runs the complete TTS pipeline: BPE tokenization, a 28-layer causal t
 
 ## Audio Samples
 
-All samples generated with the 0.6B model (RTF ~1.3, Apple M1):
+All samples generated with the 0.6B model (RTF ~1.4–2.0, Apple M1):
 
 | Language | Speaker | Sample | Text |
 |----------|---------|--------|------|
@@ -421,6 +421,10 @@ in memory, weight pages are already resident, and all prefill/sampling buffers a
 In CLI mode you pay model load + tokenizer on every invocation; the server eliminates
 that overhead entirely.
 
+Note: while CLI RTF varies from ~2.0 (short audio) to ~1.4 (long audio) due to fixed
+prefill/decoder costs, the server delivers a more consistent RTF even on shorter audio
+thanks to warm caches and pre-allocated buffers.
+
 #### Full request body
 
 ```json
@@ -476,26 +480,31 @@ The Code Predictor has the same architecture in both models (hidden=1024, 5 laye
 
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
-- **0.6B**: RTF ~1.3 (generates 1 second of audio in ~1.3 seconds)
+- **0.6B**: RTF ~1.4–2.0 depending on audio length (longer = better amortization of fixed costs)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 - SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
 - Cache-line aligned buffers (64B `posix_memalign`) for optimal BLAS/SIMD throughput
 - Multi-threaded inference via GCD (`dispatch_apply`) on macOS, pthreads on Linux
 
-### Per-component breakdown (0.6B, seed 42, warm run)
+### Per-component breakdown (0.6B, seed 42, CLI single run)
 
-| Component | Time | Notes |
-|-----------|------|-------|
-| Prefill | 230ms | 21-token prompt, BLAS sgemm on aligned buffers |
-| Talker | 20.5 ms/frame | Single-token decode, NEON bf16 matvec |
-| Code Predictor | 58.8 ms/frame | 15 sequential passes, ~55% of total |
-| Speech Decoder | 1306ms | 62 frames, NEON attention/RoPE + BLAS sgemm |
-| **Total** | **6.5s for 5.0s audio** | **RTF 1.3** |
+| Component | Short text (4.7s audio) | Long text (16.8s audio) |
+|-----------|------------------------|------------------------|
+| Prefill | 1,633ms | 1,040ms |
+| Talker | 21.0 ms/frame | 22.0 ms/frame |
+| Code Predictor | 69.3 ms/frame | 60.1 ms/frame |
+| Speech Decoder | 2,359ms | 5,313ms |
+| **Total** | **9.5s → RTF 2.01** | **23.9s → RTF 1.42** |
+
+Prefill and speech decoder are fixed costs that amortize over longer audio.
+Per-frame decode (Talker + CP) is ~82 ms/frame, which sets the asymptotic RTF at ~1.0
+for sufficiently long generations. The server mode further improves warm-call RTF by
+reusing tokenizer cache and pre-allocated buffers (see below).
 
 ### Optimization history
 
-Starting from a baseline of **RTF 2.5**, the following optimizations brought
-performance to **RTF 1.3** (2x total speedup):
+Starting from a baseline of **RTF ~3.5** (CLI), the following optimizations brought
+performance to **RTF ~1.4–2.0** (up to 2x total speedup):
 
 | Optimization | Speedup | Technique |
 |---|---|---|
@@ -514,7 +523,7 @@ For context, here's how the official Python + PyTorch implementation performs on
 
 | Hardware | 0.6B RTF | Notes |
 |----------|----------|-------|
-| **This project (C, Apple M1 CPU)** | **1.3** | **Pure C, no GPU, 16 GB RAM** |
+| **This project (C, Apple M1 CPU)** | **1.4–2.0** | **Pure C, no GPU, 16 GB RAM** |
 | NVIDIA RTX 3090 | 0.52–0.68 | Python + PyTorch + FlashAttention 2 |
 | NVIDIA RTX 4090 | 0.38 | Python + PyTorch + FlashAttention 2 |
 | NVIDIA A100 | 0.28 | Data center GPU |
@@ -522,10 +531,10 @@ For context, here's how the official Python + PyTorch implementation performs on
 
 > RTF = Real-Time Factor = processing_time / audio_duration. Lower is faster; <1.0 means faster than real-time.
 >
-> Our pure C engine on a laptop CPU is ~2x slower than an RTX 3090 running the official
+> Our pure C engine on a laptop CPU is ~2–3x slower than an RTX 3090 running the official
 > Python implementation — a reasonable trade-off for zero dependencies, no GPU requirement,
-> and a ~$700 laptop vs ~$1,500 GPU. The gap to data center GPUs (A100/H100) is 4–6x,
-> but those are $10k+ cards. For a CPU-only engine, being within 2x of a consumer GPU is a solid result.
+> and a ~$700 laptop vs ~$1,500 GPU. The gap to data center GPUs (A100/H100) is 5–7x,
+> but those are $10k+ cards. For a CPU-only engine, being within 2–3x of a consumer GPU is a solid result.
 
 ## Credits & Acknowledgments
 

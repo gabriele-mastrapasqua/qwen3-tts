@@ -1,4 +1,4 @@
-# From RTF 2.5 to RTF 1.3: Optimizing a Pure C TTS Engine
+# From RTF 3.5 to RTF 1.4: Optimizing a Pure C TTS Engine
 
 *How cache alignment, NEON intrinsics, and lessons from 1990s game programming doubled our inference speed.*
 
@@ -11,10 +11,12 @@ and NEON intrinsics on an Apple M1 with 16 GB RAM.
 
 After getting the pipeline correct and implementing the first round of NEON
 kernels (fused 2-row bf16 matvec, unified QKV dispatch, fused gate+up SwiGLU),
-we were at **RTF 2.5** (generating 1 second of audio took about 2.5 seconds).
+we were at **RTF ~3.5** on short text and **RTF ~2.5** on longer text (the fixed
+costs of prefill and speech decoding amortize over longer audio).
 
-This post covers the second round of optimizations that brought us to **RTF 1.3**
-— a 2x total speedup with zero algorithmic changes and zero new dependencies.
+This post covers the second round of optimizations that brought us to
+**RTF ~1.4–2.0** — up to a 2x total speedup with zero algorithmic changes and
+zero new dependencies.
 
 > **RTF** = Real-Time Factor = processing_time / audio_duration. Lower is better.
 > RTF < 1.0 means faster than real-time.
@@ -199,14 +201,18 @@ are 4x larger.
 
 | Metric | Baseline | After all optimizations |
 |--------|----------|------------------------|
-| Talker | 46.9 ms/f | 20.5 ms/f |
-| Code Predictor | 104.7 ms/f | 58.8 ms/f |
-| Speech Decoder | ~2,600ms | 1,306ms |
-| Total (warm) | ~15s | ~6.5s |
-| **RTF** | **2.5** | **1.3** |
+| Talker | 46.9 ms/f | 21.0 ms/f |
+| Code Predictor | 104.7 ms/f | 60.1 ms/f |
+| Speech Decoder | ~2,600ms | ~2,400ms (short) / ~5,300ms (long) |
+| Prefill | ~1,800ms | ~1,000–1,600ms |
+| **RTF (CLI, short ~5s audio)** | **~3.5** | **~2.0** |
+| **RTF (CLI, long ~17s audio)** | **~2.5** | **~1.4** |
 | Per-token malloc calls | ~120+ | **0** |
 
-All on an Apple M1 8-core, 16 GB RAM, 4 threads.
+All on an Apple M1 8-core, 16 GB RAM, 4 threads. RTF improves with longer
+audio because prefill and speech decoder are fixed costs that amortize over
+more frames. Per-frame decode (Talker + CP) is ~82 ms/frame, setting an
+asymptotic RTF of ~1.0 for sufficiently long generations.
 
 ## Lessons
 
