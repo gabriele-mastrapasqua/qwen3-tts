@@ -642,20 +642,207 @@ repeated identically on every request with the same text.
 
 ### Tasks
 
-- [ ] `[HIGH]` **Cache special token embeddings at load time**: tts_pad, tts_bos, tts_eos
-  are computed every request. Compute once in `qwen_tts_load()` and store in ctx.
-  Eliminates 3 × embed_one_text_token() per request. Trivial change.
+- [x] `[HIGH]` **Cache special token embeddings at load time**: tts_pad, tts_bos, tts_eos
+  computed once in `qwen_tts_load()`. Eliminates 3 × embed_one_text_token() per request.
+  *(2026-03-12)*
 
-- [ ] `[MED]` **LRU hash map for text token embeddings**: Cache `token_id → float[hidden]`
-  for all text tokens seen. Vocab is 151K but typical usage hits a few K tokens.
-  Memory: 1000 cached tokens × 1024 floats × 4B = **4MB** — negligible.
-  On cache hit: single memcpy (4KB) instead of 2 matvec + bf16 conversion.
-  Benefits server mode where same phrases are repeated.
+- [x] `[MED]` **LRU hash map for text token embeddings**: Open-addressing hash map
+  (2048 slots, ~8MB) with Knuth hash + linear probing + LRU eviction. Always active
+  (CLI + server). **Result: 14% faster long-text server cold (RTF 1.55→1.33), best
+  RTF 1.31 server warm.** Output bit-identical. *(2026-03-12)*
 
-- [ ] `[LOW]` **Batch text embedding with BLAS sgemm**: Instead of per-token matvec,
+- [ ] `[MED]` **Batch text embedding with BLAS sgemm**: Instead of per-token matvec,
   collect all text token IDs, do a single bf16→f32 gather, then batch fc1 and fc2 as
   sgemm. For 50 tokens: 1 sgemm(50×2048 × 2048×2048) instead of 50 individual matvecs.
-  Benefits both CLI and server.
+  Benefits both CLI and server. Less impactful now that LRU cache is active (warm hits
+  are memcpy), but still helps CLI first-run and server cold call.
+
+---
+
+## Phase 10c: Decoder Thread Overlap (Pipeline Parallelism)
+
+**Goal**: Overlap speech decoder execution with Talker+CP generation by running the
+decoder in a separate thread. Currently the decoder runs AFTER all frames are generated,
+wasting CPU cores that sit idle during generation.
+
+**Analysis (2026-03-12)**: The speech decoder takes 2.4s (short) to 5.3s (long) and
+runs sequentially after generation completes. During generation, the decode cores are
+idle. The decoder is already designed as causal (sliding-window attention w=72, causal
+ConvNet) and streaming mode already processes chunks of 10 frames incrementally.
+
+**Architecture**: Producer-consumer pipeline with 2 threads:
+- **Main thread** (producer): Runs Talker+CP generation loop, pushes completed frames
+  to a shared queue
+- **Decoder thread** (consumer): Pulls frames from queue, runs speech decoder
+  incrementally using the existing `qwen_sd_stream_state_t` streaming infrastructure
+
+**Implementation plan**:
+1. Ringbuffer or simple mutex-guarded queue for codec frames (16 ints per frame)
+2. Decoder thread blocks on condition variable when queue is empty
+3. Main thread signals after each frame (or batch of N frames)
+4. Decoder thread uses existing `qwen_speech_decoder_forward_streaming()` path
+5. Main thread joins decoder thread after generation completes, collects final audio
+
+**Estimated gain**: 15-20% of total pipeline time. The decoder runs ~25% of total time;
+overlapping it with generation hides most of that cost. Gain is larger on long text
+(more frames = more overlap opportunity, less edge effects from pipeline startup/drain).
+
+**Complexity**: Medium (~200 lines). The decoder is already stateful and streaming-ready.
+Main risk is thread synchronization correctness, but the data flow is simple (one
+producer, one consumer, no shared mutable state except the queue).
+
+**Risk**: LOW. The decoder is completely independent from Talker+CP — it only reads
+completed codec frames and writes audio. No shared weights, no shared KV cache.
+The streaming decoder path is already tested and produces identical output.
+
+### Tasks
+
+- [ ] `[HIGH]` **Implement decoder thread with frame queue**
+  - pthread + mutex + condvar queue (or lockfree ringbuffer)
+  - Decoder thread runs `qwen_speech_decoder_forward_streaming()` per chunk
+  - Main thread pushes frames, signals decoder, joins at end
+  - Collect audio samples from decoder thread after join
+
+- [ ] `[HIGH]` **Verify bit-identical output**
+  - Same seed must produce same WAV with and without threading
+  - The streaming decoder path should already guarantee this
+
+- [ ] `[MED]` **Benchmark CLI and server, short + long text**
+  - Measure overlap efficiency: how much decoder time is hidden
+  - Expected: better gains on long text (more pipeline overlap)
+
+---
+
+## Phase 10d: Batch Text Embedding (BLAS sgemm)
+
+**Goal**: Replace per-token sequential matvec with a single batched sgemm for all text
+tokens in the prefill. Currently each token does 2 individual bf16 matvec calls through
+`embed_one_text_token()`. Batching them into one sgemm call lets BLAS optimize the
+memory access pattern across all tokens simultaneously.
+
+**Analysis**: For a 50-token prompt:
+- Current: 50 × matvec(2048×2048) + 50 × matvec(1024×2048) = 100 individual calls
+- Batched: 1 × sgemm(50×2048, 2048×2048) + SiLU + 1 × sgemm(50×2048, 2048×1024) = 2 calls
+- BLAS sgemm is significantly more efficient than repeated matvec for batch sizes > ~8
+
+**Interaction with LRU cache**: On server warm calls, most tokens are cache hits (memcpy).
+The batch sgemm only helps for cache misses (first time a token is seen). Main benefit
+is CLI mode and server cold calls where the LRU cache is empty.
+
+**Complexity**: Low-medium (~80 lines). Gather bf16 embeddings for all tokens into a
+contiguous f32 matrix, run 2 sgemm calls, scatter results. Need a temporary buffer
+of `seq × text_hidden × sizeof(float)` (~400KB for 50 tokens).
+
+**Risk**: LOW. Pure numerical change — output should be bit-identical to sequential
+path (sgemm vs individual matvec may differ by FP rounding, but functionally equivalent).
+
+### Tasks
+
+- [ ] `[MED]` **Implement batched embedding function**
+  - `embed_text_tokens_batch(ctx, token_ids[], n_tokens, output[])`
+  - bf16→f32 gather → sgemm fc1 → SiLU → sgemm fc2 → bias add
+  - Fall back to per-token for n_tokens < 4 (overhead not worth it)
+
+- [ ] `[MED]` **Integrate into prefill path**
+  - Replace the per-token loops in sections 0, 1, 3 of prompt construction
+  - Keep LRU cache active — batch only the cache-miss tokens
+
+---
+
+## Phase 10e: Speculative Code Predictor Decoding (Experimental)
+
+**Goal**: Reduce Code Predictor time (~55% of total) by predicting multiple codebook
+tokens in parallel and verifying, rather than generating all 15 sequentially.
+
+**⚠️ RISK: HIGH — may degrade audio quality. Must be thoroughly tested before merge.**
+
+**Background**: The CP generates 15 codebook tokens per frame sequentially:
+```
+step 0: hidden → code[0]
+step 1: embed(code[0]) → transformer → code[1]
+step 2: embed(code[1]) → transformer → code[2]
+...
+```
+Each step depends on the previous code. But the later codebooks encode finer details
+(residual quantization — codebook 0 is coarse, codebook 15 is fine detail). This
+means later codes have lower entropy and may be more predictable.
+
+**Approach**: Draft-then-verify (inspired by speculative decoding in LLMs):
+1. Run steps 0-4 normally (coarse codebooks, high information)
+2. For steps 5-14: predict N codes in parallel using a lightweight draft head
+3. Verify predictions against the real CP transformer
+4. Accept correct predictions, recompute from first rejection point
+
+**Estimated gain**: 20-30% of CP time IF acceptance rate is >60%. Each accepted
+speculation saves one full transformer forward pass (~4ms).
+
+**Complexity**: HIGH (~300-500 lines). Need to implement:
+- Draft prediction head (small MLP trained on codebook statistics, or heuristic)
+- Parallel evaluation of multiple candidate codes
+- Verification loop with rollback
+- Quality validation framework (correlation with non-speculative output)
+
+**Risk**: HIGH. Wrong speculative codes = different audio. Even if individual codes
+look similar, autoregressive error accumulation can cause quality drift. Must validate
+with extensive listening tests and correlation metrics.
+
+**Requirements before starting**:
+- All other optimizations committed and tested
+- Baseline audio samples saved for A/B comparison
+- Correlation threshold defined (e.g., >0.999 vs non-speculative)
+- Implemented behind `--speculative` flag, OFF by default
+
+### Tasks
+
+- [ ] `[LOW]` **Analyze codebook entropy by position**
+  - Run 100+ generations, collect per-codebook token distributions
+  - Measure conditional entropy: H(code[k] | code[0..k-1])
+  - If later codebooks have low entropy, speculation is viable
+
+- [ ] `[LOW]` **Implement draft-verify loop with flag**
+  - `--speculative` CLI flag, disabled by default
+  - Start conservative: speculate only codebooks 10-14
+  - Measure acceptance rate and quality impact
+
+- [ ] `[LOW]` **Quality validation**
+  - Compare speculative vs non-speculative on 50+ test phrases
+  - Correlation > 0.999 required for merge
+  - Listening test: no audible artifacts
+
+---
+
+## Phase 10f: SDOT/SMMLA INT8 Native Dot Product (Optional, Architecture-Specific)
+
+**Goal**: Use ARM NEON SDOT (`__ARM_FEATURE_DOTPROD`) instruction for native int8×int8
+dot products in the Code Predictor matvec, bypassing f32 dequantization entirely.
+
+**Context**: Current INT8 path dequantizes to f32 before multiply-accumulate (3 NEON ops).
+SDOT computes 4 × int8 dot products in a single instruction, accumulating into int32.
+This eliminates the dequant overhead that made INT8 neutral on 0.6B.
+
+**Architecture requirements**:
+- SDOT (`__ARM_FEATURE_DOTPROD`): Apple M1+, ARM Cortex-A76+
+- SMMLA (`__ARM_FEATURE_MATMUL_INT8`): Apple M2+, ARM Cortex-X2+
+- x86 equivalent: VNNI (AVX-512 VNNI on Ice Lake+, AVX-VNNI on Alder Lake+)
+
+**Complexity**: Medium (~150 lines kernel + ~50 lines dispatch).
+Need to quantize activations (x vector) to int8 too, not just weights. Per-vector
+dynamic quantization adds ~0.1ms overhead per matvec call.
+
+**Risk**: MEDIUM. Quantizing both weights AND activations to int8 introduces more
+approximation error than weight-only quantization. May need per-channel scaling
+or mixed precision (int8 weights × int8 activations with f32 accumulation + rescale).
+
+**Priority**: LOW — architecture-specific optimization that breaks our goal of being
+CPU-agnostic. Implement as opt-in behind `--sdot` flag with runtime feature detection.
+The main codebase should remain portable (bf16 matvec as default path).
+
+### Tasks
+
+- [ ] `[LOW]` **Runtime feature detection**: Check `__ARM_FEATURE_DOTPROD` at compile
+  time, `getauxval(AT_HWCAP)` at runtime on Linux, `sysctlbyname` on macOS.
+- [ ] `[LOW]` **SDOT int8 matvec kernel**: int8 weights × int8 activations → int32 accum → f32 rescale
+- [ ] `[LOW]` **Quality validation**: Compare audio output with bf16 baseline
 
 ---
 
@@ -727,7 +914,12 @@ Raw Metal with custom shaders keeps the zero-dependency philosophy.
 | **P7** | Phase 8: Windows | Broader platform support | Low |
 | **P8** | Phase 9: GH Actions | Cross-platform CI, benchmarks, releases | Medium |
 | **P9** | Phase 10: CPU Cache | Cache alignment, memory layout, alloc optimization | Medium |
-| **P10** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
+| **P10** | Phase 10b: Embedding Cache | LRU token embedding cache (server RTF 1.31) | Low |
+| **P11** | Phase 10c: Decoder Thread | Pipeline overlap generation+decode (est. 15-20%) | Medium |
+| **P12** | Phase 10d: Batch Embedding | BLAS sgemm for text token projection | Low |
+| **P13** | Phase 10e: Speculative CP | Draft-verify for later codebooks (⚠️ HIGH RISK) | High |
+| **P14** | Phase 10f: SDOT INT8 | Native int8 dot product (optional, arch-specific) | Medium |
+| **P15** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
 
 ---
 
