@@ -10,7 +10,7 @@ The engine runs the complete TTS pipeline: BPE tokenization, a 28-layer causal t
 
 ## Audio Samples
 
-All samples generated with the 0.6B model at ~0.7x realtime:
+All samples generated with the 0.6B model (RTF ~1.3, Apple M1):
 
 | Language | Speaker | Sample | Text |
 |----------|---------|--------|------|
@@ -410,10 +410,10 @@ curl -s http://localhost:8080/v1/health
 
 Same text, same seed (`--seed 42`), identical output (bit-for-bit):
 
-| | Wall time | Audio length | Realtime factor |
+| | Wall time | Audio length | RTF |
 |---|---|---|---|
-| **First call** | 10.4s | 5.5s | 0.5x |
-| **Warm call** | 7.3s | 5.5s | 0.8x |
+| **First call** | 10.4s | 5.5s | 1.9 |
+| **Warm call** | 7.3s | 5.5s | 1.3 |
 
 The first request pays a one-time cost for tokenizer parsing (~200ms) and warming the
 OS page cache for mmap'd weights. Subsequent calls skip both: the tokenizer is cached
@@ -475,7 +475,7 @@ The Code Predictor has the same architecture in both models (hidden=1024, 5 laye
 
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
-- **0.6B**: ~0.7x realtime (generates 1 second of audio in ~1.4 seconds)
+- **0.6B**: RTF ~1.3 (generates 1 second of audio in ~1.3 seconds)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 - SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
 - Cache-line aligned buffers (64B `posix_memalign`) for optimal BLAS/SIMD throughput
@@ -489,12 +489,12 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 | Talker | 20.5 ms/frame | Single-token decode, NEON bf16 matvec |
 | Code Predictor | 58.8 ms/frame | 15 sequential passes, ~55% of total |
 | Speech Decoder | 1306ms | 62 frames, NEON attention/RoPE + BLAS sgemm |
-| **Total** | **6.5s for 5.0s audio** | **0.8x realtime** |
+| **Total** | **6.5s for 5.0s audio** | **RTF 1.3** |
 
 ### Optimization history
 
-Starting from a baseline of **0.4x realtime**, the following optimizations brought
-performance to **0.8x realtime** (2x total speedup):
+Starting from a baseline of **RTF 2.5**, the following optimizations brought
+performance to **RTF 1.3** (2x total speedup):
 
 | Optimization | Speedup | Technique |
 |---|---|---|
@@ -513,18 +513,18 @@ For context, here's how the official Python + PyTorch implementation performs on
 
 | Hardware | 0.6B RTF | Notes |
 |----------|----------|-------|
-| **This project (C, Apple M1 CPU)** | **0.5–0.8x** | **Pure C, no GPU, 16 GB RAM** |
-| NVIDIA RTX 4090 | 0.38x | Python + PyTorch + FlashAttention 2 |
-| NVIDIA RTX 3090 | 0.52–0.68x | Python + PyTorch + FlashAttention 2 |
-| NVIDIA A100 | 0.28x | Data center GPU |
-| NVIDIA H100 | 0.22x | Data center GPU |
+| **This project (C, Apple M1 CPU)** | **1.3** | **Pure C, no GPU, 16 GB RAM** |
+| NVIDIA RTX 3090 | 0.52–0.68 | Python + PyTorch + FlashAttention 2 |
+| NVIDIA RTX 4090 | 0.38 | Python + PyTorch + FlashAttention 2 |
+| NVIDIA A100 | 0.28 | Data center GPU |
+| NVIDIA H100 | 0.22 | Data center GPU |
 
-> RTF = Real-Time Factor (lower is faster; <1.0 means faster than real-time).
+> RTF = Real-Time Factor = processing_time / audio_duration. Lower is faster; <1.0 means faster than real-time.
 >
-> Our pure C engine on a laptop CPU (M1, ~$700) achieves performance comparable to an
-> RTX 3090 (~$1500) running the official Python implementation. The gap to high-end GPUs
-> (A100/H100) is 2–3x, but those are $10k+ data center cards. For a zero-dependency
-> CPU-only engine, this is a strong result.
+> Our pure C engine on a laptop CPU is ~2x slower than an RTX 3090 running the official
+> Python implementation — a reasonable trade-off for zero dependencies, no GPU requirement,
+> and a ~$700 laptop vs ~$1,500 GPU. The gap to data center GPUs (A100/H100) is 4–6x,
+> but those are $10k+ cards. For a CPU-only engine, being within 2x of a consumer GPU is a solid result.
 
 ## Credits & Acknowledgments
 
