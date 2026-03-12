@@ -496,6 +496,22 @@ typedef struct qwen_tts_ctx {
     /* Cached tokenizer (avoid re-loading from disk each call) */
     void *cached_tokenizer;
 
+    /* Text embedding cache (server optimization) */
+    float *cached_tts_pad_embed;   /* [hidden] — computed once at load */
+    float *cached_tts_bos_embed;   /* [hidden] */
+    float *cached_tts_eos_embed;   /* [hidden] */
+
+    /* LRU token embedding cache: token_id → float[hidden]
+     * Open-addressing hash map with linear probing. */
+    struct {
+        int *keys;          /* token IDs (-1 = empty) */
+        float *values;      /* [capacity × hidden] embeddings */
+        uint32_t *access;   /* access counter for LRU eviction */
+        int capacity;       /* hash map capacity (power of 2) */
+        int count;          /* entries currently cached */
+        uint32_t clock;     /* global access counter */
+    } emb_cache;
+
 } qwen_tts_ctx_t;
 
 /* ========================================================================
