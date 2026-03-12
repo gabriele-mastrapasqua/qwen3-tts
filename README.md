@@ -498,8 +498,19 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
 Prefill and speech decoder are fixed costs that amortize over longer audio.
 Per-frame decode (Talker + CP) is ~82 ms/frame, which sets the asymptotic RTF at ~1.0
-for sufficiently long generations. The server mode further improves warm-call RTF by
-reusing tokenizer cache and pre-allocated buffers (see below).
+for sufficiently long generations.
+
+### RTF across modes (0.6B, Apple M1 8-core 16 GB, 4 threads)
+
+|  | Short text (~5–8s audio) | Long text (~16s audio) |
+|---|---|---|
+| **CLI** | RTF 2.01 | RTF 1.42 |
+| **Server (cold)** | RTF 1.77 | RTF 1.55 |
+| **Server (warm)** | RTF 1.39 | **RTF 1.34** |
+
+Server warm calls benefit from cached tokenizer, resident mmap'd weight pages,
+and pre-allocated prefill/sampling buffers. Longer audio amortizes fixed costs
+(prefill, speech decoder) over more frames.
 
 ### Optimization history
 
