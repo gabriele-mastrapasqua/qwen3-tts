@@ -337,7 +337,7 @@ A mismatched sample rate would produce incorrect mel features and a bad voice em
 
 The server loads the model once at startup and keeps weights in memory across requests.
 The tokenizer is also cached after the first call, so **subsequent requests skip all loading
-overhead and go straight to inference** (~5-6s per short sentence on 0.6B, 4 threads, Apple Silicon).
+overhead and go straight to inference** (~5-6s per short sentence on 0.6B, 4 threads, Apple M1 8-core 16 GB).
 
 ```bash
 # Start server (model loaded once, shared across requests)
@@ -398,7 +398,7 @@ curl -s http://localhost:8080/v1/speakers | python3 -m json.tool
 curl -s http://localhost:8080/v1/health
 ```
 
-#### Server performance (0.6B, Apple Silicon, 4 threads)
+#### Server performance (0.6B, Apple M1 8-core 16 GB, 4 threads)
 
 | | Wall time | Audio length | Realtime factor |
 |---|---|---|---|
@@ -454,7 +454,7 @@ All model dimensions are read from the weight files at load time — no recompil
 
 ## Performance
 
-Benchmarked with 4 threads on CPU:
+Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
 - **0.6B**: ~0.7x realtime (generates 1 second of audio in ~1.4 seconds)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
