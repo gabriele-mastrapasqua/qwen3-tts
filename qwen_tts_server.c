@@ -358,8 +358,8 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
 
     double elapsed = server_time_ms() - t0;
     float audio_secs = (float)n_samples / QWEN_TTS_SAMPLE_RATE;
-    fprintf(stderr, "[HTTP] Sent %d bytes WAV (%.2fs audio) in %.1fs (%.1fx realtime)\n",
-            wav_size, audio_secs, elapsed / 1000.0, audio_secs / (elapsed / 1000.0));
+    fprintf(stderr, "[HTTP] Sent %d bytes WAV (%.2fs audio) in %.1fs (RTF %.2f)\n",
+            wav_size, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs);
 }
 
 static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
@@ -402,8 +402,8 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
 
     double elapsed = server_time_ms() - t0;
     float audio_secs = (float)state.total_samples / QWEN_TTS_SAMPLE_RATE;
-    fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio) in %.1fs (%.1fx realtime)\n",
-            state.total_samples, audio_secs, elapsed / 1000.0, audio_secs / (elapsed / 1000.0));
+    fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio) in %.1fs (RTF %.2f)\n",
+            state.total_samples, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs);
 }
 
 /* ── Main server loop ────────────────────────────────────────────────── */
