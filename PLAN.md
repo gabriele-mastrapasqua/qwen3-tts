@@ -564,6 +564,109 @@ Separate workflows:
 
 ---
 
+## Phase 10: CPU Cache & Memory Optimizations
+
+**Goal**: Squeeze more performance from CPU-only inference through cache alignment,
+memory layout, and allocation optimizations. Zero new dependencies.
+
+**Context**: At 0.7x RTF on M1, we already match an RTX 3090 running Python+PyTorch.
+These optimizations target the remaining overhead from cache misses, unaligned allocations,
+and per-token malloc traffic. Combined estimated gain: 10-25%.
+
+### 10.1 Quick Wins (high ROI, low effort)
+
+- [ ] `[HIGH]` **Pre-allocate sampling temp buffer**: `qwen_tts_sampling.c` allocates ~600KB
+  via `malloc()` on EVERY token, then frees it. For 100 tokens = 60MB of malloc traffic.
+  Pre-allocate once in context and reuse. **Est: 5-15% on generation loop.**
+
+- [ ] `[MED]` **Align speech decoder buffers**: im2col, weight slice, and result buffers
+  use `malloc()` without alignment. Apple Accelerate/BLAS can bypass SIMD optimizations
+  on misaligned buffers. Switch to `posix_memalign(64, ...)`. **Est: 5-15% on decoder.**
+
+- [ ] `[LOW]` **Pre-allocate CP emb_buf**: `float emb_buf[4096]` is stack-allocated
+  15 times per frame inside `qwen_cp_predict()`. Move to context. **Est: 1-2%.**
+
+### 10.2 Memory Layout (medium effort, medium gain)
+
+- [ ] `[MED]` **Align KV cache to cache lines**: KV cache allocated via `calloc()` without
+  alignment guarantee. Each position = 2048 bytes (0.6B). Use `posix_memalign(64, ...)`
+  and ensure per-position data starts on 64B boundary. **Est: 5-10% on attention.**
+
+- [ ] `[MED]` **Reorder context struct hot fields**: Decode buffers (`dec_x`, `dec_q`, etc.),
+  KV cache pointers, and CP buffers are scattered across `qwen_tts_ctx_t`. Group by
+  access frequency: hot (decode loop) → warm (RoPE, config) → cold (model paths, state).
+  **Est: 3-7% from reduced L1 misses on pointer loads.**
+
+- [ ] `[LOW]` **Reorder layer struct fields**: `qwen_talker_layer_t` pointers not ordered
+  by access sequence in `qwen_talker_step()`. Sort by usage order. **Est: 1-3%.**
+
+### 10.3 Advanced (lower priority)
+
+- [ ] `[LOW]` **L1 cache blocking for matvec**: Partition weight matrix into 32×in_dim tiles
+  with explicit prefetch. Current 2-row fused kernel relies on HW prefetcher. **Est: 3-5%.**
+
+- [ ] `[LOW]` **Prefetch hints in CP loop**: Add `__builtin_prefetch()` for next-layer
+  weights in Code Predictor's 15-pass loop. **Est: 0.5-1%.**
+
+- [ ] `[LOW]` **Persist prefill buffers**: `qwen_talker_prefill()` allocates/frees temp
+  buffers each generation. For server mode (many generations), persist in context. **Est: <1%.**
+
+---
+
+## Phase 11: GPU Acceleration via Metal (Optional, Future)
+
+**Goal**: Evaluate Metal GPU offload for Apple Silicon, specifically for attention and
+matmul kernels. Pure C + Objective-C wrapper (`.m` files), no external dependencies.
+Metal framework ships with macOS — it's a system framework, not an external lib.
+
+**Context**: We previously implemented and removed a Metal backend (PR #14) because
+it was 1.3x SLOWER than CPU on M1 due to per-dispatch command buffer overhead
+(~50μs × 112 dispatches/step). However:
+- Metal 4 (2025) introduces tensors as first-class citizens and 4.7x transformer kernel speedups
+- FlashAttention on GPU fuses QKV projection + attention + softmax into a single kernel,
+  eliminating the per-dispatch overhead that killed our previous attempt
+- M3/M4 have improved GPU memory bandwidth and Metal 4 support
+
+### 11.1 FlashAttention Metal Kernel
+
+FlashAttention fuses the entire attention computation (Q×K^T, softmax, ×V) into a
+single GPU kernel, avoiding materialization of the N×N attention matrix. This is what
+gives the 30-40% speedup reported in GPU benchmarks.
+
+**Complexity assessment:**
+- ~300-500 lines Metal shader code (tiled attention with online softmax)
+- ~200-300 lines Objective-C wrapper (command buffer, pipeline state, dispatch)
+- Requires careful tile size tuning for Apple GPU architecture
+- KV cache must live on GPU (unified memory makes this transparent)
+- **Medium-high complexity**, but no external dependencies
+
+**When to attempt:** Only when M3/M4 hardware is available for testing.
+Metal 4's tensor APIs may simplify the shader significantly.
+
+- [ ] `[LOW]` Prototype fused attention Metal shader (FlashAttention-style)
+- [ ] `[LOW]` Benchmark vs CPU on M3/M4 (must beat CPU to justify inclusion)
+- [ ] `[LOW]` If faster: add `--gpu` flag with automatic CPU fallback
+
+### 11.2 MLX Integration (Alternative)
+
+Apple's [MLX](https://github.com/ml-explore/mlx) framework provides optimized GPU
+kernels for Apple Silicon. Antirez uses MLX in [flux2.c](https://github.com/antirez/flux2)
+without external dependencies by linking the MLX C API directly.
+
+**Trade-offs vs raw Metal:**
+- Pro: Pre-optimized matmul, attention, and elementwise kernels
+- Pro: Unified memory management, lazy evaluation, JIT compilation
+- Con: MLX is a separate library (not a system framework like Metal)
+- Con: Adds ~50MB dependency, requires C++ runtime
+
+**Not recommended** unless MLX becomes a system framework on macOS.
+Raw Metal with custom shaders keeps the zero-dependency philosophy.
+
+- [ ] `[LOW]` Evaluate MLX C API for matmul/attention offload
+- [ ] `[LOW]` Compare MLX vs raw Metal performance on M3/M4
+
+---
+
 ## Priority Summary
 
 | Priority | Phase | Impact | Effort |
@@ -577,6 +680,8 @@ Separate workflows:
 | **P6** | Phase 7: Performance | CPU optimizations, faster 1.7B | High |
 | **P7** | Phase 8: Windows | Broader platform support | Low |
 | **P8** | Phase 9: GH Actions | Cross-platform CI, benchmarks, releases | Medium |
+| **P9** | Phase 10: CPU Cache | Cache alignment, memory layout, alloc optimization | Medium |
+| **P10** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
 
 ---
 
