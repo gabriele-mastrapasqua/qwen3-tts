@@ -471,14 +471,14 @@ Cross-compilation (stretch goal):
 ### 9.2 Build Verification
 
 Each runner must:
-- [ ] `[HIGH]` Install deps (`libopenblas-dev` on Linux, Xcode on macOS)
-- [ ] `[HIGH]` `make blas` — verify clean compile (zero warnings)
-- [ ] `[HIGH]` Binary exists and `./qwen_tts --help` returns 0
+- [x] `[HIGH]` Install deps (`libopenblas-dev` on Linux, Xcode on macOS)
+- [x] `[HIGH]` `make blas` — verify clean compile (zero warnings)
+- [x] `[HIGH]` Binary exists and `./qwen_tts --help` returns 0
 
 ### 9.3 Benchmark + Hardware Dump
 
 Each runner must dump system info and run a synthetic benchmark (no model needed):
-- [ ] `[MED]` Dump: OS version, CPU model, core count, RAM, BLAS version
+- [x] `[MED]` Dump: OS version, CPU model, core count, RAM, BLAS version
 - [ ] `[MED]` Micro-benchmark: matvec throughput (bf16, various sizes), to compare
   across runners without needing model files (models are too large for CI)
 - [ ] `[LOW]` If feasible: download 0.6B model + run a fixed-seed generation and
@@ -490,30 +490,30 @@ Each runner must dump system info and run a synthetic benchmark (no model needed
 ### 9.4 Release Artifacts
 
 On manual trigger (or tag push like `v1.0`):
-- [ ] `[HIGH]` Build static binaries per platform/arch
-- [ ] `[HIGH]` Upload as GitHub Release assets (`qwen_tts-linux-x86_64`,
+- [x] `[HIGH]` Build static binaries per platform/arch
+- [x] `[HIGH]` Upload as GitHub Release assets (`qwen_tts-linux-x86_64`,
   `qwen_tts-linux-aarch64`, `qwen_tts-macos-arm64`, `qwen_tts-macos-x86_64`)
 - [ ] `[MED]` Include version string in binary (`--version` flag)
-- [ ] `[LOW]` Checksums (SHA256) for all release binaries
+- [x] `[LOW]` Checksums (SHA256) for all release binaries
 
 ### 9.5 Code Quality & Memory Safety (free, automated)
 
 #### CodeQL (GitHub native)
-- [ ] `[HIGH]` Enable CodeQL for C/C++ (Settings → Code security → CodeQL)
+- [x] `[HIGH]` Enable CodeQL for C/C++ (Settings → Code security → CodeQL)
   - Zero config: GitHub auto-detects `make blas` build
   - Finds: buffer overflows, use-after-free, integer overflow, null deref
   - Runs on every PR to main (free, ~5 min)
   - Particularly useful for our mmap + raw pointer + bf16 cast patterns
 
 #### clang-tidy (static analysis)
-- [ ] `[MED]` Add `clang-tidy` job with `clang-analyzer-*` checks
+- [x] `[MED]` Add `clang-tidy` job with `clang-analyzer-*` checks
   - Complementary to CodeQL (different analysis engine, finds different bugs)
   - Focus checks: `clang-analyzer-core.*`, `clang-analyzer-unix.*`,
     `clang-analyzer-security.*`, `bugprone-*`
   - Run on Linux runner only (clang-tidy pre-installed on ubuntu-latest)
 
 #### ASan/UBSan (runtime memory safety)
-- [ ] `[HIGH]` CI job: `make debug` (ASan + UBSan) + run 2-3 fixed-seed generations
+- [x] `[HIGH]` CI job: `make debug` (ASan + UBSan) + run 2-3 fixed-seed generations
   - Short English phrase (seed 42) + longer multilingual phrase (seed 7)
   - Catches: out-of-bounds, stack overflow, undefined behavior, alignment issues
   - Needs 0.6B model download (~2 min) but catches real bugs in real paths
