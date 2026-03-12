@@ -1,6 +1,6 @@
-# From RTF 3.5 to RTF 1.4: Optimizing a Pure C TTS Engine
+# From RTF 3.5 to RTF 1.26: Optimizing a Pure C TTS Engine
 
-*How cache alignment, NEON intrinsics, and lessons from 1990s game programming doubled our inference speed.*
+*How cache alignment, NEON intrinsics, pipeline threading, and lessons from 1990s game programming nearly tripled our inference speed.*
 
 ## The Starting Point
 
@@ -14,9 +14,9 @@ kernels (fused 2-row bf16 matvec, unified QKV dispatch, fused gate+up SwiGLU),
 we were at **RTF ~3.5** on short text and **RTF ~2.5** on longer text (the fixed
 costs of prefill and speech decoding amortize over longer audio).
 
-This post covers the second round of optimizations that brought us to
-**RTF ~1.4–2.0** — up to a 2x total speedup with zero algorithmic changes and
-zero new dependencies.
+This post covers the optimizations that brought us to **RTF ~1.26** (server warm,
+long text) — up to a 2.7x total speedup with zero algorithmic changes and zero
+new dependencies.
 
 > **RTF** = Real-Time Factor = processing_time / audio_duration. Lower is better.
 > RTF < 1.0 means faster than real-time.
@@ -187,7 +187,51 @@ model weights. Always active (both CLI and server) since the overhead is near-ze
 
 **Result: 14% faster on long-text server cold call** (RTF 1.55 → 1.33). On warm calls
 the improvement is smaller (~2%) because subsequent requests already benefit from OS
-page cache and buffer reuse. Best server RTF is now **1.31** on long text.
+page cache and buffer reuse.
+
+## Decoder Thread: Pipeline Parallelism
+
+The TTS pipeline has three stages: Talker generates a codec token, the Code Predictor
+fills in 15 more codebook entries, then the speech decoder converts those codes to
+audio. The original code ran these strictly sequentially — the speech decoder waited
+until ALL frames were generated, then processed everything in one batch.
+
+But the speech decoder is completely independent of the Talker and Code Predictor.
+It reads completed codec frames and writes audio. No shared weights, no shared KV
+cache. And it's already designed for incremental operation: the pre-transformer uses
+sliding-window causal attention (window=72), and the ConvNet is fully causal.
+
+The fix: a producer-consumer pipeline with two threads:
+
+```
+Main thread:    [Talker → CP → push frame] → [Talker → CP → push frame] → ...
+Decoder thread: [wait] → [decode chunk] → [wait] → [decode chunk] → ...
+```
+
+The main thread pushes completed frames to a mutex-guarded queue. The decoder thread
+wakes on a condition variable, pulls available frames, and decodes them incrementally
+using the existing streaming decoder path. At the end, the main thread joins the
+decoder thread and collects the accumulated audio.
+
+~150 lines of pthreads code: mutex + condvar queue, producer push, consumer loop,
+join + audio collection.
+
+### The Result
+
+| Mode | Before | After | Improvement |
+|------|--------|-------|-------------|
+| CLI short (~5s audio) | RTF 2.01 | RTF 1.74 | **14%** |
+| Server short cold | RTF 1.85 | RTF 1.50 | **19%** |
+| Server long warm | RTF 1.31 | **RTF 1.26** | **4%** |
+
+The gain is largest on short text where the speech decoder is a bigger fraction of
+total time. On long text, Talker+CP dominate and the decoder overlap has less to
+hide. The "drain" at the end (waiting for the decoder to finish its last chunk) is
+only ~500ms on short text.
+
+One trade-off: the decoder thread competes with the main thread for CPU cores and
+memory bandwidth. Talker+CP ms/frame increases slightly (~10%) due to contention,
+but the net wall-time improvement from overlapping far exceeds this cost.
 
 ## What We Analyzed and Skipped
 
@@ -226,20 +270,21 @@ are 4x larger.
 
 | Metric | Baseline | After all optimizations |
 |--------|----------|------------------------|
-| Talker | 46.9 ms/f | 21.0 ms/f |
-| Code Predictor | 104.7 ms/f | 60.1 ms/f |
-| Speech Decoder | ~2,600ms | ~2,400ms (short) / ~5,300ms (long) |
+| Talker | 46.9 ms/f | ~22 ms/f |
+| Code Predictor | 104.7 ms/f | ~60 ms/f |
+| Speech Decoder | ~2,600ms (blocking) | overlapped (background thread) |
 | Prefill | ~1,800ms | ~1,000–1,600ms |
-| **RTF (CLI, short ~5s audio)** | **~3.5** | **~2.0** |
+| **RTF (CLI, short ~5s audio)** | **~3.5** | **1.74** |
 | **RTF (CLI, long ~17s audio)** | **~2.5** | **~1.4** |
 | Per-token malloc calls | ~120+ | **0** |
-| **RTF (server warm, long)** | — | **1.31** |
+| **RTF (server warm, short)** | — | **1.39** |
+| **RTF (server warm, long)** | — | **1.26** |
 
 All on an Apple M1 8-core, 16 GB RAM, 4 threads. RTF improves with longer
-audio because prefill and speech decoder are fixed costs that amortize over
-more frames. Per-frame decode (Talker + CP) is ~82 ms/frame, setting an
-asymptotic RTF of ~1.0 for sufficiently long generations. Server mode with
-embedding cache and warm buffers delivers the best RTF at 1.31.
+audio because prefill is a fixed cost that amortizes over more frames. The
+speech decoder runs in a background thread, overlapping most of its work with
+generation. Server mode with embedding cache, warm buffers, and decoder thread
+overlap delivers the best RTF at **1.26**.
 
 ## Lessons
 
@@ -265,7 +310,13 @@ embedding cache and warm buffers delivers the best RTF at 1.31.
    8MB for 2048 tokens, it's practically free. The lesson: when you spot a
    pure function called repeatedly with the same inputs, memoize it.
 
-6. **Read the old books.** Abrash's *Graphics Programming Black Book* and
+6. **Pipeline independent stages.** The speech decoder doesn't share any state
+   with the Talker or Code Predictor. Once we recognized that, overlapping them
+   with a simple producer-consumer thread was ~150 lines for a 14-19% speedup.
+   Look for stages in your pipeline that only consume the output of previous
+   stages — those are free parallelism.
+
+7. **Read the old books.** Abrash's *Graphics Programming Black Book* and
    Carmack's `.plan` files are from another era, but the principles — cache
    friendliness, data alignment, knowing your memory hierarchy — are timeless.
    The specific rules change (64-byte cache lines instead of dword alignment),
