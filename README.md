@@ -10,7 +10,7 @@ The engine runs the complete TTS pipeline: BPE tokenization, a 28-layer causal t
 
 ## Audio Samples
 
-All samples generated with the 0.6B model (RTF ~1.3–2.0, Apple M1):
+All samples generated with the 0.6B model (RTF ~1.3–1.7, Apple M1):
 
 | Language | Speaker | Sample | Text |
 |----------|---------|--------|------|
@@ -412,25 +412,24 @@ Same text, same seed (`--seed 42`), identical output (bit-for-bit):
 
 | | Short text (~8s audio) | Long text (~16s audio) |
 |---|---|---|
-| **First call** | 15.1s → RTF 1.85 | 20.9s → RTF 1.33 |
-| **Warm call** | 11.5s → RTF 1.41 | 20.6s → **RTF 1.31** |
+| **First call** | 12.2s → RTF 1.50 | 20.0s → RTF 1.28 |
+| **Warm call** | 11.3s → RTF 1.39 | 19.7s → **RTF 1.26** |
 
 The first request pays a one-time cost for tokenizer parsing (~200ms) and warming the
 OS page cache for mmap'd weights. Warm calls benefit from cached tokenizer, resident
-weight pages, pre-allocated buffers, and the **LRU text embedding cache** (token
-embeddings are computed once and reused across requests, avoiding redundant bf16 matvec
-projections — ~8MB RAM for 2048 cached tokens).
+weight pages, pre-allocated buffers, **LRU text embedding cache** (~8MB for 2048 tokens),
+and **decoder thread overlap** (speech decoder runs in background during generation).
 
 ### RTF across modes (0.6B, Apple M1 8-core 16 GB, 4 threads)
 
 |  | Short text (~5–8s audio) | Long text (~16s audio) |
 |---|---|---|
-| **CLI** | RTF 2.01 | RTF 1.42 |
-| **Server (cold)** | RTF 1.85 | RTF 1.33 |
-| **Server (warm)** | RTF 1.41 | **RTF 1.31** |
+| **CLI** | RTF 1.74 | ~RTF 1.4 |
+| **Server (cold)** | RTF 1.50 | RTF 1.28 |
+| **Server (warm)** | RTF 1.39 | **RTF 1.26** |
 
-Longer audio amortizes fixed costs (prefill, speech decoder). Server mode adds
-warm caches and embedding cache on top.
+Longer audio amortizes fixed costs (prefill). Server mode adds warm caches,
+embedding cache, and decoder thread overlap on top.
 
 #### Full request body
 
@@ -487,7 +486,7 @@ The Code Predictor has the same architecture in both models (hidden=1024, 5 laye
 
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
-- **0.6B**: RTF ~1.3–2.0 depending on audio length and mode (server warm + long text = best)
+- **0.6B**: RTF ~1.3–1.7 depending on audio length and mode (server warm + long text = best)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 - SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
 - Cache-line aligned buffers (64B `posix_memalign`) for optimal BLAS/SIMD throughput
@@ -497,36 +496,26 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
 | Component | Short text (4.7s audio) | Long text (16.8s audio) |
 |-----------|------------------------|------------------------|
-| Prefill | 1,633ms | 1,040ms |
-| Talker | 21.0 ms/frame | 22.0 ms/frame |
-| Code Predictor | 69.3 ms/frame | 60.1 ms/frame |
-| Speech Decoder | 2,359ms | 5,313ms |
-| **Total** | **9.5s → RTF 2.01** | **23.9s → RTF 1.42** |
+| Prefill | 1,647ms | ~1,040ms |
+| Talker | 24.6 ms/frame | ~22 ms/frame |
+| Code Predictor | 76.3 ms/frame | ~60 ms/frame |
+| Speech Decoder | overlapped (512ms drain) | overlapped |
+| **Total** | **8.2s → RTF 1.74** | **~20s → ~RTF 1.4** |
 
-Prefill and speech decoder are fixed costs that amortize over longer audio.
-Per-frame decode (Talker + CP) is ~82 ms/frame, which sets the asymptotic RTF at ~1.0
-for sufficiently long generations.
-
-### RTF across modes (0.6B, Apple M1 8-core 16 GB, 4 threads)
-
-|  | Short text (~5–8s audio) | Long text (~16s audio) |
-|---|---|---|
-| **CLI** | RTF 2.01 | RTF 1.42 |
-| **Server (cold)** | RTF 1.77 | RTF 1.55 |
-| **Server (warm)** | RTF 1.39 | **RTF 1.34** |
-
-Server warm calls benefit from cached tokenizer, resident mmap'd weight pages,
-and pre-allocated prefill/sampling buffers. Longer audio amortizes fixed costs
-(prefill, speech decoder) over more frames.
+The speech decoder runs in a **background thread** during generation, overlapping
+most of its work with Talker+CP. Only the final "drain" (waiting for the last chunk)
+adds to wall time. Prefill and per-frame costs amortize over longer audio, with
+an asymptotic RTF approaching ~1.0.
 
 ### Optimization history
 
 Starting from a baseline of **RTF ~3.5** (CLI), the following optimizations brought
-performance to **RTF ~1.3–2.0** (up to 2.5x total speedup):
+performance to **RTF ~1.3–1.7** (up to 2.7x total speedup):
 
 | Optimization | Speedup | Technique |
 |---|---|---|
 | Cache-line alignment (`posix_memalign(64)`) | **24%** | Aligned all BLAS/SIMD buffers and KV caches |
+| Decoder thread overlap | **14-19%** | Speech decoder runs in background thread during generation |
 | NEON speech decoder | **11%** | Replaced scalar RMSNorm, RoPE, attention with NEON |
 | Persistent prefill buffers | **38% server** | Reuse buffers across generations (zero malloc in decode) |
 | Text embedding cache | **14% server** | LRU cache for token embeddings (skip 2 matvec per cached token) |
@@ -542,7 +531,7 @@ For context, here's how the official Python + PyTorch implementation performs on
 
 | Hardware | 0.6B RTF (short) | 0.6B RTF (long) | Notes |
 |----------|------------------|-----------------|-------|
-| **This project (C, Apple M1 CPU)** | **1.41** | **1.31** | **Pure C, server warm, no GPU** |
+| **This project (C, Apple M1 CPU)** | **1.39** | **1.26** | **Pure C, server warm, no GPU** |
 | Python + PyTorch (Ryzen 9 7950X CPU) | 4.5–5.8 | — | Official Python, CPU-only, no GPU |
 | NVIDIA RTX 3090 | 0.52 | 0.68 | Python + PyTorch + FlashAttention 2 |
 | NVIDIA RTX 4090 | 0.38 | 0.45 | Python + PyTorch + FlashAttention 2 |
@@ -556,7 +545,7 @@ For context, here's how the official Python + PyTorch implementation performs on
 >
 > **We're 3–4x faster than Python on CPU.** The official Python + PyTorch implementation
 > on a Ryzen 9 7950X (16-core Zen 4, 2022, DDR5) gets RTF 4.5–5.8. Our pure C engine on
-> an Apple M1 (8-core, 2020, LPDDR4X) gets RTF 1.3–2.0 — on older, slower hardware.
+> an Apple M1 (8-core, 2020, LPDDR4X) gets RTF 1.3–1.7 — on older, slower hardware.
 > That's the difference between optimized C with NEON/BLAS and Python with PyTorch overhead.
 >
 > **GPUs get worse on long text, we get better.** GPU RTF degrades 18–31% from short

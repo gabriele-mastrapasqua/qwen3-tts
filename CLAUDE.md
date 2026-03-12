@@ -13,7 +13,7 @@ Primary target is CPU inference (BLAS + architecture-specific SIMD paths).
 ## Current Status
 
 - **All components verified correct** (Talker, Code Predictor, Speech Decoder — bit-identical to Python)
-- **Performance**: RTF ~1.4–2.0 on Apple M1 8-core, 16 GB RAM (4 threads)
+- **Performance**: RTF ~1.3–1.7 on Apple M1 8-core, 16 GB RAM (4 threads)
 - **Dev hardware**: Apple M1 8-core, 16 GB RAM — all benchmarks reference this machine
 
 ## Active Branches
