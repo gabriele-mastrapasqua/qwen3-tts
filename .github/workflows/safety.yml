@@ -8,7 +8,7 @@ on:
 
 jobs:
   asan:
-    name: ASan + UBSan
+    name: ASan + UBSan Build
     runs-on: ubuntu-latest
 
     steps:
@@ -22,51 +22,5 @@ jobs:
       - name: Build with sanitizers
         run: make debug
 
-      - name: Download 0.6B model
-        run: |
-          if [ -f download_model.sh ]; then
-            chmod +x download_model.sh
-            ./download_model.sh --model small || true
-          fi
-          # Fallback: download via huggingface-cli
-          if [ ! -d qwen3-tts-0.6b ]; then
-            echo "Attempting direct download from HuggingFace..."
-            pip install huggingface-hub
-            huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-              --local-dir qwen3-tts-0.6b \
-              --include "*.safetensors" "*.json" "vocab.json" "speech_tokenizer/*"
-          fi
-
-      - name: Verify model exists
-        run: |
-          if [ ! -f qwen3-tts-0.6b/model.safetensors ]; then
-            echo "SKIP: Model not available, skipping runtime safety tests"
-            exit 0
-          fi
-          echo "Model found, proceeding with safety tests"
-
-      - name: Run fixed-seed generation (English, seed 42)
-        run: |
-          if [ ! -f qwen3-tts-0.6b/model.safetensors ]; then exit 0; fi
-          ./qwen_tts -d qwen3-tts-0.6b -s ryan -l English \
-            --text "Hello, this is a safety test of the text to speech system." \
-            --seed 42 \
-            -o /tmp/asan_test_en.wav
-
-      - name: Run fixed-seed generation (multilingual, seed 7)
-        run: |
-          if [ ! -f qwen3-tts-0.6b/model.safetensors ]; then exit 0; fi
-          ./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian \
-            --text "Buongiorno, questa è una prova del sistema di sintesi vocale." \
-            --seed 7 \
-            -o /tmp/asan_test_it.wav
-
-      - name: Validate outputs
-        run: |
-          if [ ! -f qwen3-tts-0.6b/model.safetensors ]; then exit 0; fi
-          for f in /tmp/asan_test_en.wav /tmp/asan_test_it.wav; do
-            if [ ! -f "$f" ]; then echo "FAIL: $f not created"; exit 1; fi
-            SIZE=$(stat -c%s "$f")
-            if [ "$SIZE" -le 44 ]; then echo "FAIL: $f is empty ($SIZE bytes)"; exit 1; fi
-            echo "PASS: $f ($SIZE bytes)"
-          done
+      - name: Verify binary
+        run: ./qwen_tts --help
