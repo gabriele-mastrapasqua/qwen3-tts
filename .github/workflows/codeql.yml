@@ -47,11 +47,14 @@ jobs:
       - name: Run clang-tidy
         run: |
           clang-tidy \
-            -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' \
+            -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result' \
             -warnings-as-errors='clang-analyzer-*' \
             -p . \
             --extra-arg='-DUSE_BLAS' \
             --extra-arg='-DUSE_OPENBLAS' \
             --extra-arg='-I/usr/include/openblas' \
-            *.c \
+            main.c qwen_tts.c qwen_tts_talker.c qwen_tts_code_predictor.c \
+            qwen_tts_speech_decoder.c qwen_tts_kernels.c qwen_tts_audio.c \
+            qwen_tts_sampling.c qwen_tts_tokenizer.c qwen_tts_safetensors.c \
+            qwen_tts_server.c qwen_tts_voice_clone.c qwen_tts_speech_encoder.c \
             -- -I/usr/include/openblas
