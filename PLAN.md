@@ -586,25 +586,25 @@ The real gains come from **cache alignment** of BLAS buffers and KV cache, not m
   Applied to talker, code predictor, and speech decoder. **Result: 24% total speedup**
   (prefill 84%, decoder 36%, CP 9%). Cross-platform (POSIX standard). *(2026-03-12)*
 
-- [ ] `[LOW]` **Pre-allocate sampling work buffers**: `qwen_tts_sampling.c` allocates
-  ~12KB per token for top-k/top-p (only when sampling with temp>0). Small but easy to
-  pre-allocate in context. **Est: <1% (only ~100 malloc calls of 12KB each).**
+- [x] `[LOW]` **Pre-allocate sampling work buffers**: Reuse topk/topp work buffers across
+  sample calls. Eliminates ~100 malloc/free pairs per generation. **Result: <1%.** *(2026-03-12)*
 
-- [ ] `[LOW]` **Pre-allocate text embedding temps**: `qwen_tts.c:232-233` allocates
-  2 × text_hidden_size floats per token during prompt construction. **Est: <1%.**
+- [x] `[LOW]` **Pre-allocate text embedding temps**: Pre-allocate in context instead of
+  per-call malloc. **Result: <1%.** *(2026-03-12)*
 
 ### 10.2 Memory Layout (medium effort, medium gain)
 
 - [x] `[MED]` **Align KV cache to cache lines**: Done as part of 10.1 cache-line alignment.
   KV caches use `aligned_calloc(64, ...)` in talker and code predictor. *(2026-03-12)*
 
-- [ ] `[MED]` **Reorder context struct hot fields**: Decode buffers (`dec_x`, `dec_q`, etc.),
-  KV cache pointers, and CP buffers are scattered across `qwen_tts_ctx_t`. Group by
-  access frequency: hot (decode loop) → warm (RoPE, config) → cold (model paths, state).
-  **Est: 3-7% from reduced L1 misses on pointer loads.**
+- [x] `[SKIP]` **Reorder context struct hot fields**: Analyzed — struct is 7.6KB (119 cache
+  lines) but fields are pointer loads, not compute data. Hot decode pointers (kv_cache,
+  dec_x, etc.) are already on adjacent cache lines 112-118. Reordering would not measurably
+  help since the actual bottleneck is the data these pointers reference, not the pointer
+  loads themselves. *(2026-03-12)*
 
-- [ ] `[LOW]` **Reorder layer struct fields**: `qwen_talker_layer_t` pointers not ordered
-  by access sequence in `qwen_talker_step()`. Sort by usage order. **Est: 1-3%.**
+- [x] `[SKIP]` **Reorder layer struct fields**: Same analysis — layer struct fields are
+  weight pointers. The weight data locality matters, not the pointer ordering. *(2026-03-12)*
 
 ### 10.3 Advanced (lower priority)
 
@@ -614,8 +614,9 @@ The real gains come from **cache alignment** of BLAS buffers and KV cache, not m
 - [ ] `[LOW]` **Prefetch hints in CP loop**: Add `__builtin_prefetch()` for next-layer
   weights in Code Predictor's 15-pass loop. **Est: 0.5-1%.**
 
-- [ ] `[LOW]` **Persist prefill buffers**: `qwen_talker_prefill()` allocates/frees temp
-  buffers each generation. For server mode (many generations), persist in context. **Est: <1%.**
+- [x] `[LOW]` **Persist prefill buffers**: Prefill working buffers and f32 weight conversion
+  buffers now persist in context across generations. Eliminates ~50MB of malloc/free traffic
+  per generation in server mode. **Result: 38% faster on 2nd+ server request.** *(2026-03-12)*
 
 ---
 

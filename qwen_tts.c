@@ -379,8 +379,11 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->dec_attn_out); free(ctx->dec_proj_out); free(ctx->dec_gate); free(ctx->dec_up); free(ctx->dec_ffn_out);
     free(ctx->cp_dec_x); free(ctx->cp_dec_q); free(ctx->cp_dec_k); free(ctx->cp_dec_v);
     free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_up); free(ctx->cp_dec_ffn_out);
-    free(ctx->pref_x); free(ctx->pref_x_norm); free(ctx->pref_q); free(ctx->pref_k); free(ctx->pref_v);
-    free(ctx->pref_attn_out); free(ctx->pref_ffn_out);
+    free(ctx->pref_residual); free(ctx->pref_x_norm); free(ctx->pref_q);
+    free(ctx->pref_k); free(ctx->pref_v); free(ctx->pref_attn_out);
+    free(ctx->pref_gate); free(ctx->pref_proj);
+    free(ctx->pref_wq_f32); free(ctx->pref_wk_f32); free(ctx->pref_wv_f32);
+    free(ctx->pref_wo_f32); free(ctx->pref_gate_up_f32); free(ctx->pref_down_f32);
     free(ctx->rope_cos); free(ctx->rope_sin); free(ctx->rope_inv_freq);
     free(ctx->cp_rope_cos); free(ctx->cp_rope_sin);
     free(ctx->emb_tmp1); free(ctx->emb_tmp2);

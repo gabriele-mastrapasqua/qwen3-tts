@@ -446,15 +446,23 @@ typedef struct qwen_tts_ctx {
     float *cp_dec_up;
     float *cp_dec_ffn_out;
     
-    /* Prefill buffers */
-    float *pref_x;
+    /* Prefill buffers (persisted across generations for server mode) */
+    float *pref_residual;
     float *pref_x_norm;
     float *pref_q;
     float *pref_k;
     float *pref_v;
     float *pref_attn_out;
-    float *pref_ffn_out;
+    float *pref_gate;
+    float *pref_proj;
     int pref_seq_cap;
+    /* Prefill weight conversion buffers (fixed size, allocated once) */
+    float *pref_wq_f32;
+    float *pref_wk_f32;
+    float *pref_wv_f32;
+    float *pref_wo_f32;
+    float *pref_gate_up_f32;
+    float *pref_down_f32;
     
     /* RoPE caches */
     float *rope_cos;
