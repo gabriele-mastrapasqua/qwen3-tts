@@ -608,15 +608,22 @@ The real gains come from **cache alignment** of BLAS buffers and KV cache, not m
 
 ### 10.3 Advanced (lower priority)
 
-- [ ] `[LOW]` **L1 cache blocking for matvec**: Partition weight matrix into 32×in_dim tiles
-  with explicit prefetch. Current 2-row fused kernel relies on HW prefetcher. **Est: 3-5%.**
+- [x] `[SKIP]` **L1 cache blocking for matvec**: Analyzed — bf16 matvec kernel already optimal
+  (2-row fused, 32 elem/iter, 8 NEON accumulators). x vector (4KB) fits in L1, weight access
+  is sequential, HW prefetcher handles it. Bottleneck is memory bandwidth, not cache misses.
+  *(2026-03-12)*
 
-- [ ] `[LOW]` **Prefetch hints in CP loop**: Add `__builtin_prefetch()` for next-layer
-  weights in Code Predictor's 15-pass loop. **Est: 0.5-1%.**
+- [x] `[SKIP]` **Prefetch hints in CP loop**: Analyzed — can't prefetch 26MB/layer into L2
+  (12MB). HW prefetcher handles sequential access within matvec. *(2026-03-12)*
 
 - [x] `[LOW]` **Persist prefill buffers**: Prefill working buffers and f32 weight conversion
   buffers now persist in context across generations. Eliminates ~50MB of malloc/free traffic
   per generation in server mode. **Result: 38% faster on 2nd+ server request.** *(2026-03-12)*
+
+- [x] `[MED]` **NEON-optimize speech decoder**: Replaced scalar RMSNorm (6 instances),
+  scalar RoPE, and scalar attention with NEON-optimized versions. Added windowed causal
+  attention kernel. Batched VQ dequant projections with BLAS sgemm. **Result: speech decoder
+  ~11% faster (1446ms → 1288ms).** *(2026-03-12)*
 
 ---
 
