@@ -226,8 +226,9 @@ extern void qwen_sd_stream_free(qwen_sd_stream_state_t *st);
 extern int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float top_p, float rep_penalty, int *prev_tokens, int n_prev);
 extern void qwen_set_seed(uint32_t seed);
 
-/* Embed a single text token: text_embedding → text_projection(SiLU) → out[hidden] */
-static void embed_one_text_token(qwen_tts_ctx_t *ctx, int tid, float *out) {
+/* Embed a single text token: text_embedding → text_projection(SiLU) → out[hidden]
+ * Computes the full projection (bf16 lookup + fc1 SiLU + fc2). */
+static void embed_one_text_token_compute(qwen_tts_ctx_t *ctx, int tid, float *out) {
     int th = ctx->config.text_hidden_size, h = ctx->config.hidden_size;
     float *text_emb = ctx->emb_tmp1;
     float *fc1_out = ctx->emb_tmp2;
@@ -242,6 +243,94 @@ static void embed_one_text_token(qwen_tts_ctx_t *ctx, int tid, float *out) {
     } else {
         memcpy(out, text_emb, h * sizeof(float));
     }
+}
+
+/* ── LRU embedding cache ─────────────────────────────────────────────── */
+
+#define EMB_CACHE_CAPACITY 2048  /* power of 2, holds up to ~1500 tokens before eviction */
+
+static void emb_cache_init(qwen_tts_ctx_t *ctx) {
+    int cap = EMB_CACHE_CAPACITY;
+    int h = ctx->config.hidden_size;
+    ctx->emb_cache.capacity = cap;
+    ctx->emb_cache.count = 0;
+    ctx->emb_cache.clock = 0;
+    ctx->emb_cache.keys = (int *)malloc(cap * sizeof(int));
+    ctx->emb_cache.values = (float *)malloc((size_t)cap * h * sizeof(float));
+    ctx->emb_cache.access = (uint32_t *)calloc(cap, sizeof(uint32_t));
+    for (int i = 0; i < cap; i++) ctx->emb_cache.keys[i] = -1;
+}
+
+static void emb_cache_free(qwen_tts_ctx_t *ctx) {
+    free(ctx->emb_cache.keys);
+    free(ctx->emb_cache.values);
+    free(ctx->emb_cache.access);
+    ctx->emb_cache.keys = NULL;
+    ctx->emb_cache.values = NULL;
+    ctx->emb_cache.access = NULL;
+    ctx->emb_cache.capacity = 0;
+    ctx->emb_cache.count = 0;
+}
+
+/* Lookup or compute+insert. Returns pointer to cached embedding (valid until next eviction). */
+static const float *emb_cache_get(qwen_tts_ctx_t *ctx, int tid) {
+    int cap = ctx->emb_cache.capacity;
+    int h = ctx->config.hidden_size;
+    int mask = cap - 1;  /* cap is power of 2 */
+    int idx = (tid * 2654435761u) & mask;  /* Knuth multiplicative hash */
+
+    /* Linear probe: find existing or empty slot */
+    for (int probe = 0; probe < cap; probe++) {
+        int slot = (idx + probe) & mask;
+        if (ctx->emb_cache.keys[slot] == tid) {
+            /* Cache hit */
+            ctx->emb_cache.access[slot] = ++ctx->emb_cache.clock;
+            return ctx->emb_cache.values + (size_t)slot * h;
+        }
+        if (ctx->emb_cache.keys[slot] == -1) {
+            /* Empty slot — compute and insert */
+            ctx->emb_cache.keys[slot] = tid;
+            ctx->emb_cache.access[slot] = ++ctx->emb_cache.clock;
+            ctx->emb_cache.count++;
+            float *dst = ctx->emb_cache.values + (size_t)slot * h;
+            embed_one_text_token_compute(ctx, tid, dst);
+            return dst;
+        }
+    }
+
+    /* Table full (load factor ~75% with cap=2048) — evict LRU entry */
+    uint32_t min_access = UINT32_MAX;
+    int victim = 0;
+    for (int i = 0; i < cap; i++) {
+        if (ctx->emb_cache.access[i] < min_access) {
+            min_access = ctx->emb_cache.access[i];
+            victim = i;
+        }
+    }
+    ctx->emb_cache.keys[victim] = tid;
+    ctx->emb_cache.access[victim] = ++ctx->emb_cache.clock;
+    float *dst = ctx->emb_cache.values + (size_t)victim * h;
+    embed_one_text_token_compute(ctx, tid, dst);
+    return dst;
+}
+
+/* Embed a text token with caching. Checks special tokens first, then LRU cache. */
+static void embed_one_text_token(qwen_tts_ctx_t *ctx, int tid, float *out) {
+    int h = ctx->config.hidden_size;
+    /* Fast path: pre-computed special tokens */
+    if (ctx->cached_tts_pad_embed) {
+        if (tid == QWEN_TTS_TTS_PAD) { memcpy(out, ctx->cached_tts_pad_embed, h * sizeof(float)); return; }
+        if (tid == QWEN_TTS_TTS_BOS) { memcpy(out, ctx->cached_tts_bos_embed, h * sizeof(float)); return; }
+        if (tid == QWEN_TTS_TTS_EOS) { memcpy(out, ctx->cached_tts_eos_embed, h * sizeof(float)); return; }
+    }
+    /* LRU cache path (server mode) */
+    if (ctx->emb_cache.capacity > 0) {
+        const float *cached = emb_cache_get(ctx, tid);
+        memcpy(out, cached, h * sizeof(float));
+        return;
+    }
+    /* Fallback: compute directly */
+    embed_one_text_token_compute(ctx, tid, out);
 }
 
 /* Load model */
@@ -350,8 +439,20 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
 
     /* Pre-allocate text embedding temp buffers */
     int th = ctx->config.text_hidden_size;
+    int h = ctx->config.hidden_size;
     ctx->emb_tmp1 = (float *)malloc(th * sizeof(float));
     ctx->emb_tmp2 = (float *)malloc(th * sizeof(float));
+
+    /* Pre-compute special token embeddings (used every request) */
+    ctx->cached_tts_pad_embed = (float *)malloc(h * sizeof(float));
+    ctx->cached_tts_bos_embed = (float *)malloc(h * sizeof(float));
+    ctx->cached_tts_eos_embed = (float *)malloc(h * sizeof(float));
+    embed_one_text_token_compute(ctx, QWEN_TTS_TTS_PAD, ctx->cached_tts_pad_embed);
+    embed_one_text_token_compute(ctx, QWEN_TTS_TTS_BOS, ctx->cached_tts_bos_embed);
+    embed_one_text_token_compute(ctx, QWEN_TTS_TTS_EOS, ctx->cached_tts_eos_embed);
+
+    /* Initialize LRU embedding cache (8MB for 2048 slots × 1024 hidden) */
+    emb_cache_init(ctx);
 
     if (!ctx->silent) fprintf(stderr, "Model loaded in %.0f ms\n", time_ms() - t0);
     return ctx;
@@ -387,6 +488,8 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->rope_cos); free(ctx->rope_sin); free(ctx->rope_inv_freq);
     free(ctx->cp_rope_cos); free(ctx->cp_rope_sin);
     free(ctx->emb_tmp1); free(ctx->emb_tmp2);
+    free(ctx->cached_tts_pad_embed); free(ctx->cached_tts_bos_embed); free(ctx->cached_tts_eos_embed);
+    emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
@@ -553,13 +656,10 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     codec_tokens[codec_len++] = QWEN_TTS_CODEC_PAD;
     codec_tokens[codec_len++] = QWEN_TTS_CODEC_BOS;
 
-    /* Pre-compute key embeddings */
-    float *tts_pad_embed = (float *)malloc(h * sizeof(float));
-    float *tts_bos_embed = (float *)malloc(h * sizeof(float));
-    float *tts_eos_embed = (float *)malloc(h * sizeof(float));
-    embed_one_text_token(ctx, QWEN_TTS_TTS_PAD, tts_pad_embed);
-    embed_one_text_token(ctx, QWEN_TTS_TTS_BOS, tts_bos_embed);
-    embed_one_text_token(ctx, QWEN_TTS_TTS_EOS, tts_eos_embed);
+    /* Special token embeddings: use pre-computed cache from load time */
+    const float *tts_pad_embed = ctx->cached_tts_pad_embed;
+    const float *tts_bos_embed = ctx->cached_tts_bos_embed;
+    const float *tts_eos_embed = ctx->cached_tts_eos_embed;
 
     float *codec_pad_embed = (float *)malloc(h * sizeof(float));
     float *codec_bos_embed = (float *)malloc(h * sizeof(float));
@@ -735,8 +835,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     free(all_tokens);
     free(tmp_embed);
-    free(tts_bos_embed);
-    free(tts_eos_embed);
+    /* tts_pad/bos/eos_embed are ctx-owned cache — do not free */
     free(ref_text_tokens);
     free(ref_codes);
 
@@ -768,7 +867,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     /* Talker prefill */
     double t_prefill = time_ms();
     if (qwen_talker_prefill(ctx, input_embeds, prefill_len) != 0) {
-        free(input_embeds); free(tts_pad_embed);
+        free(input_embeds);
         return -1;
     }
     free(input_embeds);
@@ -922,7 +1021,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         /* Talker step */
         double t_step_start = time_ms();
         if (qwen_talker_step(ctx, step_embed, last_hidden) != 0) {
-            free(step_embed); free(last_hidden); free(tts_pad_embed);
+            free(step_embed); free(last_hidden);
             return -1;
         }
         t_talker_step_total += time_ms() - t_step_start;
@@ -930,7 +1029,6 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     free(step_embed);
     free(last_hidden);
-    free(tts_pad_embed);
 
     double t_talker_end = time_ms();
     double t_total_gen = t_talker_end - t_prefill - prefill_ms;
