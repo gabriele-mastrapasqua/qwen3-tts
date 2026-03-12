@@ -485,15 +485,27 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
 | Component | Time | Notes |
 |-----------|------|-------|
-| Prefill | 260ms | 25-token prompt, BLAS sgemm on aligned buffers |
-| Talker | 21.2 ms/frame | Single-token decode, NEON bf16 matvec |
-| Code Predictor | 60.8 ms/frame | 15 sequential passes, ~55% of total |
-| Speech Decoder | 1648ms | 69 frames, causal ConvNet + BLAS sgemm |
-| **Total** | **7.9s for 5.5s audio** | **0.7x realtime** |
+| Prefill | 230ms | 21-token prompt, BLAS sgemm on aligned buffers |
+| Talker | 20.5 ms/frame | Single-token decode, NEON bf16 matvec |
+| Code Predictor | 58.8 ms/frame | 15 sequential passes, ~55% of total |
+| Speech Decoder | 1306ms | 62 frames, NEON attention/RoPE + BLAS sgemm |
+| **Total** | **6.5s for 5.0s audio** | **0.8x realtime** |
 
-Cache-line alignment alone provided a **24% speedup** across the pipeline — prefill
-improved 84%, speech decoder 36%, and Code Predictor 9%. All optimizations are
-cross-platform (POSIX standard, works on Linux and macOS).
+### Optimization history
+
+Starting from a baseline of **0.4x realtime**, the following optimizations brought
+performance to **0.8x realtime** (2x total speedup):
+
+| Optimization | Speedup | Technique |
+|---|---|---|
+| Cache-line alignment (`posix_memalign(64)`) | **24%** | Aligned all BLAS/SIMD buffers and KV caches |
+| NEON speech decoder | **11%** | Replaced scalar RMSNorm, RoPE, attention with NEON |
+| Persistent prefill buffers | **38% server** | Reuse buffers across generations (zero malloc in decode) |
+| Batched VQ projection | minor | BLAS sgemm instead of per-frame scalar matvec |
+| Pre-allocated sampling buffers | minor | Zero per-token malloc in generation loop |
+
+All optimizations are cross-platform (POSIX standard `posix_memalign`, conditional NEON/AVX).
+See [blog/optimization-notes.md](blog/optimization-notes.md) for the full story.
 
 ### How does CPU compare to GPU?
 
