@@ -20,6 +20,7 @@ This document tracks all planned features, improvements, and known issues.
 - [x] Makefile test targets: `test-small`, `test-large`, `test-regression`, `test-all`
 - [x] `download_model.sh` for both model sizes
 - [x] ~0.5-0.7x realtime (0.6B), ~0.2-0.4x realtime (1.7B) on Apple Silicon
+- [x] GitHub Actions CI/CD: build matrix, CodeQL, clang-tidy, ASan/UBSan, release artifacts
 
 ---
 
@@ -444,10 +445,12 @@ The README already mentions WSL2 as the recommended approach.
 
 ---
 
-## Phase 9: GitHub Actions CI/CD
+## Phase 9: GitHub Actions CI/CD ✅ DONE
 
 **Goal**: Automated cross-platform builds, benchmarks, and release artifacts.
 Public repos get unlimited free CI minutes on GitHub-hosted runners.
+**Status**: Core CI/CD implemented and running — build matrix, CodeQL, clang-tidy,
+ASan/UBSan, release artifacts with checksums. Remaining items are stretch goals.
 
 ### 9.1 Build Matrix
 
@@ -569,7 +572,7 @@ Separate workflows:
 **Goal**: Squeeze more performance from CPU-only inference through cache alignment,
 memory layout, and allocation optimizations. Zero new dependencies.
 
-**Context**: At 0.7x RTF on M1, we already match an RTX 3090 running Python+PyTorch.
+**Context**: At RTF ~1.4–2.0 on M1, we're within 2–3x of an RTX 3090 running Python+PyTorch.
 These optimizations target the remaining overhead from cache misses, unaligned allocations,
 and per-token malloc traffic. Combined estimated gain: 10-25%.
 
@@ -624,6 +627,35 @@ The real gains come from **cache alignment** of BLAS buffers and KV cache, not m
   scalar RoPE, and scalar attention with NEON-optimized versions. Added windowed causal
   attention kernel. Batched VQ dequant projections with BLAS sgemm. **Result: speech decoder
   ~11% faster (1446ms → 1288ms).** *(2026-03-12)*
+
+---
+
+## Phase 10b: Text Embedding Cache (Server Optimization)
+
+**Goal**: Cache text token embeddings to avoid redundant matvec computation on repeated
+or similar requests. Each `embed_one_text_token()` does 2 bf16 matvec ops (fc1: 2048×2048,
+fc2: 1024×2048) — ~12M FLOPs per token. For a 60-token prompt that's ~29ms of pure compute
+repeated identically on every request with the same text.
+
+**Analysis (2026-03-12)**: Embedding cost is "Embed: 29ms" for long text (210 frames),
+"Embed: 12ms" for short text. Not huge vs total RTF, but on server it's free savings.
+
+### Tasks
+
+- [ ] `[HIGH]` **Cache special token embeddings at load time**: tts_pad, tts_bos, tts_eos
+  are computed every request. Compute once in `qwen_tts_load()` and store in ctx.
+  Eliminates 3 × embed_one_text_token() per request. Trivial change.
+
+- [ ] `[MED]` **LRU hash map for text token embeddings**: Cache `token_id → float[hidden]`
+  for all text tokens seen. Vocab is 151K but typical usage hits a few K tokens.
+  Memory: 1000 cached tokens × 1024 floats × 4B = **4MB** — negligible.
+  On cache hit: single memcpy (4KB) instead of 2 matvec + bf16 conversion.
+  Benefits server mode where same phrases are repeated.
+
+- [ ] `[LOW]` **Batch text embedding with BLAS sgemm**: Instead of per-token matvec,
+  collect all text token IDs, do a single bf16→f32 gather, then batch fc1 and fc2 as
+  sgemm. For 50 tokens: 1 sgemm(50×2048 × 2048×2048) instead of 50 individual matvecs.
+  Benefits both CLI and server.
 
 ---
 
