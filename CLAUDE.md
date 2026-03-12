@@ -10,6 +10,27 @@ Pure C inference engine for Qwen3-TTS text-to-speech models:
 
 Primary target is CPU inference (BLAS + architecture-specific SIMD paths).
 
+## Current Status
+
+- **All components verified correct** (Talker, Code Predictor, Speech Decoder — bit-identical to Python)
+- **Performance**: ~0.7x realtime on Apple M1 8-core, 16 GB RAM (4 threads)
+- **Dev hardware**: Apple M1 8-core, 16 GB RAM — all benchmarks reference this machine
+
+## Active Branches
+
+- **`main`**: Stable, production-ready code
+- **`feat/labs`**: Experimental branch for architecture tweaks, performance experiments, mixed optimizations, and general R&D. Use this for testing before merging to main.
+
+## CI/CD (planned, not yet implemented)
+
+After implementation, GitHub Actions will provide:
+- **Build matrix**: Linux x86/ARM, macOS ARM/x86, Windows/WSL2 (manual trigger only)
+- **CodeQL + clang-tidy**: Auto on PR to main (buffer overflow, UB, security checks)
+- **ASan/UBSan**: Auto on PR to main (runtime memory safety with real model)
+- **Benchmarks**: Per-runner CPU dump + ms/f breakdown as JSON artifacts
+- **Releases**: Static binaries per platform on tag push (`v*`)
+- See PLAN.md Phase 9 for full details
+
 ## Source Of Truth
 
 When docs and code disagree, trust these files first:

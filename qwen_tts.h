@@ -171,6 +171,20 @@ typedef struct {
 
     /* Fused gate+up for optimization */
     uint16_t *gate_up_fused_bf16; /* [2*inter, hidden] */
+
+    /* INT8 quantized weights (optional, allocated if --int8 flag is set) */
+    int8_t *wq_int8;           /* [q_dim, hidden] */
+    float  *wq_scale;          /* [q_dim] per-row scale */
+    int8_t *wk_int8;           /* [kv_dim, hidden] */
+    float  *wk_scale;          /* [kv_dim] */
+    int8_t *wv_int8;           /* [kv_dim, hidden] */
+    float  *wv_scale;          /* [kv_dim] */
+    int8_t *wo_int8;           /* [hidden, q_dim] */
+    float  *wo_scale;          /* [hidden] */
+    int8_t *gate_up_fused_int8; /* [2*inter, hidden] */
+    float  *gate_up_fused_scale; /* [2*inter] */
+    int8_t *down_int8;         /* [hidden, inter] */
+    float  *down_scale;        /* [hidden] */
 } qwen_cp_layer_t;
 
 /* ========================================================================
@@ -324,6 +338,7 @@ typedef struct qwen_tts_ctx {
     /* Silence flag */
     int silent;
     int debug;
+    int use_int8;  /* INT8 quantized Code Predictor weights */
     
     /* Sampling parameters */
     float temperature;
@@ -384,6 +399,8 @@ typedef struct qwen_tts_ctx {
     qwen_cp_layer_t cp_layers[QWEN_TTS_MAX_CP_LAYERS];
     uint16_t *cp_codec_emb_bf16[15];  /* 15 × [codebook_size, emb_dim] */
     uint16_t *cp_lm_head_bf16[15];    /* 15 × [codebook_size, cp_hidden] */
+    int8_t   *cp_lm_head_int8[15];   /* INT8 quantized lm_head (optional) */
+    float    *cp_lm_head_scale[15];  /* per-row scales for INT8 lm_head */
     int cp_emb_dim;                   /* embedding dim: talker_hidden for 1.7B, cp_hidden for 0.6B */
     uint16_t *cp_mtp_proj_bf16;       /* [cp_hidden, talker_hidden] or NULL if same size */
     float *cp_mtp_proj_bias;          /* [cp_hidden] or NULL */

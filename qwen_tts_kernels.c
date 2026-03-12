@@ -338,6 +338,267 @@ void qwen_linear(float *y, const float *x, const float *W, const float *bias,
 }
 
 /* ========================================================================
+ * INT8 MatVec (per-row absmax quantization)
+ * ======================================================================== */
+
+/* Quantize bf16 weight matrix to int8 with per-row absmax scaling.
+ * scale[row] = max(|W_row|) / 127, W_int8[row][k] = round(W_bf16[row][k] / scale[row]) */
+void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
+                                 int8_t *dst_int8, float *dst_scale) {
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *row = src_bf16 + (size_t)r * cols;
+        /* Find absmax */
+        float amax = 0.0f;
+#ifdef __ARM_NEON
+        float32x4_t vmax = vdupq_n_f32(0);
+        int k = 0;
+        for (; k + 7 < cols; k += 8) {
+            uint16x8_t bf = vld1q_u16(row + k);
+            float32x4_t f0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16));
+            float32x4_t f1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bf), 16));
+            vmax = vmaxq_f32(vmax, vabsq_f32(f0));
+            vmax = vmaxq_f32(vmax, vabsq_f32(f1));
+        }
+        amax = vmaxvq_f32(vmax);
+        for (; k < cols; k++) {
+            uint32_t bits = (uint32_t)row[k] << 16;
+            float val; memcpy(&val, &bits, sizeof(float));
+            float a = fabsf(val);
+            if (a > amax) amax = a;
+        }
+#else
+        for (int k = 0; k < cols; k++) {
+            uint32_t bits = (uint32_t)row[k] << 16;
+            float val; memcpy(&val, &bits, sizeof(float));
+            float a = fabsf(val);
+            if (a > amax) amax = a;
+        }
+#endif
+        float s = amax / 127.0f;
+        dst_scale[r] = s;
+        float inv_s = (s > 0) ? 127.0f / amax : 0.0f;
+
+        /* Quantize */
+        int8_t *dst_row = dst_int8 + (size_t)r * cols;
+#ifdef __ARM_NEON
+        float32x4_t vinv = vdupq_n_f32(inv_s);
+        k = 0;
+        for (; k + 7 < cols; k += 8) {
+            uint16x8_t bf = vld1q_u16(row + k);
+            float32x4_t f0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16));
+            float32x4_t f1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bf), 16));
+            int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(f0, vinv));
+            int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(f1, vinv));
+            int16x4_t s0 = vqmovn_s32(i0);
+            int16x4_t s1 = vqmovn_s32(i1);
+            int8x8_t q = vqmovn_s16(vcombine_s16(s0, s1));
+            vst1_s8(dst_row + k, q);
+        }
+        for (; k < cols; k++) {
+            uint32_t bits = (uint32_t)row[k] << 16;
+            float val; memcpy(&val, &bits, sizeof(float));
+            int v = (int)roundf(val * inv_s);
+            dst_row[k] = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+        }
+#else
+        for (int k = 0; k < cols; k++) {
+            uint32_t bits = (uint32_t)row[k] << 16;
+            float val; memcpy(&val, &bits, sizeof(float));
+            int v = (int)roundf(val * inv_s);
+            dst_row[k] = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+        }
+#endif
+    }
+}
+
+/* INT8 matvec inner kernel: process 2 rows at a time (NEON). */
+static void int8_matvec_fused(float *y, const float *x, const int8_t *W,
+                               const float *scale, int in_dim, int out_dim) {
+    int o = 0;
+#ifdef __ARM_NEON
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0),
+                    a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+        float32x4_t b0 = vdupq_n_f32(0), b1 = vdupq_n_f32(0),
+                    b2 = vdupq_n_f32(0), b3 = vdupq_n_f32(0);
+        int k = 0;
+
+        for (; k + 15 < in_dim; k += 16) {
+            /* Load 4 x vectors (f32) */
+            float32x4_t x0 = vld1q_f32(x + k);
+            float32x4_t x1 = vld1q_f32(x + k + 4);
+            float32x4_t x2 = vld1q_f32(x + k + 8);
+            float32x4_t x3 = vld1q_f32(x + k + 12);
+
+            /* Load 16 int8 weights, convert to f32 */
+            int8x16_t r0 = vld1q_s8(w0 + k);
+            int16x8_t r0lo = vmovl_s8(vget_low_s8(r0));
+            int16x8_t r0hi = vmovl_s8(vget_high_s8(r0));
+            float32x4_t f00 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(r0lo)));
+            float32x4_t f01 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(r0lo)));
+            float32x4_t f02 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(r0hi)));
+            float32x4_t f03 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(r0hi)));
+            a0 = vfmaq_f32(a0, f00, x0);
+            a1 = vfmaq_f32(a1, f01, x1);
+            a2 = vfmaq_f32(a2, f02, x2);
+            a3 = vfmaq_f32(a3, f03, x3);
+
+            int8x16_t r1 = vld1q_s8(w1 + k);
+            int16x8_t r1lo = vmovl_s8(vget_low_s8(r1));
+            int16x8_t r1hi = vmovl_s8(vget_high_s8(r1));
+            float32x4_t f10 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(r1lo)));
+            float32x4_t f11 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(r1lo)));
+            float32x4_t f12 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(r1hi)));
+            float32x4_t f13 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(r1hi)));
+            b0 = vfmaq_f32(b0, f10, x0);
+            b1 = vfmaq_f32(b1, f11, x1);
+            b2 = vfmaq_f32(b2, f12, x2);
+            b3 = vfmaq_f32(b3, f13, x3);
+        }
+        float s0 = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3)));
+        float s1 = vaddvq_f32(vaddq_f32(vaddq_f32(b0, b2), vaddq_f32(b1, b3)));
+        for (; k < in_dim; k++) {
+            s0 += (float)w0[k] * x[k];
+            s1 += (float)w1[k] * x[k];
+        }
+        y[o] = s0 * scale[o];
+        y[o + 1] = s1 * scale[o + 1];
+    }
+    if (o < out_dim) {
+        const int8_t *w_row = W + (size_t)o * in_dim;
+        float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+        int k = 0;
+        for (; k + 7 < in_dim; k += 8) {
+            int8x8_t r = vld1_s8(w_row + k);
+            int16x8_t r16 = vmovl_s8(r);
+            float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(r16)));
+            float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(r16)));
+            acc0 = vfmaq_f32(acc0, f0, vld1q_f32(x + k));
+            acc1 = vfmaq_f32(acc1, f1, vld1q_f32(x + k + 4));
+        }
+        float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; k < in_dim; k++) sum += (float)w_row[k] * x[k];
+        y[o] = sum * scale[o];
+    }
+#else
+    for (; o < out_dim; o++) {
+        const int8_t *row = W + (size_t)o * in_dim;
+        float sum = 0.0f;
+        for (int k = 0; k < in_dim; k++) sum += (float)row[k] * x[k];
+        y[o] = sum * scale[o];
+    }
+#endif
+}
+
+void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
+                      const float *x, int rows, int cols) {
+#if defined(__APPLE__) && defined(__BLOCKS__)
+    int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) {
+        dispatch_apply((size_t)nt,
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                       ^(size_t tid) {
+            int r0 = (int)tid * rows / nt;
+            int r1 = (int)(tid + 1) * rows / nt;
+            int8_matvec_fused(y + r0, x, W + (size_t)r0 * cols,
+                               scale + r0, cols, r1 - r0);
+        });
+        return;
+    }
+#endif
+    int8_matvec_fused(y, x, W, scale, cols, rows);
+}
+
+void qwen_matvec_int8_qkv(float *q, float *k, float *v,
+                           const int8_t *Wq, const float *sq,
+                           const int8_t *Wk, const float *sk,
+                           const int8_t *Wv, const float *sv,
+                           const float *x, int in_dim, int q_dim, int kv_dim) {
+#if defined(__APPLE__) && defined(__BLOCKS__)
+    int nt = g_n_threads;
+    if (nt > 1) {
+        int total = q_dim + 2 * kv_dim;
+        dispatch_apply((size_t)nt,
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                       ^(size_t tid) {
+            int r0 = (int)tid * total / nt;
+            int r1 = (int)(tid + 1) * total / nt;
+            for (int r = r0; r < r1; r++) {
+                float *dst;
+                const int8_t *W;
+                const float *sc;
+                int dim;
+                if (r < q_dim) {
+                    dst = q; W = Wq; sc = sq; dim = q_dim;
+                } else if (r < q_dim + kv_dim) {
+                    dst = k; W = Wk; sc = sk; dim = kv_dim;
+                    r -= q_dim;
+                } else {
+                    dst = v; W = Wv; sc = sv; dim = kv_dim;
+                    r -= q_dim + kv_dim;
+                }
+                (void)dim;
+                const int8_t *row = W + (size_t)r * in_dim;
+                float sum = 0.0f;
+#ifdef __ARM_NEON
+                float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+                int kk = 0;
+                for (; kk + 7 < in_dim; kk += 8) {
+                    int8x8_t rr = vld1_s8(row + kk);
+                    int16x8_t r16 = vmovl_s8(rr);
+                    a0 = vfmaq_f32(a0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(r16))),
+                                   vld1q_f32(x + kk));
+                    a1 = vfmaq_f32(a1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(r16))),
+                                   vld1q_f32(x + kk + 4));
+                }
+                sum = vaddvq_f32(vaddq_f32(a0, a1));
+                for (; kk < in_dim; kk++) sum += (float)row[kk] * x[kk];
+#else
+                for (int kk = 0; kk < in_dim; kk++) sum += (float)row[kk] * x[kk];
+#endif
+                dst[r] = sum * sc[r];
+            }
+        });
+        return;
+    }
+#endif
+    int8_matvec_fused(q, x, Wq, sq, in_dim, q_dim);
+    int8_matvec_fused(k, x, Wk, sk, in_dim, kv_dim);
+    int8_matvec_fused(v, x, Wv, sv, in_dim, kv_dim);
+}
+
+int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
+                            int in_dim, int out_dim) {
+    int best = 0;
+    float best_val = -1e30f;
+    for (int o = 0; o < out_dim; o++) {
+        const int8_t *row = W + (size_t)o * in_dim;
+        float sum = 0.0f;
+#ifdef __ARM_NEON
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+        int k = 0;
+        for (; k + 7 < in_dim; k += 8) {
+            int8x8_t r = vld1_s8(row + k);
+            int16x8_t r16 = vmovl_s8(r);
+            a0 = vfmaq_f32(a0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(r16))),
+                           vld1q_f32(x + k));
+            a1 = vfmaq_f32(a1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(r16))),
+                           vld1q_f32(x + k + 4));
+        }
+        sum = vaddvq_f32(vaddq_f32(a0, a1));
+        for (; k < in_dim; k++) sum += (float)row[k] * x[k];
+#else
+        for (int k = 0; k < in_dim; k++) sum += (float)row[k] * x[k];
+#endif
+        sum *= scale[o];
+        if (sum > best_val) { best_val = sum; best = o; }
+    }
+    return best;
+}
+
+/* ========================================================================
  * Attention
  * ======================================================================== */
 
@@ -602,6 +863,7 @@ void qwen_silu(float *x, int n) {
     for (int i = 0; i < n; i++)
         x[i] = x[i] / (1.0f + expf(-x[i]));
 }
+
 
 void qwen_add_inplace(float *y, const float *x, int n) {
     for (int i = 0; i < n; i++) y[i] += x[i];
