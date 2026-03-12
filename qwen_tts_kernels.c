@@ -8,7 +8,12 @@
 #include <string.h>
 #include <math.h>
 #include <sys/types.h>
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
