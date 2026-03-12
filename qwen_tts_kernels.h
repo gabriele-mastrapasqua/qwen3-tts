@@ -82,6 +82,11 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                            int seq_q, int seq_k, int n_heads, int n_kv_heads,
                            int head_dim, float scale, int q_offset);
 
+/* Causal GQA attention with sliding window (f32 KV, window=0 means no window) */
+void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, const float *V,
+                                     int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                     int head_dim, float scale, int q_offset, int window);
+
 /* Causal GQA attention with bf16 KV cache (K/V stored as uint16_t bf16) */
 void qwen_causal_attention_bf16kv(float *out, const float *Q,
                                   const uint16_t *K_bf16, const uint16_t *V_bf16,
