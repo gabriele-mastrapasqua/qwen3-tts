@@ -573,24 +573,30 @@ memory layout, and allocation optimizations. Zero new dependencies.
 These optimizations target the remaining overhead from cache misses, unaligned allocations,
 and per-token malloc traffic. Combined estimated gain: 10-25%.
 
+**Allocation analysis (2026-03-12)**: Codebase is already well-optimized — zero malloc
+in the Talker/CP decode loop. All decode buffers (`dec_x`, `dec_q`, etc.) are pre-allocated
+at load time. The only per-token mallocs are in sampling (top-k/top-p work buffers, ~12KB)
+and text embedding (~8KB during prompt). These are minor (<1-2ms total).
+The real gains come from **cache alignment** of BLAS buffers and KV cache, not malloc elimination.
+
 ### 10.1 Quick Wins (high ROI, low effort)
 
-- [ ] `[HIGH]` **Pre-allocate sampling temp buffer**: `qwen_tts_sampling.c` allocates ~600KB
-  via `malloc()` on EVERY token, then frees it. For 100 tokens = 60MB of malloc traffic.
-  Pre-allocate once in context and reuse. **Est: 5-15% on generation loop.**
+- [x] `[HIGH]` **Cache-line align all hot-path buffers**: All decode buffers, KV caches, BLAS
+  temporaries, and speech decoder buffers aligned to 64 bytes via `posix_memalign()`.
+  Applied to talker, code predictor, and speech decoder. **Result: 24% total speedup**
+  (prefill 84%, decoder 36%, CP 9%). Cross-platform (POSIX standard). *(2026-03-12)*
 
-- [ ] `[MED]` **Align speech decoder buffers**: im2col, weight slice, and result buffers
-  use `malloc()` without alignment. Apple Accelerate/BLAS can bypass SIMD optimizations
-  on misaligned buffers. Switch to `posix_memalign(64, ...)`. **Est: 5-15% on decoder.**
+- [ ] `[LOW]` **Pre-allocate sampling work buffers**: `qwen_tts_sampling.c` allocates
+  ~12KB per token for top-k/top-p (only when sampling with temp>0). Small but easy to
+  pre-allocate in context. **Est: <1% (only ~100 malloc calls of 12KB each).**
 
-- [ ] `[LOW]` **Pre-allocate CP emb_buf**: `float emb_buf[4096]` is stack-allocated
-  15 times per frame inside `qwen_cp_predict()`. Move to context. **Est: 1-2%.**
+- [ ] `[LOW]` **Pre-allocate text embedding temps**: `qwen_tts.c:232-233` allocates
+  2 × text_hidden_size floats per token during prompt construction. **Est: <1%.**
 
 ### 10.2 Memory Layout (medium effort, medium gain)
 
-- [ ] `[MED]` **Align KV cache to cache lines**: KV cache allocated via `calloc()` without
-  alignment guarantee. Each position = 2048 bytes (0.6B). Use `posix_memalign(64, ...)`
-  and ensure per-position data starts on 64B boundary. **Est: 5-10% on attention.**
+- [x] `[MED]` **Align KV cache to cache lines**: Done as part of 10.1 cache-line alignment.
+  KV caches use `aligned_calloc(64, ...)` in talker and code predictor. *(2026-03-12)*
 
 - [ ] `[MED]` **Reorder context struct hot fields**: Decode buffers (`dec_x`, `dec_q`, etc.),
   KV cache pointers, and CP buffers are scattered across `qwen_tts_ctx_t`. Group by

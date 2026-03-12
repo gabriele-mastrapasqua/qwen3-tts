@@ -478,7 +478,22 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 - **0.6B**: ~0.7x realtime (generates 1 second of audio in ~1.4 seconds)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 - SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
+- Cache-line aligned buffers (64B `posix_memalign`) for optimal BLAS/SIMD throughput
 - Multi-threaded inference via GCD (`dispatch_apply`) on macOS, pthreads on Linux
+
+### Per-component breakdown (0.6B, seed 42, warm run)
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| Prefill | 260ms | 25-token prompt, BLAS sgemm on aligned buffers |
+| Talker | 21.2 ms/frame | Single-token decode, NEON bf16 matvec |
+| Code Predictor | 60.8 ms/frame | 15 sequential passes, ~55% of total |
+| Speech Decoder | 1648ms | 69 frames, causal ConvNet + BLAS sgemm |
+| **Total** | **7.9s for 5.5s audio** | **0.7x realtime** |
+
+Cache-line alignment alone provided a **24% speedup** across the pipeline — prefill
+improved 84%, speech decoder 36%, and Code Predictor 9%. All optimizations are
+cross-platform (POSIX standard, works on Linux and macOS).
 
 ### How does CPU compare to GPU?
 
