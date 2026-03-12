@@ -10,7 +10,7 @@ The engine runs the complete TTS pipeline: BPE tokenization, a 28-layer causal t
 
 ## Audio Samples
 
-All samples generated with the 0.6B model (RTF ~1.4–2.0, Apple M1):
+All samples generated with the 0.6B model (RTF ~1.3–2.0, Apple M1):
 
 | Language | Speaker | Sample | Text |
 |----------|---------|--------|------|
@@ -410,20 +410,27 @@ curl -s http://localhost:8080/v1/health
 
 Same text, same seed (`--seed 42`), identical output (bit-for-bit):
 
-| | Wall time | Audio length | RTF |
-|---|---|---|---|
-| **First call** | 14.5s | 8.2s | 1.77 |
-| **Warm call** | 11.4s | 8.2s | 1.39 |
+| | Short text (~8s audio) | Long text (~16s audio) |
+|---|---|---|
+| **First call** | 15.1s → RTF 1.85 | 20.9s → RTF 1.33 |
+| **Warm call** | 11.5s → RTF 1.41 | 20.6s → **RTF 1.31** |
 
 The first request pays a one-time cost for tokenizer parsing (~200ms) and warming the
-OS page cache for mmap'd weights. Warm calls are **22% faster**: the tokenizer is cached
-in memory, weight pages are already resident, and all prefill/sampling buffers are reused.
-In CLI mode you pay model load + tokenizer on every invocation; the server eliminates
-that overhead entirely.
+OS page cache for mmap'd weights. Warm calls benefit from cached tokenizer, resident
+weight pages, pre-allocated buffers, and the **LRU text embedding cache** (token
+embeddings are computed once and reused across requests, avoiding redundant bf16 matvec
+projections — ~8MB RAM for 2048 cached tokens).
 
-Note: while CLI RTF varies from ~2.0 (short audio) to ~1.4 (long audio) due to fixed
-prefill/decoder costs, the server delivers a more consistent RTF even on shorter audio
-thanks to warm caches and pre-allocated buffers.
+### RTF across modes (0.6B, Apple M1 8-core 16 GB, 4 threads)
+
+|  | Short text (~5–8s audio) | Long text (~16s audio) |
+|---|---|---|
+| **CLI** | RTF 2.01 | RTF 1.42 |
+| **Server (cold)** | RTF 1.85 | RTF 1.33 |
+| **Server (warm)** | RTF 1.41 | **RTF 1.31** |
+
+Longer audio amortizes fixed costs (prefill, speech decoder). Server mode adds
+warm caches and embedding cache on top.
 
 #### Full request body
 
@@ -480,7 +487,7 @@ The Code Predictor has the same architecture in both models (hidden=1024, 5 laye
 
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
-- **0.6B**: RTF ~1.4–2.0 depending on audio length (longer = better amortization of fixed costs)
+- **0.6B**: RTF ~1.3–2.0 depending on audio length and mode (server warm + long text = best)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 - SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
 - Cache-line aligned buffers (64B `posix_memalign`) for optimal BLAS/SIMD throughput
@@ -515,13 +522,14 @@ and pre-allocated prefill/sampling buffers. Longer audio amortizes fixed costs
 ### Optimization history
 
 Starting from a baseline of **RTF ~3.5** (CLI), the following optimizations brought
-performance to **RTF ~1.4–2.0** (up to 2x total speedup):
+performance to **RTF ~1.3–2.0** (up to 2.5x total speedup):
 
 | Optimization | Speedup | Technique |
 |---|---|---|
 | Cache-line alignment (`posix_memalign(64)`) | **24%** | Aligned all BLAS/SIMD buffers and KV caches |
 | NEON speech decoder | **11%** | Replaced scalar RMSNorm, RoPE, attention with NEON |
 | Persistent prefill buffers | **38% server** | Reuse buffers across generations (zero malloc in decode) |
+| Text embedding cache | **14% server** | LRU cache for token embeddings (skip 2 matvec per cached token) |
 | Batched VQ projection | minor | BLAS sgemm instead of per-frame scalar matvec |
 | Pre-allocated sampling buffers | minor | Zero per-token malloc in generation loop |
 
@@ -534,7 +542,7 @@ For context, here's how the official Python + PyTorch implementation performs on
 
 | Hardware | 0.6B RTF | Notes |
 |----------|----------|-------|
-| **This project (C, Apple M1 CPU)** | **1.4–2.0** | **Pure C, no GPU, 16 GB RAM** |
+| **This project (C, Apple M1 CPU)** | **1.3–2.0** | **Pure C, no GPU, 16 GB RAM** |
 | NVIDIA RTX 3090 | 0.52–0.68 | Python + PyTorch + FlashAttention 2 |
 | NVIDIA RTX 4090 | 0.38 | Python + PyTorch + FlashAttention 2 |
 | NVIDIA A100 | 0.28 | Data center GPU |
