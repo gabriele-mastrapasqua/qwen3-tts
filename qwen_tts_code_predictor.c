@@ -15,6 +15,19 @@
 #include <string.h>
 #include <math.h>
 
+/* Cache-line aligned allocation (64B for Apple M1/M2) */
+static inline void *aligned_malloc(size_t size) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
+    return ptr;
+}
+static inline void *aligned_calloc(size_t count, size_t size) {
+    size_t total = count * size;
+    void *ptr = aligned_malloc(total);
+    if (ptr) memset(ptr, 0, total);
+    return ptr;
+}
+
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -195,20 +208,20 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     /* Allocate CP KV cache (bf16 — needs 17 positions max: 2 prefill + 14 steps + margin) */
     int cp_kv_max = 64;
     int64_t cp_kv_size = (int64_t)c->cp_num_layers * cp_kv_max * cp_kv_dim;
-    ctx->cp_kv_k = (uint16_t *)calloc(cp_kv_size, sizeof(uint16_t));
-    ctx->cp_kv_v = (uint16_t *)calloc(cp_kv_size, sizeof(uint16_t));
+    ctx->cp_kv_k = (uint16_t *)aligned_calloc(cp_kv_size, sizeof(uint16_t));
+    ctx->cp_kv_v = (uint16_t *)aligned_calloc(cp_kv_size, sizeof(uint16_t));
     ctx->cp_kv_max = cp_kv_max;
     ctx->cp_kv_len = 0;
 
     /* Allocate CP decode buffers */
-    ctx->cp_dec_x = (float *)malloc(cp_h * sizeof(float));
-    ctx->cp_dec_q = (float *)malloc(cp_q_dim * sizeof(float));
-    ctx->cp_dec_k = (float *)malloc(cp_kv_dim * sizeof(float));
-    ctx->cp_dec_v = (float *)malloc(cp_kv_dim * sizeof(float));
-    ctx->cp_dec_attn_out = (float *)malloc(cp_q_dim * sizeof(float));
-    ctx->cp_dec_gate = (float *)malloc(2 * c->cp_intermediate_size * sizeof(float));
+    ctx->cp_dec_x = (float *)aligned_malloc(cp_h * sizeof(float));
+    ctx->cp_dec_q = (float *)aligned_malloc(cp_q_dim * sizeof(float));
+    ctx->cp_dec_k = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
+    ctx->cp_dec_v = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
+    ctx->cp_dec_attn_out = (float *)aligned_malloc(cp_q_dim * sizeof(float));
+    ctx->cp_dec_gate = (float *)aligned_malloc(2 * c->cp_intermediate_size * sizeof(float));
     ctx->cp_dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
-    ctx->cp_dec_ffn_out = (float *)malloc(cp_h * sizeof(float));
+    ctx->cp_dec_ffn_out = (float *)aligned_malloc(cp_h * sizeof(float));
 
     /* CP RoPE cache (same theta as talker) */
     int half_dim = c->cp_head_dim / 2;
