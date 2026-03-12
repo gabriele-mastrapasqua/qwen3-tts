@@ -28,10 +28,6 @@ jobs:
             os: macos
             arch: arm64
             blas: accelerate
-          - runner: macos-13
-            os: macos
-            arch: x86_64
-            blas: accelerate
 
     runs-on: ${{ matrix.runner }}
     name: "${{ matrix.os }}-${{ matrix.arch }}"
