@@ -466,6 +466,10 @@ typedef struct qwen_tts_ctx {
     float *cp_rope_sin;
     int cp_rope_cache_len;
     
+    /* Text embedding temp buffers (reused across embed_one_text_token calls) */
+    float *emb_tmp1;
+    float *emb_tmp2;
+
     /* Logits buffer */
     float *logits;
     

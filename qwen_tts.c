@@ -229,8 +229,8 @@ extern void qwen_set_seed(uint32_t seed);
 /* Embed a single text token: text_embedding → text_projection(SiLU) → out[hidden] */
 static void embed_one_text_token(qwen_tts_ctx_t *ctx, int tid, float *out) {
     int th = ctx->config.text_hidden_size, h = ctx->config.hidden_size;
-    float *text_emb = (float *)malloc(th * sizeof(float));
-    float *fc1_out = (float *)malloc(th * sizeof(float));
+    float *text_emb = ctx->emb_tmp1;
+    float *fc1_out = ctx->emb_tmp2;
     const uint16_t *emb = ctx->tok_embeddings_bf16 + (int64_t)tid * th;
     for (int j = 0; j < th; j++) text_emb[j] = bf16_to_f32(emb[j]);
     if (ctx->text_proj_fc1_bf16 && ctx->text_proj_fc2_bf16) {
@@ -242,7 +242,6 @@ static void embed_one_text_token(qwen_tts_ctx_t *ctx, int tid, float *out) {
     } else {
         memcpy(out, text_emb, h * sizeof(float));
     }
-    free(text_emb); free(fc1_out);
 }
 
 /* Load model */
@@ -349,6 +348,11 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         }
     }
 
+    /* Pre-allocate text embedding temp buffers */
+    int th = ctx->config.text_hidden_size;
+    ctx->emb_tmp1 = (float *)malloc(th * sizeof(float));
+    ctx->emb_tmp2 = (float *)malloc(th * sizeof(float));
+
     if (!ctx->silent) fprintf(stderr, "Model loaded in %.0f ms\n", time_ms() - t0);
     return ctx;
 }
@@ -379,6 +383,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->pref_attn_out); free(ctx->pref_ffn_out);
     free(ctx->rope_cos); free(ctx->rope_sin); free(ctx->rope_inv_freq);
     free(ctx->cp_rope_cos); free(ctx->cp_rope_sin);
+    free(ctx->emb_tmp1); free(ctx->emb_tmp2);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);

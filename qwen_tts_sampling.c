@@ -8,6 +8,19 @@
 #include <string.h>
 #include <math.h>
 
+/* Pre-allocated work buffers (avoids malloc per sample call) */
+static float *g_topk_tmp = NULL;
+static int   *g_topp_idx = NULL;
+static int    g_work_cap = 0;
+
+static void ensure_work_buffers(int n) {
+    if (n <= g_work_cap) return;
+    free(g_topk_tmp); free(g_topp_idx);
+    g_topk_tmp = (float *)malloc(n * sizeof(float));
+    g_topp_idx = (int *)malloc(n * sizeof(int));
+    g_work_cap = n;
+}
+
 /* Simple LCG random number generator */
 static uint32_t g_seed = 12345;
 static float rand_uniform(void) {
@@ -35,9 +48,9 @@ static int topk_filter(float *logits, int n, int k) {
     if (k <= 0 || k >= n) return n;
     
     /* Find k-th largest */
-    float *tmp = (float *)malloc(n * sizeof(float));
+    float *tmp = g_topk_tmp;
     memcpy(tmp, logits, n * sizeof(float));
-    
+
     /* Simple selection */
     for (int i = 0; i < k; i++) {
         int max_idx = i;
@@ -46,7 +59,6 @@ static int topk_filter(float *logits, int n, int k) {
         float t = tmp[i]; tmp[i] = tmp[max_idx]; tmp[max_idx] = t;
     }
     float threshold = tmp[k - 1];
-    free(tmp);
     
     /* Zero out below threshold */
     int count = 0;
@@ -62,16 +74,16 @@ static int topp_filter(float *logits, int n, float p) {
     if (p >= 1.0f) return n;
     
     /* Sort indices by probability */
-    int *idx = (int *)malloc(n * sizeof(int));
+    int *idx = g_topp_idx;
     for (int i = 0; i < n; i++) idx[i] = i;
-    
+
     for (int i = 0; i < n - 1; i++) {
         int max_idx = i;
         for (int j = i + 1; j < n; j++)
             if (logits[idx[j]] > logits[idx[max_idx]]) max_idx = j;
         int t = idx[i]; idx[i] = idx[max_idx]; idx[max_idx] = t;
     }
-    
+
     /* Find cutoff */
     float cumsum = 0;
     int cutoff = n;
@@ -79,7 +91,6 @@ static int topp_filter(float *logits, int n, float p) {
         cumsum += logits[idx[i]];
         if (cumsum > p) { cutoff = i + 1; break; }
     }
-    free(idx);
     
     /* Zero out beyond cutoff */
     int count = 0;
@@ -104,6 +115,8 @@ static int sample_from_probs(float *probs, int n) {
 /* Main sampling function */
 int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float top_p,
                     float rep_penalty, int *prev_tokens, int n_prev) {
+    ensure_work_buffers(vocab_size);
+
     /* Apply repetition penalty */
     if (rep_penalty != 1.0f && n_prev > 0) {
         for (int i = 0; i < n_prev; i++) {
