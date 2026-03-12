@@ -293,6 +293,98 @@ test-serve: $(TARGET)
 	 echo "PASS: HTTP Server test"
 	@echo ""
 
+# ── Server benchmark: 2 sequential runs, same seed (bit-identical output) ──
+
+test-serve-bench: $(TARGET)
+	@echo "=== Server Benchmark (seed=42, 2 runs) ==="
+	@mkdir -p $(TEST_DIR)
+	@./$(TARGET) -d $(MODEL_SMALL) --serve 8091 &>/dev/null & SERVER_PID=$$!; \
+	 sleep 4; \
+	 echo "--- Run 1 (cold) ---"; \
+	 T1=$$(curl -s -w "%{time_total}" -X POST http://localhost:8091/v1/tts \
+	   -H "Content-Type: application/json" \
+	   -d '{"text":"The quick brown fox jumps over the lazy dog on a sunny afternoon.","speaker":"ryan","language":"English","seed":42}' \
+	   -o $(TEST_DIR)/bench_run1.wav); \
+	 S1=$$(stat -f%z $(TEST_DIR)/bench_run1.wav 2>/dev/null || stat -c%s $(TEST_DIR)/bench_run1.wav 2>/dev/null); \
+	 echo "  $${T1}s, $$S1 bytes"; \
+	 if [ "$$S1" -le 44 ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: empty WAV"; exit 1; fi; \
+	 echo "--- Run 2 (warm) ---"; \
+	 T2=$$(curl -s -w "%{time_total}" -X POST http://localhost:8091/v1/tts \
+	   -H "Content-Type: application/json" \
+	   -d '{"text":"The quick brown fox jumps over the lazy dog on a sunny afternoon.","speaker":"ryan","language":"English","seed":42}' \
+	   -o $(TEST_DIR)/bench_run2.wav); \
+	 S2=$$(stat -f%z $(TEST_DIR)/bench_run2.wav 2>/dev/null || stat -c%s $(TEST_DIR)/bench_run2.wav 2>/dev/null); \
+	 echo "  $${T2}s, $$S2 bytes"; \
+	 echo "--- Comparing outputs ---"; \
+	 MD5_1=$$(md5sum $(TEST_DIR)/bench_run1.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/bench_run1.wav 2>/dev/null); \
+	 MD5_2=$$(md5sum $(TEST_DIR)/bench_run2.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/bench_run2.wav 2>/dev/null); \
+	 if [ "$$MD5_1" != "$$MD5_2" ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: outputs differ ($$MD5_1 vs $$MD5_2)"; exit 1; fi; \
+	 kill $$SERVER_PID 2>/dev/null; \
+	 echo "PASS: identical output ($$MD5_1)"
+	@echo ""
+
+# ── Server OpenAI-compatible API test ──
+
+test-serve-openai: $(TARGET)
+	@echo "=== Server OpenAI API test ==="
+	@mkdir -p $(TEST_DIR)
+	@./$(TARGET) -d $(MODEL_SMALL) --serve 8092 &>/dev/null & SERVER_PID=$$!; \
+	 sleep 4; \
+	 echo "--- /v1/audio/speech (OpenAI-compatible) ---"; \
+	 HTTP_CODE=$$(curl -s -w "%{http_code}" -X POST http://localhost:8092/v1/audio/speech \
+	   -H "Content-Type: application/json" \
+	   -d '{"input":"Hello, this is a test of the OpenAI compatible endpoint.","voice":"ryan","seed":42}' \
+	   -o $(TEST_DIR)/openai_test.wav); \
+	 if [ "$$HTTP_CODE" != "200" ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: HTTP $$HTTP_CODE"; exit 1; fi; \
+	 WAV_SIZE=$$(stat -f%z $(TEST_DIR)/openai_test.wav 2>/dev/null || stat -c%s $(TEST_DIR)/openai_test.wav 2>/dev/null); \
+	 if [ "$$WAV_SIZE" -le 44 ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: empty WAV ($$WAV_SIZE bytes)"; exit 1; fi; \
+	 echo "  HTTP 200, $$WAV_SIZE bytes"; \
+	 echo "--- Verify same seed produces same output via /v1/tts ---"; \
+	 curl -s -X POST http://localhost:8092/v1/tts \
+	   -H "Content-Type: application/json" \
+	   -d '{"text":"Hello, this is a test of the OpenAI compatible endpoint.","speaker":"ryan","seed":42}' \
+	   -o $(TEST_DIR)/openai_ref.wav; \
+	 MD5_OAI=$$(md5sum $(TEST_DIR)/openai_test.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/openai_test.wav 2>/dev/null); \
+	 MD5_REF=$$(md5sum $(TEST_DIR)/openai_ref.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/openai_ref.wav 2>/dev/null); \
+	 if [ "$$MD5_OAI" != "$$MD5_REF" ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: OpenAI and TTS endpoints differ"; exit 1; fi; \
+	 kill $$SERVER_PID 2>/dev/null; \
+	 echo "PASS: OpenAI API (identical to /v1/tts)"
+	@echo ""
+
+# ── Server parallel requests test ──
+
+test-serve-parallel: $(TARGET)
+	@echo "=== Server Parallel Requests test ==="
+	@mkdir -p $(TEST_DIR)
+	@./$(TARGET) -d $(MODEL_SMALL) --serve 8093 &>/dev/null & SERVER_PID=$$!; \
+	 sleep 4; \
+	 echo "--- Sending 2 concurrent requests ---"; \
+	 curl -s -w "Req1: HTTP %{http_code} in %{time_total}s\n" -X POST http://localhost:8093/v1/tts \
+	   -H "Content-Type: application/json" \
+	   -d '{"text":"Hello, this is request number one.","speaker":"ryan","seed":100}' \
+	   -o $(TEST_DIR)/parallel_1.wav & PID1=$$!; \
+	 curl -s -w "Req2: HTTP %{http_code} in %{time_total}s\n" -X POST http://localhost:8093/v1/tts \
+	   -H "Content-Type: application/json" \
+	   -d '{"text":"And this is request number two.","speaker":"vivian","seed":200}' \
+	   -o $(TEST_DIR)/parallel_2.wav & PID2=$$!; \
+	 wait $$PID1; wait $$PID2; \
+	 echo "--- Validating outputs ---"; \
+	 FAIL=0; \
+	 for f in $(TEST_DIR)/parallel_1.wav $(TEST_DIR)/parallel_2.wav; do \
+	   if [ ! -f "$$f" ]; then echo "FAIL: $$f not created"; FAIL=1; continue; fi; \
+	   SZ=$$(stat -f%z "$$f" 2>/dev/null || stat -c%s "$$f" 2>/dev/null); \
+	   if [ "$$SZ" -le 44 ]; then echo "FAIL: $$f empty ($$SZ bytes)"; FAIL=1; else echo "  $$f: $$SZ bytes"; fi; \
+	 done; \
+	 kill $$SERVER_PID 2>/dev/null; \
+	 if [ "$$FAIL" -ne 0 ]; then echo "FAIL: parallel test"; exit 1; fi; \
+	 echo "PASS: 2 parallel requests served"
+	@echo ""
+
+# ── Combined server tests ──
+
+test-serve-all: test-serve test-serve-bench test-serve-openai test-serve-parallel
+	@echo "=== All server tests passed ==="
+
 # ── Voice Clone e2e test ──
 # Step 1: Generate reference audio with CustomVoice model
 # Step 2: Use that audio as voice clone reference with Base model (different text)
@@ -417,7 +509,9 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve test-serve test-clone test-voice-design \
+.PHONY: all help blas clean debug info serve \
+        test-serve test-serve-bench test-serve-openai test-serve-parallel test-serve-all \
+        test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
