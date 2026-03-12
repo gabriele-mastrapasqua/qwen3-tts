@@ -53,6 +53,26 @@ void qwen_linear_nobias_bf16(float *y, const float *x,
 void qwen_linear(float *y, const float *x, const float *W, const float *bias,
                  int seq, int in_dim, int out_dim);
 
+/* INT8 matvec: y[rows] = (W_int8[rows,cols] * scale[rows]) @ x[cols]
+ * Per-row absmax dequantization. NEON-optimized + multi-threaded. */
+void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
+                      const float *x, int rows, int cols);
+
+/* Unified QKV matvec (INT8 variant) */
+void qwen_matvec_int8_qkv(float *q, float *k, float *v,
+                           const int8_t *Wq, const float *sq,
+                           const int8_t *Wk, const float *sk,
+                           const int8_t *Wv, const float *sv,
+                           const float *x, int in_dim, int q_dim, int kv_dim);
+
+/* INT8 fused argmax+matvec (returns argmax of W @ x without materializing logits) */
+int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
+                            int in_dim, int out_dim);
+
+/* Quantize bf16 weight matrix to int8 with per-row absmax scaling */
+void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
+                                 int8_t *dst_int8, float *dst_scale);
+
 /* ========================================================================
  * Attention
  * ======================================================================== */

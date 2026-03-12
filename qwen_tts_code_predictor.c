@@ -223,9 +223,59 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     }
     ctx->cp_rope_cache_len = cp_kv_max;
 
+    /* INT8 quantization of CP weights (optional, enabled by --int8 flag) */
+    if (ctx->use_int8) {
+        if (!ctx->silent)
+            fprintf(stderr, "  Quantizing CP weights to INT8 (per-row absmax)...\n");
+        int cp_inter = c->cp_intermediate_size;
+        for (int i = 0; i < c->cp_num_layers; i++) {
+            qwen_cp_layer_t *l = &ctx->cp_layers[i];
+
+            /* QKV + O projections */
+            l->wq_int8 = (int8_t *)malloc((size_t)cp_q_dim * cp_h);
+            l->wq_scale = (float *)malloc(cp_q_dim * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wq_bf16, cp_q_dim, cp_h, l->wq_int8, l->wq_scale);
+
+            l->wk_int8 = (int8_t *)malloc((size_t)cp_kv_dim * cp_h);
+            l->wk_scale = (float *)malloc(cp_kv_dim * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wk_bf16, cp_kv_dim, cp_h, l->wk_int8, l->wk_scale);
+
+            l->wv_int8 = (int8_t *)malloc((size_t)cp_kv_dim * cp_h);
+            l->wv_scale = (float *)malloc(cp_kv_dim * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wv_bf16, cp_kv_dim, cp_h, l->wv_int8, l->wv_scale);
+
+            l->wo_int8 = (int8_t *)malloc((size_t)cp_h * cp_q_dim);
+            l->wo_scale = (float *)malloc(cp_h * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wo_bf16, cp_h, cp_q_dim, l->wo_int8, l->wo_scale);
+
+            /* Fused gate+up + down */
+            l->gate_up_fused_int8 = (int8_t *)malloc((size_t)2 * cp_inter * cp_h);
+            l->gate_up_fused_scale = (float *)malloc(2 * cp_inter * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->gate_up_fused_bf16, 2 * cp_inter, cp_h,
+                                        l->gate_up_fused_int8, l->gate_up_fused_scale);
+
+            l->down_int8 = (int8_t *)malloc((size_t)cp_h * cp_inter);
+            l->down_scale = (float *)malloc(cp_h * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->down_bf16, cp_h, cp_inter, l->down_int8, l->down_scale);
+        }
+
+        /* LM heads */
+        for (int g = 0; g < 15; g++) {
+            if (ctx->cp_lm_head_bf16[g]) {
+                ctx->cp_lm_head_int8[g] = (int8_t *)malloc((size_t)c->codebook_size * cp_h);
+                ctx->cp_lm_head_scale[g] = (float *)malloc(c->codebook_size * sizeof(float));
+                qwen_quantize_bf16_to_int8(ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h,
+                                            ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g]);
+            }
+        }
+        if (!ctx->silent)
+            fprintf(stderr, "  INT8 quantization done (%d layers + 15 lm_heads)\n", c->cp_num_layers);
+    }
+
     if (!ctx->silent)
-        fprintf(stderr, "  Code Predictor: %d layers loaded, q_dim=%d kv_dim=%d\n",
-                c->cp_num_layers, cp_q_dim, cp_kv_dim);
+        fprintf(stderr, "  Code Predictor: %d layers loaded, q_dim=%d kv_dim=%d%s\n",
+                c->cp_num_layers, cp_q_dim, cp_kv_dim,
+                ctx->use_int8 ? " [INT8]" : "");
 
     return 0;
 }
@@ -249,9 +299,17 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
         qwen_rms_norm(x_norm, x, l->input_norm, 1, cp_h, eps);
 
         /* 2. QKV projections (unified dispatch — single barrier for all 3) */
-        qwen_matvec_bf16_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
-                              l->wq_bf16, l->wk_bf16, l->wv_bf16,
-                              x_norm, cp_h, cp_q_dim, cp_kv_dim);
+        if (l->wq_int8) {
+            qwen_matvec_int8_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                                  l->wq_int8, l->wq_scale,
+                                  l->wk_int8, l->wk_scale,
+                                  l->wv_int8, l->wv_scale,
+                                  x_norm, cp_h, cp_q_dim, cp_kv_dim);
+        } else {
+            qwen_matvec_bf16_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                                  l->wq_bf16, l->wk_bf16, l->wv_bf16,
+                                  x_norm, cp_h, cp_q_dim, cp_kv_dim);
+        }
 
         /* 3. Q/K RMSNorm per-head */
         qwen_rms_norm_per_head(ctx->cp_dec_q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
@@ -278,14 +336,21 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
 
         /* 7. Output projection + residual */
         float *proj = ctx->cp_dec_ffn_out; /* reuse buffer */
-        matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+        if (l->wo_int8)
+            qwen_matvec_int8(proj, l->wo_int8, l->wo_scale, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+        else
+            matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
 
         /* 8. Post-attention RMSNorm */
         qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, cp_h, eps);
 
         /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-        matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
+        if (l->gate_up_fused_int8)
+            qwen_matvec_int8(ctx->cp_dec_gate, l->gate_up_fused_int8, l->gate_up_fused_scale,
+                              x_norm, 2 * cp_inter, cp_h);
+        else
+            matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
         for (int o = 0; o < cp_inter; o++) {
             float g = ctx->cp_dec_gate[2 * o];
             float u = ctx->cp_dec_gate[2 * o + 1];
@@ -293,7 +358,10 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
         }
 
         /* Down projection + residual */
-        matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
+        if (l->down_int8)
+            qwen_matvec_int8(proj, l->down_int8, l->down_scale, ctx->cp_dec_gate, cp_h, cp_inter);
+        else
+            matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
     }
 }
@@ -358,7 +426,11 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 
     /* Predict codebook 1: fused argmax+matvec (greedy — avoids writing 2048 logits) */
     qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
-    out_codes[0] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[0], cp_h, c->codebook_size);
+    if (ctx->cp_lm_head_int8[0])
+        out_codes[0] = qwen_argmax_matvec_int8(cp_normed, ctx->cp_lm_head_int8[0],
+                                                ctx->cp_lm_head_scale[0], cp_h, c->codebook_size);
+    else
+        out_codes[0] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[0], cp_h, c->codebook_size);
 
     /* Steps 2-15: generate codebooks 2-15. */
     for (int g = 1; g < 15; g++) {
@@ -380,7 +452,11 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 
         /* Fused argmax+matvec (greedy) */
         qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
-        out_codes[g] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[g], cp_h, c->codebook_size);
+        if (ctx->cp_lm_head_int8[g])
+            out_codes[g] = qwen_argmax_matvec_int8(cp_normed, ctx->cp_lm_head_int8[g],
+                                                    ctx->cp_lm_head_scale[g], cp_h, c->codebook_size);
+        else
+            out_codes[g] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[g], cp_h, c->codebook_size);
     }
 
     return 0;
