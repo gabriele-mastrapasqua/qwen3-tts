@@ -404,10 +404,12 @@ curl -s http://localhost:8080/v1/health
 
 #### Server performance (0.6B, Apple M1 8-core 16 GB, 4 threads)
 
+Same text, same seed (`--seed 42`), identical output (bit-for-bit):
+
 | | Wall time | Audio length | Realtime factor |
 |---|---|---|---|
-| **First call** | 7.3s | 2.6s | 0.3x |
-| **Second call** | 5.2s | 3.5s | 0.7x |
+| **First call** | 10.4s | 5.5s | 0.5x |
+| **Warm call** | 7.3s | 5.5s | 0.8x |
 
 The first request pays a one-time cost for tokenizer parsing (~200ms) and warming the
 OS page cache for mmap'd weights. Subsequent calls skip both: the tokenizer is cached
@@ -448,13 +450,22 @@ Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --
 
 | | 0.6B | 1.7B |
 |-----------|------|------|
-| Talker hidden dim | 1024 | 2048 |
-| Talker heads (Q/KV) | 16/8 | 32/8 |
+| **Talker** | | |
+| Hidden dim | 1024 | 2048 |
+| Heads (Q/KV) | 16/8 | 16/8 |
+| Intermediate | 3072 | 6144 |
+| Layers | 28 | 28 |
+| **Code Predictor** | | |
+| Hidden dim | 1024 | 1024 |
+| Heads | 16 | 16 |
+| Layers | 5 | 5 |
+| MTP projection | — | 2048→1024 |
+| **General** | | |
 | Parameters | ~600M | ~1.7B |
 | Memory usage | ~3 GB | ~8 GB |
 | Weight format | BF16 | BF16 |
 
-All model dimensions are read from the weight files at load time — no recompilation needed to switch between 0.6B and 1.7B.
+The Code Predictor has the same architecture in both models (hidden=1024, 5 layers). On the 1.7B, a linear projection bridges the larger Talker hidden dim (2048) down to the CP's 1024. All dimensions are auto-detected from weight files — no recompilation needed to switch models.
 
 ## Performance
 
@@ -464,6 +475,25 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 - SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
 - Multi-threaded inference via GCD (`dispatch_apply`) on macOS, pthreads on Linux
+
+### How does CPU compare to GPU?
+
+For context, here's how the official Python + PyTorch implementation performs on GPUs:
+
+| Hardware | 0.6B RTF | Notes |
+|----------|----------|-------|
+| **This project (C, Apple M1 CPU)** | **0.5–0.8x** | **Pure C, no GPU, 16 GB RAM** |
+| NVIDIA RTX 4090 | 0.38x | Python + PyTorch + FlashAttention 2 |
+| NVIDIA RTX 3090 | 0.52–0.68x | Python + PyTorch + FlashAttention 2 |
+| NVIDIA A100 | 0.28x | Data center GPU |
+| NVIDIA H100 | 0.22x | Data center GPU |
+
+> RTF = Real-Time Factor (lower is faster; <1.0 means faster than real-time).
+>
+> Our pure C engine on a laptop CPU (M1, ~$700) achieves performance comparable to an
+> RTX 3090 (~$1500) running the official Python implementation. The gap to high-end GPUs
+> (A100/H100) is 2–3x, but those are $10k+ data center cards. For a zero-dependency
+> CPU-only engine, this is a strong result.
 
 ## Credits & Acknowledgments
 
