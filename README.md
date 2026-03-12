@@ -120,8 +120,12 @@ make test-small       # Run 0.6B tests (English, Italian, multiple speakers)
 make test-large       # Run 1.7B tests (config check, English, Italian, instruct styles)
 make test-regression  # Cross-model regression checks (safetensors, config parsing)
 make test-all         # Run everything (0.6B + 1.7B + regression)
-make test-serve       # HTTP server integration test
-make serve            # Start HTTP server on port 8080
+make test-serve          # HTTP server integration test (health, speakers, TTS)
+make test-serve-bench    # Server benchmark: 2 runs, same seed, verify bit-identical output
+make test-serve-openai   # OpenAI-compatible /v1/audio/speech endpoint test
+make test-serve-parallel # 2 concurrent requests, verify both complete
+make test-serve-all      # Run all server tests
+make serve               # Start HTTP server on port 8080
 ```
 
 ## Usage
