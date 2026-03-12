@@ -651,11 +651,11 @@ repeated identically on every request with the same text.
   (CLI + server). **Result: 14% faster long-text server cold (RTF 1.55→1.33), best
   RTF 1.31 server warm.** Output bit-identical. *(2026-03-12)*
 
-- [ ] `[MED]` **Batch text embedding with BLAS sgemm**: Instead of per-token matvec,
-  collect all text token IDs, do a single bf16→f32 gather, then batch fc1 and fc2 as
-  sgemm. For 50 tokens: 1 sgemm(50×2048 × 2048×2048) instead of 50 individual matvecs.
-  Benefits both CLI and server. Less impactful now that LRU cache is active (warm hits
-  are memcpy), but still helps CLI first-run and server cold call.
+- [x] `[SKIP]` **Batch text embedding with BLAS sgemm**: Analyzed — "Embed: 37ms" on
+  long text (210 frames, CLI) = 0.13% of total time. With LRU cache active, all tokens
+  are cache hits on warm calls (memcpy). Even on cold CLI, embed is negligible vs
+  Talker+CP (~25s). Batch sgemm would require bf16→f32 weight conversion buffers for
+  text_projection (~32MB) for <0.2% gain. Not worth the complexity. *(2026-03-12)*
 
 ---
 
@@ -713,39 +713,16 @@ The streaming decoder path is already tested and produces identical output.
 
 ---
 
-## Phase 10d: Batch Text Embedding (BLAS sgemm)
+## Phase 10d: Batch Text Embedding (BLAS sgemm) — SKIPPED
 
-**Goal**: Replace per-token sequential matvec with a single batched sgemm for all text
-tokens in the prefill. Currently each token does 2 individual bf16 matvec calls through
-`embed_one_text_token()`. Batching them into one sgemm call lets BLAS optimize the
-memory access pattern across all tokens simultaneously.
+**Status**: SKIPPED after analysis (2026-03-12).
 
-**Analysis**: For a 50-token prompt:
-- Current: 50 × matvec(2048×2048) + 50 × matvec(1024×2048) = 100 individual calls
-- Batched: 1 × sgemm(50×2048, 2048×2048) + SiLU + 1 × sgemm(50×2048, 2048×1024) = 2 calls
-- BLAS sgemm is significantly more efficient than repeated matvec for batch sizes > ~8
+**Reason**: Benchmarked "Embed: 37ms" on long text (210 frames, CLI) = 0.13% of total
+pipeline time. With LRU cache active, all tokens are cache hits on warm calls (memcpy
+instead of compute). Even on cold CLI, embedding is negligible vs Talker+CP (~25s total).
 
-**Interaction with LRU cache**: On server warm calls, most tokens are cache hits (memcpy).
-The batch sgemm only helps for cache misses (first time a token is seen). Main benefit
-is CLI mode and server cold calls where the LRU cache is empty.
-
-**Complexity**: Low-medium (~80 lines). Gather bf16 embeddings for all tokens into a
-contiguous f32 matrix, run 2 sgemm calls, scatter results. Need a temporary buffer
-of `seq × text_hidden × sizeof(float)` (~400KB for 50 tokens).
-
-**Risk**: LOW. Pure numerical change — output should be bit-identical to sequential
-path (sgemm vs individual matvec may differ by FP rounding, but functionally equivalent).
-
-### Tasks
-
-- [ ] `[MED]` **Implement batched embedding function**
-  - `embed_text_tokens_batch(ctx, token_ids[], n_tokens, output[])`
-  - bf16→f32 gather → sgemm fc1 → SiLU → sgemm fc2 → bias add
-  - Fall back to per-token for n_tokens < 4 (overhead not worth it)
-
-- [ ] `[MED]` **Integrate into prefill path**
-  - Replace the per-token loops in sections 0, 1, 3 of prompt construction
-  - Keep LRU cache active — batch only the cache-miss tokens
+Batch sgemm would require bf16→f32 weight conversion buffers for text_projection (~32MB)
+for <0.2% theoretical gain. Not worth the complexity.
 
 ---
 
@@ -916,7 +893,7 @@ Raw Metal with custom shaders keeps the zero-dependency philosophy.
 | **P9** | Phase 10: CPU Cache | Cache alignment, memory layout, alloc optimization | Medium |
 | **P10** | Phase 10b: Embedding Cache | LRU token embedding cache (server RTF 1.31) | Low |
 | **P11** | Phase 10c: Decoder Thread | Pipeline overlap generation+decode (est. 15-20%) | Medium |
-| **P12** | Phase 10d: Batch Embedding | BLAS sgemm for text token projection | Low |
+| **P12** | Phase 10d: Batch Embedding | ~~SKIPPED~~ — 0.13% of pipeline, not worth it | — |
 | **P13** | Phase 10e: Speculative CP | Draft-verify for later codebooks (⚠️ HIGH RISK) | High |
 | **P14** | Phase 10f: SDOT INT8 | Native int8 dot product (optional, arch-specific) | Medium |
 | **P15** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
