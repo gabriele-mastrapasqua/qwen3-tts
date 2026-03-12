@@ -1,0 +1,57 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+
+      - name: Build
+        run: make blas
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev clang-tidy
+
+      - name: Run clang-tidy
+        run: |
+          clang-tidy \
+            -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions' \
+            -warnings-as-errors='clang-analyzer-*' \
+            -p . \
+            --extra-arg='-DUSE_BLAS' \
+            --extra-arg='-DUSE_OPENBLAS' \
+            --extra-arg='-I/usr/include/openblas' \
+            *.c \
+            -- -I/usr/include/openblas

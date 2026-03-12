@@ -1,0 +1,116 @@
+name: Build & Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub Release with binaries'
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            blas: openblas
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            blas: openblas
+          - runner: macos-latest
+            os: macos
+            arch: arm64
+            blas: accelerate
+          - runner: macos-13
+            os: macos
+            arch: x86_64
+            blas: accelerate
+
+    runs-on: ${{ matrix.runner }}
+    name: "${{ matrix.os }}-${{ matrix.arch }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
+      - name: Build
+        run: make blas
+
+      - name: Verify binary
+        run: ./qwen_tts --help
+
+      - name: System info
+        run: |
+          echo "=== System Info ==="
+          uname -a
+          if [ -f /proc/cpuinfo ]; then
+            grep "model name" /proc/cpuinfo | head -1
+            grep "cpu cores" /proc/cpuinfo | head -1
+            echo "Logical CPUs: $(nproc)"
+          else
+            sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+            sysctl -n hw.ncpu 2>/dev/null || true
+          fi
+          free -h 2>/dev/null || sysctl -n hw.memsize 2>/dev/null | awk '{printf "Memory: %.0f GB\n", $1/1073741824}' || true
+
+      - name: Rename binary for release
+        run: |
+          cp qwen_tts qwen_tts-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen_tts-${{ matrix.os }}-${{ matrix.arch }}
+          path: qwen_tts-${{ matrix.os }}-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'qwen_tts-*' -exec cp {} release/ \;
+          chmod +x release/*
+          cd release && sha256sum * > SHA256SUMS
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "qwen-tts ${{ steps.version.outputs.tag }}"
+          files: release/*
+          generate_release_notes: true
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
