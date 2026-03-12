@@ -16,6 +16,19 @@
 #include <string.h>
 #include <math.h>
 
+/* Cache-line aligned allocation (64B for Apple M1/M2) */
+static inline void *aligned_malloc(size_t size) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
+    return ptr;
+}
+static inline void *aligned_calloc(size_t count, size_t size) {
+    size_t total = count * size;
+    void *ptr = aligned_malloc(total);
+    if (ptr) memset(ptr, 0, total);
+    return ptr;
+}
+
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -248,22 +261,22 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
     /* Allocate KV cache (bf16 — halves memory vs f32) */
     int initial_kv_max = 2048;
     int64_t kv_size = (int64_t)c->num_layers * initial_kv_max * kv_dim;
-    ctx->kv_cache_k = (uint16_t *)calloc(kv_size, sizeof(uint16_t));
-    ctx->kv_cache_v = (uint16_t *)calloc(kv_size, sizeof(uint16_t));
+    ctx->kv_cache_k = (uint16_t *)aligned_calloc(kv_size, sizeof(uint16_t));
+    ctx->kv_cache_v = (uint16_t *)aligned_calloc(kv_size, sizeof(uint16_t));
     ctx->kv_max = initial_kv_max;
     ctx->kv_len = 0;
 
-    /* Allocate decode buffers (single-token step) */
-    ctx->dec_x = (float *)calloc(h, sizeof(float));
-    ctx->dec_x_norm = (float *)malloc(h * sizeof(float));
-    ctx->dec_q = (float *)malloc(q_dim * sizeof(float));
-    ctx->dec_k = (float *)malloc(kv_dim * sizeof(float));
-    ctx->dec_v = (float *)malloc(kv_dim * sizeof(float));
-    ctx->dec_attn_out = (float *)malloc(q_dim * sizeof(float));
-    ctx->dec_proj_out = (float *)malloc(h * sizeof(float));
-    ctx->dec_gate = (float *)malloc(2 * c->intermediate_size * sizeof(float));
+    /* Allocate decode buffers (single-token step) — 64B aligned for NEON/BLAS */
+    ctx->dec_x = (float *)aligned_calloc(h, sizeof(float));
+    ctx->dec_x_norm = (float *)aligned_malloc(h * sizeof(float));
+    ctx->dec_q = (float *)aligned_malloc(q_dim * sizeof(float));
+    ctx->dec_k = (float *)aligned_malloc(kv_dim * sizeof(float));
+    ctx->dec_v = (float *)aligned_malloc(kv_dim * sizeof(float));
+    ctx->dec_attn_out = (float *)aligned_malloc(q_dim * sizeof(float));
+    ctx->dec_proj_out = (float *)aligned_malloc(h * sizeof(float));
+    ctx->dec_gate = (float *)aligned_malloc(2 * c->intermediate_size * sizeof(float));
     ctx->dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
-    ctx->dec_ffn_out = (float *)malloc(h * sizeof(float));
+    ctx->dec_ffn_out = (float *)aligned_malloc(h * sizeof(float));
 
     /* Allocate RoPE cache */
     int rope_max = 8192;
@@ -390,22 +403,22 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     if (kv_cache_grow(ctx, seq_len) != 0) return -1;
 
     /* Allocate prefill working buffer (separate from dec_x which is single-token) */
-    float *residual = (float *)malloc((int64_t)seq_len * h * sizeof(float));
-    float *pref_q = (float *)malloc((int64_t)seq_len * q_dim * sizeof(float));
-    float *pref_k = (float *)malloc((int64_t)seq_len * kv_dim * sizeof(float));
-    float *pref_v = (float *)malloc((int64_t)seq_len * kv_dim * sizeof(float));
-    float *pref_x_norm = (float *)malloc((int64_t)seq_len * h * sizeof(float));
-    float *pref_attn_out = (float *)malloc((int64_t)seq_len * q_dim * sizeof(float));
-    float *pref_gate = (float *)malloc((int64_t)seq_len * 2 * inter * sizeof(float));
-    float *pref_proj = (float *)malloc((int64_t)seq_len * h * sizeof(float));
+    float *residual = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+    float *pref_q = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+    float *pref_k = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+    float *pref_v = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+    float *pref_x_norm = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+    float *pref_attn_out = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+    float *pref_gate = (float *)aligned_malloc((int64_t)seq_len * 2 * inter * sizeof(float));
+    float *pref_proj = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
 
     /* Temp f32 weight buffers for prefill matmul (converted per-layer) */
-    float *wq_f32 = (float *)malloc((int64_t)q_dim * h * sizeof(float));
-    float *wk_f32 = (float *)malloc((int64_t)kv_dim * h * sizeof(float));
-    float *wv_f32 = (float *)malloc((int64_t)kv_dim * h * sizeof(float));
-    float *wo_f32 = (float *)malloc((int64_t)h * q_dim * sizeof(float));
-    float *gate_up_f32 = (float *)malloc((int64_t)2 * inter * h * sizeof(float));
-    float *down_f32 = (float *)malloc((int64_t)h * inter * sizeof(float));
+    float *wq_f32 = (float *)aligned_malloc((int64_t)q_dim * h * sizeof(float));
+    float *wk_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+    float *wv_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+    float *wo_f32 = (float *)aligned_malloc((int64_t)h * q_dim * sizeof(float));
+    float *gate_up_f32 = (float *)aligned_malloc((int64_t)2 * inter * h * sizeof(float));
+    float *down_f32 = (float *)aligned_malloc((int64_t)h * inter * sizeof(float));
 
     if (!residual || !pref_q || !pref_k || !pref_v || !pref_x_norm ||
         !pref_attn_out || !pref_gate || !pref_proj ||
