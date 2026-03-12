@@ -402,32 +402,49 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 
     if (kv_cache_grow(ctx, seq_len) != 0) return -1;
 
-    /* Allocate prefill working buffer (separate from dec_x which is single-token) */
-    float *residual = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
-    float *pref_q = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
-    float *pref_k = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
-    float *pref_v = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
-    float *pref_x_norm = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
-    float *pref_attn_out = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
-    float *pref_gate = (float *)aligned_malloc((int64_t)seq_len * 2 * inter * sizeof(float));
-    float *pref_proj = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+    /* Allocate/grow persistent prefill buffers (reused across generations in server mode) */
+    if (seq_len > ctx->pref_seq_cap) {
+        free(ctx->pref_residual); free(ctx->pref_q); free(ctx->pref_k); free(ctx->pref_v);
+        free(ctx->pref_x_norm); free(ctx->pref_attn_out); free(ctx->pref_gate); free(ctx->pref_proj);
+        ctx->pref_residual = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_q = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+        ctx->pref_k = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+        ctx->pref_v = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+        ctx->pref_x_norm = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_attn_out = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+        ctx->pref_gate = (float *)aligned_malloc((int64_t)seq_len * 2 * inter * sizeof(float));
+        ctx->pref_proj = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_seq_cap = seq_len;
+    }
+    /* Allocate persistent weight conversion buffers (fixed size, allocated once) */
+    if (!ctx->pref_wq_f32) {
+        ctx->pref_wq_f32 = (float *)aligned_malloc((int64_t)q_dim * h * sizeof(float));
+        ctx->pref_wk_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+        ctx->pref_wv_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+        ctx->pref_wo_f32 = (float *)aligned_malloc((int64_t)h * q_dim * sizeof(float));
+        ctx->pref_gate_up_f32 = (float *)aligned_malloc((int64_t)2 * inter * h * sizeof(float));
+        ctx->pref_down_f32 = (float *)aligned_malloc((int64_t)h * inter * sizeof(float));
+    }
 
-    /* Temp f32 weight buffers for prefill matmul (converted per-layer) */
-    float *wq_f32 = (float *)aligned_malloc((int64_t)q_dim * h * sizeof(float));
-    float *wk_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
-    float *wv_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
-    float *wo_f32 = (float *)aligned_malloc((int64_t)h * q_dim * sizeof(float));
-    float *gate_up_f32 = (float *)aligned_malloc((int64_t)2 * inter * h * sizeof(float));
-    float *down_f32 = (float *)aligned_malloc((int64_t)h * inter * sizeof(float));
+    float *residual = ctx->pref_residual;
+    float *pref_q = ctx->pref_q;
+    float *pref_k = ctx->pref_k;
+    float *pref_v = ctx->pref_v;
+    float *pref_x_norm = ctx->pref_x_norm;
+    float *pref_attn_out = ctx->pref_attn_out;
+    float *pref_gate = ctx->pref_gate;
+    float *pref_proj = ctx->pref_proj;
+    float *wq_f32 = ctx->pref_wq_f32;
+    float *wk_f32 = ctx->pref_wk_f32;
+    float *wv_f32 = ctx->pref_wv_f32;
+    float *wo_f32 = ctx->pref_wo_f32;
+    float *gate_up_f32 = ctx->pref_gate_up_f32;
+    float *down_f32 = ctx->pref_down_f32;
 
     if (!residual || !pref_q || !pref_k || !pref_v || !pref_x_norm ||
         !pref_attn_out || !pref_gate || !pref_proj ||
         !wq_f32 || !wk_f32 || !wv_f32 || !wo_f32 || !gate_up_f32 || !down_f32) {
         fprintf(stderr, "Error: prefill allocation failed\n");
-        free(residual); free(pref_q); free(pref_k); free(pref_v); free(pref_x_norm);
-        free(pref_attn_out); free(pref_gate); free(pref_proj);
-        free(wq_f32); free(wk_f32); free(wv_f32); free(wo_f32);
-        free(gate_up_f32); free(down_f32);
         return -1;
     }
 
@@ -619,13 +636,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     /* Copy last position to dec_x for use in generation */
     memcpy(ctx->dec_x, residual + (int64_t)(seq_len - 1) * h, h * sizeof(float));
 
-    /* Free prefill buffers */
-    free(residual);
-    free(pref_q); free(pref_k); free(pref_v);
-    free(pref_x_norm); free(pref_attn_out);
-    free(pref_gate); free(pref_proj);
-    free(wq_f32); free(wk_f32); free(wv_f32); free(wo_f32);
-    free(gate_up_f32); free(down_f32);
+    /* Buffers persist in ctx for reuse across generations (server mode) */
 
     if (!ctx->silent) fprintf(stderr, "  Prefill complete (%d tokens in KV cache)\n", seq_len);
     return 0;
