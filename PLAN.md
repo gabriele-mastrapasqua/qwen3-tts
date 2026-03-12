@@ -726,65 +726,39 @@ for <0.2% theoretical gain. Not worth the complexity.
 
 ---
 
-## Phase 10e: Speculative Code Predictor Decoding (Experimental)
+## Phase 10e: Speculative Code Predictor Decoding — ABANDONED
 
-**Goal**: Reduce Code Predictor time (~55% of total) by predicting multiple codebook
-tokens in parallel and verifying, rather than generating all 15 sequentially.
+**Status**: ABANDONED after thorough analysis and testing (2026-03-12).
 
-**⚠️ RISK: HIGH — may degrade audio quality. Must be thoroughly tested before merge.**
+**Analysis performed**:
 
-**Background**: The CP generates 15 codebook tokens per frame sequentially:
-```
-step 0: hidden → code[0]
-step 1: embed(code[0]) → transformer → code[1]
-step 2: embed(code[1]) → transformer → code[2]
-...
-```
-Each step depends on the previous code. But the later codebooks encode finer details
-(residual quantization — codebook 0 is coarse, codebook 15 is fine detail). This
-means later codes have lower entropy and may be more predictable.
+1. **Codebook entropy analysis** (598 frames across 6 generations, 5 seeds + long text):
+   - ALL 16 codebooks have high, uniform entropy: 7.6–8.5 bits (out of max 11 bits)
+   - 266–439 unique values per codebook (out of 2048 possible)
+   - Zero intra-frame correlation: CB[k] == CB[k-1] ≈ 0.0%
+   - Frame-to-frame repetition: 1–9% (not exploitable)
+   - Initial hypothesis was wrong: later codebooks are NOT more predictable
+   - **Conclusion**: Draft+verify speculative decoding would have ~0% acceptance rate
 
-**Approach**: Draft-then-verify (inspired by speculative decoding in LLMs):
-1. Run steps 0-4 normally (coarse codebooks, high information)
-2. For steps 5-14: predict N codes in parallel using a lightweight draft head
-3. Verify predictions against the real CP transformer
-4. Accept correct predictions, recompute from first rejection point
+2. **Early exit experiment** (fewer transformer layers for later codebooks):
+   - Tested `--cp-early-exit N`: codebooks N–14 use 3 layers instead of 5
+   - CP ms/f dropped 14% (80.8→69.8 for EE10)
+   - **Critical discovery**: CP codes feed back into Talker via embedding sum
+     (all 16 codebook embeddings are summed into the next frame's Talker input).
+     Changing ANY CP code perturbs the entire generation trajectory.
+   - Multi-seed stability test (7 seeds):
+     - Baseline frame range: 70–103 (normal sampling variance)
+     - EE8 frame range: 56–116 (doubled variance)
+     - EE10 frame range: 79–161 (tripled variance, seed 456: 70→161 = 2.3x)
+   - Audio quality: unpredictable — sometimes acceptable, sometimes garbled or 2x too long
 
-**Estimated gain**: 20-30% of CP time IF acceptance rate is >60%. Each accepted
-speculation saves one full transformer forward pass (~4ms).
+3. **Root cause**: The model's feedback loop (CP codes → embedding sum → Talker input)
+   makes ANY approximation in CP codes structurally unsafe. Small perturbations in
+   later codebook tokens amplify exponentially through the autoregressive generation
+   loop with sampling (temp=0.9). This is an inherent architectural property of
+   Qwen3-TTS, not a fixable implementation issue.
 
-**Complexity**: HIGH (~300-500 lines). Need to implement:
-- Draft prediction head (small MLP trained on codebook statistics, or heuristic)
-- Parallel evaluation of multiple candidate codes
-- Verification loop with rollback
-- Quality validation framework (correlation with non-speculative output)
-
-**Risk**: HIGH. Wrong speculative codes = different audio. Even if individual codes
-look similar, autoregressive error accumulation can cause quality drift. Must validate
-with extensive listening tests and correlation metrics.
-
-**Requirements before starting**:
-- All other optimizations committed and tested
-- Baseline audio samples saved for A/B comparison
-- Correlation threshold defined (e.g., >0.999 vs non-speculative)
-- Implemented behind `--speculative` flag, OFF by default
-
-### Tasks
-
-- [ ] `[LOW]` **Analyze codebook entropy by position**
-  - Run 100+ generations, collect per-codebook token distributions
-  - Measure conditional entropy: H(code[k] | code[0..k-1])
-  - If later codebooks have low entropy, speculation is viable
-
-- [ ] `[LOW]` **Implement draft-verify loop with flag**
-  - `--speculative` CLI flag, disabled by default
-  - Start conservative: speculate only codebooks 10-14
-  - Measure acceptance rate and quality impact
-
-- [ ] `[LOW]` **Quality validation**
-  - Compare speculative vs non-speculative on 50+ test phrases
-  - Correlation > 0.999 required for merge
-  - Listening test: no audible artifacts
+**No variant of speculative, early-exit, or approximate CP is viable for this model.**
 
 ---
 
@@ -894,7 +868,7 @@ Raw Metal with custom shaders keeps the zero-dependency philosophy.
 | **P10** | Phase 10b: Embedding Cache | LRU token embedding cache (server RTF 1.31) | Low |
 | **P11** | Phase 10c: Decoder Thread | Pipeline overlap generation+decode (est. 15-20%) | Medium |
 | **P12** | Phase 10d: Batch Embedding | ~~SKIPPED~~ — 0.13% of pipeline, not worth it | — |
-| **P13** | Phase 10e: Speculative CP | Draft-verify for later codebooks (⚠️ HIGH RISK) | High |
+| **P13** | Phase 10e: Speculative CP | ~~ABANDONED~~ — codebook feedback loop makes it structurally unsafe | — |
 | **P14** | Phase 10f: SDOT INT8 | Native int8 dot product (optional, arch-specific) | Medium |
 | **P15** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
 
