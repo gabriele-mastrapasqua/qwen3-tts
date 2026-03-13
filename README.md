@@ -118,6 +118,9 @@ make info       # Show build configuration
 ```bash
 make test-small       # Run 0.6B tests (English, Italian, multiple speakers)
 make test-large       # Run 1.7B tests (config check, English, Italian, instruct styles)
+make test-large-int8  # Run 1.7B INT8 quantization tests (Italian + English, seed 42)
+make test-large-int4  # Run 1.7B INT4 quantization tests (Italian + English, seed 42)
+make test-large-quant # Run all 1.7B quantization tests (INT8 + INT4)
 make test-regression  # Cross-model regression checks (safetensors, config parsing)
 make test-all         # Run everything (0.6B + 1.7B + regression)
 make test-serve          # HTTP server integration test (health, speakers, TTS)
