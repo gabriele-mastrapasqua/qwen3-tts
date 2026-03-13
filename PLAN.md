@@ -1217,6 +1217,127 @@ fallbacks. Priority: INT4 > INT8 > BF16.
 
 ---
 
+## Phase 10j: Batch Vectorized Math + Embedding SIMD
+
+**Goal**: Squeeze remaining per-frame overhead from scalar math and BF16→F32
+conversion loops. Two independent optimizations, both cross-platform (NEON/AVX/generic).
+
+**Inspiration**: antirez/qwen-asr uses Apple Accelerate `vvexpf()` for batch
+exponential in SwiGLU, avoiding per-element `expf()` overhead.
+
+### Tasks
+
+#### 10j.1 Batch vvexpf for SwiGLU (Talker + CP)
+
+**What**: Restructure the SwiGLU loop to batch all gate values, compute exp in
+one call, then apply sigmoid×up. On macOS use `vvexpf()` (Accelerate/vForce);
+on Linux/generic use a scalar loop (compiler vectorizes with `-ffast-math`).
+
+Current (scalar, per-element):
+```c
+for (int o = 0; o < inter; o++) {
+    float g = gate[2*o], u = gate[2*o+1];
+    gate[o] = g / (1.0f + expf(-g)) * u;  // expf called N times
+}
+```
+
+Proposed (batched):
+```c
+// 1. Extract gate values into contiguous buffer, negate
+for (int o = 0; o < inter; o++) neg_g[o] = -gate[2*o];
+// 2. Batch exp (vvexpf on macOS, scalar loop elsewhere)
+vvexpf(exp_g, neg_g, &inter);  // or: for(...) exp_g[o] = expf(neg_g[o]);
+// 3. Apply sigmoid × up
+for (int o = 0; o < inter; o++) {
+    float g = gate[2*o], u = gate[2*o+1];
+    gate[o] = g / (1.0f + exp_g[o]) * u;
+}
+```
+
+**Call count**: Talker 28 layers × 3072 + CP 5×15 × 1024 = ~163K expf/frame.
+**Platform support**:
+- macOS: `vvexpf()` from `<Accelerate/Accelerate.h>` (already linked)
+- Linux/generic: scalar loop, compiler auto-vectorizes with `-ffast-math`
+- AVX/SSE: no manual intrinsics needed (compiler handles it)
+
+| Metric | Value |
+|--------|-------|
+| Expected gain | 1-3 ms/frame (vvexpf is 4-8x faster than scalar expf) |
+| Difficulty | LOW — restructure loop + conditional vvexpf call |
+| Risk | NONE — mathematically identical, no approximation |
+| Files | `qwen_tts_talker.c`, `qwen_tts_code_predictor.c` |
+
+#### 10j.2 NEON/AVX Codec Embedding BF16→F32 Accumulation
+
+**What**: Vectorize the scalar loop that accumulates 15 codebook embeddings per
+frame. Currently 15 × hidden BF16→F32 conversions done one element at a time.
+
+Current (scalar):
+```c
+for (int j = 0; j < h; j++) step_embed[j] += bf16_to_f32(emb[j]);
+```
+
+Proposed (NEON):
+```c
+for (int j = 0; j + 7 < h; j += 8) {
+    uint16x8_t bf = vld1q_u16(emb + j);
+    float32x4_t f0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16));
+    float32x4_t f1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bf), 16));
+    vst1q_f32(step_embed + j,     vaddq_f32(vld1q_f32(step_embed + j), f0));
+    vst1q_f32(step_embed + j + 4, vaddq_f32(vld1q_f32(step_embed + j + 4), f1));
+}
+```
+
+AVX equivalent: `_mm256_slli_epi32(_mm256_cvtepu16_epi32(load128), 16)` → cast to f32.
+
+**Call count**: 15 codebooks × 1024 elements = 15K conversions per frame.
+**Platform support**:
+- ARM NEON: `vshll_n_u16` + `vaddq_f32`
+- x86 AVX2: `_mm256_cvtepu16_epi32` + `_mm256_slli_epi32` + `_mm256_add_ps`
+- Generic: existing scalar loop (unchanged)
+
+| Metric | Value |
+|--------|-------|
+| Expected gain | 0.5-1 ms/frame |
+| Difficulty | LOW — straightforward NEON/AVX conversion |
+| Risk | NONE — pure arithmetic optimization |
+| Files | `qwen_tts.c` (generation loop, codec embedding accumulation) |
+
+#### 10j.3 Delta Prefill / KV Cache Reuse (Server Mode)
+
+**What**: In server mode, compare the current prompt's token IDs with the previous
+request's. If the prefix matches (same speaker, language, ChatML header), skip
+re-prefilling those tokens and reuse the existing KV cache entries.
+
+Typical prompt structure (25 tokens):
+- Tokens 0-9: ChatML header + speaker + language (IDENTICAL across requests with same speaker)
+- Tokens 10-24: Text content (DIFFERENT per request)
+
+If speaker/language match, skip prefill for first ~10 tokens = ~40% prefill savings.
+
+**Implementation**:
+- Store previous prompt token IDs + length in context
+- On new request, compare token-by-token to find longest common prefix
+- Set `kv_len = prefix_len` instead of 0, prefill only new tokens
+- Reset to 0 if speaker/language changed
+
+| Metric | Value |
+|--------|-------|
+| Expected gain | 40% prefill time on repeated speaker (~800ms → ~480ms) |
+| Difficulty | MEDIUM — need to track previous state, handle edge cases |
+| Risk | LOW — only in server mode, easy to disable |
+| Files | `qwen_tts.c` (prefill section), `qwen_tts.h` (context fields) |
+
+### Priority Order
+
+| Order | Task | Expected Gain | Difficulty | Risk |
+|-------|------|---------------|------------|------|
+| 1 | 10j.1 Batch vvexpf SwiGLU | 1-3 ms/f | LOW | NONE |
+| 2 | 10j.2 Codec embedding NEON/AVX | 0.5-1 ms/f | LOW | NONE |
+| 3 | 10j.3 Delta prefill (server) | 40% prefill | MEDIUM | LOW |
+
+---
+
 ## Phase 11: GPU Acceleration via Metal (Optional, Future)
 
 **Goal**: Evaluate Metal GPU offload for Apple Silicon, specifically for attention and
