@@ -424,12 +424,14 @@ and **decoder thread overlap** (speech decoder runs in background during generat
 
 |  | Short text (~5–8s audio) | Long text (~16s audio) |
 |---|---|---|
-| **CLI** | RTF 1.74 | ~RTF 1.4 |
+| **CLI** | RTF 1.4–1.7 | ~RTF 1.3 |
+| **CLI `--stream`** | RTF 1.4–1.7 | ~RTF 1.3 |
 | **Server (cold)** | RTF 1.50 | RTF 1.28 |
 | **Server (warm)** | RTF 1.39 | **RTF 1.26** |
 
-Longer audio amortizes fixed costs (prefill). Server mode adds warm caches,
-embedding cache, and decoder thread overlap on top.
+Streaming mode has **identical performance** to normal mode — the speech decoder
+runs in a pipeline thread in both cases. Longer audio amortizes fixed costs (prefill).
+Server mode adds warm caches, embedding cache, and decoder thread overlap on top.
 
 #### Full request body
 
@@ -521,6 +523,8 @@ performance to **RTF ~1.3–1.7** (up to 2.7x total speedup):
 | Text embedding cache | **14% server** | LRU cache for token embeddings (skip 2 matvec per cached token) |
 | Batched VQ projection | minor | BLAS sgemm instead of per-frame scalar matvec |
 | Pre-allocated sampling buffers | minor | Zero per-token malloc in generation loop |
+| Top-k quickselect | **4× sampling** | O(n) quickselect replaces O(kn) selection sort |
+| Streaming pipeline parallelism | **RTF 2.0→1.4** | Decoder thread runs in streaming mode too |
 
 All optimizations are cross-platform (POSIX standard `posix_memalign`, conditional NEON/AVX).
 See [blog/optimization-notes.md](blog/optimization-notes.md) for the full story.

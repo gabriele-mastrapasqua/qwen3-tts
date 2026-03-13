@@ -357,9 +357,14 @@ typedef struct {
     int  done;              /* producer signals no more frames */
 
     /* Decoder output (owned by decoder thread) */
-    float *audio_buf;       /* growing audio buffer */
+    float *audio_buf;       /* growing audio buffer (NULL if streaming via cb) */
     int    audio_len;       /* samples written */
     int    audio_cap;       /* capacity */
+
+    /* Streaming callback (if set, audio goes to callback instead of buffer) */
+    qwen_tts_audio_cb audio_cb;
+    void *audio_cb_userdata;
+    int   cb_aborted;       /* set to 1 if callback returns non-zero */
 
     /* Context for decoder */
     qwen_tts_ctx_t *ctx;
@@ -376,6 +381,9 @@ static void dt_init(decoder_thread_t *dt, qwen_tts_ctx_t *ctx, int max_frames) {
     dt->done = 0;
     dt->ctx = ctx;
     dt->decode_ms = 0;
+    dt->audio_cb = NULL;
+    dt->audio_cb_userdata = NULL;
+    dt->cb_aborted = 0;
     /* Pre-allocate audio for ~max_frames worth of audio */
     dt->audio_cap = max_frames * 1920 + 4096;  /* 1920 samples/frame + margin */
     dt->audio_buf = (float *)malloc(dt->audio_cap * sizeof(float));
@@ -443,10 +451,18 @@ static void *decoder_thread_fn(void *arg) {
         gettimeofday(&tv, NULL);
         t0 = tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 
+        if (dt->cb_aborted) { dt->read_pos += avail; continue; }
+
         if (qwen_speech_decoder_decode_streaming(ctx, chunk_codes, avail,
                                                    &chunk_audio, &chunk_samples) == 0) {
             if (chunk_samples > 0 && chunk_audio) {
-                dt_append_audio(dt, chunk_audio, chunk_samples);
+                if (dt->audio_cb) {
+                    int ret = dt->audio_cb(chunk_audio, chunk_samples, dt->audio_cb_userdata);
+                    if (ret != 0) dt->cb_aborted = 1;
+                    dt->audio_len += chunk_samples;
+                } else {
+                    dt_append_audio(dt, chunk_audio, chunk_samples);
+                }
             }
             free(chunk_audio);
         }
@@ -1021,25 +1037,19 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     double t_cp_total = 0, t_talker_step_total = 0, t_embed_total = 0;
     float *step_embed = (float *)malloc(h * sizeof(float));
-    int stream_chunk = ctx->stream_chunk_frames > 0 ? ctx->stream_chunk_frames : 10;
-    int stream_aborted = 0;
-    int stream_frames_decoded = 0;   /* frames sent to incremental decoder */
 
-    /* Initialize streaming decoder state */
-    if (ctx->stream && ctx->audio_cb) {
-        qwen_sd_stream_init(&ctx->sd_stream);
-    }
-
-    /* Launch decoder thread for pipeline overlap (non-streaming mode only).
-     * In streaming mode, the main thread handles decode+callback directly. */
+    /* Launch decoder thread for pipeline overlap (always — both streaming and normal).
+     * In streaming mode, the decoder thread calls audio_cb directly.
+     * In normal mode, it accumulates audio to a buffer. */
     decoder_thread_t dt_state;
     pthread_t dt_thread;
-    int use_decoder_thread = !(ctx->stream && ctx->audio_cb);  /* non-streaming */
-    if (use_decoder_thread) {
-        qwen_sd_stream_init(&ctx->sd_stream);
-        dt_init(&dt_state, ctx, max_frames);
-        pthread_create(&dt_thread, NULL, decoder_thread_fn, &dt_state);
+    qwen_sd_stream_init(&ctx->sd_stream);
+    dt_init(&dt_state, ctx, max_frames);
+    if (ctx->stream && ctx->audio_cb) {
+        dt_state.audio_cb = ctx->audio_cb;
+        dt_state.audio_cb_userdata = ctx->audio_cb_userdata;
     }
+    pthread_create(&dt_thread, NULL, decoder_thread_fn, &dt_state);
 
     for (int frame = 0; frame < max_frames; frame++) {
         /* Codec head: logits = codec_head @ last_hidden */
@@ -1102,9 +1112,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         ctx->codec_frames++;
 
         /* Push frame to decoder thread for pipeline overlap */
-        if (use_decoder_thread) {
-            dt_push_frames(&dt_state, codes, 1);
-        }
+        dt_push_frames(&dt_state, codes, 1);
 
         /* Debug: dump codes for all frames */
         if (ctx->debug) {
@@ -1121,30 +1129,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         if (!ctx->silent && frame % 50 == 0 && frame > 0)
             fprintf(stderr, "\r  Frame %d/%d (%.1fs audio)...", frame, max_frames, frame / 12.5);
 
-        /* Streaming: incremental decode — only process NEW frames */
-        if (ctx->stream && ctx->audio_cb && ctx->codec_frames % stream_chunk == 0) {
-            int new_chunk_frames = ctx->codec_frames - stream_frames_decoded;
-            if (new_chunk_frames > 0) {
-                const int *new_codes = ctx->codec_codes + stream_frames_decoded * 16;
-                float *chunk_audio = NULL; int chunk_samples = 0;
-                if (qwen_speech_decoder_decode_streaming(ctx, new_codes, new_chunk_frames,
-                                                          &chunk_audio, &chunk_samples) == 0) {
-                    if (chunk_samples > 0 && chunk_audio) {
-                        int ret = ctx->audio_cb(chunk_audio, chunk_samples,
-                                                ctx->audio_cb_userdata);
-                        if (ret != 0) {
-                            if (!ctx->silent) fprintf(stderr, "\n  Streaming aborted by callback\n");
-                            stream_aborted = 1;
-                        }
-                    }
-                    free(chunk_audio);
-                }
-                stream_frames_decoded = ctx->codec_frames;
-            }
-            if (stream_aborted) break;
+        /* Check if streaming callback was aborted by decoder thread */
+        if (ctx->stream && ctx->audio_cb && dt_state.cb_aborted) {
+            if (!ctx->silent) fprintf(stderr, "\n  Streaming aborted by callback\n");
+            break;
         }
 
-        /* Build next input embedding (non-streaming mode):
+        /* Build next input embedding:
          * codec_side: codec_embed(code0) + sum of CP codec_embeds(codes 1-15)
          * text_side: always tts_pad (all text was in prefill)
          */
@@ -1187,57 +1178,39 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     /* Speech decoder */
     if (ctx->codec_frames == 0) {
-        if (use_decoder_thread) { dt_finish(&dt_state); pthread_join(dt_thread, NULL); qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state); }
+        dt_finish(&dt_state); pthread_join(dt_thread, NULL);
+        qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
         *out_samples = NULL; *out_n_samples = 0;
         return 0;
     }
 
-    /* Streaming: emit remaining frames via incremental decoder */
-    if (ctx->stream && ctx->audio_cb && !stream_aborted) {
-        int remaining = ctx->codec_frames - stream_frames_decoded;
-        if (remaining > 0) {
-            const int *new_codes = ctx->codec_codes + stream_frames_decoded * 16;
-            float *chunk_audio = NULL; int chunk_samples = 0;
-            if (qwen_speech_decoder_decode_streaming(ctx, new_codes, remaining,
-                                                      &chunk_audio, &chunk_samples) == 0) {
-                if (chunk_samples > 0 && chunk_audio)
-                    ctx->audio_cb(chunk_audio, chunk_samples, ctx->audio_cb_userdata);
-                free(chunk_audio);
-            }
-        }
-    }
-
-    /* Free streaming state (streaming mode only — decoder thread handles its own) */
-    if (ctx->stream && ctx->audio_cb) {
-        qwen_sd_stream_free(&ctx->sd_stream);
-    }
-
+    /* Signal decoder thread that generation is done, join, collect audio */
     float *audio; int n_samples;
     double t_dec_start = time_ms();
 
-    if (use_decoder_thread) {
-        /* Signal decoder thread that generation is done, join, collect audio */
-        dt_finish(&dt_state);
-        pthread_join(dt_thread, NULL);
-        qwen_sd_stream_free(&ctx->sd_stream);
+    dt_finish(&dt_state);
+    pthread_join(dt_thread, NULL);
+    qwen_sd_stream_free(&ctx->sd_stream);
 
+    double dt_decode_ms = dt_state.decode_ms;
+    double dt_drain_ms = time_ms() - t_dec_start;
+
+    if (dt_state.audio_cb) {
+        /* Streaming mode: audio was already sent via callback, return empty */
+        audio = NULL;
+        n_samples = dt_state.audio_len;  /* track for reporting */
+        dt_free(&dt_state);
+    } else {
+        /* Normal mode: collect audio from decoder thread buffer */
         audio = dt_state.audio_buf;
         n_samples = dt_state.audio_len;
-        double dt_decode_ms = dt_state.decode_ms;
         dt_state.audio_buf = NULL;  /* ownership transferred */
         dt_free(&dt_state);
-
-        double dt_drain_ms = time_ms() - t_dec_start;
-        if (!ctx->silent)
-            fprintf(stderr, "  Speech decoder: %.0f ms total (%.0f ms drain after gen)\n",
-                    dt_decode_ms, dt_drain_ms);
-    } else {
-        /* Full decode (fallback — only when streaming with callback) */
-        if (qwen_speech_decoder_decode(ctx, ctx->codec_codes, ctx->codec_frames, &audio, &n_samples) != 0)
-            return -1;
-        if (!ctx->silent)
-            fprintf(stderr, "  Speech decoder: %.0f ms\n", time_ms() - t_dec_start);
     }
+
+    if (!ctx->silent)
+        fprintf(stderr, "  Speech decoder: %.0f ms total (%.0f ms drain after gen)\n",
+                dt_decode_ms, dt_drain_ms);
 
     *out_samples = audio;
     *out_n_samples = n_samples;
