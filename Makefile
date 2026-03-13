@@ -53,6 +53,9 @@ help:
 	@echo "Test (requires models downloaded via ./download_model.sh):"
 	@echo "  make test-small      - Run all 0.6B tests (English + Italian)"
 	@echo "  make test-large      - Run all 1.7B tests (config + English + Italian)"
+	@echo "  make test-large-int8 - Run 1.7B INT8 tests (Italian + English, seed 42)"
+	@echo "  make test-large-int4 - Run 1.7B INT4 tests (Italian + English, seed 42)"
+	@echo "  make test-large-quant - Run all 1.7B quantization tests (INT8 + INT4)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
@@ -225,6 +228,39 @@ test-large-instruct:
 		--instruct "Speak in a very happy, cheerful and excited tone" \
 		-o $(TEST_DIR)/large_happy.wav 2>&1 | tee $(TEST_DIR)/large_happy.wav.log
 	$(call validate_wav,$(TEST_DIR)/large_happy.wav,1.7B Instruct happy)
+
+test-large-int8:
+	@echo "--- 1.7B INT8 Italian ryan (seed 42) ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan -l Italian --seed 42 \
+		--text "Ciao, come stai oggi? Spero tutto bene." \
+		--int8 \
+		-o $(TEST_DIR)/large_int8_it.wav 2>&1 | tee $(TEST_DIR)/large_int8_it.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_int8_it.wav,1.7B INT8 Italian ryan)
+	@echo "--- 1.7B INT8 English ryan (seed 42) ---"
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan --seed 42 \
+		--text "Hello, how are you doing today? I hope everything is going well." \
+		--int8 \
+		-o $(TEST_DIR)/large_int8_en.wav 2>&1 | tee $(TEST_DIR)/large_int8_en.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_int8_en.wav,1.7B INT8 English ryan)
+
+test-large-int4:
+	@echo "--- 1.7B INT4 Italian ryan (seed 42) ---"
+	@mkdir -p $(TEST_DIR)
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan -l Italian --seed 42 \
+		--text "Ciao, come stai oggi? Spero tutto bene." \
+		--int4 \
+		-o $(TEST_DIR)/large_int4_it.wav 2>&1 | tee $(TEST_DIR)/large_int4_it.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_int4_it.wav,1.7B INT4 Italian ryan)
+	@echo "--- 1.7B INT4 English ryan (seed 42) ---"
+	./$(TARGET) -d $(MODEL_LARGE) -s ryan --seed 42 \
+		--text "Hello, how are you doing today? I hope everything is going well." \
+		--int4 \
+		-o $(TEST_DIR)/large_int4_en.wav 2>&1 | tee $(TEST_DIR)/large_int4_en.wav.log
+	$(call validate_wav,$(TEST_DIR)/large_int4_en.wav,1.7B INT4 English ryan)
+
+test-large-quant: test-large-int8 test-large-int4
+	@echo "=== All 1.7B quantization tests passed ==="
 
 test-large: test-large-config test-large-en test-large-it test-large-instruct
 	@echo "=== All 1.7B tests passed ==="
@@ -515,4 +551,5 @@ test-it-ryan: test-small-it
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
         test-large test-large-en test-large-it test-large-config test-large-instruct \
+        test-large-int8 test-large-int4 test-large-quant \
         test-regression test-all test-en test-it-ryan
