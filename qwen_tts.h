@@ -391,6 +391,10 @@ typedef struct qwen_tts_ctx {
     char *ref_audio_path;        /* Path to reference audio file */
     char *ref_text;              /* Reference text for ICL mode */
 
+    /* Cached ICL data (for .qvoice save/load) */
+    int *cached_ref_codes;       /* [cached_ref_n_frames × 16] codec tokens from speech encoder */
+    int cached_ref_n_frames;     /* Number of reference codec frames */
+
     /* Base model type */
     int is_base_model;           /* 1 = Base model, 0 = CustomVoice/VoiceDesign */
 

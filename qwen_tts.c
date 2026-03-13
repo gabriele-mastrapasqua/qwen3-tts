@@ -637,7 +637,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->cached_tts_pad_embed); free(ctx->cached_tts_bos_embed); free(ctx->cached_tts_eos_embed);
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
-    free(ctx->prev_input_embeds);
+    free(ctx->prev_input_embeds); free(ctx->cached_ref_codes);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
 }
@@ -813,12 +813,25 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_PAD, codec_pad_embed);
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_BOS, codec_bos_embed);
 
-    /* === ICL mode: encode reference audio === */
+    /* === ICL mode: use cached ref_codes (.qvoice) or encode reference audio === */
     int *ref_codes = NULL;
     int ref_n_frames = 0;
-    int icl_mode = (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text
-                    && ref_text_tokens && ref_text_token_len > 0);
-    if (icl_mode) {
+    int ref_codes_owned = 0;  /* 1 if we allocated ref_codes and must free it */
+    int icl_mode = 0;
+
+    /* Check for cached ref_codes from .qvoice file */
+    if (ctx->voice_clone && ctx->cached_ref_codes && ctx->cached_ref_n_frames > 0
+        && ctx->ref_text && ref_text_tokens && ref_text_token_len > 0) {
+        ref_codes = ctx->cached_ref_codes;
+        ref_n_frames = ctx->cached_ref_n_frames;
+        icl_mode = 1;
+        if (!ctx->silent)
+            fprintf(stderr, "ICL: using %d cached ref frames from .qvoice\n", ref_n_frames);
+    }
+    /* Otherwise encode from ref audio file */
+    else if (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text
+             && ref_text_tokens && ref_text_token_len > 0) {
+        icl_mode = 1;
         float *ref_audio_samples = NULL;
         int ref_n_samples = 0, ref_sr = 0;
         if (qwen_read_wav(ctx->ref_audio_path, &ref_audio_samples, &ref_n_samples, &ref_sr) != 0) {
@@ -834,6 +847,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                 icl_mode = 0;
             }
             free(ref_audio_samples);
+            ref_codes_owned = 1;
         }
     }
 
@@ -983,7 +997,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(tmp_embed);
     /* tts_pad/bos/eos_embed are ctx-owned cache — do not free */
     free(ref_text_tokens);
-    free(ref_codes);
+    if (ref_codes_owned) free(ref_codes);
 
     free(codec_pad_embed);
     free(codec_bos_embed);
