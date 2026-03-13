@@ -1248,6 +1248,33 @@ void qwen_round_bf16(float *x, int n) {
     }
 }
 
+void qwen_bf16_accum_f32(float *dst, const uint16_t *src_bf16, int n) {
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 7 < n; i += 8) {
+        uint16x8_t bf = vld1q_u16(src_bf16 + i);
+        float32x4_t f0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16));
+        float32x4_t f1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bf), 16));
+        vst1q_f32(dst + i,     vaddq_f32(vld1q_f32(dst + i), f0));
+        vst1q_f32(dst + i + 4, vaddq_f32(vld1q_f32(dst + i + 4), f1));
+    }
+#elif defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        /* Load 8 bf16 values, zero-extend to 32-bit, shift left 16 to get f32 */
+        __m128i bf = _mm_loadu_si128((const __m128i *)(src_bf16 + i));
+        __m256i wide = _mm256_cvtepu16_epi32(bf);
+        __m256 f = _mm256_castsi256_ps(_mm256_slli_epi32(wide, 16));
+        __m256 d = _mm256_loadu_ps(dst + i);
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(d, f));
+    }
+#endif
+    for (; i < n; i++) {
+        uint32_t bits = (uint32_t)src_bf16[i] << 16;
+        float val; memcpy(&val, &bits, sizeof(float));
+        dst[i] += val;
+    }
+}
+
 /* ========================================================================
  * Snake activation: x += (1/exp(beta)) * sin²(exp(alpha) * x)
  * ======================================================================== */

@@ -947,8 +947,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                         && code_g < ctx->config.codebook_size) {
                         const uint16_t *emb = ctx->cp_codec_emb_bf16[g]
                                               + (int64_t)code_g * h;
-                        for (int j = 0; j < h; j++)
-                            dst[j] += bf16_to_f32(emb[j]);
+                        qwen_bf16_accum_f32(dst, emb, h);
                     }
                 }
             }
@@ -1161,7 +1160,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             int code_g = codes[g + 1];
             if (ctx->cp_codec_emb_bf16[g] && code_g >= 0 && code_g < ctx->config.codebook_size) {
                 const uint16_t *emb = ctx->cp_codec_emb_bf16[g] + (int64_t)code_g * h;
-                for (int j = 0; j < h; j++) step_embed[j] += bf16_to_f32(emb[j]);
+                qwen_bf16_accum_f32(step_embed, emb, h);
             }
         }
 
