@@ -143,6 +143,20 @@ typedef struct {
 
     /* Fused gate+up for optimization */
     uint16_t *gate_up_fused_bf16; /* [2*inter, hidden] */
+
+    /* INT8 quantized weights (optional, allocated if --int8 flag is set) */
+    int8_t *wq_int8;              /* [q_dim, hidden] */
+    float  *wq_scale;             /* [q_dim] per-row scale */
+    int8_t *wk_int8;              /* [kv_dim, hidden] */
+    float  *wk_scale;             /* [kv_dim] */
+    int8_t *wv_int8;              /* [kv_dim, hidden] */
+    float  *wv_scale;             /* [kv_dim] */
+    int8_t *wo_int8;              /* [hidden, q_dim] */
+    float  *wo_scale;             /* [hidden] */
+    int8_t *gate_up_fused_int8;   /* [2*inter, hidden] */
+    float  *gate_up_fused_scale;  /* [2*inter] */
+    int8_t *down_int8;            /* [hidden, inter] */
+    float  *down_scale;           /* [hidden] */
 } qwen_talker_layer_t;
 
 /* ========================================================================
