@@ -959,7 +959,7 @@ only when `--int8` is enabled. Reduces `qwen_cp_layer_t` to ~132 bytes.
 | 4 | 10g.3 Top-p partial sort | MEDIUM | LOW | 5-10× top-p |
 | 5 | ~~10g.4 Depthwise conv NEON~~ | MEDIUM | LOW | SKIP (see below) |
 | 6 | ~~10g.5 LayerNorm NEON~~ | MEDIUM | LOW | SKIP (see below) |
-| 7 | 10g.6 Streaming pipeline | HIGH | MEDIUM | RTF 2.0→1.4 |
+| 7 | **10g.6 Streaming pipeline** | HIGH | MEDIUM | **DONE: RTF 2.0→1.38** |
 
 ### Results & Analysis (2026-03-13)
 
@@ -984,8 +984,10 @@ Talker+CP completes (9.9s decoder vs 10.8s generation). It's NOT the bottleneck.
 ConvNeXt depthwise (1.4M FLOPs) is 600× less compute than BLAS-accelerated PW1
 (838M FLOPs). These scalar loops are negligible in the total decoder time.
 
-**10g.6 Streaming pipeline**: Remaining. This is the one structural fix that would
-close the RTF gap between streaming (2.0) and normal mode (1.4).
+**10g.6 Streaming pipeline**: DONE. Decoder thread now runs in streaming mode too,
+calling audio_cb from the thread. Main thread never blocks on decode.
+**Streaming RTF: 2.04 → 1.38** (matches normal mode). Output bit-identical across
+all 4 modes (CLI normal, CLI stream, server normal, server stream). *(2026-03-13)*
 
 ---
 
