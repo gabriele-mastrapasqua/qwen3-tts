@@ -1,6 +1,6 @@
 # PLAN.md — Qwen3-TTS C Engine Roadmap
 
-Updated: 2026-03-12
+Updated: 2026-03-13
 
 Core engine is **COMPLETE** and producing good audio for both 0.6B and 1.7B models.
 This document tracks all planned features, improvements, and known issues.
@@ -797,6 +797,172 @@ The main codebase should remain portable (bf16 matvec as default path).
 
 ---
 
+## Phase 10g: Scalar Hot Paths → NEON/Algorithm Optimization
+
+**Goal**: Vectorize remaining scalar C loops on hot paths and fix algorithmic
+inefficiencies (O(n²) sorts). These are the last major CPU-only wins before
+hitting memory bandwidth limits.
+
+**Context (2026-03-13)**: Profiling identified several hot paths that are 100%
+scalar C — no SIMD, no BLAS. The sampling pipeline is the worst offender:
+called ~8000× per generation with O(n²) sorting. Speech decoder has scalar
+depthwise conv and per-timestep LayerNorm. Streaming mode also has a structural
+overhead from blocking the main thread during decode.
+
+**Approach**: One task at a time, test after each with identical params
+(`--seed 42 -s ryan -l Italian`, same text). Ordered by: (1) expected gain,
+(2) low cognitive difficulty, (3) low code invasion risk.
+
+---
+
+### 10g.1 Top-k: Replace Selection Sort with Quickselect
+
+**What**: `sampling.c:55-70` — O(k×n) selection sort to find k-th largest value.
+Default top_k=50, vocab=2048 → 102k comparisons per call × ~8000 calls/gen.
+
+**Fix**: nth_element / quickselect (O(n) average). Find the k-th value, then
+threshold in a single pass. No SIMD needed, pure algorithm improvement.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — ~30 lines, drop-in replacement |
+| Risk | LOW — same output (deterministic threshold, identical filtering) |
+| Code invasion | LOW — contained in `qwen_tts_sampling.c` only |
+| Expected gain | **2-3× faster top-k**, ~1-2% total frame time |
+| Calls/gen | ~8000 (1 per token + 15 per CP frame) |
+
+---
+
+### 10g.2 Softmax: NEON Vectorized exp + Horizontal Sum
+
+**What**: `sampling.c:34-44` — 3 scalar passes over vocab (2048): find max,
+compute `expf()` + sum, normalize. Called ~8000×/gen. 100% scalar.
+
+**Fix**: NEON 4-wide `vexpq_f32` approximation (or vDSP on macOS) + horizontal
+reduction. Keep generic fallback for non-NEON.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — NEON exp approximation needs care for numerical stability |
+| Risk | LOW-MEDIUM — exp approximation error must not change sampling distribution meaningfully |
+| Code invasion | LOW — contained in `qwen_tts_sampling.c`, dispatch via `#ifdef __ARM_NEON` |
+| Expected gain | **2-4× faster softmax**, ~1-2% total frame time |
+| Calls/gen | ~8000 |
+
+**Note**: On macOS, `vvexpf()` from Accelerate is already fast with `-ffast-math`.
+Benchmark before implementing custom NEON exp to see if there's actual headroom.
+
+---
+
+### 10g.3 Top-p: Replace Full Sort with Partial Sort / Early Exit
+
+**What**: `sampling.c:73-102` — O(n²) selection sort on FULL vocab to compute
+cumulative probability. With default top_p=1.0 this is skipped, but any top_p<1.0
+triggers a full sort of 2048 elements per call.
+
+**Fix**: Use partial quicksort or heapsort that stops once cumsum > p. Typical
+top_p=0.9 only needs the top ~50-100 tokens sorted, not all 2048.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — quicksort with early exit, ~50 lines |
+| Risk | LOW — same output (cumulative threshold is identical) |
+| Code invasion | LOW — contained in `qwen_tts_sampling.c` |
+| Expected gain | **5-10× faster top-p** when top_p<1.0, 0% when top_p=1.0 (skipped) |
+| Calls/gen | ~8000 (when enabled) |
+
+---
+
+### 10g.4 Speech Decoder: NEON Depthwise Conv (k=7)
+
+**What**: `speech_decoder.c:971-981` — scalar depthwise conv, 1024 channels ×
+~10k samples × kernel 7. Called in 2 ConvNeXt blocks per decode.
+
+**Fix**: NEON vectorize the inner kernel loop (7 multiply-accumulates). Process
+4 channels simultaneously with `vfmaq_f32`.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — fixed kernel size (7) simplifies NEON, ~40 lines |
+| Risk | LOW — pure computation, easy to verify bit-exact |
+| Code invasion | LOW — add NEON path alongside scalar in speech_decoder.c |
+| Expected gain | **1.5-2× faster depthwise conv**, ~2-3% of decoder time |
+| Calls/gen | 2 blocks × per-decode |
+
+---
+
+### 10g.5 Speech Decoder: NEON LayerNorm Per-Timestep
+
+**What**: `speech_decoder.c:986-999` — scalar LayerNorm across 1024 channels per
+timestep. 2 passes (sum+sum_sq, normalize). Called ~16k× per decode.
+
+**Fix**: NEON horizontal sum reduction + broadcast multiply. Process 4 channels
+per iteration with `vaddq_f32` accumulation.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — similar to existing NEON RMSNorm, ~30 lines |
+| Risk | LOW — pure computation, easy to verify |
+| Code invasion | LOW — add NEON path in speech_decoder.c |
+| Expected gain | **2-3× faster LayerNorm**, ~1-2% of decoder time |
+| Calls/gen | ~16k timesteps |
+
+---
+
+### 10g.6 Streaming: Pipeline Parallelism (Decoder Thread)
+
+**What**: Streaming mode (`--stream`) calls the speech decoder synchronously in
+the main thread, blocking Talker+CP generation. Normal mode already uses a
+decoder thread for pipeline overlap. Streaming gets RTF ~2.0 vs ~1.4 normal.
+
+**Fix**: Use the existing decoder thread infrastructure in streaming mode too.
+The decoder thread calls the audio callback instead of accumulating to buffer.
+Main thread never blocks on decode.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | HIGH — thread synchronization with callback, edge cases at drain |
+| Risk | MEDIUM — threading bugs, callback from wrong thread, audio ordering |
+| Code invasion | MEDIUM — modify `qwen_tts.c` decoder thread + streaming paths (~50-100 lines) |
+| Expected gain | **Streaming RTF from ~2.0 to ~1.4** (match normal mode) |
+
+**Note**: This overlaps with Phase 10c (decoder thread). If 10c is implemented
+first, streaming just needs to hook into it. If not, implement both together.
+
+---
+
+### 10g.7 Separate INT8 Fields from `qwen_cp_layer_t`
+
+**What**: `qwen_cp_layer_t` is 264 bytes (33 pointers) — half are optional INT8
+weight pointers that waste cache when `--int8` is not used.
+
+**Fix**: Move INT8 fields to a separate `qwen_cp_layer_int8_t` struct, allocated
+only when `--int8` is enabled. Reduces `qwen_cp_layer_t` to ~132 bytes.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — mechanical refactor, move fields + update accessors |
+| Risk | LOW — no behavioral change, just memory layout |
+| Code invasion | LOW-MEDIUM — touch `qwen_tts.h` + `qwen_tts_code_predictor.c` |
+| Expected gain | **~2-3% less cache pollution** in CP loop when INT8 disabled |
+| Calls/gen | N/A (structural) |
+
+---
+
+### Priority Order (do one at a time, test after each)
+
+| Order | Task | Difficulty | Risk | Expected Gain |
+|-------|------|------------|------|---------------|
+| 1 | 10g.1 Top-k quickselect | LOW | LOW | 2-3× top-k |
+| 2 | 10g.7 Separate INT8 from CP layer | LOW | LOW | ~2-3% cache |
+| 3 | 10g.2 Softmax NEON | MEDIUM | LOW-MED | 2-4× softmax |
+| 4 | 10g.3 Top-p partial sort | MEDIUM | LOW | 5-10× top-p |
+| 5 | 10g.4 Depthwise conv NEON | MEDIUM | LOW | 1.5-2× dwconv |
+| 6 | 10g.5 LayerNorm NEON | MEDIUM | LOW | 2-3× LN |
+| 7 | 10g.6 Streaming pipeline | HIGH | MEDIUM | RTF 2.0→1.4 |
+
+---
+
 ## Phase 11: GPU Acceleration via Metal (Optional, Future)
 
 **Goal**: Evaluate Metal GPU offload for Apple Silicon, specifically for attention and
@@ -870,7 +1036,8 @@ Raw Metal with custom shaders keeps the zero-dependency philosophy.
 | **P12** | Phase 10d: Batch Embedding | ~~SKIPPED~~ — 0.13% of pipeline, not worth it | — |
 | **P13** | Phase 10e: Speculative CP | ~~ABANDONED~~ — codebook feedback loop makes it structurally unsafe | — |
 | **P14** | Phase 10f: SDOT INT8 | Native int8 dot product (optional, arch-specific) | Medium |
-| **P15** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
+| **P15** | Phase 10g: Scalar→NEON+Algo | Sampling vectorization, depthwise NEON, streaming pipeline | Medium |
+| **P16** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
 
 ---
 
