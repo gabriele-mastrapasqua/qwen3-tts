@@ -188,8 +188,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
                 fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model)\n");
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
-                fprintf(stderr, "  --save-voice <path>        Save speaker embedding to file\n");
-                fprintf(stderr, "  --load-voice <path>        Load speaker embedding from file (skip extraction)\n");
+                fprintf(stderr, "  --save-voice <path>        Save voice (.qvoice = full ICL, other = embedding only)\n");
+                fprintf(stderr, "  --load-voice <path>        Load voice (.qvoice = full ICL, other = embedding only)\n");
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
@@ -271,23 +271,89 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        /* Check if file has .qvoice extension */
+        int load_is_qvoice = load_voice && strlen(load_voice) > 7 &&
+            strcmp(load_voice + strlen(load_voice) - 7, ".qvoice") == 0;
+        int save_is_qvoice = save_voice && strlen(save_voice) > 7 &&
+            strcmp(save_voice + strlen(save_voice) - 7, ".qvoice") == 0;
+
         if (load_voice) {
-            /* Load pre-computed speaker embedding from file */
-            FILE *vf = fopen(load_voice, "rb");
-            if (!vf) {
-                fprintf(stderr, "Error: cannot open voice file %s\n", load_voice);
-                qwen_tts_unload(ctx);
-                return 1;
+            if (load_is_qvoice) {
+                /* Load .qvoice file: speaker embedding + ref_codes + ref_text */
+                FILE *vf = fopen(load_voice, "rb");
+                if (!vf) {
+                    fprintf(stderr, "Error: cannot open voice file %s\n", load_voice);
+                    qwen_tts_unload(ctx);
+                    return 1;
+                }
+                /* Read and validate magic */
+                char magic[4];
+                uint32_t version;
+                if (fread(magic, 1, 4, vf) != 4 || memcmp(magic, "QVCE", 4) != 0) {
+                    fprintf(stderr, "Error: %s is not a valid .qvoice file\n", load_voice);
+                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                }
+                if (fread(&version, sizeof(uint32_t), 1, vf) != 1 || version != 1) {
+                    fprintf(stderr, "Error: unsupported .qvoice version %u\n", version);
+                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                }
+                /* Read speaker embedding */
+                if (fread(ctx->speaker_embedding, sizeof(float), enc_dim, vf) != (size_t)enc_dim) {
+                    fprintf(stderr, "Error: failed to read speaker embedding from %s\n", load_voice);
+                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                }
+                /* Read ref_text */
+                uint32_t ref_text_len;
+                if (fread(&ref_text_len, sizeof(uint32_t), 1, vf) != 1) {
+                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                }
+                if (ref_text_len > 0) {
+                    char *rt = (char *)malloc(ref_text_len + 1);
+                    if (fread(rt, 1, ref_text_len, vf) != ref_text_len) {
+                        free(rt); fclose(vf); qwen_tts_unload(ctx); return 1;
+                    }
+                    rt[ref_text_len] = '\0';
+                    free(ctx->ref_text);
+                    ctx->ref_text = rt;
+                }
+                /* Read ref_codes */
+                uint32_t n_ref_frames;
+                if (fread(&n_ref_frames, sizeof(uint32_t), 1, vf) != 1) {
+                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                }
+                if (n_ref_frames > 0) {
+                    int n_codes = (int)n_ref_frames * 16;
+                    ctx->cached_ref_codes = (int *)malloc(n_codes * sizeof(int));
+                    if (fread(ctx->cached_ref_codes, sizeof(int), n_codes, vf) != (size_t)n_codes) {
+                        free(ctx->cached_ref_codes);
+                        ctx->cached_ref_codes = NULL;
+                        fclose(vf); qwen_tts_unload(ctx); return 1;
+                    }
+                    ctx->cached_ref_n_frames = (int)n_ref_frames;
+                    ctx->xvector_only = 0;  /* ICL mode */
+                }
+                fclose(vf);
+                if (!silent)
+                    fprintf(stderr, "Voice clone: loaded .qvoice from %s (embedding + %d ICL frames + ref_text)\n",
+                            load_voice, ctx->cached_ref_n_frames);
+            } else {
+                /* Load legacy voice file: raw speaker embedding only */
+                FILE *vf = fopen(load_voice, "rb");
+                if (!vf) {
+                    fprintf(stderr, "Error: cannot open voice file %s\n", load_voice);
+                    qwen_tts_unload(ctx);
+                    return 1;
+                }
+                size_t n = fread(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
+                fclose(vf);
+                if ((int)n != enc_dim) {
+                    fprintf(stderr, "Error: voice file has %zu floats, expected %d\n", n, enc_dim);
+                    qwen_tts_unload(ctx);
+                    return 1;
+                }
+                if (!silent)
+                    fprintf(stderr, "Voice clone: loaded speaker embedding from %s\n", load_voice);
             }
-            size_t n = fread(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
-            fclose(vf);
-            if ((int)n != enc_dim) {
-                fprintf(stderr, "Error: voice file has %zu floats, expected %d\n", n, enc_dim);
-                qwen_tts_unload(ctx);
-                return 1;
-            }
-            if (!silent)
-                fprintf(stderr, "Voice clone: loaded speaker embedding from %s\n", load_voice);
         } else {
             /* Extract speaker embedding from reference audio */
             if (qwen_extract_speaker_embedding(ctx, ref_audio, ctx->speaker_embedding) != 0) {
@@ -299,19 +365,6 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Voice clone: extracted speaker embedding from %s\n", ref_audio);
         }
 
-        /* Save embedding if requested */
-        if (save_voice) {
-            FILE *vf = fopen(save_voice, "wb");
-            if (!vf) {
-                fprintf(stderr, "Error: cannot write voice file %s\n", save_voice);
-            } else {
-                fwrite(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
-                fclose(vf);
-                if (!silent)
-                    fprintf(stderr, "Saved speaker embedding to %s (%d floats)\n", save_voice, enc_dim);
-            }
-        }
-
         /* If ICL mode (not xvector_only), load the speech encoder for ref audio encoding */
         if (!ctx->xvector_only && ref_audio) {
             if (qwen_speech_encoder_load(ctx) != 0) {
@@ -320,9 +373,73 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* For .qvoice save: need to encode ref audio now to get ref_codes */
+        if (save_is_qvoice && ref_audio && ref_text_str && !ctx->cached_ref_codes) {
+            /* Ensure speech encoder is loaded */
+            if (!ctx->xvector_only) {
+                float *ref_audio_samples = NULL;
+                int ref_n_samples = 0, ref_sr = 0;
+                if (qwen_read_wav(ref_audio, &ref_audio_samples, &ref_n_samples, &ref_sr) == 0) {
+                    int *codes = NULL;
+                    int n_frames = 0;
+                    if (qwen_speech_encoder_encode(ctx, ref_audio_samples, ref_n_samples,
+                                                    &codes, &n_frames) == 0) {
+                        ctx->cached_ref_codes = codes;
+                        ctx->cached_ref_n_frames = n_frames;
+                        if (!silent)
+                            fprintf(stderr, "Encoded ref audio: %d ICL frames\n", n_frames);
+                    }
+                    free(ref_audio_samples);
+                }
+            }
+        }
+
+        /* Save voice file */
+        if (save_voice) {
+            if (save_is_qvoice) {
+                /* Save .qvoice: embedding + ref_codes + ref_text */
+                FILE *vf = fopen(save_voice, "wb");
+                if (!vf) {
+                    fprintf(stderr, "Error: cannot write voice file %s\n", save_voice);
+                } else {
+                    fwrite("QVCE", 1, 4, vf);
+                    uint32_t version = 1;
+                    fwrite(&version, sizeof(uint32_t), 1, vf);
+                    fwrite(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
+                    /* ref_text */
+                    uint32_t ref_text_len = ref_text_str ? (uint32_t)strlen(ref_text_str) : 0;
+                    fwrite(&ref_text_len, sizeof(uint32_t), 1, vf);
+                    if (ref_text_len > 0)
+                        fwrite(ref_text_str, 1, ref_text_len, vf);
+                    /* ref_codes */
+                    uint32_t n_ref_frames = ctx->cached_ref_codes ? (uint32_t)ctx->cached_ref_n_frames : 0;
+                    fwrite(&n_ref_frames, sizeof(uint32_t), 1, vf);
+                    if (n_ref_frames > 0)
+                        fwrite(ctx->cached_ref_codes, sizeof(int), (int)n_ref_frames * 16, vf);
+                    fclose(vf);
+                    if (!silent)
+                        fprintf(stderr, "Saved .qvoice to %s (embedding + %u ICL frames + ref_text)\n",
+                                save_voice, n_ref_frames);
+                }
+            } else {
+                /* Save legacy format: raw speaker embedding only */
+                FILE *vf = fopen(save_voice, "wb");
+                if (!vf) {
+                    fprintf(stderr, "Error: cannot write voice file %s\n", save_voice);
+                } else {
+                    fwrite(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
+                    fclose(vf);
+                    if (!silent)
+                        fprintf(stderr, "Saved speaker embedding to %s (%d floats)\n", save_voice, enc_dim);
+                }
+            }
+        }
+
         if (!silent) {
-            if (ctx->xvector_only)
+            if (ctx->xvector_only && !ctx->cached_ref_codes)
                 fprintf(stderr, "Mode: x-vector only (no reference transcription)\n");
+            else if (ctx->cached_ref_codes)
+                fprintf(stderr, "Mode: ICL with %d cached ref frames\n", ctx->cached_ref_n_frames);
             else
                 fprintf(stderr, "Mode: ICL with ref text: \"%s\"\n", ref_text_str);
         }
