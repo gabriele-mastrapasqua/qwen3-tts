@@ -1,6 +1,6 @@
 # PLAN.md — Qwen3-TTS C Engine Roadmap
 
-Updated: 2026-03-12
+Updated: 2026-03-13
 
 Core engine is **COMPLETE** and producing good audio for both 0.6B and 1.7B models.
 This document tracks all planned features, improvements, and known issues.
@@ -651,11 +651,11 @@ repeated identically on every request with the same text.
   (CLI + server). **Result: 14% faster long-text server cold (RTF 1.55→1.33), best
   RTF 1.31 server warm.** Output bit-identical. *(2026-03-12)*
 
-- [ ] `[MED]` **Batch text embedding with BLAS sgemm**: Instead of per-token matvec,
-  collect all text token IDs, do a single bf16→f32 gather, then batch fc1 and fc2 as
-  sgemm. For 50 tokens: 1 sgemm(50×2048 × 2048×2048) instead of 50 individual matvecs.
-  Benefits both CLI and server. Less impactful now that LRU cache is active (warm hits
-  are memcpy), but still helps CLI first-run and server cold call.
+- [x] `[SKIP]` **Batch text embedding with BLAS sgemm**: Analyzed — "Embed: 37ms" on
+  long text (210 frames, CLI) = 0.13% of total time. With LRU cache active, all tokens
+  are cache hits on warm calls (memcpy). Even on cold CLI, embed is negligible vs
+  Talker+CP (~25s). Batch sgemm would require bf16→f32 weight conversion buffers for
+  text_projection (~32MB) for <0.2% gain. Not worth the complexity. *(2026-03-12)*
 
 ---
 
@@ -713,101 +713,52 @@ The streaming decoder path is already tested and produces identical output.
 
 ---
 
-## Phase 10d: Batch Text Embedding (BLAS sgemm)
+## Phase 10d: Batch Text Embedding (BLAS sgemm) — SKIPPED
 
-**Goal**: Replace per-token sequential matvec with a single batched sgemm for all text
-tokens in the prefill. Currently each token does 2 individual bf16 matvec calls through
-`embed_one_text_token()`. Batching them into one sgemm call lets BLAS optimize the
-memory access pattern across all tokens simultaneously.
+**Status**: SKIPPED after analysis (2026-03-12).
 
-**Analysis**: For a 50-token prompt:
-- Current: 50 × matvec(2048×2048) + 50 × matvec(1024×2048) = 100 individual calls
-- Batched: 1 × sgemm(50×2048, 2048×2048) + SiLU + 1 × sgemm(50×2048, 2048×1024) = 2 calls
-- BLAS sgemm is significantly more efficient than repeated matvec for batch sizes > ~8
+**Reason**: Benchmarked "Embed: 37ms" on long text (210 frames, CLI) = 0.13% of total
+pipeline time. With LRU cache active, all tokens are cache hits on warm calls (memcpy
+instead of compute). Even on cold CLI, embedding is negligible vs Talker+CP (~25s total).
 
-**Interaction with LRU cache**: On server warm calls, most tokens are cache hits (memcpy).
-The batch sgemm only helps for cache misses (first time a token is seen). Main benefit
-is CLI mode and server cold calls where the LRU cache is empty.
-
-**Complexity**: Low-medium (~80 lines). Gather bf16 embeddings for all tokens into a
-contiguous f32 matrix, run 2 sgemm calls, scatter results. Need a temporary buffer
-of `seq × text_hidden × sizeof(float)` (~400KB for 50 tokens).
-
-**Risk**: LOW. Pure numerical change — output should be bit-identical to sequential
-path (sgemm vs individual matvec may differ by FP rounding, but functionally equivalent).
-
-### Tasks
-
-- [ ] `[MED]` **Implement batched embedding function**
-  - `embed_text_tokens_batch(ctx, token_ids[], n_tokens, output[])`
-  - bf16→f32 gather → sgemm fc1 → SiLU → sgemm fc2 → bias add
-  - Fall back to per-token for n_tokens < 4 (overhead not worth it)
-
-- [ ] `[MED]` **Integrate into prefill path**
-  - Replace the per-token loops in sections 0, 1, 3 of prompt construction
-  - Keep LRU cache active — batch only the cache-miss tokens
+Batch sgemm would require bf16→f32 weight conversion buffers for text_projection (~32MB)
+for <0.2% theoretical gain. Not worth the complexity.
 
 ---
 
-## Phase 10e: Speculative Code Predictor Decoding (Experimental)
+## Phase 10e: Speculative Code Predictor Decoding — ABANDONED
 
-**Goal**: Reduce Code Predictor time (~55% of total) by predicting multiple codebook
-tokens in parallel and verifying, rather than generating all 15 sequentially.
+**Status**: ABANDONED after thorough analysis and testing (2026-03-12).
 
-**⚠️ RISK: HIGH — may degrade audio quality. Must be thoroughly tested before merge.**
+**Analysis performed**:
 
-**Background**: The CP generates 15 codebook tokens per frame sequentially:
-```
-step 0: hidden → code[0]
-step 1: embed(code[0]) → transformer → code[1]
-step 2: embed(code[1]) → transformer → code[2]
-...
-```
-Each step depends on the previous code. But the later codebooks encode finer details
-(residual quantization — codebook 0 is coarse, codebook 15 is fine detail). This
-means later codes have lower entropy and may be more predictable.
+1. **Codebook entropy analysis** (598 frames across 6 generations, 5 seeds + long text):
+   - ALL 16 codebooks have high, uniform entropy: 7.6–8.5 bits (out of max 11 bits)
+   - 266–439 unique values per codebook (out of 2048 possible)
+   - Zero intra-frame correlation: CB[k] == CB[k-1] ≈ 0.0%
+   - Frame-to-frame repetition: 1–9% (not exploitable)
+   - Initial hypothesis was wrong: later codebooks are NOT more predictable
+   - **Conclusion**: Draft+verify speculative decoding would have ~0% acceptance rate
 
-**Approach**: Draft-then-verify (inspired by speculative decoding in LLMs):
-1. Run steps 0-4 normally (coarse codebooks, high information)
-2. For steps 5-14: predict N codes in parallel using a lightweight draft head
-3. Verify predictions against the real CP transformer
-4. Accept correct predictions, recompute from first rejection point
+2. **Early exit experiment** (fewer transformer layers for later codebooks):
+   - Tested `--cp-early-exit N`: codebooks N–14 use 3 layers instead of 5
+   - CP ms/f dropped 14% (80.8→69.8 for EE10)
+   - **Critical discovery**: CP codes feed back into Talker via embedding sum
+     (all 16 codebook embeddings are summed into the next frame's Talker input).
+     Changing ANY CP code perturbs the entire generation trajectory.
+   - Multi-seed stability test (7 seeds):
+     - Baseline frame range: 70–103 (normal sampling variance)
+     - EE8 frame range: 56–116 (doubled variance)
+     - EE10 frame range: 79–161 (tripled variance, seed 456: 70→161 = 2.3x)
+   - Audio quality: unpredictable — sometimes acceptable, sometimes garbled or 2x too long
 
-**Estimated gain**: 20-30% of CP time IF acceptance rate is >60%. Each accepted
-speculation saves one full transformer forward pass (~4ms).
+3. **Root cause**: The model's feedback loop (CP codes → embedding sum → Talker input)
+   makes ANY approximation in CP codes structurally unsafe. Small perturbations in
+   later codebook tokens amplify exponentially through the autoregressive generation
+   loop with sampling (temp=0.9). This is an inherent architectural property of
+   Qwen3-TTS, not a fixable implementation issue.
 
-**Complexity**: HIGH (~300-500 lines). Need to implement:
-- Draft prediction head (small MLP trained on codebook statistics, or heuristic)
-- Parallel evaluation of multiple candidate codes
-- Verification loop with rollback
-- Quality validation framework (correlation with non-speculative output)
-
-**Risk**: HIGH. Wrong speculative codes = different audio. Even if individual codes
-look similar, autoregressive error accumulation can cause quality drift. Must validate
-with extensive listening tests and correlation metrics.
-
-**Requirements before starting**:
-- All other optimizations committed and tested
-- Baseline audio samples saved for A/B comparison
-- Correlation threshold defined (e.g., >0.999 vs non-speculative)
-- Implemented behind `--speculative` flag, OFF by default
-
-### Tasks
-
-- [ ] `[LOW]` **Analyze codebook entropy by position**
-  - Run 100+ generations, collect per-codebook token distributions
-  - Measure conditional entropy: H(code[k] | code[0..k-1])
-  - If later codebooks have low entropy, speculation is viable
-
-- [ ] `[LOW]` **Implement draft-verify loop with flag**
-  - `--speculative` CLI flag, disabled by default
-  - Start conservative: speculate only codebooks 10-14
-  - Measure acceptance rate and quality impact
-
-- [ ] `[LOW]` **Quality validation**
-  - Compare speculative vs non-speculative on 50+ test phrases
-  - Correlation > 0.999 required for merge
-  - Listening test: no audible artifacts
+**No variant of speculative, early-exit, or approximate CP is viable for this model.**
 
 ---
 
@@ -843,6 +794,200 @@ The main codebase should remain portable (bf16 matvec as default path).
   time, `getauxval(AT_HWCAP)` at runtime on Linux, `sysctlbyname` on macOS.
 - [ ] `[LOW]` **SDOT int8 matvec kernel**: int8 weights × int8 activations → int32 accum → f32 rescale
 - [ ] `[LOW]` **Quality validation**: Compare audio output with bf16 baseline
+
+---
+
+## Phase 10g: Scalar Hot Paths → NEON/Algorithm Optimization
+
+**Goal**: Vectorize remaining scalar C loops on hot paths and fix algorithmic
+inefficiencies (O(n²) sorts). These are the last major CPU-only wins before
+hitting memory bandwidth limits.
+
+**Context (2026-03-13)**: Profiling identified several hot paths that are 100%
+scalar C — no SIMD, no BLAS. The sampling pipeline is the worst offender:
+called ~8000× per generation with O(n²) sorting. Speech decoder has scalar
+depthwise conv and per-timestep LayerNorm. Streaming mode also has a structural
+overhead from blocking the main thread during decode.
+
+**Approach**: One task at a time, test after each with identical params
+(`--seed 42 -s ryan -l Italian`, same text). Ordered by: (1) expected gain,
+(2) low cognitive difficulty, (3) low code invasion risk.
+
+---
+
+### 10g.1 Top-k: Replace Selection Sort with Quickselect
+
+**What**: `sampling.c:55-70` — O(k×n) selection sort to find k-th largest value.
+Default top_k=50, vocab=2048 → 102k comparisons per call × ~8000 calls/gen.
+
+**Fix**: nth_element / quickselect (O(n) average). Find the k-th value, then
+threshold in a single pass. No SIMD needed, pure algorithm improvement.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — ~30 lines, drop-in replacement |
+| Risk | LOW — same output (deterministic threshold, identical filtering) |
+| Code invasion | LOW — contained in `qwen_tts_sampling.c` only |
+| Expected gain | **2-3× faster top-k**, ~1-2% total frame time |
+| Calls/gen | ~8000 (1 per token + 15 per CP frame) |
+
+---
+
+### 10g.2 Softmax: NEON Vectorized exp + Horizontal Sum
+
+**What**: `sampling.c:34-44` — 3 scalar passes over vocab (2048): find max,
+compute `expf()` + sum, normalize. Called ~8000×/gen. 100% scalar.
+
+**Fix**: NEON 4-wide `vexpq_f32` approximation (or vDSP on macOS) + horizontal
+reduction. Keep generic fallback for non-NEON.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — NEON exp approximation needs care for numerical stability |
+| Risk | LOW-MEDIUM — exp approximation error must not change sampling distribution meaningfully |
+| Code invasion | LOW — contained in `qwen_tts_sampling.c`, dispatch via `#ifdef __ARM_NEON` |
+| Expected gain | **2-4× faster softmax**, ~1-2% total frame time |
+| Calls/gen | ~8000 |
+
+**Note**: On macOS, `vvexpf()` from Accelerate is already fast with `-ffast-math`.
+Benchmark before implementing custom NEON exp to see if there's actual headroom.
+
+---
+
+### 10g.3 Top-p: Replace Full Sort with Partial Sort / Early Exit
+
+**What**: `sampling.c:73-102` — O(n²) selection sort on FULL vocab to compute
+cumulative probability. With default top_p=1.0 this is skipped, but any top_p<1.0
+triggers a full sort of 2048 elements per call.
+
+**Fix**: Use partial quicksort or heapsort that stops once cumsum > p. Typical
+top_p=0.9 only needs the top ~50-100 tokens sorted, not all 2048.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — quicksort with early exit, ~50 lines |
+| Risk | LOW — same output (cumulative threshold is identical) |
+| Code invasion | LOW — contained in `qwen_tts_sampling.c` |
+| Expected gain | **5-10× faster top-p** when top_p<1.0, 0% when top_p=1.0 (skipped) |
+| Calls/gen | ~8000 (when enabled) |
+
+---
+
+### 10g.4 Speech Decoder: NEON Depthwise Conv (k=7)
+
+**What**: `speech_decoder.c:971-981` — scalar depthwise conv, 1024 channels ×
+~10k samples × kernel 7. Called in 2 ConvNeXt blocks per decode.
+
+**Fix**: NEON vectorize the inner kernel loop (7 multiply-accumulates). Process
+4 channels simultaneously with `vfmaq_f32`.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — fixed kernel size (7) simplifies NEON, ~40 lines |
+| Risk | LOW — pure computation, easy to verify bit-exact |
+| Code invasion | LOW — add NEON path alongside scalar in speech_decoder.c |
+| Expected gain | **1.5-2× faster depthwise conv**, ~2-3% of decoder time |
+| Calls/gen | 2 blocks × per-decode |
+
+---
+
+### 10g.5 Speech Decoder: NEON LayerNorm Per-Timestep
+
+**What**: `speech_decoder.c:986-999` — scalar LayerNorm across 1024 channels per
+timestep. 2 passes (sum+sum_sq, normalize). Called ~16k× per decode.
+
+**Fix**: NEON horizontal sum reduction + broadcast multiply. Process 4 channels
+per iteration with `vaddq_f32` accumulation.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — similar to existing NEON RMSNorm, ~30 lines |
+| Risk | LOW — pure computation, easy to verify |
+| Code invasion | LOW — add NEON path in speech_decoder.c |
+| Expected gain | **2-3× faster LayerNorm**, ~1-2% of decoder time |
+| Calls/gen | ~16k timesteps |
+
+---
+
+### 10g.6 Streaming: Pipeline Parallelism (Decoder Thread)
+
+**What**: Streaming mode (`--stream`) calls the speech decoder synchronously in
+the main thread, blocking Talker+CP generation. Normal mode already uses a
+decoder thread for pipeline overlap. Streaming gets RTF ~2.0 vs ~1.4 normal.
+
+**Fix**: Use the existing decoder thread infrastructure in streaming mode too.
+The decoder thread calls the audio callback instead of accumulating to buffer.
+Main thread never blocks on decode.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | HIGH — thread synchronization with callback, edge cases at drain |
+| Risk | MEDIUM — threading bugs, callback from wrong thread, audio ordering |
+| Code invasion | MEDIUM — modify `qwen_tts.c` decoder thread + streaming paths (~50-100 lines) |
+| Expected gain | **Streaming RTF from ~2.0 to ~1.4** (match normal mode) |
+
+**Note**: This overlaps with Phase 10c (decoder thread). If 10c is implemented
+first, streaming just needs to hook into it. If not, implement both together.
+
+---
+
+### 10g.7 Separate INT8 Fields from `qwen_cp_layer_t`
+
+**What**: `qwen_cp_layer_t` is 264 bytes (33 pointers) — half are optional INT8
+weight pointers that waste cache when `--int8` is not used.
+
+**Fix**: Move INT8 fields to a separate `qwen_cp_layer_int8_t` struct, allocated
+only when `--int8` is enabled. Reduces `qwen_cp_layer_t` to ~132 bytes.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — mechanical refactor, move fields + update accessors |
+| Risk | LOW — no behavioral change, just memory layout |
+| Code invasion | LOW-MEDIUM — touch `qwen_tts.h` + `qwen_tts_code_predictor.c` |
+| Expected gain | **~2-3% less cache pollution** in CP loop when INT8 disabled |
+| Calls/gen | N/A (structural) |
+
+---
+
+### Priority Order (do one at a time, test after each)
+
+| Order | Task | Difficulty | Risk | Expected Gain |
+|-------|------|------------|------|---------------|
+| 1 | 10g.1 Top-k quickselect | LOW | LOW | 2-3× top-k |
+| 2 | ~~10g.7 Separate INT8 from CP layer~~ | LOW | LOW | SKIP (see below) |
+| 3 | ~~10g.2 Softmax NEON~~ | MEDIUM | LOW-MED | SKIP (see below) |
+| 4 | 10g.3 Top-p partial sort | MEDIUM | LOW | 5-10× top-p |
+| 5 | ~~10g.4 Depthwise conv NEON~~ | MEDIUM | LOW | SKIP (see below) |
+| 6 | ~~10g.5 LayerNorm NEON~~ | MEDIUM | LOW | SKIP (see below) |
+| 7 | **10g.6 Streaming pipeline** | HIGH | MEDIUM | **DONE: RTF 2.0→1.38** |
+
+### Results & Analysis (2026-03-13)
+
+**10g.1 Top-k quickselect**: DONE. Selection sort O(k×n) → quickselect O(n).
+Codec head+sampling: 93ms → 21-24ms (**4× faster**). Output bit-identical.
+
+**10g.7 Separate INT8 from CP layer**: SKIP. Only 5 layers × 264B = 1.3KB.
+Removing INT8 fields saves ~660B but the bottleneck is weight data, not pointer
+loads. Code churn not worth ~2-3% theoretical cache improvement.
+
+**10g.2 Softmax NEON**: SKIP. Post-quickselect, total sampling is ~21ms/101 frames
+= 0.2ms/frame. Softmax is ~1.5ms of that (101 × 3072 expf). With `-ffast-math`
+on macOS, `expf` is already vectorized by the compiler via Accelerate. No headroom.
+
+**10g.3 Top-p partial sort**: Low priority. Default top_p=1.0 already skips the
+sort entirely. Only triggered if user explicitly sets `--top-p 0.9` etc. Keep as
+optional future improvement.
+
+**10g.4 Depthwise conv NEON + 10g.5 LayerNorm NEON**: SKIP. The speech decoder
+runs in a decoder thread overlapped with generation. Decoder finishes BEFORE
+Talker+CP completes (9.9s decoder vs 10.8s generation). It's NOT the bottleneck.
+ConvNeXt depthwise (1.4M FLOPs) is 600× less compute than BLAS-accelerated PW1
+(838M FLOPs). These scalar loops are negligible in the total decoder time.
+
+**10g.6 Streaming pipeline**: DONE. Decoder thread now runs in streaming mode too,
+calling audio_cb from the thread. Main thread never blocks on decode.
+**Streaming RTF: 2.04 → 1.38** (matches normal mode). Output bit-identical across
+all 4 modes (CLI normal, CLI stream, server normal, server stream). *(2026-03-13)*
 
 ---
 
@@ -916,10 +1061,11 @@ Raw Metal with custom shaders keeps the zero-dependency philosophy.
 | **P9** | Phase 10: CPU Cache | Cache alignment, memory layout, alloc optimization | Medium |
 | **P10** | Phase 10b: Embedding Cache | LRU token embedding cache (server RTF 1.31) | Low |
 | **P11** | Phase 10c: Decoder Thread | Pipeline overlap generation+decode (est. 15-20%) | Medium |
-| **P12** | Phase 10d: Batch Embedding | BLAS sgemm for text token projection | Low |
-| **P13** | Phase 10e: Speculative CP | Draft-verify for later codebooks (⚠️ HIGH RISK) | High |
+| **P12** | Phase 10d: Batch Embedding | ~~SKIPPED~~ — 0.13% of pipeline, not worth it | — |
+| **P13** | Phase 10e: Speculative CP | ~~ABANDONED~~ — codebook feedback loop makes it structurally unsafe | — |
 | **P14** | Phase 10f: SDOT INT8 | Native int8 dot product (optional, arch-specific) | Medium |
-| **P15** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
+| **P15** | Phase 10g: Scalar→NEON+Algo | Sampling vectorization, depthwise NEON, streaming pipeline | Medium |
+| **P16** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
 
 ---
 

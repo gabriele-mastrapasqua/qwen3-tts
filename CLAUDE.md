@@ -174,6 +174,33 @@ After editing:
 4. Update `README.md` if CLI/runtime behavior changed.
 5. Keep `PLAN.md` aligned if roadmap items completed or changed.
 
+## Testing Rules (Comparative / A-B Tests)
+
+When running comparative tests (normal vs streaming, before vs after optimization,
+CLI vs server, etc.), **always use identical explicit parameters** across all runs:
+
+- `--seed N` — same seed for every run
+- `-s <speaker>` — explicit speaker name (not default)
+- `-l <language>` — explicit language matching the text content
+- Same `--text` across all runs
+- Same model directory (`-d`)
+
+**Default speaker for Italian and English**: `ryan` (`-s ryan`)
+
+Example — comparing CLI normal vs streaming:
+```bash
+./qwen_tts -d qwen3-tts-0.6b --text "Test phrase here." --seed 42 -s ryan -l Italian -o normal.wav
+./qwen_tts -d qwen3-tts-0.6b --text "Test phrase here." --seed 42 -s ryan -l Italian --stream -o stream.wav
+```
+
+For server tests, pass the same params in the JSON body:
+```bash
+curl -s http://localhost:8000/v1/tts -d '{"text":"Test phrase here.","seed":42,"speaker":"ryan","language":"Italian"}' -o server.wav
+```
+
+**Why**: Without explicit params, auto-detection or defaults may produce different
+prompts (e.g. different codec token counts), making outputs non-comparable.
+
 ## Local-Only Artifacts (Do Not Depend On In Commits)
 
 Common local directories/files are intentionally ignored:

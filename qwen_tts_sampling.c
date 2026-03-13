@@ -43,23 +43,46 @@ static void softmax(float *logits, int n, float temp) {
     for (int i = 0; i < n; i++) logits[i] /= sum;
 }
 
+/* Quickselect: find k-th largest value in O(n) average time */
+static float quickselect_kth_largest(float *arr, int n, int k) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        float pivot = arr[lo + (hi - lo) / 2];
+        int i = lo, j = hi;
+        /* 3-way partition: [>pivot] [==pivot] [<pivot] (descending) */
+        int p = lo;
+        while (i <= j) {
+            if (arr[i] > pivot) {
+                float t = arr[p]; arr[p] = arr[i]; arr[i] = t;
+                p++; i++;
+            } else if (arr[i] < pivot) {
+                float t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+                j--;
+            } else {
+                i++;
+            }
+        }
+        /* arr[lo..p-1] > pivot, arr[p..j] == pivot, arr[j+1..hi] < pivot */
+        if (k - 1 < p) {
+            hi = p - 1;
+        } else if (k - 1 > j) {
+            lo = j + 1;
+        } else {
+            return pivot;
+        }
+    }
+    return arr[lo];
+}
+
 /* Top-k filtering */
 static int topk_filter(float *logits, int n, int k) {
     if (k <= 0 || k >= n) return n;
-    
-    /* Find k-th largest */
+
+    /* Find k-th largest value via quickselect on copy */
     float *tmp = g_topk_tmp;
     memcpy(tmp, logits, n * sizeof(float));
+    float threshold = quickselect_kth_largest(tmp, n, k);
 
-    /* Simple selection */
-    for (int i = 0; i < k; i++) {
-        int max_idx = i;
-        for (int j = i + 1; j < n; j++)
-            if (tmp[j] > tmp[max_idx]) max_idx = j;
-        float t = tmp[i]; tmp[i] = tmp[max_idx]; tmp[max_idx] = t;
-    }
-    float threshold = tmp[k - 1];
-    
     /* Zero out below threshold */
     int count = 0;
     for (int i = 0; i < n; i++) {
