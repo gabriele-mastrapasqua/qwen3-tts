@@ -120,10 +120,10 @@ and model-portable (same codec tokens work for both 0.6B and 1.7B Base models).
            --text "Any new text here" -o output.wav
 ```
 
-**Tasks** (to investigate and implement):
-- [ ] `[MED]` Design `.qvoice` file format (speaker embedding + ref_code + ref_text)
-- [ ] `[MED]` Extend `--save-voice` to save full ICL data (not just x-vector)
-- [ ] `[MED]` Extend `--load-voice` to load `.qvoice` and reconstruct ICL prompt
+**Tasks**:
+- [x] `[MED]` Design `.qvoice` file format (speaker embedding + ref_code + ref_text)
+- [x] `[MED]` Extend `--save-voice` to save full ICL data (not just x-vector)
+- [x] `[MED]` Extend `--load-voice` to load `.qvoice` and reconstruct ICL prompt
 - [ ] `[LOW]` CLI: `--create-voice` command that runs encoder + saves without generating
 - [ ] `[LOW]` Evaluate KV cache prefix caching (is it worth the ~50MB size?)
 - [ ] `[LOW]` Voice library management: list/delete saved voices
