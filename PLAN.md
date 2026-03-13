@@ -991,6 +991,104 @@ all 4 modes (CLI normal, CLI stream, server normal, server stream). *(2026-03-13
 
 ---
 
+## Phase 10h: INT8 Talker Quantization (1.7B Priority)
+
+**Goal**: Extend `--int8` to quantize Talker weights in addition to CP. The 1.7B Talker
+has 2.8 GB of BF16 weights (28 layers × ~100MB/layer) that are bandwidth-bound during
+single-token decode. INT8 halves this to 1.4 GB, potentially saving 2-3 seconds per
+generation on the 1.7B model.
+
+**Motivation**: Micro-benchmarks show scalar loop optimizations (fast sigmoid, NEON GELU)
+save <50ms total — negligible on a 27s generation. The real bottleneck is memory bandwidth
+for matvec. INT8 directly attacks this: half the data = half the bandwidth.
+
+**Context**: INT8 CP on 1.7B gave 14% speedup (86→72 ms/f). The Talker has 4x larger
+matrices (hidden=2048, inter=6144 vs CP hidden=1024, inter=1024), making it MORE
+bandwidth-bound and MORE likely to benefit from INT8.
+
+**Why 1.7B benefits more than 0.6B**: On 0.6B, INT8 CP gave 0% speedup because
+hidden=1024 matrices are too small to be bandwidth-bound — the INT8 dequant overhead
+(3 SIMD ops) cancels the bandwidth savings. On 1.7B, the same CP (hidden=1024) gained
+14% because the larger Talker model creates more memory pressure. The 1.7B Talker
+itself (hidden=2048) has matrices large enough that bandwidth is clearly the bottleneck.
+
+### Tasks
+
+#### 10h.1 Add INT8 fields to `qwen_talker_layer_t` struct
+
+**What**: Add INT8 weight pointers and per-row scales to the Talker layer struct,
+mirroring the existing CP pattern.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — copy pattern from `qwen_cp_layer_t` |
+| Risk | NONE — struct fields only, no behavioral change |
+| Files | `qwen_tts.h` |
+
+#### 10h.2 Quantize Talker weights at load time
+
+**What**: After loading BF16 weights in `qwen_talker_load()`, call
+`qwen_quantize_bf16_to_int8()` for each layer's QKV, output, gate+up fused, and
+down projections. Guard behind `ctx->use_int8`.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — same API as CP quantization |
+| Risk | LOW — quantization is well-tested |
+| Files | `qwen_tts_talker.c` |
+
+#### 10h.3 Dispatch INT8 matvec in Talker single-token decode
+
+**What**: In `qwen_talker_step()`, add `if (l->wq_int8)` checks for QKV, output,
+gate+up, and down projections. Same dispatch pattern as CP.
+
+Note: Talker prefill uses BLAS `cblas_sgemm` (batch matmul), NOT matvec. INT8 batch
+matmul is not implemented and would require a different kernel. **Keep prefill as BF16
+BLAS** — prefill is a one-time cost and already fast.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — copy dispatch pattern from CP |
+| Risk | MEDIUM — quality impact on Talker (it drives the generation) |
+| Files | `qwen_tts_talker.c` |
+
+#### 10h.4 Quantize codec head (optional)
+
+**What**: The codec head maps Talker hidden → codec vocab (3072 tokens). Currently
+BF16 matvec. Could be INT8 + argmax fused (like CP lm_head).
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — same fused argmax pattern |
+| Risk | LOW — codec head is small, and argmax is robust to quantization |
+| Files | `qwen_tts.c` (codec head projection) |
+
+#### 10h.5 Test quality and performance
+
+**What**: Run same-seed A/B tests:
+- `./qwen_tts -d qwen3-tts-1.7b --text "..." -s ryan -l Italian --seed 42`
+- Same with `--int8`
+- Compare: frame count, RTF, listen to both
+
+| Metric | Value |
+|--------|-------|
+| Expected 1.7B Talker speedup | 15-30% (120→85-100 ms/f) |
+| Expected 1.7B total saving | 2-4 seconds on long text |
+| Expected 0.6B impact | Minimal (same as CP: ~0%) |
+| Quality risk | Talker is autoregressive — INT8 error accumulates |
+
+### Priority Order
+
+| Order | Task | Difficulty | Risk |
+|-------|------|------------|------|
+| 1 | 10h.1 Struct fields | LOW | NONE |
+| 2 | 10h.2 Load-time quantization | LOW | LOW |
+| 3 | 10h.3 Decode dispatch | LOW | MEDIUM |
+| 4 | 10h.5 Test quality + perf | — | — |
+| 5 | 10h.4 Codec head (optional) | LOW | LOW |
+
+---
+
 ## Phase 11: GPU Acceleration via Metal (Optional, Future)
 
 **Goal**: Evaluate Metal GPU offload for Apple Silicon, specifically for attention and
