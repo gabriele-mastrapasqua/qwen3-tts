@@ -1089,6 +1089,134 @@ BF16 matvec. Could be INT8 + argmax fused (like CP lm_head).
 
 ---
 
+## Phase 10i: INT4 (Q4_0) Talker Quantization (1.7B Only) — NO SPEEDUP
+
+**Status**: IMPLEMENTED but NO SPEEDUP. INT4 Talker is ~4% SLOWER than BF16 on 1.7B
+(82.6 vs 79.3 ms/f). The Q4 nibble unpacking overhead outweighs bandwidth savings,
+same root cause as INT4 CP on 0.6B. INT8 remains the best quantization for 1.7B (15% speedup).
+
+**A/B Results (Italian, seed=42, ryan, Apple M1 16GB)**:
+| Config | Frames | Talker ms/f | CP ms/f | Total | RTF |
+|--------|--------|-------------|---------|-------|-----|
+| 0.6B BF16 | 38 | 22.5 | 82.0 | 6.5s | 2.15 |
+| 1.7B BF16 | 38 | 79.3 | 87.0 | 13.1s | 4.32 |
+| 1.7B INT8 | 39 | 67.4 | 78.7 | 11.2s | 3.59 |
+| 1.7B INT4 | 39 | 82.6 | 81.7 | 14.1s | 4.51 |
+
+Audio quality: all four outputs sound good. Frame count variation (38 vs 39) is
+normal with quantization-induced sampling divergence.
+
+**Conclusion**: Keep `--int4` as opt-in flag but don't recommend it. INT8 is the
+sweet spot for 1.7B Talker. For maximum speed, use 0.6B (RTF 2.15 vs 3.59).
+
+**Original Goal**: Quantize Talker weights to 4-bit (Q4_0 format) for the 1.7B model. Reduces
+weight memory from 2.8 GB (BF16) to ~0.7 GB, halving INT8's 1.4 GB. Expected 25-30%
+Talker speedup over BF16 with much less memory pressure than INT8.
+
+**Format**: Q4_0 — groups of 32 weights packed into 16 bytes (nibble pairs) + 1 fp16
+scale factor = 18 bytes per 32 weights. Same format used by llama.cpp and whisper.cpp.
+
+**Why 1.7B only**: On 0.6B, INT8 already showed 0% speedup (hidden=1024 too small to
+be bandwidth-bound). INT4's extra dequantization overhead would make it SLOWER on 0.6B.
+The 1.7B Talker (hidden=2048, inter=6144) is clearly bandwidth-bound and benefits from
+reduced data movement.
+
+**Memory comparison**:
+| Format | Talker weights | Total model | RAM headroom (16GB) |
+|--------|---------------|-------------|---------------------|
+| BF16   | 2.8 GB        | 3.6 GB      | ~12 GB              |
+| INT8   | 1.4 GB + 2.8 GB mmap | 4.2 GB peak | ~12 GB (but mmap pages compete) |
+| INT4   | 0.7 GB + 2.8 GB mmap | 3.5 GB peak | ~12 GB (mmap pages paged out faster) |
+
+**Quality risk**: INT4 has 16x fewer representable values than INT8. Talker is
+autoregressive — quantization error accumulates across frames. Must test quality
+carefully with listening comparison.
+
+### Tasks
+
+#### 10i.1 Implement Q4_0 quantize and matvec kernels
+
+**What**: Add Q4_0 data structures and two core functions:
+- `qwen_quantize_bf16_to_q4_0()`: Pack BF16 weights into Q4_0 blocks (32 weights → 18 bytes)
+- `qwen_matvec_q4_0()`: NEON matvec with Q4_0 weights (unpack nibbles → int8 → f32 → FMA)
+- `qwen_matvec_q4_0_qkv()`: Fused QKV variant
+
+Q4_0 block layout (18 bytes):
+```
+struct { float16 scale; int8_t qs[16]; } // 16 bytes store 32 nibbles
+```
+
+NEON dequant per 32 weights: load 16 bytes → split nibbles (AND 0x0F, SHR 4) →
+subtract 8 (unsigned→signed) → widen to int16 → widen to int32 → cvt to f32 →
+multiply by scale → FMA with input vector.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | MEDIUM — nibble packing/unpacking is fiddly |
+| Risk | LOW — well-known format, many reference implementations |
+| Files | `qwen_tts_kernels_neon.c`, `qwen_tts_kernels_generic.c`, `qwen_tts_kernels.c` |
+
+#### 10i.2 Add INT4 fields to Talker layer struct + CLI flag
+
+**What**: Add Q4_0 weight pointers to `qwen_talker_layer_t`. Add `--int4` CLI flag
+and `use_int4` field to context. INT4 and INT8 are mutually exclusive.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — struct fields + flag parsing |
+| Risk | NONE — no behavioral change |
+| Files | `qwen_tts.h`, `main.c` |
+
+#### 10i.3 Quantize Talker to Q4_0 at load time
+
+**What**: In `qwen_talker_load()`, when `use_int4` is set, call
+`qwen_quantize_bf16_to_q4_0()` for all Talker weight matrices. Sequential INT4
+prefill (same approach as INT8 — one token at a time via `qwen_talker_step()`).
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — same pattern as INT8 |
+| Risk | LOW |
+| Files | `qwen_tts_talker.c`, `qwen_tts.c` |
+
+#### 10i.4 Dispatch Q4_0 matvec in Talker decode
+
+**What**: In `qwen_talker_step()`, add `if (l->wq_q4)` checks before INT8 and BF16
+fallbacks. Priority: INT4 > INT8 > BF16.
+
+| Metric | Value |
+|--------|-------|
+| Difficulty | LOW — copy dispatch pattern |
+| Risk | MEDIUM — quality impact |
+| Files | `qwen_tts_talker.c` |
+
+#### 10i.5 A/B Comparison: 0.6B BF16 vs 1.7B INT4
+
+**What**: Compare full pipeline quality and performance:
+- `./qwen_tts -d qwen3-tts-0.6b --text "Ciao, come stai oggi? Spero tutto bene." -s ryan -l Italian --seed 42 -o /tmp/06b_full.wav`
+- `./qwen_tts -d qwen3-tts-1.7b --text "Ciao, come stai oggi? Spero tutto bene." -s ryan -l Italian --seed 42 --int4 -o /tmp/17b_int4.wav`
+- Compare: frame count, ms/f Talker, ms/f CP, total time, RTF
+- Listen to both WAVs for quality assessment
+- Also test English: "Hello, how are you doing today?"
+
+| Metric | Value |
+|--------|-------|
+| Expected 1.7B INT4 Talker speedup | 25-30% over BF16 |
+| Expected memory savings | 0.7 GB vs 1.4 GB (INT8) vs 2.8 GB (BF16) |
+| Quality risk | HIGH — must verify with listening test |
+
+### Priority Order
+
+| Order | Task | Difficulty | Risk |
+|-------|------|------------|------|
+| 1 | 10i.1 Q4_0 kernels | MEDIUM | LOW |
+| 2 | 10i.2 Struct + CLI | LOW | NONE |
+| 3 | 10i.3 Load-time quant | LOW | LOW |
+| 4 | 10i.4 Decode dispatch | LOW | MEDIUM |
+| 5 | 10i.5 A/B comparison | — | — |
+
+---
+
 ## Phase 11: GPU Acceleration via Metal (Optional, Future)
 
 **Goal**: Evaluate Metal GPU offload for Apple Silicon, specifically for attention and

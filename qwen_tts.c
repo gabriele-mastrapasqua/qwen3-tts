@@ -1012,12 +1012,10 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     /* Talker prefill */
     double t_prefill = time_ms();
-    if (ctx->use_int8) {
-        /* Sequential INT8 prefill: process one token at a time via talker_step.
+    if (ctx->use_int8 || ctx->use_int4) {
+        /* Sequential quantized prefill: process one token at a time via talker_step.
          * This avoids needing BF16 weights for BLAS batch matmul, reducing
-         * memory pressure on 16GB machines (1.4GB INT8 + 3.6GB mmap'd BF16
-         * causes swapping). For 25 tokens at ~120ms/step ≈ 3s — comparable
-         * to the BLAS batch prefill (5.5s) which converts BF16→f32 per layer. */
+         * memory pressure on 16GB machines. */
         float *dummy_hidden = (float *)malloc(h * sizeof(float));
         for (int t = 0; t < prefill_len; t++) {
             if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {

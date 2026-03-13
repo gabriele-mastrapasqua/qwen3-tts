@@ -604,6 +604,225 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 }
 
 /* ========================================================================
+ * Q4_0 Quantization + Matvec
+ * ======================================================================== */
+
+void qwen_quantize_bf16_to_q4_0(const uint16_t *src_bf16, int rows, int cols,
+                                 q4_0_block_t *dst) {
+    int blocks_per_row = cols / Q4_0_BLOCK_SIZE;
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *row = src_bf16 + (size_t)r * cols;
+        q4_0_block_t *dst_row = dst + (size_t)r * blocks_per_row;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            const uint16_t *blk = row + b * Q4_0_BLOCK_SIZE;
+
+            /* Convert bf16 block to f32 and find absmax */
+            float vals[Q4_0_BLOCK_SIZE];
+            float amax = 0.0f;
+            for (int i = 0; i < Q4_0_BLOCK_SIZE; i++) {
+                uint32_t bits = (uint32_t)blk[i] << 16;
+                memcpy(&vals[i], &bits, sizeof(float));
+                float a = fabsf(vals[i]);
+                if (a > amax) amax = a;
+            }
+
+            float s = amax / 7.0f;  /* map to [-7, 7] → unsigned [0, 15] */
+            dst_row[b].scale = s;
+            float inv_s = (s > 0) ? 1.0f / s : 0.0f;
+
+            /* Quantize: round to [-8, 7], store as unsigned [0, 15] */
+            for (int i = 0; i < 16; i++) {
+                int lo = (int)roundf(vals[2*i] * inv_s);
+                int hi = (int)roundf(vals[2*i+1] * inv_s);
+                lo = lo < -8 ? -8 : (lo > 7 ? 7 : lo);
+                hi = hi < -8 ? -8 : (hi > 7 ? 7 : hi);
+                dst_row[b].qs[i] = (uint8_t)((lo + 8) | ((hi + 8) << 4));
+            }
+        }
+    }
+}
+
+/* Q4_0 matvec inner kernel: one row at a time */
+static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
+                               int cols, int out_dim) {
+    int blocks_per_row = cols / Q4_0_BLOCK_SIZE;
+    for (int o = 0; o < out_dim; o++) {
+        const q4_0_block_t *row = W + (size_t)o * blocks_per_row;
+        float sum = 0.0f;
+#ifdef __ARM_NEON
+        for (int b = 0; b < blocks_per_row; b++) {
+            float scale = row[b].scale;
+            const uint8_t *qs = row[b].qs;
+            const float *xb = x + b * Q4_0_BLOCK_SIZE;
+
+            /* Load 16 bytes = 32 nibbles */
+            uint8x16_t raw = vld1q_u8(qs);
+            uint8x16_t lo_nibble = vandq_u8(raw, vdupq_n_u8(0x0F));
+            uint8x16_t hi_nibble = vshrq_n_u8(raw, 4);
+
+            /* Interleave: [lo0,hi0,lo1,hi1,...] to get 32 values in order */
+            /* Convert to signed: subtract 8 */
+            int16x8_t s0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(lo_nibble), vdup_n_u8(8)));
+            int16x8_t s1 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(hi_nibble), vdup_n_u8(8)));
+            int16x8_t s2 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(lo_nibble), vdup_n_u8(8)));
+            int16x8_t s3 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(hi_nibble), vdup_n_u8(8)));
+
+            /* s0 has lo[0..7], s1 has hi[0..7] — need to zip them:
+             * [lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3] and [lo4,hi4,...,lo7,hi7] */
+            int16x8x2_t z0 = vzipq_s16(s0, s1);  /* z0.val[0]=[lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3] */
+            int16x8x2_t z1 = vzipq_s16(s2, s3);  /* z1.val[0]=[lo8,hi8,lo9,hi9,...] */
+
+            /* Convert to f32 and FMA with x — 8 groups of 4 */
+            float32x4_t vscale = vdupq_n_f32(scale);
+            float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+
+            float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[0])));
+            float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[0])));
+            float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[1])));
+            float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[1])));
+            acc0 = vfmaq_f32(acc0, vmulq_f32(f0, vscale), vld1q_f32(xb));
+            acc1 = vfmaq_f32(acc1, vmulq_f32(f1, vscale), vld1q_f32(xb + 4));
+            acc2 = vfmaq_f32(acc2, vmulq_f32(f2, vscale), vld1q_f32(xb + 8));
+            acc3 = vfmaq_f32(acc3, vmulq_f32(f3, vscale), vld1q_f32(xb + 12));
+
+            float32x4_t f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[0])));
+            float32x4_t f5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[0])));
+            float32x4_t f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[1])));
+            float32x4_t f7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[1])));
+            acc0 = vfmaq_f32(acc0, vmulq_f32(f4, vscale), vld1q_f32(xb + 16));
+            acc1 = vfmaq_f32(acc1, vmulq_f32(f5, vscale), vld1q_f32(xb + 20));
+            acc2 = vfmaq_f32(acc2, vmulq_f32(f6, vscale), vld1q_f32(xb + 24));
+            acc3 = vfmaq_f32(acc3, vmulq_f32(f7, vscale), vld1q_f32(xb + 28));
+
+            sum += vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+        }
+#else
+        for (int b = 0; b < blocks_per_row; b++) {
+            float scale = row[b].scale;
+            const uint8_t *qs = row[b].qs;
+            const float *xb = x + b * Q4_0_BLOCK_SIZE;
+            for (int i = 0; i < 16; i++) {
+                int lo = (int)(qs[i] & 0x0F) - 8;
+                int hi = (int)(qs[i] >> 4) - 8;
+                sum += scale * (float)lo * xb[2*i];
+                sum += scale * (float)hi * xb[2*i+1];
+            }
+        }
+#endif
+        y[o] = sum;
+    }
+}
+
+void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
+                       int rows, int cols) {
+    int blocks_per_row = cols / Q4_0_BLOCK_SIZE;
+#if defined(__APPLE__) && defined(__BLOCKS__)
+    int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) {
+        dispatch_apply((size_t)nt,
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                       ^(size_t tid) {
+            int r0 = (int)tid * rows / nt;
+            int r1 = (int)(tid + 1) * rows / nt;
+            q4_0_matvec_inner(y + r0, x, W + (size_t)r0 * blocks_per_row,
+                               cols, r1 - r0);
+        });
+        return;
+    }
+#endif
+    q4_0_matvec_inner(y, x, W, cols, rows);
+}
+
+void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
+                            const q4_0_block_t *Wq, const q4_0_block_t *Wk,
+                            const q4_0_block_t *Wv,
+                            const float *x, int in_dim, int q_dim, int kv_dim) {
+    int blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
+#if defined(__APPLE__) && defined(__BLOCKS__)
+    int nt = g_n_threads;
+    if (nt > 1) {
+        int total = q_dim + 2 * kv_dim;
+        dispatch_apply((size_t)nt,
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                       ^(size_t tid) {
+            int r0 = (int)tid * total / nt;
+            int r1 = (int)(tid + 1) * total / nt;
+            for (int r = r0; r < r1; r++) {
+                float *dst;
+                const q4_0_block_t *W;
+                int orig_r = r;
+                if (r < q_dim) {
+                    dst = q; W = Wq;
+                } else if (r < q_dim + kv_dim) {
+                    dst = k; W = Wk;
+                    r -= q_dim;
+                } else {
+                    dst = v; W = Wv;
+                    r -= q_dim + kv_dim;
+                }
+                const q4_0_block_t *row = W + (size_t)r * blocks_per_row;
+                float sum = 0.0f;
+#ifdef __ARM_NEON
+                for (int b = 0; b < blocks_per_row; b++) {
+                    float scale = row[b].scale;
+                    const uint8_t *qs = row[b].qs;
+                    const float *xb = x + b * Q4_0_BLOCK_SIZE;
+
+                    uint8x16_t raw = vld1q_u8(qs);
+                    uint8x16_t lo_nibble = vandq_u8(raw, vdupq_n_u8(0x0F));
+                    uint8x16_t hi_nibble = vshrq_n_u8(raw, 4);
+
+                    int16x8_t s0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(lo_nibble), vdup_n_u8(8)));
+                    int16x8_t s1 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(hi_nibble), vdup_n_u8(8)));
+                    int16x8_t s2 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(lo_nibble), vdup_n_u8(8)));
+                    int16x8_t s3 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(hi_nibble), vdup_n_u8(8)));
+
+                    int16x8x2_t z0 = vzipq_s16(s0, s1);
+                    int16x8x2_t z1 = vzipq_s16(s2, s3);
+
+                    float32x4_t vscale = vdupq_n_f32(scale);
+                    float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+                    float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+
+                    acc0 = vfmaq_f32(acc0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[0]))), vscale), vld1q_f32(xb));
+                    acc1 = vfmaq_f32(acc1, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[0]))), vscale), vld1q_f32(xb + 4));
+                    acc2 = vfmaq_f32(acc2, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[1]))), vscale), vld1q_f32(xb + 8));
+                    acc3 = vfmaq_f32(acc3, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[1]))), vscale), vld1q_f32(xb + 12));
+                    acc0 = vfmaq_f32(acc0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[0]))), vscale), vld1q_f32(xb + 16));
+                    acc1 = vfmaq_f32(acc1, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[0]))), vscale), vld1q_f32(xb + 20));
+                    acc2 = vfmaq_f32(acc2, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[1]))), vscale), vld1q_f32(xb + 24));
+                    acc3 = vfmaq_f32(acc3, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[1]))), vscale), vld1q_f32(xb + 28));
+
+                    sum += vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+                }
+#else
+                for (int b = 0; b < blocks_per_row; b++) {
+                    float scale = row[b].scale;
+                    const uint8_t *qs = row[b].qs;
+                    const float *xb = x + b * Q4_0_BLOCK_SIZE;
+                    for (int i = 0; i < 16; i++) {
+                        int lo = (int)(qs[i] & 0x0F) - 8;
+                        int hi = (int)(qs[i] >> 4) - 8;
+                        sum += scale * (float)lo * xb[2*i];
+                        sum += scale * (float)hi * xb[2*i+1];
+                    }
+                }
+#endif
+                dst[r] = sum;
+                r = orig_r;  /* restore for loop */
+            }
+        });
+        return;
+    }
+#endif
+    q4_0_matvec_inner(q, x, Wq, in_dim, q_dim);
+    q4_0_matvec_inner(k, x, Wk, in_dim, kv_dim);
+    q4_0_matvec_inner(v, x, Wv, in_dim, kv_dim);
+}
+
+/* ========================================================================
  * Attention
  * ======================================================================== */
 

@@ -73,6 +73,30 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
                                  int8_t *dst_int8, float *dst_scale);
 
+/* Q4_0 block: 32 weights packed into 18 bytes (16 nibble-pairs + fp32 scale) */
+#define Q4_0_BLOCK_SIZE 32
+typedef struct {
+    float scale;           /* per-block scale factor */
+    uint8_t qs[16];        /* 32 nibbles: low 4 bits = even idx, high 4 bits = odd idx */
+} q4_0_block_t;            /* 20 bytes per 32 weights */
+
+/* Quantize bf16 weight matrix to Q4_0 blocks.
+ * cols must be a multiple of 32. Returns number of blocks per row = cols/32.
+ * dst must have rows * (cols/32) blocks pre-allocated. */
+void qwen_quantize_bf16_to_q4_0(const uint16_t *src_bf16, int rows, int cols,
+                                 q4_0_block_t *dst);
+
+/* Q4_0 matvec: y[rows] = dequant(W_q4[rows, cols/32 blocks]) @ x[cols]
+ * NEON-optimized + multi-threaded. */
+void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
+                       int rows, int cols);
+
+/* Unified QKV matvec (Q4_0 variant) */
+void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
+                            const q4_0_block_t *Wq, const q4_0_block_t *Wk,
+                            const q4_0_block_t *Wv,
+                            const float *x, int in_dim, int q_dim, int kv_dim);
+
 /* ========================================================================
  * Attention
  * ======================================================================== */

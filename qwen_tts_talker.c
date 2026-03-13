@@ -297,6 +297,39 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
             fprintf(stderr, "  Talker INT8 quantization done (%d layers)\n", c->num_layers);
     }
 
+    /* Q4_0 quantization of Talker weights (optional, enabled by --int4 flag) */
+    if (ctx->use_int4) {
+        if (!ctx->silent)
+            fprintf(stderr, "  Quantizing Talker weights to Q4_0 (4-bit)...\n");
+        int inter = c->intermediate_size;
+        int q_bpr = h / Q4_0_BLOCK_SIZE;          /* blocks per row for hidden dim */
+        int qd_bpr = q_dim / Q4_0_BLOCK_SIZE;     /* blocks per row for q_dim */
+        int i_bpr = inter / Q4_0_BLOCK_SIZE;       /* blocks per row for inter dim */
+        for (int i = 0; i < c->num_layers; i++) {
+            qwen_talker_layer_t *l = &ctx->layers[i];
+
+            l->wq_q4 = (q4_0_block_t *)malloc((size_t)q_dim * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wq_bf16, q_dim, h, l->wq_q4);
+
+            l->wk_q4 = (q4_0_block_t *)malloc((size_t)kv_dim * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wk_bf16, kv_dim, h, l->wk_q4);
+
+            l->wv_q4 = (q4_0_block_t *)malloc((size_t)kv_dim * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wv_bf16, kv_dim, h, l->wv_q4);
+
+            l->wo_q4 = (q4_0_block_t *)malloc((size_t)h * qd_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wo_bf16, h, q_dim, l->wo_q4);
+
+            l->gate_up_fused_q4 = (q4_0_block_t *)malloc((size_t)2 * inter * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->gate_up_fused_bf16, 2 * inter, h, l->gate_up_fused_q4);
+
+            l->down_q4 = (q4_0_block_t *)malloc((size_t)h * i_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->down_bf16, h, inter, l->down_q4);
+        }
+        if (!ctx->silent)
+            fprintf(stderr, "  Talker Q4_0 quantization done (%d layers)\n", c->num_layers);
+    }
+
     /* Allocate KV cache (bf16 — halves memory vs f32) */
     int initial_kv_max = 2048;
     int64_t kv_size = (int64_t)c->num_layers * initial_kv_max * kv_dim;
@@ -369,7 +402,11 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, l->input_norm, 1, h, eps);
 
         /* 2. QKV projections (unified dispatch — single barrier for all 3) */
-        if (l->wq_int8)
+        if (l->wq_q4)
+            qwen_matvec_q4_0_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
+                                  l->wq_q4, l->wk_q4, l->wv_q4,
+                                  ctx->dec_x_norm, h, q_dim, kv_dim);
+        else if (l->wq_int8)
             qwen_matvec_int8_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
                                   l->wq_int8, l->wq_scale,
                                   l->wk_int8, l->wk_scale,
@@ -404,7 +441,9 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
                                      c->head_dim, scale, pos);
 
         /* 7. Output projection + residual */
-        if (l->wo_int8)
+        if (l->wo_q4)
+            qwen_matvec_q4_0(ctx->dec_proj_out, l->wo_q4, ctx->dec_attn_out, h, q_dim);
+        else if (l->wo_int8)
             qwen_matvec_int8(ctx->dec_proj_out, l->wo_int8, l->wo_scale,
                               ctx->dec_attn_out, h, q_dim);
         else
@@ -415,7 +454,10 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, l->post_attn_norm, 1, h, eps);
 
         /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-        if (l->gate_up_fused_int8)
+        if (l->gate_up_fused_q4)
+            qwen_matvec_q4_0(ctx->dec_gate, l->gate_up_fused_q4, ctx->dec_x_norm,
+                              2 * inter, h);
+        else if (l->gate_up_fused_int8)
             qwen_matvec_int8(ctx->dec_gate, l->gate_up_fused_int8, l->gate_up_fused_scale,
                               ctx->dec_x_norm, 2 * inter, h);
         else
@@ -429,7 +471,9 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         }
 
         /* Down projection + residual */
-        if (l->down_int8)
+        if (l->down_q4)
+            qwen_matvec_q4_0(ctx->dec_proj_out, l->down_q4, ctx->dec_gate, h, inter);
+        else if (l->down_int8)
             qwen_matvec_int8(ctx->dec_proj_out, l->down_int8, l->down_scale,
                               ctx->dec_gate, h, inter);
         else

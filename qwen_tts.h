@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <pthread.h>
 
+#include "qwen_tts_kernels.h"
 #include "qwen_tts_voice_clone.h"
 
 /* ========================================================================
@@ -157,6 +158,14 @@ typedef struct {
     float  *gate_up_fused_scale;  /* [2*inter] */
     int8_t *down_int8;            /* [hidden, inter] */
     float  *down_scale;           /* [hidden] */
+
+    /* Q4_0 quantized weights (optional, allocated if --int4 flag is set) */
+    q4_0_block_t *wq_q4;              /* [q_dim, hidden/32 blocks] */
+    q4_0_block_t *wk_q4;              /* [kv_dim, hidden/32 blocks] */
+    q4_0_block_t *wv_q4;              /* [kv_dim, hidden/32 blocks] */
+    q4_0_block_t *wo_q4;              /* [hidden, q_dim/32 blocks] */
+    q4_0_block_t *gate_up_fused_q4;   /* [2*inter, hidden/32 blocks] */
+    q4_0_block_t *down_q4;            /* [hidden, inter/32 blocks] */
 } qwen_talker_layer_t;
 
 /* ========================================================================
@@ -353,6 +362,7 @@ typedef struct qwen_tts_ctx {
     int silent;
     int debug;
     int use_int8;  /* INT8 quantized Code Predictor weights */
+    int use_int4;  /* Q4_0 quantized Talker weights (1.7B only) */
     
     /* Sampling parameters */
     float temperature;

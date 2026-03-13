@@ -95,6 +95,7 @@ int main(int argc, char **argv) {
     const char *load_voice = NULL;
     float max_ref_duration = 15.0f;  /* default: use first 15s of ref audio */
     int use_int8 = 0;
+    int use_int4 = 0;
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
         {"text",          required_argument, 0, 't'},
@@ -124,6 +125,7 @@ int main(int argc, char **argv) {
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"int8",          no_argument,       0, 1014},
+        {"int4",          no_argument,       0, 1015},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -157,6 +159,7 @@ int main(int argc, char **argv) {
             case 1012: load_voice = optarg; break;
             case 1013: max_ref_duration = (float)atof(optarg); break;
             case 1014: use_int8 = 1; break;
+            case 1015: use_int4 = 1; break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -188,7 +191,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --save-voice <path>        Save speaker embedding to file\n");
                 fprintf(stderr, "  --load-voice <path>        Load speaker embedding from file (skip extraction)\n");
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)\n");
-                fprintf(stderr, "  --int8                     INT8 quantized Code Predictor (faster, slight quality loss)\n");
+                fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
+                fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
@@ -230,6 +234,7 @@ int main(int argc, char **argv) {
     ctx->silent = silent;
     ctx->debug = debug;
     ctx->use_int8 = use_int8;
+    ctx->use_int4 = use_int4;
 
     if (speaker_id >= 0) ctx->speaker_id = speaker_id;
     if (language) ctx->language_id = qwen_tts_language_id(language);
