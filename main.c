@@ -188,8 +188,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
                 fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model)\n");
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
-                fprintf(stderr, "  --save-voice <path>        Save voice (.qvoice = full ICL, other = embedding only)\n");
-                fprintf(stderr, "  --load-voice <path>        Load voice (.qvoice = full ICL, other = embedding only)\n");
+                fprintf(stderr, "  --save-voice <path>        Save voice (.qvoice = full ICL, .bin = embedding only)\n");
+                fprintf(stderr, "                             Without --text: create voice profile and exit\n");
+                fprintf(stderr, "  --load-voice <path>        Load voice (.qvoice = full ICL, .bin = embedding only)\n");
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
@@ -203,14 +204,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: --model-dir is required\n");
         return 1;
     }
-    if (!text && serve_port <= 0) {
+    /* --save-voice without --text = create voice only (no generation) */
+    int create_voice_only = (save_voice && !text && serve_port <= 0);
+    if (!text && serve_port <= 0 && !create_voice_only) {
         fprintf(stderr, "Error: --text or --serve is required\n");
         return 1;
     }
 
     if (!silent) {
         fprintf(stderr, "Model dir: %s\n", model_dir);
-        fprintf(stderr, "Text: \"%s\"\n", text);
+        if (text) fprintf(stderr, "Text: \"%s\"\n", text);
         fprintf(stderr, "Output: %s\n", output);
     }
 
@@ -451,6 +454,25 @@ int main(int argc, char **argv) {
         } else {
             ctx->instruct = strdup(instruct);
         }
+    }
+
+    /* Create voice only: save and exit without generating */
+    if (create_voice_only) {
+        if (!save_voice) {
+            fprintf(stderr, "Error: --save-voice is required when no --text is provided\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        if (!ref_audio) {
+            fprintf(stderr, "Error: --ref-audio is required to create a voice profile\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        /* Voice was already saved above in the voice clone setup block */
+        if (!silent)
+            fprintf(stderr, "Voice profile created. Use --load-voice to generate speech.\n");
+        qwen_tts_unload(ctx);
+        return 0;
     }
 
     /* Server mode: start HTTP server and block */

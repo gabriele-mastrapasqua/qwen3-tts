@@ -306,12 +306,11 @@ re-processing the reference audio. This skips mel spectrogram extraction, speake
 encoding, and speech encoding — giving a **2x speedup** on subsequent generations.
 
 ```bash
-# Step 1: Create a .qvoice profile from reference audio
-#   This encodes the audio and saves: speaker embedding + ICL codec tokens + transcript
+# Step 1: Create a .qvoice profile from reference audio (no --text needed)
+#   Encodes audio and saves: speaker embedding + ICL codec tokens + transcript
 ./qwen_tts -d qwen3-tts-0.6b-base \
     --ref-audio reference.wav --ref-text "Exact transcript of the reference audio." \
-    --save-voice my_voice.qvoice \
-    --text "Hello, test." -o first_output.wav
+    --save-voice my_voice.qvoice
 
 # Step 2: Reuse the saved voice for any new text (no ref audio needed)
 ./qwen_tts -d qwen3-tts-0.6b-base \
