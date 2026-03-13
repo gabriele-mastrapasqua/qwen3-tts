@@ -1,6 +1,6 @@
 # From RTF 3.5 to RTF 1.26: Optimizing a Pure C TTS Engine
 
-*How cache alignment, NEON intrinsics, pipeline threading, and lessons from 1990s game programming nearly tripled our inference speed.*
+*How cache alignment, NEON intrinsics, pipeline threading, algorithm fixes, and lessons from 1990s game programming nearly tripled our inference speed.*
 
 ## The Starting Point
 
@@ -233,6 +233,101 @@ One trade-off: the decoder thread competes with the main thread for CPU cores an
 memory bandwidth. Talker+CP ms/frame increases slightly (~10%) due to contention,
 but the net wall-time improvement from overlapping far exceeds this cost.
 
+## Quickselect: When the Algorithm Is the Bug
+
+After all the SIMD and threading work, we noticed the "Codec head+sampling"
+line in the timing report: **93ms** for 101 frames. That's almost 1ms per frame
+spent on... sampling? Something was off.
+
+The top-k filter used **selection sort** to find the k-th largest logit:
+
+```c
+// O(k × n) — selection sort to find top-k threshold
+for (int i = 0; i < k; i++) {
+    int max_idx = i;
+    for (int j = i + 1; j < n; j++)
+        if (tmp[j] > tmp[max_idx]) max_idx = j;
+    float t = tmp[i]; tmp[i] = tmp[max_idx]; tmp[max_idx] = t;
+}
+```
+
+With `k=50` and `n=3072` (codec vocabulary), that's **153,600 comparisons per
+frame** × 101 frames = 15.5M comparisons. It's technically O(kn), but the
+constant is awful.
+
+The fix: **quickselect** (Hoare's algorithm). It finds the k-th element in
+O(n) average time using 3-way partitioning:
+
+```c
+static float quickselect_kth_largest(float *arr, int n, int k) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        float pivot = arr[lo + (hi - lo) / 2];
+        // 3-way partition: [>pivot] [==pivot] [<pivot]
+        // ...
+    }
+    return arr[lo];
+}
+```
+
+**Result: 93ms → 21ms (4.4× faster).** Output bit-identical — same threshold,
+same filtering, same samples. The only thing that changed was how fast we find
+the threshold value.
+
+We also checked softmax (3 scalar passes over vocab) and top-p (O(n²) full
+sort). Softmax turned out to be ~1.5ms total — with `-ffast-math` on macOS,
+`expf` is already vectorized by the compiler via Accelerate. And top-p is
+skipped entirely at the default `top_p=1.0`. So quickselect was the only
+sampling fix that mattered.
+
+## Streaming Pipeline: Closing the Last Gap
+
+With streaming mode (`--stream`), the user hears audio as it generates — chunks
+of ~0.8s arrive progressively. But streaming was **30% slower** than normal mode
+(RTF 2.0 vs 1.4). Why?
+
+Normal mode uses a **decoder thread**: the speech decoder runs in the background
+while Talker+CP generate the next frame. The two stages overlap in time:
+
+```
+Main thread:    [Gen F1] [Gen F2] [Gen F3] ...
+Decoder thread:          [Dec F1] [Dec F2] ...
+```
+
+But streaming mode ran the decoder **synchronously in the main thread**. Every
+10 frames, the main thread stopped generating to decode audio and call the
+callback. The main thread was blocked during decode:
+
+```
+Main thread:    [Gen F1-10] [DECODE+CALLBACK] [Gen F11-20] [DECODE+CALLBACK] ...
+                             ^^^^ BLOCKED ^^^^               ^^^^ BLOCKED ^^^^
+```
+
+The fix: use the decoder thread for streaming too. Instead of accumulating audio
+in a buffer, the decoder thread calls the audio callback directly. The main
+thread never blocks on decode:
+
+```c
+if (dt->audio_cb) {
+    int ret = dt->audio_cb(chunk_audio, chunk_samples, dt->audio_cb_userdata);
+    if (ret != 0) dt->cb_aborted = 1;
+} else {
+    dt_append_audio(dt, chunk_audio, chunk_samples);
+}
+```
+
+The callback (`fwrite` + `fflush` to a WAV file, or `send()` to an HTTP socket)
+is called from the decoder thread. Both are thread-safe by default.
+
+**Result: Streaming RTF 2.04 → 1.38** — identical to normal mode. The change
+was `-80` lines, `+53` lines (net simpler!), because we deleted the entire
+synchronous streaming code path and unified everything through the decoder
+thread.
+
+The output is **bit-identical** across all four modes: CLI normal, CLI streaming,
+HTTP server normal, HTTP server streaming. Same seed, same speaker, same language
+→ same bytes in the WAV file.
+
 ## What We Analyzed and Skipped
 
 Not every optimization idea pans out. Here's what we investigated and rejected:
@@ -266,6 +361,21 @@ bandwidth savings. BF16-to-f32 conversion is essentially free — a single
 `vshll` instruction. Quantization might help on the 1.7B model where matrices
 are 4x larger.
 
+**Softmax NEON vectorization** (est. 2-4×, actual: not worth it). After
+quickselect reduced total sampling from 93ms to 21ms, softmax is only ~1.5ms
+of the remaining 21ms. With `-ffast-math`, clang already vectorizes `expf`
+via Apple Accelerate. No headroom for custom NEON exp.
+
+**Speech decoder depthwise conv / LayerNorm NEON** (est. 1.5-3×, actual: not
+worth it). The speech decoder runs in a background thread overlapped with
+generation. It finishes *before* Talker+CP complete — it's not the bottleneck.
+ConvNeXt depthwise conv does 1.4M FLOPs vs 838M FLOPs for the BLAS-accelerated
+pointwise convolutions. Optimizing 0.2% of the decoder's compute is pointless.
+
+**Separating INT8 fields from CP layer struct** (est. 2-3% cache, actual: not
+worth it). Only 5 layers × 264 bytes = 1.3KB total. The bottleneck is the
+weight data (26MB per layer), not the 8-byte pointer loads in the struct.
+
 ## The Numbers
 
 | Metric | Baseline | After all optimizations |
@@ -274,17 +384,20 @@ are 4x larger.
 | Code Predictor | 104.7 ms/f | ~60 ms/f |
 | Speech Decoder | ~2,600ms (blocking) | overlapped (background thread) |
 | Prefill | ~1,800ms | ~1,000–1,600ms |
-| **RTF (CLI, short ~5s audio)** | **~3.5** | **1.74** |
-| **RTF (CLI, long ~17s audio)** | **~2.5** | **~1.4** |
+| Codec head+sampling | 93ms | 21ms |
 | Per-token malloc calls | ~120+ | **0** |
+| **RTF (CLI, short ~5s audio)** | **~3.5** | **~1.4–1.7** |
+| **RTF (CLI, long ~17s audio)** | **~2.5** | **~1.3** |
+| **RTF (CLI `--stream`)** | **~3.5** | **~1.4–1.7** (same as normal) |
 | **RTF (server warm, short)** | — | **1.39** |
 | **RTF (server warm, long)** | — | **1.26** |
 
 All on an Apple M1 8-core, 16 GB RAM, 4 threads. RTF improves with longer
 audio because prefill is a fixed cost that amortizes over more frames. The
 speech decoder runs in a background thread, overlapping most of its work with
-generation. Server mode with embedding cache, warm buffers, and decoder thread
-overlap delivers the best RTF at **1.26**.
+generation — including streaming mode, where the decoder thread calls the audio
+callback directly. Server mode with embedding cache, warm buffers, and decoder
+thread overlap delivers the best RTF at **1.26**.
 
 ## Lessons
 
@@ -316,7 +429,17 @@ overlap delivers the best RTF at **1.26**.
    Look for stages in your pipeline that only consume the output of previous
    stages — those are free parallelism.
 
-7. **Read the old books.** Abrash's *Graphics Programming Black Book* and
+7. **Check your algorithms, not just your SIMD.** A 4× sampling speedup from
+   replacing selection sort with quickselect — no intrinsics, no threading,
+   just a better algorithm. Profile first, but when you find O(kn) in a hot
+   loop, fix the algorithm before reaching for NEON.
+
+8. **Unify code paths.** Streaming was 30% slower because it had its own
+   synchronous decode path. When we unified it with the decoder thread (the
+   same path normal mode uses), the gap disappeared. Two code paths that do
+   the same thing will always diverge in performance.
+
+9. **Read the old books.** Abrash's *Graphics Programming Black Book* and
    Carmack's `.plan` files are from another era, but the principles — cache
    friendliness, data alignment, knowing your memory hierarchy — are timeless.
    The specific rules change (64-byte cache lines instead of dword alignment),
