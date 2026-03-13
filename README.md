@@ -145,7 +145,7 @@ Optional:
   -s, --speaker <name>       Speaker voice (default: ryan)
   -l, --language <lang>      Target language (default: English)
   -I, --instruct <text>      Style/emotion instruction (1.7B model only)
-  --temperature <f>          Sampling temperature (default: 0.9)
+  --temperature <f>          Sampling temperature (default: 0.5)
   --top-k <n>                Top-k sampling (default: 50)
   --top-p <f>                Top-p nucleus sampling (default: 1.0)
   --rep-penalty <f>          Repetition penalty (default: 1.05)
@@ -247,7 +247,7 @@ By default, each run uses a time-based random seed, so the same text produces sl
 ```
 
 > **Note:** Audio quality varies across seeds — this is inherent to the model's sampling
-> process (temperature=0.9 by default). Some seeds sound better than others. If a particular
+> process (temperature=0.5 by default). Some seeds sound better than others. If a particular
 > generation sounds off, try a different seed or lower the temperature. Duration also varies
 > significantly (3-7x range for the same text), which is normal model behavior.
 
@@ -475,7 +475,7 @@ Server mode adds warm caches, embedding cache, and decoder thread overlap on top
   "language": "English",
   "instruct": "Speak cheerfully",
   "seed": 42,
-  "temperature": 0.9,
+  "temperature": 0.5,
   "top_k": 50,
   "top_p": 1.0,
   "rep_penalty": 1.05
@@ -483,7 +483,7 @@ Server mode adds warm caches, embedding cache, and decoder thread overlap on top
 ```
 
 All fields except `text` are optional. Defaults: speaker=ryan, language=English,
-temperature=0.9, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
+temperature=0.5, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
 Each request starts from clean defaults — parameters do not leak between requests.
 
 ## How It Works

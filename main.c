@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     int speaker_id = -1;
     const char *language = NULL;
     const char *instruct = NULL;
-    float temperature = 0.9f;
+    float temperature = 0.5f;
     int top_k = 50;
     float top_p = 1.0f;
     float rep_penalty = 1.05f;

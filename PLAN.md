@@ -133,7 +133,7 @@ lightweight, zero-dependency alternative.
     "speaker": "ryan",
     "language": "English",
     "instruct": "Speak cheerfully",
-    "temperature": 0.9,
+    "temperature": 0.5,
     "top_k": 50
   }
   ```
@@ -302,11 +302,11 @@ ceiling). The entire Metal backend was removed as dead code in commit history.
 The same text with different seeds (or same seed with different temperatures) produces
 audio of very different durations — up to 3-7x range. This is **inherent model behavior**
 (confirmed identical in Python). The Talker's autoregressive loop decides when to emit EOS,
-and sampling randomness (temp=0.9 default) heavily influences frame count.
+and sampling randomness heavily influences frame count.
 
 - Greedy (temp=0, top_k=1) produces consistent, short output
-- temp=0.9 + top_k=50 (defaults) gives natural-sounding but variable-length output
-- Lower temperature (0.6-0.7) is a good middle ground: less variability, still natural
+- temp=0.5 + top_k=50 (defaults) gives natural-sounding output with moderate variability
+- Higher temperature (0.7-0.9) increases variability and expressiveness
 - **No single "sweet spot"** — it's a quality/consistency tradeoff the user should control
 - All sampling params remain user-configurable (--temperature, --top-k, --top-p, --seed)
 

@@ -242,7 +242,7 @@ static void reset_request_state(qwen_tts_ctx_t *ctx) {
     ctx->language_id = 2050;  /* English */
 
     /* Reset sampling params to defaults */
-    ctx->temperature = 0.9f;
+    ctx->temperature = 0.5f;
     ctx->top_k = 50;
     ctx->top_p = 1.0f;
     ctx->rep_penalty = 1.05f;
