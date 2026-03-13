@@ -159,6 +159,8 @@ Optional:
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
   --stream-chunk <n>         Frames per stream chunk (default: 10 = 0.8s)
+  --int8                     INT8 quantized Talker + Code Predictor (1.7B recommended)
+  --int4                     Q4_0 quantized Talker (1.7B only, experimental)
   --silent                   Suppress status output
   --debug                    Verbose diagnostics
 ```
@@ -199,6 +201,34 @@ Optional:
 
 > **Note:** The `--instruct` flag only works with the 1.7B model. The 0.6B model does not
 > support style control and will ignore the instruction.
+
+### Weight Quantization (1.7B model)
+
+The `--int8` and `--int4` flags quantize Talker weights at load time, reducing memory usage and (for INT8) improving speed on the 1.7B model. These flags have no meaningful effect on the 0.6B model (matrices too small to be bandwidth-bound).
+
+```bash
+# INT8 — recommended for 1.7B (15% Talker speedup, good quality)
+./qwen_tts -d qwen3-tts-1.7b --text "Hello world" --int8 -o hello.wav
+
+# INT4 — experimental, smaller memory but no speed gain
+./qwen_tts -d qwen3-tts-1.7b --text "Hello world" --int4 -o hello.wav
+```
+
+**Comparison (1.7B, Italian, seed=42, Apple M1 16 GB, 4 threads):**
+
+| Config | Talker ms/f | Total time | RTF | Talker RAM |
+|--------|-------------|------------|-----|------------|
+| BF16 (default) | ~80 ms/f | ~13s | ~4.3 | 2.8 GB (mmap) |
+| **INT8 (recommended)** | **~67 ms/f** | **~11s** | **~3.6** | **1.4 GB** |
+| INT4 (experimental) | ~83 ms/f | ~14s | ~4.5 | 0.7 GB |
+
+> **Recommendation:** Use `--int8` for the 1.7B model. It gives 15% Talker speedup with
+> good audio quality. INT4 saves memory but is slightly *slower* due to nibble unpacking
+> overhead. For maximum speed, use the 0.6B model (RTF ~1.3–1.7 vs 3.6 for 1.7B INT8).
+>
+> On systems with 16+ GB free RAM, expected performance is better than shown above
+> (our test machine had high system memory pressure from other applications).
+> Projected RTF with free RAM: **0.6B ~1.3, 1.7B BF16 ~3.0, 1.7B INT8 ~2.5**.
 
 ### Seed & Reproducibility
 
@@ -489,8 +519,10 @@ The Code Predictor has the same architecture in both models (hidden=1024, 5 laye
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
 - **0.6B**: RTF ~1.3–1.7 depending on audio length and mode (server warm + long text = best)
+- **1.7B**: RTF ~3.0–4.3 (BF16), ~2.5–3.6 with `--int8` (recommended)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
-- SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
+- SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16/INT8 matrix-vector operations
+- Optional INT8/INT4 Talker quantization for the 1.7B model (see [Weight Quantization](#weight-quantization-17b-model))
 - Cache-line aligned buffers (64B `posix_memalign`) for optimal BLAS/SIMD throughput
 - Multi-threaded inference via GCD (`dispatch_apply`) on macOS, pthreads on Linux
 
