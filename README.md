@@ -282,11 +282,13 @@ Create entirely new voices from natural language descriptions using the VoiceDes
 
 ### Voice Cloning
 
-Clone any voice from a short reference audio clip using the Base model:
+Clone any voice from a short reference audio clip. **Requires a Base model** — the
+CustomVoice models (0.6B, 1.7B) do NOT support voice cloning.
 
 ```bash
 # Download the Base model (has speaker encoder for voice cloning)
-./download_model.sh --model base-small
+./download_model.sh --model base-small   # 0.6B-Base
+./download_model.sh --model base-large   # 1.7B-Base
 
 # Clone a voice from a WAV file
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Hello, this is my cloned voice." \
@@ -295,17 +297,52 @@ Clone any voice from a short reference audio clip using the Base model:
 # Clone with Italian text
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Ciao, questa e la mia voce clonata." \
     --ref-audio reference.wav -o cloned_it.wav
+```
 
-# Save reusable voice profile (.qvoice = embedding + ICL codec tokens + ref text)
-./qwen_tts -d qwen3-tts-0.6b-base --text "Hello" \
-    --ref-audio reference.wav --ref-text "Transcript of the reference audio." \
-    --save-voice my_voice.qvoice -o out.wav
+#### Reusable Voice Profiles (`.qvoice`)
 
-# Load saved voice (ICL quality, no ref audio needed — just the .qvoice file)
-./qwen_tts -d qwen3-tts-0.6b-base --text "Any new text here" \
-    --load-voice my_voice.qvoice -o out2.wav
+Save a cloned voice to a `.qvoice` file once, then reuse it for any text without
+re-processing the reference audio. This skips mel spectrogram extraction, speaker
+encoding, and speech encoding — giving a **2x speedup** on subsequent generations.
 
-# Legacy: raw speaker embedding (.bin) still supported
+```bash
+# Step 1: Create a .qvoice profile from reference audio
+#   This encodes the audio and saves: speaker embedding + ICL codec tokens + transcript
+./qwen_tts -d qwen3-tts-0.6b-base \
+    --ref-audio reference.wav --ref-text "Exact transcript of the reference audio." \
+    --save-voice my_voice.qvoice \
+    --text "Hello, test." -o first_output.wav
+
+# Step 2: Reuse the saved voice for any new text (no ref audio needed)
+./qwen_tts -d qwen3-tts-0.6b-base \
+    --load-voice my_voice.qvoice \
+    --text "A completely different sentence." -o output.wav
+
+# Works with the 1.7B Base model too (same .qvoice file)
+./qwen_tts -d qwen3-tts-1.7b-base \
+    --load-voice my_voice.qvoice \
+    --text "Same voice, bigger model." -o output_1.7b.wav
+```
+
+**Performance comparison** (Apple M1 8-core, 4 threads, 0.6B-Base, ~4s output):
+
+| Mode | Prefill | Total | RTF | Notes |
+|------|---------|-------|-----|-------|
+| From WAV (`--ref-audio`) | 2.8s | 21.6s | 4.91 | Mel + speaker enc + speech enc + generate |
+| From `.qvoice` (`--load-voice`) | 1.7s | 9.8s | 2.23 | Load file + generate (no audio processing) |
+
+The `.qvoice` format is compact (~20-50KB for a typical 3-10s reference clip) and
+portable across 0.6B-Base and 1.7B-Base models (same codec tokens).
+
+> **Important:** `.qvoice` files only work with **Base** models (`0.6B-Base`, `1.7B-Base`).
+> They cannot be used with CustomVoice or VoiceDesign models.
+
+#### Legacy format
+
+Raw speaker embedding files (`.bin`) are still supported for backward compatibility,
+but they only store the x-vector (lower quality than ICL mode with `.qvoice`):
+
+```bash
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Hello" \
     --ref-audio reference.wav --save-voice my_voice.bin -o out.wav
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Another sentence" \
@@ -335,11 +372,6 @@ make demo-clone REF=my_voice.wav TEXT="Hello from my cloned voice!"
 > **Note:** Voice cloning requires a **Base** model (`Qwen3-TTS-12Hz-0.6B-Base` or `1.7B-Base`),
 > not the CustomVoice model. The Base model includes an ECAPA-TDNN speaker encoder that extracts
 > a voice embedding from the reference audio. A few seconds of clear speech is sufficient.
->
-> **Reusable voices:** Use `--save-voice my_voice.qvoice` to save a full voice profile
-> (speaker embedding + ICL codec tokens + transcript). Load it later with `--load-voice`
-> to clone the same voice for any text — no reference audio needed. The `.qvoice` format
-> is compact (~20-50KB) and works across both 0.6B and 1.7B Base models.
 >
 > By default, only the first **15 seconds** of reference audio are used for the speaker embedding.
 > This is enough for high-quality cloning and keeps extraction fast. Use `--max-ref-duration 0`
