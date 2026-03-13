@@ -954,12 +954,38 @@ only when `--int8` is enabled. Reduces `qwen_cp_layer_t` to ~132 bytes.
 | Order | Task | Difficulty | Risk | Expected Gain |
 |-------|------|------------|------|---------------|
 | 1 | 10g.1 Top-k quickselect | LOW | LOW | 2-3× top-k |
-| 2 | 10g.7 Separate INT8 from CP layer | LOW | LOW | ~2-3% cache |
-| 3 | 10g.2 Softmax NEON | MEDIUM | LOW-MED | 2-4× softmax |
+| 2 | ~~10g.7 Separate INT8 from CP layer~~ | LOW | LOW | SKIP (see below) |
+| 3 | ~~10g.2 Softmax NEON~~ | MEDIUM | LOW-MED | SKIP (see below) |
 | 4 | 10g.3 Top-p partial sort | MEDIUM | LOW | 5-10× top-p |
-| 5 | 10g.4 Depthwise conv NEON | MEDIUM | LOW | 1.5-2× dwconv |
-| 6 | 10g.5 LayerNorm NEON | MEDIUM | LOW | 2-3× LN |
+| 5 | ~~10g.4 Depthwise conv NEON~~ | MEDIUM | LOW | SKIP (see below) |
+| 6 | ~~10g.5 LayerNorm NEON~~ | MEDIUM | LOW | SKIP (see below) |
 | 7 | 10g.6 Streaming pipeline | HIGH | MEDIUM | RTF 2.0→1.4 |
+
+### Results & Analysis (2026-03-13)
+
+**10g.1 Top-k quickselect**: DONE. Selection sort O(k×n) → quickselect O(n).
+Codec head+sampling: 93ms → 21-24ms (**4× faster**). Output bit-identical.
+
+**10g.7 Separate INT8 from CP layer**: SKIP. Only 5 layers × 264B = 1.3KB.
+Removing INT8 fields saves ~660B but the bottleneck is weight data, not pointer
+loads. Code churn not worth ~2-3% theoretical cache improvement.
+
+**10g.2 Softmax NEON**: SKIP. Post-quickselect, total sampling is ~21ms/101 frames
+= 0.2ms/frame. Softmax is ~1.5ms of that (101 × 3072 expf). With `-ffast-math`
+on macOS, `expf` is already vectorized by the compiler via Accelerate. No headroom.
+
+**10g.3 Top-p partial sort**: Low priority. Default top_p=1.0 already skips the
+sort entirely. Only triggered if user explicitly sets `--top-p 0.9` etc. Keep as
+optional future improvement.
+
+**10g.4 Depthwise conv NEON + 10g.5 LayerNorm NEON**: SKIP. The speech decoder
+runs in a decoder thread overlapped with generation. Decoder finishes BEFORE
+Talker+CP completes (9.9s decoder vs 10.8s generation). It's NOT the bottleneck.
+ConvNeXt depthwise (1.4M FLOPs) is 600× less compute than BLAS-accelerated PW1
+(838M FLOPs). These scalar loops are negligible in the total decoder time.
+
+**10g.6 Streaming pipeline**: Remaining. This is the one structural fix that would
+close the RTF gap between streaming (2.0) and normal mode (1.4).
 
 ---
 
