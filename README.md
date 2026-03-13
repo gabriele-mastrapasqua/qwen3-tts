@@ -518,7 +518,7 @@ performance to **RTF ~1.3–1.7** (up to 2.7x total speedup):
 |---|---|---|
 | Cache-line alignment (`posix_memalign(64)`) | **24%** | Aligned all BLAS/SIMD buffers and KV caches |
 | Decoder thread overlap | **14-19%** | Speech decoder runs in background thread during generation |
-| NEON speech decoder | **11%** | Replaced scalar RMSNorm, RoPE, attention with NEON |
+| SIMD speech decoder | **11%** | Replaced scalar RMSNorm, RoPE, attention with NEON/AVX |
 | Persistent prefill buffers | **38% server** | Reuse buffers across generations (zero malloc in decode) |
 | Text embedding cache | **14% server** | LRU cache for token embeddings (skip 2 matvec per cached token) |
 | Batched VQ projection | minor | BLAS sgemm instead of per-frame scalar matvec |
@@ -550,7 +550,7 @@ For context, here's how the official Python + PyTorch implementation performs on
 > **We're 3–4x faster than Python on CPU.** The official Python + PyTorch implementation
 > on a Ryzen 9 7950X (16-core Zen 4, 2022, DDR5) gets RTF 4.5–5.8. Our pure C engine on
 > an Apple M1 (8-core, 2020, LPDDR4X) gets RTF 1.3–1.7 — on older, slower hardware.
-> That's the difference between optimized C with NEON/BLAS and Python with PyTorch overhead.
+> That's the difference between optimized C with SIMD (NEON/AVX) + BLAS and Python with PyTorch overhead.
 >
 > **GPUs get worse on long text, we get better.** GPU RTF degrades 18–31% from short
 > to long text (attention scales quadratically even with FlashAttention). Our RTF *improves*

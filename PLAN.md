@@ -328,7 +328,7 @@ and sampling randomness (temp=0.9 default) heavily influences frame count.
   - Generic fallback for non-SIMD platforms
 - [x] `[LOW]` Persistent BF16 KV cache (halves KV memory, bf16 stored/read in attention)
 
-### 7.4 NEON SiLU for SwiGLU (feat/labs) — TESTED, NO GAIN
+### 7.4 SIMD SiLU for SwiGLU (NEON tested, feat/labs) — TESTED, NO GAIN
 
 SwiGLU activation (`silu(gate) * up`) uses scalar `expf()` in the hot loop.
 Called per-layer per-step: Talker (28 layers × 3072) + CP (5 layers × 15 passes × 3072)
@@ -355,7 +355,7 @@ choose quality (BF16) vs speed (INT8) without separate model files. The Talker s
 BF16 regardless — it's only 35% of frame time and more sensitive to precision.
 
 - [x] `[HIGH]` `--int8` CLI flag: quantize CP weights at load time (bf16→int8 per-row absmax)
-- [x] `[MED]` NEON int8→f32 matvec kernel (dequant on the fly, 2-row fused, multi-threaded)
+- [x] `[MED]` SIMD int8→f32 matvec kernel (NEON/AVX, dequant on the fly, 2-row fused, multi-threaded)
 - [x] `[MED]` Quality validation: same frame count (54), audio sounds correct
 - [ ] `[LOW]` AVX equivalent for x86
 
@@ -367,8 +367,8 @@ BF16 regardless — it's only 35% of frame time and more sensitive to precision.
 | 1.7B | 83.7 | 72.0 | ~14% |
 
 **0.6B**: No measurable speedup. Same root cause as INT4: cp_hidden=1024 matrices
-too small to be bandwidth-bound. INT8 dequant overhead (3 NEON ops/4 weights) cancels
-the halved bandwidth vs BF16 dequant (1 NEON op/4 weights via vshll).
+too small to be bandwidth-bound. INT8 dequant overhead (3 SIMD ops/4 weights on NEON,
+similar on AVX) cancels the halved bandwidth vs BF16 dequant (1 op/4 weights).
 
 **1.7B**: ~14% CP speedup (median of 5 runs). CP still has hidden=1024 but the larger
 Talker creates more memory pressure, making bandwidth savings from INT8 more visible.
@@ -379,8 +379,8 @@ Code is correct (same frame count, audio sounds good) and kept as `--int8` opt-i
 
 ### 7.6 SDOT/I8MM Integer Dot Product Kernels (optional, future — needs M2+ or AVX-512 to test)
 
-Current INT8 matvec dequantizes weights to f32 then does f32 FMA — 3 NEON ops per
-4 weights for dequant alone. Native integer dot product instructions can do int8×int8
+Current INT8 matvec dequantizes weights to f32 then does f32 FMA — 3 SIMD ops per
+4 weights for dequant alone (NEON/AVX). Native integer dot product instructions can do int8×int8
 multiplication directly in hardware, avoiding the f32 conversion entirely.
 
 **Available instructions (compile-time detection via preprocessor macros):**
@@ -612,7 +612,7 @@ The real gains come from **cache alignment** of BLAS buffers and KV cache, not m
 ### 10.3 Advanced (lower priority)
 
 - [x] `[SKIP]` **L1 cache blocking for matvec**: Analyzed — bf16 matvec kernel already optimal
-  (2-row fused, 32 elem/iter, 8 NEON accumulators). x vector (4KB) fits in L1, weight access
+  (2-row fused, 32 elem/iter, 8 SIMD accumulators NEON/AVX). x vector (4KB) fits in L1, weight access
   is sequential, HW prefetcher handles it. Bottleneck is memory bandwidth, not cache misses.
   *(2026-03-12)*
 
@@ -623,8 +623,8 @@ The real gains come from **cache alignment** of BLAS buffers and KV cache, not m
   buffers now persist in context across generations. Eliminates ~50MB of malloc/free traffic
   per generation in server mode. **Result: 38% faster on 2nd+ server request.** *(2026-03-12)*
 
-- [x] `[MED]` **NEON-optimize speech decoder**: Replaced scalar RMSNorm (6 instances),
-  scalar RoPE, and scalar attention with NEON-optimized versions. Added windowed causal
+- [x] `[MED]` **SIMD-optimize speech decoder**: Replaced scalar RMSNorm (6 instances),
+  scalar RoPE, and scalar attention with SIMD-optimized versions (NEON/AVX). Added windowed causal
   attention kernel. Batched VQ dequant projections with BLAS sgemm. **Result: speech decoder
   ~11% faster (1446ms → 1288ms).** *(2026-03-12)*
 
@@ -764,10 +764,10 @@ for <0.2% theoretical gain. Not worth the complexity.
 
 ## Phase 10f: SDOT/SMMLA INT8 Native Dot Product (Optional, Architecture-Specific)
 
-**Goal**: Use ARM NEON SDOT (`__ARM_FEATURE_DOTPROD`) instruction for native int8×int8
-dot products in the Code Predictor matvec, bypassing f32 dequantization entirely.
+**Goal**: Use native int8×int8 dot product instructions (ARM SDOT / x86 VNNI) for
+Code Predictor matvec, bypassing f32 dequantization entirely.
 
-**Context**: Current INT8 path dequantizes to f32 before multiply-accumulate (3 NEON ops).
+**Context**: Current INT8 path dequantizes to f32 before multiply-accumulate (3 SIMD ops).
 SDOT computes 4 × int8 dot products in a single instruction, accumulating into int32.
 This eliminates the dequant overhead that made INT8 neutral on 0.6B.
 
@@ -797,7 +797,7 @@ The main codebase should remain portable (bf16 matvec as default path).
 
 ---
 
-## Phase 10g: Scalar Hot Paths → NEON/Algorithm Optimization
+## Phase 10g: Scalar Hot Paths → SIMD (NEON/AVX) / Algorithm Optimization
 
 **Goal**: Vectorize remaining scalar C loops on hot paths and fix algorithmic
 inefficiencies (O(n²) sorts). These are the last major CPU-only wins before
@@ -833,24 +833,24 @@ threshold in a single pass. No SIMD needed, pure algorithm improvement.
 
 ---
 
-### 10g.2 Softmax: NEON Vectorized exp + Horizontal Sum
+### 10g.2 Softmax: SIMD Vectorized exp + Horizontal Sum (NEON/AVX)
 
 **What**: `sampling.c:34-44` — 3 scalar passes over vocab (2048): find max,
 compute `expf()` + sum, normalize. Called ~8000×/gen. 100% scalar.
 
-**Fix**: NEON 4-wide `vexpq_f32` approximation (or vDSP on macOS) + horizontal
-reduction. Keep generic fallback for non-NEON.
+**Fix**: SIMD 4-wide exp approximation (NEON `vexpq_f32` / AVX `_mm256_exp_ps`,
+or vDSP on macOS) + horizontal reduction. Keep generic fallback.
 
 | Metric | Value |
 |--------|-------|
-| Difficulty | MEDIUM — NEON exp approximation needs care for numerical stability |
+| Difficulty | MEDIUM — SIMD exp approximation needs care for numerical stability |
 | Risk | LOW-MEDIUM — exp approximation error must not change sampling distribution meaningfully |
-| Code invasion | LOW — contained in `qwen_tts_sampling.c`, dispatch via `#ifdef __ARM_NEON` |
+| Code invasion | LOW — contained in `qwen_tts_sampling.c`, dispatch via arch ifdef |
 | Expected gain | **2-4× faster softmax**, ~1-2% total frame time |
 | Calls/gen | ~8000 |
 
 **Note**: On macOS, `vvexpf()` from Accelerate is already fast with `-ffast-math`.
-Benchmark before implementing custom NEON exp to see if there's actual headroom.
+Benchmark before implementing custom SIMD exp to see if there's actual headroom.
 
 ---
 
@@ -873,37 +873,37 @@ top_p=0.9 only needs the top ~50-100 tokens sorted, not all 2048.
 
 ---
 
-### 10g.4 Speech Decoder: NEON Depthwise Conv (k=7)
+### 10g.4 Speech Decoder: SIMD Depthwise Conv (k=7) (NEON/AVX)
 
 **What**: `speech_decoder.c:971-981` — scalar depthwise conv, 1024 channels ×
 ~10k samples × kernel 7. Called in 2 ConvNeXt blocks per decode.
 
-**Fix**: NEON vectorize the inner kernel loop (7 multiply-accumulates). Process
-4 channels simultaneously with `vfmaq_f32`.
+**Fix**: SIMD vectorize the inner kernel loop (7 multiply-accumulates). Process
+4 channels simultaneously (NEON `vfmaq_f32` / AVX `_mm256_fmadd_ps`).
 
 | Metric | Value |
 |--------|-------|
-| Difficulty | MEDIUM — fixed kernel size (7) simplifies NEON, ~40 lines |
+| Difficulty | MEDIUM — fixed kernel size (7) simplifies SIMD, ~40 lines per arch |
 | Risk | LOW — pure computation, easy to verify bit-exact |
-| Code invasion | LOW — add NEON path alongside scalar in speech_decoder.c |
+| Code invasion | LOW — add NEON/AVX path alongside scalar in speech_decoder.c |
 | Expected gain | **1.5-2× faster depthwise conv**, ~2-3% of decoder time |
 | Calls/gen | 2 blocks × per-decode |
 
 ---
 
-### 10g.5 Speech Decoder: NEON LayerNorm Per-Timestep
+### 10g.5 Speech Decoder: SIMD LayerNorm Per-Timestep (NEON/AVX)
 
 **What**: `speech_decoder.c:986-999` — scalar LayerNorm across 1024 channels per
 timestep. 2 passes (sum+sum_sq, normalize). Called ~16k× per decode.
 
-**Fix**: NEON horizontal sum reduction + broadcast multiply. Process 4 channels
-per iteration with `vaddq_f32` accumulation.
+**Fix**: SIMD horizontal sum reduction + broadcast multiply. Process 4-8 channels
+per iteration (NEON `vaddq_f32` / AVX `_mm256_add_ps`).
 
 | Metric | Value |
 |--------|-------|
-| Difficulty | MEDIUM — similar to existing NEON RMSNorm, ~30 lines |
+| Difficulty | MEDIUM — similar to existing SIMD RMSNorm, ~30 lines per arch |
 | Risk | LOW — pure computation, easy to verify |
-| Code invasion | LOW — add NEON path in speech_decoder.c |
+| Code invasion | LOW — add NEON/AVX path in speech_decoder.c |
 | Expected gain | **2-3× faster LayerNorm**, ~1-2% of decoder time |
 | Calls/gen | ~16k timesteps |
 
@@ -955,10 +955,10 @@ only when `--int8` is enabled. Reduces `qwen_cp_layer_t` to ~132 bytes.
 |-------|------|------------|------|---------------|
 | 1 | 10g.1 Top-k quickselect | LOW | LOW | 2-3× top-k |
 | 2 | ~~10g.7 Separate INT8 from CP layer~~ | LOW | LOW | SKIP (see below) |
-| 3 | ~~10g.2 Softmax NEON~~ | MEDIUM | LOW-MED | SKIP (see below) |
+| 3 | ~~10g.2 Softmax SIMD (NEON/AVX)~~ | MEDIUM | LOW-MED | SKIP (see below) |
 | 4 | 10g.3 Top-p partial sort | MEDIUM | LOW | 5-10× top-p |
-| 5 | ~~10g.4 Depthwise conv NEON~~ | MEDIUM | LOW | SKIP (see below) |
-| 6 | ~~10g.5 LayerNorm NEON~~ | MEDIUM | LOW | SKIP (see below) |
+| 5 | ~~10g.4 Depthwise conv SIMD (NEON/AVX)~~ | MEDIUM | LOW | SKIP (see below) |
+| 6 | ~~10g.5 LayerNorm SIMD (NEON/AVX)~~ | MEDIUM | LOW | SKIP (see below) |
 | 7 | **10g.6 Streaming pipeline** | HIGH | MEDIUM | **DONE: RTF 2.0→1.38** |
 
 ### Results & Analysis (2026-03-13)
@@ -970,15 +970,15 @@ Codec head+sampling: 93ms → 21-24ms (**4× faster**). Output bit-identical.
 Removing INT8 fields saves ~660B but the bottleneck is weight data, not pointer
 loads. Code churn not worth ~2-3% theoretical cache improvement.
 
-**10g.2 Softmax NEON**: SKIP. Post-quickselect, total sampling is ~21ms/101 frames
-= 0.2ms/frame. Softmax is ~1.5ms of that (101 × 3072 expf). With `-ffast-math`
-on macOS, `expf` is already vectorized by the compiler via Accelerate. No headroom.
+**10g.2 Softmax SIMD (NEON/AVX)**: SKIP. Post-quickselect, total sampling is ~21ms/101 frames
+= 0.2ms/frame. Softmax is ~1.5ms of that (101 × 3072 expf). With `-ffast-math`,
+the compiler already vectorizes `expf` via platform libraries. No headroom.
 
 **10g.3 Top-p partial sort**: Low priority. Default top_p=1.0 already skips the
 sort entirely. Only triggered if user explicitly sets `--top-p 0.9` etc. Keep as
 optional future improvement.
 
-**10g.4 Depthwise conv NEON + 10g.5 LayerNorm NEON**: SKIP. The speech decoder
+**10g.4 Depthwise conv SIMD + 10g.5 LayerNorm SIMD (NEON/AVX)**: SKIP. The speech decoder
 runs in a decoder thread overlapped with generation. Decoder finishes BEFORE
 Talker+CP completes (9.9s decoder vs 10.8s generation). It's NOT the bottleneck.
 ConvNeXt depthwise (1.4M FLOPs) is 600× less compute than BLAS-accelerated PW1
@@ -1064,7 +1064,7 @@ Raw Metal with custom shaders keeps the zero-dependency philosophy.
 | **P12** | Phase 10d: Batch Embedding | ~~SKIPPED~~ — 0.13% of pipeline, not worth it | — |
 | **P13** | Phase 10e: Speculative CP | ~~ABANDONED~~ — codebook feedback loop makes it structurally unsafe | — |
 | **P14** | Phase 10f: SDOT INT8 | Native int8 dot product (optional, arch-specific) | Medium |
-| **P15** | Phase 10g: Scalar→NEON+Algo | Sampling vectorization, depthwise NEON, streaming pipeline | Medium |
+| **P15** | Phase 10g: Scalar→SIMD+Algo | Sampling vectorization, depthwise SIMD (NEON/AVX), streaming pipeline | Medium |
 | **P16** | Phase 11: Metal GPU | FlashAttention Metal shader, MLX eval (optional, M3/M4+) | High |
 
 ---

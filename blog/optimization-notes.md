@@ -1,16 +1,16 @@
 # From RTF 3.5 to RTF 1.26: Optimizing a Pure C TTS Engine
 
-*How cache alignment, NEON intrinsics, pipeline threading, algorithm fixes, and lessons from 1990s game programming nearly tripled our inference speed.*
+*How cache alignment, SIMD intrinsics (NEON/AVX), pipeline threading, algorithm fixes, and lessons from 1990s game programming nearly tripled our inference speed.*
 
 ## The Starting Point
 
 We have a pure C inference engine for Qwen3-TTS, a text-to-speech model with
 a 28-layer transformer (Talker), a 5-layer code predictor, and a convolutional
 speech decoder. No Python, no PyTorch, no GPU — just C, Apple Accelerate BLAS,
-and NEON intrinsics on an Apple M1 with 16 GB RAM.
+and SIMD intrinsics (NEON on ARM, AVX on x86) on an Apple M1 with 16 GB RAM.
 
-After getting the pipeline correct and implementing the first round of NEON
-kernels (fused 2-row bf16 matvec, unified QKV dispatch, fused gate+up SwiGLU),
+After getting the pipeline correct and implementing the first round of SIMD
+kernels (NEON/AVX: fused 2-row bf16 matvec, unified QKV dispatch, fused gate+up SwiGLU),
 we were at **RTF ~3.5** on short text and **RTF ~2.5** on longer text (the fixed
 costs of prefill and speech decoding amortize over longer audio).
 
@@ -37,8 +37,8 @@ alignment, struct layout, and how the CPU bus punishes you for sloppy memory
 access patterns.
 
 Here's the thing: **those lessons still apply.** The penalty isn't wait-states
-anymore — it's SIMD throughput. Modern CPUs like the Apple M1 have 128-bit
-NEON units that operate on 16-byte-aligned data natively. When you feed
+anymore — it's SIMD throughput. Modern CPUs have SIMD units (128-bit NEON on
+ARM, 256-bit AVX on x86) that operate on aligned data natively. When you feed
 misaligned buffers to BLAS routines like `cblas_sgemm`, the library can't
 use its fastest SIMD paths. Apple Accelerate checks alignment at runtime and
 falls back to slower code when buffers aren't aligned.
@@ -64,13 +64,13 @@ instruction or a BLAS call got 64-byte alignment (one cache line on M1).
 |-----------|--------|-------|-------------|
 | Prefill (BLAS sgemm) | 475ms | 260ms | **84%** |
 | Speech Decoder (BLAS sgemm) | 2,580ms | 1,648ms | **36%** |
-| Code Predictor (NEON matvec) | 66.4 ms/f | 60.8 ms/f | **9%** |
+| Code Predictor (SIMD matvec) | 66.4 ms/f | 60.8 ms/f | **9%** |
 | **Total pipeline** | **10.4s** | **7.9s** | **24%** |
 
 The prefill stage — which does batch matrix multiplication via `cblas_sgemm` —
 nearly doubled in speed. The speech decoder, which also relies heavily on
 sgemm for its convolutions, improved by 36%. Even the Code Predictor, which
-uses our hand-written NEON bf16 matvec kernel, gained 9% from aligned KV
+uses our hand-written SIMD bf16 matvec kernel (NEON/AVX), gained 9% from aligned KV
 cache and decode buffers.
 
 And the output is **bit-identical**. Same seed, same text, same bytes in the
@@ -92,9 +92,10 @@ code, zero dependencies, cross-platform.
 
 After the alignment win, we profiled again. The speech decoder still took
 ~1,650ms for 62 frames. Digging into the code, we found something
-embarrassing: **six scalar RMSNorm loops** that were never converted to NEON.
+embarrassing: **six scalar RMSNorm loops** that were never converted to SIMD.
 
-The Talker and Code Predictor used our NEON-optimized `qwen_rms_norm()`
+The Talker and Code Predictor used our SIMD-optimized `qwen_rms_norm()`
+(NEON on ARM, AVX on x86)
 function. But the speech decoder had its own hand-written scalar version:
 
 ```c
@@ -110,13 +111,13 @@ for (int s = 0; s < n_frames; s++) {
 qwen_rms_norm(x_norm, hidden, l->attn_norm, n_frames, dec_hidden, eps);
 ```
 
-The NEON version processes 8 floats per iteration with fused multiply-accumulate,
-versus one float at a time in the scalar version.
+The SIMD version (NEON on ARM, AVX on x86) processes 4-8 floats per iteration
+with fused multiply-accumulate, versus one float at a time in the scalar version.
 
 Same story with RoPE (rotary position embeddings) — the speech decoder had a
 scalar loop doing paired rotations at 32 elements per head. We replaced it
-with NEON intrinsics that process 4 pairs at once, fusing Q and K rotation
-in the same pass:
+with SIMD intrinsics that process 4 pairs at once, fusing Q and K rotation
+in the same pass (shown here with NEON; AVX variant in `qwen_tts_kernels_avx.c`):
 
 ```c
 // NEON: 4-wide fused Q+K rotation
@@ -130,8 +131,8 @@ vst1q_f32(kh + i,        vmlsq_f32(vmulq_f32(k1, c), k2, si));
 vst1q_f32(kh + i + half, vmlaq_f32(vmulq_f32(k2, c), k1, si));
 ```
 
-We also replaced the scalar attention dot-product loop with our NEON-optimized
-windowed causal attention kernel — online softmax with 16-element-wide dot
+We also replaced the scalar attention dot-product loop with our SIMD-optimized
+windowed causal attention kernel (NEON/AVX) — online softmax with wide dot
 products and fused V accumulation.
 
 And the VQ dequantization step, which did per-frame scalar matrix-vector
@@ -341,8 +342,8 @@ in L1. The bottleneck is the data these pointers *reference* (multi-MB weight
 matrices), not the 8-byte pointer loads themselves.
 
 **L1 cache blocking for matvec** (est. 3-5%, actual: not worth the complexity).
-Our bf16 matvec kernel already processes 2 rows at a time with 8 NEON
-accumulators, doing 32 elements per inner loop iteration. The input vector
+Our bf16 matvec kernel already processes 2 rows at a time with 8 SIMD
+accumulators (NEON/AVX), doing 32 elements per inner loop iteration. The input vector
 (4 KB for hidden=1024) fits entirely in L1. The weight matrix access is
 sequential, which the hardware prefetcher handles well. The bottleneck is
 main memory bandwidth (~10 GB/s effective out of 68 GB/s peak), not cache
@@ -356,17 +357,18 @@ cold misses, and those are unavoidable without smaller weights.
 
 **INT4/INT8 quantization on 0.6B** (tested, slower or neutral). The hidden
 dimension of 1024 produces matrices too small to be bandwidth-bound. The
-dequantization overhead (3 NEON ops for INT8, 8 ops for INT4) exceeds the
-bandwidth savings. BF16-to-f32 conversion is essentially free — a single
-`vshll` instruction. Quantization might help on the 1.7B model where matrices
+dequantization overhead (3 SIMD ops for INT8, 8 ops for INT4 on NEON; similar
+on AVX) exceeds the bandwidth savings. BF16-to-f32 conversion is essentially
+free — a single shift instruction (`vshll` on NEON, bit shift on AVX). Quantization might help on the 1.7B model where matrices
 are 4x larger.
 
-**Softmax NEON vectorization** (est. 2-4×, actual: not worth it). After
+**Softmax SIMD vectorization** (est. 2-4×, actual: not worth it). After
 quickselect reduced total sampling from 93ms to 21ms, softmax is only ~1.5ms
-of the remaining 21ms. With `-ffast-math`, clang already vectorizes `expf`
-via Apple Accelerate. No headroom for custom NEON exp.
+of the remaining 21ms. With `-ffast-math`, the compiler already vectorizes
+`expf` via platform libraries (Accelerate on macOS, libm on Linux). No
+headroom for custom NEON/AVX exp.
 
-**Speech decoder depthwise conv / LayerNorm NEON** (est. 1.5-3×, actual: not
+**Speech decoder depthwise conv / LayerNorm SIMD** (est. 1.5-3×, actual: not
 worth it). The speech decoder runs in a background thread overlapped with
 generation. It finishes *before* Talker+CP complete — it's not the bottleneck.
 ConvNeXt depthwise conv does 1.4M FLOPs vs 838M FLOPs for the BLAS-accelerated
@@ -432,7 +434,7 @@ thread overlap delivers the best RTF at **1.26**.
 7. **Check your algorithms, not just your SIMD.** A 4× sampling speedup from
    replacing selection sort with quickselect — no intrinsics, no threading,
    just a better algorithm. Profile first, but when you find O(kn) in a hot
-   loop, fix the algorithm before reaching for NEON.
+   loop, fix the algorithm before reaching for SIMD.
 
 8. **Unify code paths.** Streaming was 30% slower because it had its own
    synchronous decode path. When we unified it with the decoder thread (the
