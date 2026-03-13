@@ -154,13 +154,19 @@ M1 has SDOT but not SMMLA; the 0.6B model is too small to be bandwidth-bound any
 
 ---
 
-### Phase 14: Metal GPU / MLX (M3/M4+ only)
+### Phase 14: Metal GPU / MLX
 
-**Context**: Metal backend was previously implemented and removed (1.3x slower on M1).
-Metal 4 (2025) introduces tensor first-class support and ~4.7x transformer speedups.
-FlashAttention on GPU could fuse QKV+attention+softmax into one kernel.
+**Context**: Metal backend was previously implemented and benchmarked on M1 — **1.3x slower
+than CPU NEON**. Root cause: unified memory means CPU and GPU share the same bandwidth ceiling,
+and our workload (bf16 matvec) is already bandwidth-bound. GPU adds kernel launch overhead
+without gaining bandwidth.
 
-**When to revisit**: Only when M3/M4 hardware is available.
+Metal 4 (2025, M3/M4) introduces tensor first-class support and ~4.7x transformer speedups.
+FlashAttention on GPU could fuse QKV+attention+softmax into one kernel, reducing memory
+round-trips. Higher bandwidth on newer chips (M3: 100GB/s, M4 Pro: 273GB/s vs M1: 68GB/s)
+could tip the balance.
+
+**When to revisit**: When M3/M4 hardware is available to benchmark. M1/M2 unlikely to benefit.
 
 - [ ] `[LOW]` Prototype fused attention Metal shader (FlashAttention-style)
 - [ ] `[LOW]` Benchmark vs CPU on M3/M4 (must beat CPU to justify inclusion)
