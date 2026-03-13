@@ -118,6 +118,9 @@ make info       # Show build configuration
 ```bash
 make test-small       # Run 0.6B tests (English, Italian, multiple speakers)
 make test-large       # Run 1.7B tests (config check, English, Italian, instruct styles)
+make test-large-int8  # Run 1.7B INT8 quantization tests (Italian + English, seed 42)
+make test-large-int4  # Run 1.7B INT4 quantization tests (Italian + English, seed 42)
+make test-large-quant # Run all 1.7B quantization tests (INT8 + INT4)
 make test-regression  # Cross-model regression checks (safetensors, config parsing)
 make test-all         # Run everything (0.6B + 1.7B + regression)
 make test-serve          # HTTP server integration test (health, speakers, TTS)
@@ -142,7 +145,7 @@ Optional:
   -s, --speaker <name>       Speaker voice (default: ryan)
   -l, --language <lang>      Target language (default: English)
   -I, --instruct <text>      Style/emotion instruction (1.7B model only)
-  --temperature <f>          Sampling temperature (default: 0.9)
+  --temperature <f>          Sampling temperature (default: 0.5)
   --top-k <n>                Top-k sampling (default: 50)
   --top-p <f>                Top-p nucleus sampling (default: 1.0)
   --rep-penalty <f>          Repetition penalty (default: 1.05)
@@ -152,13 +155,15 @@ Optional:
   --voice-design             VoiceDesign mode (create voice from --instruct)
   --ref-audio <path>         Reference audio for voice cloning (Base model)
   --xvector-only             Use speaker embedding only (no ref text/codes)
-  --save-voice <path>        Save speaker embedding to file for reuse
-  --load-voice <path>        Load speaker embedding (skip extraction)
+  --save-voice <path>        Save voice profile (.qvoice with ICL data, or .bin for raw embedding)
+  --load-voice <path>        Load voice profile (.qvoice or legacy .bin)
   --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)
   -j, --threads <n>          Worker threads (default: 4)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
   --stream-chunk <n>         Frames per stream chunk (default: 10 = 0.8s)
+  --int8                     INT8 quantized Talker + Code Predictor (1.7B recommended)
+  --int4                     Q4_0 quantized Talker (1.7B only, experimental)
   --silent                   Suppress status output
   --debug                    Verbose diagnostics
 ```
@@ -200,6 +205,34 @@ Optional:
 > **Note:** The `--instruct` flag only works with the 1.7B model. The 0.6B model does not
 > support style control and will ignore the instruction.
 
+### Weight Quantization (1.7B model)
+
+The `--int8` and `--int4` flags quantize Talker weights at load time, reducing memory usage and (for INT8) improving speed on the 1.7B model. These flags have no meaningful effect on the 0.6B model (matrices too small to be bandwidth-bound).
+
+```bash
+# INT8 — recommended for 1.7B (15% Talker speedup, good quality)
+./qwen_tts -d qwen3-tts-1.7b --text "Hello world" --int8 -o hello.wav
+
+# INT4 — experimental, smaller memory but no speed gain
+./qwen_tts -d qwen3-tts-1.7b --text "Hello world" --int4 -o hello.wav
+```
+
+**Comparison (1.7B, Italian, seed=42, Apple M1 16 GB, 4 threads):**
+
+| Config | Talker ms/f | Total time | RTF | Talker RAM |
+|--------|-------------|------------|-----|------------|
+| BF16 (default) | ~80 ms/f | ~13s | ~4.3 | 2.8 GB (mmap) |
+| **INT8 (recommended)** | **~67 ms/f** | **~11s** | **~3.6** | **1.4 GB** |
+| INT4 (experimental) | ~83 ms/f | ~14s | ~4.5 | 0.7 GB |
+
+> **Recommendation:** Use `--int8` for the 1.7B model. It gives 15% Talker speedup with
+> good audio quality. INT4 saves memory but is slightly *slower* due to nibble unpacking
+> overhead. For maximum speed, use the 0.6B model (RTF ~1.3–1.7 vs 3.6 for 1.7B INT8).
+>
+> On systems with 16+ GB free RAM, expected performance is better than shown above
+> (our test machine had high system memory pressure from other applications).
+> Projected RTF with free RAM: **0.6B ~1.3, 1.7B BF16 ~3.0, 1.7B INT8 ~2.5**.
+
 ### Seed & Reproducibility
 
 By default, each run uses a time-based random seed, so the same text produces slightly different audio each time. Use `--seed` for reproducible output:
@@ -214,7 +247,7 @@ By default, each run uses a time-based random seed, so the same text produces sl
 ```
 
 > **Note:** Audio quality varies across seeds — this is inherent to the model's sampling
-> process (temperature=0.9 by default). Some seeds sound better than others. If a particular
+> process (temperature=0.5 by default). Some seeds sound better than others. If a particular
 > generation sounds off, try a different seed or lower the temperature. Duration also varies
 > significantly (3-7x range for the same text), which is normal model behavior.
 
@@ -249,11 +282,13 @@ Create entirely new voices from natural language descriptions using the VoiceDes
 
 ### Voice Cloning
 
-Clone any voice from a short reference audio clip using the Base model:
+Clone any voice from a short reference audio clip. **Requires a Base model** — the
+CustomVoice models (0.6B, 1.7B) do NOT support voice cloning.
 
 ```bash
 # Download the Base model (has speaker encoder for voice cloning)
-./download_model.sh --model base-small
+./download_model.sh --model base-small   # 0.6B-Base
+./download_model.sh --model base-large   # 1.7B-Base
 
 # Clone a voice from a WAV file
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Hello, this is my cloned voice." \
@@ -262,12 +297,68 @@ Clone any voice from a short reference audio clip using the Base model:
 # Clone with Italian text
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Ciao, questa e la mia voce clonata." \
     --ref-audio reference.wav -o cloned_it.wav
+```
 
-# Save voice embedding for reuse (avoids re-extracting each time)
+#### Reusable Voice Profiles (`.qvoice`)
+
+Save a cloned voice to a `.qvoice` file once, then reuse it for any text without
+re-processing the reference audio. This skips mel spectrogram extraction, speaker
+encoding, and speech encoding — giving a **2x speedup** on subsequent generations.
+
+```bash
+# Step 1: Create a .qvoice profile from reference audio (no --text needed)
+#   Encodes audio and saves: speaker embedding + ICL codec tokens + transcript
+./qwen_tts -d qwen3-tts-0.6b-base \
+    --ref-audio reference.wav --ref-text "Exact transcript of the reference audio." \
+    --save-voice my_voice.qvoice
+
+# Step 2: Reuse the saved voice for any new text (no ref audio needed)
+./qwen_tts -d qwen3-tts-0.6b-base \
+    --load-voice my_voice.qvoice \
+    --text "A completely different sentence." -o output.wav
+
+# Works with the 1.7B Base model too (same .qvoice file)
+./qwen_tts -d qwen3-tts-1.7b-base \
+    --load-voice my_voice.qvoice \
+    --text "Same voice, bigger model." -o output_1.7b.wav
+```
+
+**Performance comparison** (Apple M1 8-core, 4 threads, 0.6B-Base, ~4s output):
+
+| Mode | Prefill | Total | RTF | Notes |
+|------|---------|-------|-----|-------|
+| From WAV (`--ref-audio`) | 2.8s | 21.6s | 4.91 | Mel + speaker enc + speech enc + generate |
+| From `.qvoice` (`--load-voice`) | 1.7s | 9.8s | 2.23 | Load file + generate (no audio processing) |
+
+The `.qvoice` format is compact (~20-50KB for a typical 3-10s reference clip) and
+portable across 0.6B-Base and 1.7B-Base models (same codec tokens).
+
+> **Important:** `.qvoice` files only work with **Base** models (`0.6B-Base`, `1.7B-Base`).
+> They cannot be used with CustomVoice or VoiceDesign models.
+
+#### Managing Voice Profiles
+
+```bash
+# List all .qvoice files in a directory
+./qwen_tts --list-voices ./my_voices/
+
+# Inspect a single .qvoice file
+./qwen_tts --list-voices my_voice.qvoice
+
+# Delete a voice profile
+./qwen_tts --delete-voice ./my_voices/old_voice.qvoice
+```
+
+These commands don't require a model — they read/manage the `.qvoice` files directly.
+
+#### Legacy format
+
+Raw speaker embedding files (`.bin`) are still supported for backward compatibility,
+but they only store the x-vector (lower quality than ICL mode with `.qvoice`):
+
+```bash
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Hello" \
     --ref-audio reference.wav --save-voice my_voice.bin -o out.wav
-
-# Load saved voice (faster — skips mel spectrogram + speaker encoder)
 ./qwen_tts -d qwen3-tts-0.6b-base --text "Another sentence" \
     --load-voice my_voice.bin -o out2.wav
 ```
@@ -442,7 +533,7 @@ Server mode adds warm caches, embedding cache, and decoder thread overlap on top
   "language": "English",
   "instruct": "Speak cheerfully",
   "seed": 42,
-  "temperature": 0.9,
+  "temperature": 0.5,
   "top_k": 50,
   "top_p": 1.0,
   "rep_penalty": 1.05
@@ -450,7 +541,7 @@ Server mode adds warm caches, embedding cache, and decoder thread overlap on top
 ```
 
 All fields except `text` are optional. Defaults: speaker=ryan, language=English,
-temperature=0.9, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
+temperature=0.5, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
 Each request starts from clean defaults — parameters do not leak between requests.
 
 ## How It Works
@@ -489,8 +580,10 @@ The Code Predictor has the same architecture in both models (hidden=1024, 5 laye
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
 
 - **0.6B**: RTF ~1.3–1.7 depending on audio length and mode (server warm + long text = best)
+- **1.7B**: RTF ~3.0–4.3 (BF16), ~2.5–3.6 with `--int8` (recommended)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
-- SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16 matrix-vector operations
+- SIMD-optimized kernels (NEON on ARM, AVX on x86) for BF16/INT8 matrix-vector operations
+- Optional INT8/INT4 Talker quantization for the 1.7B model (see [Weight Quantization](#weight-quantization-17b-model))
 - Cache-line aligned buffers (64B `posix_memalign`) for optimal BLAS/SIMD throughput
 - Multi-threaded inference via GCD (`dispatch_apply`) on macOS, pthreads on Linux
 

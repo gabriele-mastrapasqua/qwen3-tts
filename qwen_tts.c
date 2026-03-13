@@ -15,6 +15,8 @@
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 int qwen_verbose = 0;
 
@@ -481,7 +483,7 @@ static void *decoder_thread_fn(void *arg) {
 qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     qwen_tts_ctx_t *ctx = (qwen_tts_ctx_t *)calloc(1, sizeof(qwen_tts_ctx_t)); if (!ctx) return NULL;
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
-    ctx->temperature = 0.9f; ctx->top_k = 50; ctx->top_p = 1.0f; ctx->rep_penalty = 1.05f;
+    ctx->temperature = 0.5f; ctx->top_k = 50; ctx->top_p = 1.0f; ctx->rep_penalty = 1.05f;
     ctx->max_tokens = 8192; ctx->cp_temperature = 0.0f; ctx->cp_top_k = 1;
     ctx->stream_chunk_frames = 10; /* default: 10 frames = 0.8s audio per chunk */
     /* Default speaker: Ryan (3061) - native English speaker
@@ -635,6 +637,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->cached_tts_pad_embed); free(ctx->cached_tts_bos_embed); free(ctx->cached_tts_eos_embed);
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
+    free(ctx->prev_input_embeds); free(ctx->cached_ref_codes);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
 }
@@ -810,12 +813,25 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_PAD, codec_pad_embed);
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_BOS, codec_bos_embed);
 
-    /* === ICL mode: encode reference audio === */
+    /* === ICL mode: use cached ref_codes (.qvoice) or encode reference audio === */
     int *ref_codes = NULL;
     int ref_n_frames = 0;
-    int icl_mode = (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text
-                    && ref_text_tokens && ref_text_token_len > 0);
-    if (icl_mode) {
+    int ref_codes_owned = 0;  /* 1 if we allocated ref_codes and must free it */
+    int icl_mode = 0;
+
+    /* Check for cached ref_codes from .qvoice file */
+    if (ctx->voice_clone && ctx->cached_ref_codes && ctx->cached_ref_n_frames > 0
+        && ctx->ref_text && ref_text_tokens && ref_text_token_len > 0) {
+        ref_codes = ctx->cached_ref_codes;
+        ref_n_frames = ctx->cached_ref_n_frames;
+        icl_mode = 1;
+        if (!ctx->silent)
+            fprintf(stderr, "ICL: using %d cached ref frames from .qvoice\n", ref_n_frames);
+    }
+    /* Otherwise encode from ref audio file */
+    else if (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text
+             && ref_text_tokens && ref_text_token_len > 0) {
+        icl_mode = 1;
         float *ref_audio_samples = NULL;
         int ref_n_samples = 0, ref_sr = 0;
         if (qwen_read_wav(ctx->ref_audio_path, &ref_audio_samples, &ref_n_samples, &ref_sr) != 0) {
@@ -831,6 +847,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                 icl_mode = 0;
             }
             free(ref_audio_samples);
+            ref_codes_owned = 1;
         }
     }
 
@@ -945,8 +962,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                         && code_g < ctx->config.codebook_size) {
                         const uint16_t *emb = ctx->cp_codec_emb_bf16[g]
                                               + (int64_t)code_g * h;
-                        for (int j = 0; j < h; j++)
-                            dst[j] += bf16_to_f32(emb[j]);
+                        qwen_bf16_accum_f32(dst, emb, h);
                     }
                 }
             }
@@ -981,7 +997,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(tmp_embed);
     /* tts_pad/bos/eos_embed are ctx-owned cache — do not free */
     free(ref_text_tokens);
-    free(ref_codes);
+    if (ref_codes_owned) free(ref_codes);
 
     free(codec_pad_embed);
     free(codec_bos_embed);
@@ -1008,15 +1024,67 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "[CORR] pre-prefill: pre_conv_w[0]=%.6f\n", ctx->speech_dec.pre_conv_weight[0]);
     }
 
-    /* Talker prefill */
-    double t_prefill = time_ms();
-    if (qwen_talker_prefill(ctx, input_embeds, prefill_len) != 0) {
-        free(input_embeds);
-        return -1;
+    /* Delta prefill: compare with previous embeddings to find reusable KV prefix.
+     * For server mode, consecutive calls with the same speaker/language share
+     * the role+codec prefix (~8-9 tokens), so we skip re-prefilling those. */
+    int delta_start = 0;
+    if (ctx->prev_input_embeds && ctx->prev_prefill_len > 0) {
+        int max_match = (prefill_len < ctx->prev_prefill_len) ? prefill_len : ctx->prev_prefill_len;
+        for (int t = 0; t < max_match; t++) {
+            if (memcmp(input_embeds + (int64_t)t * h,
+                       ctx->prev_input_embeds + (int64_t)t * h,
+                       h * sizeof(float)) != 0)
+                break;
+            delta_start = t + 1;
+        }
     }
-    free(input_embeds);
+
+    /* Reset KV cache to the reusable prefix length */
+    ctx->kv_len = delta_start;
+
+    double t_prefill = time_ms();
+    if (delta_start < prefill_len) {
+        if (delta_start > 0 || ctx->use_int8 || ctx->use_int4) {
+            /* Sequential prefill for delta tokens (or all tokens in quantized mode).
+             * When delta_start > 0, we must use sequential step because the BLAS
+             * batch prefill assumes it processes the full sequence from position 0.
+             * For quantized mode, sequential avoids needing BF16 weights for sgemm. */
+            float *dummy_hidden = (float *)malloc(h * sizeof(float));
+            for (int t = delta_start; t < prefill_len; t++) {
+                if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
+                    free(input_embeds); free(dummy_hidden);
+                    return -1;
+                }
+            }
+            free(dummy_hidden);
+        } else {
+            /* Full BLAS batch prefill (first call, no delta, no quantization) */
+            if (qwen_talker_prefill(ctx, input_embeds, prefill_len) != 0) {
+                free(input_embeds);
+                return -1;
+            }
+        }
+    }
     double prefill_ms = time_ms() - t_prefill;
-    if (!ctx->silent) fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
+    if (!ctx->silent) {
+        if (delta_start > 0)
+            fprintf(stderr, "  Prefill: %.0f ms (delta: %d new tokens, %d cached)\n",
+                    prefill_ms, prefill_len - delta_start, delta_start);
+        else
+            fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
+    }
+
+    /* Cache current embeddings for delta prefill on next call */
+    if (!ctx->prev_input_embeds || ctx->prev_prefill_len < prefill_len) {
+        free(ctx->prev_input_embeds);
+        ctx->prev_input_embeds = (float *)malloc((int64_t)prefill_len * h * sizeof(float));
+    }
+    if (ctx->prev_input_embeds) {
+        memcpy(ctx->prev_input_embeds, input_embeds, (int64_t)prefill_len * h * sizeof(float));
+        ctx->prev_prefill_len = prefill_len;
+    }
+
+    free(input_embeds);
 
     /* Debug: check speech decoder weights after prefill */
     if (ctx->debug && ctx->speech_dec.pre_conv_weight) {
@@ -1145,7 +1213,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             int code_g = codes[g + 1];
             if (ctx->cp_codec_emb_bf16[g] && code_g >= 0 && code_g < ctx->config.codebook_size) {
                 const uint16_t *emb = ctx->cp_codec_emb_bf16[g] + (int64_t)code_g * h;
-                for (int j = 0; j < h; j++) step_embed[j] += bf16_to_f32(emb[j]);
+                qwen_bf16_accum_f32(step_embed, emb, h);
             }
         }
 

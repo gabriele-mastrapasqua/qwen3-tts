@@ -72,12 +72,12 @@ Architecture/background references:
 
 From `qwen_tts_load()` and CLI:
 - Speaker ID: `0` (first preset voice)
-- Temperature: `0.9`
+- Temperature: `0.5`
 - Top-k: `50`
 - Top-p: `1.0`
 - Repetition penalty: `1.05`
 - Max new tokens: `8192`
-- Code Predictor temperature: `0.9`
+- Code Predictor temperature: `0.0` (greedy)
 - Code Predictor top-k: `50`
 - Output file: `output.wav`
 

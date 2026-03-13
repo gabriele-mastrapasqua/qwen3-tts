@@ -473,10 +473,10 @@ Unlike ASR which uses greedy argmax, TTS requires sampling:
 - Top-p (nucleus): keep smallest set of tokens whose cumulative probability >= p
 - Repetition penalty: divide logits of previously generated tokens by penalty factor
 
-Default parameters: temperature=0.9, top_k=50, top_p=1.0, repetition_penalty=1.05
+Default parameters: temperature=0.5, top_k=50, top_p=1.0, repetition_penalty=1.05
 
 The Code Predictor uses separate sampling parameters:
-code_predictor_temperature=0.9, code_predictor_top_k=50
+code_predictor_temperature=0.0 (greedy), code_predictor_top_k=1
 
 ---
 

@@ -73,6 +73,30 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
                                  int8_t *dst_int8, float *dst_scale);
 
+/* Q4_0 block: 32 weights packed into 18 bytes (16 nibble-pairs + fp32 scale) */
+#define Q4_0_BLOCK_SIZE 32
+typedef struct {
+    float scale;           /* per-block scale factor */
+    uint8_t qs[16];        /* 32 nibbles: low 4 bits = even idx, high 4 bits = odd idx */
+} q4_0_block_t;            /* 20 bytes per 32 weights */
+
+/* Quantize bf16 weight matrix to Q4_0 blocks.
+ * cols must be a multiple of 32. Returns number of blocks per row = cols/32.
+ * dst must have rows * (cols/32) blocks pre-allocated. */
+void qwen_quantize_bf16_to_q4_0(const uint16_t *src_bf16, int rows, int cols,
+                                 q4_0_block_t *dst);
+
+/* Q4_0 matvec: y[rows] = dequant(W_q4[rows, cols/32 blocks]) @ x[cols]
+ * NEON-optimized + multi-threaded. */
+void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
+                       int rows, int cols);
+
+/* Unified QKV matvec (Q4_0 variant) */
+void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
+                            const q4_0_block_t *Wq, const q4_0_block_t *Wk,
+                            const q4_0_block_t *Wv,
+                            const float *x, int in_dim, int q_dim, int kv_dim);
+
 /* ========================================================================
  * Attention
  * ======================================================================== */
@@ -112,6 +136,11 @@ void qwen_apply_rope_interleaved(float *x, const float *cos_vals, const float *s
 /* SiLU: x = x / (1 + exp(-x)) */
 void qwen_silu(float *x, int n);
 
+/* Fused SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, silu(g1)*u1, ...]
+ * Uses vvexpf (Accelerate) on macOS for batch exp, scalar loop elsewhere.
+ * tmp must have space for n floats (used for batch exp). */
+void qwen_swiglu_inplace(float *gate_up, float *tmp, int n);
+
 /* Add: y += x */
 void qwen_add_inplace(float *y, const float *x, int n);
 
@@ -123,6 +152,10 @@ void qwen_vec_scale_inplace(float *y, float s, int n);
 
 /* bf16 rounding */
 void qwen_round_bf16(float *x, int n);
+
+/* Accumulate bf16 vector into f32: dst[i] += bf16_to_f32(src[i])
+ * NEON/AVX optimized for batch BF16→F32 conversion + addition. */
+void qwen_bf16_accum_f32(float *dst, const uint16_t *src_bf16, int n);
 
 /* Snake activation: x += (1/exp(beta)) * sin²(exp(alpha) * x)
  * Applied per-channel to channel-first data [channels, length].

@@ -16,4 +16,6 @@ __pycache__/
 .DS_Store
 TODO.md
 weights.bin
+bench_scalar
+bench_simd
 .claude/

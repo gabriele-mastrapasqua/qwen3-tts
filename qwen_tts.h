@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <pthread.h>
 
+#include "qwen_tts_kernels.h"
 #include "qwen_tts_voice_clone.h"
 
 /* ========================================================================
@@ -143,6 +144,28 @@ typedef struct {
 
     /* Fused gate+up for optimization */
     uint16_t *gate_up_fused_bf16; /* [2*inter, hidden] */
+
+    /* INT8 quantized weights (optional, allocated if --int8 flag is set) */
+    int8_t *wq_int8;              /* [q_dim, hidden] */
+    float  *wq_scale;             /* [q_dim] per-row scale */
+    int8_t *wk_int8;              /* [kv_dim, hidden] */
+    float  *wk_scale;             /* [kv_dim] */
+    int8_t *wv_int8;              /* [kv_dim, hidden] */
+    float  *wv_scale;             /* [kv_dim] */
+    int8_t *wo_int8;              /* [hidden, q_dim] */
+    float  *wo_scale;             /* [hidden] */
+    int8_t *gate_up_fused_int8;   /* [2*inter, hidden] */
+    float  *gate_up_fused_scale;  /* [2*inter] */
+    int8_t *down_int8;            /* [hidden, inter] */
+    float  *down_scale;           /* [hidden] */
+
+    /* Q4_0 quantized weights (optional, allocated if --int4 flag is set) */
+    q4_0_block_t *wq_q4;              /* [q_dim, hidden/32 blocks] */
+    q4_0_block_t *wk_q4;              /* [kv_dim, hidden/32 blocks] */
+    q4_0_block_t *wv_q4;              /* [kv_dim, hidden/32 blocks] */
+    q4_0_block_t *wo_q4;              /* [hidden, q_dim/32 blocks] */
+    q4_0_block_t *gate_up_fused_q4;   /* [2*inter, hidden/32 blocks] */
+    q4_0_block_t *down_q4;            /* [hidden, inter/32 blocks] */
 } qwen_talker_layer_t;
 
 /* ========================================================================
@@ -339,6 +362,7 @@ typedef struct qwen_tts_ctx {
     int silent;
     int debug;
     int use_int8;  /* INT8 quantized Code Predictor weights */
+    int use_int4;  /* Q4_0 quantized Talker weights (1.7B only) */
     
     /* Sampling parameters */
     float temperature;
@@ -366,6 +390,10 @@ typedef struct qwen_tts_ctx {
     float max_ref_seconds;       /* Max ref audio duration for embedding (0=all, default 15) */
     char *ref_audio_path;        /* Path to reference audio file */
     char *ref_text;              /* Reference text for ICL mode */
+
+    /* Cached ICL data (for .qvoice save/load) */
+    int *cached_ref_codes;       /* [cached_ref_n_frames × 16] codec tokens from speech encoder */
+    int cached_ref_n_frames;     /* Number of reference codec frames */
 
     /* Base model type */
     int is_base_model;           /* 1 = Base model, 0 = CustomVoice/VoiceDesign */
@@ -435,6 +463,7 @@ typedef struct qwen_tts_ctx {
     float *dec_gate;
     float *dec_up;
     float *dec_ffn_out;
+    float *swiglu_tmp;  /* Temp buffer for batch vvexpf in SwiGLU */
     
     /* CP decode buffers */
     float *cp_dec_x;
@@ -511,6 +540,12 @@ typedef struct qwen_tts_ctx {
         int count;          /* entries currently cached */
         uint32_t clock;     /* global access counter */
     } emb_cache;
+
+    /* Delta prefill cache: store previous prompt embeddings for KV reuse.
+     * On repeat calls with same speaker/language, the prompt prefix
+     * (role + codec) is identical — we skip re-prefilling those tokens. */
+    float *prev_input_embeds;    /* [prev_prefill_len × hidden] */
+    int prev_prefill_len;        /* length of cached embeddings */
 
 } qwen_tts_ctx_t;
 

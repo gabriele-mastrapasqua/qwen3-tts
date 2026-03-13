@@ -258,6 +258,78 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
         #undef LOAD_F32
     }
 
+    /* INT8 quantization of Talker weights (optional, enabled by --int8 flag) */
+    if (ctx->use_int8) {
+        if (!ctx->silent)
+            fprintf(stderr, "  Quantizing Talker weights to INT8 (per-row absmax)...\n");
+        int inter = c->intermediate_size;
+        for (int i = 0; i < c->num_layers; i++) {
+            qwen_talker_layer_t *l = &ctx->layers[i];
+
+            /* QKV + O projections */
+            l->wq_int8 = (int8_t *)malloc((size_t)q_dim * h);
+            l->wq_scale = (float *)malloc(q_dim * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wq_bf16, q_dim, h, l->wq_int8, l->wq_scale);
+
+            l->wk_int8 = (int8_t *)malloc((size_t)kv_dim * h);
+            l->wk_scale = (float *)malloc(kv_dim * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wk_bf16, kv_dim, h, l->wk_int8, l->wk_scale);
+
+            l->wv_int8 = (int8_t *)malloc((size_t)kv_dim * h);
+            l->wv_scale = (float *)malloc(kv_dim * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wv_bf16, kv_dim, h, l->wv_int8, l->wv_scale);
+
+            l->wo_int8 = (int8_t *)malloc((size_t)h * q_dim);
+            l->wo_scale = (float *)malloc(h * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->wo_bf16, h, q_dim, l->wo_int8, l->wo_scale);
+
+            /* Fused gate+up + down */
+            l->gate_up_fused_int8 = (int8_t *)malloc((size_t)2 * inter * h);
+            l->gate_up_fused_scale = (float *)malloc(2 * inter * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->gate_up_fused_bf16, 2 * inter, h,
+                                        l->gate_up_fused_int8, l->gate_up_fused_scale);
+
+            l->down_int8 = (int8_t *)malloc((size_t)h * inter);
+            l->down_scale = (float *)malloc(h * sizeof(float));
+            qwen_quantize_bf16_to_int8(l->down_bf16, h, inter, l->down_int8, l->down_scale);
+        }
+        if (!ctx->silent)
+            fprintf(stderr, "  Talker INT8 quantization done (%d layers)\n", c->num_layers);
+    }
+
+    /* Q4_0 quantization of Talker weights (optional, enabled by --int4 flag) */
+    if (ctx->use_int4) {
+        if (!ctx->silent)
+            fprintf(stderr, "  Quantizing Talker weights to Q4_0 (4-bit)...\n");
+        int inter = c->intermediate_size;
+        int q_bpr = h / Q4_0_BLOCK_SIZE;          /* blocks per row for hidden dim */
+        int qd_bpr = q_dim / Q4_0_BLOCK_SIZE;     /* blocks per row for q_dim */
+        int i_bpr = inter / Q4_0_BLOCK_SIZE;       /* blocks per row for inter dim */
+        for (int i = 0; i < c->num_layers; i++) {
+            qwen_talker_layer_t *l = &ctx->layers[i];
+
+            l->wq_q4 = (q4_0_block_t *)malloc((size_t)q_dim * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wq_bf16, q_dim, h, l->wq_q4);
+
+            l->wk_q4 = (q4_0_block_t *)malloc((size_t)kv_dim * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wk_bf16, kv_dim, h, l->wk_q4);
+
+            l->wv_q4 = (q4_0_block_t *)malloc((size_t)kv_dim * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wv_bf16, kv_dim, h, l->wv_q4);
+
+            l->wo_q4 = (q4_0_block_t *)malloc((size_t)h * qd_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->wo_bf16, h, q_dim, l->wo_q4);
+
+            l->gate_up_fused_q4 = (q4_0_block_t *)malloc((size_t)2 * inter * q_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->gate_up_fused_bf16, 2 * inter, h, l->gate_up_fused_q4);
+
+            l->down_q4 = (q4_0_block_t *)malloc((size_t)h * i_bpr * sizeof(q4_0_block_t));
+            qwen_quantize_bf16_to_q4_0(l->down_bf16, h, inter, l->down_q4);
+        }
+        if (!ctx->silent)
+            fprintf(stderr, "  Talker Q4_0 quantization done (%d layers)\n", c->num_layers);
+    }
+
     /* Allocate KV cache (bf16 — halves memory vs f32) */
     int initial_kv_max = 2048;
     int64_t kv_size = (int64_t)c->num_layers * initial_kv_max * kv_dim;
@@ -277,6 +349,10 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
     ctx->dec_gate = (float *)aligned_malloc(2 * c->intermediate_size * sizeof(float));
     ctx->dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
     ctx->dec_ffn_out = (float *)aligned_malloc(h * sizeof(float));
+    /* SwiGLU tmp buffer: max of Talker inter and CP inter (CP allocated later, but inter is known) */
+    int swiglu_size = c->intermediate_size;
+    if (c->cp_intermediate_size > swiglu_size) swiglu_size = c->cp_intermediate_size;
+    ctx->swiglu_tmp = (float *)aligned_malloc(swiglu_size * sizeof(float));
 
     /* Allocate RoPE cache */
     int rope_max = 8192;
@@ -330,9 +406,20 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, l->input_norm, 1, h, eps);
 
         /* 2. QKV projections (unified dispatch — single barrier for all 3) */
-        qwen_matvec_bf16_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
-                              l->wq_bf16, l->wk_bf16, l->wv_bf16,
-                              ctx->dec_x_norm, h, q_dim, kv_dim);
+        if (l->wq_q4)
+            qwen_matvec_q4_0_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
+                                  l->wq_q4, l->wk_q4, l->wv_q4,
+                                  ctx->dec_x_norm, h, q_dim, kv_dim);
+        else if (l->wq_int8)
+            qwen_matvec_int8_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
+                                  l->wq_int8, l->wq_scale,
+                                  l->wk_int8, l->wk_scale,
+                                  l->wv_int8, l->wv_scale,
+                                  ctx->dec_x_norm, h, q_dim, kv_dim);
+        else
+            qwen_matvec_bf16_qkv(ctx->dec_q, ctx->dec_k, ctx->dec_v,
+                                  l->wq_bf16, l->wk_bf16, l->wv_bf16,
+                                  ctx->dec_x_norm, h, q_dim, kv_dim);
 
         /* 3. Q/K RMSNorm per-head */
         qwen_rms_norm_per_head(ctx->dec_q, l->q_norm, 1, c->num_heads, c->head_dim, eps);
@@ -358,24 +445,40 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
                                      c->head_dim, scale, pos);
 
         /* 7. Output projection + residual */
-        matvec_bf16_local(ctx->dec_proj_out, l->wo_bf16, ctx->dec_attn_out, h, q_dim);
+        if (l->wo_q4)
+            qwen_matvec_q4_0(ctx->dec_proj_out, l->wo_q4, ctx->dec_attn_out, h, q_dim);
+        else if (l->wo_int8)
+            qwen_matvec_int8(ctx->dec_proj_out, l->wo_int8, l->wo_scale,
+                              ctx->dec_attn_out, h, q_dim);
+        else
+            matvec_bf16_local(ctx->dec_proj_out, l->wo_bf16, ctx->dec_attn_out, h, q_dim);
         for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
 
         /* 8. Post-attention RMSNorm */
         qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, l->post_attn_norm, 1, h, eps);
 
         /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-        qwen_matvec_bf16(ctx->dec_gate, l->gate_up_fused_bf16, ctx->dec_x_norm,
-                          2 * inter, h);
-        /* In-place SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, ...] */
-        for (int o = 0; o < inter; o++) {
-            float g = ctx->dec_gate[2 * o];
-            float u = ctx->dec_gate[2 * o + 1];
-            ctx->dec_gate[o] = g / (1.0f + expf(-g)) * u;
-        }
+        if (l->gate_up_fused_q4)
+            qwen_matvec_q4_0(ctx->dec_gate, l->gate_up_fused_q4, ctx->dec_x_norm,
+                              2 * inter, h);
+        else if (l->gate_up_fused_int8)
+            qwen_matvec_int8(ctx->dec_gate, l->gate_up_fused_int8, l->gate_up_fused_scale,
+                              ctx->dec_x_norm, 2 * inter, h);
+        else
+            qwen_matvec_bf16(ctx->dec_gate, l->gate_up_fused_bf16, ctx->dec_x_norm,
+                              2 * inter, h);
+        /* In-place SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, ...]
+         * Uses batch vvexpf on macOS via Accelerate for faster exp computation. */
+        qwen_swiglu_inplace(ctx->dec_gate, ctx->swiglu_tmp, inter);
 
         /* Down projection + residual */
-        qwen_matvec_bf16(ctx->dec_proj_out, l->down_bf16, ctx->dec_gate, h, inter);
+        if (l->down_q4)
+            qwen_matvec_q4_0(ctx->dec_proj_out, l->down_q4, ctx->dec_gate, h, inter);
+        else if (l->down_int8)
+            qwen_matvec_int8(ctx->dec_proj_out, l->down_int8, l->down_scale,
+                              ctx->dec_gate, h, inter);
+        else
+            qwen_matvec_bf16(ctx->dec_proj_out, l->down_bf16, ctx->dec_gate, h, inter);
         for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
     }
 
@@ -576,15 +679,15 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 #endif
 
-        /* SiLU(gate) * up on interleaved pairs, compact to stride=inter */
+        /* SiLU(gate) * up on interleaved pairs, compact to stride=inter.
+         * Uses batch vvexpf on macOS for faster exp. */
         for (int s = 0; s < seq_len; s++) {
             float *src = pref_gate + (int64_t)s * 2 * inter;
             float *dst = pref_gate + (int64_t)s * inter;
-            for (int o = 0; o < inter; o++) {
-                float g = src[2 * o];
-                float u = src[2 * o + 1];
-                dst[o] = g / (1.0f + expf(-g)) * u;
-            }
+            qwen_swiglu_inplace(src, ctx->swiglu_tmp, inter);
+            /* swiglu_inplace writes result to src[0..inter-1], copy to compacted dst */
+            if (dst != src)
+                memcpy(dst, src, inter * sizeof(float));
         }
 
         /* Down projection + residual (compacted: lda=inter) */
