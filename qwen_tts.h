@@ -537,6 +537,12 @@ typedef struct qwen_tts_ctx {
         uint32_t clock;     /* global access counter */
     } emb_cache;
 
+    /* Delta prefill cache: store previous prompt embeddings for KV reuse.
+     * On repeat calls with same speaker/language, the prompt prefix
+     * (role + codec) is identical — we skip re-prefilling those tokens. */
+    float *prev_input_embeds;    /* [prev_prefill_len × hidden] */
+    int prev_prefill_len;        /* length of cached embeddings */
+
 } qwen_tts_ctx_t;
 
 /* ========================================================================

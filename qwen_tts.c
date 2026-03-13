@@ -637,6 +637,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->cached_tts_pad_embed); free(ctx->cached_tts_bos_embed); free(ctx->cached_tts_eos_embed);
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
+    free(ctx->prev_input_embeds);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
 }
@@ -1009,29 +1010,67 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "[CORR] pre-prefill: pre_conv_w[0]=%.6f\n", ctx->speech_dec.pre_conv_weight[0]);
     }
 
-    /* Talker prefill */
+    /* Delta prefill: compare with previous embeddings to find reusable KV prefix.
+     * For server mode, consecutive calls with the same speaker/language share
+     * the role+codec prefix (~8-9 tokens), so we skip re-prefilling those. */
+    int delta_start = 0;
+    if (ctx->prev_input_embeds && ctx->prev_prefill_len > 0) {
+        int max_match = (prefill_len < ctx->prev_prefill_len) ? prefill_len : ctx->prev_prefill_len;
+        for (int t = 0; t < max_match; t++) {
+            if (memcmp(input_embeds + (int64_t)t * h,
+                       ctx->prev_input_embeds + (int64_t)t * h,
+                       h * sizeof(float)) != 0)
+                break;
+            delta_start = t + 1;
+        }
+    }
+
+    /* Reset KV cache to the reusable prefix length */
+    ctx->kv_len = delta_start;
+
     double t_prefill = time_ms();
-    if (ctx->use_int8 || ctx->use_int4) {
-        /* Sequential quantized prefill: process one token at a time via talker_step.
-         * This avoids needing BF16 weights for BLAS batch matmul, reducing
-         * memory pressure on 16GB machines. */
-        float *dummy_hidden = (float *)malloc(h * sizeof(float));
-        for (int t = 0; t < prefill_len; t++) {
-            if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
-                free(input_embeds); free(dummy_hidden);
+    if (delta_start < prefill_len) {
+        if (delta_start > 0 || ctx->use_int8 || ctx->use_int4) {
+            /* Sequential prefill for delta tokens (or all tokens in quantized mode).
+             * When delta_start > 0, we must use sequential step because the BLAS
+             * batch prefill assumes it processes the full sequence from position 0.
+             * For quantized mode, sequential avoids needing BF16 weights for sgemm. */
+            float *dummy_hidden = (float *)malloc(h * sizeof(float));
+            for (int t = delta_start; t < prefill_len; t++) {
+                if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
+                    free(input_embeds); free(dummy_hidden);
+                    return -1;
+                }
+            }
+            free(dummy_hidden);
+        } else {
+            /* Full BLAS batch prefill (first call, no delta, no quantization) */
+            if (qwen_talker_prefill(ctx, input_embeds, prefill_len) != 0) {
+                free(input_embeds);
                 return -1;
             }
         }
-        free(dummy_hidden);
-    } else {
-        if (qwen_talker_prefill(ctx, input_embeds, prefill_len) != 0) {
-            free(input_embeds);
-            return -1;
-        }
     }
-    free(input_embeds);
     double prefill_ms = time_ms() - t_prefill;
-    if (!ctx->silent) fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
+    if (!ctx->silent) {
+        if (delta_start > 0)
+            fprintf(stderr, "  Prefill: %.0f ms (delta: %d new tokens, %d cached)\n",
+                    prefill_ms, prefill_len - delta_start, delta_start);
+        else
+            fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
+    }
+
+    /* Cache current embeddings for delta prefill on next call */
+    if (!ctx->prev_input_embeds || ctx->prev_prefill_len < prefill_len) {
+        free(ctx->prev_input_embeds);
+        ctx->prev_input_embeds = (float *)malloc((int64_t)prefill_len * h * sizeof(float));
+    }
+    if (ctx->prev_input_embeds) {
+        memcpy(ctx->prev_input_embeds, input_embeds, (int64_t)prefill_len * h * sizeof(float));
+        ctx->prev_prefill_len = prefill_len;
+    }
+
+    free(input_embeds);
 
     /* Debug: check speech decoder weights after prefill */
     if (ctx->debug && ctx->speech_dec.pre_conv_weight) {

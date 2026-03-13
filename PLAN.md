@@ -1303,29 +1303,31 @@ AVX equivalent: `_mm256_slli_epi32(_mm256_cvtepu16_epi32(load128), 16)` → cast
 | Risk | NONE — pure arithmetic optimization |
 | Files | `qwen_tts.c` (generation loop, codec embedding accumulation) |
 
-#### 10j.3 Delta Prefill / KV Cache Reuse (Server Mode)
+#### 10j.3 Delta Prefill / KV Cache Reuse (Server Mode) — DONE
 
-**What**: In server mode, compare the current prompt's token IDs with the previous
+**What**: In server mode, compare the current prompt's input embeddings with the previous
 request's. If the prefix matches (same speaker, language, ChatML header), skip
 re-prefilling those tokens and reuse the existing KV cache entries.
 
-Typical prompt structure (25 tokens):
-- Tokens 0-9: ChatML header + speaker + language (IDENTICAL across requests with same speaker)
-- Tokens 10-24: Text content (DIFFERENT per request)
+Typical prompt structure (~16 tokens for 0.6B):
+- Tokens 0-7: ChatML header + speaker + language + codec prefix (IDENTICAL across requests with same speaker)
+- Tokens 8-15: Text content + eos + final (DIFFERENT per request)
 
-If speaker/language match, skip prefill for first ~10 tokens = ~40% prefill savings.
+If speaker/language match, skip prefill for first ~8 tokens = ~50% prefill savings.
 
 **Implementation**:
-- Store previous prompt token IDs + length in context
-- On new request, compare token-by-token to find longest common prefix
-- Set `kv_len = prefix_len` instead of 0, prefill only new tokens
-- Reset to 0 if speaker/language changed
+- Store previous `input_embeds` + length in `ctx->prev_input_embeds` / `ctx->prev_prefill_len`
+- On new request, compare embedding vectors (memcmp per position) to find longest common prefix
+- Set `ctx->kv_len = delta_start` (reuse cached KV entries for matched prefix)
+- Process only delta tokens via sequential `qwen_talker_step()` (correct for all quant modes)
+- First call uses full BLAS batch prefill (BF16 mode) or sequential (INT8/INT4)
+- Causal attention guarantees: prefix tokens produce identical KV regardless of following text
 
 | Metric | Value |
 |--------|-------|
-| Expected gain | 40% prefill time on repeated speaker (~800ms → ~480ms) |
+| Expected gain | ~50% prefill time on repeated speaker |
 | Difficulty | MEDIUM — need to track previous state, handle edge cases |
-| Risk | LOW — only in server mode, easy to disable |
+| Risk | LOW — automatic, transparent optimization; falls back to full prefill on mismatch |
 | Files | `qwen_tts.c` (prefill section), `qwen_tts.h` (context fields) |
 
 ### Priority Order
@@ -1334,7 +1336,7 @@ If speaker/language match, skip prefill for first ~10 tokens = ~40% prefill savi
 |-------|------|---------------|------------|------|
 | 1 | 10j.1 Batch vvexpf SwiGLU | 1-3 ms/f | LOW | NONE |
 | 2 | 10j.2 Codec embedding NEON/AVX | 0.5-1 ms/f | LOW | NONE |
-| 3 | 10j.3 Delta prefill (server) | 40% prefill | MEDIUM | LOW |
+| 3 | 10j.3 Delta prefill (server) | ~50% prefill | MEDIUM | LOW | **DONE** |
 
 ---
 
