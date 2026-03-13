@@ -126,7 +126,7 @@ and model-portable (same codec tokens work for both 0.6B and 1.7B Base models).
 - [x] `[MED]` Extend `--load-voice` to load `.qvoice` and reconstruct ICL prompt
 - [x] `[LOW]` CLI: `--save-voice` without `--text` creates voice profile and exits
 - [ ] `[LOW]` Evaluate KV cache prefix caching (is it worth the ~50MB size?)
-- [ ] `[LOW]` Voice library management: list/delete saved voices
+- [x] `[LOW]` Voice library management: `--list-voices`, `--delete-voice`
 
 ---
 

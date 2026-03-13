@@ -336,6 +336,21 @@ portable across 0.6B-Base and 1.7B-Base models (same codec tokens).
 > **Important:** `.qvoice` files only work with **Base** models (`0.6B-Base`, `1.7B-Base`).
 > They cannot be used with CustomVoice or VoiceDesign models.
 
+#### Managing Voice Profiles
+
+```bash
+# List all .qvoice files in a directory
+./qwen_tts --list-voices ./my_voices/
+
+# Inspect a single .qvoice file
+./qwen_tts --list-voices my_voice.qvoice
+
+# Delete a voice profile
+./qwen_tts --delete-voice ./my_voices/old_voice.qvoice
+```
+
+These commands don't require a model — they read/manage the `.qvoice` files directly.
+
 #### Legacy format
 
 Raw speaker embedding files (`.bin`) are still supported for backward compatibility,
