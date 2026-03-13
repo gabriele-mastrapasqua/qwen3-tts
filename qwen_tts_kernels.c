@@ -1205,6 +1205,28 @@ void qwen_silu(float *x, int n) {
         x[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
+void qwen_swiglu_inplace(float *gate_up, float *tmp, int n) {
+    /* 1. Extract gate values and negate: tmp[i] = -gate_up[2*i] */
+    for (int i = 0; i < n; i++)
+        tmp[i] = -gate_up[2 * i];
+
+    /* 2. Batch exp: tmp[i] = exp(-g[i])
+     * On macOS, vvexpf computes vectorized exp via Accelerate/vForce.
+     * On other platforms, scalar loop (compiler auto-vectorizes with -ffast-math). */
+#if defined(__APPLE__) && defined(USE_BLAS)
+    vvexpf(tmp, tmp, &n);
+#else
+    for (int i = 0; i < n; i++)
+        tmp[i] = expf(tmp[i]);
+#endif
+
+    /* 3. Apply sigmoid(g) * up = g / (1 + exp(-g)) * up */
+    for (int i = 0; i < n; i++) {
+        float g = gate_up[2 * i];
+        float u = gate_up[2 * i + 1];
+        gate_up[i] = g / (1.0f + tmp[i]) * u;
+    }
+}
 
 void qwen_add_inplace(float *y, const float *x, int n) {
     for (int i = 0; i < n; i++) y[i] += x[i];

@@ -349,6 +349,10 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
     ctx->dec_gate = (float *)aligned_malloc(2 * c->intermediate_size * sizeof(float));
     ctx->dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
     ctx->dec_ffn_out = (float *)aligned_malloc(h * sizeof(float));
+    /* SwiGLU tmp buffer: max of Talker inter and CP inter (CP allocated later, but inter is known) */
+    int swiglu_size = c->intermediate_size;
+    if (c->cp_intermediate_size > swiglu_size) swiglu_size = c->cp_intermediate_size;
+    ctx->swiglu_tmp = (float *)aligned_malloc(swiglu_size * sizeof(float));
 
     /* Allocate RoPE cache */
     int rope_max = 8192;
@@ -463,12 +467,9 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         else
             qwen_matvec_bf16(ctx->dec_gate, l->gate_up_fused_bf16, ctx->dec_x_norm,
                               2 * inter, h);
-        /* In-place SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, ...] */
-        for (int o = 0; o < inter; o++) {
-            float g = ctx->dec_gate[2 * o];
-            float u = ctx->dec_gate[2 * o + 1];
-            ctx->dec_gate[o] = g / (1.0f + expf(-g)) * u;
-        }
+        /* In-place SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, ...]
+         * Uses batch vvexpf on macOS via Accelerate for faster exp computation. */
+        qwen_swiglu_inplace(ctx->dec_gate, ctx->swiglu_tmp, inter);
 
         /* Down projection + residual */
         if (l->down_q4)
@@ -678,15 +679,15 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 #endif
 
-        /* SiLU(gate) * up on interleaved pairs, compact to stride=inter */
+        /* SiLU(gate) * up on interleaved pairs, compact to stride=inter.
+         * Uses batch vvexpf on macOS for faster exp. */
         for (int s = 0; s < seq_len; s++) {
             float *src = pref_gate + (int64_t)s * 2 * inter;
             float *dst = pref_gate + (int64_t)s * inter;
-            for (int o = 0; o < inter; o++) {
-                float g = src[2 * o];
-                float u = src[2 * o + 1];
-                dst[o] = g / (1.0f + expf(-g)) * u;
-            }
+            qwen_swiglu_inplace(src, ctx->swiglu_tmp, inter);
+            /* swiglu_inplace writes result to src[0..inter-1], copy to compacted dst */
+            if (dst != src)
+                memcpy(dst, src, inter * sizeof(float));
         }
 
         /* Down projection + residual (compacted: lda=inter) */

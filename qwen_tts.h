@@ -459,6 +459,7 @@ typedef struct qwen_tts_ctx {
     float *dec_gate;
     float *dec_up;
     float *dec_ffn_out;
+    float *swiglu_tmp;  /* Temp buffer for batch vvexpf in SwiGLU */
     
     /* CP decode buffers */
     float *cp_dec_x;

@@ -136,6 +136,11 @@ void qwen_apply_rope_interleaved(float *x, const float *cos_vals, const float *s
 /* SiLU: x = x / (1 + exp(-x)) */
 void qwen_silu(float *x, int n);
 
+/* Fused SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, silu(g1)*u1, ...]
+ * Uses vvexpf (Accelerate) on macOS for batch exp, scalar loop elsewhere.
+ * tmp must have space for n floats (used for batch exp). */
+void qwen_swiglu_inplace(float *gate_up, float *tmp, int n);
+
 /* Add: y += x */
 void qwen_add_inplace(float *y, const float *x, int n);
 

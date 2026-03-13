@@ -364,11 +364,8 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
                               x_norm, 2 * cp_inter, cp_h);
         else
             matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
-        for (int o = 0; o < cp_inter; o++) {
-            float g = ctx->cp_dec_gate[2 * o];
-            float u = ctx->cp_dec_gate[2 * o + 1];
-            ctx->cp_dec_gate[o] = g / (1.0f + expf(-g)) * u;
-        }
+        /* Batch SwiGLU: uses vvexpf on macOS for faster exp */
+        qwen_swiglu_inplace(ctx->cp_dec_gate, ctx->swiglu_tmp, cp_inter);
 
         /* Down projection + residual */
         if (l->down_int8)
