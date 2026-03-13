@@ -11,6 +11,97 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+/* Print info about a .qvoice file. Returns 0 on success. */
+static int print_qvoice_info(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    char magic[4];
+    uint32_t version;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "QVCE", 4) != 0) {
+        fclose(f); return -1;
+    }
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1) {
+        fclose(f); return -1;
+    }
+
+    /* Skip speaker embedding (1024 floats) */
+    fseek(f, 1024 * sizeof(float), SEEK_CUR);
+
+    /* Read ref_text */
+    uint32_t ref_text_len = 0;
+    fread(&ref_text_len, sizeof(uint32_t), 1, f);
+    char ref_text[256] = {0};
+    if (ref_text_len > 0) {
+        int read_len = ref_text_len < 255 ? (int)ref_text_len : 255;
+        fread(ref_text, 1, read_len, f);
+        ref_text[read_len] = '\0';
+        if (ref_text_len > 255) fseek(f, ref_text_len - 255, SEEK_CUR);
+    }
+
+    /* Read n_ref_frames */
+    uint32_t n_ref_frames = 0;
+    fread(&n_ref_frames, sizeof(uint32_t), 1, f);
+
+    fclose(f);
+
+    /* File size */
+    struct stat st;
+    stat(path, &st);
+
+    /* Extract just filename */
+    const char *basename = strrchr(path, '/');
+    basename = basename ? basename + 1 : path;
+
+    printf("  %-30s  v%u  %3u frames (%.1fs ref)  %5.1f KB",
+           basename, version, n_ref_frames, n_ref_frames / 12.5f,
+           (float)st.st_size / 1024.0f);
+    if (ref_text_len > 0)
+        printf("  \"%s\"", ref_text);
+    printf("\n");
+    return 0;
+}
+
+/* List all .qvoice files in a directory */
+static int list_voices(const char *dir_path) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        /* Maybe it's a single file */
+        if (strstr(dir_path, ".qvoice")) {
+            printf("Voice profiles:\n");
+            if (print_qvoice_info(dir_path) != 0) {
+                fprintf(stderr, "Error: %s is not a valid .qvoice file\n", dir_path);
+                return 1;
+            }
+            return 0;
+        }
+        fprintf(stderr, "Error: cannot open directory %s\n", dir_path);
+        return 1;
+    }
+
+    printf("Voice profiles in %s:\n\n", dir_path);
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if (len > 7 && strcmp(entry->d_name + len - 7, ".qvoice") == 0) {
+            char fullpath[4096];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", dir_path, entry->d_name);
+            if (print_qvoice_info(fullpath) == 0)
+                count++;
+        }
+    }
+    closedir(dir);
+
+    if (count == 0)
+        printf("  (no .qvoice files found)\n");
+    else
+        printf("\n  %d voice profile(s)\n", count);
+    return 0;
+}
 
 /* Streaming callback state */
 typedef struct {
@@ -93,6 +184,8 @@ int main(int argc, char **argv) {
     int xvector_only = 0;
     const char *save_voice = NULL;
     const char *load_voice = NULL;
+    const char *list_voices_dir = NULL;
+    const char *delete_voice = NULL;
     float max_ref_duration = 15.0f;  /* default: use first 15s of ref audio */
     int use_int8 = 0;
     int use_int4 = 0;
@@ -124,6 +217,8 @@ int main(int argc, char **argv) {
         {"max-ref-duration", required_argument, 0, 1013},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
+        {"list-voices",   required_argument, 0, 1016},
+        {"delete-voice",  required_argument, 0, 1017},
         {"int8",          no_argument,       0, 1014},
         {"int4",          no_argument,       0, 1015},
         {"help",          no_argument,       0, 'h'},
@@ -160,6 +255,8 @@ int main(int argc, char **argv) {
             case 1013: max_ref_duration = (float)atof(optarg); break;
             case 1014: use_int8 = 1; break;
             case 1015: use_int4 = 1; break;
+            case 1016: list_voices_dir = optarg; break;
+            case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
             case 'D': debug = 1; break;
             case 'h':
@@ -191,6 +288,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --save-voice <path>        Save voice (.qvoice = full ICL, .bin = embedding only)\n");
                 fprintf(stderr, "                             Without --text: create voice profile and exit\n");
                 fprintf(stderr, "  --load-voice <path>        Load voice (.qvoice = full ICL, .bin = embedding only)\n");
+                fprintf(stderr, "  --list-voices <dir>        List .qvoice files in directory\n");
+                fprintf(stderr, "  --delete-voice <path>      Delete a .qvoice file\n");
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
@@ -198,6 +297,38 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 return opt == 'h' ? 0 : 1;
         }
+    }
+
+    /* Voice library management (no model loading needed) */
+    if (list_voices_dir) {
+        return list_voices(list_voices_dir);
+    }
+    if (delete_voice) {
+        /* Validate it's a .qvoice file */
+        size_t dlen = strlen(delete_voice);
+        if (dlen <= 7 || strcmp(delete_voice + dlen - 7, ".qvoice") != 0) {
+            fprintf(stderr, "Error: --delete-voice only works with .qvoice files\n");
+            return 1;
+        }
+        /* Check it exists and is valid */
+        FILE *vf = fopen(delete_voice, "rb");
+        if (!vf) {
+            fprintf(stderr, "Error: file not found: %s\n", delete_voice);
+            return 1;
+        }
+        char magic[4];
+        int valid = (fread(magic, 1, 4, vf) == 4 && memcmp(magic, "QVCE", 4) == 0);
+        fclose(vf);
+        if (!valid) {
+            fprintf(stderr, "Error: %s is not a valid .qvoice file\n", delete_voice);
+            return 1;
+        }
+        if (remove(delete_voice) != 0) {
+            fprintf(stderr, "Error: failed to delete %s\n", delete_voice);
+            return 1;
+        }
+        printf("Deleted %s\n", delete_voice);
+        return 0;
     }
 
     if (!model_dir) {
