@@ -480,37 +480,45 @@ also has more capacity to condition its output on these speaker characteristics.
 For the technical details of how the speaker encoder works, see the
 [voice cloning internals blog post](blog/voice-cloning-internals.md).
 
-#### Cross-Model Voice Injection (Experimental)
+#### Cross-Model Voice Injection (Custom Voices Per Language)
 
-The Base model can clone any voice but doesn't support `--instruct`. The CustomVoice
-model supports `--instruct` but only has 9 preset voices. In theory, you could extract
-a speaker embedding with the Base model and inject it into CustomVoice for style control:
+The Base model produces the most faithful voice clones but doesn't support `--instruct`.
+You can extract a speaker embedding from the Base model and use it in **any other model**
+— CustomVoice (with or without `--instruct`) or VoiceDesign. This enables **custom voices
+per language**: clone a native Italian speaker and use them across all model types.
 
 ```bash
-# Extract speaker embedding (Base model)
-./qwen_tts -d qwen3-tts-1.7b-base --ref-audio speaker.wav --save-voice my_voice.bin
+# Step 1: Extract voice embedding (one-time, Base model)
+./qwen_tts -d qwen3-tts-1.7b-base --ref-audio native_speaker.wav --save-voice my_voice.bin
 
-# Inject into CustomVoice (experimental)
+# Step 2: Use in CustomVoice (fast, no instruct)
+./qwen_tts -d qwen3-tts-0.6b --load-voice my_voice.bin \
+    --text "Buongiorno a tutti!" -l Italian -o output.wav
+
+# Step 3: Use in CustomVoice with style control (1.7B only)
 ./qwen_tts -d qwen3-tts-1.7b --load-voice my_voice.bin \
-    --text "Hello world" -l English -o output.wav
+    --text "Buongiorno a tutti!" -l Italian \
+    -I "Speak with warmth and enthusiasm" -o styled.wav
 ```
 
-> **Warning:** This is experimental and produces noticeably different voice timbre compared
-> to direct voice cloning on the Base model. The Base and CustomVoice models were trained
-> with different speaker representations (ECAPA continuous embeddings vs discrete codec
-> tokens), so they interpret the same vector differently. The 0.6B CustomVoice is somewhat
-> closer, but the 1.7B CustomVoice can produce accented or off-target voices. For reliable
-> voice cloning, use the Base model directly with `--ref-audio` or `.qvoice`.
+The voice is recognizably the same speaker but may have a slight timbre shift compared to
+direct voice clone on the Base model. This is because the models have different transformer
+weights (trained separately). The speaker embedding norm is auto-scaled to match the target
+model's preset speaker range.
 
-| Model Type | Use Case | Voice Source | Style Control |
-|------------|----------|-------------|---------------|
-| **Base** | Clone voice (best fidelity) | Speaker embedding from WAV | None |
-| **CustomVoice** | Preset speakers | 9 built-in voices | `--instruct` (1.7B) |
-| **VoiceDesign** | Create voice from description | Text description only | `--instruct` |
+| Model Type | Use Case | Voice Source | Style Control | Clone Fidelity |
+|------------|----------|-------------|---------------|----------------|
+| **Base** | Direct voice clone | `--ref-audio` / `.qvoice` | None | Best (near-perfect) |
+| **CustomVoice** | Preset voices | 9 built-in | `--instruct` (1.7B) | N/A |
+| **CustomVoice + `.bin`** | Custom cloned voice | Injected `.bin` from Base | `--instruct` (1.7B) | Good (slight shift) |
+| **VoiceDesign** | Voice from description | Text description | `--instruct` | N/A |
 
-> **Note:** `--instruct` on the Base model is not recommended — the Base model wasn't
-> trained with instruct conditioning. For style control, use CustomVoice with preset
-> speakers, or VoiceDesign for text-described voices.
+> **Tip:** For best fidelity, use the Base model directly. For speed + custom voices per
+> language (RTF ~1.5 on 0.6B), use cross-model injection with `.bin` files. The quality
+> tradeoff is small and the value of having native-sounding voices is significant.
+>
+> **Note:** `--instruct` on the Base model is not recommended — use CustomVoice + `.bin`
+> for style control with cloned voices.
 
 ### Streaming
 

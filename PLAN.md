@@ -158,45 +158,79 @@ supports `--instruct` for style control.
 | Cross-model + --instruct | fast | ~45s | 5.81 | Full style control on cloned voice |
 | Preset speaker (CustomVoice) | fast | ~44.7s | 6.21 | Baseline for comparison |
 
-**Status: EXPERIMENTAL — quality issues on 1.7B**
+**Status: WORKING — slight timbre shift vs direct clone, but valuable for custom voices**
 
-A/B testing revealed that cross-model injection produces noticeably different voice
-timbre compared to direct voice clone on the Base model. The high cosine similarity
-(~0.94) was misleading — the Base and CustomVoice transformers interpret the embedding
-vectors differently because they were trained with different data (ECAPA continuous
-embeddings vs discrete codec tokens). The 0.6B is closer but still loses fidelity.
+Cross-model injection works: a .bin extracted from the Base model can be loaded into
+CustomVoice (with or without --instruct) and produces recognizable, usable voice output.
+There is a slight timbre difference vs direct voice clone on Base — the voice is similar
+but not identical. This is expected because Base and CustomVoice have different transformer
+weights (80-88% of attention/MLP values differ — they were trained separately).
 
-Root cause: only 3 of 9 preset speakers have real embeddings (ryan, vivian, serena;
-others are placeholder ~0.02 norm). 2 of 3 are Chinese-trained, creating a biased
-embedding subspace. The CustomVoice transformer "reads" any injected embedding
-through this biased lens, producing Chinese-accented output for non-Chinese voices.
+Despite the difference, the **value is immense**: custom voices per language, reusable
+voice profiles, fast generation with CustomVoice model speed (RTF ~1.5-1.7 on 0.6B).
+
+**Key findings**:
+- Only 3 of 9 preset speakers have real embeddings (ryan, vivian, serena; others ~0.02 norm)
+- Auto norm scaling helps (ECAPA ~17 → CustomVoice ~14.5)
+- 0.6B cross-model produces good results (closer norm match)
+- 1.7B cross-model usable but more timbre shift (2 of 3 real speakers are Chinese-trained)
+- Voice clone on Base model is nearly perfect — understanding WHY is key to improving cross-model
 
 **Completed**:
 - [x] `[MED]` Allow `--load-voice .bin` on CustomVoice/VoiceDesign models
 - [x] `[MED]` Smarter `--instruct` warning (only on Base, not CustomVoice)
 - [x] `[MED]` Better `--ref-audio` error message (suggest 2-step workflow)
 - [x] `[MED]` README documentation with workflow, examples, model table
-- [x] `[MED]` Tested embedding space: cosine ~0.94 but semantically different across models
-- [x] `[MED]` Tested norm scaling: auto-scale to ryan norm (helps but doesn't fix)
-- [x] `[MED]` Tested direction blending: alpha*silvio + (1-alpha)*ryan (marginal improvement)
+- [x] `[MED]` Auto norm scaling to match target model's preset speakers
+- [x] `[MED]` Tested embedding space: cosine ~0.94, norms differ, direction blending tested
+- [x] `[MED]` Verified: Base and CustomVoice transformer weights differ 80-88%
 
-**TODO**:
+**TODO — Understanding & Analysis**:
+- [ ] `[HIGH]` **Deep analysis: why does Base voice clone work so well?**
+  - Trace the full pipeline: WAV → mel → ECAPA-TDNN → embedding → prefill → KV cache → generation
+  - The Base model produces near-perfect clone from just 30s of audio + a 2048-dim embedding
+  - How does the transformer use the embedding during attention? Is it just the initial KV entry
+    at the speaker position, or does it propagate through the layers in a special way?
+  - Compare what the Base transformer "does" with the embedding vs what CustomVoice does
+  - This understanding is key to making cross-model portable voices
+- [ ] `[HIGH]` **Analyze RTF difference: why is Base voice clone slower?**
+  - Base 1.7B: RTF 3.2-4.1 vs CustomVoice 1.7B with preset: similar RTF
+  - But Base 0.6B: RTF 1.5-1.8 vs CustomVoice 0.6B: RTF 1.5-1.7 (similar!)
+  - Is the slowness on 1.7B Base due to RAM pressure (16GB machine, mmap paging)?
+  - Or is there actual compute difference in the Base model architecture?
+  - Profile: prefill time, per-frame Talker ms, per-frame CP ms — compare Base vs CustomVoice
+  - If it's just RAM, a machine with 32GB would show no difference
+- [ ] `[HIGH]` **KV cache dump approach**: instead of injecting raw ECAPA embedding into
+  CustomVoice, dump the KV cache entries at the speaker position AFTER prefill on the
+  Base model, and inject those processed KV values into CustomVoice. This would bypass
+  the different-transformer-weights issue because we inject post-processed values.
+  - Estimate KV cache size per position: 28 layers × 2 (K+V) × kv_dim × sizeof(bf16)
+  - For 0.6B: 28 × 2 × 1024 × 2 = ~112KB per position (very small!)
+  - For 1.7B: 28 × 2 × 1024 × 2 = ~112KB (same — KV uses kv_dim not hidden)
+  - Could save just the speaker position's KV entries in a new format
+  - Question: does CustomVoice's KV cache expect data from its own transformer or is it flexible?
+- [ ] `[MED]` **Lightweight projection layer**: train a small linear projection (matrix multiply)
+  that maps ECAPA embeddings → CustomVoice codec embedding space. Would need correspondences:
+  generate audio of preset speakers with CustomVoice, extract ECAPA from that audio, build
+  mapping from the pairs. Only 3 real speakers (ryan, vivian, serena) = very underdetermined,
+  but could work with pseudo-inverse or regularized regression.
+
+**TODO — Features & Tooling**:
 - [ ] `[HIGH]` One-command voice extraction: `./qwen_tts --extract-voice ref.wav -o voice.bin`
   - Loads only speaker encoder (not full model), extracts embedding, prints usage tips
   - Detects language from audio (or accepts `--language`) and suggests matching model
   - Prints: "Voice saved. Use with: ./qwen_tts -d qwen3-tts-1.7b --load-voice voice.bin ..."
 - [ ] `[HIGH]` `make extract-voice REF=speaker.wav` Makefile target for quick extraction
-- [ ] `[HIGH]` Test cross-model injection on 0.6B CustomVoice (not just 1.7B)
-  - The 0.6B Base has enc_dim=1024, 0.6B CustomVoice has hidden=1024 — should work
-  - Would give fast cloned voice generation (RTF ~1.5) without instruct but with correct voice
-- [ ] `[HIGH]` Test cross-model injection on 1.7B CustomVoice with 0.6B Base embedding
-  - 0.6B Base produces 1024-dim embedding, 1.7B CustomVoice expects 2048-dim
-  - Needs zero-padding or projection — may not work without training
+- [ ] `[HIGH]` Test cross-model injection on 0.6B CustomVoice — already confirmed working well
+- [ ] `[HIGH]` Test cross-model with 1.7B Base .bin → 1.7B CustomVoice with/without instruct
+  - Confirmed: works with slight timbre shift, still valuable for custom voices per language
 - [ ] `[MED]` Test with genuinely new voices (not ryan-from-ryan, but unseen speakers)
-- [ ] `[MED]` Evaluate quality loss from norm scaling (current: scale to ~14.5 target norm)
-  - Are raw ECAPA norms (~17) better? Or does CustomVoice expect ~14-15 norm range?
 - [ ] `[MED]` Voice gallery: pre-extract .bin files for common languages (Italian, Spanish, etc.)
-- [ ] `[LOW]` Blog post on cross-model embedding space compatibility
+  - Find native speakers for target languages, extract .bin, test quality
+  - Ship as `qvoices/italian_native.bin`, `qvoices/spanish_native.bin`, etc.
+- [ ] `[MED]` Evaluate quality with different norm scaling strategies
+  - Raw ECAPA norms vs scaled to preset range — which sounds more faithful?
+- [ ] `[LOW]` Blog post on cross-model voice injection analysis
 - [ ] `[LOW]` Server API: accept .bin path in JSON request for per-request voice switching
 
 ---
