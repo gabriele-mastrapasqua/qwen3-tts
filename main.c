@@ -602,6 +602,13 @@ int main(int argc, char **argv) {
     if (instruct) {
         if (ctx->config.hidden_size < 2048) {
             fprintf(stderr, "Warning: --instruct is only supported on 1.7B model (ignored)\n");
+        } else if (ctx->voice_clone) {
+            fprintf(stderr, "Warning: --instruct with voice cloning is not officially supported by Qwen3-TTS.\n");
+            fprintf(stderr, "  The Base model was not trained with instruct + clone together.\n");
+            fprintf(stderr, "  The instruct signal may partially override the cloned voice timbre.\n");
+            fprintf(stderr, "  For style control, use the CustomVoice model (preset voices + --instruct)\n");
+            fprintf(stderr, "  or VoiceDesign model (voice from text description).\n");
+            ctx->instruct = strdup(instruct);
         } else {
             ctx->instruct = strdup(instruct);
         }
