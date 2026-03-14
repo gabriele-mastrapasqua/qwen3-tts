@@ -319,6 +319,22 @@ of audio is ~200ms — negligible compared to the generation itself.
    cloning. The speaker encoder itself is working correctly — it's just capturing
    exactly what you give it.
 
+7. **Style control and voice cloning are separate worlds.** We tried combining
+   `--instruct` (style/tone control) with voice cloning on the Base model. The
+   result sounded like a mix — the cloned voice's timbre partially overridden by a
+   generic voice matching the instruction. Digging into the Python reference code
+   revealed why: `generate_voice_clone()` never passes `instruct_ids` to the model.
+   Instruct is for `generate_voice_design()` (creates voice from text description)
+   and `generate_custom_voice()` (preset speakers). The three model types —
+   CustomVoice, VoiceDesign, and Base — are distinct pipelines trained for different
+   tasks. The internal `generate()` function accepts both `instruct_ids` and
+   `voice_clone_prompt`, but the Base model was never trained with both signals
+   together. When both are present, the instruct tokens dominate because the model
+   learned strong text→voice conditioning during VoiceDesign training, while the
+   weaker speaker embedding gets partially ignored. The lesson: just because two
+   features can be combined at the code level doesn't mean the model knows what to
+   do with them.
+
 ---
 
 *This is part of the [qwen3-tts](https://github.com/gabriele-mastrapasqua/qwen3-tts)

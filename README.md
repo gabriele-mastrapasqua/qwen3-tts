@@ -471,7 +471,6 @@ A mismatched sample rate would produce incorrect mel features and a bad voice em
 | **Clone fidelity** | Good | Best |
 | **Speed (Apple M1)** | RTF ~1.5–1.7 | RTF ~3.2–4.1 |
 | **Best for** | Fast cloning, acceptable quality | Maximum voice fidelity |
-| **Style control (`--instruct`)** | Not supported | Supported |
 
 The 1.7B-Base produces noticeably more faithful voice clones — the 2048-dim speaker
 embedding captures twice the vocal detail (timbre, pitch contour, breathiness,
@@ -480,6 +479,29 @@ also has more capacity to condition its output on these speaker characteristics.
 
 For the technical details of how the speaker encoder works, see the
 [voice cloning internals blog post](blog/voice-cloning-internals.md).
+
+#### Voice Clone Limitations
+
+**No style control.** Voice cloning (Base model) does not support `--instruct` or any
+style/tone parameters. The cloned voice's tone, speed, and expressiveness come entirely
+from the speaker embedding extracted from the reference audio. This is by design —
+Qwen3-TTS has three distinct model types, each for a different use case:
+
+| Model Type | Use Case | Voice Source | Style Control |
+|------------|----------|-------------|---------------|
+| **CustomVoice** | Preset speakers | 9 built-in voices (discrete token) | `--instruct` (1.7B only) |
+| **VoiceDesign** | Create voice from description | Text description only | `--instruct` (creates the voice) |
+| **Base** | Clone from audio | Speaker embedding from WAV | None |
+
+While `--instruct` technically works with voice cloning (the tool will show a warning),
+the Base model was not trained with instruct + clone together. The instruct signal
+competes with the speaker embedding in the transformer's attention, partially overriding
+the cloned voice's timbre. The result sounds like a mix between the cloned voice and a
+generic voice matching the instruction.
+
+**If you need style control with a specific voice**, use the CustomVoice model with one
+of the 9 preset speakers + `--instruct`. If you need a specific voice character described
+in text (e.g., "a warm elderly woman"), use the VoiceDesign model.
 
 ### Streaming
 
