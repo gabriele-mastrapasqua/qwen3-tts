@@ -480,28 +480,45 @@ also has more capacity to condition its output on these speaker characteristics.
 For the technical details of how the speaker encoder works, see the
 [voice cloning internals blog post](blog/voice-cloning-internals.md).
 
-#### Voice Clone Limitations
+#### Cross-Model Voice Injection (Clone + Style Control)
 
-**No style control.** Voice cloning (Base model) does not support `--instruct` or any
-style/tone parameters. The cloned voice's tone, speed, and expressiveness come entirely
-from the speaker embedding extracted from the reference audio. This is by design —
-Qwen3-TTS has three distinct model types, each for a different use case:
+The Base model can clone any voice but doesn't support `--instruct`. The CustomVoice
+model supports `--instruct` but only has 9 preset voices. **You can combine both**: extract
+a speaker embedding with the Base model, then inject it into the CustomVoice model for
+style-controlled generation with any cloned voice.
+
+This works because the Base model's ECAPA-TDNN speaker embeddings and the CustomVoice
+model's discrete speaker embeddings live in compatible vector spaces (cosine similarity
+~0.94 between them, matching norms).
+
+```bash
+# Step 1: Extract speaker embedding from any voice (one-time, Base model)
+./qwen_tts -d qwen3-tts-1.7b-base --ref-audio speaker.wav --save-voice my_voice.bin
+
+# Step 2: Use the cloned voice with style control (CustomVoice model)
+./qwen_tts -d qwen3-tts-1.7b --load-voice my_voice.bin \
+    --text "Buongiorno a tutti!" -l Italian \
+    -I "Speak with warmth and enthusiasm" -o output.wav
+
+# Step 3: Same voice, different style — no re-extraction needed
+./qwen_tts -d qwen3-tts-1.7b --load-voice my_voice.bin \
+    --text "Questa è una notizia importante." -l Italian \
+    -I "Speak in a serious, formal news anchor tone" -o news.wav
+```
+
+This unlocks **custom voices per language** — instead of using preset speakers that may
+sound unnatural in certain languages, clone a native speaker and use them with style control.
 
 | Model Type | Use Case | Voice Source | Style Control |
 |------------|----------|-------------|---------------|
-| **CustomVoice** | Preset speakers | 9 built-in voices (discrete token) | `--instruct` (1.7B only) |
-| **VoiceDesign** | Create voice from description | Text description only | `--instruct` (creates the voice) |
-| **Base** | Clone from audio | Speaker embedding from WAV | None |
+| **Base** | Clone voice (extract embedding) | Speaker embedding from WAV | None |
+| **CustomVoice** | Generate with preset voices | 9 built-in voices | `--instruct` (1.7B) |
+| **CustomVoice + `.bin`** | Generate with cloned voice | Injected embedding from Base | `--instruct` (1.7B) |
+| **VoiceDesign** | Create voice from description | Text description only | `--instruct` |
 
-While `--instruct` technically works with voice cloning (the tool will show a warning),
-the Base model was not trained with instruct + clone together. The instruct signal
-competes with the speaker embedding in the transformer's attention, partially overriding
-the cloned voice's timbre. The result sounds like a mix between the cloned voice and a
-generic voice matching the instruction.
-
-**If you need style control with a specific voice**, use the CustomVoice model with one
-of the 9 preset speakers + `--instruct`. If you need a specific voice character described
-in text (e.g., "a warm elderly woman"), use the VoiceDesign model.
+> **Note:** Direct `--instruct` on the Base model (without cross-model injection) is not
+> recommended — the Base model wasn't trained with instruct conditioning, so the instruct
+> signal competes with the speaker embedding and partially overrides the voice timbre.
 
 ### Streaming
 
