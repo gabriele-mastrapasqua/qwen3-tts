@@ -519,6 +519,12 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
                 }
             }
 
+            /* Parse speaker_encoder_config enc_dim (1024 for 0.6B, 2048 for 1.7B) */
+            const char *sec = strstr(cfg_raw, "\"speaker_encoder_config\"");
+            if (sec) {
+                ctx->speaker_enc_dim = json_get_int(sec, "enc_dim", 1024);
+            }
+
             /* VoiceDesign: "spk_id": {} (empty object) */
             if (!ctx->voice_design && !ctx->is_base_model) {
                 const char *spk = strstr(cfg_raw, "\"spk_id\"");
@@ -576,6 +582,8 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
 
     /* Load speaker encoder for Base models */
     if (ctx->is_base_model) {
+        if (ctx->speaker_enc_dim > 0)
+            ctx->speaker_enc.enc_dim = ctx->speaker_enc_dim;
         if (qwen_speaker_encoder_load(&ctx->speaker_enc, ctx->safetensors) != 0) {
             fprintf(stderr, "Warning: failed to load speaker encoder (voice cloning unavailable)\n");
         } else if (!ctx->silent) {

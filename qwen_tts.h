@@ -397,6 +397,7 @@ typedef struct qwen_tts_ctx {
 
     /* Base model type */
     int is_base_model;           /* 1 = Base model, 0 = CustomVoice/VoiceDesign */
+    int speaker_enc_dim;         /* Speaker encoder output dim (1024 for 0.6B, 2048 for 1.7B) */
 
     /* Streaming */
     int stream;                  /* Enable streaming (decode chunks during generation) */
