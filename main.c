@@ -389,11 +389,22 @@ int main(int argc, char **argv) {
     }
     /* Voice cloning setup */
     if (ref_audio || load_voice) {
-        if (!ctx->is_base_model) {
-            fprintf(stderr, "Error: --ref-audio/--load-voice requires a Base model (not CustomVoice)\n");
-            fprintf(stderr, "Download it with: ./download_model.sh --model base-small\n");
+        if (!ctx->is_base_model && ref_audio) {
+            /* --ref-audio requires speaker encoder (Base model only) */
+            fprintf(stderr, "Error: --ref-audio requires a Base model (not CustomVoice)\n");
+            fprintf(stderr, "Extract a speaker embedding first with the Base model:\n");
+            fprintf(stderr, "  ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio %s --save-voice voice.bin\n", ref_audio);
+            fprintf(stderr, "Then use it here with --load-voice voice.bin\n");
             qwen_tts_unload(ctx);
             return 1;
+        }
+        if (!ctx->is_base_model && load_voice) {
+            /* Cross-model voice injection: use ECAPA-TDNN embedding from Base model
+             * in CustomVoice/VoiceDesign model. This works because the embedding spaces
+             * are compatible (cosine similarity ~0.94 between ECAPA and discrete speakers). */
+            if (!silent)
+                fprintf(stderr, "Cross-model voice: loading speaker embedding into %s model\n",
+                        ctx->voice_design ? "VoiceDesign" : "CustomVoice");
         }
         ctx->voice_clone = 1;
         ctx->xvector_only = xvector_only ? 1 : (ref_text_str ? 0 : 1);
@@ -401,7 +412,8 @@ int main(int argc, char **argv) {
         if (ref_audio) ctx->ref_audio_path = strdup(ref_audio);
         if (ref_text_str) ctx->ref_text = strdup(ref_text_str);
 
-        int enc_dim = ctx->speaker_enc.enc_dim;
+        /* Use speaker encoder dim if available, otherwise model hidden_size */
+        int enc_dim = ctx->speaker_enc.enc_dim > 0 ? ctx->speaker_enc.enc_dim : ctx->config.hidden_size;
         ctx->speaker_embedding = (float *)malloc(enc_dim * sizeof(float));
         if (!ctx->speaker_embedding) {
             fprintf(stderr, "Error: failed to allocate speaker embedding\n");
@@ -602,12 +614,11 @@ int main(int argc, char **argv) {
     if (instruct) {
         if (ctx->config.hidden_size < 2048) {
             fprintf(stderr, "Warning: --instruct is only supported on 1.7B model (ignored)\n");
-        } else if (ctx->voice_clone) {
-            fprintf(stderr, "Warning: --instruct with voice cloning is not officially supported by Qwen3-TTS.\n");
-            fprintf(stderr, "  The Base model was not trained with instruct + clone together.\n");
-            fprintf(stderr, "  The instruct signal may partially override the cloned voice timbre.\n");
-            fprintf(stderr, "  For style control, use the CustomVoice model (preset voices + --instruct)\n");
-            fprintf(stderr, "  or VoiceDesign model (voice from text description).\n");
+        } else if (ctx->voice_clone && ctx->is_base_model) {
+            fprintf(stderr, "Warning: --instruct with voice cloning on a Base model is not officially supported.\n");
+            fprintf(stderr, "  For best results, extract the voice with the Base model and use it with CustomVoice:\n");
+            fprintf(stderr, "    ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio ref.wav --save-voice voice.bin\n");
+            fprintf(stderr, "    ./qwen_tts -d qwen3-tts-1.7b --load-voice voice.bin --instruct \"...\" --text \"...\"\n");
             ctx->instruct = strdup(instruct);
         } else {
             ctx->instruct = strdup(instruct);
