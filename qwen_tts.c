@@ -604,6 +604,10 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_PAD, ctx->cached_tts_pad_embed);
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_BOS, ctx->cached_tts_bos_embed);
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_EOS, ctx->cached_tts_eos_embed);
+    if (!ctx->silent) {
+        fprintf(stderr, "  tts_pad_embed[:3]=[%.6f,%.6f,%.6f]\n",
+                ctx->cached_tts_pad_embed[0], ctx->cached_tts_pad_embed[1], ctx->cached_tts_pad_embed[2]);
+    }
 
     /* Initialize LRU embedding cache (8MB for 2048 slots × 1024 hidden) */
     emb_cache_init(ctx);
@@ -1066,7 +1070,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             if (fread(magic, 1, 4, kf) == 4 && memcmp(magic, "QVKV", 4) == 0 &&
                 fread(&ver, 4, 1, kf) == 1 && ver == 1 &&
                 fread(&nl, 4, 1, kf) == 1 && fread(&kd, 4, 1, kf) == 1 && fread(&pl, 4, 1, kf) == 1) {
-                int kv_dim = ctx->config.hidden_size / (ctx->config.num_heads / ctx->config.num_kv_heads);
+                int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
                 if ((int)nl == ctx->config.num_layers && (int)kd == kv_dim && (int)pl <= (int)ctx->kv_max) {
                     /* Load KV for all layers */
                     for (int l = 0; l < (int)nl; l++) {
@@ -1075,8 +1079,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                         fread(ctx->kv_cache_v + layer_off, sizeof(uint16_t), (int64_t)pl * kv_dim, kf);
                     }
                     ctx->kv_len = (int)pl;
+                    /* Load dec_x (last hidden state for generation start) */
+                    if (fread(ctx->dec_x, sizeof(float), h, kf) != (size_t)h) {
+                        fprintf(stderr, "Warning: KV file missing dec_x — generation may fail\n");
+                    }
+                    fclose(kf);
                     if (!ctx->silent)
-                        fprintf(stderr, "  Loaded KV cache from %s (%d layers × %d pos × %d dim)\n",
+                        fprintf(stderr, "  Loaded KV cache from %s (%d layers × %d pos × %d dim + dec_x)\n",
                                 ctx->load_kv_path, (int)nl, (int)pl, (int)kd);
                     /* Skip prefill entirely — KV is already populated */
                     free(input_embeds);
@@ -1147,7 +1156,7 @@ kv_loaded:
     if (ctx->dump_kv_path) {
         FILE *kf = fopen(ctx->dump_kv_path, "wb");
         if (kf) {
-            int kv_dim = ctx->config.hidden_size / (ctx->config.num_heads / ctx->config.num_kv_heads);
+            int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
             int n_layers = ctx->config.num_layers;
             /* Header: magic + version + n_layers + kv_dim + prefill_len */
             fwrite("QVKV", 1, 4, kf);
@@ -1163,6 +1172,8 @@ kv_loaded:
                 fwrite(ctx->kv_cache_k + layer_off, sizeof(uint16_t), (int64_t)ctx->kv_len * kv_dim, kf);
                 fwrite(ctx->kv_cache_v + layer_off, sizeof(uint16_t), (int64_t)ctx->kv_len * kv_dim, kf);
             }
+            /* Also save dec_x (last hidden state, needed to start generation) */
+            fwrite(ctx->dec_x, sizeof(float), h, kf);
             fclose(kf);
             if (!ctx->silent) {
                 int64_t kv_bytes = (int64_t)n_layers * ctx->kv_len * kv_dim * 2 * sizeof(uint16_t);
@@ -1320,12 +1331,22 @@ kv_loaded:
         t_embed_total += time_ms() - t_embed_start;
 
         /* Talker step */
+        if (ctx->debug && frame < 2) {
+            fprintf(stderr, "  [frame %d] step_embed[:5]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    frame, step_embed[0], step_embed[1], step_embed[2], step_embed[3], step_embed[4]);
+            fprintf(stderr, "  [frame %d] PRE last_hidden[:5]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    frame, last_hidden[0], last_hidden[1], last_hidden[2], last_hidden[3], last_hidden[4]);
+        }
         double t_step_start = time_ms();
         if (qwen_talker_step(ctx, step_embed, last_hidden) != 0) {
             free(step_embed); free(last_hidden);
             return -1;
         }
         t_talker_step_total += time_ms() - t_step_start;
+        if (ctx->debug && frame < 2) {
+            fprintf(stderr, "  [frame %d] POST last_hidden[:5]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                    frame, last_hidden[0], last_hidden[1], last_hidden[2], last_hidden[3], last_hidden[4]);
+        }
     }
 
     free(step_embed);
