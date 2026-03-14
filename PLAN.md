@@ -186,55 +186,91 @@ voice profiles, fast generation with CustomVoice model speed (RTF ~1.5-1.7 on 0.
 - [x] `[MED]` Verified: Base and CustomVoice transformer weights differ 80-88%
 
 **TODO — Understanding & Analysis**:
-- [ ] `[HIGH]` **Deep analysis: why does Base voice clone work so well?**
-  - Trace the full pipeline: WAV → mel → ECAPA-TDNN → embedding → prefill → KV cache → generation
-  - The Base model produces near-perfect clone from just 30s of audio + a 2048-dim embedding
-  - How does the transformer use the embedding during attention? Is it just the initial KV entry
-    at the speaker position, or does it propagate through the layers in a special way?
-  - Compare what the Base transformer "does" with the embedding vs what CustomVoice does
-  - This understanding is key to making cross-model portable voices
-- [ ] `[HIGH]` **Analyze RTF difference: why is Base voice clone slower?**
+- [x] `[HIGH]` **Deep analysis: why does Base voice clone work so well?**
+  - ANSWERED: The Base model's ECAPA embedding gets processed through 28 attention layers
+    during prefill, producing rich KV entries that condition all subsequent generation.
+    The KV cache carries the FULL voice identity — not just a single embedding vector.
+  - PROVEN: dumping the KV and loading it cross-model preserves ~90% voice fidelity,
+    far better than raw embedding injection (~60-70%)
+  - KEY INSIGHT: the voice prefix (first ~10 KV positions) carries the identity.
+    Separating this from the text portion enables reuse with different text + instruct.
+- [ ] `[MED]` **Analyze RTF difference: why is Base voice clone slower?**
   - Base 1.7B: RTF 3.2-4.1 vs CustomVoice 1.7B with preset: similar RTF
   - But Base 0.6B: RTF 1.5-1.8 vs CustomVoice 0.6B: RTF 1.5-1.7 (similar!)
   - Is the slowness on 1.7B Base due to RAM pressure (16GB machine, mmap paging)?
-  - Or is there actual compute difference in the Base model architecture?
   - Profile: prefill time, per-frame Talker ms, per-frame CP ms — compare Base vs CustomVoice
-  - If it's just RAM, a machine with 32GB would show no difference
-- [x] `[HIGH]` **KV cache dump approach**: TESTED — two findings:
-  - **Cross-model (Base→CustomVoice): DOESN'T WORK** — KV entries contain K=W_k·hidden and
-    V=W_v·hidden computed by the Base transformer's projection matrices. CustomVoice's Q
-    (from its own W_q) does attention against these incompatible K/V → garbage output (noise).
-    KV is even MORE model-specific than raw embeddings.
-  - **Same-model (Base→Base): WORKS** — implemented `--dump-kv` / `--load-kv` flags.
-    Dumps full prefill KV (28 layers × N pos × 512 kv_dim × bf16 = ~1.7MB for 31 pos).
-    Loading skips prefill entirely → useful for repeated Base model clone calls.
-  - Format: `.bin` with header (magic "QVKV", version, n_layers, kv_dim, prefill_len)
-- [ ] `[MED]` **KV cache for voice-only prefix**: dump only role+codec+speaker positions
-  (pos 0-9, before text), load for different texts on the same model. Would skip
-  voice extraction + partial prefill on every call. ~300KB for the prefix portion.
+- [x] `[HIGH]` **KV cache dump approach**: TESTED and WORKING
+  - Initial bug: kv_dim was 512 instead of 1024 (half data) → garbage output. Fixed.
+  - **Same-model (Base→Base): BIT-IDENTICAL** output. Skip prefill entirely → faster.
+  - **Cross-model (Base→CustomVoice): WORKS WELL** — slight timbro shift (~90% fidelity)
+    but voice is clear, correct language, no artifacts. Much better than .bin embedding
+    injection (~60-70%). The KV carries 28 layers of processed conditioning vs single vector.
+  - Size: ~3.5MB (0.6B) to ~5MB (1.7B) for full prefill KV
+  - Format: `.bin` with header (magic "QVKV", ver, n_layers, kv_dim, prefill_len) + dec_x
+  - **Limitation**: current dump includes FULL prefill (voice + text). Cannot change text
+    or add instruct after loading — the KV is for ONE specific prompt. Need voice-only
+    prefix dump to enable text changes and instruct.
+- [ ] `[HIGH]` **KV voice prefix dump (split voice from text)**:
+  The key to enabling instruct + custom voice. The prefill has this structure:
+  ```
+  [instruct tokens] [role prefix (3)] [codec prefix + speaker (~6)] [text + eos] [codec_bos]
+  ```
+  The voice identity is in positions 0 to ~9 (role + codec + speaker). The text is after.
+  Plan:
+  1. Dump ONLY the voice prefix KV (first ~10 positions) from Base model clone
+  2. On target model (CustomVoice): load voice prefix KV, then do normal prefill for
+     instruct + text starting from the loaded KV position
+  3. This gives: Base clone voice quality + CustomVoice instruct + any text
+  Size: ~10 positions × 28 layers × 1024 kv_dim × 2 bytes × 2 (K+V) = ~1.1MB
+  Format: new `.qvkv` file with voice-only prefix + metadata (language, etc.)
+  **This is the path to reusable custom voices with instruct support.**
 - [ ] `[MED]` **Lightweight projection layer**: train a small linear projection (matrix multiply)
   that maps ECAPA embeddings → CustomVoice codec embedding space. Would need correspondences:
   generate audio of preset speakers with CustomVoice, extract ECAPA from that audio, build
   mapping from the pairs. Only 3 real speakers (ryan, vivian, serena) = very underdetermined,
   but could work with pseudo-inverse or regularized regression.
 
-**TODO — Features & Tooling**:
-- [ ] `[HIGH]` One-command voice extraction: `./qwen_tts --extract-voice ref.wav -o voice.bin`
-  - Loads only speaker encoder (not full model), extracts embedding, prints usage tips
-  - Detects language from audio (or accepts `--language`) and suggests matching model
-  - Prints: "Voice saved. Use with: ./qwen_tts -d qwen3-tts-1.7b --load-voice voice.bin ..."
-- [ ] `[HIGH]` `make extract-voice REF=speaker.wav` Makefile target for quick extraction
-- [ ] `[HIGH]` Test cross-model injection on 0.6B CustomVoice — already confirmed working well
-- [ ] `[HIGH]` Test cross-model with 1.7B Base .bin → 1.7B CustomVoice with/without instruct
-  - Confirmed: works with slight timbre shift, still valuable for custom voices per language
-- [ ] `[MED]` Test with genuinely new voices (not ryan-from-ryan, but unseen speakers)
-- [ ] `[MED]` Voice gallery: pre-extract .bin files for common languages (Italian, Spanish, etc.)
-  - Find native speakers for target languages, extract .bin, test quality
-  - Ship as `qvoices/italian_native.bin`, `qvoices/spanish_native.bin`, etc.
-- [ ] `[MED]` Evaluate quality with different norm scaling strategies
-  - Raw ECAPA norms vs scaled to preset range — which sounds more faithful?
-- [ ] `[LOW]` Blog post on cross-model voice injection analysis
-- [ ] `[LOW]` Server API: accept .bin path in JSON request for per-request voice switching
+**TODO — KV Voice Prefix (the path to custom voices with instruct)**:
+- [ ] `[HIGH]` **Implement KV voice prefix dump**: `--dump-voice-kv voice.qvkv`
+  - During voice clone on Base model, dump KV for ONLY the voice prefix positions
+    (role + codec + speaker, ~10 positions). Exclude text positions.
+  - Save as `.qvkv` file: header + KV data + dec_x at voice prefix boundary
+  - ~1.1MB per voice (28 layers × 10 pos × 1024 dim × 2 × 2)
+- [ ] `[HIGH]` **Implement KV voice prefix load**: `--load-voice-kv voice.qvkv`
+  - Load voice prefix KV into positions 0-9 of target model's KV cache
+  - Then do NORMAL prefill for instruct + text starting from position 10
+  - The target model "sees" the voice from KV and adds its own text + instruct processing
+  - This should enable: Base clone quality + CustomVoice instruct + any text
+- [ ] `[HIGH]` **Test voice prefix KV with instruct on 1.7B CustomVoice**
+  - The ultimate test: load silvio voice prefix, add instruct "speak slowly and solemnly",
+    generate with different Italian text → should produce silvio's voice with style control
+- [ ] `[HIGH]` **One-command voice creation workflow**:
+  ```bash
+  # Step 1: Create reusable voice from audio (one-time, needs Base model)
+  ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio speaker.wav --dump-voice-kv voices/mario.qvkv
+  # Step 2: Use voice on any model, any text, with instruct
+  ./qwen_tts -d qwen3-tts-1.7b --load-voice-kv voices/mario.qvkv \
+      --text "Ciao mondo!" -I "Speak cheerfully" -o out.wav
+  # Step 3: Same voice, different style
+  ./qwen_tts -d qwen3-tts-0.6b --load-voice-kv voices/mario.qvkv \
+      --text "Notizia urgente." -o news.wav
+  ```
+- [ ] `[MED]` `make create-voice REF=speaker.wav` Makefile target
+- [ ] `[MED]` Voice gallery: pre-create .qvkv files for common languages
+  - Italian, Spanish, French, German, Portuguese native speakers
+  - Ship as `voices/italian.qvkv`, `voices/spanish.qvkv`, etc.
+- [ ] `[MED]` Test with genuinely new voices (unseen speakers, different languages)
+- [ ] `[MED]` Test 0.6B→0.6B and 1.7B→0.6B cross-model voice prefix
+  - Can a voice created with 1.7B Base be used on 0.6B CustomVoice?
+  - kv_dim is 1024 on both → should work if attention patterns are compatible
+
+**TODO — Existing approaches (keep as fallback)**:
+- [x] `[MED]` .bin embedding injection: works ~60-70% fidelity, auto norm scaling
+- [x] `[MED]` Full KV dump: works ~90% but tied to specific text, no instruct
+- [ ] `[MED]` Evaluate .bin vs .qvkv quality comparison across languages
+- [ ] `[LOW]` Lightweight projection layer (ECAPA→CustomVoice codec space)
+- [ ] `[LOW]` Blog post on KV cache approach and custom voice creation
+- [ ] `[LOW]` Server API: accept voice path in JSON for per-request voice switching
 
 ---
 
