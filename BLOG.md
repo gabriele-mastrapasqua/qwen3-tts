@@ -60,12 +60,20 @@ The 0.6B model runs at about 0.7x realtime on a 4-core CPU (meaning 1 second of 
 Key optimizations:
 - **Memory-mapped BF16 weights** — near-instant loading, no copy.
 - **Fused NEON/AVX kernels** — BF16 matvec with 2-row fusion, directly reading from mmapped weights.
+- **Cache alignment** — replacing `malloc` with `posix_memalign(64)` for all BLAS/SIMD buffers gave a 24% total speedup. Abrash's alignment lessons from the *Graphics Programming Black Book* (1997) still apply — BLAS libraries check alignment at runtime and fall back to slower paths when buffers aren't cache-line-aligned.
 - **Multi-threaded dispatch** — 4 threads for the bandwidth-bound matvec operations.
-- **Reused buffers** — eliminated ~1000+ malloc/free calls per generation by pre-allocating and reusing scratch buffers.
+- **Pipeline parallelism** — the speech decoder runs in a background thread, overlapping with Talker+CP generation. 14-19% faster, including streaming mode.
+- **Batch vvexpf for SwiGLU** — replacing ~163K per-frame `expf()` calls with batched `vvexpf()` via Apple Accelerate. 8% Code Predictor speedup.
+- **Delta prefill** — reusing KV cache entries for repeated speaker/language prefix in server mode. ~50% prefill time savings.
+- **Quickselect** — replacing O(kn) selection sort with O(n) Hoare's algorithm for top-k sampling. 4.4× faster.
+- **Zero per-token malloc** — pre-allocated all buffers; 38% faster on warm server requests.
 - **Fused argmax+matvec** — for greedy decoding, computes the argmax during the matrix-vector multiply without materializing the full logit vector.
 - **BLAS for prefill** — the initial prompt processing uses cblas_sgemm for the large matrix-matrix multiplications.
+- **INT8 quantization for 1.7B** — per-row absmax quantization gives 20% Talker speedup on the larger model where matrices are bandwidth-bound.
 
-I tried INT4 quantization for the 0.6B model but it was actually 20% slower — the matrices are small enough (1024-wide) that the overhead of unpacking quantized weights exceeds the bandwidth savings. BF16 is the sweet spot for this model size.
+I tried INT4 quantization but it was actually slower on both model sizes — the overhead of unpacking nibble-packed weights (8 SIMD ops) exceeds the bandwidth savings. BF16 is the sweet spot for 0.6B; INT8 for 1.7B.
+
+For the full optimization story — including cache alignment, what we tried and rejected, and why reading Abrash's *Graphics Programming Black Book* in 2026 still pays off — see the [detailed optimization notes](blog/optimization-notes.md).
 
 ## The Result
 
