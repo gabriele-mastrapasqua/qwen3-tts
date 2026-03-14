@@ -572,8 +572,9 @@ static float *load_f32_tensor(multi_safetensors_t *ms, const char *name) {
 
 int qwen_speaker_encoder_load(qwen_speaker_encoder_t *enc, void *safetensors) {
     multi_safetensors_t *st = (multi_safetensors_t *)safetensors;
+    int saved_enc_dim = enc->enc_dim;  /* may be pre-set from config */
     memset(enc, 0, sizeof(*enc));
-    enc->enc_dim = 1024;
+    enc->enc_dim = saved_enc_dim > 0 ? saved_enc_dim : 1024;
     enc->mel_dim = 128;
 
     /* Helper macro */
