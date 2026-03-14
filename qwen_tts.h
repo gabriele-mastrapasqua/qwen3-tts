@@ -377,6 +377,10 @@ typedef struct qwen_tts_ctx {
     int speaker_id;
     int language_id;
 
+    /* KV cache dump/load for cross-model voice portability */
+    char *dump_kv_path;     /* --dump-kv: save prefill KV cache to file */
+    char *load_kv_path;     /* --load-kv: load prefill KV cache from file */
+
     /* Instruct text (style/emotion control, 1.7B only; required for VoiceDesign) */
     char *instruct;
 

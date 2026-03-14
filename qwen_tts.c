@@ -1058,6 +1058,40 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "[CORR] pre-prefill: pre_conv_w[0]=%.6f\n", ctx->speech_dec.pre_conv_weight[0]);
     }
 
+    /* Load KV cache from file (cross-model voice portability) */
+    if (ctx->load_kv_path) {
+        FILE *kf = fopen(ctx->load_kv_path, "rb");
+        if (kf) {
+            char magic[4]; uint32_t ver, nl, kd, pl;
+            if (fread(magic, 1, 4, kf) == 4 && memcmp(magic, "QVKV", 4) == 0 &&
+                fread(&ver, 4, 1, kf) == 1 && ver == 1 &&
+                fread(&nl, 4, 1, kf) == 1 && fread(&kd, 4, 1, kf) == 1 && fread(&pl, 4, 1, kf) == 1) {
+                int kv_dim = ctx->config.hidden_size / (ctx->config.num_heads / ctx->config.num_kv_heads);
+                if ((int)nl == ctx->config.num_layers && (int)kd == kv_dim && (int)pl <= (int)ctx->kv_max) {
+                    /* Load KV for all layers */
+                    for (int l = 0; l < (int)nl; l++) {
+                        int64_t layer_off = (int64_t)l * ctx->kv_max * kv_dim;
+                        fread(ctx->kv_cache_k + layer_off, sizeof(uint16_t), (int64_t)pl * kv_dim, kf);
+                        fread(ctx->kv_cache_v + layer_off, sizeof(uint16_t), (int64_t)pl * kv_dim, kf);
+                    }
+                    ctx->kv_len = (int)pl;
+                    if (!ctx->silent)
+                        fprintf(stderr, "  Loaded KV cache from %s (%d layers × %d pos × %d dim)\n",
+                                ctx->load_kv_path, (int)nl, (int)pl, (int)kd);
+                    /* Skip prefill entirely — KV is already populated */
+                    free(input_embeds);
+                    goto kv_loaded;
+                } else {
+                    fprintf(stderr, "Warning: KV cache mismatch (file: %d layers/%d dim/%d pos, model: %d/%d/%d) — ignoring\n",
+                            (int)nl, (int)kd, (int)pl, ctx->config.num_layers, kv_dim, ctx->kv_max);
+                }
+            }
+            fclose(kf);
+        } else {
+            fprintf(stderr, "Warning: cannot open KV cache file %s\n", ctx->load_kv_path);
+        }
+    }
+
     /* Delta prefill: compare with previous embeddings to find reusable KV prefix.
      * For server mode, consecutive calls with the same speaker/language share
      * the role+codec prefix (~8-9 tokens), so we skip re-prefilling those. */
@@ -1106,6 +1140,36 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     prefill_ms, prefill_len - delta_start, delta_start);
         else
             fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
+    }
+
+kv_loaded:
+    /* Dump KV cache after prefill (for cross-model voice portability) */
+    if (ctx->dump_kv_path) {
+        FILE *kf = fopen(ctx->dump_kv_path, "wb");
+        if (kf) {
+            int kv_dim = ctx->config.hidden_size / (ctx->config.num_heads / ctx->config.num_kv_heads);
+            int n_layers = ctx->config.num_layers;
+            /* Header: magic + version + n_layers + kv_dim + prefill_len */
+            fwrite("QVKV", 1, 4, kf);
+            uint32_t ver = 1;
+            fwrite(&ver, 4, 1, kf);
+            uint32_t nl = (uint32_t)n_layers, kd = (uint32_t)kv_dim, pl = (uint32_t)ctx->kv_len;
+            fwrite(&nl, 4, 1, kf);
+            fwrite(&kd, 4, 1, kf);
+            fwrite(&pl, 4, 1, kf);
+            /* Dump KV for all layers, only the prefilled positions */
+            for (int l = 0; l < n_layers; l++) {
+                int64_t layer_off = (int64_t)l * ctx->kv_max * kv_dim;
+                fwrite(ctx->kv_cache_k + layer_off, sizeof(uint16_t), (int64_t)ctx->kv_len * kv_dim, kf);
+                fwrite(ctx->kv_cache_v + layer_off, sizeof(uint16_t), (int64_t)ctx->kv_len * kv_dim, kf);
+            }
+            fclose(kf);
+            if (!ctx->silent) {
+                int64_t kv_bytes = (int64_t)n_layers * ctx->kv_len * kv_dim * 2 * sizeof(uint16_t);
+                fprintf(stderr, "  Dumped KV cache to %s (%d layers × %d pos × %d dim = %.1f KB)\n",
+                        ctx->dump_kv_path, n_layers, ctx->kv_len, kv_dim, kv_bytes / 1024.0f);
+            }
+        }
     }
 
     /* Cache current embeddings for delta prefill on next call */
