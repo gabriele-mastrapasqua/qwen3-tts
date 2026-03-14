@@ -308,6 +308,17 @@ of audio is ~200ms — negligible compared to the generation itself.
    clones, noticing the 1.7B sounded wrong, and tracing back through the pipeline
    to find the hardcoded dimension. Listen to your outputs.
 
+6. **The encoder hears everything, not just the voice.** The ECAPA-TDNN processes the
+   raw mel spectrogram — it has no concept of "voice" vs "background." When the
+   reference audio contains background music, ambient noise, or other speakers, those
+   sounds become part of the speaker embedding. The model faithfully reproduces them
+   as artifacts in the generated audio — a low hum, a rhythmic texture, or subtle
+   noise floor that shouldn't be there. The fix is upstream: use clean reference audio,
+   or pre-process with a source separation tool like
+   [demucs](https://github.com/facebookresearch/demucs) to isolate the voice before
+   cloning. The speaker encoder itself is working correctly — it's just capturing
+   exactly what you give it.
+
 ---
 
 *This is part of the [qwen3-tts](https://github.com/gabriele-mastrapasqua/qwen3-tts)

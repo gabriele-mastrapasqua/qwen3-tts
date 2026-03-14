@@ -424,7 +424,11 @@ By default, the first **30 seconds** of reference audio are used. Use `--max-ref
 to process the entire file, or set a custom limit (e.g., `--max-ref-duration 45`).
 
 **Tips for best results:**
-- Use clean audio without background music or noise
+- **Use clean audio without background music or noise.** The speaker encoder processes the
+  raw mel spectrogram and cannot separate voice from background — music, ambient noise, or
+  other speakers will be captured as part of the speaker embedding and reproduced as artifacts
+  in the output. If your reference has background noise, pre-process it with a voice separation
+  tool (e.g., [demucs](https://github.com/facebookresearch/demucs)) before cloning.
 - Include varied speech (questions, statements, different emotions) rather than monotone reading
 - 24 kHz WAV is ideal; other sample rates will be rejected (convert with `ffmpeg -i input.wav -ar 24000 output.wav`)
 
