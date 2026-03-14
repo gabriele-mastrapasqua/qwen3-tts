@@ -196,6 +196,8 @@ int main(int argc, char **argv) {
     int use_int4 = 0;
     const char *dump_kv = NULL;
     const char *load_kv = NULL;
+    const char *dump_voice_kv = NULL;
+    const char *load_voice_kv = NULL;
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
         {"text",          required_argument, 0, 't'},
@@ -230,6 +232,8 @@ int main(int argc, char **argv) {
         {"int4",          no_argument,       0, 1015},
         {"dump-kv",       required_argument, 0, 1018},
         {"load-kv",       required_argument, 0, 1019},
+        {"dump-voice-kv", required_argument, 0, 1020},
+        {"load-voice-kv", required_argument, 0, 1021},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -266,6 +270,8 @@ int main(int argc, char **argv) {
             case 1015: use_int4 = 1; break;
             case 1018: dump_kv = optarg; break;
             case 1019: load_kv = optarg; break;
+            case 1020: dump_voice_kv = optarg; break;
+            case 1021: load_voice_kv = optarg; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -643,6 +649,8 @@ int main(int argc, char **argv) {
     /* KV cache dump/load paths */
     if (dump_kv) ctx->dump_kv_path = strdup(dump_kv);
     if (load_kv) ctx->load_kv_path = strdup(load_kv);
+    if (dump_voice_kv) ctx->dump_voice_kv_path = strdup(dump_voice_kv);
+    if (load_voice_kv) ctx->load_voice_kv_path = strdup(load_voice_kv);
 
     /* Create voice only: save and exit without generating */
     if (create_voice_only) {
