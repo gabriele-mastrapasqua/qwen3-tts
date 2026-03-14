@@ -314,19 +314,15 @@ encoding, and speech encoding — giving a **2x speedup** on subsequent generati
 ```bash
 # Step 1: Create a .qvoice profile from reference audio (no --text needed)
 #   Encodes audio and saves: speaker embedding + ICL codec tokens + transcript
-./qwen_tts -d qwen3-tts-0.6b-base \
+#   Use the same Base model you'll generate with (0.6B or 1.7B)
+./qwen_tts -d qwen3-tts-1.7b-base \
     --ref-audio reference.wav --ref-text "Exact transcript of the reference audio." \
     --save-voice my_voice.qvoice
 
 # Step 2: Reuse the saved voice for any new text (no ref audio needed)
-./qwen_tts -d qwen3-tts-0.6b-base \
-    --load-voice my_voice.qvoice \
-    --text "A completely different sentence." -o output.wav
-
-# Works with the 1.7B Base model too (same .qvoice file)
 ./qwen_tts -d qwen3-tts-1.7b-base \
     --load-voice my_voice.qvoice \
-    --text "Same voice, bigger model." -o output_1.7b.wav
+    --text "A completely different sentence." -o output.wav
 ```
 
 **Performance comparison** (Apple M1 8-core, 4 threads, 0.6B-Base, ~4s output):
@@ -450,6 +446,25 @@ ffmpeg -i voice_16k.wav -ar 24000 output.wav
 This is required because the ECAPA-TDNN speaker encoder uses a mel spectrogram
 computed at 24 kHz with specific FFT parameters (n_fft=1024, hop=256, 128 mels).
 A mismatched sample rate would produce incorrect mel features and a bad voice embedding.
+
+#### Model Comparison for Voice Cloning
+
+| | 0.6B-Base | 1.7B-Base |
+|---|---|---|
+| **Speaker embedding dim** | 1024 | 2048 |
+| **Transformer hidden** | 1024 | 2048 |
+| **Clone fidelity** | Good | Best |
+| **Speed (Apple M1)** | RTF ~1.5–1.7 | RTF ~3.2–4.1 |
+| **Best for** | Fast cloning, acceptable quality | Maximum voice fidelity |
+| **Style control (`--instruct`)** | Not supported | Supported |
+
+The 1.7B-Base produces noticeably more faithful voice clones — the 2048-dim speaker
+embedding captures twice the vocal detail (timbre, pitch contour, breathiness,
+speaking rhythm) compared to the 0.6B's 1024-dim embedding. The larger transformer
+also has more capacity to condition its output on these speaker characteristics.
+
+For the technical details of how the speaker encoder works, see the
+[voice cloning internals blog post](blog/voice-cloning-internals.md).
 
 ### Streaming
 
