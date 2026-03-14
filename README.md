@@ -382,10 +382,15 @@ make demo-clone REF=my_voice.wav TEXT="Hello from my cloned voice!"
 
 #### Voice Clone Samples
 
-| Input | Cloned Output | Text |
-|-------|---------------|------|
-| [reference (movie clip)](samples/10s_back_down_the_road.wav) | [english](samples/clone_output_en.wav) | *I love programming in C, it gives you complete control over the machine.* |
-| [reference (movie clip)](samples/10s_back_down_the_road.wav) | [italian](samples/clone_output_it.wav) | *Buongiorno, questa e una dimostrazione della clonazione vocale.* |
+| Input | Model | Cloned Output | Text |
+|-------|-------|---------------|------|
+| [reference (movie clip)](samples/10s_back_down_the_road.wav) | 0.6B | [english](samples/clone_output_en.wav) | *I love programming in C, it gives you complete control over the machine.* |
+| [reference (movie clip)](samples/10s_back_down_the_road.wav) | 0.6B | [italian](samples/clone_output_it.wav) | *Buongiorno, questa e una dimostrazione della clonazione vocale.* |
+| italian speaker | 0.6B | [italian](samples/clone_silvio_constitution_06b.wav) | *Tutti i cittadini hanno il dovere di essere fedeli alla Repubblica...* |
+| italian speaker | 1.7B | [italian](samples/clone_silvio_constitution_17b.wav) | *Tutti i cittadini hanno il dovere di essere fedeli alla Repubblica...* |
+
+The 1.7B clone captures the original speaker's timbre and pitch more faithfully than
+the 0.6B — compare the two Italian constitution samples above.
 
 > **Note:** Voice cloning requires a **Base** model (`Qwen3-TTS-12Hz-0.6B-Base` or `1.7B-Base`),
 > not the CustomVoice model. The Base model includes an ECAPA-TDNN speaker encoder that extracts
