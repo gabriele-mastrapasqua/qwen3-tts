@@ -827,7 +827,7 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
         fprintf(stderr, "Reference audio: %s (%d samples, %d Hz, %.2fs)\n",
                 ref_audio_path, n_samples, sample_rate, (float)n_samples / sample_rate);
 
-    /* Truncate to max_ref_seconds if set (default 15s, 0=use all) */
+    /* Truncate to max_ref_seconds if set (default 30s, 0=use all) */
     if (ctx->max_ref_seconds > 0) {
         int max_samples = (int)(ctx->max_ref_seconds * sample_rate);
         if (n_samples > max_samples) {

@@ -28,8 +28,12 @@ static int print_qvoice_info(const char *path) {
         fclose(f); return -1;
     }
 
-    /* Skip speaker embedding (1024 floats) */
-    fseek(f, 1024 * sizeof(float), SEEK_CUR);
+    /* Read/skip speaker embedding (v2 has enc_dim header, v1 assumes 1024) */
+    uint32_t file_enc_dim = 1024;
+    if (version >= 2) {
+        if (fread(&file_enc_dim, sizeof(uint32_t), 1, f) != 1) { fclose(f); return -1; }
+    }
+    fseek(f, file_enc_dim * sizeof(float), SEEK_CUR);
 
     /* Read ref_text */
     uint32_t ref_text_len = 0;
@@ -427,11 +431,25 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Error: %s is not a valid .qvoice file\n", load_voice);
                     fclose(vf); qwen_tts_unload(ctx); return 1;
                 }
-                if (fread(&version, sizeof(uint32_t), 1, vf) != 1 || version != 1) {
+                if (fread(&version, sizeof(uint32_t), 1, vf) != 1 || (version != 1 && version != 2)) {
                     fprintf(stderr, "Error: unsupported .qvoice version %u\n", version);
                     fclose(vf); qwen_tts_unload(ctx); return 1;
                 }
-                /* Read speaker embedding */
+                /* Read speaker embedding (v2 has enc_dim header, v1 assumes model's enc_dim) */
+                int file_enc_dim = enc_dim;
+                if (version >= 2) {
+                    uint32_t d;
+                    if (fread(&d, sizeof(uint32_t), 1, vf) != 1) {
+                        fprintf(stderr, "Error: failed to read enc_dim from %s\n", load_voice);
+                        fclose(vf); qwen_tts_unload(ctx); return 1;
+                    }
+                    file_enc_dim = (int)d;
+                }
+                if (file_enc_dim != enc_dim) {
+                    fprintf(stderr, "Error: .qvoice has enc_dim=%d but model expects %d\n", file_enc_dim, enc_dim);
+                    fprintf(stderr, "Re-create the .qvoice with the matching Base model.\n");
+                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                }
                 if (fread(ctx->speaker_embedding, sizeof(float), enc_dim, vf) != (size_t)enc_dim) {
                     fprintf(stderr, "Error: failed to read speaker embedding from %s\n", load_voice);
                     fclose(vf); qwen_tts_unload(ctx); return 1;
@@ -531,14 +549,16 @@ int main(int argc, char **argv) {
         /* Save voice file */
         if (save_voice) {
             if (save_is_qvoice) {
-                /* Save .qvoice: embedding + ref_codes + ref_text */
+                /* Save .qvoice v2: enc_dim + embedding + ref_codes + ref_text */
                 FILE *vf = fopen(save_voice, "wb");
                 if (!vf) {
                     fprintf(stderr, "Error: cannot write voice file %s\n", save_voice);
                 } else {
                     fwrite("QVCE", 1, 4, vf);
-                    uint32_t version = 1;
+                    uint32_t version = 2;
                     fwrite(&version, sizeof(uint32_t), 1, vf);
+                    uint32_t saved_dim = (uint32_t)enc_dim;
+                    fwrite(&saved_dim, sizeof(uint32_t), 1, vf);
                     fwrite(ctx->speaker_embedding, sizeof(float), enc_dim, vf);
                     /* ref_text */
                     uint32_t ref_text_len = ref_text_str ? (uint32_t)strlen(ref_text_str) : 0;

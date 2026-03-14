@@ -285,17 +285,23 @@ Create entirely new voices from natural language descriptions using the VoiceDes
 Clone any voice from a short reference audio clip. **Requires a Base model** — the
 CustomVoice models (0.6B, 1.7B) do NOT support voice cloning.
 
+**The 1.7B-Base model produces significantly better voice clones** than the 0.6B-Base.
+The 1.7B has a richer speaker embedding (2048-dim vs 1024-dim) and a larger transformer
+that better preserves the original speaker's timbre, pitch, and speaking style. The
+0.6B-Base works well for preset voices but loses some fidelity when cloning unseen voices.
+Use 1.7B-Base when voice clone quality matters most.
+
 ```bash
 # Download the Base model (has speaker encoder for voice cloning)
-./download_model.sh --model base-small   # 0.6B-Base
-./download_model.sh --model base-large   # 1.7B-Base
+./download_model.sh --model base-small   # 0.6B-Base (faster, good quality)
+./download_model.sh --model base-large   # 1.7B-Base (slower, best clone quality)
 
-# Clone a voice from a WAV file
-./qwen_tts -d qwen3-tts-0.6b-base --text "Hello, this is my cloned voice." \
+# Clone a voice from a WAV file (1.7B recommended for best results)
+./qwen_tts -d qwen3-tts-1.7b-base --text "Hello, this is my cloned voice." \
     --ref-audio reference.wav -o cloned.wav
 
 # Clone with Italian text
-./qwen_tts -d qwen3-tts-0.6b-base --text "Ciao, questa e la mia voce clonata." \
+./qwen_tts -d qwen3-tts-1.7b-base --text "Ciao, questa e la mia voce clonata." \
     --ref-audio reference.wav -o cloned_it.wav
 ```
 
@@ -330,11 +336,13 @@ encoding, and speech encoding — giving a **2x speedup** on subsequent generati
 | From WAV (`--ref-audio`) | 2.8s | 21.6s | 4.91 | Mel + speaker enc + speech enc + generate |
 | From `.qvoice` (`--load-voice`) | 1.7s | 9.8s | 2.23 | Load file + generate (no audio processing) |
 
-The `.qvoice` format is compact (~20-50KB for a typical 3-10s reference clip) and
-portable across 0.6B-Base and 1.7B-Base models (same codec tokens).
+The `.qvoice` format (v2) is compact (~20-50KB for a typical 3-10s reference clip) and
+stores the speaker embedding dimension (`enc_dim`) in the header.
 
-> **Important:** `.qvoice` files only work with **Base** models (`0.6B-Base`, `1.7B-Base`).
-> They cannot be used with CustomVoice or VoiceDesign models.
+> **Important:** `.qvoice` files are **model-specific** — a file created with 0.6B-Base
+> (`enc_dim=1024`) cannot be used with 1.7B-Base (`enc_dim=2048`) and vice versa. The tool
+> will show a clear error if there is a mismatch. Re-create the `.qvoice` with the matching
+> Base model. Legacy v1 `.qvoice` files (without `enc_dim` header) are still supported.
 
 #### Managing Voice Profiles
 
