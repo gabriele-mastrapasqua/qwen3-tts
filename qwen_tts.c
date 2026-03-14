@@ -701,6 +701,46 @@ static void lookup_codec_embed(qwen_tts_ctx_t *ctx, int token_id, float *out) {
  *
  * Generation: every frame gets tts_pad (text side) + codec_embed(sum_all_codes)
  */
+/* Re-encode RoPE in KV cache K entries: shift from old positions to new positions.
+ * RoPE rotations compose: rotate(K, new_pos) = rotate(rotate(K, old_pos), new_pos - old_pos).
+ * V entries don't have RoPE — only K does. */
+static void reposition_rope_kv(uint16_t *kv_k, int n_layers, int kv_max, int kv_dim,
+                                int n_kv_heads, int head_dim, int n_pos,
+                                int old_start, int new_start,
+                                const float *rope_cos, const float *rope_sin) {
+    int half = head_dim / 2;
+    int delta = new_start - old_start;
+    if (delta == 0) return;
+    /* Delta rotation is constant for all positions: Δθ = delta * freq_i
+     * We use rope_cos/sin[delta] which encodes cos/sin(delta * freq_i) */
+    const float *cos_d = rope_cos + (int64_t)delta * half;
+    const float *sin_d = rope_sin + (int64_t)delta * half;
+    float *k_f32 = (float *)malloc(kv_dim * sizeof(float));
+    for (int p = 0; p < n_pos; p++) {
+        for (int l = 0; l < n_layers; l++) {
+            int64_t off = (int64_t)l * kv_max * kv_dim + (int64_t)(new_start + p) * kv_dim;
+            /* Convert bf16 → f32 */
+            for (int j = 0; j < kv_dim; j++)
+                k_f32[j] = bf16_to_f32(kv_k[off + j]);
+            /* Apply delta rotation per head */
+            for (int h = 0; h < n_kv_heads; h++) {
+                float *kh = k_f32 + h * head_dim;
+                for (int i = 0; i < half; i++) {
+                    float k1 = kh[i], k2 = kh[i + half];
+                    kh[i]        = k1 * cos_d[i] - k2 * sin_d[i];
+                    kh[i + half] = k2 * cos_d[i] + k1 * sin_d[i];
+                }
+            }
+            /* Convert f32 → bf16 back */
+            for (int j = 0; j < kv_dim; j++) {
+                uint32_t bits; memcpy(&bits, &k_f32[j], 4);
+                kv_k[off + j] = (uint16_t)(bits >> 16);
+            }
+        }
+    }
+    free(k_f32);
+}
+
 int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples, int *out_n_samples) {
     double t_start = time_ms();
     int h = ctx->config.hidden_size;
@@ -1083,45 +1123,58 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     }
                     fclose(kf);
 
-                    /* Strategy: [voice_prefix_KV] [instruct] [text + codec_bos]
-                     * Voice prefix KV must stay at pos 0 because it has RoPE encoded
-                     * for pos 0-8. Moving it to a different position would break the
-                     * relative position encoding in attention.
-                     * 1. Load voice prefix KV at pos 0 → fills KV 0 to vl-1
-                     * 2. Prefill instruct tokens (if any) → KV pos vl onwards
-                     * 3. Prefill text+codec_bos after instruct */
+                    /* Strategy: [instruct] [voice_prefix_KV] [text + codec_bos]
+                     * This matches the model's training order. The voice prefix KV
+                     * has RoPE for pos 0-8 (from Base model). When instruct is present,
+                     * we re-encode the RoPE to shift it to pos inst_len onwards.
+                     * 1. Prefill instruct tokens (pos 0 to inst_len-1)
+                     * 2. Load voice prefix KV at pos inst_len, re-encode RoPE
+                     * 3. Prefill text+codec_bos after voice prefix */
                     ctx->kv_len = 0;
                     float *dummy_hidden = (float *)malloc(h * sizeof(float));
 
-                    /* Step 1: Load voice prefix KV at pos 0 (RoPE matches) */
-                    for (int l = 0; l < (int)nl; l++) {
-                        int64_t dst_off = (int64_t)l * ctx->kv_max * kv_dim;
-                        memcpy(ctx->kv_cache_k + dst_off, vp_k + (int64_t)l * vp_layer_size,
-                               vp_layer_size * sizeof(uint16_t));
-                        memcpy(ctx->kv_cache_v + dst_off, vp_v + (int64_t)l * vp_layer_size,
-                               vp_layer_size * sizeof(uint16_t));
-                    }
-                    ctx->kv_len = (int)vl;
-                    free(vp_k); free(vp_v);
-
-                    if (!ctx->silent)
-                        fprintf(stderr, "  Loaded voice prefix KV at pos 0-%d (%d pos from %s)\n",
-                                (int)(vl - 1), (int)vl, ctx->load_voice_kv_path);
-
-                    /* Step 2: Prefill instruct tokens (if any) */
+                    /* Step 1: Prefill instruct tokens (if any) */
                     if (inst_len > 0) {
                         if (!ctx->silent)
-                            fprintf(stderr, "  Prefilling %d instruct tokens (pos %d-%d)...\n",
-                                    inst_len, ctx->kv_len, ctx->kv_len + inst_len - 1);
+                            fprintf(stderr, "  Prefilling %d instruct tokens (pos 0-%d)...\n",
+                                    inst_len, inst_len - 1);
                         for (int t = 0; t < inst_len; t++) {
                             if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
-                                free(input_embeds); free(dummy_hidden);
+                                free(input_embeds); free(dummy_hidden); free(vp_k); free(vp_v);
                                 return -1;
                             }
                         }
                     }
 
-                    /* Step 3: Prefill text + codec_bos (skip role + codec in input_embeds) */
+                    /* Step 2: Load voice prefix KV at pos inst_len */
+                    int vp_start = ctx->kv_len;  /* = inst_len */
+                    for (int l = 0; l < (int)nl; l++) {
+                        int64_t dst_off = (int64_t)l * ctx->kv_max * kv_dim + (int64_t)vp_start * kv_dim;
+                        memcpy(ctx->kv_cache_k + dst_off, vp_k + (int64_t)l * vp_layer_size,
+                               vp_layer_size * sizeof(uint16_t));
+                        memcpy(ctx->kv_cache_v + dst_off, vp_v + (int64_t)l * vp_layer_size,
+                               vp_layer_size * sizeof(uint16_t));
+                    }
+                    ctx->kv_len = vp_start + (int)vl;
+                    free(vp_k); free(vp_v);
+
+                    /* Re-encode RoPE if voice prefix was shifted (instruct present) */
+                    if (vp_start > 0) {
+                        reposition_rope_kv(ctx->kv_cache_k, ctx->config.num_layers,
+                                           ctx->kv_max, kv_dim,
+                                           ctx->config.num_kv_heads, ctx->config.head_dim,
+                                           (int)vl, 0, vp_start,
+                                           ctx->rope_cos, ctx->rope_sin);
+                        if (!ctx->silent)
+                            fprintf(stderr, "  Re-encoded RoPE: pos 0-%d → pos %d-%d\n",
+                                    (int)(vl - 1), vp_start, (int)(vp_start + vl - 1));
+                    }
+
+                    if (!ctx->silent)
+                        fprintf(stderr, "  Loaded voice prefix KV at pos %d-%d (%d pos from %s)\n",
+                                vp_start, (int)(vp_start + vl - 1), (int)vl, ctx->load_voice_kv_path);
+
+                    /* Step 3: Prefill text + codec_bos (skip instruct+role+codec in embeds) */
                     int text_start = voice_prefix_len;  /* skip instruct+role+codec in embeds */
                     int text_count = prefill_len - text_start;
                     if (!ctx->silent)
