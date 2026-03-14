@@ -33,18 +33,18 @@ static int print_qvoice_info(const char *path) {
 
     /* Read ref_text */
     uint32_t ref_text_len = 0;
-    fread(&ref_text_len, sizeof(uint32_t), 1, f);
+    if (fread(&ref_text_len, sizeof(uint32_t), 1, f) != 1) { fclose(f); return -1; }
     char ref_text[256] = {0};
     if (ref_text_len > 0) {
         int read_len = ref_text_len < 255 ? (int)ref_text_len : 255;
-        fread(ref_text, 1, read_len, f);
+        if (fread(ref_text, 1, read_len, f) != (size_t)read_len) { fclose(f); return -1; }
         ref_text[read_len] = '\0';
         if (ref_text_len > 255) fseek(f, ref_text_len - 255, SEEK_CUR);
     }
 
     /* Read n_ref_frames */
     uint32_t n_ref_frames = 0;
-    fread(&n_ref_frames, sizeof(uint32_t), 1, f);
+    if (fread(&n_ref_frames, sizeof(uint32_t), 1, f) != 1) { fclose(f); return -1; }
 
     fclose(f);
 
