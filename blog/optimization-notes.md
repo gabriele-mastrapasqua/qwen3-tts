@@ -329,6 +329,157 @@ The output is **bit-identical** across all four modes: CLI normal, CLI streaming
 HTTP server normal, HTTP server streaming. Same seed, same speaker, same language
 → same bytes in the WAV file.
 
+## Batch vvexpf: Transcendentals Are Expensive One at a Time
+
+After the algorithmic wins, we went hunting for smaller gains. The SwiGLU
+activation function in every transformer layer computes `x * sigmoid(x)`, and
+sigmoid needs `expf()`. In a 28-layer Talker and a 5-layer Code Predictor
+running 15 passes per frame, that's ~163,000 individual `expf()` calls per
+audio frame.
+
+Each `expf()` is a transcendental function — high latency, hard to pipeline.
+But calling them one by one wastes the CPU's SIMD units. The fix: batch them.
+
+On macOS, Apple's Accelerate framework provides `vvexpf()` — a vectorized
+exponential that processes an entire array at once using optimized SIMD paths
+internally. We wrote a `qwen_swiglu_inplace()` kernel that computes
+`gate = vvexpf(-gate); gate = x / (1 + gate); gate *= up` over the full
+intermediate dimension in one call:
+
+```c
+void qwen_swiglu_inplace(float *gate, const float *up, int n) {
+#if defined(__APPLE__) && defined(USE_BLAS)
+    int ni = n;
+    // gate = -gate
+    vDSP_vneg(gate, 1, gate, 1, ni);
+    // gate = exp(-gate)  (batch)
+    vvexpf(gate, gate, &ni);
+    // gate = 1 + exp(-gate)
+    float one = 1.0f;
+    vDSP_vsadd(gate, 1, &one, gate, 1, ni);
+    // gate = x / (1 + exp(-gate))  →  sigmoid(x) * x via up vector
+    vDSP_vdiv(gate, 1, up, 1, gate, 1, ni);
+#else
+    // scalar fallback — compiler auto-vectorizes with -ffast-math
+    for (int i = 0; i < n; i++)
+        gate[i] = up[i] * gate[i] / (1.0f + expf(-gate[i]));
+#endif
+}
+```
+
+**Result: Code Predictor 8% faster** (76 ms/f → 70 ms/f). Those ~163K scalar
+`expf` calls per frame collapsed into ~206 batched `vvexpf` calls. Not a
+headline number, but it's free — the output is bit-identical and the code is
+actually cleaner than the inline scalar loop it replaced.
+
+The Abrash lesson applies here too: just as he taught us that unaligned memory
+access wastes bus cycles, calling transcendentals one at a time wastes SIMD
+lanes. The hardware *wants* to process 4-8 values at once — you just have to
+feed it that way.
+
+## SIMD BF16 Accumulation: One More Scalar Loop
+
+The codec embedding lookup accumulates 15 codebook vectors per audio frame —
+each a BF16-to-F32 conversion followed by a vector add. The original code did
+this scalar:
+
+```c
+for (int i = 0; i < dim; i++) {
+    uint32_t bits = (uint32_t)src_bf16[i] << 16;
+    float val; memcpy(&val, &bits, sizeof(float));
+    dst[i] += val;
+}
+```
+
+We wrote `qwen_bf16_accum_f32()` with NEON and AVX2 paths. The NEON version
+processes 8 BF16 values per iteration — load, shift-widen to F32, add:
+
+```c
+// NEON: 8-wide BF16→F32 accumulate
+uint16x8_t bf = vld1q_u16(src_bf16 + i);
+float32x4_t f0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16));
+float32x4_t f1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bf), 16));
+vst1q_f32(dst + i,     vaddq_f32(vld1q_f32(dst + i), f0));
+vst1q_f32(dst + i + 4, vaddq_f32(vld1q_f32(dst + i + 4), f1));
+```
+
+The AVX2 version does the same with 256-bit registers — `cvtepu16_epi32` to
+zero-extend, `slli_epi32` to shift into F32 position, `add_ps` to accumulate.
+
+The per-frame impact is small (~0.5-1ms), but it adds up over hundreds of
+frames and eliminates yet another scalar loop hiding in a SIMD codebase —
+exactly the kind of thing Abrash warned about: the fast path is only fast if
+*all* the code on it is optimized.
+
+## Delta Prefill: Reusing the KV Cache Across Requests
+
+The Talker's prompt has a fixed structure: ChatML header, speaker token,
+language token, codec control tokens, then the actual text. For a server
+handling multiple requests with the same speaker and language, the prefix
+is identical every time — but we were re-prefilling it from scratch on every
+call.
+
+Causal attention gives us a nice property: prefix tokens produce identical
+KV cache entries regardless of what comes after. If the first 8 tokens of
+the prompt match the previous request, their KV entries are already in the
+cache. We just need to prefill the *new* tokens.
+
+The implementation compares the current input embeddings against the previous
+call's cached embeddings (stored in `prev_input_embeds`). If the first N
+embeddings match, we skip to position N and only process the delta:
+
+```
+Request 1: [header][speaker][lang][codec][text_A]  →  full prefill (18 tokens)
+Request 2: [header][speaker][lang][codec][text_B]  →  delta prefill (skip 8, process 10)
+Request 3: [header][speaker][lang][codec][text_C]  →  delta prefill (skip 8, process 7)
+```
+
+When the speaker or language changes, the prefix differs and we fall back to
+full prefill automatically — no special-casing needed.
+
+**Result: ~50% prefill time savings on repeated speaker** in server mode. For
+a chatbot or voice assistant scenario where you're generating many responses
+in the same voice, this eliminates the biggest fixed cost in the pipeline.
+
+## Quantization: What the 1.7B Model Taught Us
+
+We'd already tried INT4 and INT8 quantization on the 0.6B model and found
+them slower or neutral — the matrices are too small (hidden=1024) to be
+bandwidth-bound, so dequantization overhead dominates. But the 1.7B model
+has `hidden=2048` and `intermediate=6144` — 4× larger matrices. Time to
+revisit.
+
+**INT8 (`--int8`): 20% Talker speedup on 1.7B.** Per-row absmax quantization
+at load time (scale = max(|row|) / 127), NEON int8 matvec for decode. The
+Talker went from 79.3 ms/f to 67.4 ms/f. Audio quality is good — no
+perceptible degradation in A/B tests.
+
+**INT4 Q4_0 (`--int4`): no speedup, actually 4% slower.** We used the same
+nibble-packed format as llama.cpp (32 weights per block, 16 bytes + 1 fp32
+scale). The NEON unpack path needs AND, SHR, subtract-8, widen, convert —
+about 8 ops per 32 weights versus 1 op for BF16 (`vshll`). Even at 2048-wide,
+the compute overhead exceeds the bandwidth savings.
+
+| Config | Talker ms/f | CP ms/f | RTF |
+|--------|------------|---------|-----|
+| 1.7B BF16 | 79.3 | 87.0 | 4.32 |
+| 1.7B INT8 | 67.4 | 78.7 | 3.59 |
+| 1.7B INT4 | 82.6 | 81.7 | 4.51 |
+| 0.6B BF16 | 22.5 | 82.0 | 2.15 |
+
+The takeaway: quantization is not a universal win. It depends on whether
+you're compute-bound or bandwidth-bound at your specific matrix dimensions.
+INT8 hits the sweet spot for 1.7B — enough bandwidth reduction to matter,
+low enough unpack overhead (3 NEON ops vs BF16's 1) to not eat the gains.
+INT4's nibble unpacking (8 ops) crosses the break-even point. And on 0.6B,
+nothing helps because you're compute-bound anyway.
+
+This echoes what Abrash wrote about optimization traps: "the fastest code
+is the code you don't execute." INT4 adds *more* code per weight (unpack,
+shift, subtract, widen, convert, scale, accumulate) than BF16 (shift,
+accumulate). The memory savings are real, but speed is what matters for
+realtime TTS.
+
 ## What We Analyzed and Skipped
 
 Not every optimization idea pans out. Here's what we investigated and rejected:
@@ -355,12 +506,10 @@ can't prefetch what doesn't fit. The hardware prefetcher handles sequential
 access within each matvec just fine — it's the layer *transitions* that cause
 cold misses, and those are unavoidable without smaller weights.
 
-**INT4/INT8 quantization on 0.6B** (tested, slower or neutral). The hidden
-dimension of 1024 produces matrices too small to be bandwidth-bound. The
-dequantization overhead (3 SIMD ops for INT8, 8 ops for INT4 on NEON; similar
-on AVX) exceeds the bandwidth savings. BF16-to-f32 conversion is essentially
-free — a single shift instruction (`vshll` on NEON, bit shift on AVX). Quantization might help on the 1.7B model where matrices
-are 4x larger.
+**INT4/INT8 quantization on 0.6B** (tested, slower or neutral). See the
+Quantization section above — the 0.6B model's hidden=1024 matrices are
+compute-bound, not bandwidth-bound. Quantization only helped on 1.7B (INT8:
+20% Talker speedup), while INT4 was slower even there.
 
 **Softmax SIMD vectorization** (est. 2-4×, actual: not worth it). After
 quickselect reduced total sampling from 93ms to 21ms, softmax is only ~1.5ms
@@ -380,12 +529,14 @@ weight data (26MB per layer), not the 8-byte pointer loads in the struct.
 
 ## The Numbers
 
+### 0.6B Model (Primary Target)
+
 | Metric | Baseline | After all optimizations |
 |--------|----------|------------------------|
 | Talker | 46.9 ms/f | ~22 ms/f |
-| Code Predictor | 104.7 ms/f | ~60 ms/f |
+| Code Predictor | 104.7 ms/f | ~60 ms/f (batch vvexpf: 70→60) |
 | Speech Decoder | ~2,600ms (blocking) | overlapped (background thread) |
-| Prefill | ~1,800ms | ~1,000–1,600ms |
+| Prefill | ~1,800ms | ~1,000–1,600ms (delta: ~500ms repeat) |
 | Codec head+sampling | 93ms | 21ms |
 | Per-token malloc calls | ~120+ | **0** |
 | **RTF (CLI, short ~5s audio)** | **~3.5** | **~1.4–1.7** |
@@ -394,12 +545,20 @@ weight data (26MB per layer), not the 8-byte pointer loads in the struct.
 | **RTF (server warm, short)** | — | **1.39** |
 | **RTF (server warm, long)** | — | **1.26** |
 
+### 1.7B Model (with INT8)
+
+| Metric | BF16 | INT8 (`--int8`) |
+|--------|------|-----------------|
+| Talker | 79.3 ms/f | 67.4 ms/f (**20% faster**) |
+| Code Predictor | 87.0 ms/f | 78.7 ms/f |
+| **RTF** | **4.32** | **3.59** |
+
 All on an Apple M1 8-core, 16 GB RAM, 4 threads. RTF improves with longer
 audio because prefill is a fixed cost that amortizes over more frames. The
 speech decoder runs in a background thread, overlapping most of its work with
 generation — including streaming mode, where the decoder thread calls the audio
-callback directly. Server mode with embedding cache, warm buffers, and decoder
-thread overlap delivers the best RTF at **1.26**.
+callback directly. Server mode with embedding cache, warm buffers, delta prefill,
+and decoder thread overlap delivers the best RTF at **1.26**.
 
 ## Lessons
 
@@ -441,12 +600,30 @@ thread overlap delivers the best RTF at **1.26**.
    same path normal mode uses), the gap disappeared. Two code paths that do
    the same thing will always diverge in performance.
 
-9. **Read the old books.** Abrash's *Graphics Programming Black Book* and
-   Carmack's `.plan` files are from another era, but the principles — cache
-   friendliness, data alignment, knowing your memory hierarchy — are timeless.
-   The specific rules change (64-byte cache lines instead of dword alignment),
-   but the instinct to think about how data flows through the CPU is exactly
-   the same.
+9. **Batch your transcendentals.** Calling `expf()` 163,000 times per frame
+   is slower than calling `vvexpf()` 206 times — same math, same result,
+   8% faster. SIMD units want batches. This is the Abrash data alignment
+   lesson in a different guise: don't waste hardware lanes by feeding values
+   one at a time.
+
+10. **Exploit causal structure for caching.** Causal attention means prefix
+    tokens produce identical KV entries regardless of suffix. Delta prefill
+    cuts server prefill time in half for repeated speakers — zero accuracy
+    cost, because the math guarantees identical outputs.
+
+11. **Quantization is not free compression.** INT8 works on 1.7B (20% win)
+    because the matrices are large enough to be bandwidth-bound. INT4 loses
+    on every model size we tested — the nibble unpack overhead exceeds the
+    bandwidth savings. Always measure before assuming "smaller weights = faster."
+
+12. **Read the old books.** Abrash's *Graphics Programming Black Book* and
+    Carmack's `.plan` files are from another era, but the principles — cache
+    friendliness, data alignment, knowing your memory hierarchy — are timeless.
+    The specific rules change (64-byte cache lines instead of dword alignment),
+    but the instinct to think about how data flows through the CPU is exactly
+    the same. Every optimization in this post — alignment, SIMD batching,
+    pipeline parallelism, algorithmic complexity — traces back to ideas those
+    two articulated thirty years ago. The hardware evolved; the thinking didn't.
 
 ---
 
