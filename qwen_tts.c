@@ -1103,8 +1103,39 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "[CORR] pre-prefill: pre_conv_w[0]=%.6f\n", ctx->speech_dec.pre_conv_weight[0]);
     }
 
-    /* Load voice prefix KV (voice identity only, then prefill text normally) */
-    if (ctx->load_voice_kv_path) {
+    /* Load speaker position KV (.qvsp) — inject single speaker KV during normal prefill */
+    uint16_t *spk_kv_k = NULL, *spk_kv_v = NULL;
+    int spk_kv_loaded = 0;
+    int spk_kv_codec_pos = -1;  /* position within codec prefix */
+    if (ctx->load_voice_kv_path && strstr(ctx->load_voice_kv_path, ".qvsp")) {
+        FILE *kf = fopen(ctx->load_voice_kv_path, "rb");
+        if (kf) {
+            char magic[4]; uint32_t ver, nl, kd, sp;
+            if (fread(magic, 1, 4, kf) == 4 && memcmp(magic, "QVSP", 4) == 0 &&
+                fread(&ver, 4, 1, kf) == 1 && ver == 1 &&
+                fread(&nl, 4, 1, kf) == 1 && fread(&kd, 4, 1, kf) == 1 && fread(&sp, 4, 1, kf) == 1) {
+                int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
+                if ((int)nl == ctx->config.num_layers && (int)kd == kv_dim) {
+                    int n_layers = (int)nl;
+                    spk_kv_k = (uint16_t *)malloc((int64_t)n_layers * kv_dim * sizeof(uint16_t));
+                    spk_kv_v = (uint16_t *)malloc((int64_t)n_layers * kv_dim * sizeof(uint16_t));
+                    for (int l = 0; l < n_layers; l++) {
+                        fread(spk_kv_k + (int64_t)l * kv_dim, sizeof(uint16_t), kv_dim, kf);
+                        fread(spk_kv_v + (int64_t)l * kv_dim, sizeof(uint16_t), kv_dim, kf);
+                    }
+                    spk_kv_loaded = 1;
+                    spk_kv_codec_pos = (int)sp;
+                    if (!ctx->silent)
+                        fprintf(stderr, "  Loaded speaker KV from %s (codec_pos=%d, %d layers × %d dim)\n",
+                                ctx->load_voice_kv_path, (int)sp, n_layers, kv_dim);
+                }
+            }
+            fclose(kf);
+        }
+    }
+
+    /* Load voice prefix KV (.qvkv) — voice identity only, then prefill text normally */
+    if (ctx->load_voice_kv_path && !strstr(ctx->load_voice_kv_path, ".qvsp")) {
         FILE *kf = fopen(ctx->load_voice_kv_path, "rb");
         if (kf) {
             char magic[4]; uint32_t ver, nl, kd, vl;
@@ -1288,6 +1319,38 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
     }
 
+    /* Inject speaker position KV from .qvsp file (overwrite after normal prefill) */
+    if (spk_kv_loaded && spk_kv_k && spk_kv_v) {
+        int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
+        int n_layers = ctx->config.num_layers;
+        /* Speaker position in current prefill */
+        int spk_pos_target = inst_len + role_len + spk_kv_codec_pos;
+        /* Speaker position in dump (Base, no instruct) */
+        int spk_pos_source = role_len + spk_kv_codec_pos;  /* typically 3+4=7 */
+
+        if (spk_pos_target < ctx->kv_len) {
+            /* Overwrite K and V at speaker position */
+            for (int l = 0; l < n_layers; l++) {
+                int64_t dst_off = (int64_t)l * ctx->kv_max * kv_dim + (int64_t)spk_pos_target * kv_dim;
+                memcpy(ctx->kv_cache_k + dst_off, spk_kv_k + (int64_t)l * kv_dim, kv_dim * sizeof(uint16_t));
+                memcpy(ctx->kv_cache_v + dst_off, spk_kv_v + (int64_t)l * kv_dim, kv_dim * sizeof(uint16_t));
+            }
+            /* Re-encode RoPE from source position to target position */
+            if (spk_pos_source != spk_pos_target) {
+                reposition_rope_kv(ctx->kv_cache_k, n_layers, ctx->kv_max, kv_dim,
+                                   ctx->config.num_kv_heads, ctx->config.head_dim,
+                                   1, spk_pos_source, spk_pos_target,
+                                   ctx->rope_cos, ctx->rope_sin);
+            }
+            if (!ctx->silent)
+                fprintf(stderr, "  Injected speaker KV at pos %d (from source pos %d, RoPE %s)\n",
+                        spk_pos_target, spk_pos_source,
+                        spk_pos_source != spk_pos_target ? "re-encoded" : "unchanged");
+        }
+        free(spk_kv_k); free(spk_kv_v);
+        spk_kv_k = NULL; spk_kv_v = NULL;
+    }
+
 kv_loaded:
     /* Dump KV cache after prefill (for cross-model voice portability) */
     if (ctx->dump_kv_path) {
@@ -1320,8 +1383,40 @@ kv_loaded:
         }
     }
 
+    /* Dump speaker position KV (single position — just the speaker identity) */
+    if (ctx->dump_voice_kv_path && strstr(ctx->dump_voice_kv_path, ".qvsp")) {
+        /* .qvsp = single speaker position KV */
+        int spk_pos = inst_len + role_len + speaker_embed_pos;  /* absolute position in prefill */
+        if (speaker_embed_pos >= 0 && spk_pos < ctx->kv_len) {
+            FILE *kf = fopen(ctx->dump_voice_kv_path, "wb");
+            if (kf) {
+                int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
+                int n_layers = ctx->config.num_layers;
+                fwrite("QVSP", 1, 4, kf);
+                uint32_t ver = 1;
+                fwrite(&ver, 4, 1, kf);
+                uint32_t nl = (uint32_t)n_layers, kd = (uint32_t)kv_dim;
+                uint32_t sp = (uint32_t)speaker_embed_pos;  /* position within codec prefix */
+                fwrite(&nl, 4, 1, kf);
+                fwrite(&kd, 4, 1, kf);
+                fwrite(&sp, 4, 1, kf);
+                /* Dump K and V for just the speaker position across all layers */
+                for (int l = 0; l < n_layers; l++) {
+                    int64_t off = (int64_t)l * ctx->kv_max * kv_dim + (int64_t)spk_pos * kv_dim;
+                    fwrite(ctx->kv_cache_k + off, sizeof(uint16_t), kv_dim, kf);
+                    fwrite(ctx->kv_cache_v + off, sizeof(uint16_t), kv_dim, kf);
+                }
+                fclose(kf);
+                if (!ctx->silent)
+                    fprintf(stderr, "  Dumped speaker KV to %s (pos %d, %d layers × %d dim = %.1f KB)\n",
+                            ctx->dump_voice_kv_path, spk_pos, n_layers, kv_dim,
+                            (float)n_layers * kv_dim * 2 * sizeof(uint16_t) / 1024.0f);
+            }
+        }
+    }
+
     /* Dump voice prefix KV (voice identity only, without text) */
-    if (ctx->dump_voice_kv_path) {
+    if (ctx->dump_voice_kv_path && !strstr(ctx->dump_voice_kv_path, ".qvsp")) {
         FILE *kf = fopen(ctx->dump_voice_kv_path, "wb");
         if (kf) {
             int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
