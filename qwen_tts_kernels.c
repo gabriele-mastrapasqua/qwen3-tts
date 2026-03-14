@@ -14,6 +14,9 @@
 #ifdef __linux__
 #include <unistd.h>
 #endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -717,8 +720,8 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
 
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
-    int blocks_per_row = cols / Q4_0_BLOCK_SIZE;
 #if defined(__APPLE__) && defined(__BLOCKS__)
+    int blocks_per_row = cols / Q4_0_BLOCK_SIZE;
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         dispatch_apply((size_t)nt,
@@ -739,8 +742,8 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
-    int blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
 #if defined(__APPLE__) && defined(__BLOCKS__)
+    int blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
     int nt = g_n_threads;
     if (nt > 1) {
         int total = q_dim + 2 * kv_dim;
