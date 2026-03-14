@@ -323,6 +323,12 @@ encoding, and speech encoding — giving a **2x speedup** on subsequent generati
 ./qwen_tts -d qwen3-tts-1.7b-base \
     --load-voice my_voice.qvoice \
     --text "A completely different sentence." -o output.wav
+
+# Example: use the included Italian voice profile
+./qwen_tts -d qwen3-tts-1.7b-base \
+    --load-voice qvoices/silvio_italian_17b.qvoice \
+    --text "Buongiorno, questa è una prova di clonazione vocale." \
+    -l Italian -o output.wav
 ```
 
 **Performance comparison** (Apple M1 8-core, 4 threads, 0.6B-Base, ~4s output):
