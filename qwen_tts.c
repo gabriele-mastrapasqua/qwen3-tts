@@ -920,8 +920,34 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         }
         /* Codec side: codec_tokens[i] or speaker embedding for voice clone */
         if (codec_tokens[i] == -1 && ctx->voice_clone && ctx->speaker_embedding) {
-            /* Voice clone: use continuous speaker embedding directly */
-            for (int j = 0; j < h; j++) dst[j] += ctx->speaker_embedding[j];
+            /* Voice clone: use continuous speaker embedding.
+             * For cross-model injection (ECAPA embedding into CustomVoice), scale
+             * the embedding norm to match the model's preset speaker norms.
+             * This is needed because ECAPA and codec embedding tables have different
+             * norm ranges (e.g., ECAPA ~17 vs CustomVoice ~14.5 on 1.7B). */
+            float emb_norm = 0;
+            for (int j = 0; j < h; j++) emb_norm += ctx->speaker_embedding[j] * ctx->speaker_embedding[j];
+            emb_norm = sqrtf(emb_norm);
+
+            /* Compute target norm from a reference preset speaker (ryan=3061) */
+            float ref_norm = 0;
+            {
+                float tmp_ref[4096];
+                lookup_codec_embed(ctx, 3061, tmp_ref);  /* ryan */
+                for (int j = 0; j < h; j++) ref_norm += tmp_ref[j] * tmp_ref[j];
+                ref_norm = sqrtf(ref_norm);
+            }
+
+            float scale = (ref_norm > 0.1f && emb_norm > 0.1f) ? ref_norm / emb_norm : 1.0f;
+            for (int j = 0; j < h; j++) dst[j] += ctx->speaker_embedding[j] * scale;
+
+            if (!ctx->silent && fabsf(scale - 1.0f) > 0.01f)
+                fprintf(stderr, "  Speaker embedding norm scaled: %.2f -> %.2f (scale=%.4f)\n",
+                        emb_norm, emb_norm * scale, scale);
+            if (ctx->debug)
+                fprintf(stderr, "[PROMPT] pos=%d SPEAKER EMBED injected (h=%d, raw_norm=%.4f, target_norm=%.4f, scale=%.4f)\n",
+                        pos, h, emb_norm, ref_norm, scale);
+
         } else {
             lookup_codec_embed(ctx, codec_tokens[i], tmp_embed);
             for (int j = 0; j < h; j++) dst[j] += tmp_embed[j];
