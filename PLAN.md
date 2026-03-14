@@ -158,12 +158,27 @@ supports `--instruct` for style control.
 | Cross-model + --instruct | fast | ~45s | 5.81 | Full style control on cloned voice |
 | Preset speaker (CustomVoice) | fast | ~44.7s | 6.21 | Baseline for comparison |
 
+**Status: EXPERIMENTAL — quality issues on 1.7B**
+
+A/B testing revealed that cross-model injection produces noticeably different voice
+timbre compared to direct voice clone on the Base model. The high cosine similarity
+(~0.94) was misleading — the Base and CustomVoice transformers interpret the embedding
+vectors differently because they were trained with different data (ECAPA continuous
+embeddings vs discrete codec tokens). The 0.6B is closer but still loses fidelity.
+
+Root cause: only 3 of 9 preset speakers have real embeddings (ryan, vivian, serena;
+others are placeholder ~0.02 norm). 2 of 3 are Chinese-trained, creating a biased
+embedding subspace. The CustomVoice transformer "reads" any injected embedding
+through this biased lens, producing Chinese-accented output for non-Chinese voices.
+
 **Completed**:
 - [x] `[MED]` Allow `--load-voice .bin` on CustomVoice/VoiceDesign models
 - [x] `[MED]` Smarter `--instruct` warning (only on Base, not CustomVoice)
 - [x] `[MED]` Better `--ref-audio` error message (suggest 2-step workflow)
 - [x] `[MED]` README documentation with workflow, examples, model table
-- [x] `[MED]` Verified embedding space compatibility (cosine ~0.94, norm ~14-17)
+- [x] `[MED]` Tested embedding space: cosine ~0.94 but semantically different across models
+- [x] `[MED]` Tested norm scaling: auto-scale to ryan norm (helps but doesn't fix)
+- [x] `[MED]` Tested direction blending: alpha*silvio + (1-alpha)*ryan (marginal improvement)
 
 **TODO**:
 - [ ] `[HIGH]` One-command voice extraction: `./qwen_tts --extract-voice ref.wav -o voice.bin`

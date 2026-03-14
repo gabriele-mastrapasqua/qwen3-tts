@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -515,8 +516,16 @@ int main(int argc, char **argv) {
                     qwen_tts_unload(ctx);
                     return 1;
                 }
-                if (!silent)
-                    fprintf(stderr, "Voice clone: loaded speaker embedding from %s\n", load_voice);
+                if (!silent) {
+                    fprintf(stderr, "Voice clone: loaded speaker embedding from %s (%d floats)\n", load_voice, enc_dim);
+                    /* Debug: print embedding stats */
+                    float norm = 0;
+                    for (int i = 0; i < enc_dim; i++) norm += ctx->speaker_embedding[i] * ctx->speaker_embedding[i];
+                    norm = sqrtf(norm);
+                    fprintf(stderr, "  embedding norm=%.4f, first5=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                            norm, ctx->speaker_embedding[0], ctx->speaker_embedding[1],
+                            ctx->speaker_embedding[2], ctx->speaker_embedding[3], ctx->speaker_embedding[4]);
+                }
             }
         } else {
             /* Extract speaker embedding from reference audio */
