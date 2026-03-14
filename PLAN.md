@@ -200,15 +200,18 @@ voice profiles, fast generation with CustomVoice model speed (RTF ~1.5-1.7 on 0.
   - Or is there actual compute difference in the Base model architecture?
   - Profile: prefill time, per-frame Talker ms, per-frame CP ms — compare Base vs CustomVoice
   - If it's just RAM, a machine with 32GB would show no difference
-- [ ] `[HIGH]` **KV cache dump approach**: instead of injecting raw ECAPA embedding into
-  CustomVoice, dump the KV cache entries at the speaker position AFTER prefill on the
-  Base model, and inject those processed KV values into CustomVoice. This would bypass
-  the different-transformer-weights issue because we inject post-processed values.
-  - Estimate KV cache size per position: 28 layers × 2 (K+V) × kv_dim × sizeof(bf16)
-  - For 0.6B: 28 × 2 × 1024 × 2 = ~112KB per position (very small!)
-  - For 1.7B: 28 × 2 × 1024 × 2 = ~112KB (same — KV uses kv_dim not hidden)
-  - Could save just the speaker position's KV entries in a new format
-  - Question: does CustomVoice's KV cache expect data from its own transformer or is it flexible?
+- [x] `[HIGH]` **KV cache dump approach**: TESTED — two findings:
+  - **Cross-model (Base→CustomVoice): DOESN'T WORK** — KV entries contain K=W_k·hidden and
+    V=W_v·hidden computed by the Base transformer's projection matrices. CustomVoice's Q
+    (from its own W_q) does attention against these incompatible K/V → garbage output (noise).
+    KV is even MORE model-specific than raw embeddings.
+  - **Same-model (Base→Base): WORKS** — implemented `--dump-kv` / `--load-kv` flags.
+    Dumps full prefill KV (28 layers × N pos × 512 kv_dim × bf16 = ~1.7MB for 31 pos).
+    Loading skips prefill entirely → useful for repeated Base model clone calls.
+  - Format: `.bin` with header (magic "QVKV", version, n_layers, kv_dim, prefill_len)
+- [ ] `[MED]` **KV cache for voice-only prefix**: dump only role+codec+speaker positions
+  (pos 0-9, before text), load for different texts on the same model. Would skip
+  voice extraction + partial prefill on every call. ~300KB for the prefix portion.
 - [ ] `[MED]` **Lightweight projection layer**: train a small linear projection (matrix multiply)
   that maps ECAPA embeddings → CustomVoice codec embedding space. Would need correspondences:
   generate audio of preset speakers with CustomVoice, extract ECAPA from that audio, build
