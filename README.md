@@ -385,11 +385,44 @@ make demo-clone REF=my_voice.wav TEXT="Hello from my cloned voice!"
 
 > **Note:** Voice cloning requires a **Base** model (`Qwen3-TTS-12Hz-0.6B-Base` or `1.7B-Base`),
 > not the CustomVoice model. The Base model includes an ECAPA-TDNN speaker encoder that extracts
-> a voice embedding from the reference audio. A few seconds of clear speech is sufficient.
->
-> By default, only the first **15 seconds** of reference audio are used for the speaker embedding.
-> This is enough for high-quality cloning and keeps extraction fast. Use `--max-ref-duration 0`
-> to process the entire file, or set a custom limit (e.g., `--max-ref-duration 30`).
+> a voice embedding from the reference audio.
+
+#### How Voice Cloning Works
+
+The speaker encoder is an **ECAPA-TDNN** (Emphasized Channel Attention, Propagation and
+Aggregation in TDNN) network that converts reference audio into a fixed-size speaker embedding:
+
+1. **Mel spectrogram**: The reference audio is converted to a 128-band mel spectrogram at 24 kHz
+   (hop size 256 = ~94 frames/second).
+2. **TDNN + SE-Res2Net blocks**: Four convolutional blocks extract speaker-characteristic features
+   across time — capturing pitch, timbre, and speaking style.
+3. **Attentive Statistics Pooling**: Computes a weighted mean and standard deviation over the
+   **entire temporal sequence**. This is the key step: longer audio means the pooling sees more
+   variation in the speaker's voice (different intonations, pitch ranges, speaking styles),
+   producing a richer and more representative embedding.
+4. **FC projection**: The pooled statistics (3072-dim) are projected to the final embedding
+   dimension (1024 for 0.6B, 2048 for 1.7B) and injected into the transformer prompt.
+
+#### Reference Audio Duration
+
+More reference audio generally produces better voice clones. The attentive pooling layer benefits
+from seeing diverse speech patterns — monotone input yields a flatter embedding, while varied
+speech with different intonations captures the speaker's full vocal range.
+
+| Duration | Mel frames | Quality | Notes |
+|----------|-----------|---------|-------|
+| 5-10s | 470-940 | Good | Minimum for recognizable clone |
+| 15-20s | 1400-1880 | Better | Covers basic vocal range |
+| **30s** | **2810** | **Recommended** | Good balance of quality and speed |
+| 45s+ | 4200+ | Best | Diminishing returns, slower extraction |
+
+By default, the first **30 seconds** of reference audio are used. Use `--max-ref-duration 0`
+to process the entire file, or set a custom limit (e.g., `--max-ref-duration 45`).
+
+**Tips for best results:**
+- Use clean audio without background music or noise
+- Include varied speech (questions, statements, different emotions) rather than monotone reading
+- 24 kHz WAV is ideal; other sample rates will be rejected (convert with `ffmpeg -i input.wav -ar 24000 output.wav`)
 
 #### Reference Audio Format
 

@@ -186,7 +186,7 @@ int main(int argc, char **argv) {
     const char *load_voice = NULL;
     const char *list_voices_dir = NULL;
     const char *delete_voice = NULL;
-    float max_ref_duration = 15.0f;  /* default: use first 15s of ref audio */
+    float max_ref_duration = 30.0f;  /* default: use first 30s of ref audio */
     int use_int8 = 0;
     int use_int4 = 0;
     static struct option long_options[] = {
@@ -290,7 +290,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --load-voice <path>        Load voice (.qvoice = full ICL, .bin = embedding only)\n");
                 fprintf(stderr, "  --list-voices <dir>        List .qvoice files in directory\n");
                 fprintf(stderr, "  --delete-voice <path>      Delete a .qvoice file\n");
-                fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)\n");
+                fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 30, 0=all)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
