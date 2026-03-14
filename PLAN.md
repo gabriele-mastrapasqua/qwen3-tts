@@ -130,7 +130,63 @@ and model-portable (same codec tokens work for both 0.6B and 1.7B Base models).
 
 ---
 
-### Phase 13: SDOT/SMMLA INT8 Native Dot Product (Architecture-Specific)
+### Phase 13: Cross-Model Voice Injection (Clone + Style Control)
+
+**Goal**: Enable cloning any voice and using it across all model types with full style
+control. One-command extraction from audio → reusable `.bin` → works on CustomVoice (with
+`--instruct`), Base, and VoiceDesign models.
+
+**Discovery**: The ECAPA-TDNN speaker embeddings (Base model) and the discrete codec speaker
+embeddings (CustomVoice model) live in **compatible vector spaces** (cosine similarity ~0.94,
+norms 14-17). Injecting an ECAPA embedding into CustomVoice produces the correct voice AND
+supports `--instruct` for style control.
+
+**Why this matters**:
+- Preset voices (ryan, serena, etc.) sound unnatural in some languages — cloned native
+  speakers sound much better
+- Voice clone on Base model has no style control (instruct not supported)
+- Cross-model injection gives **clone quality + instruct control** in one workflow
+- RTF savings: `.bin` injection skips mel/ECAPA entirely, prefill only (fast)
+
+**Performance comparison** (Apple M1, Italian text ~8s audio):
+
+| Method | Prefill | Total | RTF | Notes |
+|--------|---------|-------|-----|-------|
+| Voice clone (Base, --ref-audio) | 5.4s | 27.9s | 3.21 | Full ECAPA extraction every time |
+| Voice clone (Base, .qvoice) | 5.3s | 37.1s | 4.14 | Skip ECAPA but still Base model speed |
+| Cross-model (CustomVoice, .bin) | fast | ~19.5s | 3.17 | Skip ECAPA, CustomVoice model weights |
+| Cross-model + --instruct | fast | ~45s | 5.81 | Full style control on cloned voice |
+| Preset speaker (CustomVoice) | fast | ~44.7s | 6.21 | Baseline for comparison |
+
+**Completed**:
+- [x] `[MED]` Allow `--load-voice .bin` on CustomVoice/VoiceDesign models
+- [x] `[MED]` Smarter `--instruct` warning (only on Base, not CustomVoice)
+- [x] `[MED]` Better `--ref-audio` error message (suggest 2-step workflow)
+- [x] `[MED]` README documentation with workflow, examples, model table
+- [x] `[MED]` Verified embedding space compatibility (cosine ~0.94, norm ~14-17)
+
+**TODO**:
+- [ ] `[HIGH]` One-command voice extraction: `./qwen_tts --extract-voice ref.wav -o voice.bin`
+  - Loads only speaker encoder (not full model), extracts embedding, prints usage tips
+  - Detects language from audio (or accepts `--language`) and suggests matching model
+  - Prints: "Voice saved. Use with: ./qwen_tts -d qwen3-tts-1.7b --load-voice voice.bin ..."
+- [ ] `[HIGH]` `make extract-voice REF=speaker.wav` Makefile target for quick extraction
+- [ ] `[HIGH]` Test cross-model injection on 0.6B CustomVoice (not just 1.7B)
+  - The 0.6B Base has enc_dim=1024, 0.6B CustomVoice has hidden=1024 — should work
+  - Would give fast cloned voice generation (RTF ~1.5) without instruct but with correct voice
+- [ ] `[HIGH]` Test cross-model injection on 1.7B CustomVoice with 0.6B Base embedding
+  - 0.6B Base produces 1024-dim embedding, 1.7B CustomVoice expects 2048-dim
+  - Needs zero-padding or projection — may not work without training
+- [ ] `[MED]` Test with genuinely new voices (not ryan-from-ryan, but unseen speakers)
+- [ ] `[MED]` Evaluate quality loss from norm scaling (current: scale to ~14.5 target norm)
+  - Are raw ECAPA norms (~17) better? Or does CustomVoice expect ~14-15 norm range?
+- [ ] `[MED]` Voice gallery: pre-extract .bin files for common languages (Italian, Spanish, etc.)
+- [ ] `[LOW]` Blog post on cross-model embedding space compatibility
+- [ ] `[LOW]` Server API: accept .bin path in JSON request for per-request voice switching
+
+---
+
+### Phase 15: SDOT/SMMLA INT8 Native Dot Product (Architecture-Specific)
 
 **Goal**: Use native int8×int8 dot product instructions (ARM SDOT / x86 VNNI) for
 matvec, bypassing f32 dequantization entirely.
@@ -154,7 +210,7 @@ M1 has SDOT but not SMMLA; the 0.6B model is too small to be bandwidth-bound any
 
 ---
 
-### Phase 14: Metal GPU / MLX
+### Phase 16: Metal GPU / MLX
 
 **Context**: Metal backend was previously implemented and benchmarked on M1 — **1.3x slower
 than CPU NEON**. Root cause: unified memory means CPU and GPU share the same bandwidth ceiling,
