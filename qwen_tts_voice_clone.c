@@ -25,25 +25,77 @@
  * ════════════════════════════════════════════════════════════════════════ */
 
 int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int *out_sample_rate) {
+    /* Quick extension check — catch obvious mistakes before reading */
+    const char *ext = strrchr(path, '.');
+    if (ext) {
+        if (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".m4a") == 0 ||
+            strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".ogg") == 0 ||
+            strcasecmp(ext, ".opus") == 0 || strcasecmp(ext, ".flac") == 0 ||
+            strcasecmp(ext, ".aac") == 0 || strcasecmp(ext, ".wma") == 0 ||
+            strcasecmp(ext, ".webm") == 0 || strcasecmp(ext, ".mkv") == 0 ||
+            strcasecmp(ext, ".avi") == 0 || strcasecmp(ext, ".mov") == 0) {
+            fprintf(stderr, "Error: %s is not a WAV file (detected %s format)\n", path, ext);
+            fprintf(stderr, "Voice cloning requires 24 kHz WAV (PCM, 16-bit, mono).\n");
+            fprintf(stderr, "Convert first:\n");
+            fprintf(stderr, "  ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
+            return -1;
+        }
+    }
+
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "Error: cannot open WAV file: %s\n", path);
+        fprintf(stderr, "Error: cannot open file: %s\n", path);
         return -1;
     }
 
-    /* Read RIFF header */
-    char riff[4];
-    if (fread(riff, 1, 4, f) != 4 || memcmp(riff, "RIFF", 4) != 0) {
-        fprintf(stderr, "Error: not a WAV file (no RIFF header): %s\n", path);
+    /* Read and validate file header */
+    unsigned char header[12];
+    size_t hdr_read = fread(header, 1, 12, f);
+    if (hdr_read < 4) {
+        fprintf(stderr, "Error: file too small to be audio: %s\n", path);
         fclose(f); return -1;
     }
 
-    uint32_t file_size;
-    fread(&file_size, 4, 1, f);
+    /* Check for common non-WAV formats and give helpful error messages */
+    if (hdr_read >= 4 && (memcmp(header, "\x00\x00\x00", 3) == 0 ||
+                          memcmp(header + 4, "ftyp", 4) == 0)) {
+        fprintf(stderr, "Error: %s is an MP4/M4A file, not a WAV file\n", path);
+        fprintf(stderr, "Convert first: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
+        fclose(f); return -1;
+    }
+    if (hdr_read >= 3 && header[0] == 0xFF && (header[1] & 0xE0) == 0xE0) {
+        fprintf(stderr, "Error: %s is an MP3 file, not a WAV file\n", path);
+        fprintf(stderr, "Convert first: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
+        fclose(f); return -1;
+    }
+    if (hdr_read >= 4 && memcmp(header, "OggS", 4) == 0) {
+        fprintf(stderr, "Error: %s is an OGG/Opus file, not a WAV file\n", path);
+        fprintf(stderr, "Convert first: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
+        fclose(f); return -1;
+    }
+    if (hdr_read >= 4 && memcmp(header, "fLaC", 4) == 0) {
+        fprintf(stderr, "Error: %s is a FLAC file, not a WAV file\n", path);
+        fprintf(stderr, "Convert first: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
+        fclose(f); return -1;
+    }
+    if (hdr_read >= 4 && memcmp(header, "ID3", 3) == 0) {
+        fprintf(stderr, "Error: %s is an MP3 file (ID3 tagged), not a WAV file\n", path);
+        fprintf(stderr, "Convert first: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
+        fclose(f); return -1;
+    }
 
-    char wave[4];
-    if (fread(wave, 1, 4, f) != 4 || memcmp(wave, "WAVE", 4) != 0) {
-        fprintf(stderr, "Error: not a WAV file (no WAVE marker): %s\n", path);
+    /* Check for RIFF/WAVE header */
+    if (memcmp(header, "RIFF", 4) != 0) {
+        fprintf(stderr, "Error: %s is not a WAV file (unrecognized format)\n", path);
+        fprintf(stderr, "Only 24 kHz WAV (PCM, 16/32-bit) is supported.\n");
+        fprintf(stderr, "Convert with: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
+        fclose(f); return -1;
+    }
+
+    /* header[4..7] = file_size, header[8..11] = "WAVE" (already read) */
+    if (hdr_read < 12 || memcmp(header + 8, "WAVE", 4) != 0) {
+        fprintf(stderr, "Error: %s has RIFF header but is not a WAV file (no WAVE marker)\n", path);
+        fprintf(stderr, "Convert with: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
         fclose(f); return -1;
     }
 
