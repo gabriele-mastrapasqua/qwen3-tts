@@ -372,7 +372,8 @@ typedef struct qwen_tts_ctx {
     int max_tokens;
     float cp_temperature;
     int cp_top_k;
-    
+    int greedy_warmup;  /* initial frames sampled greedily (temp=0) for cross-model stability */
+
     /* Speaker and language */
     int speaker_id;
     int language_id;

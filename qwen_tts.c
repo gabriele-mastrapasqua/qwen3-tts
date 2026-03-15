@@ -230,7 +230,7 @@ extern void qwen_set_seed(uint32_t seed);
 
 /* Embed a single text token: text_embedding → text_projection(SiLU) → out[hidden]
  * Computes the full projection (bf16 lookup + fc1 SiLU + fc2). */
-static void embed_one_text_token_compute(qwen_tts_ctx_t *ctx, int tid, float *out) {
+void embed_one_text_token_compute(qwen_tts_ctx_t *ctx, int tid, float *out) {
     int th = ctx->config.text_hidden_size, h = ctx->config.hidden_size;
     float *text_emb = ctx->emb_tmp1;
     float *fc1_out = ctx->emb_tmp2;
@@ -1529,9 +1529,15 @@ kv_loaded:
             fprintf(stderr, "  [frame %d] EOS logit=%.2f rank=%d\n", frame, eos_logit, eos_rank);
         }
 
-        /* Sample code0 */
+        /* Sample code0 — use greedy for warmup frames to reduce cross-model divergence */
+        float frame_temp = ctx->temperature;
+        int frame_top_k = ctx->top_k;
+        if (ctx->greedy_warmup > 0 && frame < ctx->greedy_warmup) {
+            frame_temp = 0.0f;
+            frame_top_k = 1;
+        }
         int code0 = qwen_tts_sample(ctx->logits, ctx->config.codec_vocab_size,
-                                     ctx->temperature, ctx->top_k, ctx->top_p,
+                                     frame_temp, frame_top_k, ctx->top_p,
                                      ctx->rep_penalty, ctx->prev_tokens, ctx->n_prev_tokens);
 
         if (code0 == QWEN_TTS_CODEC_EOS) {

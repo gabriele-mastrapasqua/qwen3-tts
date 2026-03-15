@@ -3,7 +3,7 @@
 UNAME_S := $(shell uname -s)
 CC = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
-LDLIBS = -lm -lpthread
+LDLIBS = -lm -lpthread -lz
 
 # BLAS (Accelerate on macOS, OpenBLAS on Linux)
 ifeq ($(UNAME_S),Darwin)

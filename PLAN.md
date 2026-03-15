@@ -1,6 +1,6 @@
 # PLAN.md — Qwen3-TTS C Engine Roadmap
 
-Updated: 2026-03-13
+Updated: 2026-03-14
 
 Core engine is **COMPLETE** and producing good audio for both 0.6B and 1.7B models.
 This document tracks completed work and remaining future ideas.
@@ -136,17 +136,23 @@ and model-portable (same codec tokens work for both 0.6B and 1.7B Base models).
 control. One-command extraction from audio → reusable `.bin` → works on CustomVoice (with
 `--instruct`), Base, and VoiceDesign models.
 
-**Discovery**: The ECAPA-TDNN speaker embeddings (Base model) and the discrete codec speaker
-embeddings (CustomVoice model) live in **compatible vector spaces** (cosine similarity ~0.94,
-norms 14-17). Injecting an ECAPA embedding into CustomVoice produces the correct voice AND
-supports `--instruct` for style control.
+**Discovery (March 2026)**: Deep weight analysis revealed that Base and CustomVoice models
+have **nearly identical transformer weights** (cosine ≈ 0.9999 per layer). The ONLY difference
+is the codec_embedding table (9 preset speaker tokens) and the ECAPA-TDNN speaker encoder
+(76 extra tensors in Base only). The earlier claim of "80-88% different weights" was WRONG —
+that was measuring KV cache output divergence, not weight divergence.
+
+**What this means**: Cross-model voice injection is fundamentally sound because the
+transformer that processes the voice embedding is the SAME model. The fidelity gap comes
+from micro-differences (cosine 0.99997 in text_projection) that accumulate through
+autoregressive generation, not from a fundamental architecture mismatch.
 
 **Why this matters**:
 - Preset voices (ryan, serena, etc.) sound unnatural in some languages — cloned native
   speakers sound much better
 - Voice clone on Base model has no style control (instruct not supported)
 - Cross-model injection gives **clone quality + instruct control** in one workflow
-- RTF savings: `.bin` injection skips mel/ECAPA entirely, prefill only (fast)
+- RTF savings: `.bin`/`.qvoice` injection skips mel/ECAPA entirely, prefill only (fast)
 
 **Performance comparison** (Apple M1, Italian text ~8s audio):
 
@@ -158,23 +164,37 @@ supports `--instruct` for style control.
 | Cross-model + --instruct | fast | ~45s | 5.81 | Full style control on cloned voice |
 | Preset speaker (CustomVoice) | fast | ~44.7s | 6.21 | Baseline for comparison |
 
-**Status: WORKING — slight timbre shift vs direct clone, but valuable for custom voices**
+**Status: WORKING — slight timbre shift vs direct clone, root cause identified**
 
-Cross-model injection works: a .bin extracted from the Base model can be loaded into
+Cross-model injection works: a .qvoice extracted from the Base model can be loaded into
 CustomVoice (with or without --instruct) and produces recognizable, usable voice output.
-There is a slight timbre difference vs direct voice clone on Base — the voice is similar
-but not identical. This is expected because Base and CustomVoice have different transformer
-weights (80-88% of attention/MLP values differ — they were trained separately).
+There is a slight timbre difference vs direct voice clone — the voice is similar but not
+identical. Root cause analysis (March 2026) identified THREE specific sources:
 
-Despite the difference, the **value is immense**: custom voices per language, reusable
-voice profiles, fast generation with CustomVoice model speed (RTF ~1.5-1.7 on 0.6B).
+1. **`tts_pad_embed` micro-difference** (cosine 0.99996 between models) — used at EVERY
+   frame of generation, accumulates through 28 layers × 60+ frames
+2. **Weight micro-differences** (cosine 0.9998 worst at layers 16-18 MLP) — compound
+   through the attention chain
+3. **Autoregressive butterfly effect** — tiny logit differences push past sampling
+   thresholds → different token → cascade divergence
 
 **Key findings**:
+- Transformer weights are **identical** (cosine 0.9998-1.0000 across ALL 308 talker tensors)
+- Codec embedding: codebook entries (0-2047) are **identical** between models
+- Only 9 speaker preset tokens differ (norm ~0.016 in Base vs ~10 in CV)
+- Base has 76 extra ECAPA-TDNN tensors (speaker_encoder.*)
 - Only 3 of 9 preset speakers have real embeddings (ryan, vivian, serena; others ~0.02 norm)
-- Auto norm scaling helps (ECAPA ~17 → CustomVoice ~14.5)
-- 0.6B cross-model produces good results (closer norm match)
-- 1.7B cross-model usable but more timbre shift (2 of 3 real speakers are Chinese-trained)
-- Voice clone on Base model is nearly perfect — understanding WHY is key to improving cross-model
+- Auto norm scaling helps (ECAPA ~17 → CustomVoice ~9.4 on 0.6B)
+- Same-model KV reload also diverges (mel corr 0.85) — sets upper bound on injection quality
+- Cross-model injection mel correlation: 0.65 overall, 0.85 at first frames → butterfly effect
+
+**Quantified divergence** (Silvio Italian, seed 42):
+
+| Configuration | Mel Corr vs Base | Duration | Quality |
+|--------------|------------------|----------|---------|
+| Base direct (ground truth) | 1.000 | 4.48s | Perfect clone |
+| Base KV reload (same model) | 0.847 | 4.32s | BF16 quantization cascade |
+| CV inject (.qvoice v3) | 0.649 | 5.20s | Recognizable, slight timbre shift |
 
 **Completed**:
 - [x] `[MED]` Allow `--load-voice .bin` on CustomVoice/VoiceDesign models
@@ -183,7 +203,9 @@ voice profiles, fast generation with CustomVoice model speed (RTF ~1.5-1.7 on 0.
 - [x] `[MED]` README documentation with workflow, examples, model table
 - [x] `[MED]` Auto norm scaling to match target model's preset speakers
 - [x] `[MED]` Tested embedding space: cosine ~0.94, norms differ, direction blending tested
-- [x] `[MED]` Verified: Base and CustomVoice transformer weights differ 80-88%
+- [x] `[MED]` ~~Verified: Base and CustomVoice transformer weights differ 80-88%~~
+  **CORRECTED (March 2026): weights are nearly IDENTICAL (cosine 0.9998-1.0000).
+  The 80-88% claim was measuring KV output divergence, not weight divergence.**
 
 **TODO — Understanding & Analysis**:
 - [x] `[HIGH]` **Deep analysis: why does Base voice clone work so well?**
@@ -194,6 +216,14 @@ voice profiles, fast generation with CustomVoice model speed (RTF ~1.5-1.7 on 0.
     far better than raw embedding injection (~60-70%)
   - KEY INSIGHT: the voice prefix (first ~10 KV positions) carries the identity.
     Separating this from the text portion enables reuse with different text + instruct.
+- [x] `[HIGH]` **Deep weight analysis (March 2026)**: COMPLETE
+  - ALL transformer weights are nearly identical (cosine 0.9998-1.0000)
+  - Only difference: codec_embedding table (9 speaker presets) + ECAPA-TDNN (Base only)
+  - Root cause of cross-model divergence identified:
+    1. `tts_pad_embed` micro-difference (cosine 0.99996) → accumulates per-frame
+    2. Weight micro-diffs (cosine 0.9998 at layers 16-18) → compound through layers
+    3. Autoregressive butterfly effect → cascading token divergence
+  - See blog/cross-model-voice-analysis.md for full analysis
 - [ ] `[MED]` **Analyze RTF difference: why is Base voice clone slower?**
   - Base 1.7B: RTF 3.2-4.1 vs CustomVoice 1.7B with preset: similar RTF
   - But Base 0.6B: RTF 1.5-1.8 vs CustomVoice 0.6B: RTF 1.5-1.7 (similar!)
@@ -269,8 +299,101 @@ voice profiles, fast generation with CustomVoice model speed (RTF ~1.5-1.7 on 0.
 - [x] `[MED]` Full KV dump: works ~90% but tied to specific text, no instruct
 - [ ] `[MED]` Evaluate .bin vs .qvkv quality comparison across languages
 - [ ] `[LOW]` Lightweight projection layer (ECAPA→CustomVoice codec space)
-- [ ] `[LOW]` Blog post on KV cache approach and custom voice creation
+  **NOTE (March 2026)**: May not be needed — weights are identical, projection ≈ identity
+- [x] `[LOW]` Blog post on cross-model voice analysis: blog/cross-model-voice-analysis.md
 - [ ] `[LOW]` Server API: accept voice path in JSON for per-request voice switching
+
+**Fidelity gap analysis — COMPLETE (March 2026)**:
+
+Exhaustive testing revealed that **cross-model divergence ≈ same-model seed variance**.
+The voice identity is preserved; only prosody varies. This is a structural limit of
+autoregressive generation, not a fixable bug.
+
+- [x] `[HIGH]` **TPAD: Save Base tts_pad/bos/eos embeds in .qvoice**: +2.3% mel corr,
+  eliminates dominant per-frame drift. Cost: +12KB. Implemented.
+- [x] `[HIGH]` **WOVR: Save text_projection + codec_embedding in .qvoice**: Full weight
+  override for maximum cross-model fidelity. Self-contained 16MB file — no Base model
+  needed to use the voice. RTF 1.60 (-20% vs clone from WAV). Implemented.
+- [x] `[MED]` **.qvoice v3 with metadata**: Language auto-set, model mismatch warnings,
+  voice naming. Prevents the "Italian voice used with English" mistake.
+- [x] `[MED]` **Test lower temperature**: temp 0.3 WORSE (sharpens butterfly effect).
+- [x] `[MED]` **Test longer reference audio**: 47s WORSE than 30s. 30s is sweet spot.
+  ECAPA embeddings already very stable (cosine > 0.999 between 30s and 47s).
+- [x] `[MED]` **Test greedy warmup**: WORSE (changes generation trajectory completely).
+- [x] `[MED]` **Test top-k reduction**: No effect (token already in top-5 at temp 0.5).
+- [x] `[MED]` **Multi-seed analysis**: Cross-model variance (0.32) = same-model variance
+  (0.30). Confirmed: divergence is natural sampling noise, not a quality issue.
+- [x] `[LOW]` **Verified preset voices don't interfere**: codec_embedding codebook entries
+  (0-2047) are bit-identical. Speaker presets are never looked up in voice_clone mode.
+- [x] `[LOW]` Per-layer KV adapter: NOT NEEDED — divergence is at seed-variance level.
+- [x] `[HIGH]` **Partial layer replacement test**: Replacing top-5 or top-10 most-divergent
+  layers with Base weights makes output WORSE (mel corr 0.59/0.37 vs 0.71 baseline).
+  Transformer is a chain — mismatched interfaces at layer boundaries cause more harm
+  than uniform micro-differences. It's all-or-nothing.
+- [x] `[MED]` **Weight delta compression analysis**: 87% of BF16 values differ (mean
+  |delta|=117-228 per layer). Delta gzip = 290-370 MB, not feasible for .qvoice.
+  Delta gzip = 290-370 MB — too large for naive approach but promising for smarter encoding.
+- [x] `[HIGH]` **WFULL: Store ALL Talker+CP weights in .qvoice**: 402 tensors, 1.7GB file.
+  Produces **PCM-level BIT-IDENTICAL** output on CustomVoice. No Base model needed at runtime.
+  Critical fix: CP gate_up_fused must be rebuilt after weight override (was causing codebook
+  5-15 divergence). RTF 1.96. **THIS IS THE PROOF THAT PERFECT CROSS-MODEL IS POSSIBLE.**
+
+**RTF summary (Apple M1, 0.6B, Silvio Italian)**:
+
+| Config | .qvoice Size | RTF | Mel Corr | Fidelity |
+|--------|-------------|-----|----------|----------|
+| Base --ref-audio | N/A | 2.00 | ref | Perfect clone |
+| Base --load-voice | 16MB | 1.78 | 1.000 | **bit-identical** |
+| CV TPAD only | 16KB | 1.88 | 0.756 | Voice similar, prosody varies |
+| CV WOVR | 16MB | 1.60 | 0.711 | Voice similar, prosody varies |
+| **CV WFULL** | **1.7GB** | **1.96** | **1.000** | **BIT-IDENTICAL** |
+
+**TODO — WDELTA: Compress WFULL for practical voice files**:
+
+The 1.7GB WFULL proves bit-identical cross-model is achievable. Now compress it.
+The delta distribution is very favorable for custom encoding:
+
+```
+|delta| = 0:  12.8% of values (skip — no change needed)
+|delta| ≤ 1:  33.8% (1 bit + sign = 2 bits)
+|delta| ≤ 3:  58.2% (2 bits + sign = 3 bits)
+|delta| ≤ 7:  77.3% (3 bits + sign = 4 bits)
+|delta| ≤ 15: 88.5% (4 bits + sign = 5 bits)
+|delta| ≤ 127: 98.5% (7 bits + sign = 1 byte)
+```
+
+Approach: store deltas as variable-width integers with tensor index.
+At load time: read CV weights from mmap, apply deltas in-place (allocate copy first).
+Both models must have same architecture for deltas to apply.
+
+- [x] `[HIGH]` **WDELTA int8: implemented, mel corr 0.82, RTF 1.49 (fastest!)**
+  INT8 delta (clamp ±127), gzipped per tensor, 403 MB file. 0.9% clamp overflow
+  causes CP codebooks 14-15 to diverge → not bit-identical but much better than WOVR.
+  Bugs fixed: (1) F32 tensors must not be treated as BF16 delta, (2) WOVR modifies
+  global pointers before WDELTA → must save/use original mmap'd pointers.
+- [x] `[HIGH]` **WDELTA int16 (lossless): BIT-IDENTICAL at 510 MB! RTF 1.49!**
+  Int16 deltas (no clamp), gzipped per tensor, dtype_flag=3. CONFIRMED BIT-IDENTICAL
+  PCM output. 3.3x smaller than WFULL (1.7GB), same RTF 1.49 as int8 delta.
+  This is the **recommended format** for cross-model voice cloning with perfect fidelity.
+  Requires `--target-cv <cv-model-dir>` at creation time.
+- [ ] `[LOW]` **Further compression**: Huffman/ANS could reduce from 494MB to ~350MB
+  since delta distribution is heavily peaked at 0. But complexity may not be worth it.
+- [ ] `[MED]` **README documentation for WDELTA voice creation**: Document the full
+  workflow including requirements (need BOTH Base + CV model for creation), file naming
+  conventions (e.g. `silvio_06b.qvoice` / `silvio_17b.qvoice`), metadata that encodes
+  the target CV model size, and load-time validation (warn if loading 0.6B voice on 1.7B).
+  Include examples:
+  ```bash
+  # Create voice (needs Base + CV models present for delta computation)
+  ./qwen_tts -d qwen3-tts-0.6b-base --ref-audio speaker.wav -l Italian \
+      --voice-name "Mario" --target-cv qwen3-tts-0.6b \
+      --save-voice voices/mario_06b.qvoice
+  # Use voice on any machine (only needs CV model + .qvoice file)
+  ./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario_06b.qvoice \
+      --text "Ciao mondo!" -o output.wav
+  ```
+  Must clearly explain: creation = one-time (needs both models), usage = portable
+  (only CV model + .qvoice). This is the key UX story for voice cloning.
 
 ---
 
