@@ -854,6 +854,27 @@ int main(int argc, char **argv) {
                         is_wdelta = 1;
                     }
                     if ((magic_read == 5 && memcmp(wfull_magic, "WFULL", 5) == 0) || is_wdelta) {
+                        /* WDELTA: validate target model */
+                        if (is_wdelta) {
+                            uint32_t target_h;
+                            if (fread(&target_h, sizeof(uint32_t), 1, vf) == 1) {
+                                if (ctx->is_base_model) {
+                                    fprintf(stderr, "ERROR: this .qvoice contains weight deltas for CustomVoice,\n");
+                                    fprintf(stderr, "  but you're loading it on a Base model. This would corrupt weights.\n");
+                                    fprintf(stderr, "  Use --load-voice on the CustomVoice model instead:\n");
+                                    fprintf(stderr, "    ./qwen_tts -d qwen3-tts-%s --load-voice %s ...\n",
+                                            target_h >= 2048 ? "1.7b" : "0.6b", load_voice);
+                                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                                }
+                                if ((int)target_h != ctx->config.hidden_size) {
+                                    fprintf(stderr, "ERROR: .qvoice was created for %s model (hidden=%u)\n",
+                                            target_h >= 2048 ? "1.7B" : "0.6B", target_h);
+                                    fprintf(stderr, "  but current model has hidden=%d. Recreate with matching --target-cv.\n",
+                                            ctx->config.hidden_size);
+                                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                                }
+                            }
+                        }
                         uint32_t n_tensors;
                         fread(&n_tensors, sizeof(uint32_t), 1, vf);
                         int loaded = 0;
@@ -1322,6 +1343,11 @@ int main(int argc, char **argv) {
                             WRITE_TENSOR_BF16(tname_str, ptr, nbytes)
 
                         fwrite(use_wdelta ? "WDLT" : "WFULL", 1, use_wdelta ? 4 : 5, vf);
+                        /* For WDELTA: store target model hidden_size for validation */
+                        if (use_wdelta) {
+                            uint32_t target_h = (uint32_t)ctx->config.hidden_size;
+                            fwrite(&target_h, sizeof(uint32_t), 1, vf);
+                        }
                         int cp_nl = ctx->config.cp_num_layers;
                         int cp_h = ctx->config.cp_hidden_size;
                         int cp_inter = ctx->config.cp_intermediate_size;
