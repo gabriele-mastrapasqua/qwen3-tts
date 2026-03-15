@@ -302,10 +302,6 @@ int main(int argc, char **argv) {
     float max_ref_duration = 30.0f;  /* default: use first 30s of ref audio */
     int use_int8 = 0;
     int use_int4 = 0;
-    const char *dump_kv = NULL;
-    const char *load_kv = NULL;
-    const char *dump_voice_kv = NULL;
-    const char *load_voice_kv = NULL;
     static struct option long_options[] = {
         {"model-dir",     required_argument, 0, 'd'},
         {"text",          required_argument, 0, 't'},
@@ -338,10 +334,6 @@ int main(int argc, char **argv) {
         {"delete-voice",  required_argument, 0, 1017},
         {"int8",          no_argument,       0, 1014},
         {"int4",          no_argument,       0, 1015},
-        {"dump-kv",       required_argument, 0, 1018},
-        {"load-kv",       required_argument, 0, 1019},
-        {"dump-voice-kv", required_argument, 0, 1020},
-        {"load-voice-kv", required_argument, 0, 1021},
         {"voice-name",    required_argument, 0, 1022},
         {"greedy-warmup", required_argument, 0, 1023},
         {"target-cv",     required_argument, 0, 1024},
@@ -379,10 +371,6 @@ int main(int argc, char **argv) {
             case 1013: max_ref_duration = (float)atof(optarg); break;
             case 1014: use_int8 = 1; break;
             case 1015: use_int4 = 1; break;
-            case 1018: dump_kv = optarg; break;
-            case 1019: load_kv = optarg; break;
-            case 1020: dump_voice_kv = optarg; break;
-            case 1021: load_voice_kv = optarg; break;
             case 1022: voice_name = optarg; break;
             case 1023: { int gw = atoi(optarg); ctx_greedy_warmup = gw; } break;
             case 1024: target_cv_dir = optarg; break;
@@ -1509,12 +1497,6 @@ int main(int argc, char **argv) {
             ctx->instruct = strdup(instruct);
         }
     }
-
-    /* KV cache dump/load paths */
-    if (dump_kv) ctx->dump_kv_path = strdup(dump_kv);
-    if (load_kv) ctx->load_kv_path = strdup(load_kv);
-    if (dump_voice_kv) ctx->dump_voice_kv_path = strdup(dump_voice_kv);
-    if (load_voice_kv) ctx->load_voice_kv_path = strdup(load_voice_kv);
 
     /* Create voice only: save and exit without generating */
     if (create_voice_only) {
