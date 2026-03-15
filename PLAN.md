@@ -399,10 +399,11 @@ Both models must have same architecture for deltas to apply.
   Language auto-preserved from .qvoice metadata across requests. Clients just
   send `{"text":"..."}` — no need to specify language or speaker.
   Per-request voice switching not implemented (WDELTA too heavy for hot-swap).
-- [ ] `[MED]` **README documentation**: Update with full .qvoice workflow, WDELTA
-  creation examples, zlib dependency note, file size/RTF comparison table.
+- [x] `[MED]` **README documentation**: Update with full .qvoice workflow, WDELTA
+  creation examples, LZ4 dependency note, file size/RTF comparison table.
   Document --target-cv, --voice-name flags. Add troubleshooting section.
-- [ ] `[MED]` **README documentation for WDELTA voice creation**: Document the full
+  Server + .qvoice startup preload documented.
+- [x] `[MED]` **README documentation for WDELTA voice creation**: Document the full
   workflow including requirements (need BOTH Base + CV model for creation), file naming
   conventions (e.g. `silvio_06b.qvoice` / `silvio_17b.qvoice`), metadata that encodes
   the target CV model size, and load-time validation (warn if loading 0.6B voice on 1.7B).

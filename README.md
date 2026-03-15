@@ -552,6 +552,34 @@ Voice files include metadata that prevents common mistakes:
 #   mario_06b.qvoice    v3  [Mario]  lang=Italian  model=0.6B
 ```
 
+#### Troubleshooting
+
+**"ERROR: .qvoice enc_dim mismatch"** — The `.qvoice` was created with a different model
+size than the one you're loading it on. A file from 0.6B-Base (`enc_dim=1024`) cannot be
+used on 1.7B and vice versa. Create separate files per model size (e.g., `mario_06b.qvoice`,
+`mario_17b.qvoice`).
+
+**"ERROR: WDELTA target_hidden_size mismatch"** — The delta `.qvoice` was created with
+`--target-cv` pointing to a different model size. A delta file targeting 0.6B CustomVoice
+cannot be loaded on 1.7B CustomVoice.
+
+**"ERROR: WDELTA voices cannot be loaded on Base models"** — Delta `.qvoice` files contain
+weight deltas relative to a CustomVoice model. They must be loaded on the corresponding
+CustomVoice model, not on a Base model.
+
+**Voice sounds different than the original clone** — If using a standard (non-delta)
+`.qvoice` on CustomVoice, this is expected. The voice identity is preserved but prosody
+varies due to micro-differences between Base and CustomVoice models. Use `--target-cv`
+when creating the `.qvoice` for bit-identical output.
+
+**Language mismatch warning** — The `.qvoice` stores the language used during creation.
+If you override with `-l`, the engine warns you. This usually means you're using an
+Italian voice with English text (or vice versa). Omit `-l` to use the voice's native language.
+
+**File naming convention** — Include the target model size in the filename to avoid confusion:
+`silvio_06b.qvoice` (for 0.6B), `silvio_17b.qvoice` (for 1.7B). Delta files must match
+the target CV model exactly.
+
 | Model Type | Use Case | Voice Source | Style Control | Clone Fidelity |
 |------------|----------|-------------|---------------|----------------|
 | **Base** | Direct voice clone | `--ref-audio` / `.qvoice` | None | Perfect |
@@ -597,7 +625,17 @@ overhead and go straight to inference** (~5-6s per short sentence on 0.6B, 4 thr
 ```bash
 # Start server (model loaded once, shared across requests)
 ./qwen_tts -d qwen3-tts-0.6b --serve 8080
+
+# Start server with a custom voice preloaded
+# Language is auto-set from .qvoice metadata — clients just send {"text":"..."}
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario_06b.qvoice --serve 8080
 ```
+
+> **Custom voice server:** When started with `--load-voice`, the server preloads the
+> `.qvoice` at startup (including WDELTA weight deltas if present). The voice language
+> is preserved from the `.qvoice` metadata across all requests — clients don't need to
+> specify language or speaker. Per-request voice switching is not supported (WDELTA
+> weight application is too heavy for hot-swap).
 
 #### Generate speech (full WAV)
 
