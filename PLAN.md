@@ -240,66 +240,20 @@ identical. Root cause analysis (March 2026) identified THREE specific sources:
   - **Limitation**: current dump includes FULL prefill (voice + text). Cannot change text
     or add instruct after loading — the KV is for ONE specific prompt. Need voice-only
     prefix dump to enable text changes and instruct.
-- [ ] `[HIGH]` **KV voice prefix dump (split voice from text)**:
-  The key to enabling instruct + custom voice. The prefill has this structure:
-  ```
-  [instruct tokens] [role prefix (3)] [codec prefix + speaker (~6)] [text + eos] [codec_bos]
-  ```
-  The voice identity is in positions 0 to ~9 (role + codec + speaker). The text is after.
-  Plan:
-  1. Dump ONLY the voice prefix KV (first ~10 positions) from Base model clone
-  2. On target model (CustomVoice): load voice prefix KV, then do normal prefill for
-     instruct + text starting from the loaded KV position
-  3. This gives: Base clone voice quality + CustomVoice instruct + any text
-  Size: ~10 positions × 28 layers × 1024 kv_dim × 2 bytes × 2 (K+V) = ~1.1MB
-  Format: new `.qvkv` file with voice-only prefix + metadata (language, etc.)
-  **This is the path to reusable custom voices with instruct support.**
-- [ ] `[MED]` **Lightweight projection layer**: train a small linear projection (matrix multiply)
-  that maps ECAPA embeddings → CustomVoice codec embedding space. Would need correspondences:
-  generate audio of preset speakers with CustomVoice, extract ECAPA from that audio, build
-  mapping from the pairs. Only 3 real speakers (ryan, vivian, serena) = very underdetermined,
-  but could work with pseudo-inverse or regularized regression.
+**SUPERSEDED — KV voice prefix approach abandoned in favor of WDELTA**:
 
-**TODO — KV Voice Prefix (the path to custom voices with instruct)**:
-- [ ] `[HIGH]` **Implement KV voice prefix dump**: `--dump-voice-kv voice.qvkv`
-  - During voice clone on Base model, dump KV for ONLY the voice prefix positions
-    (role + codec + speaker, ~10 positions). Exclude text positions.
-  - Save as `.qvkv` file: header + KV data + dec_x at voice prefix boundary
-  - ~1.1MB per voice (28 layers × 10 pos × 1024 dim × 2 × 2)
-- [ ] `[HIGH]` **Implement KV voice prefix load**: `--load-voice-kv voice.qvkv`
-  - Load voice prefix KV into positions 0-9 of target model's KV cache
-  - Then do NORMAL prefill for instruct + text starting from position 10
-  - The target model "sees" the voice from KV and adds its own text + instruct processing
-  - This should enable: Base clone quality + CustomVoice instruct + any text
-- [ ] `[HIGH]` **Test voice prefix KV with instruct on 1.7B CustomVoice**
-  - The ultimate test: load silvio voice prefix, add instruct "speak slowly and solemnly",
-    generate with different Italian text → should produce silvio's voice with style control
-- [ ] `[HIGH]` **One-command voice creation workflow**:
-  ```bash
-  # Step 1: Create reusable voice from audio (one-time, needs Base model)
-  ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio speaker.wav --dump-voice-kv voices/mario.qvkv
-  # Step 2: Use voice on any model, any text, with instruct
-  ./qwen_tts -d qwen3-tts-1.7b --load-voice-kv voices/mario.qvkv \
-      --text "Ciao mondo!" -I "Speak cheerfully" -o out.wav
-  # Step 3: Same voice, different style
-  ./qwen_tts -d qwen3-tts-0.6b --load-voice-kv voices/mario.qvkv \
-      --text "Notizia urgente." -o news.wav
-  ```
-- [ ] `[MED]` `make create-voice REF=speaker.wav` Makefile target
-- [ ] `[MED]` Voice gallery: pre-create .qvkv files for common languages
-  - Italian, Spanish, French, German, Portuguese native speakers
-  - Ship as `voices/italian.qvkv`, `voices/spanish.qvkv`, etc.
-- [ ] `[MED]` Test with genuinely new voices (unseen speakers, different languages)
-- [ ] `[MED]` Test 0.6B→0.6B and 1.7B→0.6B cross-model voice prefix
-  - Can a voice created with 1.7B Base be used on 0.6B CustomVoice?
-  - kv_dim is 1024 on both → should work if attention patterns are compatible
+The KV voice prefix idea (dump ~10 positions of voice KV, reload on target model) was
+explored but WDELTA int16 with LZ4 compression proved superior in every dimension:
+bit-identical output, only +7% overhead, self-contained file, works with --instruct,
+no need for separate .qvkv format. The KV prefix approach would have been ~90% fidelity
+at best (same as full KV dump) vs WDELTA's 100% bit-identical.
 
-**TODO — Existing approaches (keep as fallback)**:
+Similarly, lightweight projection layers (ECAPA→CustomVoice codec space) are unnecessary
+since WDELTA already achieves perfect fidelity by applying the exact weight differences.
+
+**Completed approaches (for reference)**:
 - [x] `[MED]` .bin embedding injection: works ~60-70% fidelity, auto norm scaling
 - [x] `[MED]` Full KV dump: works ~90% but tied to specific text, no instruct
-- [ ] `[MED]` Evaluate .bin vs .qvkv quality comparison across languages
-- [ ] `[LOW]` Lightweight projection layer (ECAPA→CustomVoice codec space)
-  **NOTE (March 2026)**: May not be needed — weights are identical, projection ≈ identity
 - [x] `[LOW]` Blog post on cross-model voice analysis: blog/cross-model-voice-analysis.md
 - [ ] `[LOW]` Server API: accept voice path in JSON for per-request voice switching
 
@@ -392,8 +346,6 @@ Both models must have same architecture for deltas to apply.
 - [x] `[HIGH]` **WDELTA target model validation**: Stores target hidden_size in WDELTA
   header. Rejects: (1) loading on Base model, (2) size mismatch (0.6B↔1.7B).
   Existing enc_dim check provides defense-in-depth.
-- [ ] `[LOW]` **Further compression**: Huffman/ANS could reduce from 494MB to ~350MB
-  since delta distribution is heavily peaked at 0. But complexity may not be worth it.
 - [x] `[HIGH]` **Server .qvoice support**: Works via startup preload:
   `./qwen_tts -d qwen3-tts-0.6b --load-voice silvio.qvoice --serve 8080`
   Language auto-preserved from .qvoice metadata across requests. Clients just
