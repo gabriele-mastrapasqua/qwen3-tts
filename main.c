@@ -480,6 +480,59 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Output: %s\n", output);
     }
 
+    /* Early validation: check ref-audio format BEFORE loading the model.
+     * This saves the user from waiting for model load (~2s) only to discover
+     * their input file is MP4/MP3/wrong format. */
+    if (ref_audio) {
+        /* Extension check */
+        const char *ext = strrchr(ref_audio, '.');
+        if (ext && (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".m4a") == 0 ||
+                    strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".ogg") == 0 ||
+                    strcasecmp(ext, ".opus") == 0 || strcasecmp(ext, ".flac") == 0 ||
+                    strcasecmp(ext, ".aac") == 0 || strcasecmp(ext, ".wma") == 0 ||
+                    strcasecmp(ext, ".webm") == 0 || strcasecmp(ext, ".mkv") == 0 ||
+                    strcasecmp(ext, ".avi") == 0 || strcasecmp(ext, ".mov") == 0)) {
+            fprintf(stderr, "Error: %s is not a WAV file (detected %s format)\n", ref_audio, ext);
+            fprintf(stderr, "Voice cloning requires 24 kHz WAV (PCM, 16-bit, mono).\n");
+            fprintf(stderr, "Convert first:\n");
+            fprintf(stderr, "  ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", ref_audio);
+            return 1;
+        }
+        /* Quick header check — read first 12 bytes */
+        FILE *check_f = fopen(ref_audio, "rb");
+        if (check_f) {
+            unsigned char hdr[12];
+            size_t n = fread(hdr, 1, 12, check_f);
+            fclose(check_f);
+            int bad = 0;
+            if (n >= 8 && memcmp(hdr + 4, "ftyp", 4) == 0) {
+                fprintf(stderr, "Error: %s is an MP4/M4A file, not a WAV file\n", ref_audio);
+                bad = 1;
+            } else if (n >= 3 && hdr[0] == 0xFF && (hdr[1] & 0xE0) == 0xE0) {
+                fprintf(stderr, "Error: %s is an MP3 file, not a WAV file\n", ref_audio);
+                bad = 1;
+            } else if (n >= 4 && memcmp(hdr, "OggS", 4) == 0) {
+                fprintf(stderr, "Error: %s is an OGG/Opus file, not a WAV file\n", ref_audio);
+                bad = 1;
+            } else if (n >= 4 && memcmp(hdr, "fLaC", 4) == 0) {
+                fprintf(stderr, "Error: %s is a FLAC file, not a WAV file\n", ref_audio);
+                bad = 1;
+            } else if (n >= 3 && memcmp(hdr, "ID3", 3) == 0) {
+                fprintf(stderr, "Error: %s is an MP3 file (ID3 tagged), not a WAV file\n", ref_audio);
+                bad = 1;
+            } else if (n >= 4 && memcmp(hdr, "RIFF", 4) != 0) {
+                fprintf(stderr, "Error: %s is not a WAV file (unrecognized format)\n", ref_audio);
+                bad = 1;
+            }
+            if (bad) {
+                fprintf(stderr, "Voice cloning requires 24 kHz WAV (PCM, 16-bit, mono).\n");
+                fprintf(stderr, "Convert first:\n");
+                fprintf(stderr, "  ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", ref_audio);
+                return 1;
+            }
+        }
+    }
+
     /* Initialize threading: auto-detect or user override */
     if (threads > 0) qwen_set_threads(threads);
     else qwen_init_threads();
