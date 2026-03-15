@@ -492,15 +492,16 @@ runtime. Two options:
 
 **Option A: Delta format (recommended) — 100% identical to the original clone**
 
-Requires both Base and CustomVoice models downloaded. The `.qvoice` stores compressed
-weight differences so the CustomVoice model produces the exact same output as Base.
+Requires both Base and CustomVoice models downloaded. Adding **`--target-cv`** computes
+weight deltas between the two models and stores them in the `.qvoice`. At load time,
+the CustomVoice weights are patched to exactly match Base — bit-identical output.
 
 ```bash
 # Download both models (one-time)
 ./download_model.sh --model base-small    # 0.6B-Base (for voice extraction)
-./download_model.sh --model small         # 0.6B-CustomVoice (for generation)
+./download_model.sh --model small         # 0.6B-CustomVoice (target for deltas)
 
-# Create the voice (one-time, ~30s ref audio recommended)
+# Create: --target-cv is what makes it a delta .qvoice
 ./qwen_tts -d qwen3-tts-0.6b-base --ref-audio mario.wav -l Italian \
     --voice-name "Mario" --target-cv qwen3-tts-0.6b \
     --save-voice mario.qvoice
@@ -519,14 +520,15 @@ weight differences so the CustomVoice model produces the exact same output as Ba
 
 **Option B: Standard format — lightweight, good fidelity**
 
-Only needs the Base model. Smaller file (16 MB vs 785 MB), voice is recognizable but
-prosody may vary slightly from the original clone.
+Only needs the Base model. Same command but **without `--target-cv`** — no delta
+computation, just the speaker embedding + weight snapshot. Smaller file (16 MB vs 785 MB),
+voice is recognizable but prosody may vary slightly from the original clone.
 
 ```bash
 # Only need the Base model
 ./download_model.sh --model base-small
 
-# Create (no --target-cv = standard format)
+# Create: no --target-cv = standard format (16 MB instead of 785 MB)
 ./qwen_tts -d qwen3-tts-0.6b-base --ref-audio mario.wav -l Italian \
     --voice-name "Mario" --save-voice mario_light.qvoice
 
