@@ -389,16 +389,16 @@ Both models must have same architecture for deltas to apply.
   - File size: 510MB (zlib) → 785MB (LZ4) = +54% larger but ~7x faster load
   - Multi-threaded decompress evaluated: NOT NEEDED — LZ4 delta load is ~1s,
     only 5% of total time. Threading complexity not worth 0.7s saving.
-- [ ] `[HIGH]` **Add WDELTA target model validation**: Prevent loading a CV-targeted
-  WDELTA on the Base model (would corrupt weights: base + (base-cv) = 2*base-cv).
-  Store target model hash or identifier in .qvoice metadata.
+- [x] `[HIGH]` **WDELTA target model validation**: Stores target hidden_size in WDELTA
+  header. Rejects: (1) loading on Base model, (2) size mismatch (0.6B↔1.7B).
+  Existing enc_dim check provides defense-in-depth.
 - [ ] `[LOW]` **Further compression**: Huffman/ANS could reduce from 494MB to ~350MB
   since delta distribution is heavily peaked at 0. But complexity may not be worth it.
-- [ ] `[HIGH]` **Server support for .qvoice**: Add `voice_path` parameter to server
-  JSON body so users can load .qvoice files per-request (including WDELTA).
-  Example: `{"text":"Ciao","voice_path":"voices/silvio_06b.qvoice"}`.
-  Consider: should voice be loaded once at startup, or per-request?
-  For WDELTA (510MB), per-request loading is too slow — needs startup preload.
+- [x] `[HIGH]` **Server .qvoice support**: Works via startup preload:
+  `./qwen_tts -d qwen3-tts-0.6b --load-voice silvio.qvoice --serve 8080`
+  Language auto-preserved from .qvoice metadata across requests. Clients just
+  send `{"text":"..."}` — no need to specify language or speaker.
+  Per-request voice switching not implemented (WDELTA too heavy for hot-swap).
 - [ ] `[MED]` **README documentation**: Update with full .qvoice workflow, WDELTA
   creation examples, zlib dependency note, file size/RTF comparison table.
   Document --target-cv, --voice-name flags. Add troubleshooting section.
