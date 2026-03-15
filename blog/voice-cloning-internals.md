@@ -401,7 +401,9 @@ Key discoveries along the way:
 
 ### Performance Comparison
 
-All measurements on Apple M1 8-core, 0.6B model, Italian text:
+All measurements on Apple M1 8-core, 16 GB RAM, Italian text, seed 42.
+
+**.qvoice format comparison** (0.6B, CLI):
 
 | .qvoice Format | Size | Mel Corr | Wall Time | vs Preset | Bit-identical? |
 |----------------|------|----------|----------|-----------|----------------|
@@ -414,6 +416,53 @@ The delta format with LZ4 has only **+7% overhead** compared to using a preset v
 This was a major optimization: the original zlib compression had +32% overhead (~4s
 decompression for 494MB). Switching to LZ4 reduced decompression to ~1s for the same
 data, despite a 54% larger file (785MB vs 510MB). The tradeoff is worth it.
+
+**.qvoice file sizes** by model and format:
+
+| Format | 0.6B | 1.7B | Fidelity |
+|--------|------|------|----------|
+| Embedding only (.bin) | 4 KB | 8 KB | ~60-70% |
+| Standard (TPAD+WOVR) | ~16 MB | ~24 MB | Good (prosody varies) |
+| **Delta (WDELTA+LZ4)** | **785 MB** | **2.8 GB** | **Bit-identical** |
+
+### Server and Streaming Performance
+
+The .qvoice is loaded once at server startup — WDELTA decompression happens during
+initialization, so requests pay zero delta overhead. The server preserves the voice
+language from .qvoice metadata across all requests automatically.
+
+```bash
+# Start server with custom voice (WDELTA applied at startup)
+./qwen_tts -d qwen3-tts-0.6b --load-voice silvio_06b.qvoice --serve 8080
+
+# Clients just send text — language auto-set from voice metadata
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"Buongiorno a tutti.","seed":42}' -o output.wav
+```
+
+**0.6B + Silvio WDELTA .qvoice** (Apple M1, 4 threads):
+
+| Mode | Audio | Wall Time | RTF |
+|------|-------|-----------|-----|
+| CLI | 4.6s | 6.8s | 1.48 |
+| Server (cold) | 6.7s | 13.5s | 2.01 |
+| Server (warm) | 8.5s | 14.7s | 1.74 |
+| Server (warm, short) | 4.6s | 6.6s | **1.44** |
+| Server stream | 4.0s | 5.9s | **1.48** |
+
+**1.7B + Silvio WDELTA .qvoice** (Apple M1, 4 threads):
+
+| Mode | Audio | Wall Time | RTF |
+|------|-------|-----------|-----|
+| Server (cold) | 6.1s | 21.7s | 3.57 |
+| Server (warm) | 5.2s | 17.3s | 3.32 |
+| Server (warm, short) | 4.0s | 13.6s | 3.40 |
+| Server stream | 2.1s | 6.6s | 3.18 |
+
+The cold/warm gap is OS page cache — the first request pages in mmap'd weights from
+SSD (~2x slower). Subsequent requests hit warm RAM. This applies to all modes, not
+just .qvoice. Streaming RTF is similar to non-streaming because the speech decoder
+runs in a pipeline thread in both cases.
 
 ### LZ4 vs Zlib: Why Faster Decompression Matters More Than File Size
 

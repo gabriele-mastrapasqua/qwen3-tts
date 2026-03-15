@@ -530,9 +530,44 @@ bit-identical** output with only **+7% overhead** compared to using a preset voi
 99.98% identical transformer weights (cosine similarity 0.9999 per layer). The only
 differences are the codec embedding table (9 preset speaker tokens) and the ECAPA-TDNN
 speaker encoder. The delta format exploits this near-identity by storing only the small
-per-weight differences (int16 deltas, gzip compressed), achieving bit-identical output
-at ~30% of the full model size. See [blog/cross-model-voice-analysis.md](blog/cross-model-voice-analysis.md)
-for the full technical analysis.
+per-weight differences (int16 deltas, LZ4 compressed), achieving bit-identical output.
+See [blog/cross-model-voice-analysis.md](blog/cross-model-voice-analysis.md) for the
+full technical analysis.
+
+**.qvoice file sizes** by model and format:
+
+| Format | 0.6B | 1.7B | Fidelity |
+|--------|------|------|----------|
+| Embedding only (.bin) | 4 KB | 8 KB | ~60-70% |
+| Standard (TPAD+WOVR) | ~16 MB | ~24 MB | Good (prosody varies) |
+| **Delta (WDELTA+LZ4)** | **785 MB** | **2.8 GB** | **Bit-identical** |
+
+#### Server with Custom Voices
+
+The server loads the `.qvoice` at startup (including WDELTA decompression), so requests
+pay zero delta overhead. Language is auto-preserved from the `.qvoice` metadata.
+
+```bash
+# Start server with custom voice
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario_06b.qvoice --serve 8080
+
+# Clients just send text — no need to specify language or speaker
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"Ciao, come va?","seed":42}' -o output.wav
+```
+
+**RTF with WDELTA .qvoice** (Apple M1, 4 threads, Italian, seed 42):
+
+| Mode | 0.6B RTF | 1.7B RTF |
+|------|----------|----------|
+| CLI | 1.48 | — |
+| Server (cold) | 2.01 | 3.57 |
+| Server (warm) | 1.74 | 3.32 |
+| Server (warm, short text) | **1.44** | 3.40 |
+| Server stream | **1.48** | 3.18 |
+
+The cold/warm gap is OS page cache — the first request pages in mmap'd weights from
+SSD. Custom voices have **no meaningful RTF penalty** compared to preset voices.
 
 #### .qvoice v3 Metadata
 
