@@ -334,6 +334,13 @@ metadata. **Specify `-l` when creating** so the voice carries the correct langua
 # Language auto-set from .qvoice metadata — no -l needed!
 ```
 
+**Performance comparison** (Apple M1 8-core, 4 threads, 0.6B-Base, ~4s output):
+
+| Mode | Prefill | Total | RTF | Notes |
+|------|---------|-------|-----|-------|
+| From WAV (`--ref-audio`) | 2.8s | 21.6s | 4.91 | Mel + speaker enc + speech enc + generate |
+| From `.qvoice` (`--load-voice`) | 1.7s | 9.8s | 2.23 | Load file + generate (no audio processing) |
+
 > **Important:** `.qvoice` files created with 0.6B-Base (`enc_dim=1024`) cannot be used
 > with 1.7B-Base (`enc_dim=2048`) and vice versa. The tool shows a clear error on mismatch.
 
