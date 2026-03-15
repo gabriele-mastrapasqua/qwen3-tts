@@ -57,21 +57,25 @@ make blas
 ### macOS
 
 ```bash
+# Install LZ4 for fast .qvoice voice loading (recommended)
+brew install lz4
+
 make blas    # Uses Accelerate framework (ships with Xcode)
 ```
 
 ### Linux
 
 ```bash
-# Install OpenBLAS and zlib (required for .qvoice delta compression)
-sudo apt install libopenblas-dev zlib1g-dev    # Ubuntu/Debian
-sudo dnf install openblas-devel zlib-devel     # Fedora/RHEL
+# Install OpenBLAS + compression libraries
+sudo apt install libopenblas-dev zlib1g-dev liblz4-dev    # Ubuntu/Debian
+sudo dnf install openblas-devel zlib-devel lz4-devel      # Fedora/RHEL
 
 make blas
 ```
 
-> **Note:** zlib is required for reading/writing `.qvoice` files with weight deltas (WDELTA format).
-> On macOS, zlib ships with the system. On Linux, install `zlib1g-dev` (Debian/Ubuntu) or `zlib-devel` (Fedora/RHEL).
+> **Dependencies:**
+> - **zlib** (required): used for `.qvoice` file support. Ships with macOS; install `zlib1g-dev` on Linux.
+> - **LZ4** (recommended): ~7x faster `.qvoice` loading. Install `lz4` (macOS) or `liblz4-dev` (Linux). Auto-detected at build time; falls back to zlib if not available.
 
 ### Windows (WSL2) — Beta
 
@@ -492,14 +496,16 @@ file is self-contained — no Base model needed at runtime.
 
 **Three quality levels** depending on what you store in the `.qvoice`:
 
-| .qvoice Format | File Size | Voice Fidelity | RTF (0.6B, M1) | Creation needs |
-|----------------|-----------|---------------|----------------|----------------|
-| **Standard** (TPAD+WOVR) | ~16 MB | Good — voice similar, prosody varies | 1.60 | Base model only |
-| **Delta** (WDELTA int16) | ~510 MB | **Perfect** — bit-identical to Base clone | **1.56** | Base + CV models |
+| .qvoice Format | File Size | Voice Fidelity | Wall Time (0.6B, M1) | Creation needs |
+|----------------|-----------|---------------|---------------------|----------------|
+| **Standard** (TPAD+WOVR) | ~16 MB | Good — voice similar, prosody varies | 10.6s | Base model only |
+| **Delta** (WDELTA + LZ4) | ~785 MB | **Perfect** — bit-identical to Base clone | **12.8s** | Base + CV models |
+| CV preset (no .qvoice) | — | N/A (preset voice) | 12.0s | — |
 
-The **Delta format** stores compressed weight differences between Base and CustomVoice
-models. At load time, the deltas are applied to transform the CustomVoice model's weights
-to match the Base model exactly, producing **PCM-level bit-identical** output.
+The **Delta format** stores LZ4-compressed weight differences between Base and CustomVoice
+models (~7x faster loading than zlib). At load time, the deltas are applied to transform
+the CustomVoice model's weights to match the Base model exactly, producing **PCM-level
+bit-identical** output with only **+7% overhead** compared to using a preset voice.
 
 ```bash
 # === Perfect fidelity: Delta format (recommended) ===
