@@ -5,11 +5,8 @@ CC = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
 LDLIBS = -lm -lpthread
 
-# LZ4 (required for .qvoice delta compression)
-LDLIBS += $(shell pkg-config --libs liblz4 2>/dev/null || echo "-llz4")
-CFLAGS_BASE += $(shell pkg-config --cflags liblz4 2>/dev/null || \
-    (test -f /opt/homebrew/include/lz4.h && echo "-I/opt/homebrew/include -L/opt/homebrew/lib") || \
-    echo "")
+# LZ4 (embedded in vendor/ — no external dependency needed)
+CFLAGS_BASE += -Ivendor
 
 # BLAS (Accelerate on macOS, OpenBLAS on Linux)
 ifeq ($(UNAME_S),Darwin)
@@ -38,7 +35,8 @@ SRCS = main.c \
        qwen_tts_safetensors.c \
        qwen_tts_server.c \
        qwen_tts_voice_clone.c \
-       qwen_tts_speech_encoder.c
+       qwen_tts_speech_encoder.c \
+       vendor/lz4.c
 
 OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts

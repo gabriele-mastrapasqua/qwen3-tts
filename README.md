@@ -57,24 +57,21 @@ make blas
 ### macOS
 
 ```bash
-# Install LZ4 for fast .qvoice voice loading (recommended)
-brew install lz4
-
 make blas    # Uses Accelerate framework (ships with Xcode)
 ```
 
 ### Linux
 
 ```bash
-# Install OpenBLAS + LZ4 (required for .qvoice voice files)
-sudo apt install libopenblas-dev liblz4-dev    # Ubuntu/Debian
-sudo dnf install openblas-devel lz4-devel      # Fedora/RHEL
+# Install OpenBLAS (the only external dependency)
+sudo apt install libopenblas-dev    # Ubuntu/Debian
+sudo dnf install openblas-devel     # Fedora/RHEL
 
 make blas
 ```
 
-> **Dependencies:**
-> - **LZ4** (required): fast compression for `.qvoice` voice files. Install `lz4` (macOS) or `liblz4-dev` (Linux). BSD licensed, lightweight (~30KB source).
+> **Dependencies:** Only a C compiler and BLAS (Accelerate on macOS, OpenBLAS on Linux).
+> LZ4 compression (for `.qvoice` voice files) is embedded in the repo — no separate install needed.
 
 ### Windows (WSL2) — Beta
 
