@@ -383,12 +383,12 @@ Both models must have same architecture for deltas to apply.
   Silvio voice + instruct (triste/felice/arrabbiato/solenne) on 1.7B CV confirmed.
   Voice identity preserved, styles applied. Effect is subtle — instruct modulates
   prosody more than timbre. This is expected model behavior.
-- [ ] `[HIGH]` **WDELTA load speedup**: Delta decompression is the bottleneck.
-  Options (in order of impact):
-  1. **LZ4 instead of zlib**: ~10x faster decompression, slightly larger files
-  2. **Multi-threaded decompress**: parallel per-tensor, ~4x with 4 threads
-  3. **Uncompressed .qvoice variant**: larger file (~840MB 0.6B), zero load overhead
-  4. **Server preload**: load .qvoice at startup, amortize across requests
+- [x] `[HIGH]` **WDELTA load speedup: LZ4 compression — DONE, +7% vs preset!**
+  LZ4 replaces zlib for delta compression (dtype=4). Results:
+  - 0.6B: 15.9s (zlib) → 12.8s (LZ4), vs 12.0s preset = **+7% overhead only**
+  - File size: 510MB (zlib) → 785MB (LZ4) = +54% larger but ~7x faster load
+  - Multi-threaded decompress evaluated: NOT NEEDED — LZ4 delta load is ~1s,
+    only 5% of total time. Threading complexity not worth 0.7s saving.
 - [ ] `[HIGH]` **Add WDELTA target model validation**: Prevent loading a CV-targeted
   WDELTA on the Base model (would corrupt weights: base + (base-cv) = 2*base-cv).
   Store target model hash or identifier in .qvoice metadata.
