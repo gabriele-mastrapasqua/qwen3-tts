@@ -371,18 +371,29 @@ Both models must have same architecture for deltas to apply.
   causes CP codebooks 14-15 to diverge → not bit-identical but much better than WOVR.
   Bugs fixed: (1) F32 tensors must not be treated as BF16 delta, (2) WOVR modifies
   global pointers before WDELTA → must save/use original mmap'd pointers.
-- [x] `[HIGH]` **WDELTA int16 (lossless): BIT-IDENTICAL at 510 MB! RTF 1.49!**
+- [x] `[HIGH]` **WDELTA int16 (lossless): BIT-IDENTICAL at 510 MB!**
   Int16 deltas (no clamp), gzipped per tensor, dtype_flag=3. CONFIRMED BIT-IDENTICAL
-  PCM output. 3.3x smaller than WFULL (1.7GB), same RTF 1.49 as int8 delta.
-  This is the **recommended format** for cross-model voice cloning with perfect fidelity.
-  Requires `--target-cv <cv-model-dir>` at creation time.
+  PCM output on both 0.6B and 1.7B. 1.7B required adding `small_to_mtp_projection`
+  (weight+bias, 404 tensors total). Requires `--target-cv <cv-model-dir>` at creation.
+  **PERFORMANCE ISSUE**: delta decompression overhead is significant:
+  - 0.6B: ~7s (494MB gzip) → total 16.7s vs 13.8s preset (21% slower)
+  - 1.7B: ~21s (1.8GB gzip) → total 54.5s vs 33.1s preset (65% slower)
+  Generation RTF itself is fine (1.98 vs 2.25), the bottleneck is zlib decompress.
+- [x] `[HIGH]` **Test WDELTA int16 + --instruct: WORKS!**
+  Silvio voice + instruct (triste/felice/arrabbiato/solenne) on 1.7B CV confirmed.
+  Voice identity preserved, styles applied. Effect is subtle — instruct modulates
+  prosody more than timbre. This is expected model behavior.
+- [ ] `[HIGH]` **WDELTA load speedup**: Delta decompression is the bottleneck.
+  Options (in order of impact):
+  1. **LZ4 instead of zlib**: ~10x faster decompression, slightly larger files
+  2. **Multi-threaded decompress**: parallel per-tensor, ~4x with 4 threads
+  3. **Uncompressed .qvoice variant**: larger file (~840MB 0.6B), zero load overhead
+  4. **Server preload**: load .qvoice at startup, amortize across requests
+- [ ] `[HIGH]` **Add WDELTA target model validation**: Prevent loading a CV-targeted
+  WDELTA on the Base model (would corrupt weights: base + (base-cv) = 2*base-cv).
+  Store target model hash or identifier in .qvoice metadata.
 - [ ] `[LOW]` **Further compression**: Huffman/ANS could reduce from 494MB to ~350MB
   since delta distribution is heavily peaked at 0. But complexity may not be worth it.
-- [ ] `[HIGH]` **Test WDELTA int16 + --instruct**: Load silvio_delta16_06b.qvoice on
-  1.7B CustomVoice with instruct variations: "parla tristemente", "parla felicemente",
-  "parla con rabbia", "parla solennemente". Verify voice identity is preserved AND
-  instruct style is applied. This is the ultimate test: clone quality + style control.
-  Note: needs 1.7B models (instruct only supported on 1.7B). Create 1.7B delta too.
 - [ ] `[HIGH]` **Server support for .qvoice**: Add `voice_path` parameter to server
   JSON body so users can load .qvoice files per-request (including WDELTA).
   Example: `{"text":"Ciao","voice_path":"voices/silvio_06b.qvoice"}`.
