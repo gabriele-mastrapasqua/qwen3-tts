@@ -378,6 +378,19 @@ Both models must have same architecture for deltas to apply.
   Requires `--target-cv <cv-model-dir>` at creation time.
 - [ ] `[LOW]` **Further compression**: Huffman/ANS could reduce from 494MB to ~350MB
   since delta distribution is heavily peaked at 0. But complexity may not be worth it.
+- [ ] `[HIGH]` **Test WDELTA int16 + --instruct**: Load silvio_delta16_06b.qvoice on
+  1.7B CustomVoice with instruct variations: "parla tristemente", "parla felicemente",
+  "parla con rabbia", "parla solennemente". Verify voice identity is preserved AND
+  instruct style is applied. This is the ultimate test: clone quality + style control.
+  Note: needs 1.7B models (instruct only supported on 1.7B). Create 1.7B delta too.
+- [ ] `[HIGH]` **Server support for .qvoice**: Add `voice_path` parameter to server
+  JSON body so users can load .qvoice files per-request (including WDELTA).
+  Example: `{"text":"Ciao","voice_path":"voices/silvio_06b.qvoice"}`.
+  Consider: should voice be loaded once at startup, or per-request?
+  For WDELTA (510MB), per-request loading is too slow — needs startup preload.
+- [ ] `[MED]` **README documentation**: Update with full .qvoice workflow, WDELTA
+  creation examples, zlib dependency note, file size/RTF comparison table.
+  Document --target-cv, --voice-name flags. Add troubleshooting section.
 - [ ] `[MED]` **README documentation for WDELTA voice creation**: Document the full
   workflow including requirements (need BOTH Base + CV model for creation), file naming
   conventions (e.g. `silvio_06b.qvoice` / `silvio_17b.qvoice`), metadata that encodes

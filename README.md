@@ -63,12 +63,15 @@ make blas    # Uses Accelerate framework (ships with Xcode)
 ### Linux
 
 ```bash
-# Install OpenBLAS
-sudo apt install libopenblas-dev    # Ubuntu/Debian
-sudo dnf install openblas-devel     # Fedora/RHEL
+# Install OpenBLAS and zlib (required for .qvoice delta compression)
+sudo apt install libopenblas-dev zlib1g-dev    # Ubuntu/Debian
+sudo dnf install openblas-devel zlib-devel     # Fedora/RHEL
 
 make blas
 ```
+
+> **Note:** zlib is required for reading/writing `.qvoice` files with weight deltas (WDELTA format).
+> On macOS, zlib ships with the system. On Linux, install `zlib1g-dev` (Debian/Ubuntu) or `zlib-devel` (Fedora/RHEL).
 
 ### Windows (WSL2) — Beta
 
@@ -155,9 +158,11 @@ Optional:
   --voice-design             VoiceDesign mode (create voice from --instruct)
   --ref-audio <path>         Reference audio for voice cloning (Base model)
   --xvector-only             Use speaker embedding only (no ref text/codes)
-  --save-voice <path>        Save voice profile (.qvoice with ICL data, or .bin for raw embedding)
+  --save-voice <path>        Save voice profile (.qvoice or .bin for raw embedding)
   --load-voice <path>        Load voice profile (.qvoice or legacy .bin)
-  --max-ref-duration <secs>  Max ref audio for embedding (default: 15, 0=all)
+  --voice-name <name>        Name for the voice (stored in .qvoice metadata)
+  --target-cv <dir>          CV model dir for delta encoding (bit-identical cross-model)
+  --max-ref-duration <secs>  Max ref audio for embedding (default: 30, 0=all)
   -j, --threads <n>          Worker threads (default: 4)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
@@ -338,13 +343,12 @@ encoding, and speech encoding — giving a **2x speedup** on subsequent generati
 | From WAV (`--ref-audio`) | 2.8s | 21.6s | 4.91 | Mel + speaker enc + speech enc + generate |
 | From `.qvoice` (`--load-voice`) | 1.7s | 9.8s | 2.23 | Load file + generate (no audio processing) |
 
-The `.qvoice` format (v2) is compact (~20-50KB for a typical 3-10s reference clip) and
-stores the speaker embedding dimension (`enc_dim`) in the header.
+The `.qvoice` format (v3) stores the speaker embedding, metadata (language, voice name,
+source model), and optionally weight deltas for cross-model fidelity.
 
-> **Important:** `.qvoice` files are **model-specific** — a file created with 0.6B-Base
-> (`enc_dim=1024`) cannot be used with 1.7B-Base (`enc_dim=2048`) and vice versa. The tool
-> will show a clear error if there is a mismatch. Re-create the `.qvoice` with the matching
-> Base model. Legacy v1 `.qvoice` files (without `enc_dim` header) are still supported.
+> **Important:** `.qvoice` files created with 0.6B-Base (`enc_dim=1024`) cannot be used
+> with 1.7B-Base (`enc_dim=2048`) and vice versa. The tool shows a clear error on mismatch.
+> Legacy v1/v2 files are still supported.
 
 #### Managing Voice Profiles
 
@@ -480,45 +484,85 @@ also has more capacity to condition its output on these speaker characteristics.
 For the technical details of how the speaker encoder works, see the
 [voice cloning internals blog post](blog/voice-cloning-internals.md).
 
-#### Cross-Model Voice Injection (Custom Voices Per Language)
+#### Cross-Model Voice Injection (Custom Voices on CustomVoice)
 
-The Base model produces the most faithful voice clones but doesn't support `--instruct`.
-You can extract a speaker embedding from the Base model and use it in **any other model**
-— CustomVoice (with or without `--instruct`) or VoiceDesign. This enables **custom voices
-per language**: clone a native Italian speaker and use them across all model types.
+Clone a voice once with the Base model, save it as a `.qvoice` file, then use it on
+the CustomVoice model for fast generation and `--instruct` style control. The `.qvoice`
+file is self-contained — no Base model needed at runtime.
+
+**Three quality levels** depending on what you store in the `.qvoice`:
+
+| .qvoice Format | File Size | Voice Fidelity | RTF (0.6B, M1) | Creation needs |
+|----------------|-----------|---------------|----------------|----------------|
+| **Standard** (TPAD+WOVR) | ~16 MB | Good — voice similar, prosody varies | 1.60 | Base model only |
+| **Delta** (WDELTA int16) | ~510 MB | **Perfect** — bit-identical to Base clone | **1.56** | Base + CV models |
+
+The **Delta format** stores compressed weight differences between Base and CustomVoice
+models. At load time, the deltas are applied to transform the CustomVoice model's weights
+to match the Base model exactly, producing **PCM-level bit-identical** output.
 
 ```bash
-# Step 1: Extract voice embedding (one-time, Base model)
-./qwen_tts -d qwen3-tts-1.7b-base --ref-audio native_speaker.wav --save-voice my_voice.bin
+# === Perfect fidelity: Delta format (recommended) ===
+# Requires BOTH Base and CV models at creation time
 
-# Step 2: Use in CustomVoice (fast, no instruct)
-./qwen_tts -d qwen3-tts-0.6b --load-voice my_voice.bin \
-    --text "Buongiorno a tutti!" -l Italian -o output.wav
+# Step 1: Create delta .qvoice (one-time, ~510 MB for 0.6B)
+./qwen_tts -d qwen3-tts-0.6b-base --ref-audio speaker.wav -l Italian \
+    --voice-name "Mario" --target-cv qwen3-tts-0.6b \
+    --save-voice voices/mario_06b.qvoice
 
-# Step 3: Use in CustomVoice with style control (1.7B only)
-./qwen_tts -d qwen3-tts-1.7b --load-voice my_voice.bin \
-    --text "Buongiorno a tutti!" -l Italian \
-    -I "Speak with warmth and enthusiasm" -o styled.wav
+# Step 2: Use on CustomVoice (only CV model + .qvoice needed)
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario_06b.qvoice \
+    --text "Ciao, come stai?" -o output.wav
+# Language is auto-set from the .qvoice metadata!
+
+# === Standard format (lightweight, no --target-cv) ===
+./qwen_tts -d qwen3-tts-0.6b-base --ref-audio speaker.wav -l Italian \
+    --voice-name "Mario" --save-voice voices/mario_light.qvoice
+
+# Use: voice is recognizable but prosody varies vs Base clone
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario_light.qvoice \
+    --text "Ciao, come stai?" -o output.wav
 ```
 
-The voice is recognizably the same speaker but may have a slight timbre shift compared to
-direct voice clone on the Base model. This is because the models have different transformer
-weights (trained separately). The speaker embedding norm is auto-scaled to match the target
-model's preset speaker range.
+**How it works:** Deep analysis revealed that Base and CustomVoice models share
+99.98% identical transformer weights (cosine similarity 0.9999 per layer). The only
+differences are the codec embedding table (9 preset speaker tokens) and the ECAPA-TDNN
+speaker encoder. The delta format exploits this near-identity by storing only the small
+per-weight differences (int16 deltas, gzip compressed), achieving bit-identical output
+at ~30% of the full model size. See [blog/cross-model-voice-analysis.md](blog/cross-model-voice-analysis.md)
+for the full technical analysis.
+
+#### .qvoice v3 Metadata
+
+Voice files include metadata that prevents common mistakes:
+
+```bash
+# Language is auto-set when loading (no need for -l flag)
+./qwen_tts -d qwen3-tts-0.6b --load-voice mario_06b.qvoice --text "Ciao!"
+#   Auto-set language from voice: Italian
+
+# Warning if you override with wrong language
+./qwen_tts -d qwen3-tts-0.6b --load-voice mario_06b.qvoice -l English --text "Hello"
+#   WARNING: voice was created with language 'Italian' but you specified 'English'
+
+# List all voices with metadata
+./qwen_tts --list-voices voices/
+#   mario_06b.qvoice    v3  [Mario]  lang=Italian  model=0.6B
+```
 
 | Model Type | Use Case | Voice Source | Style Control | Clone Fidelity |
 |------------|----------|-------------|---------------|----------------|
-| **Base** | Direct voice clone | `--ref-audio` / `.qvoice` | None | Best (near-perfect) |
+| **Base** | Direct voice clone | `--ref-audio` / `.qvoice` | None | Perfect |
 | **CustomVoice** | Preset voices | 9 built-in | `--instruct` (1.7B) | N/A |
-| **CustomVoice + `.bin`** | Custom cloned voice | Injected `.bin` from Base | `--instruct` (1.7B) | Good (slight shift) |
+| **CustomVoice + .qvoice delta** | Custom cloned voice | `.qvoice` from Base | `--instruct` (1.7B) | **Perfect** (bit-identical) |
+| **CustomVoice + .qvoice standard** | Custom cloned voice | `.qvoice` from Base | `--instruct` (1.7B) | Good (prosody varies) |
 | **VoiceDesign** | Voice from description | Text description | `--instruct` | N/A |
 
-> **Tip:** For best fidelity, use the Base model directly. For speed + custom voices per
-> language (RTF ~1.5 on 0.6B), use cross-model injection with `.bin` files. The quality
-> tradeoff is small and the value of having native-sounding voices is significant.
+> **Tip:** Use delta format (`--target-cv`) for maximum fidelity. Use standard format
+> (no `--target-cv`) for smaller files when perfect fidelity isn't critical.
 >
-> **Note:** `--instruct` on the Base model is not recommended — use CustomVoice + `.bin`
-> for style control with cloned voices.
+> **Note:** Delta `.qvoice` files are tied to a specific CV model version. A file created
+> with `--target-cv qwen3-tts-0.6b` must be loaded on the same 0.6B CustomVoice model.
 
 ### Streaming
 

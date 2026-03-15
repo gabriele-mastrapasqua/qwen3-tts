@@ -215,13 +215,22 @@ four convolutional blocks, attentive pooling, and FC projection take about 200ms
 30 seconds of audio. Not terrible, but unnecessary if you're cloning the same voice
 repeatedly.
 
-We designed the `.qvoice` format to store the extracted embedding for instant reuse:
+We designed the `.qvoice` format to store the extracted embedding for instant reuse.
+The format has evolved through three versions:
+
+- **v1/v2**: Speaker embedding + optional ICL data (~4-50 KB)
+- **v3**: Added metadata (language, voice name, model size) + optional weight overrides
+- **v3 + WDELTA**: Added compressed weight deltas for bit-identical cross-model output (~510 MB)
+
+For the full story on cross-model voice injection and how we achieved bit-identical output
+across different model variants, see [cross-model-voice-analysis.md](cross-model-voice-analysis.md).
+
+The base format:
 
 ```
 Offset  Size    Field
 0       4       Magic: "QVCE"
-4       4       Version (2)
-8       4       enc_dim (1024 or 2048)
+4       4       Version (3)
 12      N×4     Speaker embedding (N = enc_dim floats)
 12+N×4  4       ref_text length
 ...     var     ref_text (UTF-8)
