@@ -224,11 +224,14 @@ identical. Root cause analysis (March 2026) identified THREE specific sources:
     2. Weight micro-diffs (cosine 0.9998 at layers 16-18) → compound through layers
     3. Autoregressive butterfly effect → cascading token divergence
   - See blog/cross-model-voice-analysis.md for full analysis
-- [ ] `[MED]` **Analyze RTF difference: why is Base voice clone slower?**
-  - Base 1.7B: RTF 3.2-4.1 vs CustomVoice 1.7B with preset: similar RTF
-  - But Base 0.6B: RTF 1.5-1.8 vs CustomVoice 0.6B: RTF 1.5-1.7 (similar!)
-  - Is the slowness on 1.7B Base due to RAM pressure (16GB machine, mmap paging)?
-  - Profile: prefill time, per-frame Talker ms, per-frame CP ms — compare Base vs CustomVoice
+- [x] `[MED]` **Analyze RTF difference: why is Base voice clone slower?**
+  ANSWERED (March 2026): Base is only ~10% slower on 1.7B, negligible on 0.6B.
+  Earlier measurements were contaminated by mmap cache pressure (running both models
+  back-to-back on 16GB). Measured in isolation (same text, seed 42, Italian):
+  - 0.6B: CV RTF 1.94, Base RTF ~2.0 (negligible difference)
+  - 1.7B: CV RTF 4.58, Base RTF 5.05 (+10%)
+  Root cause: Base has ~76 extra ECAPA-TDNN tensors in mmap that compete for OS page
+  cache on RAM-constrained machines (16GB). Not a code issue — just mmap paging.
 - [x] `[HIGH]` **KV cache dump approach**: TESTED and WORKING
   - Initial bug: kv_dim was 512 instead of 1024 (half data) → garbage output. Fixed.
   - **Same-model (Base→Base): BIT-IDENTICAL** output. Skip prefill entirely → faster.
