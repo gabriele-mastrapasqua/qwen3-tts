@@ -230,7 +230,7 @@ extern void qwen_set_seed(uint32_t seed);
 
 /* Embed a single text token: text_embedding → text_projection(SiLU) → out[hidden]
  * Computes the full projection (bf16 lookup + fc1 SiLU + fc2). */
-static void embed_one_text_token_compute(qwen_tts_ctx_t *ctx, int tid, float *out) {
+void embed_one_text_token_compute(qwen_tts_ctx_t *ctx, int tid, float *out) {
     int th = ctx->config.text_hidden_size, h = ctx->config.hidden_size;
     float *text_emb = ctx->emb_tmp1;
     float *fc1_out = ctx->emb_tmp2;
@@ -701,46 +701,6 @@ static void lookup_codec_embed(qwen_tts_ctx_t *ctx, int token_id, float *out) {
  *
  * Generation: every frame gets tts_pad (text side) + codec_embed(sum_all_codes)
  */
-/* Re-encode RoPE in KV cache K entries: shift from old positions to new positions.
- * RoPE rotations compose: rotate(K, new_pos) = rotate(rotate(K, old_pos), new_pos - old_pos).
- * V entries don't have RoPE — only K does. */
-static void reposition_rope_kv(uint16_t *kv_k, int n_layers, int kv_max, int kv_dim,
-                                int n_kv_heads, int head_dim, int n_pos,
-                                int old_start, int new_start,
-                                const float *rope_cos, const float *rope_sin) {
-    int half = head_dim / 2;
-    int delta = new_start - old_start;
-    if (delta == 0) return;
-    /* Delta rotation is constant for all positions: Δθ = delta * freq_i
-     * We use rope_cos/sin[delta] which encodes cos/sin(delta * freq_i) */
-    const float *cos_d = rope_cos + (int64_t)delta * half;
-    const float *sin_d = rope_sin + (int64_t)delta * half;
-    float *k_f32 = (float *)malloc(kv_dim * sizeof(float));
-    for (int p = 0; p < n_pos; p++) {
-        for (int l = 0; l < n_layers; l++) {
-            int64_t off = (int64_t)l * kv_max * kv_dim + (int64_t)(new_start + p) * kv_dim;
-            /* Convert bf16 → f32 */
-            for (int j = 0; j < kv_dim; j++)
-                k_f32[j] = bf16_to_f32(kv_k[off + j]);
-            /* Apply delta rotation per head */
-            for (int h = 0; h < n_kv_heads; h++) {
-                float *kh = k_f32 + h * head_dim;
-                for (int i = 0; i < half; i++) {
-                    float k1 = kh[i], k2 = kh[i + half];
-                    kh[i]        = k1 * cos_d[i] - k2 * sin_d[i];
-                    kh[i + half] = k2 * cos_d[i] + k1 * sin_d[i];
-                }
-            }
-            /* Convert f32 → bf16 back */
-            for (int j = 0; j < kv_dim; j++) {
-                uint32_t bits; memcpy(&bits, &k_f32[j], 4);
-                kv_k[off + j] = (uint16_t)(bits >> 16);
-            }
-        }
-    }
-    free(k_f32);
-}
-
 int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples, int *out_n_samples) {
     double t_start = time_ms();
     int h = ctx->config.hidden_size;
@@ -844,10 +804,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * - VoiceDesign: no speaker (voice from instruct)
      * - Voice Clone: continuous speaker embedding replaces token
      *   We use -1 as sentinel; the embedding loop handles it specially. */
-    int speaker_embed_pos = -1;  /* codec_tokens index where speaker goes */
-    (void)speaker_embed_pos;
     if (ctx->voice_clone && ctx->speaker_embedding) {
-        speaker_embed_pos = codec_len;
         codec_tokens[codec_len++] = -1;  /* placeholder — will use speaker_embedding */
     } else if (!ctx->voice_design) {
         codec_tokens[codec_len++] = ctx->speaker_id;
@@ -929,8 +886,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         sec3_len = text_content_len + 1;  /* text + eos */
         sec4_len = 1;                     /* bos */
     }
-    int voice_prefix_len = inst_len + role_len + sec2_len;  /* voice identity portion */
-    int prefill_len = voice_prefix_len + sec3_len + sec4_len;
+    int prefill_len = inst_len + role_len + sec2_len + sec3_len + sec4_len;
 
     float *input_embeds = (float *)calloc((int64_t)prefill_len * h, sizeof(float));
     float *tmp_embed = (float *)malloc(h * sizeof(float));
@@ -1103,172 +1059,6 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "[CORR] pre-prefill: pre_conv_w[0]=%.6f\n", ctx->speech_dec.pre_conv_weight[0]);
     }
 
-    /* Load speaker position KV (.qvsp) — inject single speaker KV during normal prefill */
-    uint16_t *spk_kv_k = NULL, *spk_kv_v = NULL;
-    int spk_kv_loaded = 0;
-    int spk_kv_codec_pos = -1;  /* position within codec prefix */
-    if (ctx->load_voice_kv_path && strstr(ctx->load_voice_kv_path, ".qvsp")) {
-        FILE *kf = fopen(ctx->load_voice_kv_path, "rb");
-        if (kf) {
-            char magic[4]; uint32_t ver, nl, kd, sp;
-            if (fread(magic, 1, 4, kf) == 4 && memcmp(magic, "QVSP", 4) == 0 &&
-                fread(&ver, 4, 1, kf) == 1 && ver == 1 &&
-                fread(&nl, 4, 1, kf) == 1 && fread(&kd, 4, 1, kf) == 1 && fread(&sp, 4, 1, kf) == 1) {
-                int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
-                if ((int)nl == ctx->config.num_layers && (int)kd == kv_dim) {
-                    int n_layers = (int)nl;
-                    spk_kv_k = (uint16_t *)malloc((int64_t)n_layers * kv_dim * sizeof(uint16_t));
-                    spk_kv_v = (uint16_t *)malloc((int64_t)n_layers * kv_dim * sizeof(uint16_t));
-                    for (int l = 0; l < n_layers; l++) {
-                        fread(spk_kv_k + (int64_t)l * kv_dim, sizeof(uint16_t), kv_dim, kf);
-                        fread(spk_kv_v + (int64_t)l * kv_dim, sizeof(uint16_t), kv_dim, kf);
-                    }
-                    spk_kv_loaded = 1;
-                    spk_kv_codec_pos = (int)sp;
-                    if (!ctx->silent)
-                        fprintf(stderr, "  Loaded speaker KV from %s (codec_pos=%d, %d layers × %d dim)\n",
-                                ctx->load_voice_kv_path, (int)sp, n_layers, kv_dim);
-                }
-            }
-            fclose(kf);
-        }
-    }
-
-    /* Load voice prefix KV (.qvkv) — voice identity only, then prefill text normally */
-    if (ctx->load_voice_kv_path && !strstr(ctx->load_voice_kv_path, ".qvsp")) {
-        FILE *kf = fopen(ctx->load_voice_kv_path, "rb");
-        if (kf) {
-            char magic[4]; uint32_t ver, nl, kd, vl;
-            if (fread(magic, 1, 4, kf) == 4 && memcmp(magic, "QVVP", 4) == 0 &&
-                fread(&ver, 4, 1, kf) == 1 && ver == 1 &&
-                fread(&nl, 4, 1, kf) == 1 && fread(&kd, 4, 1, kf) == 1 && fread(&vl, 4, 1, kf) == 1) {
-                int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
-                if ((int)nl == ctx->config.num_layers && (int)kd == kv_dim && (int)vl <= (int)ctx->kv_max) {
-                    /* Read voice prefix KV data into temporary buffer */
-                    int64_t vp_layer_size = (int64_t)vl * kv_dim;
-                    uint16_t *vp_k = (uint16_t *)malloc((int64_t)nl * vp_layer_size * sizeof(uint16_t));
-                    uint16_t *vp_v = (uint16_t *)malloc((int64_t)nl * vp_layer_size * sizeof(uint16_t));
-                    for (int l = 0; l < (int)nl; l++) {
-                        fread(vp_k + (int64_t)l * vp_layer_size, sizeof(uint16_t), vp_layer_size, kf);
-                        fread(vp_v + (int64_t)l * vp_layer_size, sizeof(uint16_t), vp_layer_size, kf);
-                    }
-                    fclose(kf);
-
-                    /* Strategy: [instruct] [voice_prefix_KV] [text + codec_bos]
-                     * This matches the model's training order. The voice prefix KV
-                     * has RoPE for pos 0-8 (from Base model). When instruct is present,
-                     * we re-encode the RoPE to shift it to pos inst_len onwards.
-                     * 1. Prefill instruct tokens (pos 0 to inst_len-1)
-                     * 2. Load voice prefix KV at pos inst_len, re-encode RoPE
-                     * 3. Prefill text+codec_bos after voice prefix */
-                    ctx->kv_len = 0;
-                    float *dummy_hidden = (float *)malloc(h * sizeof(float));
-
-                    /* Step 1: Prefill instruct tokens (if any) */
-                    if (inst_len > 0) {
-                        if (!ctx->silent)
-                            fprintf(stderr, "  Prefilling %d instruct tokens (pos 0-%d)...\n",
-                                    inst_len, inst_len - 1);
-                        for (int t = 0; t < inst_len; t++) {
-                            if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
-                                free(input_embeds); free(dummy_hidden); free(vp_k); free(vp_v);
-                                return -1;
-                            }
-                        }
-                    }
-
-                    /* Step 2: Load voice prefix KV at pos inst_len */
-                    int vp_start = ctx->kv_len;  /* = inst_len */
-                    for (int l = 0; l < (int)nl; l++) {
-                        int64_t dst_off = (int64_t)l * ctx->kv_max * kv_dim + (int64_t)vp_start * kv_dim;
-                        memcpy(ctx->kv_cache_k + dst_off, vp_k + (int64_t)l * vp_layer_size,
-                               vp_layer_size * sizeof(uint16_t));
-                        memcpy(ctx->kv_cache_v + dst_off, vp_v + (int64_t)l * vp_layer_size,
-                               vp_layer_size * sizeof(uint16_t));
-                    }
-                    ctx->kv_len = vp_start + (int)vl;
-                    free(vp_k); free(vp_v);
-
-                    /* Re-encode RoPE if voice prefix was shifted (instruct present) */
-                    if (vp_start > 0) {
-                        reposition_rope_kv(ctx->kv_cache_k, ctx->config.num_layers,
-                                           ctx->kv_max, kv_dim,
-                                           ctx->config.num_kv_heads, ctx->config.head_dim,
-                                           (int)vl, 0, vp_start,
-                                           ctx->rope_cos, ctx->rope_sin);
-                        if (!ctx->silent)
-                            fprintf(stderr, "  Re-encoded RoPE: pos 0-%d → pos %d-%d\n",
-                                    (int)(vl - 1), vp_start, (int)(vp_start + vl - 1));
-                    }
-
-                    if (!ctx->silent)
-                        fprintf(stderr, "  Loaded voice prefix KV at pos %d-%d (%d pos from %s)\n",
-                                vp_start, (int)(vp_start + vl - 1), (int)vl, ctx->load_voice_kv_path);
-
-                    /* Step 3: Prefill text + codec_bos (skip instruct+role+codec in embeds) */
-                    int text_start = voice_prefix_len;  /* skip instruct+role+codec in embeds */
-                    int text_count = prefill_len - text_start;
-                    if (!ctx->silent)
-                        fprintf(stderr, "  Prefilling %d text tokens (pos %d-%d)...\n",
-                                text_count, ctx->kv_len, ctx->kv_len + text_count - 1);
-                    for (int t = text_start; t < prefill_len; t++) {
-                        if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
-                            free(input_embeds); free(dummy_hidden);
-                            return -1;
-                        }
-                    }
-                    free(dummy_hidden);
-                    free(input_embeds); input_embeds = NULL;
-                    goto kv_loaded;
-                } else {
-                    fprintf(stderr, "Warning: voice prefix KV mismatch — ignoring\n");
-                }
-            }
-            fclose(kf);
-        } else {
-            fprintf(stderr, "Warning: cannot open voice prefix file %s\n", ctx->load_voice_kv_path);
-        }
-    }
-
-    /* Load full KV cache from file (cross-model voice portability) */
-    if (ctx->load_kv_path) {
-        FILE *kf = fopen(ctx->load_kv_path, "rb");
-        if (kf) {
-            char magic[4]; uint32_t ver, nl, kd, pl;
-            if (fread(magic, 1, 4, kf) == 4 && memcmp(magic, "QVKV", 4) == 0 &&
-                fread(&ver, 4, 1, kf) == 1 && ver == 1 &&
-                fread(&nl, 4, 1, kf) == 1 && fread(&kd, 4, 1, kf) == 1 && fread(&pl, 4, 1, kf) == 1) {
-                int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
-                if ((int)nl == ctx->config.num_layers && (int)kd == kv_dim && (int)pl <= (int)ctx->kv_max) {
-                    /* Load KV for all layers */
-                    for (int l = 0; l < (int)nl; l++) {
-                        int64_t layer_off = (int64_t)l * ctx->kv_max * kv_dim;
-                        fread(ctx->kv_cache_k + layer_off, sizeof(uint16_t), (int64_t)pl * kv_dim, kf);
-                        fread(ctx->kv_cache_v + layer_off, sizeof(uint16_t), (int64_t)pl * kv_dim, kf);
-                    }
-                    ctx->kv_len = (int)pl;
-                    /* Load dec_x (last hidden state for generation start) */
-                    if (fread(ctx->dec_x, sizeof(float), h, kf) != (size_t)h) {
-                        fprintf(stderr, "Warning: KV file missing dec_x — generation may fail\n");
-                    }
-                    fclose(kf);
-                    if (!ctx->silent)
-                        fprintf(stderr, "  Loaded KV cache from %s (%d layers × %d pos × %d dim + dec_x)\n",
-                                ctx->load_kv_path, (int)nl, (int)pl, (int)kd);
-                    /* Skip prefill entirely — KV is already populated */
-                    free(input_embeds); input_embeds = NULL;
-                    goto kv_loaded;
-                } else {
-                    fprintf(stderr, "Warning: KV cache mismatch (file: %d layers/%d dim/%d pos, model: %d/%d/%d) — ignoring\n",
-                            (int)nl, (int)kd, (int)pl, ctx->config.num_layers, kv_dim, ctx->kv_max);
-                }
-            }
-            fclose(kf);
-        } else {
-            fprintf(stderr, "Warning: cannot open KV cache file %s\n", ctx->load_kv_path);
-        }
-    }
-
     /* Delta prefill: compare with previous embeddings to find reusable KV prefix.
      * For server mode, consecutive calls with the same speaker/language share
      * the role+codec prefix (~8-9 tokens), so we skip re-prefilling those. */
@@ -1317,132 +1107,6 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     prefill_ms, prefill_len - delta_start, delta_start);
         else
             fprintf(stderr, "  Prefill: %.0f ms\n", prefill_ms);
-    }
-
-    /* Inject speaker position KV from .qvsp file (overwrite after normal prefill) */
-    if (spk_kv_loaded && spk_kv_k && spk_kv_v) {
-        int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
-        int n_layers = ctx->config.num_layers;
-        /* Speaker position in current prefill */
-        int spk_pos_target = inst_len + role_len + spk_kv_codec_pos;
-        /* Speaker position in dump (Base, no instruct) */
-        int spk_pos_source = role_len + spk_kv_codec_pos;  /* typically 3+4=7 */
-
-        if (spk_pos_target < ctx->kv_len) {
-            /* Overwrite K and V at speaker position */
-            for (int l = 0; l < n_layers; l++) {
-                int64_t dst_off = (int64_t)l * ctx->kv_max * kv_dim + (int64_t)spk_pos_target * kv_dim;
-                memcpy(ctx->kv_cache_k + dst_off, spk_kv_k + (int64_t)l * kv_dim, kv_dim * sizeof(uint16_t));
-                memcpy(ctx->kv_cache_v + dst_off, spk_kv_v + (int64_t)l * kv_dim, kv_dim * sizeof(uint16_t));
-            }
-            /* Re-encode RoPE from source position to target position */
-            if (spk_pos_source != spk_pos_target) {
-                reposition_rope_kv(ctx->kv_cache_k, n_layers, ctx->kv_max, kv_dim,
-                                   ctx->config.num_kv_heads, ctx->config.head_dim,
-                                   1, spk_pos_source, spk_pos_target,
-                                   ctx->rope_cos, ctx->rope_sin);
-            }
-            if (!ctx->silent)
-                fprintf(stderr, "  Injected speaker KV at pos %d (from source pos %d, RoPE %s)\n",
-                        spk_pos_target, spk_pos_source,
-                        spk_pos_source != spk_pos_target ? "re-encoded" : "unchanged");
-        }
-        free(spk_kv_k); free(spk_kv_v);
-        spk_kv_k = NULL; spk_kv_v = NULL;
-    }
-
-kv_loaded:
-    /* Dump KV cache after prefill (for cross-model voice portability) */
-    if (ctx->dump_kv_path) {
-        FILE *kf = fopen(ctx->dump_kv_path, "wb");
-        if (kf) {
-            int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
-            int n_layers = ctx->config.num_layers;
-            /* Header: magic + version + n_layers + kv_dim + prefill_len */
-            fwrite("QVKV", 1, 4, kf);
-            uint32_t ver = 1;
-            fwrite(&ver, 4, 1, kf);
-            uint32_t nl = (uint32_t)n_layers, kd = (uint32_t)kv_dim, pl = (uint32_t)ctx->kv_len;
-            fwrite(&nl, 4, 1, kf);
-            fwrite(&kd, 4, 1, kf);
-            fwrite(&pl, 4, 1, kf);
-            /* Dump KV for all layers, only the prefilled positions */
-            for (int l = 0; l < n_layers; l++) {
-                int64_t layer_off = (int64_t)l * ctx->kv_max * kv_dim;
-                fwrite(ctx->kv_cache_k + layer_off, sizeof(uint16_t), (int64_t)ctx->kv_len * kv_dim, kf);
-                fwrite(ctx->kv_cache_v + layer_off, sizeof(uint16_t), (int64_t)ctx->kv_len * kv_dim, kf);
-            }
-            /* Also save dec_x (last hidden state, needed to start generation) */
-            fwrite(ctx->dec_x, sizeof(float), h, kf);
-            fclose(kf);
-            if (!ctx->silent) {
-                int64_t kv_bytes = (int64_t)n_layers * ctx->kv_len * kv_dim * 2 * sizeof(uint16_t);
-                fprintf(stderr, "  Dumped KV cache to %s (%d layers × %d pos × %d dim = %.1f KB)\n",
-                        ctx->dump_kv_path, n_layers, ctx->kv_len, kv_dim, kv_bytes / 1024.0f);
-            }
-        }
-    }
-
-    /* Dump speaker position KV (single position — just the speaker identity) */
-    if (ctx->dump_voice_kv_path && strstr(ctx->dump_voice_kv_path, ".qvsp")) {
-        /* .qvsp = single speaker position KV */
-        int spk_pos = inst_len + role_len + speaker_embed_pos;  /* absolute position in prefill */
-        if (speaker_embed_pos >= 0 && spk_pos < ctx->kv_len) {
-            FILE *kf = fopen(ctx->dump_voice_kv_path, "wb");
-            if (kf) {
-                int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
-                int n_layers = ctx->config.num_layers;
-                fwrite("QVSP", 1, 4, kf);
-                uint32_t ver = 1;
-                fwrite(&ver, 4, 1, kf);
-                uint32_t nl = (uint32_t)n_layers, kd = (uint32_t)kv_dim;
-                uint32_t sp = (uint32_t)speaker_embed_pos;  /* position within codec prefix */
-                fwrite(&nl, 4, 1, kf);
-                fwrite(&kd, 4, 1, kf);
-                fwrite(&sp, 4, 1, kf);
-                /* Dump K and V for just the speaker position across all layers */
-                for (int l = 0; l < n_layers; l++) {
-                    int64_t off = (int64_t)l * ctx->kv_max * kv_dim + (int64_t)spk_pos * kv_dim;
-                    fwrite(ctx->kv_cache_k + off, sizeof(uint16_t), kv_dim, kf);
-                    fwrite(ctx->kv_cache_v + off, sizeof(uint16_t), kv_dim, kf);
-                }
-                fclose(kf);
-                if (!ctx->silent)
-                    fprintf(stderr, "  Dumped speaker KV to %s (pos %d, %d layers × %d dim = %.1f KB)\n",
-                            ctx->dump_voice_kv_path, spk_pos, n_layers, kv_dim,
-                            (float)n_layers * kv_dim * 2 * sizeof(uint16_t) / 1024.0f);
-            }
-        }
-    }
-
-    /* Dump voice prefix KV (voice identity only, without text) */
-    if (ctx->dump_voice_kv_path && !strstr(ctx->dump_voice_kv_path, ".qvsp")) {
-        FILE *kf = fopen(ctx->dump_voice_kv_path, "wb");
-        if (kf) {
-            int kv_dim = ctx->config.num_kv_heads * ctx->config.head_dim;
-            int n_layers = ctx->config.num_layers;
-            int vp_len = voice_prefix_len;
-            /* Header */
-            fwrite("QVVP", 1, 4, kf);  /* magic: Voice Prefix */
-            uint32_t ver = 1;
-            fwrite(&ver, 4, 1, kf);
-            uint32_t nl = (uint32_t)n_layers, kd = (uint32_t)kv_dim, vl = (uint32_t)vp_len;
-            fwrite(&nl, 4, 1, kf);
-            fwrite(&kd, 4, 1, kf);
-            fwrite(&vl, 4, 1, kf);
-            /* KV data for voice prefix positions only */
-            for (int l = 0; l < n_layers; l++) {
-                int64_t layer_off = (int64_t)l * ctx->kv_max * kv_dim;
-                fwrite(ctx->kv_cache_k + layer_off, sizeof(uint16_t), (int64_t)vp_len * kv_dim, kf);
-                fwrite(ctx->kv_cache_v + layer_off, sizeof(uint16_t), (int64_t)vp_len * kv_dim, kf);
-            }
-            fclose(kf);
-            if (!ctx->silent) {
-                int64_t kv_bytes = (int64_t)n_layers * vp_len * kv_dim * 2 * sizeof(uint16_t);
-                fprintf(stderr, "  Dumped voice prefix KV to %s (%d layers × %d pos × %d dim = %.1f KB)\n",
-                        ctx->dump_voice_kv_path, n_layers, vp_len, kv_dim, kv_bytes / 1024.0f);
-            }
-        }
     }
 
     /* Cache current embeddings for delta prefill on next call */
@@ -1529,9 +1193,15 @@ kv_loaded:
             fprintf(stderr, "  [frame %d] EOS logit=%.2f rank=%d\n", frame, eos_logit, eos_rank);
         }
 
-        /* Sample code0 */
+        /* Sample code0 — use greedy for warmup frames to reduce cross-model divergence */
+        float frame_temp = ctx->temperature;
+        int frame_top_k = ctx->top_k;
+        if (ctx->greedy_warmup > 0 && frame < ctx->greedy_warmup) {
+            frame_temp = 0.0f;
+            frame_top_k = 1;
+        }
         int code0 = qwen_tts_sample(ctx->logits, ctx->config.codec_vocab_size,
-                                     ctx->temperature, ctx->top_k, ctx->top_p,
+                                     frame_temp, frame_top_k, ctx->top_p,
                                      ctx->rep_penalty, ctx->prev_tokens, ctx->n_prev_tokens);
 
         if (code0 == QWEN_TTS_CODEC_EOS) {

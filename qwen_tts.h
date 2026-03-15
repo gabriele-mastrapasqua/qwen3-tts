@@ -372,16 +372,11 @@ typedef struct qwen_tts_ctx {
     int max_tokens;
     float cp_temperature;
     int cp_top_k;
-    
+    int greedy_warmup;  /* initial frames sampled greedily (temp=0) for cross-model stability */
+
     /* Speaker and language */
     int speaker_id;
     int language_id;
-
-    /* KV cache dump/load for cross-model voice portability */
-    char *dump_kv_path;     /* --dump-kv: save full prefill KV cache */
-    char *load_kv_path;     /* --load-kv: load full prefill KV cache */
-    char *dump_voice_kv_path;  /* --dump-voice-kv: save voice prefix KV only */
-    char *load_voice_kv_path;  /* --load-voice-kv: load voice prefix, then prefill text */
 
     /* Instruct text (style/emotion control, 1.7B only; required for VoiceDesign) */
     char *instruct;

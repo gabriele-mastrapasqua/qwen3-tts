@@ -5,6 +5,9 @@ CC = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
 LDLIBS = -lm -lpthread
 
+# LZ4 (embedded in vendor/ — no external dependency needed)
+CFLAGS_BASE += -Ivendor
+
 # BLAS (Accelerate on macOS, OpenBLAS on Linux)
 ifeq ($(UNAME_S),Darwin)
     CFLAGS_BASE += -DUSE_BLAS -DACCELERATE_NEW_LAPACK
@@ -32,7 +35,8 @@ SRCS = main.c \
        qwen_tts_safetensors.c \
        qwen_tts_server.c \
        qwen_tts_voice_clone.c \
-       qwen_tts_speech_encoder.c
+       qwen_tts_speech_encoder.c \
+       vendor/lz4.c
 
 OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts

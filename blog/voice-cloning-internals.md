@@ -215,13 +215,22 @@ four convolutional blocks, attentive pooling, and FC projection take about 200ms
 30 seconds of audio. Not terrible, but unnecessary if you're cloning the same voice
 repeatedly.
 
-We designed the `.qvoice` format to store the extracted embedding for instant reuse:
+We designed the `.qvoice` format to store the extracted embedding for instant reuse.
+The format has evolved through three versions:
+
+- **v1/v2**: Speaker embedding + optional ICL data (~4-50 KB)
+- **v3**: Added metadata (language, voice name, model size) + optional weight overrides
+- **v3 + WDELTA**: Added compressed weight deltas for bit-identical cross-model output (~510 MB)
+
+For the full story on cross-model voice injection and how we achieved bit-identical output
+across different model variants, see [cross-model-voice-analysis.md](cross-model-voice-analysis.md).
+
+The base format:
 
 ```
 Offset  Size    Field
 0       4       Magic: "QVCE"
-4       4       Version (2)
-8       4       enc_dim (1024 or 2048)
+4       4       Version (3)
 12      N×4     Speaker embedding (N = enc_dim floats)
 12+N×4  4       ref_text length
 ...     var     ref_text (UTF-8)
@@ -319,21 +328,217 @@ of audio is ~200ms — negligible compared to the generation itself.
    cloning. The speaker encoder itself is working correctly — it's just capturing
    exactly what you give it.
 
-7. **Style control and voice cloning are separate worlds.** We tried combining
-   `--instruct` (style/tone control) with voice cloning on the Base model. The
-   result sounded like a mix — the cloned voice's timbre partially overridden by a
-   generic voice matching the instruction. Digging into the Python reference code
-   revealed why: `generate_voice_clone()` never passes `instruct_ids` to the model.
-   Instruct is for `generate_voice_design()` (creates voice from text description)
-   and `generate_custom_voice()` (preset speakers). The three model types —
-   CustomVoice, VoiceDesign, and Base — are distinct pipelines trained for different
-   tasks. The internal `generate()` function accepts both `instruct_ids` and
-   `voice_clone_prompt`, but the Base model was never trained with both signals
-   together. When both are present, the instruct tokens dominate because the model
-   learned strong text→voice conditioning during VoiceDesign training, while the
-   weaker speaker embedding gets partially ignored. The lesson: just because two
-   features can be combined at the code level doesn't mean the model knows what to
-   do with them.
+7. **Style control and voice cloning are separate worlds** — on the Base model.
+   The Base model was never trained with both instruct tokens and voice clone prompt
+   together. When both are present, instruct dominates and the cloned voice fades.
+   But there's a solution: cross-model injection with weight deltas (see below).
+
+## Cross-Model Voice Injection: Reusable Custom Voices
+
+After implementing the basic voice clone, we discovered something remarkable: the Base
+and CustomVoice models have **99.98% identical transformer weights** (cosine similarity
+0.9999 per layer). The only differences are the 9 preset speaker embeddings in the codec
+table and the ECAPA-TDNN speaker encoder that only the Base model has.
+
+This near-identity opened the door to **perfect cross-model voice transfer**. We can
+clone a voice on Base, then replay it on CustomVoice — with `--instruct` support —
+by correcting for the tiny weight differences between models.
+
+### The .qvoice v3 Format
+
+The format evolved from a simple embedding dump to a full voice profile with metadata
+and optional weight corrections:
+
+```
+.qvoice v3 structure:
+  QVCE magic + version 3
+  ├── Speaker embedding (ECAPA-TDNN, 1024 or 2048 floats)
+  ├── Reference text + ICL codec tokens (optional)
+  ├── META: language, voice name, source model size, flags
+  │         → auto-sets language at load time, warns on mismatch
+  ├── TPAD: source model's tts_pad/bos/eos embeddings (12 KB)
+  ├── WOVR: text_projection + codec_embedding weights (16 MB)
+  └── WDELTA: LZ4-compressed int16 deltas for all talker+CP weights (~785 MB)
+              → bit-identical output on target CustomVoice model
+```
+
+### How We Got to Bit-Identical
+
+The journey involved systematic elimination of divergence sources:
+
+**Step 1: Embed override (TPAD, +12 KB)** — The `tts_pad_embed` (used every generation
+frame) differs slightly between models due to micro-differences in `text_projection`
+weights. Storing and overriding the source model's embed eliminates per-frame drift.
+Result: mel correlation improved from baseline to 0.756.
+
+**Step 2: Weight override (WOVR, +16 MB)** — Override `text_projection` and
+`codec_embedding` entirely. Eliminates embedding-pipeline differences.
+Result: mel correlation 0.711, RTF improved to 1.60 (fastest variant at the time).
+
+**Step 3: Full weight delta (WDELTA, ~785 MB with LZ4)** — The remaining gap came from
+the transformer layers themselves (28 talker layers + 5 code predictor layers). Despite
+being 99.98% similar by cosine, the BF16 values differ at 87% of positions. We store
+int16 deltas per tensor, compressed with LZ4 — at load time, the target model's weights
+are corrected to exactly match the source model.
+Result: **mel correlation 1.000, PCM bit-identical output**.
+
+Key discoveries along the way:
+
+- **Partial layer replacement makes things worse** — replacing only the 5 most-divergent
+  layers (out of 28) drops quality below the no-replacement baseline. The transformer is
+  a chain; mismatched interfaces at layer boundaries cause more harm than uniform small
+  differences across all layers. It's all-or-nothing.
+
+- **The Code Predictor matters** — even after replacing all 28 talker layers, codebooks
+  5-15 still diverged. The CP has its own weights (86 tensors) and its own `gate_up_fused`
+  buffer that must be rebuilt after weight override. Missing this caused us hours of
+  debugging.
+
+- **30 seconds of reference audio is the sweet spot** — more audio doesn't help because
+  the ECAPA embedding stabilizes quickly (cosine > 0.999 between 30s and 47s embeddings).
+  The bottleneck isn't embedding quality; it's the autoregressive butterfly effect during
+  generation.
+
+### Performance Comparison
+
+All measurements on Apple M1 8-core, 16 GB RAM, Italian text, seed 42.
+
+**.qvoice format comparison** (0.6B, CLI):
+
+| .qvoice Format | Size | Mel Corr | Wall Time | vs Preset | Bit-identical? |
+|----------------|------|----------|----------|-----------|----------------|
+| CV preset ryan (baseline) | — | N/A | 12.0s | — | — |
+| Standard (TPAD+WOVR) | 16 MB | 0.711 | 10.6s | -12% | No |
+| **Delta + LZ4 (WDELTA)** | **785 MB** | **1.000** | **12.8s** | **+7%** | **Yes** |
+| Base `--ref-audio` | — | reference | 33.5s | +179% | — |
+
+The delta format with LZ4 has only **+7% overhead** compared to using a preset voice.
+This was a major optimization: the original zlib compression had +32% overhead (~4s
+decompression for 494MB). Switching to LZ4 reduced decompression to ~1s for the same
+data, despite a 54% larger file (785MB vs 510MB). The tradeoff is worth it.
+
+**.qvoice file sizes** by model and format:
+
+| Format | 0.6B | 1.7B | Fidelity |
+|--------|------|------|----------|
+| Embedding only (.bin) | 4 KB | 8 KB | ~60-70% |
+| Standard (TPAD+WOVR) | ~16 MB | ~24 MB | Good (prosody varies) |
+| **Delta (WDELTA+LZ4)** | **785 MB** | **2.8 GB** | **Bit-identical** |
+
+### Server and Streaming Performance
+
+The .qvoice is loaded once at server startup — WDELTA decompression happens during
+initialization, so requests pay zero delta overhead. The server preserves the voice
+language from .qvoice metadata across all requests automatically.
+
+```bash
+# Start server with custom voice (WDELTA applied at startup)
+./qwen_tts -d qwen3-tts-0.6b --load-voice silvio_06b.qvoice --serve 8080
+
+# Clients just send text — language auto-set from voice metadata
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"Buongiorno a tutti.","seed":42}' -o output.wav
+```
+
+**0.6B + Silvio WDELTA .qvoice** (Apple M1, 4 threads):
+
+| Mode | Audio | Wall Time | RTF |
+|------|-------|-----------|-----|
+| CLI | 4.6s | 6.8s | 1.48 |
+| Server (cold) | 6.7s | 13.5s | 2.01 |
+| Server (warm) | 8.5s | 14.7s | 1.74 |
+| Server (warm, short) | 4.6s | 6.6s | **1.44** |
+| Server stream | 4.0s | 5.9s | **1.48** |
+
+**1.7B + Silvio WDELTA .qvoice** (Apple M1, 4 threads):
+
+| Mode | Audio | Wall Time | RTF |
+|------|-------|-----------|-----|
+| Server (cold) | 6.1s | 21.7s | 3.57 |
+| Server (warm) | 5.2s | 17.3s | 3.32 |
+| Server (warm, short) | 4.0s | 13.6s | 3.40 |
+| Server stream | 2.1s | 6.6s | 3.18 |
+
+The cold/warm gap is OS page cache — the first request pages in mmap'd weights from
+SSD (~2x slower). Subsequent requests hit warm RAM. This applies to all modes, not
+just .qvoice. Streaming RTF is similar to non-streaming because the speech decoder
+runs in a pipeline thread in both cases.
+
+### LZ4 vs Zlib: Why Faster Decompression Matters More Than File Size
+
+We initially used zlib (gzip level 6) for delta compression. It produced compact files
+but the decompression dominated load time:
+
+| Compression | File (0.6B) | Decompress | Total Wall Time | vs Preset |
+|-------------|------------|-----------|----------------|-----------|
+| zlib | 510 MB | ~4s | 15.9s | +32% |
+| **LZ4** | **785 MB** | **~1s** | **12.8s** | **+7%** |
+
+LZ4 decompresses ~7.5x faster because it trades compression ratio for speed — the
+algorithm is simpler and operates on larger blocks without back-references across the
+entire stream. For our use case (one-time load at startup), decompression speed matters
+far more than file size.
+
+### Style Control with Cloned Voices (--instruct)
+
+The ultimate test: can you clone a voice AND apply style control? With the 1.7B
+CustomVoice model and a WDELTA .qvoice, yes:
+
+```bash
+# Clone once (needs 1.7B Base + CV)
+./qwen_tts -d qwen3-tts-1.7b-base --ref-audio silvio.wav -l Italian \
+    --voice-name "Silvio" --target-cv qwen3-tts-1.7b \
+    --save-voice silvio_17b.qvoice
+
+# Use with different styles
+./qwen_tts -d qwen3-tts-1.7b --load-voice silvio_17b.qvoice \
+    --text "Una notizia importante." \
+    -I "Parla con voce triste e malinconica" -o sad.wav
+
+./qwen_tts -d qwen3-tts-1.7b --load-voice silvio_17b.qvoice \
+    --text "Una notizia importante." \
+    -I "Parla con voce allegra e entusiasta" -o happy.wav
+```
+
+The voice identity is preserved across all styles — the instruct modulates prosody
+(rhythm, emphasis, pacing) while the cloned timbre stays consistent. The effect is
+subtle but real: sad speech is slower with lower energy, happy speech has more
+variation and higher pitch.
+
+This was made possible by the WDELTA format: the `.qvoice` transforms the CustomVoice
+model's weights to match the Base model exactly, so the cloned voice is processed by
+the same weights that originally produced it — but now with instruct support that only
+CustomVoice provides.
+
+### Creating and Using Reusable Voices
+
+```bash
+# One-time creation (needs both Base and CV models)
+./qwen_tts -d qwen3-tts-0.6b-base --ref-audio speaker.wav -l Italian \
+    --voice-name "Mario" --target-cv qwen3-tts-0.6b \
+    --save-voice voices/mario_06b.qvoice
+
+# Use anywhere (only needs CV model + .qvoice file)
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario_06b.qvoice \
+    --text "Ciao, come va?" -o output.wav
+# Language auto-set from metadata: Italian
+
+# List available voices
+./qwen_tts --list-voices voices/
+#   mario_06b.qvoice   v3  [Mario]  lang=Italian  model=0.6B
+```
+
+Without `--target-cv`, the standard 16 MB format is created — the voice is recognizable
+but prosody varies from the Base clone. With `--target-cv`, the ~785 MB LZ4 delta format
+gives perfect fidelity with only +7% load overhead. Users choose the tradeoff they want.
+
+The practical impact: you can clone any voice once, save it as a `.qvoice`, and share
+the file. Anyone with a CustomVoice model can use it — with perfect fidelity, correct
+language settings, and (on 1.7B) instruct-based style control. No Base model needed
+at runtime.
+
+For the full technical deep-dive on weight analysis, delta encoding, and how we traced
+every source of divergence, see [cross-model-voice-analysis.md](cross-model-voice-analysis.md).
 
 ---
 

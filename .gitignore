@@ -18,4 +18,5 @@ TODO.md
 weights.bin
 bench_scalar
 bench_simd
+qvoices/
 .claude/
