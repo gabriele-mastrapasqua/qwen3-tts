@@ -312,43 +312,30 @@ Use 1.7B-Base when voice clone quality matters most.
 
 #### Reusable Voice Profiles (`.qvoice`)
 
-Save a cloned voice to a `.qvoice` file once, then reuse it for any text without
-re-processing the reference audio. This skips mel spectrogram extraction, speaker
+Save a cloned voice to a `.qvoice` file once, then reuse it for any text — on the
+Base model or on the CustomVoice model. This skips mel spectrogram extraction, speaker
 encoding, and speech encoding — giving a **2x speedup** on subsequent generations.
 
+The `.qvoice` stores the speaker embedding, the language of the reference audio, and
+metadata. **Specify `-l` when creating** so the voice carries the correct language:
+
 ```bash
-# Step 1: Create a .qvoice profile from reference audio (no --text needed)
-#   Encodes audio and saves: speaker embedding + ICL codec tokens + transcript
-#   Use the same Base model you'll generate with (0.6B or 1.7B)
-./qwen_tts -d qwen3-tts-1.7b-base \
-    --ref-audio reference.wav --ref-text "Exact transcript of the reference audio." \
-    --save-voice my_voice.qvoice
+# Create a .qvoice from Italian reference audio
+./qwen_tts -d qwen3-tts-0.6b-base --ref-audio mario.wav -l Italian \
+    --voice-name "Mario" --save-voice mario.qvoice
 
-# Step 2: Reuse the saved voice for any new text (no ref audio needed)
-./qwen_tts -d qwen3-tts-1.7b-base \
-    --load-voice my_voice.qvoice \
-    --text "A completely different sentence." -o output.wav
+# Use on the same Base model
+./qwen_tts -d qwen3-tts-0.6b-base --load-voice mario.qvoice \
+    --text "Ciao, come stai?" -o output.wav
 
-# Example: use the included Italian voice profile
-./qwen_tts -d qwen3-tts-1.7b-base \
-    --load-voice qvoices/silvio_italian_17b.qvoice \
-    --text "Buongiorno, questa è una prova di clonazione vocale." \
-    -l Italian -o output.wav
+# Use on the CustomVoice model (works too — cross-model injection)
+./qwen_tts -d qwen3-tts-0.6b --load-voice mario.qvoice \
+    --text "Ciao, come stai?" -o output.wav
+# Language auto-set from .qvoice metadata — no -l needed!
 ```
-
-**Performance comparison** (Apple M1 8-core, 4 threads, 0.6B-Base, ~4s output):
-
-| Mode | Prefill | Total | RTF | Notes |
-|------|---------|-------|-----|-------|
-| From WAV (`--ref-audio`) | 2.8s | 21.6s | 4.91 | Mel + speaker enc + speech enc + generate |
-| From `.qvoice` (`--load-voice`) | 1.7s | 9.8s | 2.23 | Load file + generate (no audio processing) |
-
-The `.qvoice` format (v3) stores the speaker embedding, metadata (language, voice name,
-source model), and optionally weight deltas for cross-model fidelity.
 
 > **Important:** `.qvoice` files created with 0.6B-Base (`enc_dim=1024`) cannot be used
 > with 1.7B-Base (`enc_dim=2048`) and vice versa. The tool shows a clear error on mismatch.
-> Legacy v1/v2 files are still supported.
 
 #### Managing Voice Profiles
 
@@ -364,18 +351,6 @@ source model), and optionally weight deltas for cross-model fidelity.
 ```
 
 These commands don't require a model — they read/manage the `.qvoice` files directly.
-
-#### Legacy format
-
-Raw speaker embedding files (`.bin`) are still supported for backward compatibility,
-but they only store the x-vector (lower quality than ICL mode with `.qvoice`):
-
-```bash
-./qwen_tts -d qwen3-tts-0.6b-base --text "Hello" \
-    --ref-audio reference.wav --save-voice my_voice.bin -o out.wav
-./qwen_tts -d qwen3-tts-0.6b-base --text "Another sentence" \
-    --load-voice my_voice.bin -o out2.wav
-```
 
 #### Quick Demo
 
@@ -496,12 +471,17 @@ Requires both Base and CustomVoice models downloaded. Adding **`--target-cv`** c
 weight deltas between the two models and stores them in the `.qvoice`. At load time,
 the CustomVoice weights are patched to exactly match Base — bit-identical output.
 
+**Always specify `-l` with the language of the reference audio** — it's saved in the
+`.qvoice` and auto-applied when loading. Without it, the voice may generate in the
+wrong language.
+
 ```bash
 # Download both models (one-time)
 ./download_model.sh --model base-small    # 0.6B-Base (for voice extraction)
 ./download_model.sh --model small         # 0.6B-CustomVoice (target for deltas)
 
 # Create: --target-cv is what makes it a delta .qvoice
+# -l Italian because the reference audio is Italian
 ./qwen_tts -d qwen3-tts-0.6b-base --ref-audio mario.wav -l Italian \
     --voice-name "Mario" --target-cv qwen3-tts-0.6b \
     --save-voice mario.qvoice
@@ -529,6 +509,7 @@ voice is recognizable but prosody may vary slightly from the original clone.
 ./download_model.sh --model base-small
 
 # Create: no --target-cv = standard format (16 MB instead of 785 MB)
+# -l Italian because the reference audio is Italian
 ./qwen_tts -d qwen3-tts-0.6b-base --ref-audio mario.wav -l Italian \
     --voice-name "Mario" --save-voice mario_light.qvoice
 
