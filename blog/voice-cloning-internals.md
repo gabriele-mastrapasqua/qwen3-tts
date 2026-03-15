@@ -328,21 +328,120 @@ of audio is ~200ms — negligible compared to the generation itself.
    cloning. The speaker encoder itself is working correctly — it's just capturing
    exactly what you give it.
 
-7. **Style control and voice cloning are separate worlds.** We tried combining
-   `--instruct` (style/tone control) with voice cloning on the Base model. The
-   result sounded like a mix — the cloned voice's timbre partially overridden by a
-   generic voice matching the instruction. Digging into the Python reference code
-   revealed why: `generate_voice_clone()` never passes `instruct_ids` to the model.
-   Instruct is for `generate_voice_design()` (creates voice from text description)
-   and `generate_custom_voice()` (preset speakers). The three model types —
-   CustomVoice, VoiceDesign, and Base — are distinct pipelines trained for different
-   tasks. The internal `generate()` function accepts both `instruct_ids` and
-   `voice_clone_prompt`, but the Base model was never trained with both signals
-   together. When both are present, the instruct tokens dominate because the model
-   learned strong text→voice conditioning during VoiceDesign training, while the
-   weaker speaker embedding gets partially ignored. The lesson: just because two
-   features can be combined at the code level doesn't mean the model knows what to
-   do with them.
+7. **Style control and voice cloning are separate worlds** — on the Base model.
+   The Base model was never trained with both instruct tokens and voice clone prompt
+   together. When both are present, instruct dominates and the cloned voice fades.
+   But there's a solution: cross-model injection with weight deltas (see below).
+
+## Cross-Model Voice Injection: Reusable Custom Voices
+
+After implementing the basic voice clone, we discovered something remarkable: the Base
+and CustomVoice models have **99.98% identical transformer weights** (cosine similarity
+0.9999 per layer). The only differences are the 9 preset speaker embeddings in the codec
+table and the ECAPA-TDNN speaker encoder that only the Base model has.
+
+This near-identity opened the door to **perfect cross-model voice transfer**. We can
+clone a voice on Base, then replay it on CustomVoice — with `--instruct` support —
+by correcting for the tiny weight differences between models.
+
+### The .qvoice v3 Format
+
+The format evolved from a simple embedding dump to a full voice profile with metadata
+and optional weight corrections:
+
+```
+.qvoice v3 structure:
+  QVCE magic + version 3
+  ├── Speaker embedding (ECAPA-TDNN, 1024 or 2048 floats)
+  ├── Reference text + ICL codec tokens (optional)
+  ├── META: language, voice name, source model size, flags
+  │         → auto-sets language at load time, warns on mismatch
+  ├── TPAD: source model's tts_pad/bos/eos embeddings (12 KB)
+  ├── WOVR: text_projection + codec_embedding weights (16 MB)
+  └── WDELTA: gzipped int16 deltas for all talker+CP weights (510 MB)
+              → bit-identical output on target CustomVoice model
+```
+
+### How We Got to Bit-Identical
+
+The journey involved systematic elimination of divergence sources:
+
+**Step 1: Embed override (TPAD, +12 KB)** — The `tts_pad_embed` (used every generation
+frame) differs slightly between models due to micro-differences in `text_projection`
+weights. Storing and overriding the source model's embed eliminates per-frame drift.
+Result: mel correlation improved from baseline to 0.756.
+
+**Step 2: Weight override (WOVR, +16 MB)** — Override `text_projection` and
+`codec_embedding` entirely. Eliminates embedding-pipeline differences.
+Result: mel correlation 0.711, RTF improved to 1.60 (fastest variant at the time).
+
+**Step 3: Full weight delta (WDELTA, +510 MB)** — The remaining gap came from the
+transformer layers themselves (28 talker layers + 5 code predictor layers). Despite
+being 99.98% similar by cosine, the BF16 values differ at 87% of positions. We store
+compressed int16 deltas per tensor — at load time, the target model's weights are
+corrected to exactly match the source model.
+Result: **mel correlation 1.000, PCM bit-identical output**.
+
+Key discoveries along the way:
+
+- **Partial layer replacement makes things worse** — replacing only the 5 most-divergent
+  layers (out of 28) drops quality below the no-replacement baseline. The transformer is
+  a chain; mismatched interfaces at layer boundaries cause more harm than uniform small
+  differences across all layers. It's all-or-nothing.
+
+- **The Code Predictor matters** — even after replacing all 28 talker layers, codebooks
+  5-15 still diverged. The CP has its own weights (86 tensors) and its own `gate_up_fused`
+  buffer that must be rebuilt after weight override. Missing this caused us hours of
+  debugging.
+
+- **30 seconds of reference audio is the sweet spot** — more audio doesn't help because
+  the ECAPA embedding stabilizes quickly (cosine > 0.999 between 30s and 47s embeddings).
+  The bottleneck isn't embedding quality; it's the autoregressive butterfly effect during
+  generation.
+
+### Performance Comparison
+
+All measurements on Apple M1 8-core, 0.6B model, Italian text "Ciao, come stai oggi?":
+
+| .qvoice Format | Size | Mel Corr vs Base | RTF | Bit-identical? |
+|----------------|------|-----------------|-----|----------------|
+| Standard (TPAD+WOVR) | 16 MB | 0.711 | 1.60 | No |
+| **Delta int16 (WDELTA)** | **510 MB** | **1.000** | **1.56** | **Yes** |
+| Base `--ref-audio` | — | reference | 1.68 | — |
+| Base `--load-voice` | — | 1.000 | 1.78 | Yes (same model) |
+
+The delta format is actually **faster** than direct Base clone (RTF 1.56 vs 1.68)
+because it skips the ECAPA-TDNN extraction step entirely.
+
+### Creating and Using Reusable Voices
+
+```bash
+# One-time creation (needs both Base and CV models)
+./qwen_tts -d qwen3-tts-0.6b-base --ref-audio speaker.wav -l Italian \
+    --voice-name "Mario" --target-cv qwen3-tts-0.6b \
+    --save-voice voices/mario_06b.qvoice
+
+# Use anywhere (only needs CV model + .qvoice file)
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario_06b.qvoice \
+    --text "Ciao, come va?" -o output.wav
+# Language auto-set from metadata: Italian
+
+# List available voices
+./qwen_tts --list-voices voices/
+#   mario_06b.qvoice   v3  [Mario]  lang=Italian  model=0.6B
+```
+
+Without `--target-cv`, the standard 16 MB format is created — the voice is recognizable
+but prosody varies from the Base clone. With `--target-cv`, the 510 MB delta format gives
+perfect fidelity. Users choose the tradeoff they want: 16 MB portable vs 510 MB perfect.
+
+The practical impact: you can clone any voice once, save it as a `.qvoice`, and share
+the file. Anyone with a CustomVoice model can use it — with perfect fidelity, correct
+language settings, and (on 1.7B) instruct-based style control. No Base model needed
+at runtime.
+
+For the full technical deep-dive on weight analysis, delta encoding, and how we traced
+every source of divergence, see [cross-model-voice-analysis.md](cross-model-voice-analysis.md).
 
 ---
 
