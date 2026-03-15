@@ -358,7 +358,7 @@ and optional weight corrections:
   │         → auto-sets language at load time, warns on mismatch
   ├── TPAD: source model's tts_pad/bos/eos embeddings (12 KB)
   ├── WOVR: text_projection + codec_embedding weights (16 MB)
-  └── WDELTA: gzipped int16 deltas for all talker+CP weights (510 MB)
+  └── WDELTA: LZ4-compressed int16 deltas for all talker+CP weights (~785 MB)
               → bit-identical output on target CustomVoice model
 ```
 
@@ -375,11 +375,11 @@ Result: mel correlation improved from baseline to 0.756.
 `codec_embedding` entirely. Eliminates embedding-pipeline differences.
 Result: mel correlation 0.711, RTF improved to 1.60 (fastest variant at the time).
 
-**Step 3: Full weight delta (WDELTA, +510 MB)** — The remaining gap came from the
-transformer layers themselves (28 talker layers + 5 code predictor layers). Despite
+**Step 3: Full weight delta (WDELTA, ~785 MB with LZ4)** — The remaining gap came from
+the transformer layers themselves (28 talker layers + 5 code predictor layers). Despite
 being 99.98% similar by cosine, the BF16 values differ at 87% of positions. We store
-compressed int16 deltas per tensor — at load time, the target model's weights are
-corrected to exactly match the source model.
+int16 deltas per tensor, compressed with LZ4 — at load time, the target model's weights
+are corrected to exactly match the source model.
 Result: **mel correlation 1.000, PCM bit-identical output**.
 
 Key discoveries along the way:
@@ -401,17 +401,65 @@ Key discoveries along the way:
 
 ### Performance Comparison
 
-All measurements on Apple M1 8-core, 0.6B model, Italian text "Ciao, come stai oggi?":
+All measurements on Apple M1 8-core, 0.6B model, Italian text:
 
-| .qvoice Format | Size | Mel Corr vs Base | RTF | Bit-identical? |
-|----------------|------|-----------------|-----|----------------|
-| Standard (TPAD+WOVR) | 16 MB | 0.711 | 1.60 | No |
-| **Delta int16 (WDELTA)** | **510 MB** | **1.000** | **1.56** | **Yes** |
-| Base `--ref-audio` | — | reference | 1.68 | — |
-| Base `--load-voice` | — | 1.000 | 1.78 | Yes (same model) |
+| .qvoice Format | Size | Mel Corr | Wall Time | vs Preset | Bit-identical? |
+|----------------|------|----------|----------|-----------|----------------|
+| CV preset ryan (baseline) | — | N/A | 12.0s | — | — |
+| Standard (TPAD+WOVR) | 16 MB | 0.711 | 10.6s | -12% | No |
+| **Delta + LZ4 (WDELTA)** | **785 MB** | **1.000** | **12.8s** | **+7%** | **Yes** |
+| Base `--ref-audio` | — | reference | 33.5s | +179% | — |
 
-The delta format is actually **faster** than direct Base clone (RTF 1.56 vs 1.68)
-because it skips the ECAPA-TDNN extraction step entirely.
+The delta format with LZ4 has only **+7% overhead** compared to using a preset voice.
+This was a major optimization: the original zlib compression had +32% overhead (~4s
+decompression for 494MB). Switching to LZ4 reduced decompression to ~1s for the same
+data, despite a 54% larger file (785MB vs 510MB). The tradeoff is worth it.
+
+### LZ4 vs Zlib: Why Faster Decompression Matters More Than File Size
+
+We initially used zlib (gzip level 6) for delta compression. It produced compact files
+but the decompression dominated load time:
+
+| Compression | File (0.6B) | Decompress | Total Wall Time | vs Preset |
+|-------------|------------|-----------|----------------|-----------|
+| zlib | 510 MB | ~4s | 15.9s | +32% |
+| **LZ4** | **785 MB** | **~1s** | **12.8s** | **+7%** |
+
+LZ4 decompresses ~7.5x faster because it trades compression ratio for speed — the
+algorithm is simpler and operates on larger blocks without back-references across the
+entire stream. For our use case (one-time load at startup), decompression speed matters
+far more than file size.
+
+### Style Control with Cloned Voices (--instruct)
+
+The ultimate test: can you clone a voice AND apply style control? With the 1.7B
+CustomVoice model and a WDELTA .qvoice, yes:
+
+```bash
+# Clone once (needs 1.7B Base + CV)
+./qwen_tts -d qwen3-tts-1.7b-base --ref-audio silvio.wav -l Italian \
+    --voice-name "Silvio" --target-cv qwen3-tts-1.7b \
+    --save-voice silvio_17b.qvoice
+
+# Use with different styles
+./qwen_tts -d qwen3-tts-1.7b --load-voice silvio_17b.qvoice \
+    --text "Una notizia importante." \
+    -I "Parla con voce triste e malinconica" -o sad.wav
+
+./qwen_tts -d qwen3-tts-1.7b --load-voice silvio_17b.qvoice \
+    --text "Una notizia importante." \
+    -I "Parla con voce allegra e entusiasta" -o happy.wav
+```
+
+The voice identity is preserved across all styles — the instruct modulates prosody
+(rhythm, emphasis, pacing) while the cloned timbre stays consistent. The effect is
+subtle but real: sad speech is slower with lower energy, happy speech has more
+variation and higher pitch.
+
+This was made possible by the WDELTA format: the `.qvoice` transforms the CustomVoice
+model's weights to match the Base model exactly, so the cloned voice is processed by
+the same weights that originally produced it — but now with instruct support that only
+CustomVoice provides.
 
 ### Creating and Using Reusable Voices
 
@@ -432,8 +480,8 @@ because it skips the ECAPA-TDNN extraction step entirely.
 ```
 
 Without `--target-cv`, the standard 16 MB format is created — the voice is recognizable
-but prosody varies from the Base clone. With `--target-cv`, the 510 MB delta format gives
-perfect fidelity. Users choose the tradeoff they want: 16 MB portable vs 510 MB perfect.
+but prosody varies from the Base clone. With `--target-cv`, the ~785 MB LZ4 delta format
+gives perfect fidelity with only +7% load overhead. Users choose the tradeoff they want.
 
 The practical impact: you can clone any voice once, save it as a `.qvoice`, and share
 the file. Anyone with a CustomVoice model can use it — with perfect fidelity, correct
