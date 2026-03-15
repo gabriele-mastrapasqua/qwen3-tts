@@ -1218,7 +1218,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                         }
                     }
                     free(dummy_hidden);
-                    free(input_embeds);
+                    free(input_embeds); input_embeds = NULL;
                     goto kv_loaded;
                 } else {
                     fprintf(stderr, "Warning: voice prefix KV mismatch — ignoring\n");
@@ -1256,7 +1256,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                         fprintf(stderr, "  Loaded KV cache from %s (%d layers × %d pos × %d dim + dec_x)\n",
                                 ctx->load_kv_path, (int)nl, (int)pl, (int)kd);
                     /* Skip prefill entirely — KV is already populated */
-                    free(input_embeds);
+                    free(input_embeds); input_embeds = NULL;
                     goto kv_loaded;
                 } else {
                     fprintf(stderr, "Warning: KV cache mismatch (file: %d layers/%d dim/%d pos, model: %d/%d/%d) — ignoring\n",
