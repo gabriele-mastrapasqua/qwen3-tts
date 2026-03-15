@@ -8,17 +8,7 @@
 #include "qwen_tts_server.h"
 
 #include <stdio.h>
-#include <zlib.h>
-#ifdef __has_include
-#if __has_include(<lz4.h>)
 #include <lz4.h>
-#define HAVE_LZ4 1
-#endif
-#else
-/* Try including anyway — build will fail if not available */
-#include <lz4.h>
-#define HAVE_LZ4 1
-#endif
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
@@ -243,8 +233,7 @@ static void write_tensor_impl(FILE *vf, FILE *cv_sf, const char *cv_hdr_json, si
             for (size_t i = 0; i < n16; i++)
                 delta[i] = (int16_t)((int)base16[i] - (int)cv16[i]);
             unsigned long delta_bytes = n16 * sizeof(int16_t);
-            /* Compress delta: prefer LZ4 (7x faster decompress) over zlib */
-#ifdef HAVE_LZ4
+            /* Compress delta with LZ4 (~7x faster decompress than zlib) */
             int lz4_bound = LZ4_compressBound((int)delta_bytes);
             uint8_t *compressed = (uint8_t *)malloc(lz4_bound);
             int comp_size = LZ4_compress_default((const char *)delta, (char *)compressed,
@@ -257,20 +246,6 @@ static void write_tensor_impl(FILE *vf, FILE *cv_sf, const char *cv_hdr_json, si
             fwrite(compressed, 1, comp_size, vf);
             *total_bytes += comp_size;
             free(cv_buf); free(delta); free(compressed);
-#else
-            unsigned long gz_bound = compressBound(delta_bytes);
-            uint8_t *gz = (uint8_t *)malloc(gz_bound);
-            unsigned long gz_size = gz_bound;
-            compress2(gz, &gz_size, (const uint8_t *)delta, delta_bytes, 6);
-            /* dtype=3: int16 delta + zlib */
-            uint8_t dtype = 3;
-            fwrite(&dtype, 1, 1, vf);
-            uint32_t csz = (uint32_t)gz_size;
-            fwrite(&csz, sizeof(uint32_t), 1, vf);
-            fwrite(gz, 1, gz_size, vf);
-            *total_bytes += gz_size;
-            free(cv_buf); free(delta); free(gz);
-#endif
         } else {
             /* Fallback: raw */
             uint8_t dtype = 0;
@@ -1019,14 +994,12 @@ int main(int argc, char **argv) {
                             fread(&compressed_size, sizeof(uint32_t), 1, vf);
 
                             if (target_ptr) {
-                                if (dtype_flag == 2 || dtype_flag == 3 || dtype_flag == 4) {
-                                    /* WDELTA: compressed deltas vs CV weights.
-                                     * dtype=2: int8 deltas + zlib (lossy)
-                                     * dtype=3: int16 deltas + zlib (lossless)
-                                     * dtype=4: int16 deltas + LZ4 (lossless, fast) */
-                                    uint8_t *gz_data = (uint8_t *)malloc(compressed_size);
+                                if (dtype_flag == 4) {
+                                    /* WDELTA: LZ4-compressed int16 deltas vs CV weights */
+                                    uint8_t *lz4_data = (uint8_t *)malloc(compressed_size);
                                     size_t n16 = data_bytes / 2;
                                     uint16_t *result = (uint16_t *)malloc(data_bytes);
+                                    int16_t *delta16 = (int16_t *)malloc(n16 * sizeof(int16_t));
                                     /* Use ORIGINAL mmap'd CV weight (before WOVR modified it). */
                                     const uint16_t *cv_orig = (const uint16_t *)*target_ptr;
                                     if (strcmp(tname, "talker.model.text_embedding.weight") == 0)
@@ -1039,37 +1012,12 @@ int main(int argc, char **argv) {
                                         cv_orig = orig_codec;
                                     else if (strcmp(tname, "talker.codec_head.weight") == 0)
                                         cv_orig = orig_codec_head;
-                                    if (gz_data && result &&
-                                        fread(gz_data, 1, compressed_size, vf) == compressed_size) {
-                                        if (dtype_flag == 3 || dtype_flag == 4) {
-                                            /* int16 delta (lossless), zlib or LZ4 compressed */
-                                            int16_t *delta16 = (int16_t *)malloc(n16 * sizeof(int16_t));
-                                            if (dtype_flag == 4) {
-#ifdef HAVE_LZ4
-                                                LZ4_decompress_safe((const char *)gz_data, (char *)delta16,
-                                                                     (int)compressed_size, (int)(n16 * sizeof(int16_t)));
-#else
-                                                fprintf(stderr, "Error: .qvoice uses LZ4 compression but LZ4 is not available\n");
-                                                fprintf(stderr, "Install lz4: brew install lz4 (macOS) or apt install liblz4-dev (Linux)\n");
-                                                free(delta16); free(gz_data); free(result);
-                                                fseek(vf, 0, SEEK_END); goto wdelta_done;
-#endif
-                                            } else {
-                                                unsigned long decomp_size = n16 * sizeof(int16_t);
-                                                uncompress((uint8_t *)delta16, &decomp_size, gz_data, compressed_size);
-                                            }
-                                            for (size_t i = 0; i < n16; i++)
-                                                result[i] = (uint16_t)((int)cv_orig[i] + (int)delta16[i]);
-                                            free(delta16);
-                                        } else {
-                                            /* int8 delta (lossy clamp) */
-                                            int8_t *delta8 = (int8_t *)malloc(n16);
-                                            unsigned long decomp_size = n16;
-                                            uncompress((uint8_t *)delta8, &decomp_size, gz_data, compressed_size);
-                                            for (size_t i = 0; i < n16; i++)
-                                                result[i] = (uint16_t)((int)cv_orig[i] + (int)delta8[i]);
-                                            free(delta8);
-                                        }
+                                    if (lz4_data && result && delta16 &&
+                                        fread(lz4_data, 1, compressed_size, vf) == compressed_size) {
+                                        LZ4_decompress_safe((const char *)lz4_data, (char *)delta16,
+                                                             (int)compressed_size, (int)(n16 * sizeof(int16_t)));
+                                        for (size_t i = 0; i < n16; i++)
+                                            result[i] = (uint16_t)((int)cv_orig[i] + (int)delta16[i]);
                                         *target_ptr = result;
                                         loaded++;
                                         wfull_bytes += compressed_size;
@@ -1077,7 +1025,12 @@ int main(int argc, char **argv) {
                                         free(result);
                                         fseek(vf, compressed_size, SEEK_CUR);
                                     }
-                                    free(gz_data);
+                                    free(lz4_data); free(delta16);
+                                } else if (dtype_flag == 2 || dtype_flag == 3) {
+                                    /* Legacy zlib-compressed deltas — no longer supported */
+                                    fprintf(stderr, "Error: .qvoice uses legacy zlib compression (dtype=%d)\n", dtype_flag);
+                                    fprintf(stderr, "Recreate with: --target-cv (now uses LZ4)\n");
+                                    fseek(vf, compressed_size, SEEK_CUR);
                                 } else {
                                     /* WFULL: raw data, just read and replace */
                                     void *buf = malloc(compressed_size);
@@ -1135,7 +1088,6 @@ int main(int argc, char **argv) {
                             embed_one_text_token_compute(ctx, 151673, ctx->cached_tts_eos_embed);
                         }
 
-                        wdelta_done:
                         if (!silent && loaded > 0)
                             fprintf(stderr, "  Loaded %d/%u source talker tensors (%.1f MB) — full weight override\n",
                                     loaded, n_tensors, wfull_bytes / 1024.0f / 1024.0f);

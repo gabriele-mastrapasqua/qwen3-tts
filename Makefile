@@ -3,16 +3,13 @@
 UNAME_S := $(shell uname -s)
 CC = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
-LDLIBS = -lm -lpthread -lz
+LDLIBS = -lm -lpthread
 
-# LZ4 (optional, ~7x faster .qvoice decompression)
-LZ4_CHECK := $(shell pkg-config --exists liblz4 2>/dev/null && echo yes || \
-    (test -f /opt/homebrew/include/lz4.h && echo yes) || \
-    (test -f /usr/include/lz4.h && echo yes))
-ifeq ($(LZ4_CHECK),yes)
-    LDLIBS += $(shell pkg-config --libs liblz4 2>/dev/null || echo "-llz4")
-    CFLAGS_BASE += $(shell pkg-config --cflags liblz4 2>/dev/null || echo "-I/opt/homebrew/include")
-endif
+# LZ4 (required for .qvoice delta compression)
+LDLIBS += $(shell pkg-config --libs liblz4 2>/dev/null || echo "-llz4")
+CFLAGS_BASE += $(shell pkg-config --cflags liblz4 2>/dev/null || \
+    (test -f /opt/homebrew/include/lz4.h && echo "-I/opt/homebrew/include -L/opt/homebrew/lib") || \
+    echo "")
 
 # BLAS (Accelerate on macOS, OpenBLAS on Linux)
 ifeq ($(UNAME_S),Darwin)

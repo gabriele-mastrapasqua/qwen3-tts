@@ -66,16 +66,15 @@ make blas    # Uses Accelerate framework (ships with Xcode)
 ### Linux
 
 ```bash
-# Install OpenBLAS + compression libraries
-sudo apt install libopenblas-dev zlib1g-dev liblz4-dev    # Ubuntu/Debian
-sudo dnf install openblas-devel zlib-devel lz4-devel      # Fedora/RHEL
+# Install OpenBLAS + LZ4 (required for .qvoice voice files)
+sudo apt install libopenblas-dev liblz4-dev    # Ubuntu/Debian
+sudo dnf install openblas-devel lz4-devel      # Fedora/RHEL
 
 make blas
 ```
 
 > **Dependencies:**
-> - **zlib** (required): used for `.qvoice` file support. Ships with macOS; install `zlib1g-dev` on Linux.
-> - **LZ4** (recommended): ~7x faster `.qvoice` loading. Install `lz4` (macOS) or `liblz4-dev` (Linux). Auto-detected at build time; falls back to zlib if not available.
+> - **LZ4** (required): fast compression for `.qvoice` voice files. Install `lz4` (macOS) or `liblz4-dev` (Linux). BSD licensed, lightweight (~30KB source).
 
 ### Windows (WSL2) — Beta
 
@@ -503,7 +502,7 @@ file is self-contained — no Base model needed at runtime.
 | CV preset (no .qvoice) | — | N/A (preset voice) | 12.0s | — |
 
 The **Delta format** stores LZ4-compressed weight differences between Base and CustomVoice
-models (~7x faster loading than zlib). At load time, the deltas are applied to transform
+models (LZ4 compressed). At load time, the deltas are applied to transform
 the CustomVoice model's weights to match the Base model exactly, producing **PCM-level
 bit-identical** output with only **+7% overhead** compared to using a preset voice.
 
