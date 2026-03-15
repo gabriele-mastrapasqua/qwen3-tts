@@ -842,30 +842,43 @@ int main(int argc, char **argv) {
                         is_wdelta = 1;
                     }
                     if ((magic_read == 5 && memcmp(wfull_magic, "WFULL", 5) == 0) || is_wdelta) {
-                        /* WDELTA: validate target model */
+                        /* WDELTA: validate target model.
+                         * Format v2: "WDLT" + target_hidden_size(u32) + n_tensors(u32) + ...
+                         * Format v1 (legacy): "WDLT" + n_tensors(u32) + ... (no target_h)
+                         * Detect: valid hidden_size is 1024 or 2048; n_tensors is ~402/404 */
+                        int wdelta_has_target_h = 0;
                         if (is_wdelta) {
                             uint32_t target_h;
                             if (fread(&target_h, sizeof(uint32_t), 1, vf) == 1) {
-                                if (ctx->is_base_model) {
-                                    fprintf(stderr, "ERROR: this .qvoice contains weight deltas for CustomVoice,\n");
-                                    fprintf(stderr, "  but you're loading it on a Base model. This would corrupt weights.\n");
-                                    fprintf(stderr, "  Use --load-voice on the CustomVoice model instead:\n");
-                                    fprintf(stderr, "    ./qwen_tts -d qwen3-tts-%s --load-voice %s ...\n",
-                                            target_h >= 2048 ? "1.7b" : "0.6b", load_voice);
-                                    fclose(vf); qwen_tts_unload(ctx); return 1;
-                                }
-                                if ((int)target_h != ctx->config.hidden_size) {
-                                    fprintf(stderr, "ERROR: .qvoice was created for %s model (hidden=%u)\n",
-                                            target_h >= 2048 ? "1.7B" : "0.6B", target_h);
-                                    fprintf(stderr, "  but current model has hidden=%d. Recreate with matching --target-cv.\n",
-                                            ctx->config.hidden_size);
-                                    fclose(vf); qwen_tts_unload(ctx); return 1;
+                                if (target_h == 1024 || target_h == 2048) {
+                                    /* New format with target_hidden_size field */
+                                    wdelta_has_target_h = 1;
+                                    if (ctx->is_base_model) {
+                                        fprintf(stderr, "ERROR: this .qvoice contains weight deltas for CustomVoice,\n");
+                                        fprintf(stderr, "  but you're loading it on a Base model. This would corrupt weights.\n");
+                                        fprintf(stderr, "  Use --load-voice on the CustomVoice model instead:\n");
+                                        fprintf(stderr, "    ./qwen_tts -d qwen3-tts-%s --load-voice %s ...\n",
+                                                target_h >= 2048 ? "1.7b" : "0.6b", load_voice);
+                                        fclose(vf); qwen_tts_unload(ctx); return 1;
+                                    }
+                                    if ((int)target_h != ctx->config.hidden_size) {
+                                        fprintf(stderr, "ERROR: .qvoice was created for %s model (hidden=%u)\n",
+                                                target_h >= 2048 ? "1.7B" : "0.6B", target_h);
+                                        fprintf(stderr, "  but current model has hidden=%d. Recreate with matching --target-cv.\n",
+                                                ctx->config.hidden_size);
+                                        fclose(vf); qwen_tts_unload(ctx); return 1;
+                                    }
+                                } else {
+                                    /* Legacy format: what we read as target_h is actually n_tensors.
+                                     * Seek back so the next read picks it up as n_tensors. */
+                                    fseek(vf, -4, SEEK_CUR);
                                 }
                             }
                         }
                         uint32_t n_tensors;
                         fread(&n_tensors, sizeof(uint32_t), 1, vf);
                         int loaded = 0;
+                        int zlib_warned = 0;
                         int64_t wfull_bytes = 0;
                         int h = ctx->config.hidden_size;
                         int th = ctx->config.text_hidden_size;
@@ -1036,9 +1049,14 @@ int main(int argc, char **argv) {
                                     }
                                     free(lz4_data); free(delta16);
                                 } else if (dtype_flag == 2 || dtype_flag == 3) {
-                                    /* Legacy zlib-compressed deltas — no longer supported */
-                                    fprintf(stderr, "Error: .qvoice uses legacy zlib compression (dtype=%d)\n", dtype_flag);
-                                    fprintf(stderr, "Recreate with: --target-cv (now uses LZ4)\n");
+                                    /* Legacy zlib-compressed deltas — no longer supported.
+                                     * Print error once, then silently skip remaining tensors. */
+                                    if (!zlib_warned) {
+                                        zlib_warned = 1;
+                                        fprintf(stderr, "Error: .qvoice uses legacy zlib compression (dtype=%d).\n", dtype_flag);
+                                        fprintf(stderr, "  Recreate with --target-cv to use LZ4. Skipping %u delta tensors.\n",
+                                                n_tensors);
+                                    }
                                     fseek(vf, compressed_size, SEEK_CUR);
                                 } else {
                                     /* WFULL: raw data, just read and replace */
