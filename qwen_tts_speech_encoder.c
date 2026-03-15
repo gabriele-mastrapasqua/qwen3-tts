@@ -461,8 +461,9 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
                 float *oh = out + h * head_dim;
                 int n_keys = sq - sk_start + 1;
 
-                /* Stack-allocate scores (bounded by window size) */
-                float *scores = (float *)alloca(n_keys * sizeof(float));
+                /* Use fixed buffer for scores (max window size is small, typically <= 512) */
+                float scores_buf[512];
+                float *scores = n_keys <= 512 ? scores_buf : (float *)malloc(n_keys * sizeof(float));
                 float max_score = -1e30f;
                 for (int j = 0; j < n_keys; j++) {
                     int sk = sk_start + j;
@@ -486,6 +487,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
                     float w = scores[j] * inv_sum;
                     for (int d = 0; d < head_dim; d++) oh[d] += vh[d] * w;
                 }
+                if (scores != scores_buf) free(scores);
             }
         }
 
