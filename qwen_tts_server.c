@@ -237,9 +237,14 @@ static void handle_speakers(int fd) {
 
 /* Reset per-request context to clean defaults (prevents state leaking between requests) */
 static void reset_request_state(qwen_tts_ctx_t *ctx) {
-    /* Reset to default speaker (Ryan) and language (English) */
-    ctx->speaker_id = 3061;   /* ryan */
-    ctx->language_id = 2050;  /* English */
+    /* Reset speaker and language.
+     * If a .qvoice is loaded (voice_clone mode), preserve the language
+     * from the voice metadata — the user shouldn't need to specify it. */
+    if (!ctx->voice_clone) {
+        ctx->speaker_id = 3061;   /* ryan */
+        ctx->language_id = 2050;  /* English */
+    }
+    /* In voice_clone mode, speaker_id and language_id stay as set by .qvoice */
 
     /* Reset sampling params to defaults */
     ctx->temperature = 0.5f;
