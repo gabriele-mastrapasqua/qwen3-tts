@@ -36,20 +36,7 @@
 #include <arm_neon.h>
 #endif
 
-/* Cache-line aligned allocation for BLAS/SIMD performance.
- * 64-byte alignment matches Apple M1/M2 cache line size.
- * Falls back to malloc if posix_memalign unavailable. */
-static inline void *aligned_malloc(size_t size) {
-    void *ptr = NULL;
-    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
-    return ptr;
-}
-static inline void *aligned_calloc(size_t count, size_t size) {
-    size_t total = count * size;
-    void *ptr = aligned_malloc(total);
-    if (ptr) memset(ptr, 0, total);
-    return ptr;
-}
+/* aligned_malloc/aligned_calloc now in qwen_tts_kernels.h */
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -289,7 +276,7 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
     const float *emb_sum = get_f32(ms, "decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum");
     const float *usage = get_f32(ms, "decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage");
     if (emb_sum && usage) {
-        sd->codebook[0] = (float *)malloc((int64_t)cb_size * cb_dim * sizeof(float));
+        sd->codebook[0] = (float *)aligned_malloc((int64_t)cb_size * cb_dim * sizeof(float));
         for (int i = 0; i < cb_size; i++)
             for (int d = 0; d < cb_dim; d++)
                 sd->codebook[0][(int64_t)i * cb_dim + d] = emb_sum[(int64_t)i * cb_dim + d] / fmaxf(usage[i], 1e-5f);
@@ -303,7 +290,7 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
         emb_sum = get_f32(ms, es_name);
         usage = get_f32(ms, cu_name);
         if (emb_sum && usage) {
-            sd->codebook[k + 1] = (float *)malloc((int64_t)cb_size * cb_dim * sizeof(float));
+            sd->codebook[k + 1] = (float *)aligned_malloc((int64_t)cb_size * cb_dim * sizeof(float));
             for (int i = 0; i < cb_size; i++)
                 for (int d = 0; d < cb_dim; d++)
                     sd->codebook[k + 1][(int64_t)i * cb_dim + d] = emb_sum[(int64_t)i * cb_dim + d] / fmaxf(usage[i], 1e-5f);
@@ -355,8 +342,8 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
 
     /* RoPE cache for pre-transformer (NeoX split-half) */
     int half_dim = c->dec_head_dim / 2;
-    sd->rope_cos = (float *)malloc(8000 * half_dim * sizeof(float));
-    sd->rope_sin = (float *)malloc(8000 * half_dim * sizeof(float));
+    sd->rope_cos = (float *)aligned_malloc(8000 * half_dim * sizeof(float));
+    sd->rope_sin = (float *)aligned_malloc(8000 * half_dim * sizeof(float));
     for (int pos = 0; pos < 8000; pos++) {
         for (int i = 0; i < half_dim; i++) {
             float angle = pos / powf(c->dec_rope_theta, (float)(2*i) / c->dec_head_dim);

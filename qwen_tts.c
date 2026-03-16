@@ -257,9 +257,9 @@ static void emb_cache_init(qwen_tts_ctx_t *ctx) {
     ctx->emb_cache.capacity = cap;
     ctx->emb_cache.count = 0;
     ctx->emb_cache.clock = 0;
-    ctx->emb_cache.keys = (int *)malloc(cap * sizeof(int));
-    ctx->emb_cache.values = (float *)malloc((size_t)cap * h * sizeof(float));
-    ctx->emb_cache.access = (uint32_t *)calloc(cap, sizeof(uint32_t));
+    ctx->emb_cache.keys = (int *)aligned_malloc(cap * sizeof(int));
+    ctx->emb_cache.values = (float *)aligned_malloc((size_t)cap * h * sizeof(float));
+    ctx->emb_cache.access = (uint32_t *)aligned_calloc(cap, sizeof(uint32_t));
     for (int i = 0; i < cap; i++) ctx->emb_cache.keys[i] = -1;
 }
 
@@ -388,7 +388,7 @@ static void dt_init(decoder_thread_t *dt, qwen_tts_ctx_t *ctx, int max_frames) {
     dt->cb_aborted = 0;
     /* Pre-allocate audio for ~max_frames worth of audio */
     dt->audio_cap = max_frames * 1920 + 4096;  /* 1920 samples/frame + margin */
-    dt->audio_buf = (float *)malloc(dt->audio_cap * sizeof(float));
+    dt->audio_buf = (float *)aligned_malloc(dt->audio_cap * sizeof(float));
     dt->audio_len = 0;
 }
 
@@ -594,13 +594,13 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     /* Pre-allocate text embedding temp buffers */
     int th = ctx->config.text_hidden_size;
     int h = ctx->config.hidden_size;
-    ctx->emb_tmp1 = (float *)malloc(th * sizeof(float));
-    ctx->emb_tmp2 = (float *)malloc(th * sizeof(float));
+    ctx->emb_tmp1 = (float *)aligned_malloc(th * sizeof(float));
+    ctx->emb_tmp2 = (float *)aligned_malloc(th * sizeof(float));
 
     /* Pre-compute special token embeddings (used every request) */
-    ctx->cached_tts_pad_embed = (float *)malloc(h * sizeof(float));
-    ctx->cached_tts_bos_embed = (float *)malloc(h * sizeof(float));
-    ctx->cached_tts_eos_embed = (float *)malloc(h * sizeof(float));
+    ctx->cached_tts_pad_embed = (float *)aligned_malloc(h * sizeof(float));
+    ctx->cached_tts_bos_embed = (float *)aligned_malloc(h * sizeof(float));
+    ctx->cached_tts_eos_embed = (float *)aligned_malloc(h * sizeof(float));
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_PAD, ctx->cached_tts_pad_embed);
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_BOS, ctx->cached_tts_bos_embed);
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_EOS, ctx->cached_tts_eos_embed);
@@ -817,8 +817,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     const float *tts_bos_embed = ctx->cached_tts_bos_embed;
     const float *tts_eos_embed = ctx->cached_tts_eos_embed;
 
-    float *codec_pad_embed = (float *)malloc(h * sizeof(float));
-    float *codec_bos_embed = (float *)malloc(h * sizeof(float));
+    float *codec_pad_embed = (float *)aligned_malloc(h * sizeof(float));
+    float *codec_bos_embed = (float *)aligned_malloc(h * sizeof(float));
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_PAD, codec_pad_embed);
     lookup_codec_embed(ctx, QWEN_TTS_CODEC_BOS, codec_bos_embed);
 
@@ -888,8 +888,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     }
     int prefill_len = inst_len + role_len + sec2_len + sec3_len + sec4_len;
 
-    float *input_embeds = (float *)calloc((int64_t)prefill_len * h, sizeof(float));
-    float *tmp_embed = (float *)malloc(h * sizeof(float));
+    float *input_embeds = (float *)aligned_calloc((int64_t)prefill_len * h, sizeof(float));
+    float *tmp_embed = (float *)aligned_malloc(h * sizeof(float));
     int pos = 0;
 
     /* Section 0: Instruct tokens (text-only, no codec) */

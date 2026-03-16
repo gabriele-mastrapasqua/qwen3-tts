@@ -23,6 +23,7 @@
  */
 
 #include "qwen_tts.h"
+#include "qwen_tts_kernels.h"
 #include "qwen_tts_safetensors.h"
 
 #include <stdio.h>
@@ -237,8 +238,8 @@ int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx) {
 
     /* RoPE cache: theta=10000.0, head_dim=64, max_pos=8000 */
     int half_dim = 32; /* 64 / 2 */
-    enc->rope_cos = (float *)malloc(8000 * half_dim * sizeof(float));
-    enc->rope_sin = (float *)malloc(8000 * half_dim * sizeof(float));
+    enc->rope_cos = (float *)aligned_malloc(8000 * half_dim * sizeof(float));
+    enc->rope_sin = (float *)aligned_malloc(8000 * half_dim * sizeof(float));
     for (int pos = 0; pos < 8000; pos++) {
         for (int i = 0; i < half_dim; i++) {
             float angle = (float)pos / powf(10000.0f, (float)(2 * i) / 64.0f);
@@ -273,7 +274,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     /* === Stage 1: Conv Encoder === */
     /* Input: [1, n_samples] channel-first */
     int cur_ch = 1, cur_len = n_samples;
-    float *signal = (float *)malloc((int64_t)cur_ch * cur_len * sizeof(float));
+    float *signal = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
     memcpy(signal, audio, cur_len * sizeof(float));
 
     if (ctx->debug)
@@ -301,7 +302,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         /* ResBlock: ELU → conv1(ch→ch/2, k=3) → ELU → conv2(ch/2→ch, k=1) + residual */
         {
             int half_ch = cur_ch / 2;
-            float *residual = (float *)malloc((int64_t)cur_ch * cur_len * sizeof(float));
+            float *residual = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
             memcpy(residual, signal, (int64_t)cur_ch * cur_len * sizeof(float));
 
             /* ELU */
@@ -366,7 +367,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     /* Transpose signal from channel-first [512, len] to row-major [len, 512] */
     int n_seq = cur_len;
     int hidden = 512;
-    float *h_buf = (float *)malloc((int64_t)n_seq * hidden * sizeof(float));
+    float *h_buf = (float *)aligned_malloc((int64_t)n_seq * hidden * sizeof(float));
     for (int f = 0; f < n_seq; f++)
         for (int d = 0; d < hidden; d++)
             h_buf[(int64_t)f * hidden + d] = signal[(int64_t)d * n_seq + f];
@@ -378,11 +379,11 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     int half_hd = head_dim / 2;
     float eps = 1e-5f;
 
-    float *q = (float *)malloc((int64_t)n_seq * qkv_dim * sizeof(float));
-    float *kk = (float *)malloc((int64_t)n_seq * qkv_dim * sizeof(float));
-    float *vv = (float *)malloc((int64_t)n_seq * qkv_dim * sizeof(float));
-    float *x_norm = (float *)malloc((int64_t)n_seq * hidden * sizeof(float));
-    float *attn_out = (float *)malloc((int64_t)n_seq * qkv_dim * sizeof(float));
+    float *q = (float *)aligned_malloc((int64_t)n_seq * qkv_dim * sizeof(float));
+    float *kk = (float *)aligned_malloc((int64_t)n_seq * qkv_dim * sizeof(float));
+    float *vv = (float *)aligned_malloc((int64_t)n_seq * qkv_dim * sizeof(float));
+    float *x_norm = (float *)aligned_malloc((int64_t)n_seq * hidden * sizeof(float));
+    float *attn_out = (float *)aligned_malloc((int64_t)n_seq * qkv_dim * sizeof(float));
 
     for (int layer = 0; layer < 8; layer++) {
         /* LayerNorm (with bias) */
@@ -463,7 +464,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
 
                 /* Use fixed buffer for scores (max window size is small, typically <= 512) */
                 float scores_buf[512];
-                float *scores = n_keys <= 512 ? scores_buf : (float *)malloc(n_keys * sizeof(float));
+                float *scores = n_keys <= 512 ? scores_buf : (float *)aligned_malloc(n_keys * sizeof(float));
                 float max_score = -1e30f;
                 for (int j = 0; j < n_keys; j++) {
                     int sk = sk_start + j;
@@ -545,7 +546,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         /* GELU MLP: fc1→GELU→fc2 + layer_scale + residual */
 #ifdef USE_BLAS
         {
-            float *fc1_out = (float *)malloc((int64_t)n_seq * inter * sizeof(float));
+            float *fc1_out = (float *)aligned_malloc((int64_t)n_seq * inter * sizeof(float));
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         n_seq, inter, hidden, 1.0f,
                         x_norm, hidden, enc->transformer[layer].ffn_fc1, hidden,
@@ -554,7 +555,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             for (int64_t i = 0; i < (int64_t)n_seq * inter; i++)
                 fc1_out[i] = 0.5f * fc1_out[i] * (1.0f + erff(fc1_out[i] * 0.7071067811865476f));
 
-            float *fc2_out = (float *)malloc((int64_t)n_seq * hidden * sizeof(float));
+            float *fc2_out = (float *)aligned_malloc((int64_t)n_seq * hidden * sizeof(float));
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         n_seq, hidden, inter, 1.0f,
                         fc1_out, inter, enc->transformer[layer].ffn_fc2, inter,
@@ -577,7 +578,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         for (int s = 0; s < n_seq; s++) {
             const float *xs = x_norm + s * hidden;
             float *hs = h_buf + s * hidden;
-            float *fc1 = (float *)malloc(inter * sizeof(float));
+            float *fc1 = (float *)aligned_malloc(inter * sizeof(float));
             for (int o = 0; o < inter; o++) {
                 float sum = 0;
                 for (int i = 0; i < hidden; i++)
@@ -604,7 +605,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     free(q); free(kk); free(vv); free(x_norm); free(attn_out);
 
     /* Transpose back to channel-first [512, n_seq] */
-    signal = (float *)malloc((int64_t)hidden * n_seq * sizeof(float));
+    signal = (float *)aligned_malloc((int64_t)hidden * n_seq * sizeof(float));
     for (int f = 0; f < n_seq; f++)
         for (int d = 0; d < hidden; d++)
             signal[(int64_t)d * n_seq + f] = h_buf[(int64_t)f * hidden + d];
@@ -632,7 +633,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     /* === Stage 4: RVQ Quantization === */
     /* Project from hidden (512) to codebook dim (256) */
     /* Transpose to row-major [n_frames, 512] for projection */
-    float *enc_hidden = (float *)malloc((int64_t)n_frames * hidden * sizeof(float));
+    float *enc_hidden = (float *)aligned_malloc((int64_t)n_frames * hidden * sizeof(float));
     for (int f = 0; f < n_frames; f++)
         for (int d = 0; d < hidden; d++)
             enc_hidden[(int64_t)f * hidden + d] = signal[(int64_t)d * n_frames + f];
@@ -645,7 +646,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     /* Codebook 0 (semantic / rvq_first) */
     {
         /* Project: [n_frames, 512] → [n_frames, 256] using encoder's semantic input_proj */
-        float *projected = (float *)malloc((int64_t)n_frames * cb_dim * sizeof(float));
+        float *projected = (float *)aligned_malloc((int64_t)n_frames * cb_dim * sizeof(float));
         const float *proj_w = enc->rvq_semantic_input_proj; /* [256, 512, 1] = [256, 512] */
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -667,7 +668,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         int cb_size = ctx->config.codebook_size;
 
         /* Precompute ||e||² for each codebook entry */
-        float *cb_norm2 = (float *)malloc(cb_size * sizeof(float));
+        float *cb_norm2 = (float *)aligned_malloc(cb_size * sizeof(float));
         for (int e = 0; e < cb_size; e++) {
             float sum = 0;
             for (int d = 0; d < cb_dim; d++) {
@@ -703,7 +704,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
 
         /* Codebooks 1-15 (acoustic / rvq_rest) */
         /* Re-project using encoder's acoustic input_proj for the residual */
-        float *residual = (float *)malloc((int64_t)n_frames * cb_dim * sizeof(float));
+        float *residual = (float *)aligned_malloc((int64_t)n_frames * cb_dim * sizeof(float));
         const float *rest_proj_w = enc->rvq_acoustic_input_proj;
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -729,7 +730,7 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             const float *cb = sd->codebook[k];
 
             /* Precompute cb norms */
-            float *cn2 = (float *)malloc(cb_size * sizeof(float));
+            float *cn2 = (float *)aligned_malloc(cb_size * sizeof(float));
             for (int e = 0; e < cb_size; e++) {
                 float sum = 0;
                 for (int d = 0; d < cb_dim; d++) {

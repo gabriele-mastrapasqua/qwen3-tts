@@ -105,15 +105,16 @@ For a full technical deep-dive, see the
 
 ## Voice Clone Samples
 
-| Input | Model | Cloned Output | Text |
-|-------|-------|---------------|------|
-| [reference (movie clip)](../samples/10s_back_down_the_road.wav) | 0.6B | [english](../samples/clone_output_en.wav) | *I love programming in C, it gives you complete control over the machine.* |
-| [reference (movie clip)](../samples/10s_back_down_the_road.wav) | 0.6B | [italian](../samples/clone_output_it.wav) | *Buongiorno, questa e una dimostrazione della clonazione vocale.* |
-| italian speaker | 0.6B | [italian](../samples/clone_silvio_constitution_06b.wav) | *Tutti i cittadini hanno il dovere di essere fedeli alla Repubblica...* |
-| italian speaker | 1.7B | [italian](../samples/clone_silvio_constitution_17b.wav) | *Tutti i cittadini hanno il dovere di essere fedeli alla Repubblica...* |
+All generated via delta `.qvoice` on 0.6B CustomVoice. Reference audio is
+CC-BY 4.0 ([LibriTTS-R](https://www.openslr.org/141/)) or Public Domain ([LibriVox](https://librivox.org/)).
 
-The 1.7B clone captures the original speaker's timbre and pitch more faithfully than
-the 0.6B — compare the two Italian constitution samples above.
+| Input | Language | Cloned Output | Text |
+|-------|----------|---------------|------|
+| [LibriVox](https://librivox.org/) Pirandello Novelle ([input](../samples/ref_italian_pirandello.wav)) | Italian | [listen](../samples/clone_italian_06b.wav) | *Buongiorno a tutti, questa e una dimostrazione della clonazione vocale.* |
+| [LibriTTS-R](https://www.openslr.org/141/) speaker 3570 — Sarac (F) | English | [listen](../samples/clone_sarac_english_06b.wav) | *Good morning everyone, this is a demonstration of voice cloning using a custom voice profile.* |
+| [LibriTTS-R](https://www.openslr.org/141/) speaker 1089 — Peter Bobbe (M) | English | [listen](../samples/clone_peter_english_06b.wav) | *I love reading books aloud, there is something magical about bringing stories to life with your voice.* |
+| [LibriVox](https://librivox.org/) Les Fleurs du Mal reader | French | [listen](../samples/clone_french_06b.wav) | *Bonjour a tous, ceci est une demonstration du clonage vocal avec un profil de voix personnalise.* |
+| [LibriVox](https://librivox.org/) Don Quijote reader — Lu | Spanish | [listen](../samples/clone_spanish_06b.wav) | *Buenos dias a todos, esta es una demostracion de la clonacion de voz con un perfil de voz personalizado.* |
 
 ## Quick Demo
 

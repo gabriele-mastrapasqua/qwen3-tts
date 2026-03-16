@@ -6,10 +6,30 @@
 #define QWEN_TTS_KERNELS_H
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ========================================================================
+ * Cache-line aligned allocation (64B for Apple M1/M2/x86-64)
+ * Cross-platform: uses POSIX posix_memalign on all targets.
+ * All BLAS/SIMD buffers MUST use these to avoid cache-line splits.
+ * ======================================================================== */
+
+static inline void *aligned_malloc(size_t size) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
+    return ptr;
+}
+static inline void *aligned_calloc(size_t count, size_t size) {
+    size_t total = count * size;
+    void *ptr = aligned_malloc(total);
+    if (ptr) memset(ptr, 0, total);
+    return ptr;
+}
 
 /* ========================================================================
  * Threading

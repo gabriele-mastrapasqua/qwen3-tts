@@ -15,18 +15,7 @@
 #include <string.h>
 #include <math.h>
 
-/* Cache-line aligned allocation (64B for Apple M1/M2) */
-static inline void *aligned_malloc(size_t size) {
-    void *ptr = NULL;
-    if (posix_memalign(&ptr, 64, size) != 0) return NULL;
-    return ptr;
-}
-static inline void *aligned_calloc(size_t count, size_t size) {
-    size_t total = count * size;
-    void *ptr = aligned_malloc(total);
-    if (ptr) memset(ptr, 0, total);
-    return ptr;
-}
+/* aligned_malloc/aligned_calloc now in qwen_tts_kernels.h */
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -162,7 +151,7 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
         /* Fuse gate+up: interleave rows [gate_row0, up_row0, gate_row1, ...] */
         {
             size_t row_bytes = (size_t)cp_h * sizeof(uint16_t);
-            l->gate_up_fused_bf16 = (uint16_t *)malloc(2 * (size_t)c->cp_intermediate_size * row_bytes);
+            l->gate_up_fused_bf16 = (uint16_t *)aligned_malloc(2 * (size_t)c->cp_intermediate_size * row_bytes);
             for (int r = 0; r < c->cp_intermediate_size; r++) {
                 memcpy(l->gate_up_fused_bf16 + (size_t)(2 * r) * cp_h,
                        l->gate_bf16 + (size_t)r * cp_h, row_bytes);
@@ -191,7 +180,7 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
         /* Bias is BF16 in safetensors — convert to f32 */
         uint16_t *bias_bf16 = get_bf16(ctx->safetensors, "talker.code_predictor.small_to_mtp_projection.bias");
         if (bias_bf16) {
-            ctx->cp_mtp_proj_bias = (float *)malloc(cp_h * sizeof(float));
+            ctx->cp_mtp_proj_bias = (float *)aligned_malloc(cp_h * sizeof(float));
             for (int i = 0; i < cp_h; i++) ctx->cp_mtp_proj_bias[i] = bf16_to_f32(bias_bf16[i]);
         } else {
             ctx->cp_mtp_proj_bias = NULL;
@@ -225,8 +214,8 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
 
     /* CP RoPE cache (same theta as talker) */
     int half_dim = c->cp_head_dim / 2;
-    ctx->cp_rope_cos = (float *)malloc((int64_t)cp_kv_max * half_dim * sizeof(float));
-    ctx->cp_rope_sin = (float *)malloc((int64_t)cp_kv_max * half_dim * sizeof(float));
+    ctx->cp_rope_cos = (float *)aligned_malloc((int64_t)cp_kv_max * half_dim * sizeof(float));
+    ctx->cp_rope_sin = (float *)aligned_malloc((int64_t)cp_kv_max * half_dim * sizeof(float));
     for (int pos = 0; pos < cp_kv_max; pos++) {
         for (int i = 0; i < half_dim; i++) {
             float angle = (float)pos * (1.0f / powf(c->rope_theta, (float)(2*i) / c->cp_head_dim));
@@ -245,38 +234,38 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
             qwen_cp_layer_t *l = &ctx->cp_layers[i];
 
             /* QKV + O projections */
-            l->wq_int8 = (int8_t *)malloc((size_t)cp_q_dim * cp_h);
-            l->wq_scale = (float *)malloc(cp_q_dim * sizeof(float));
+            l->wq_int8 = (int8_t *)aligned_malloc((size_t)cp_q_dim * cp_h);
+            l->wq_scale = (float *)aligned_malloc(cp_q_dim * sizeof(float));
             qwen_quantize_bf16_to_int8(l->wq_bf16, cp_q_dim, cp_h, l->wq_int8, l->wq_scale);
 
-            l->wk_int8 = (int8_t *)malloc((size_t)cp_kv_dim * cp_h);
-            l->wk_scale = (float *)malloc(cp_kv_dim * sizeof(float));
+            l->wk_int8 = (int8_t *)aligned_malloc((size_t)cp_kv_dim * cp_h);
+            l->wk_scale = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
             qwen_quantize_bf16_to_int8(l->wk_bf16, cp_kv_dim, cp_h, l->wk_int8, l->wk_scale);
 
-            l->wv_int8 = (int8_t *)malloc((size_t)cp_kv_dim * cp_h);
-            l->wv_scale = (float *)malloc(cp_kv_dim * sizeof(float));
+            l->wv_int8 = (int8_t *)aligned_malloc((size_t)cp_kv_dim * cp_h);
+            l->wv_scale = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
             qwen_quantize_bf16_to_int8(l->wv_bf16, cp_kv_dim, cp_h, l->wv_int8, l->wv_scale);
 
-            l->wo_int8 = (int8_t *)malloc((size_t)cp_h * cp_q_dim);
-            l->wo_scale = (float *)malloc(cp_h * sizeof(float));
+            l->wo_int8 = (int8_t *)aligned_malloc((size_t)cp_h * cp_q_dim);
+            l->wo_scale = (float *)aligned_malloc(cp_h * sizeof(float));
             qwen_quantize_bf16_to_int8(l->wo_bf16, cp_h, cp_q_dim, l->wo_int8, l->wo_scale);
 
             /* Fused gate+up + down */
-            l->gate_up_fused_int8 = (int8_t *)malloc((size_t)2 * cp_inter * cp_h);
-            l->gate_up_fused_scale = (float *)malloc(2 * cp_inter * sizeof(float));
+            l->gate_up_fused_int8 = (int8_t *)aligned_malloc((size_t)2 * cp_inter * cp_h);
+            l->gate_up_fused_scale = (float *)aligned_malloc(2 * cp_inter * sizeof(float));
             qwen_quantize_bf16_to_int8(l->gate_up_fused_bf16, 2 * cp_inter, cp_h,
                                         l->gate_up_fused_int8, l->gate_up_fused_scale);
 
-            l->down_int8 = (int8_t *)malloc((size_t)cp_h * cp_inter);
-            l->down_scale = (float *)malloc(cp_h * sizeof(float));
+            l->down_int8 = (int8_t *)aligned_malloc((size_t)cp_h * cp_inter);
+            l->down_scale = (float *)aligned_malloc(cp_h * sizeof(float));
             qwen_quantize_bf16_to_int8(l->down_bf16, cp_h, cp_inter, l->down_int8, l->down_scale);
         }
 
         /* LM heads */
         for (int g = 0; g < 15; g++) {
             if (ctx->cp_lm_head_bf16[g]) {
-                ctx->cp_lm_head_int8[g] = (int8_t *)malloc((size_t)c->codebook_size * cp_h);
-                ctx->cp_lm_head_scale[g] = (float *)malloc(c->codebook_size * sizeof(float));
+                ctx->cp_lm_head_int8[g] = (int8_t *)aligned_malloc((size_t)c->codebook_size * cp_h);
+                ctx->cp_lm_head_scale[g] = (float *)aligned_malloc(c->codebook_size * sizeof(float));
                 qwen_quantize_bf16_to_int8(ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h,
                                             ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g]);
             }
