@@ -161,11 +161,11 @@ Works with `--instruct`, streaming, and the HTTP server.
 
 | Language | Voice | Source | Output | Text |
 |----------|-------|--------|--------|------|
-| Italian | Pirandello Reader | [LibriVox](https://librivox.org/) Public Domain | [input](samples/ref_italian_pirandello.wav) → [clone](samples/clone_italian_06b.wav) | *Buongiorno a tutti, questa e una dimostrazione della clonazione vocale.* |
-| English | Sarac (F) | [LibriTTS-R](https://www.openslr.org/141/) CC-BY | [listen](samples/clone_sarac_english_06b.wav) | *Good morning everyone, this is a demonstration of voice cloning using a custom voice profile.* |
-| English | Peter (M) | [LibriTTS-R](https://www.openslr.org/141/) CC-BY | [listen](samples/clone_peter_english_06b.wav) | *I love reading books aloud, there is something magical about bringing stories to life with your voice.* |
-| French | Baudelaire Reader | [LibriVox](https://librivox.org/) Public Domain | [listen](samples/clone_french_06b.wav) | *Bonjour a tous, ceci est une demonstration du clonage vocal avec un profil de voix personnalise.* |
-| Spanish | Lu | [LibriVox](https://librivox.org/) Public Domain | [listen](samples/clone_spanish_06b.wav) | *Buenos dias a todos, esta es una demostracion de la clonacion de voz con un perfil de voz personalizado.* |
+| Italian | Pirandello Reader | [LibriVox](https://librivox.org/) Public Domain | [input](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/ref_italian_pirandello.wav) → [clone](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/clone_italian_06b.wav) | *Buongiorno a tutti, questa e una dimostrazione della clonazione vocale.* |
+| English | Sarac (F) | [LibriTTS-R](https://www.openslr.org/141/) CC-BY | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/clone_sarac_english_06b.wav) | *Good morning everyone, this is a demonstration of voice cloning using a custom voice profile.* |
+| English | Peter (M) | [LibriTTS-R](https://www.openslr.org/141/) CC-BY | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/clone_peter_english_06b.wav) | *I love reading books aloud, there is something magical about bringing stories to life with your voice.* |
+| French | Baudelaire Reader | [LibriVox](https://librivox.org/) Public Domain | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/clone_french_06b.wav) | *Bonjour a tous, ceci est une demonstration du clonage vocal avec un profil de voix personnalise.* |
+| Spanish | Lu | [LibriVox](https://librivox.org/) Public Domain | [listen](https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v0.1-samples/clone_spanish_06b.wav) | *Buenos dias a todos, esta es una demostracion de la clonacion de voz con un perfil de voz personalizado.* |
 
 > Full guide: delta vs standard, format internals, troubleshooting → [docs/custom-voices.md](docs/custom-voices.md)
 
