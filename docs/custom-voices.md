@@ -128,7 +128,7 @@ Example output:
 ```
 Voice profiles in my_voices/:
   mario_06b.qvoice     v3    375 frames (30.0s ref)  804134.5 KB  [Mario]  lang=Italian  model=0.6B
-  silvio_17b.qvoice    v3    375 frames (30.0s ref)  2969485.2 KB  [Silvio]  lang=Italian  model=1.7B
+  peter_17b.qvoice     v3    375 frames (30.0s ref)  2969485.2 KB  [Peter]   lang=English  model=1.7B
   2 voice profile(s)
 ```
 
@@ -160,8 +160,8 @@ Voice files include metadata that prevents common mistakes:
 ### File naming convention
 
 Include the target model size to avoid confusion:
-- `silvio_06b.qvoice` — for 0.6B CustomVoice
-- `silvio_17b.qvoice` — for 1.7B CustomVoice
+- `mario_06b.qvoice` — for 0.6B CustomVoice
+- `mario_17b.qvoice` — for 1.7B CustomVoice
 
 Delta files must match the target CV model exactly.
 

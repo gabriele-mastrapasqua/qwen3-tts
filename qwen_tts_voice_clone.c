@@ -8,6 +8,7 @@
  */
 
 #include "qwen_tts.h"
+#include "qwen_tts_kernels.h"
 #include "qwen_tts_voice_clone.h"
 #include "qwen_tts_safetensors.h"
 
@@ -165,7 +166,7 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
     /* Convert to float32 mono */
     int bytes_per_sample = bits_per_sample / 8;
     int total_samples = (int)(data_size / (bytes_per_sample * num_channels));
-    float *samples = (float *)malloc(total_samples * sizeof(float));
+    float *samples = (float *)aligned_malloc(total_samples * sizeof(float));
 
     for (int i = 0; i < total_samples; i++) {
         float val = 0;
@@ -283,7 +284,7 @@ static float *build_mel_filterbank(int sr, int n_fft, int n_mels, float fmin, fl
     /* Mel scale points */
     float mel_min = hz_to_mel_slaney(fmin);
     float mel_max = hz_to_mel_slaney(fmax);
-    float *mels = (float *)malloc((n_mels + 2) * sizeof(float));
+    float *mels = (float *)aligned_malloc((n_mels + 2) * sizeof(float));
     for (int i = 0; i < n_mels + 2; i++) {
         float m = mel_min + (mel_max - mel_min) * i / (n_mels + 1);
         mels[i] = mel_to_hz_slaney(m);
@@ -326,7 +327,7 @@ int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,
     /* Reflect-pad the audio: padding = (n_fft - hop_size) / 2 = 384 */
     int padding = (n_fft - hop_size) / 2;
     int padded_len = n_samples + 2 * padding;
-    float *padded = (float *)malloc(padded_len * sizeof(float));
+    float *padded = (float *)aligned_malloc(padded_len * sizeof(float));
 
     /* Reflect padding (not including boundary sample) */
     for (int i = 0; i < padding; i++)
@@ -347,7 +348,7 @@ int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,
     }
 
     /* Hann window */
-    float *window = (float *)malloc(win_size * sizeof(float));
+    float *window = (float *)aligned_malloc(win_size * sizeof(float));
     for (int i = 0; i < win_size; i++)
         window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / win_size));
 
@@ -356,11 +357,11 @@ int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,
     int n_freqs = n_fft / 2 + 1;
 
     /* Output mel spectrogram [n_frames, n_mels] */
-    float *mel = (float *)malloc((size_t)n_frames * n_mels * sizeof(float));
+    float *mel = (float *)aligned_malloc((size_t)n_frames * n_mels * sizeof(float));
 
     /* FFT buffers */
-    float *fft_re = (float *)malloc(n_fft * sizeof(float));
-    float *fft_im = (float *)malloc(n_fft * sizeof(float));
+    float *fft_re = (float *)aligned_malloc(n_fft * sizeof(float));
+    float *fft_im = (float *)aligned_malloc(n_fft * sizeof(float));
 
     for (int f = 0; f < n_frames; f++) {
         int start = f * hop_size;
@@ -426,7 +427,7 @@ static void conv1d_same_reflect(
 
     /* Build padded input with reflect padding */
     int padded_len = in_len + pad_left + pad_right;
-    float *padded = (float *)malloc((size_t)in_ch * padded_len * sizeof(float));
+    float *padded = (float *)aligned_malloc((size_t)in_ch * padded_len * sizeof(float));
 
     for (int c = 0; c < in_ch; c++) {
         float *dst = padded + (size_t)c * padded_len;
@@ -495,9 +496,9 @@ static void res2net_forward(
     float *output)
 {
     int chunk_ch = channels / scale;  /* 512/8 = 64 */
-    float *prev_output = (float *)malloc((size_t)chunk_ch * in_len * sizeof(float));
-    float *block_input = (float *)malloc((size_t)chunk_ch * in_len * sizeof(float));
-    float *block_output = (float *)malloc((size_t)chunk_ch * in_len * sizeof(float));
+    float *prev_output = (float *)aligned_malloc((size_t)chunk_ch * in_len * sizeof(float));
+    float *block_input = (float *)aligned_malloc((size_t)chunk_ch * in_len * sizeof(float));
+    float *block_output = (float *)aligned_malloc((size_t)chunk_ch * in_len * sizeof(float));
 
     for (int i = 0; i < scale; i++) {
         const float *chunk = input + (size_t)i * chunk_ch * in_len;
@@ -546,16 +547,16 @@ static void se_res2net_block_forward(
     int n = channels * in_len;
 
     /* TDNN1 */
-    float *h1 = (float *)malloc(n * sizeof(float));
+    float *h1 = (float *)aligned_malloc(n * sizeof(float));
     tdnn_forward(input, channels, in_len, tdnn1_w, tdnn1_b, channels, 1, 1, h1);
 
     /* Res2Net */
-    float *h2 = (float *)malloc(n * sizeof(float));
+    float *h2 = (float *)aligned_malloc(n * sizeof(float));
     res2net_forward(h1, channels, in_len, scale, res2net_w, res2net_b, kernel, dilation, h2);
     free(h1);
 
     /* TDNN2 */
-    float *h3 = (float *)malloc(n * sizeof(float));
+    float *h3 = (float *)aligned_malloc(n * sizeof(float));
     tdnn_forward(h2, channels, in_len, tdnn2_w, tdnn2_b, channels, 1, 1, h3);
     free(h2);
 
@@ -571,7 +572,7 @@ static void se_res2net_block_forward(
     }
 
     /* SE conv1 (channels→se_ch) + ReLU */
-    float *se1 = (float *)malloc(se_ch * sizeof(float));
+    float *se1 = (float *)aligned_malloc(se_ch * sizeof(float));
     for (int i = 0; i < se_ch; i++) {
         float val = se_conv1_b[i];
         for (int c = 0; c < channels; c++)
@@ -589,7 +590,7 @@ static void se_res2net_block_forward(
     }
 
     /* SE conv2 (se_ch→channels) + Sigmoid */
-    float *se2 = (float *)malloc(channels * sizeof(float));
+    float *se2 = (float *)aligned_malloc(channels * sizeof(float));
     for (int i = 0; i < channels; i++) {
         float val = se_conv2_b[i];
         for (int c = 0; c < se_ch; c++)
@@ -700,14 +701,14 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
     /* Input: mel is [n_frames, 128] row-major
      * Python does hidden_states = hidden_states.transpose(1, 2) to get [batch, 128, T]
      * We need channel-first: [128, T] */
-    float *x = (float *)malloc((size_t)enc->mel_dim * T * sizeof(float));
+    float *x = (float *)aligned_malloc((size_t)enc->mel_dim * T * sizeof(float));
     for (int f = 0; f < T; f++)
         for (int m = 0; m < enc->mel_dim; m++)
             x[(size_t)m * T + f] = mel[(size_t)f * enc->mel_dim + m];
 
     /* blocks.0: TDNN(128→512, k=5, d=1) */
     int ch0 = 512;
-    float *h0 = (float *)malloc((size_t)ch0 * T * sizeof(float));
+    float *h0 = (float *)aligned_malloc((size_t)ch0 * T * sizeof(float));
     tdnn_forward(x, enc->mel_dim, T, enc->block0_conv_w, enc->block0_conv_b,
                  ch0, 5, 1, h0);
     free(x);
@@ -716,7 +717,7 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
     float *block_outputs[3];
     float *prev = h0;
     for (int b = 0; b < 3; b++) {
-        float *out = (float *)malloc((size_t)ch0 * T * sizeof(float));
+        float *out = (float *)aligned_malloc((size_t)ch0 * T * sizeof(float));
         se_res2net_block_forward(
             prev, ch0, T,
             enc->se_blocks[b].tdnn1_conv_w, enc->se_blocks[b].tdnn1_conv_b,
@@ -733,14 +734,14 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
 
     /* MFA: concatenate block_outputs[0,1,2] → [1536, T], then TDNN(1536→1536, k=1) */
     int mfa_ch = 1536;
-    float *cat = (float *)malloc((size_t)mfa_ch * T * sizeof(float));
+    float *cat = (float *)aligned_malloc((size_t)mfa_ch * T * sizeof(float));
     for (int b = 0; b < 3; b++) {
         memcpy(cat + (size_t)b * ch0 * T, block_outputs[b],
                (size_t)ch0 * T * sizeof(float));
         free(block_outputs[b]);
     }
 
-    float *mfa_out = (float *)malloc((size_t)mfa_ch * T * sizeof(float));
+    float *mfa_out = (float *)aligned_malloc((size_t)mfa_ch * T * sizeof(float));
     tdnn_forward(cat, mfa_ch, T, enc->mfa_conv_w, enc->mfa_conv_b,
                  mfa_ch, 1, 1, mfa_out);
     free(cat);
@@ -772,7 +773,7 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
 
     /* Build attention input: [hidden, mean_expanded, std_expanded] → [4608, T] */
     int att_ch = mfa_ch * 3;  /* 4608 */
-    float *att_input = (float *)malloc((size_t)att_ch * T * sizeof(float));
+    float *att_input = (float *)aligned_malloc((size_t)att_ch * T * sizeof(float));
     memcpy(att_input, mfa_out, (size_t)mfa_ch * T * sizeof(float));
     for (int c = 0; c < mfa_ch; c++)
         for (int t = 0; t < T; t++)
@@ -783,7 +784,7 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
 
     /* TDNN(4608→128, k=1) + tanh */
     int att_hidden = 128;
-    float *att_h = (float *)malloc((size_t)att_hidden * T * sizeof(float));
+    float *att_h = (float *)aligned_malloc((size_t)att_hidden * T * sizeof(float));
     tdnn_forward(att_input, att_ch, T, enc->asp_tdnn_conv_w, enc->asp_tdnn_conv_b,
                  att_hidden, 1, 1, att_h);
     free(att_input);
@@ -798,7 +799,7 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
         att_h[i] = tanhf(att_h[i]);
 
     /* Conv1d(128→1536, k=1) */
-    float *att_w = (float *)malloc((size_t)mfa_ch * T * sizeof(float));
+    float *att_w = (float *)aligned_malloc((size_t)mfa_ch * T * sizeof(float));
     conv1d_same_reflect(att_h, att_hidden, T, enc->asp_conv_w, enc->asp_conv_b,
                         mfa_ch, 1, 1, att_w);
     free(att_h);
@@ -843,7 +844,7 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
     free(mfa_out);
 
     /* Pooled stats: concatenate [w_mean, w_std] → [3072, 1] */
-    float *pooled = (float *)malloc(3072 * sizeof(float));
+    float *pooled = (float *)aligned_malloc(3072 * sizeof(float));
     memcpy(pooled, w_mean, mfa_ch * sizeof(float));
     memcpy(pooled + mfa_ch, w_std, mfa_ch * sizeof(float));
     free(w_mean);
