@@ -52,14 +52,14 @@ make blas
 - **9 preset voices** — `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
 - **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 - **Memory-mapped weights** — BF16 safetensors mmap'd directly. 0.6B ~3 GB, 1.7B ~8 GB.
-- **Voice cloning** — Clone any voice from a short WAV clip. Save as reusable `.qvoice` profile. [Full docs](docs/voice-cloning.md)
-- **Custom voices with Delta `.qvoice`** — Bit-identical cloned voices on CustomVoice model. Create once, use forever — with style control, streaming, server. [Full docs](docs/custom-voices.md)
+- **Voice cloning** — Clone any voice from a short WAV clip. Save as reusable `.qvoice` profile.
+- **Custom voices with Delta `.qvoice`** — Bit-identical cloned voices on CustomVoice model. Create once, use forever — with style control, streaming, server.
 - **Voice management** — List, inspect, delete `.qvoice` profiles (`--list-voices`, `--delete-voice`). No model required.
 - **Style control** — `--instruct` for emotion/style on 1.7B: angry, whisper, cheerful, and more.
-- **VoiceDesign** — Create new voices from text descriptions. [Full docs](docs/voice-design.md)
-- **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`. [Full docs](docs/server.md)
+- **VoiceDesign** — Create new voices from text descriptions.
+- **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`.
 - **Streaming** — Real-time audio via `--stream` (WAV) or `--stdout` (raw PCM).
-- **INT8/INT4 quantization** — 15% speedup on 1.7B with `--int8`. [Full docs](docs/quantization.md)
+- **INT8/INT4 quantization** — 15% speedup on 1.7B with `--int8`.
 - **Configurable sampling** — Temperature, top-k, top-p, and repetition penalty.
 - **24 kHz WAV output** — 16-bit PCM, mono.
 
