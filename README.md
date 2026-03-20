@@ -224,21 +224,29 @@ Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --
 
 ## Performance
 
-Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads:
+Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads (`make bench-full`):
 
-| Mode | 0.6B RTF | 1.7B BF16 RTF | 1.7B INT8 RTF |
-|------|----------|---------------|---------------|
-| **CLI** | 1.4–1.7 | ~4.3 | ~3.6 |
-| **CLI `--stream`** | 1.4–1.7 | ~4.3 | ~3.6 |
-| **Server (cold)** | 1.50 | — | 3.57 |
-| **Server (warm)** | **1.39** | — | 3.32 |
-| **Server stream** | 1.48 | — | 3.18 |
+| Config | 0.6B RTF | 1.7B BF16 RTF | 1.7B INT8 RTF |
+|--------|----------|---------------|---------------|
+| **CLI short** | 1.65–1.71 | 4.15–4.40 | 3.69 |
+| **CLI long** | **1.29–1.32** | 2.10–2.11 | 2.15 |
+| **CLI stream short** | 1.30–1.31 | 3.67–4.01 | — |
+| **CLI stream long** | 1.30 | 2.06–2.43 | — |
+| **Server (cold)** | 1.34 | — | — |
+| **Server (warm)** | **1.33** | — | — |
 
 RTF = processing_time / audio_duration. Lower is better; <1.0 = faster than real-time.
 
-Longer audio improves RTF (fixed costs amortize): 0.6B server warm on long text reaches **RTF 1.26**.
-Streaming has identical performance to normal mode. `--int8` gives 15% Talker speedup on 1.7B
+Longer audio improves RTF (fixed costs amortize): 0.6B long text reaches **RTF 1.29**.
+Streaming has identical performance to normal mode. `--int8` gives ~11% speedup on 1.7B
 ([details](docs/quantization.md)).
+
+Run benchmarks on your machine:
+
+```bash
+make bench         # Quick: short+long, normal+stream (both models)
+make bench-full    # Full: + server, instruct, INT8, .qvoice (if available)
+```
 
 **vs other implementations:**
 

@@ -1235,15 +1235,50 @@ void qwen_swiglu_inplace(float *gate_up, float *tmp, int n) {
 }
 
 void qwen_add_inplace(float *y, const float *x, int n) {
-    for (int i = 0; i < n; i++) y[i] += x[i];
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 7 < n; i += 8) {
+        vst1q_f32(y + i,     vaddq_f32(vld1q_f32(y + i),     vld1q_f32(x + i)));
+        vst1q_f32(y + i + 4, vaddq_f32(vld1q_f32(y + i + 4), vld1q_f32(x + i + 4)));
+    }
+#elif defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(x + i)));
+    }
+#endif
+    for (; i < n; i++) y[i] += x[i];
 }
 
 void qwen_mul_inplace(float *y, const float *x, int n) {
-    for (int i = 0; i < n; i++) y[i] *= x[i];
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 7 < n; i += 8) {
+        vst1q_f32(y + i,     vmulq_f32(vld1q_f32(y + i),     vld1q_f32(x + i)));
+        vst1q_f32(y + i + 4, vmulq_f32(vld1q_f32(y + i + 4), vld1q_f32(x + i + 4)));
+    }
+#elif defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(x + i)));
+    }
+#endif
+    for (; i < n; i++) y[i] *= x[i];
 }
 
 void qwen_vec_scale_inplace(float *y, float s, int n) {
-    for (int i = 0; i < n; i++) y[i] *= s;
+    int i = 0;
+#ifdef __ARM_NEON
+    float32x4_t vs = vdupq_n_f32(s);
+    for (; i + 7 < n; i += 8) {
+        vst1q_f32(y + i,     vmulq_f32(vld1q_f32(y + i),     vs));
+        vst1q_f32(y + i + 4, vmulq_f32(vld1q_f32(y + i + 4), vs));
+    }
+#elif defined(__AVX2__)
+    __m256 vs = _mm256_set1_ps(s);
+    for (; i + 7 < n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), vs));
+    }
+#endif
+    for (; i < n; i++) y[i] *= s;
 }
 
 void qwen_round_bf16(float *x, int n) {

@@ -83,4 +83,6 @@ make test-serve-openai   # OpenAI-compatible /v1/audio/speech endpoint test
 make test-serve-parallel # 2 concurrent requests, verify both complete
 make test-serve-all      # Run all server tests
 make serve               # Start HTTP server on port 8080
+make bench               # RTF benchmark (short+long, normal+stream, both models)
+make bench-full          # Full benchmark (+ server, instruct, INT8, .qvoice)
 ```

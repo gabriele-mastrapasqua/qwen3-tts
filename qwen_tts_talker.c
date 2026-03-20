@@ -320,7 +320,7 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
     }
 
     /* Allocate KV cache (bf16 — halves memory vs f32) */
-    int initial_kv_max = 2048;
+    int initial_kv_max = 512;  /* doubling strategy handles growth */
     int64_t kv_size = (int64_t)c->num_layers * initial_kv_max * kv_dim;
     ctx->kv_cache_k = (uint16_t *)aligned_calloc(kv_size, sizeof(uint16_t));
     ctx->kv_cache_v = (uint16_t *)aligned_calloc(kv_size, sizeof(uint16_t));
@@ -336,15 +336,14 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
     ctx->dec_attn_out = (float *)aligned_malloc(q_dim * sizeof(float));
     ctx->dec_proj_out = (float *)aligned_malloc(h * sizeof(float));
     ctx->dec_gate = (float *)aligned_malloc(2 * c->intermediate_size * sizeof(float));
-    ctx->dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
     ctx->dec_ffn_out = (float *)aligned_malloc(h * sizeof(float));
     /* SwiGLU tmp buffer: max of Talker inter and CP inter (CP allocated later, but inter is known) */
     int swiglu_size = c->intermediate_size;
     if (c->cp_intermediate_size > swiglu_size) swiglu_size = c->cp_intermediate_size;
     ctx->swiglu_tmp = (float *)aligned_malloc(swiglu_size * sizeof(float));
 
-    /* Allocate RoPE cache */
-    int rope_max = 8192;
+    /* Allocate RoPE cache — sized to max_tokens (grows if needed) */
+    int rope_max = ctx->max_tokens > 0 ? ctx->max_tokens : 8192;
     int half_dim = c->head_dim / 2;
     ctx->rope_inv_freq = (float *)aligned_malloc(half_dim * sizeof(float));
     ctx->rope_cos = (float *)aligned_malloc((int64_t)rope_max * half_dim * sizeof(float));
@@ -494,19 +493,22 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 
     if (kv_cache_grow(ctx, seq_len) != 0) return -1;
 
-    /* Allocate/grow persistent prefill buffers (reused across generations in server mode) */
+    /* Allocate/grow persistent prefill buffers (reused across generations in server mode).
+     * Doubling strategy amortizes reallocation when lengths vary. */
     if (seq_len > ctx->pref_seq_cap) {
+        int new_cap = ctx->pref_seq_cap > 0 ? ctx->pref_seq_cap : 32;
+        while (new_cap < seq_len) new_cap *= 2;
         free(ctx->pref_residual); free(ctx->pref_q); free(ctx->pref_k); free(ctx->pref_v);
         free(ctx->pref_x_norm); free(ctx->pref_attn_out); free(ctx->pref_gate); free(ctx->pref_proj);
-        ctx->pref_residual = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
-        ctx->pref_q = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
-        ctx->pref_k = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
-        ctx->pref_v = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
-        ctx->pref_x_norm = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
-        ctx->pref_attn_out = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
-        ctx->pref_gate = (float *)aligned_malloc((int64_t)seq_len * 2 * inter * sizeof(float));
-        ctx->pref_proj = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
-        ctx->pref_seq_cap = seq_len;
+        ctx->pref_residual = (float *)aligned_malloc((int64_t)new_cap * h * sizeof(float));
+        ctx->pref_q = (float *)aligned_malloc((int64_t)new_cap * q_dim * sizeof(float));
+        ctx->pref_k = (float *)aligned_malloc((int64_t)new_cap * kv_dim * sizeof(float));
+        ctx->pref_v = (float *)aligned_malloc((int64_t)new_cap * kv_dim * sizeof(float));
+        ctx->pref_x_norm = (float *)aligned_malloc((int64_t)new_cap * h * sizeof(float));
+        ctx->pref_attn_out = (float *)aligned_malloc((int64_t)new_cap * q_dim * sizeof(float));
+        ctx->pref_gate = (float *)aligned_malloc((int64_t)new_cap * 2 * inter * sizeof(float));
+        ctx->pref_proj = (float *)aligned_malloc((int64_t)new_cap * h * sizeof(float));
+        ctx->pref_seq_cap = new_cap;
     }
     /* Allocate persistent weight conversion buffers (fixed size, allocated once) */
     if (!ctx->pref_wq_f32) {

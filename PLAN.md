@@ -69,6 +69,43 @@ All major features and optimizations have been implemented and verified:
 
 ---
 
+## Phase 17: Code Cleanup & SIMD/Allocation Optimizations
+
+**Goal**: Remove dead code, fix allocation patterns, add missing SIMD paths, improve
+cache locality. Mostly quick wins with measurable impact on both ARM and x86.
+
+### 17.1 Quick Wins (cleanup + micro-optimizations)
+
+- [x] `[HIGH]` Remove dead `dec_up` / `cp_dec_up` NULL pointers + dead `free()` calls
+- [x] `[HIGH]` Cache `codec_pad_embed` + `codec_bos_embed` at load time (avoid per-generation alloc)
+- [x] `[HIGH]` Cache speaker `ref_norm` (ryan embedding norm) at load time
+- [x] `[HIGH]` Align sampling work buffers (`aligned_malloc` instead of `malloc`)
+- [x] `[MED]` Reduce KV cache initial alloc from 2048 → 512 (doubling handles growth)
+- [x] `[MED]` Reduce RoPE cache from fixed 8192 → actual `max_tokens`
+- [x] `[MED]` Prefill buffer realloc: use doubling strategy instead of exact-size
+
+### 17.2 Scalar→SIMD (ARM NEON + x86 AVX2)
+
+Element-wise ops in `qwen_tts_kernels.c` are pure scalar but called per-layer:
+
+- [x] `[HIGH]` `qwen_add_inplace` — NEON + AVX2 (residual path, every layer)
+- [x] `[HIGH]` `qwen_mul_inplace` — NEON + AVX2
+- [x] `[HIGH]` `qwen_vec_scale_inplace` — NEON + AVX2
+- [ ] `[MED]` `qwen_snake_activation` NEON — fix scalar sinf extraction (polynomial approx)
+
+### 17.3 AVX2 Parity (x86-64 performance)
+
+25 NEON-optimized paths but near-zero AVX2. On x86 everything falls to scalar.
+Estimated ~20-30% total speedup on x86 servers/desktops:
+
+- [ ] `[HIGH]` `qwen_rms_norm` + `qwen_rms_norm_per_head` — AVX2 FMA chains
+- [ ] `[HIGH]` `qwen_causal_attention` (all 4 overloads) — AVX2 dot+accum
+- [ ] `[HIGH]` `qwen_causal_attention_bf16kv` — AVX2 bf16→f32 inline dot
+- [ ] `[HIGH]` `qwen_causal_attention_windowed` — AVX2
+- [ ] `[MED]` `qwen_silu` — vectorized exp approximation
+
+---
+
 ## FUTURE IDEAS (not currently planned)
 
 ### Phase 12: Reusable Custom Voices from Voice Clone
