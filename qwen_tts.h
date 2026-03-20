@@ -463,7 +463,6 @@ typedef struct qwen_tts_ctx {
     float *dec_attn_out;
     float *dec_proj_out;
     float *dec_gate;
-    float *dec_up;
     float *dec_ffn_out;
     float *swiglu_tmp;  /* Temp buffer for batch vvexpf in SwiGLU */
     
@@ -474,7 +473,6 @@ typedef struct qwen_tts_ctx {
     float *cp_dec_v;
     float *cp_dec_attn_out;
     float *cp_dec_gate;
-    float *cp_dec_up;
     float *cp_dec_ffn_out;
     
     /* Prefill buffers (persisted across generations for server mode) */
@@ -531,6 +529,9 @@ typedef struct qwen_tts_ctx {
     float *cached_tts_pad_embed;   /* [hidden] — computed once at load */
     float *cached_tts_bos_embed;   /* [hidden] */
     float *cached_tts_eos_embed;   /* [hidden] */
+    float *cached_codec_pad_embed; /* [hidden] — codec PAD embed, once at load */
+    float *cached_codec_bos_embed; /* [hidden] — codec BOS embed, once at load */
+    float cached_ref_norm;         /* norm of ryan (3061) codec embed for voice clone scaling */
 
     /* LRU token embedding cache: token_id → float[hidden]
      * Open-addressing hash map with linear probing. */

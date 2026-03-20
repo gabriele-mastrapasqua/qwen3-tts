@@ -209,7 +209,6 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     ctx->cp_dec_v = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
     ctx->cp_dec_attn_out = (float *)aligned_malloc(cp_q_dim * sizeof(float));
     ctx->cp_dec_gate = (float *)aligned_malloc(2 * c->cp_intermediate_size * sizeof(float));
-    ctx->cp_dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
     ctx->cp_dec_ffn_out = (float *)aligned_malloc(cp_h * sizeof(float));
 
     /* CP RoPE cache (same theta as talker) */

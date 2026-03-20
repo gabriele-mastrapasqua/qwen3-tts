@@ -8,14 +8,18 @@ All benchmarks on Apple M1 8-core, 16 GB RAM, 4 threads.
 - **1.7B**: RTF ~3.0–4.3 (BF16), ~2.5–3.6 with `--int8`
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 
-## RTF Across Modes (0.6B)
+## RTF Across Modes
 
-|  | Short text (~5–8s audio) | Long text (~16s audio) |
-|---|---|---|
-| **CLI** | RTF 1.4–1.7 | ~RTF 1.3 |
-| **CLI `--stream`** | RTF 1.4–1.7 | ~RTF 1.3 |
-| **Server (cold)** | RTF 1.50 | RTF 1.28 |
-| **Server (warm)** | RTF 1.39 | **RTF 1.26** |
+Results from `make bench-full` (seed 42, speaker ryan):
+
+| Config | 0.6B Short | 0.6B Long | 1.7B Short | 1.7B Long |
+|--------|-----------|----------|-----------|----------|
+| **CLI normal** | 1.65–1.71 | **1.29–1.32** | 4.15–4.40 | 2.10–2.11 |
+| **CLI stream** | 1.30–1.31 | 1.30 | 3.67–4.01 | 2.06–2.43 |
+| **Server cold** | 1.34 | — | — | — |
+| **Server warm** | **1.33** | — | — | — |
+| **1.7B INT8** | — | — | 3.69 | 2.15 |
+| **1.7B Instruct** | — | — | 3.43 | — |
 
 Streaming mode has **identical performance** to normal mode — the speech decoder
 runs in a pipeline thread in both cases. Longer audio amortizes fixed costs (prefill).
@@ -85,6 +89,16 @@ performance to **RTF ~1.3–1.7** (up to 2.7x total speedup):
 
 All optimizations are cross-platform (POSIX standard `posix_memalign`, conditional NEON/AVX).
 See [blog/optimization-notes.md](../blog/optimization-notes.md) for the full story.
+
+## Running Benchmarks
+
+```bash
+make bench         # Quick: short+long text, normal+stream, both models
+make bench-full    # Full: + server cold/warm, instruct, INT8, .qvoice
+```
+
+Auto-skips missing models and `.qvoice` files. Output includes RTF, audio duration,
+and wall time for each configuration. Logs and WAVs saved in `/tmp/qwen_tts_bench/`.
 
 ## Key Architectural Decisions
 

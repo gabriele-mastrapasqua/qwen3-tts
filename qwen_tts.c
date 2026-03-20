@@ -20,6 +20,9 @@
 
 int qwen_verbose = 0;
 
+/* Forward declarations */
+static void lookup_codec_embed(qwen_tts_ctx_t *ctx, int token_id, float *out);
+
 static double time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -604,6 +607,22 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_PAD, ctx->cached_tts_pad_embed);
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_BOS, ctx->cached_tts_bos_embed);
     embed_one_text_token_compute(ctx, QWEN_TTS_TTS_EOS, ctx->cached_tts_eos_embed);
+
+    /* Pre-compute codec special token embeddings (PAD/BOS — used every generation) */
+    ctx->cached_codec_pad_embed = (float *)aligned_malloc(h * sizeof(float));
+    ctx->cached_codec_bos_embed = (float *)aligned_malloc(h * sizeof(float));
+    lookup_codec_embed(ctx, QWEN_TTS_CODEC_PAD, ctx->cached_codec_pad_embed);
+    lookup_codec_embed(ctx, QWEN_TTS_CODEC_BOS, ctx->cached_codec_bos_embed);
+
+    /* Pre-compute ref speaker norm for voice clone scaling (ryan=3061) */
+    {
+        float tmp_ref[4096];
+        lookup_codec_embed(ctx, 3061, tmp_ref);
+        float ref_norm = 0;
+        for (int j = 0; j < h; j++) ref_norm += tmp_ref[j] * tmp_ref[j];
+        ctx->cached_ref_norm = sqrtf(ref_norm);
+    }
+
     if (!ctx->silent) {
         fprintf(stderr, "  tts_pad_embed[:3]=[%.6f,%.6f,%.6f]\n",
                 ctx->cached_tts_pad_embed[0], ctx->cached_tts_pad_embed[1], ctx->cached_tts_pad_embed[2]);
@@ -635,9 +654,9 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     /* Free runtime buffers */
     free(ctx->kv_cache_k); free(ctx->kv_cache_v); free(ctx->cp_kv_k); free(ctx->cp_kv_v);
     free(ctx->dec_x); free(ctx->dec_x_norm); free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
-    free(ctx->dec_attn_out); free(ctx->dec_proj_out); free(ctx->dec_gate); free(ctx->dec_up); free(ctx->dec_ffn_out);
+    free(ctx->dec_attn_out); free(ctx->dec_proj_out); free(ctx->dec_gate); free(ctx->dec_ffn_out);
     free(ctx->cp_dec_x); free(ctx->cp_dec_q); free(ctx->cp_dec_k); free(ctx->cp_dec_v);
-    free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_up); free(ctx->cp_dec_ffn_out);
+    free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_ffn_out);
     free(ctx->pref_residual); free(ctx->pref_x_norm); free(ctx->pref_q);
     free(ctx->pref_k); free(ctx->pref_v); free(ctx->pref_attn_out);
     free(ctx->pref_gate); free(ctx->pref_proj);
@@ -647,6 +666,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->cp_rope_cos); free(ctx->cp_rope_sin);
     free(ctx->emb_tmp1); free(ctx->emb_tmp2);
     free(ctx->cached_tts_pad_embed); free(ctx->cached_tts_bos_embed); free(ctx->cached_tts_eos_embed);
+    free(ctx->cached_codec_pad_embed); free(ctx->cached_codec_bos_embed);
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     free(ctx->prev_input_embeds); free(ctx->cached_ref_codes);
@@ -817,10 +837,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     const float *tts_bos_embed = ctx->cached_tts_bos_embed;
     const float *tts_eos_embed = ctx->cached_tts_eos_embed;
 
-    float *codec_pad_embed = (float *)aligned_malloc(h * sizeof(float));
-    float *codec_bos_embed = (float *)aligned_malloc(h * sizeof(float));
-    lookup_codec_embed(ctx, QWEN_TTS_CODEC_PAD, codec_pad_embed);
-    lookup_codec_embed(ctx, QWEN_TTS_CODEC_BOS, codec_bos_embed);
+    const float *codec_pad_embed = ctx->cached_codec_pad_embed;
+    const float *codec_bos_embed = ctx->cached_codec_bos_embed;
 
     /* === ICL mode: use cached ref_codes (.qvoice) or encode reference audio === */
     int *ref_codes = NULL;
@@ -930,14 +948,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             for (int j = 0; j < h; j++) emb_norm += ctx->speaker_embedding[j] * ctx->speaker_embedding[j];
             emb_norm = sqrtf(emb_norm);
 
-            /* Compute target norm from a reference preset speaker (ryan=3061) */
-            float ref_norm = 0;
-            {
-                float tmp_ref[4096];
-                lookup_codec_embed(ctx, 3061, tmp_ref);  /* ryan */
-                for (int j = 0; j < h; j++) ref_norm += tmp_ref[j] * tmp_ref[j];
-                ref_norm = sqrtf(ref_norm);
-            }
+            /* Use pre-computed target norm from ryan (3061) codec embed */
+            float ref_norm = ctx->cached_ref_norm;
 
             float scale = (ref_norm > 0.1f && emb_norm > 0.1f) ? ref_norm / emb_norm : 1.0f;
             for (int j = 0; j < h; j++) dst[j] += ctx->speaker_embedding[j] * scale;
@@ -1034,8 +1046,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(ref_text_tokens);
     if (ref_codes_owned) free(ref_codes);
 
-    free(codec_pad_embed);
-    free(codec_bos_embed);
+    /* codec_pad_embed / codec_bos_embed are cached in ctx — not freed here */
 
     if (!ctx->silent) {
         if (ctx->voice_clone)

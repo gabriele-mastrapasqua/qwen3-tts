@@ -65,6 +65,10 @@ help:
 	@echo "  make test-regression - Cross-model regression checks"
 	@echo "  make test-all        - Run everything (0.6B + 1.7B + regression)"
 	@echo ""
+	@echo "Benchmark:"
+	@echo "  make bench           - RTF benchmark (short+long, normal+stream)"
+	@echo "  make bench-full      - Full benchmark (+ server, qvoice, instruct, INT8)"
+	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
 # Build
@@ -424,6 +428,15 @@ test-serve-parallel: $(TARGET)
 
 test-serve-all: test-serve test-serve-bench test-serve-openai test-serve-parallel
 	@echo "=== All server tests passed ==="
+
+# ── RTF Benchmarks ──
+# Quick RTF measurements across configs. Auto-skips missing models/voices.
+
+bench: $(TARGET)
+	@./bench.sh --level basic --seed 42
+
+bench-full: $(TARGET)
+	@./bench.sh --level full --seed 42
 
 # ── Voice Clone e2e test ──
 # Step 1: Generate reference audio with CustomVoice model
