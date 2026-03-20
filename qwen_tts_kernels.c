@@ -45,12 +45,9 @@ int qwen_get_num_cpus(void) {
 
 void qwen_init_threads(void) {
     int ncpus = qwen_get_num_cpus();
-    /* bf16 matvec is memory-bandwidth-bound: 4 threads is the sweet spot on
-     * 8-core Apple Silicon (4P+4E).  On bigger machines scale up to ncpus/2
-     * to exploit extra bandwidth without saturating all cores. */
-    int ideal = ncpus / 2;
-    if (ideal < 4) ideal = 4;
-    g_n_threads = ncpus < ideal ? ncpus : ideal;
+    /* 4 threads is the sweet spot for bf16 matvec (memory-bandwidth-bound).
+     * More threads add GCD dispatch overhead without bandwidth gain. */
+    g_n_threads = ncpus < 4 ? ncpus : 4;
 }
 
 #if defined(__APPLE__)
@@ -1235,50 +1232,15 @@ void qwen_swiglu_inplace(float *gate_up, float *tmp, int n) {
 }
 
 void qwen_add_inplace(float *y, const float *x, int n) {
-    int i = 0;
-#ifdef __ARM_NEON
-    for (; i + 7 < n; i += 8) {
-        vst1q_f32(y + i,     vaddq_f32(vld1q_f32(y + i),     vld1q_f32(x + i)));
-        vst1q_f32(y + i + 4, vaddq_f32(vld1q_f32(y + i + 4), vld1q_f32(x + i + 4)));
-    }
-#elif defined(__AVX2__)
-    for (; i + 7 < n; i += 8) {
-        _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(x + i)));
-    }
-#endif
-    for (; i < n; i++) y[i] += x[i];
+    for (int i = 0; i < n; i++) y[i] += x[i];
 }
 
 void qwen_mul_inplace(float *y, const float *x, int n) {
-    int i = 0;
-#ifdef __ARM_NEON
-    for (; i + 7 < n; i += 8) {
-        vst1q_f32(y + i,     vmulq_f32(vld1q_f32(y + i),     vld1q_f32(x + i)));
-        vst1q_f32(y + i + 4, vmulq_f32(vld1q_f32(y + i + 4), vld1q_f32(x + i + 4)));
-    }
-#elif defined(__AVX2__)
-    for (; i + 7 < n; i += 8) {
-        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(x + i)));
-    }
-#endif
-    for (; i < n; i++) y[i] *= x[i];
+    for (int i = 0; i < n; i++) y[i] *= x[i];
 }
 
 void qwen_vec_scale_inplace(float *y, float s, int n) {
-    int i = 0;
-#ifdef __ARM_NEON
-    float32x4_t vs = vdupq_n_f32(s);
-    for (; i + 7 < n; i += 8) {
-        vst1q_f32(y + i,     vmulq_f32(vld1q_f32(y + i),     vs));
-        vst1q_f32(y + i + 4, vmulq_f32(vld1q_f32(y + i + 4), vs));
-    }
-#elif defined(__AVX2__)
-    __m256 vs = _mm256_set1_ps(s);
-    for (; i + 7 < n; i += 8) {
-        _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), vs));
-    }
-#endif
-    for (; i < n; i++) y[i] *= s;
+    for (int i = 0; i < n; i++) y[i] *= s;
 }
 
 void qwen_round_bf16(float *x, int n) {
@@ -1313,6 +1275,29 @@ void qwen_bf16_accum_f32(float *dst, const uint16_t *src_bf16, int n) {
         uint32_t bits = (uint32_t)src_bf16[i] << 16;
         float val; memcpy(&val, &bits, sizeof(float));
         dst[i] += val;
+    }
+}
+
+/* Convert bf16 vector to f32 (no accumulation — pure conversion).
+ * NEON/AVX2 vectorized. */
+void qwen_bf16_to_f32_vec(float *dst, const uint16_t *src_bf16, int n) {
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 7 < n; i += 8) {
+        uint16x8_t bf = vld1q_u16(src_bf16 + i);
+        vst1q_f32(dst + i,     vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bf), 16)));
+        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bf), 16)));
+    }
+#elif defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        __m128i bf = _mm_loadu_si128((const __m128i *)(src_bf16 + i));
+        __m256i wide = _mm256_cvtepu16_epi32(bf);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(_mm256_slli_epi32(wide, 16)));
+    }
+#endif
+    for (; i < n; i++) {
+        uint32_t bits = (uint32_t)src_bf16[i] << 16;
+        memcpy(&dst[i], &bits, sizeof(float));
     }
 }
 
