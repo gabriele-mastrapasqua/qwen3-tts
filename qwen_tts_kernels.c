@@ -45,9 +45,12 @@ int qwen_get_num_cpus(void) {
 
 void qwen_init_threads(void) {
     int ncpus = qwen_get_num_cpus();
-    /* 4 threads is the sweet spot for bf16 matvec (memory-bandwidth-bound).
-     * More threads add GCD dispatch overhead without bandwidth gain. */
-    g_n_threads = ncpus < 4 ? ncpus : 4;
+    /* bf16 matvec is memory-bandwidth-bound: 4 threads is the sweet spot on
+     * 8-core Apple Silicon (4P+4E).  On bigger machines scale up to ncpus/2
+     * to exploit extra bandwidth without saturating all cores. */
+    int ideal = ncpus / 2;
+    if (ideal < 4) ideal = 4;
+    g_n_threads = ncpus < ideal ? ncpus : ideal;
 }
 
 #if defined(__APPLE__)
