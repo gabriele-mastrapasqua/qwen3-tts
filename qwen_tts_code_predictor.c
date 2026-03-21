@@ -286,83 +286,93 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
  * Single CP transformer step at given position
  * ======================================================================== */
 
-static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos) {
+static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos, int layer) {
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
     int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
     int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
     int cp_inter = c->cp_intermediate_size;
     float eps = c->rms_norm_eps;
+    float attn_scale = 1.0f / sqrtf((float)c->cp_head_dim);
+    qwen_cp_layer_t *l = &ctx->cp_layers[layer];
+    float *proj = ctx->cp_dec_ffn_out; /* reuse buffer */
 
-    for (int layer = 0; layer < c->cp_num_layers; layer++) {
-        qwen_cp_layer_t *l = &ctx->cp_layers[layer];
+    /* x_norm already contains RMSNorm(x) on entry */
 
-        /* 1. Input RMSNorm */
-        qwen_rms_norm(x_norm, x, l->input_norm, 1, cp_h, eps);
+    /* QKV projections (unified dispatch — single barrier for all 3) */
+    if (l->wq_int8) {
+        qwen_matvec_int8_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                              l->wq_int8, l->wq_scale,
+                              l->wk_int8, l->wk_scale,
+                              l->wv_int8, l->wv_scale,
+                              x_norm, cp_h, cp_q_dim, cp_kv_dim);
+    } else {
+        qwen_matvec_bf16_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                              l->wq_bf16, l->wk_bf16, l->wv_bf16,
+                              x_norm, cp_h, cp_q_dim, cp_kv_dim);
+    }
 
-        /* 2. QKV projections (unified dispatch — single barrier for all 3) */
-        if (l->wq_int8) {
-            qwen_matvec_int8_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
-                                  l->wq_int8, l->wq_scale,
-                                  l->wk_int8, l->wk_scale,
-                                  l->wv_int8, l->wv_scale,
-                                  x_norm, cp_h, cp_q_dim, cp_kv_dim);
-        } else {
-            qwen_matvec_bf16_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
-                                  l->wq_bf16, l->wk_bf16, l->wv_bf16,
-                                  x_norm, cp_h, cp_q_dim, cp_kv_dim);
-        }
+    /* Q/K RMSNorm per-head */
+    qwen_rms_norm_per_head(ctx->cp_dec_q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
+    qwen_rms_norm_per_head(ctx->cp_dec_k, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
 
-        /* 3. Q/K RMSNorm per-head */
-        qwen_rms_norm_per_head(ctx->cp_dec_q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
-        qwen_rms_norm_per_head(ctx->cp_dec_k, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
+    /* NeoX RoPE */
+    apply_rope_neox(ctx->cp_dec_q, c->cp_num_heads, c->cp_head_dim,
+                    ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
+    apply_rope_neox(ctx->cp_dec_k, c->cp_num_kv_heads, c->cp_head_dim,
+                    ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
 
-        /* 4. NeoX RoPE */
-        apply_rope_neox(ctx->cp_dec_q, c->cp_num_heads, c->cp_head_dim,
-                        ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
-        apply_rope_neox(ctx->cp_dec_k, c->cp_num_kv_heads, c->cp_head_dim,
-                        ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
+    /* Store KV in cache (convert f32→bf16) */
+    int64_t kv_off = (int64_t)layer * ctx->cp_kv_max * cp_kv_dim + (int64_t)pos * cp_kv_dim;
+    f32_to_bf16_vec(ctx->cp_kv_k + kv_off, ctx->cp_dec_k, cp_kv_dim);
+    f32_to_bf16_vec(ctx->cp_kv_v + kv_off, ctx->cp_dec_v, cp_kv_dim);
 
-        /* 5. Store KV in cache (convert f32→bf16) */
-        int64_t kv_off = (int64_t)layer * ctx->cp_kv_max * cp_kv_dim + (int64_t)pos * cp_kv_dim;
-        f32_to_bf16_vec(ctx->cp_kv_k + kv_off, ctx->cp_dec_k, cp_kv_dim);
-        f32_to_bf16_vec(ctx->cp_kv_v + kv_off, ctx->cp_dec_v, cp_kv_dim);
+    /* Causal GQA attention (bf16 KV cache) */
+    uint16_t *layer_k = ctx->cp_kv_k + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
+    uint16_t *layer_v = ctx->cp_kv_v + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
+    qwen_causal_attention_bf16kv(ctx->cp_dec_attn_out, ctx->cp_dec_q, layer_k, layer_v,
+                                 1, pos + 1, c->cp_num_heads, c->cp_num_kv_heads,
+                                 c->cp_head_dim, attn_scale, pos);
 
-        /* 6. Causal GQA attention (bf16 KV cache) */
-        float scale = 1.0f / sqrtf((float)c->cp_head_dim);
-        uint16_t *layer_k = ctx->cp_kv_k + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
-        uint16_t *layer_v = ctx->cp_kv_v + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
-        qwen_causal_attention_bf16kv(ctx->cp_dec_attn_out, ctx->cp_dec_q, layer_k, layer_v,
-                                     1, pos + 1, c->cp_num_heads, c->cp_num_kv_heads,
-                                     c->cp_head_dim, scale, pos);
+    /* Output projection */
+    if (l->wo_int8)
+        qwen_matvec_int8(proj, l->wo_int8, l->wo_scale, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+    else
+        matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
 
-        /* 7. Output projection + residual */
-        float *proj = ctx->cp_dec_ffn_out; /* reuse buffer */
-        if (l->wo_int8)
-            qwen_matvec_int8(proj, l->wo_int8, l->wo_scale, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
-        else
-            matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
-        for (int i = 0; i < cp_h; i++) x[i] += proj[i];
+    /* Fused residual-add + post-attention RMSNorm (saves one pass over x) */
+    qwen_rms_norm_residual(x_norm, x, proj, l->post_attn_norm, cp_h, eps);
 
-        /* 8. Post-attention RMSNorm */
-        qwen_rms_norm(x_norm, x, l->post_attn_norm, 1, cp_h, eps);
+    /* Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
+    if (l->gate_up_fused_int8)
+        qwen_matvec_int8(ctx->cp_dec_gate, l->gate_up_fused_int8, l->gate_up_fused_scale,
+                          x_norm, 2 * cp_inter, cp_h);
+    else
+        matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
+    qwen_swiglu_inplace(ctx->cp_dec_gate, ctx->swiglu_tmp, cp_inter);
 
-        /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-        if (l->gate_up_fused_int8)
-            qwen_matvec_int8(ctx->cp_dec_gate, l->gate_up_fused_int8, l->gate_up_fused_scale,
-                              x_norm, 2 * cp_inter, cp_h);
-        else
-            matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
-        /* Batch SwiGLU: uses vvexpf on macOS for faster exp */
-        qwen_swiglu_inplace(ctx->cp_dec_gate, ctx->swiglu_tmp, cp_inter);
+    /* Down projection */
+    if (l->down_int8)
+        qwen_matvec_int8(proj, l->down_int8, l->down_scale, ctx->cp_dec_gate, cp_h, cp_inter);
+    else
+        matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
 
-        /* Down projection + residual */
-        if (l->down_int8)
-            qwen_matvec_int8(proj, l->down_int8, l->down_scale, ctx->cp_dec_gate, cp_h, cp_inter);
-        else
-            matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
+    /* Fused residual-add + next layer's input RMSNorm (or just add for last layer) */
+    if (layer + 1 < c->cp_num_layers) {
+        qwen_rms_norm_residual(x_norm, x, proj, ctx->cp_layers[layer + 1].input_norm, cp_h, eps);
+    } else {
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
     }
+}
+
+static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos) {
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h = c->cp_hidden_size;
+
+    /* First layer: standard input RMSNorm, then body produces fused norm for next */
+    qwen_rms_norm(x_norm, x, ctx->cp_layers[0].input_norm, 1, cp_h, c->rms_norm_eps);
+    for (int layer = 0; layer < c->cp_num_layers; layer++)
+        cp_layer_body(ctx, x, x_norm, pos, layer);
 }
 
 /* ========================================================================

@@ -48,6 +48,12 @@ void qwen_init_threads(void);
 void qwen_rms_norm(float *out, const float *x, const float *weight,
                    int seq, int dim, float eps);
 
+/* Fused residual-add + RMSNorm: x[i] += residual[i], then out = RMSNorm(x, weight).
+ * Saves one full pass over x compared to separate add + norm.
+ * x is modified in-place (residual added), then normalized into out. */
+void qwen_rms_norm_residual(float *out, float *x, const float *residual,
+                            const float *weight, int dim, float eps);
+
 /* RMSNorm per-head */
 void qwen_rms_norm_per_head(float *x, const float *weight,
                             int seq, int n_heads, int head_dim, float eps);

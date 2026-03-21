@@ -433,7 +433,7 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
                                      1, pos + 1, c->num_heads, c->num_kv_heads,
                                      c->head_dim, scale, pos);
 
-        /* 7. Output projection + residual */
+        /* 7. Output projection */
         if (l->wo_q4)
             qwen_matvec_q4_0(ctx->dec_proj_out, l->wo_q4, ctx->dec_attn_out, h, q_dim);
         else if (l->wo_int8)
@@ -441,10 +441,10 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
                               ctx->dec_attn_out, h, q_dim);
         else
             matvec_bf16_local(ctx->dec_proj_out, l->wo_bf16, ctx->dec_attn_out, h, q_dim);
-        for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
 
-        /* 8. Post-attention RMSNorm */
-        qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, l->post_attn_norm, 1, h, eps);
+        /* 8. Fused residual-add + post-attention RMSNorm (saves one pass over dec_x) */
+        qwen_rms_norm_residual(ctx->dec_x_norm, ctx->dec_x, ctx->dec_proj_out,
+                               l->post_attn_norm, h, eps);
 
         /* 9. Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
         if (l->gate_up_fused_q4)
@@ -456,11 +456,9 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         else
             qwen_matvec_bf16(ctx->dec_gate, l->gate_up_fused_bf16, ctx->dec_x_norm,
                               2 * inter, h);
-        /* In-place SwiGLU: interleaved [g0,u0,g1,u1,...] → [silu(g0)*u0, ...]
-         * Uses batch vvexpf on macOS via Accelerate for faster exp computation. */
         qwen_swiglu_inplace(ctx->dec_gate, ctx->swiglu_tmp, inter);
 
-        /* Down projection + residual */
+        /* Down projection */
         if (l->down_q4)
             qwen_matvec_q4_0(ctx->dec_proj_out, l->down_q4, ctx->dec_gate, h, inter);
         else if (l->down_int8)
@@ -468,7 +466,14 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
                               ctx->dec_gate, h, inter);
         else
             qwen_matvec_bf16(ctx->dec_proj_out, l->down_bf16, ctx->dec_gate, h, inter);
-        for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
+
+        /* Fused residual-add + next layer's input RMSNorm (or just add for last layer) */
+        if (layer + 1 < c->num_layers) {
+            qwen_rms_norm_residual(ctx->dec_x_norm, ctx->dec_x, ctx->dec_proj_out,
+                                   ctx->layers[layer + 1].input_norm, h, eps);
+        } else {
+            for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
+        }
     }
 
     /* Final RMSNorm */
