@@ -3,7 +3,6 @@
  */
 
 #include "qwen_tts.h"
-#include "qwen_tts_kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +16,8 @@ static int    g_work_cap = 0;
 static void ensure_work_buffers(int n) {
     if (n <= g_work_cap) return;
     free(g_topk_tmp); free(g_topp_idx);
-    g_topk_tmp = (float *)aligned_malloc(n * sizeof(float));
-    g_topp_idx = (int *)aligned_malloc(n * sizeof(int));
+    g_topk_tmp = (float *)malloc(n * sizeof(float));
+    g_topp_idx = (int *)malloc(n * sizeof(int));
     g_work_cap = n;
 }
 

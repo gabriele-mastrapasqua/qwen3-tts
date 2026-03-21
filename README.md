@@ -228,10 +228,10 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads (`make bench-full`):
 
 | Config | 0.6B RTF | 1.7B BF16 RTF | 1.7B INT8 RTF |
 |--------|----------|---------------|---------------|
-| **CLI short** | 1.65–1.71 | 4.15–4.40 | 3.69 |
-| **CLI long** | **1.29–1.32** | 2.10–2.11 | 2.15 |
-| **CLI stream short** | 1.30–1.31 | 3.67–4.01 | — |
-| **CLI stream long** | 1.30 | 2.06–2.43 | — |
+| **CLI short** | 1.37–1.69 | 4.10–4.40 | 3.69 |
+| **CLI long** | **1.29–1.32** | **1.97–2.11** | 2.15 |
+| **CLI stream short** | 1.31 | 2.59–4.01 | — |
+| **CLI stream long** | 1.30–1.33 | 2.06–2.43 | — |
 | **Server (cold)** | 1.34 | — | — |
 | **Server (warm)** | **1.33** | — | — |
 

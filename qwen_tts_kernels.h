@@ -177,6 +177,10 @@ void qwen_round_bf16(float *x, int n);
  * NEON/AVX optimized for batch BF16→F32 conversion + addition. */
 void qwen_bf16_accum_f32(float *dst, const uint16_t *src_bf16, int n);
 
+/* Convert bf16 vector to f32: dst[i] = bf16_to_f32(src[i])
+ * NEON/AVX2 vectorized. */
+void qwen_bf16_to_f32_vec(float *dst, const uint16_t *src_bf16, int n);
+
 /* Snake activation: x += (1/exp(beta)) * sin²(exp(alpha) * x)
  * Applied per-channel to channel-first data [channels, length].
  * log_alpha/log_beta are per-channel params in LOG SPACE. */

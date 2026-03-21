@@ -209,6 +209,7 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     ctx->cp_dec_v = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
     ctx->cp_dec_attn_out = (float *)aligned_malloc(cp_q_dim * sizeof(float));
     ctx->cp_dec_gate = (float *)aligned_malloc(2 * c->cp_intermediate_size * sizeof(float));
+    ctx->cp_dec_up = NULL;  /* unused: gate buffer holds fused gate+up */
     ctx->cp_dec_ffn_out = (float *)aligned_malloc(cp_h * sizeof(float));
 
     /* CP RoPE cache (same theta as talker) */
@@ -408,17 +409,16 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     cp_transformer_step(ctx, cp_x, x_norm, 0);
 
     /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's).
-     * The embedding has dim=hidden_size (talker), so project to cp_hidden. */
+     * Vectorized bf16→f32 conversion, then project to cp_hidden. */
     {
-        int h = c->hidden_size;  /* talker hidden = embedding dim for talker codec emb */
-        float emb_buf[4096];  /* max talker_hidden is 2048, but use 4096 for safety */
+        int h = c->hidden_size;
         if (ctx->codec_embedding_bf16 && code0 >= 0 && code0 < c->codec_vocab_size) {
-            const uint16_t *e = ctx->codec_embedding_bf16 + (int64_t)code0 * h;
-            for (int i = 0; i < h; i++) emb_buf[i] = bf16_to_f32(e[i]);
+            float emb_buf[4096];
+            qwen_bf16_to_f32_vec(emb_buf, ctx->codec_embedding_bf16 + (int64_t)code0 * h, h);
+            cp_mtp_project(ctx, cp_x, emb_buf);
         } else {
-            memset(emb_buf, 0, h * sizeof(float));
+            memset(cp_x, 0, cp_h * sizeof(float));
         }
-        cp_mtp_project(ctx, cp_x, emb_buf);
     }
     cp_transformer_step(ctx, cp_x, x_norm, 1);
 
@@ -436,11 +436,11 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
         int pos = g + 1;
 
         /* Embed previous code using CP codec_emb[g-1] (NOT [g]).
-         * CP embeddings have dim=emb_dim (talker_hidden for 1.7B), project to cp_hidden. */
-        float emb_buf[4096];
+         * Vectorized bf16→f32 conversion (NEON/AVX2 via qwen_bf16_to_f32_vec). */
         if (ctx->cp_codec_emb_bf16[g - 1] && prev_code >= 0 && prev_code < c->codebook_size) {
+            float emb_buf[4096];
             const uint16_t *e = ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev_code * emb_dim;
-            for (int i = 0; i < emb_dim; i++) emb_buf[i] = bf16_to_f32(e[i]);
+            qwen_bf16_to_f32_vec(emb_buf, e, emb_dim);
             cp_mtp_project(ctx, cp_x, emb_buf);
         } else {
             memset(cp_x, 0, cp_h * sizeof(float));
