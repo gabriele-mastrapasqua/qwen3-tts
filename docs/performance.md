@@ -5,7 +5,7 @@ All benchmarks on Apple M1 8-core, 16 GB RAM, 4 threads.
 ## Summary
 
 - **0.6B**: RTF ~1.3–1.7 depending on audio length and mode
-- **1.7B**: RTF ~3.0–4.3 (BF16), ~2.5–3.6 with `--int8`
+- **1.7B**: RTF ~2.0–4.1 (BF16), ~2.5–3.6 with `--int8`
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
 
 ## RTF Across Modes
@@ -14,8 +14,8 @@ Results from `make bench-full` (seed 42, speaker ryan):
 
 | Config | 0.6B Short | 0.6B Long | 1.7B Short | 1.7B Long |
 |--------|-----------|----------|-----------|----------|
-| **CLI normal** | 1.65–1.71 | **1.29–1.32** | 4.15–4.40 | 2.10–2.11 |
-| **CLI stream** | 1.30–1.31 | 1.30 | 3.67–4.01 | 2.06–2.43 |
+| **CLI normal** | 1.37–1.71 | **1.29–1.32** | 4.10–4.40 | **1.97–2.11** |
+| **CLI stream** | 1.30–1.31 | 1.30–1.33 | 2.59–4.01 | 2.06–2.43 |
 | **Server cold** | 1.34 | — | — | — |
 | **Server warm** | **1.33** | — | — | — |
 | **1.7B INT8** | — | — | 3.69 | 2.15 |
@@ -86,6 +86,9 @@ performance to **RTF ~1.3–1.7** (up to 2.7x total speedup):
 | Pre-allocated sampling buffers | minor | Zero per-token malloc in generation loop |
 | Top-k quickselect | **4× sampling** | O(n) quickselect replaces O(kn) selection sort |
 | Streaming pipeline parallelism | **RTF 2.0→1.4** | Decoder thread runs in streaming mode too |
+| SIMD element-wise ops | minor | NEON/AVX2 for add/mul/scale inplace |
+| Vectorized bf16→f32 codec embeds | **~6% on 1.7B** | Bulk SIMD conversion replaces scalar loops in embedding lookups |
+| Auto-scaled thread count | minor | ncpus/2 (min 4) adapts to larger machines |
 
 All optimizations are cross-platform (POSIX standard `posix_memalign`, conditional NEON/AVX).
 See [blog/optimization-notes.md](../blog/optimization-notes.md) for the full story.
