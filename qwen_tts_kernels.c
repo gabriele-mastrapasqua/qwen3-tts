@@ -212,6 +212,15 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
     for (; o + 1 < out_dim; o += 2) {
         const uint16_t *w0 = W + (size_t)o * in_dim;
         const uint16_t *w1 = W + (size_t)(o + 1) * in_dim;
+        /* Prefetch next 2 rows well ahead for the memory controller */
+        if (o + 5 < out_dim) {
+            const uint16_t *pf0 = W + (size_t)(o + 4) * in_dim;
+            const uint16_t *pf1 = W + (size_t)(o + 5) * in_dim;
+            __builtin_prefetch(pf0, 0, 0);
+            __builtin_prefetch(pf0 + 64, 0, 0);
+            __builtin_prefetch(pf1, 0, 0);
+            __builtin_prefetch(pf1 + 64, 0, 0);
+        }
         float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0),
                     a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
         float32x4_t b0 = vdupq_n_f32(0), b1 = vdupq_n_f32(0),
