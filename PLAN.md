@@ -211,15 +211,38 @@ Software prefetch hints can help the memory controller prepare cache lines.
   (seed 42, ryan, English long text). Both 0.6B and 1.7B.
 - [ ] `[MED]` **x86 benchmark**: test on a Linux x86 machine to validate AVX2 gains.
 
-### Expected Impact (conservative estimates)
+### Experiments That Didn't Work (Phase 18)
+- **pthread thread pool (replace GCD)**: 8% SLOWER on macOS. Apple's GCD is
+  kernel-optimized with priority inheritance; pthreads mutex+cond can't compete.
+  Would help on Linux (no GCD), not on macOS. The "30% dispatch overhead" in profiling
+  is intrinsic synchronization cost, not fixable with a different pool.
+- **4-row fused matvec (16 elem/iter)**: 7% SLOWER than 2-row (32 elem/iter). 16 NEON
+  accumulators cause register spill; shorter inner loop can't hide memory latency.
+- **Threading threshold 2048**: 3% SLOWER. Even 1024-row matrices (O-proj, down) benefit
+  from 4-thread dispatch on M1 despite the GCD overhead.
+- **INT8 on 0.6B CP**: Generation hangs (never reaches EOS). INT8 quantization of
+  hidden=1024 matrices causes numerical issues. Auto-skipped when hidden < 2048.
+- **INT8 load bug (fixed)**: `--int8` flag was set after model load — quantization was
+  silently skipped on ALL models since first implementation. Fixed in v0.8.0.
+
+### Measured Impact
+
+| Optimization | 0.6B speedup | 1.7B speedup | Status |
+|---|---|---|---|
+| Fused residual+RMSNorm (18.1) | **-21% short** | stable | **DONE** |
+| Software prefetch (18.5) | ~1-2% | ~1-2% | DONE |
+| pthread thread pool (18.1) | -8% (worse) | untested | ABANDONED |
+| 4-row matvec (18.1) | -7% (worse) | untested | ABANDONED |
+| INT8 CP 0.6B (18.2) | hang | N/A | ABANDONED |
+
+### Remaining Opportunities
 
 | Optimization | 0.6B speedup | 1.7B speedup | Effort |
 |---|---|---|---|
-| CP overhead reduction (18.1) | 10-15% | 5-10% | 2-3 days |
-| INT8 CP (18.2) | 0-10%? | 15-25% | 1-2 days |
-| Sliding window (18.3) | 5% (long only) | 5% | 0.5 days |
+| Pipeline CP↔Talker overlap | 10-15% | 10-15% | 2-3 days |
+| INT8 CP on 1.7B (18.2) | N/A | 15-25% | 1 day |
+| Sliding window CP (18.3) | 5% (long) | 5% | 0.5 days |
 | AVX2 parity (18.4) | N/A (ARM) | N/A (ARM) | 2-3 days |
-| Prefetch (18.5) | 5-10% | 5-10% | 1 day |
 | **Combined** | **~25-35%** | **~30-45%** | ~1-2 weeks |
 
 **Target RTF after Phase 18**:
