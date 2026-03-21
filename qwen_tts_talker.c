@@ -247,8 +247,10 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
         #undef LOAD_F32
     }
 
-    /* INT8 quantization of Talker weights (optional, enabled by --int8 flag) */
-    if (ctx->use_int8) {
+    /* INT8 quantization of Talker weights (optional, enabled by --int8 flag).
+     * Skip on 0.6B (hidden=1024): matrices too small to benefit from INT8
+     * bandwidth reduction, and the extra memory causes mmap pressure on 16GB. */
+    if (ctx->use_int8 && c->hidden_size >= 2048) {
         if (!ctx->silent)
             fprintf(stderr, "  Quantizing Talker weights to INT8 (per-row absmax)...\n");
         int inter = c->intermediate_size;

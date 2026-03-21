@@ -20,3 +20,4 @@ bench_scalar
 bench_simd
 qvoices/
 .claude/
+server_stderr.log
