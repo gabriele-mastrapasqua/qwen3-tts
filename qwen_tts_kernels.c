@@ -28,7 +28,6 @@
 
 /* Threading */
 static int g_n_threads = 1;
-
 void qwen_set_threads(int n) { g_n_threads = n > 0 ? n : 1; }
 int qwen_get_threads(void) { return g_n_threads; }
 
