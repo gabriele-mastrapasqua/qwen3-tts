@@ -1,6 +1,6 @@
 # PLAN.md — Qwen3-TTS C Engine Roadmap
 
-Updated: 2026-03-14
+Updated: 2026-03-21
 
 Core engine is **COMPLETE** and producing good audio for both 0.6B and 1.7B models.
 This document tracks completed work and remaining future ideas.
@@ -53,8 +53,8 @@ All major features and optimizations have been implemented and verified:
 
 | Model | Talker ms/f | CP ms/f | RTF | Notes |
 |-------|-------------|---------|-----|-------|
-| 0.6B BF16 | ~26 | ~78 | 1.4-1.6 | Best speed |
-| 1.7B BF16 | ~79 | ~87 | 3.5-4.3 | Best quality |
+| 0.6B BF16 | ~32 | ~79 | 1.29-1.69 | Best speed |
+| 1.7B BF16 | ~80 | ~87 | 1.97-4.10 | Best quality |
 | 1.7B INT8 | ~67 | ~79 | 3.0-3.6 | Recommended for 1.7B |
 
 ### Experiments That Didn't Work
@@ -103,6 +103,128 @@ Estimated ~20-30% total speedup on x86 servers/desktops:
 - [ ] `[HIGH]` `qwen_causal_attention_bf16kv` — AVX2 bf16→f32 inline dot
 - [ ] `[HIGH]` `qwen_causal_attention_windowed` — AVX2
 - [ ] `[MED]` `qwen_silu` — vectorized exp approximation
+
+---
+
+## Phase 18: Performance Push — Target RTF ≤ 1.0 (0.6B)
+
+**Goal**: Break the RTF 1.0 barrier on 0.6B (Apple M1), push 1.7B below RTF 2.0.
+Both models must benefit, all optimizations must be cross-platform (ARM + x86).
+
+**Current baseline (Apple M1, 4 threads, long text, seed 42)**:
+
+| Model | Talker ms/f | CP ms/f | Other | Total ms/f | RTF |
+|-------|-------------|---------|-------|------------|-----|
+| 0.6B  | 31.9        | 79.1    | 0.4   | 111.3      | 1.29 |
+| 1.7B  | ~80         | ~87     | ~3    | ~170       | 1.97 |
+
+**RTF 1.0 budget**: 80ms/frame (12.5 Hz). Need ~28% total reduction.
+
+**Bottleneck analysis** (0.6B):
+- Code Predictor is **67%** of per-frame time (15 sequential passes × 5 layers)
+- 0.6B is at ~42% memory bandwidth utilization (28 GB/s of 68 GB/s)
+- NOT bandwidth-bound → overhead and compute are the bottleneck
+- 1.7B IS bandwidth-bound → INT8 helps there (already proven: ~14% CP speedup)
+
+**Key constraint from past experiments**:
+- INT8 on 0.6B Talker: 0% speedup (hidden=1024 too small)
+- Speculative CP decoding: ABANDONED (codebook feedback makes it structurally unsafe)
+- Metal GPU: 1.3x SLOWER on M1 (shared bandwidth ceiling)
+
+### 18.1 CP Overhead Reduction (cross-platform)
+
+The CP calls `cp_transformer_step()` 17 times per frame (2 prefill + 15 decode).
+Each step has 5 layers, each layer has multiple dispatch barriers and function calls.
+At 42% bandwidth utilization, the gap is overhead, not raw throughput.
+
+- [ ] `[HIGH]` **Micro-benchmark CP step**: instrument per-layer timing inside
+  `cp_transformer_step` to identify exact overhead split (matvec vs norm vs attention
+  vs dispatch barriers vs other). Currently we only time the whole CP.
+- [ ] `[HIGH]` **Fused residual + RMSNorm**: after O-proj and down-proj, we do
+  `for(i) x[i] += proj[i]` then RMSNorm reads x again. Fuse into one pass:
+  `qwen_rms_norm_with_residual(out, x, residual, weight, n, eps)`.
+  Saves 2 passes over x per layer × 5 layers × 17 steps = 170 cache misses/frame.
+- [ ] `[MED]` **Inline CP attention for short sequences**: CP attention is at most
+  pos=16 (max 17 KV entries). The generic attention kernel handles arbitrary lengths
+  with SIMD; for ≤17 entries, a specialized tiny-attention kernel (fully unrolled,
+  no branches) could avoid overhead. Cross-platform: just C with compiler unrolling.
+- [ ] `[MED]` **Eliminate per-layer function call overhead**: flatten the 5-layer loop
+  in `cp_transformer_step` into a single function with direct buffer pointers. Avoids
+  layer struct indirection and enables the compiler to keep registers live across layers.
+- [ ] `[LOW]` **RoPE precompute for CP positions 0-16**: CP only uses 17 positions.
+  Store cos/sin as a flat [17 × head_dim] array looked up by index — cheaper than
+  the generic RoPE function that handles arbitrary positions.
+
+### 18.2 INT8 Code Predictor (cross-platform, primarily 1.7B)
+
+INT8 for CP specifically. The CP is greedy (temp=0, argmax) so quantization has zero
+quality impact on output. The Talker INT8 was 0% on 0.6B but the CP has different
+characteristics (17 sequential calls means more weight re-reads, so bandwidth matters more).
+
+- [ ] `[HIGH]` **INT8 CP weights on 1.7B**: CP hidden=2048, definitely bandwidth-bound.
+  Expected ~20-30% CP speedup on 1.7B (proven: Talker INT8 gives ~14%).
+- [ ] `[MED]` **Re-test INT8 CP on 0.6B**: The old "0% speedup" test was for the Talker.
+  CP has 15× more weight reads per frame — might cross the bandwidth threshold.
+  Must measure, not assume.
+- [ ] `[MED]` **INT8 argmax_matvec for CP lm_heads**: 15 lm_head matvecs per frame
+  (2048→2048 each). Quantizing these to INT8 halves their bandwidth.
+
+### 18.3 Sliding Window Attention in CP
+
+The model config has `sliding_window=72` but it's unclear if we enforce it.
+For long sequences (200+ frames), the CP KV cache grows and attention becomes O(N).
+With a window, attention cost stays constant.
+
+- [ ] `[MED]` **Verify CP sliding window**: check if CP attention already caps at 72.
+  If not, implement windowed attention for CP. For short sequences (<72) no change;
+  for long sequences prevents linear attention growth.
+
+### 18.4 AVX2 Kernel Parity (x86 performance)
+
+Currently 25+ NEON-optimized paths but near-zero AVX2. On x86 servers/desktops,
+everything falls back to scalar — estimated 20-30% total speedup from AVX2 parity.
+Cross-platform by definition (compile-time dispatch).
+
+- [ ] `[HIGH]` `qwen_rms_norm` — AVX2 FMA sum-of-squares + scaling
+- [ ] `[HIGH]` `qwen_causal_attention_bf16kv` — AVX2 bf16→f32 dot product + accum
+- [ ] `[MED]` `qwen_causal_attention` — AVX2 (f32 KV path)
+- [ ] `[MED]` `qwen_causal_attention_windowed` — AVX2
+- [ ] `[MED]` `qwen_rms_norm_per_head` — AVX2
+
+### 18.5 Prefetch and Memory Access (cross-platform)
+
+At 42% bandwidth utilization on 0.6B, we're leaving performance on the table.
+Software prefetch hints can help the memory controller prepare cache lines.
+
+- [ ] `[MED]` **Weight prefetch in matvec**: while processing row N, prefetch row N+2.
+  ARM: `__builtin_prefetch(addr, 0, 1)`. x86: `_mm_prefetch(addr, _MM_HINT_T1)`.
+  Must be measured — prefetch can hurt if the hardware prefetcher is already doing well.
+- [ ] `[LOW]` **madvise(MADV_SEQUENTIAL)**: hint the OS that weight reads are sequential.
+  Already implicit with mmap but explicit might help on some kernels.
+
+### 18.6 Benchmark and Validation
+
+- [ ] `[HIGH]` **Per-component micro-benchmark**: add `--bench` flag that runs N frames
+  and reports per-component ms/f breakdown (Talker step, CP total, CP per-pass,
+  attention, matvec, norm, embed, sampling). Essential for measuring optimization impact.
+- [ ] `[HIGH]` **A/B test each optimization**: before/after RTF with identical params
+  (seed 42, ryan, English long text). Both 0.6B and 1.7B.
+- [ ] `[MED]` **x86 benchmark**: test on a Linux x86 machine to validate AVX2 gains.
+
+### Expected Impact (conservative estimates)
+
+| Optimization | 0.6B speedup | 1.7B speedup | Effort |
+|---|---|---|---|
+| CP overhead reduction (18.1) | 10-15% | 5-10% | 2-3 days |
+| INT8 CP (18.2) | 0-10%? | 15-25% | 1-2 days |
+| Sliding window (18.3) | 5% (long only) | 5% | 0.5 days |
+| AVX2 parity (18.4) | N/A (ARM) | N/A (ARM) | 2-3 days |
+| Prefetch (18.5) | 5-10% | 5-10% | 1 day |
+| **Combined** | **~25-35%** | **~30-45%** | ~1-2 weeks |
+
+**Target RTF after Phase 18**:
+- 0.6B: 1.29 → **0.85-0.95** (long text), **1.0-1.2** (short text)
+- 1.7B: 1.97 → **1.2-1.5** (long text)
 
 ---
 

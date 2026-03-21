@@ -28,7 +28,6 @@
 
 /* Threading */
 static int g_n_threads = 1;
-
 void qwen_set_threads(int n) { g_n_threads = n > 0 ? n : 1; }
 int qwen_get_threads(void) { return g_n_threads; }
 
@@ -104,6 +103,50 @@ void qwen_rms_norm(float *out, const float *x, const float *weight,
     }
 }
 
+void qwen_rms_norm_residual(float *out, float *x, const float *residual,
+                            const float *weight, int dim, float eps) {
+    /* Fuse: x[i] += residual[i], then out = x * inv_rms * weight */
+#ifdef __ARM_NEON
+    float32x4_t vsum0 = vdupq_n_f32(0), vsum1 = vdupq_n_f32(0);
+    int i = 0;
+    /* Pass 1: add residual to x AND compute sum of squares in one pass */
+    for (; i + 7 < dim; i += 8) {
+        float32x4_t x0 = vld1q_f32(x + i);
+        float32x4_t x1 = vld1q_f32(x + i + 4);
+        float32x4_t r0 = vld1q_f32(residual + i);
+        float32x4_t r1 = vld1q_f32(residual + i + 4);
+        x0 = vaddq_f32(x0, r0);
+        x1 = vaddq_f32(x1, r1);
+        vst1q_f32(x + i, x0);
+        vst1q_f32(x + i + 4, x1);
+        vsum0 = vfmaq_f32(vsum0, x0, x0);
+        vsum1 = vfmaq_f32(vsum1, x1, x1);
+    }
+    float sum = vaddvq_f32(vaddq_f32(vsum0, vsum1));
+    for (; i < dim; i++) { x[i] += residual[i]; sum += x[i] * x[i]; }
+
+    float inv_rms = 1.0f / sqrtf(sum / dim + eps);
+    float32x4_t vinv = vdupq_n_f32(inv_rms);
+
+    /* Pass 2: normalize and scale */
+    i = 0;
+    for (; i + 7 < dim; i += 8) {
+        float32x4_t v0 = vld1q_f32(x + i);
+        float32x4_t v1 = vld1q_f32(x + i + 4);
+        float32x4_t w0 = vld1q_f32(weight + i);
+        float32x4_t w1 = vld1q_f32(weight + i + 4);
+        vst1q_f32(out + i,     vmulq_f32(vmulq_f32(v0, vinv), w0));
+        vst1q_f32(out + i + 4, vmulq_f32(vmulq_f32(v1, vinv), w1));
+    }
+    for (; i < dim; i++) out[i] = x[i] * inv_rms * weight[i];
+#else
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) { x[i] += residual[i]; sum += x[i] * x[i]; }
+    float inv_rms = 1.0f / sqrtf(sum / dim + eps);
+    for (int i = 0; i < dim; i++) out[i] = x[i] * inv_rms * weight[i];
+#endif
+}
+
 void qwen_rms_norm_per_head(float *x, const float *weight,
                             int seq, int n_heads, int head_dim, float eps) {
     int dim = n_heads * head_dim;
@@ -169,6 +212,15 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
     for (; o + 1 < out_dim; o += 2) {
         const uint16_t *w0 = W + (size_t)o * in_dim;
         const uint16_t *w1 = W + (size_t)(o + 1) * in_dim;
+        /* Prefetch next 2 rows well ahead for the memory controller */
+        if (o + 5 < out_dim) {
+            const uint16_t *pf0 = W + (size_t)(o + 4) * in_dim;
+            const uint16_t *pf1 = W + (size_t)(o + 5) * in_dim;
+            __builtin_prefetch(pf0, 0, 0);
+            __builtin_prefetch(pf0 + 64, 0, 0);
+            __builtin_prefetch(pf1, 0, 0);
+            __builtin_prefetch(pf1 + 64, 0, 0);
+        }
         float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0),
                     a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
         float32x4_t b0 = vdupq_n_f32(0), b1 = vdupq_n_f32(0),

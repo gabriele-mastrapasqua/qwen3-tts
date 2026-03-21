@@ -525,8 +525,8 @@ int main(int argc, char **argv) {
     if (threads > 0) qwen_set_threads(threads);
     else qwen_init_threads();
 
-    /* Load model */
-    qwen_tts_ctx_t *ctx = qwen_tts_load(model_dir);
+    /* Load model — pass int8/int4/silent via env so load can quantize inline */
+    qwen_tts_ctx_t *ctx = qwen_tts_load_ex(model_dir, silent, use_int8, use_int4);
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
@@ -538,10 +538,7 @@ int main(int argc, char **argv) {
     ctx->top_p = top_p;
     ctx->rep_penalty = rep_penalty;
     ctx->max_tokens = max_tokens;
-    ctx->silent = silent;
     ctx->debug = debug;
-    ctx->use_int8 = use_int8;
-    ctx->use_int4 = use_int4;
 
     if (speaker_id >= 0) ctx->speaker_id = speaker_id;
     if (language) ctx->language_id = qwen_tts_language_id(language);

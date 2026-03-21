@@ -561,6 +561,7 @@ extern "C" {
 
 /* Load model from directory */
 qwen_tts_ctx_t *qwen_tts_load(const char *model_dir);
+qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8, int use_int4);
 
 /* Unload model and free resources */
 void qwen_tts_unload(qwen_tts_ctx_t *ctx);
