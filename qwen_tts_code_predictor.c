@@ -279,7 +279,7 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     if (!ctx->silent)
         fprintf(stderr, "  Code Predictor: %d layers loaded, q_dim=%d kv_dim=%d%s\n",
                 c->cp_num_layers, cp_q_dim, cp_kv_dim,
-                ctx->use_int8 ? " [INT8]" : "");
+                (ctx->use_int8 && cp_h >= 2048) ? " [INT8]" : "");
 
     return 0;
 }
