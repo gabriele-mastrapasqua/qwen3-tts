@@ -239,7 +239,7 @@ Software prefetch hints can help the memory controller prepare cache lines.
 
 | Optimization | 0.6B speedup | 1.7B speedup | Effort |
 |---|---|---|---|
-| Pipeline CP↔Talker overlap | 10-15% | 10-15% | 2-3 days |
+| ~~Pipeline CP↔Talker overlap~~ | ~~10-15%~~ | ~~10-15%~~ | **INFEASIBLE** |
 | INT8 CP on 1.7B (18.2) | N/A | 15-25% | 1 day |
 | Sliding window CP (18.3) | 5% (long) | 5% | 0.5 days |
 | AVX2 parity (18.4) | N/A (ARM) | N/A (ARM) | 2-3 days |
