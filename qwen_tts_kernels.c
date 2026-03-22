@@ -139,6 +139,38 @@ void qwen_rms_norm_residual(float *out, float *x, const float *residual,
         vst1q_f32(out + i + 4, vmulq_f32(vmulq_f32(v1, vinv), w1));
     }
     for (; i < dim; i++) out[i] = x[i] * inv_rms * weight[i];
+#elif defined(__AVX2__)
+    __m256 vsum0 = _mm256_setzero_ps(), vsum1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 15 < dim; i += 16) {
+        __m256 x0 = _mm256_loadu_ps(x + i);
+        __m256 x1 = _mm256_loadu_ps(x + i + 8);
+        __m256 r0 = _mm256_loadu_ps(residual + i);
+        __m256 r1 = _mm256_loadu_ps(residual + i + 8);
+        x0 = _mm256_add_ps(x0, r0);
+        x1 = _mm256_add_ps(x1, r1);
+        _mm256_storeu_ps(x + i, x0);
+        _mm256_storeu_ps(x + i + 8, x1);
+        vsum0 = _mm256_fmadd_ps(x0, x0, vsum0);
+        vsum1 = _mm256_fmadd_ps(x1, x1, vsum1);
+    }
+    __m256 vs = _mm256_add_ps(vsum0, vsum1);
+    float tmp[8]; _mm256_storeu_ps(tmp, vs);
+    float sum = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+    for (; i < dim; i++) { x[i] += residual[i]; sum += x[i] * x[i]; }
+
+    float inv_rms = 1.0f / sqrtf(sum / dim + eps);
+    __m256 vinv = _mm256_set1_ps(inv_rms);
+    i = 0;
+    for (; i + 15 < dim; i += 16) {
+        __m256 v0 = _mm256_loadu_ps(x + i);
+        __m256 v1 = _mm256_loadu_ps(x + i + 8);
+        __m256 w0 = _mm256_loadu_ps(weight + i);
+        __m256 w1 = _mm256_loadu_ps(weight + i + 8);
+        _mm256_storeu_ps(out + i,     _mm256_mul_ps(_mm256_mul_ps(v0, vinv), w0));
+        _mm256_storeu_ps(out + i + 8, _mm256_mul_ps(_mm256_mul_ps(v1, vinv), w1));
+    }
+    for (; i < dim; i++) out[i] = x[i] * inv_rms * weight[i];
 #else
     float sum = 0.0f;
     for (int i = 0; i < dim; i++) { x[i] += residual[i]; sum += x[i] * x[i]; }
