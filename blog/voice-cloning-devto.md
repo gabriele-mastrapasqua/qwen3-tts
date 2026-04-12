@@ -32,6 +32,10 @@ All audio below is hosted in the same repo — click ▶️ to play.
 📥 **Input reference** — 30 s from LibriVox · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav"></audio>
 
+---
+
+#### 🎤 Voice clone output — 3 storage formats
+
 🥇 **Top — WDELTA, 785 MB** (mel 1.000, bit-identical) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav"></audio>
 
@@ -47,6 +51,10 @@ All audio below is hosted in the same repo — click ▶️ to play.
 
 📥 **Input reference** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav"></audio>
+
+---
+
+#### 🎤 Voice clone output — 3 storage formats
 
 🥇 **Top — WDELTA, 785 MB** (mel 1.000) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav"></audio>
@@ -64,6 +72,10 @@ All audio below is hosted in the same repo — click ▶️ to play.
 📥 **Input reference** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav"></audio>
 
+---
+
+#### 🎤 Voice clone output
+
 🥇 **Top clone** (Base-native, WDELTA-equivalent) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav"></audio>
 
@@ -73,6 +85,10 @@ All audio below is hosted in the same repo — click ▶️ to play.
 
 📥 **Input reference** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav"></audio>
+
+---
+
+#### 🎤 Voice clone output
 
 🥇 **Top clone** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav)
 <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav"></audio>
