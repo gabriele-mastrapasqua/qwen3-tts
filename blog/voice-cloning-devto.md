@@ -7,15 +7,30 @@ tags: c, machinelearning, tts, audio
 
 *Part of [qwen3-tts](https://github.com/gabriele-mastrapasqua/qwen3-tts) — a pure C inference engine for Qwen3-TTS.*
 
-## TL;DR
+## TL;DR — turn any 30-second clip into a first-class Qwen3-TTS voice
 
-30 s of public-domain speech → ECAPA-TDNN speaker encoder (written from scratch in C) → a portable voice file. That voice can be stored three ways, and each trade-off is audible:
+Qwen3-TTS ships with **9 preset speakers**. That's it. You can't add your own, you can't use the 1.7B instruct feature on a cloned voice, and every new clone has to re-run the 200 ms ECAPA-TDNN encoder from scratch.
 
-| Format | Size | Mel correlation vs Base | Fidelity | Use it when… |
-|--------|------|------------------------|----------|--------------|
-| 🥇 `.qvoice` **WDELTA** (LZ4 full delta) | **785 MB** | **1.000** (bit-identical) | Perfect, PCM-identical | You want perfect reproducibility and instruct-style support |
-| 🥈 `.qvoice` **standard** (TPAD + WOVR) | **16 MB** | **0.71** | Good; small prosody drift | Default for sharing — fits in chat, sounds right |
-| 🥉 `.bin` **embedding only** | **4 KB** | *not measured* (~60–70 % subjective) | Voice drifts, timbre loose | You only have a postcard of bytes to spend |
+This post is about tearing that ceiling down.
+
+With the pure-C engine at [qwen3-tts](https://github.com/gabriele-mastrapasqua/qwen3-tts) you can:
+
+- 🎙️ Clone **any voice** from 30 seconds of audio (ECAPA-TDNN speaker encoder implemented from scratch)
+- 💾 Save it as a portable **`.qvoice` file** and load it anywhere — CLI, HTTP server, streaming pipeline, one-shot generation
+- 🎛️ Combine a cloned voice with **`--instruct` style prompts** on 1.7B (sad / happy / angry / solemn) — something the Base model alone can't do
+- 🎯 Get **bit-identical output** across runs, processes, and machines via the `WDELTA` weight-delta format
+
+The `.qvoice` file is a new way to *extend* Qwen3-TTS's voice set: drop the file next to the binary, point `--load-voice` at it, and the model speaks with your voice like it was one of the originals.
+
+That portability comes in three flavors. All produce the same voice identity; they differ in how much of the Base model's weight signature they carry along:
+
+| Format | Size | Mel correlation vs Base | Fidelity | Works with instruct? | Use when… |
+|--------|------|------------------------|----------|----------------------|-----------|
+| 🥇 `.qvoice` **WDELTA** (LZ4 full delta) | **785 MB** | **1.000** (bit-identical) | Perfect, PCM-identical | ✅ yes (1.7B) | You're building a reusable voice asset — server, streaming, product |
+| 🥈 `.qvoice` **standard** (TPAD + WOVR) | **16 MB** | **0.71** | Good; small prosody drift | ⚠️ Base only | Default for sharing — fits in chat, sounds right |
+| 🥉 `.bin` **embedding only** | **4 KB** | *not measured* (~60–70 % subj.) | Voice drifts, timbre loose | ❌ no | You have 4 kilobytes to spend |
+
+The headline: **WDELTA makes a cloned voice a first-class citizen of the CustomVoice model**. You clone once on Base, save a `.qvoice`, and the CV model loads it and treats it exactly like one of the nine built-in speakers — same latency, same server behavior, same streaming support, now with instruct-style control on top.
 
 All audio below is hosted in the same repo — click ▶️ to play.
 
@@ -72,10 +87,16 @@ All audio below is hosted in the same repo — click ▶️ to play.
 
 ---
 
-#### 🎤 Voice clone output
+#### 🎤 Voice clone output — 3 storage formats
 
-🥇 **Top clone** (Base-native, WDELTA-equivalent) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav)
-<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav"></audio>
+🥇 **Top — WDELTA, 785 MB** (mel 1.000) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_wdelta_785mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_wdelta_785mb.wav"></audio>
+
+🥈 **Mid — standard `.qvoice`, 16 MB** (mel 0.71) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_standard_16mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_standard_16mb.wav"></audio>
+
+🥉 **Light — `.bin`, 4 KB** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_bin_4kb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_bin_4kb.wav"></audio>
 
 ### 🇫🇷 French — *Le dernier jour d'un condamné* / Bidou · [LibriVox, PD](https://archive.org/details/dernierjour_2203_librivox)
 
@@ -86,10 +107,16 @@ All audio below is hosted in the same repo — click ▶️ to play.
 
 ---
 
-#### 🎤 Voice clone output
+#### 🎤 Voice clone output — 3 storage formats
 
-🥇 **Top clone** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav)
-<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav"></audio>
+🥇 **Top — WDELTA, 785 MB** (mel 1.000) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_wdelta_785mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_wdelta_785mb.wav"></audio>
+
+🥈 **Mid — standard `.qvoice`, 16 MB** (mel 0.71) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_standard_16mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_standard_16mb.wav"></audio>
+
+🥉 **Light — `.bin`, 4 KB** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_bin_4kb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_bin_4kb.wav"></audio>
 
 ### Cost table — how much you pay for each tier
 
