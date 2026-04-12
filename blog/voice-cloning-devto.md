@@ -1,169 +1,74 @@
 ---
-title: "I cloned a voice in pure C — and you can hear the difference between 4 KB, 16 MB, and 785 MB"
+title: "Qwen3-TTS voice cloning in a pure C engine — 785 MB, 16 MB, or 4 KB?"
 published: false
-description: "Three ways to store a cloned voice, from a tiny embedding to a bit-identical weight delta. Listen to them side by side, then read how the pipeline works."
+description: "Clone a voice from 30 seconds of public-domain audio in pure C, then choose how to store it: bit-identical (785 MB), small-and-sharable (16 MB), or postcard-sized (4 KB). Listen to all three."
 tags: c, machinelearning, tts, audio
 ---
 
 *Part of [qwen3-tts](https://github.com/gabriele-mastrapasqua/qwen3-tts) — a pure C inference engine for Qwen3-TTS.*
 
-## TL;DR — listen first, read later
+## TL;DR
 
-I took ~30 seconds of freely-licensed speech from public-domain recordings, ran it through an ECAPA-TDNN speaker encoder I implemented from scratch in C, and generated new speech in the same voice. The result is a `.qvoice` file you can share, reload, and mix with style prompts on a different model variant.
+30 s of public-domain speech → ECAPA-TDNN speaker encoder (written from scratch in C) → a portable voice file. That voice can be stored three ways, and each trade-off is audible:
 
-The interesting part isn't that it works — it's that **the same clone can be stored three ways, and each trade-off is audible**:
+| Format | Size | Fidelity | Use it when… |
+|--------|------|----------|--------------|
+| 🥇 `.qvoice` **WDELTA** (LZ4 full delta) | **785 MB** | **Bit-identical** (mel corr **1.000**) | You want perfect reproducibility and instruct-style support |
+| 🥈 `.qvoice` **standard** (TPAD + WOVR) | **16 MB** | Good; small prosody drift | Default for sharing — fits in chat, sounds right |
+| 🥉 `.bin` **embedding only** | **4 KB** | ~60–70 % — voice drifts | You only have a postcard of bytes to spend |
 
-| Format      | File size | Fidelity         | What's inside                                   |
-|-------------|-----------|------------------|-------------------------------------------------|
-| `.bin`      | 4 KB      | ~60–70%          | Just the 1024-float speaker embedding           |
-| `.qvoice` standard | 16 MB     | Good, prosody drifts | Embedding + `text_projection` + `codec_embedding` |
-| `.qvoice` WDELTA   | **785 MB**    | **Bit-identical**    | LZ4-compressed weight deltas for all layers     |
-
-Scroll down and hear them back to back.
+All audio below is hosted in the same repo — press play, no download needed.
 
 ---
 
-## The reference voices (CC / public domain)
+## Samples — listen for yourself
 
-All input audio below is either public domain or Creative Commons. Sources and licenses are linked next to each sample.
+Hero comparison: **same reader, same text, same seed, three formats.** Ordered top → light.
 
-All four clips are 30-second excerpts taken from the 30-second mark of the original
-recording (skipping the LibriVox preamble), downmixed to 24 kHz mono PCM.
+### 🇮🇹 Italian — *Galatea* read by Riccardo Fasol
 
-### 🇮🇹 Italian — *Galatea* by Anton Giulio Barrili
+> *"Buongiorno a tutti, oggi vi racconto una breve storia, con la voce clonata da una registrazione libera."*
 
-- **Reader:** Riccardo Fasol (solo)
-- **Source:** [archive.org/details/galatea_0908_librivox](https://archive.org/details/galatea_0908_librivox)
-- **License:** Public Domain (LibriVox)
+| # | What | Audio |
+|---|------|-------|
+| 📥 | **Input reference** — 30 s from [LibriVox *Galatea*, Barrili](https://archive.org/details/galatea_0908_librivox) • solo: Riccardo Fasol • PD | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav"></audio> |
+| 🥇 | **Top — WDELTA, 785 MB** (bit-identical) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav"></audio> |
+| 🥈 | **Mid — standard `.qvoice`, 16 MB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_standard_16mb.wav"></audio> |
+| 🥉 | **Light — `.bin`, 4 KB** (embedding only) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_bin_4kb.wav"></audio> |
 
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav">Download WAV</a>
-</audio>
+### 🇬🇧 English — *The Gifts of the Magi* read by Phil Chenevert
 
-### 🇬🇧 English — *The Gifts of the Magi* by O. Henry
+> *"Hello everyone, today I am speaking with a voice cloned from a freely licensed recording."*
 
-- **Reader:** Phil Chenevert (solo)
-- **Source:** [archive.org/details/5belovedstories_ohenry_pc_librivox](https://archive.org/details/5belovedstories_ohenry_pc_librivox)
-- **License:** CC0 / Public Domain
+| # | What | Audio |
+|---|------|-------|
+| 📥 | **Input reference** — 30 s from [LibriVox *Five Beloved Stories*, O. Henry](https://archive.org/details/5belovedstories_ohenry_pc_librivox) • solo: Phil Chenevert • CC0 | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav"></audio> |
+| 🥇 | **Top — WDELTA, 785 MB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav"></audio> |
+| 🥈 | **Mid — standard `.qvoice`, 16 MB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_standard_16mb.wav"></audio> |
+| 🥉 | **Light — `.bin`, 4 KB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_bin_4kb.wav"></audio> |
 
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav">Download WAV</a>
-</audio>
+### Extra languages — top quality only
 
-### 🇪🇸 Spanish — *Don Quijote* by Miguel de Cervantes
+Different reader per language, WDELTA-equivalent output (Base-native clone, no `.qvoice` indirection).
 
-- **Reader:** Lu (solo)
-- **Source:** [archive.org/details/donquijote_2507_librivox](https://archive.org/details/donquijote_2507_librivox)
-- **License:** Public Domain (LibriVox)
+| Lang | Reader & source | Input | Cloned output |
+|------|----------------|-------|---------------|
+| 🇪🇸 Spanish | Lu, [*Don Quijote* (LibriVox, PD)](https://archive.org/details/donquijote_2507_librivox) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav"></audio> | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav"></audio> |
+| 🇫🇷 French | Bidou, [*Le dernier jour d'un condamné* (LibriVox, PD)](https://archive.org/details/dernierjour_2203_librivox) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav"></audio> | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav"></audio> |
 
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav">Download WAV</a>
-</audio>
+### Cost table — how much you pay for each tier
 
-### 🇫🇷 French — *Le dernier jour d'un condamné* by Victor Hugo
+All numbers on Apple M1 8-core, 16 GB RAM, 4 threads, 0.6B model, cold start.
 
-- **Reader:** Bidou (solo)
-- **Source:** [archive.org/details/dernierjour_2203_librivox](https://archive.org/details/dernierjour_2203_librivox)
-- **License:** Public Domain (LibriVox)
+| Format | File size | Create `.qvoice` | Generate (wall) | What's inside |
+|--------|-----------|-----------------|----------------|---------------|
+| `.bin` | 4 KB | ~20.8 s | ~11 s | 1024 ECAPA-TDNN floats |
+| standard `.qvoice` | 16 MB | ~19.6 s | ~9.6 s | Embedding + `text_projection` + `codec_embedding` + pad embeds |
+| WDELTA `.qvoice` | 785 MB | ~28.5 s | ~13.8 s | LZ4 int16 deltas for all 402 talker + CP tensors |
 
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav">Download WAV</a>
-</audio>
+Verdict: **standard 16 MB is the sensible default.** Go to WDELTA only when you need bit-identical output or to combine a cloned voice with `--instruct` style control (1.7B). Go to `.bin` only if 4 KB is the whole budget.
 
----
-
-## The three storage formats, side by side
-
-Same reference audio, same text, same seed (42), same 0.6B CustomVoice model at generation time. Only the `.qvoice` format changes. Wall times measured on Apple M1 8-core, 16 GB RAM, 4 threads.
-
-### Summary
-
-| Format | File size | Create time | Generate wall | What's inside |
-|--------|-----------|-------------|--------------|---------------|
-| `.bin` (embedding only) | **4.0 KB** | ~20.8 s | ~11 s | 1024 ECAPA-TDNN floats |
-| `.qvoice` standard (TPAD + WOVR) | **16.0 MB** | ~19.6 s | ~9.6 s | Embedding + source `text_projection` + `codec_embedding` + pad embeds |
-| `.qvoice` WDELTA (LZ4 full delta) | **785 MB** | ~28.5 s | ~13.8 s | LZ4 int16 deltas for all 402 transformer + CP tensors |
-
-Create time includes the full 30-s reference audio pass through ECAPA-TDNN (~200 ms) plus model load + weight-delta scan (WDELTA only). Generate wall is cold-start: mmap + optional LZ4 decompress + inference.
-
-### 🇮🇹 Italian — *Galatea* / Fasol
-
-Same text for all three: *"Buongiorno a tutti, oggi vi racconto una breve storia, con la voce clonata da una registrazione libera."*
-
-**4 KB — `.bin`, embedding only.** A single 1024-float vector — the raw output of ECAPA-TDNN, nothing else. Recognizable voice, but prosody and micro-timing drift noticeably.
-
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_bin_4kb.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_bin_4kb.wav">Download WAV</a>
-</audio>
-
-**16 MB — standard `.qvoice` (TPAD + WOVR).** Adds the source model's `tts_pad` embedding and overrides of `text_projection` + `codec_embedding`. Good fidelity, small enough to share over chat, but the autoregressive "butterfly effect" still causes subtle prosody drift.
-
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_standard_16mb.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_standard_16mb.wav">Download WAV</a>
-</audio>
-
-**785 MB — WDELTA (LZ4-compressed full weight delta).** Stores int16 deltas for every transformer + code-predictor tensor, LZ4-compressed. At load time the CV model's weights are corrected to exactly match the Base model that did the cloning. Mel correlation **1.000**, PCM bit-identical.
-
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav">Download WAV</a>
-</audio>
-
-### 🇬🇧 English — O. Henry / Chenevert
-
-Same text for all three: *"Hello everyone, today I am speaking with a voice cloned from a freely licensed recording."*
-
-**4 KB — `.bin`:**
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_bin_4kb.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_bin_4kb.wav">Download WAV</a>
-</audio>
-
-**16 MB — standard `.qvoice`:**
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_standard_16mb.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_standard_16mb.wav">Download WAV</a>
-</audio>
-
-**785 MB — WDELTA:**
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav">Download WAV</a>
-</audio>
-
-Listening side by side: the 4 KB version sounds like "someone vaguely similar", the 16 MB sounds close but with slightly different pacing, and the 785 MB is indistinguishable from running the Base model directly every time. In practice the 16 MB standard format is the sensible default for sharing; WDELTA is for cases where bit-identical reproducibility and instruct-style support matter more than disk space.
-
----
-
-## Multilingual clones — one voice per language
-
-Each language uses its own CC-licensed reference voice. The clone keeps the speaker's
-timbre and prosody while speaking a completely different sentence. All generated at
-0.6B-Base, seed 42.
-
-### 🇮🇹 Italian — cloned from Fasol / *Galatea*
-> "Buongiorno a tutti, oggi vi racconto una breve storia, con la voce clonata da una registrazione libera."
-
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_galatea.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_galatea.wav">Download WAV</a>
-</audio>
-
-### 🇬🇧 English — cloned from Chenevert / *O. Henry*
-> "Hello everyone, today I am speaking with a voice cloned from a freely licensed recording."
-
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_ohenry.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_ohenry.wav">Download WAV</a>
-</audio>
-
-### 🇪🇸 Spanish — cloned from Lu / *Don Quijote*
-> "Hola a todos, hoy les hablo con una voz clonada a partir de una grabación de dominio público."
-
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav">Download WAV</a>
-</audio>
-
-### 🇫🇷 French — cloned from Bidou / Hugo
-> "Bonjour à tous, aujourd'hui je vous parle avec une voix clonée à partir d'un enregistrement libre."
-
-<audio controls src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav">
-  <a href="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav">Download WAV</a>
-</audio>
+All input clips are 30-second excerpts from the 30 s mark (skipping the LibriVox preamble), 24 kHz mono PCM. Full attribution in [`samples/voice_clone_refs/ATTRIBUTION.md`](https://github.com/gabriele-mastrapasqua/qwen3-tts/blob/main/samples/voice_clone_refs/ATTRIBUTION.md).
 
 ---
 
