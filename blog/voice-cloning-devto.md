@@ -1,5 +1,5 @@
 ---
-title: "Qwen3-TTS voice cloning in a pure C engine — 785 MB, 16 MB, or 4 KB?"
+title: "Extending Qwen3-TTS: clone voices once, reuse everywhere (pure C)"
 published: false
 description: "Clone a voice from 30 seconds of public-domain audio in pure C, then choose how to store it: bit-identical (785 MB), small-and-sharable (16 MB), or postcard-sized (4 KB). Listen to all three."
 tags: c, machinelearning, tts, audio
