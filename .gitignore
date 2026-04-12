@@ -1,6 +1,7 @@
 *.o
 *.wav
 !samples/*.wav
+!samples/voice_clone_refs/**
 *.py
 qwen_tts
 qwen_tts_py/
