@@ -11,50 +11,71 @@ tags: c, machinelearning, tts, audio
 
 30 s of public-domain speech → ECAPA-TDNN speaker encoder (written from scratch in C) → a portable voice file. That voice can be stored three ways, and each trade-off is audible:
 
-| Format | Size | Fidelity | Use it when… |
-|--------|------|----------|--------------|
-| 🥇 `.qvoice` **WDELTA** (LZ4 full delta) | **785 MB** | **Bit-identical** (mel corr **1.000**) | You want perfect reproducibility and instruct-style support |
-| 🥈 `.qvoice` **standard** (TPAD + WOVR) | **16 MB** | Good; small prosody drift | Default for sharing — fits in chat, sounds right |
-| 🥉 `.bin` **embedding only** | **4 KB** | ~60–70 % — voice drifts | You only have a postcard of bytes to spend |
+| Format | Size | Mel correlation vs Base | Fidelity | Use it when… |
+|--------|------|------------------------|----------|--------------|
+| 🥇 `.qvoice` **WDELTA** (LZ4 full delta) | **785 MB** | **1.000** (bit-identical) | Perfect, PCM-identical | You want perfect reproducibility and instruct-style support |
+| 🥈 `.qvoice` **standard** (TPAD + WOVR) | **16 MB** | **0.71** | Good; small prosody drift | Default for sharing — fits in chat, sounds right |
+| 🥉 `.bin` **embedding only** | **4 KB** | *not measured* (~60–70 % subjective) | Voice drifts, timbre loose | You only have a postcard of bytes to spend |
 
-All audio below is hosted in the same repo — press play, no download needed.
+All audio below is hosted in the same repo — click ▶️ to play.
 
 ---
 
 ## Samples — listen for yourself
 
-Hero comparison: **same reader, same text, same seed, three formats.** Ordered top → light.
+> 📌 *Most markdown renderers (GitHub, dev.to) strip `<audio>` tags from inside table cells. The inline players below live outside tables so they render everywhere; each entry also has a direct `[wav]` download link as a fallback.*
 
-### 🇮🇹 Italian — *Galatea* read by Riccardo Fasol
+### 🇮🇹 Italian — *Galatea* / Riccardo Fasol · [LibriVox, PD](https://archive.org/details/galatea_0908_librivox)
 
 > *"Buongiorno a tutti, oggi vi racconto una breve storia, con la voce clonata da una registrazione libera."*
 
-| # | What | Audio |
-|---|------|-------|
-| 📥 | **Input reference** — 30 s from [LibriVox *Galatea*, Barrili](https://archive.org/details/galatea_0908_librivox) • solo: Riccardo Fasol • PD | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav"></audio> |
-| 🥇 | **Top — WDELTA, 785 MB** (bit-identical) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav"></audio> |
-| 🥈 | **Mid — standard `.qvoice`, 16 MB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_standard_16mb.wav"></audio> |
-| 🥉 | **Light — `.bin`, 4 KB** (embedding only) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_bin_4kb.wav"></audio> |
+📥 **Input reference** — 30 s from LibriVox · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/it_galatea_fasol.wav"></audio>
 
-### 🇬🇧 English — *The Gifts of the Magi* read by Phil Chenevert
+🥇 **Top — WDELTA, 785 MB** (mel 1.000, bit-identical) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_wdelta_785mb.wav"></audio>
+
+🥈 **Mid — standard `.qvoice`, 16 MB** (mel 0.71) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_standard_16mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_standard_16mb.wav"></audio>
+
+🥉 **Light — `.bin`, 4 KB** (embedding only) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_bin_4kb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_it_bin_4kb.wav"></audio>
+
+### 🇬🇧 English — *The Gifts of the Magi* / Phil Chenevert · [LibriVox, CC0](https://archive.org/details/5belovedstories_ohenry_pc_librivox)
 
 > *"Hello everyone, today I am speaking with a voice cloned from a freely licensed recording."*
 
-| # | What | Audio |
-|---|------|-------|
-| 📥 | **Input reference** — 30 s from [LibriVox *Five Beloved Stories*, O. Henry](https://archive.org/details/5belovedstories_ohenry_pc_librivox) • solo: Phil Chenevert • CC0 | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav"></audio> |
-| 🥇 | **Top — WDELTA, 785 MB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav"></audio> |
-| 🥈 | **Mid — standard `.qvoice`, 16 MB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_standard_16mb.wav"></audio> |
-| 🥉 | **Light — `.bin`, 4 KB** | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_bin_4kb.wav"></audio> |
+📥 **Input reference** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/en_ohenry_chenevert.wav"></audio>
 
-### Extra languages — top quality only
+🥇 **Top — WDELTA, 785 MB** (mel 1.000) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_wdelta_785mb.wav"></audio>
 
-Different reader per language, WDELTA-equivalent output (Base-native clone, no `.qvoice` indirection).
+🥈 **Mid — standard `.qvoice`, 16 MB** (mel 0.71) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_standard_16mb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_standard_16mb.wav"></audio>
 
-| Lang | Reader & source | Input | Cloned output |
-|------|----------------|-------|---------------|
-| 🇪🇸 Spanish | Lu, [*Don Quijote* (LibriVox, PD)](https://archive.org/details/donquijote_2507_librivox) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav"></audio> | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav"></audio> |
-| 🇫🇷 French | Bidou, [*Le dernier jour d'un condamné* (LibriVox, PD)](https://archive.org/details/dernierjour_2203_librivox) | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav"></audio> | <audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav"></audio> |
+🥉 **Light — `.bin`, 4 KB** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_bin_4kb.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_en_bin_4kb.wav"></audio>
+
+### 🇪🇸 Spanish — *Don Quijote* / Lu · [LibriVox, PD](https://archive.org/details/donquijote_2507_librivox)
+
+> *"Hola a todos, hoy les hablo con una voz clonada a partir de una grabación de dominio público."*
+
+📥 **Input reference** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/es_quijote_lu.wav"></audio>
+
+🥇 **Top clone** (Base-native, WDELTA-equivalent) · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_es_quijote.wav"></audio>
+
+### 🇫🇷 French — *Le dernier jour d'un condamné* / Bidou · [LibriVox, PD](https://archive.org/details/dernierjour_2203_librivox)
+
+> *"Bonjour à tous, aujourd'hui je vous parle avec une voix clonée à partir d'un enregistrement libre."*
+
+📥 **Input reference** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/fr_hugo_bidou.wav"></audio>
+
+🥇 **Top clone** · [wav](https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav)
+<audio controls preload="none" src="https://raw.githubusercontent.com/gabriele-mastrapasqua/qwen3-tts/main/samples/voice_clone_refs/outputs/out_fr_hugo.wav"></audio>
 
 ### Cost table — how much you pay for each tier
 
