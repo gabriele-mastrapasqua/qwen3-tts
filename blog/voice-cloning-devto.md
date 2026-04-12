@@ -23,8 +23,6 @@ All audio below is hosted in the same repo — click ▶️ to play.
 
 ## Samples — listen for yourself
 
-> 📌 *Most markdown renderers (GitHub, dev.to) strip `<audio>` tags from inside table cells. The inline players below live outside tables so they render everywhere; each entry also has a direct `[wav]` download link as a fallback.*
-
 ### 🇮🇹 Italian — *Galatea* / Riccardo Fasol · [LibriVox, PD](https://archive.org/details/galatea_0908_librivox)
 
 > *"Buongiorno a tutti, oggi vi racconto una breve storia, con la voce clonata da una registrazione libera."*
