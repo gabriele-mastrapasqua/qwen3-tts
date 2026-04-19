@@ -625,6 +625,82 @@ could tip the balance.
 
 ---
 
+### Phase 19: Long-Form Generation Test (Audiobook-style)
+
+**Goal**: Stress-test the engine on long-running synthesis with a custom voice, e.g. one
+full book chapter (Italian) — a realistic audiobook use case. Doubles as a long-running
+soak test for memory leaks, RTF drift, KV cache growth, and thermal throttling.
+
+**Why**: Current tests are short phrases. We have no signal on:
+- Memory leaks / fragmentation over thousands of frames
+- RTF degradation across a multi-minute run
+- Stability of KV cache and sampler state over many consecutive utterances
+- UX for a run that will realistically take many minutes
+
+**Ideas to explore**:
+- [ ] `[MED]` Batch/chapter mode: input is a text file (or chapter split into paragraphs),
+  output is one long WAV (or per-paragraph WAVs + concat)
+- [ ] `[MED]` CLI progress indicator: `[chunk i/N] elapsed Xs, ETA Ys, RTF=Z` on stderr
+  (respect `--silent`); include running avg RTF and per-chunk RTF to spot drift
+- [ ] `[MED]` Long-run telemetry: periodic RSS dump, RTF per chunk, optional CSV log
+  for post-mortem plots (detect leaks / thermal throttling)
+- [ ] `[LOW]` Resumability: checkpoint at paragraph boundary so a crash/cancel doesn't
+  lose the whole chapter
+- [ ] `[LOW]` Reference target: 1 Italian chapter (~N minutes of audio) with custom voice
+  (e.g. Silvio via .qvkv) as the canonical long-form test input
+- [ ] `[LOW]` Add `make test-longform` target running the chapter test and asserting
+  no RTF regression vs a baseline
+
+#### Lightweight markup format (no XML, zero deps)
+
+Professional audiobooks use SSML (XML) or hand-annotated scripts. SSML is the industry
+standard but needs an XML parser — overkill for our use. Instead, define a **minimal
+bracket-based markup** parseable with a tiny hand-written tokenizer in C:
+
+```
+[pause:500]          → insert 500 ms of silence in the WAV
+[pause:short]        → aliases: short=300ms, medium=700ms, long=1500ms, scene=2500ms
+[emph]parola[/emph]  → wrap chunk, hint the model via instruct ("emphasize 'parola'")
+[voice:silvio]       → switch active custom voice (.qvkv) until next [voice:...]
+[instruct: slow, sad tone] ...text... [/instruct]   → per-chunk instruct prompt (1.7B only)
+[pron:schedule=ˈskɛdjuːl]   → pronunciation override (future, if needed)
+# comment line       → ignored, for human annotations in the script
+\n\n                 → paragraph boundary → auto [pause:medium]
+.  !  ?              → sentence boundary → auto [pause:short]
+```
+
+Rules:
+- Chunks are split on markup boundaries; each chunk is a separate synthesis call
+- Silences are raw PCM zeros spliced into the output WAV (no model cost)
+- Unknown tags are logged and stripped (forward-compatible)
+- Plain txt works as-is: auto-pauses on `.`/`?`/`!`/`\n\n`, no tags needed
+
+- [ ] `[MED]` Define the grammar formally (single-pass scanner, no regex, no XML)
+- [ ] `[MED]` Implement parser + chunk scheduler in a new `qwen_tts_script.c`
+- [ ] `[LOW]` Produce a realistic sample script: take one public-domain Italian chapter
+  (e.g. Pinocchio cap. 1, Pirandello, or Promessi Sposi) and hand-annotate it with
+  pauses/emphasis/voice switches as a reference fixture under `samples/longform/`
+- [ ] `[LOW]` Ship 2 fixtures: `chapter_plain.txt` (no markup) and `chapter_annotated.qts`
+  (same text, fully annotated) — diff them to showcase the format
+
+Example annotated fragment (invented but realistic, Pinocchio-style):
+
+```
+# Capitolo 1 — Come andò che Mastro Ciliegia...
+[voice:silvio]
+[instruct: narrator, warm, slightly amused tone]
+C'era una volta...[pause:short] —[pause:200] Un re! —[pause:medium]
+diranno subito i miei piccoli lettori.[pause:long]
+
+No, ragazzi, avete [emph]sbagliato[/emph]. C'era una volta un [emph]pezzo di legno[/emph].
+[pause:scene]
+
+Non era un legno di lusso, ma un semplice pezzo da catasta...
+[/instruct]
+```
+
+---
+
 ## References
 
 - [Qwen3-TTS GitHub](https://github.com/QwenLM/Qwen3-TTS)
