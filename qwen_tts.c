@@ -483,8 +483,8 @@ static void *decoder_thread_fn(void *arg) {
 qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8, int use_int4) {
     qwen_tts_ctx_t *ctx = (qwen_tts_ctx_t *)calloc(1, sizeof(qwen_tts_ctx_t)); if (!ctx) return NULL;
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
-    ctx->temperature = 0.5f; ctx->top_k = 50; ctx->top_p = 1.0f; ctx->rep_penalty = 1.05f;
-    ctx->max_tokens = 8192; ctx->cp_temperature = 0.0f; ctx->cp_top_k = 1;
+    ctx->temperature = 0.9f; ctx->top_k = 50; ctx->top_p = 1.0f; ctx->rep_penalty = 1.05f;
+    ctx->max_tokens = 8192; ctx->cp_temperature = 0.9f; ctx->cp_top_k = 50;
     ctx->stream_chunk_frames = 10; /* default: 10 frames = 0.8s audio per chunk */
     /* Default speaker: Ryan (3061) - native English speaker
      * Serena (3066) and others are Chinese speakers which may cause issues with English */
