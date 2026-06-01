@@ -863,8 +863,11 @@ We already have streaming scaffolding (`qwen_sd_stream_state_t`, `qwen_sd_stream
   Smaller chunk halves TTFA (10→2: 1571→829) but worsens RTF — the windowed decoder
   recomputes `conv_rf=20` context frames per chunk, so small chunks waste decode work
   (chunk 3 decodes 23 frames, keeps 3). TTFA floors at ~830 ms (prefill-dominated).
-- [ ] `[HIGH]` **Ramped chunk size** (the real win): tiny first chunk (2–3) for low TTFA,
-  then ramp to 10+ for throughput → best of both (TTFA ~830 ms AND RTF ~1.24). Andres-style.
+- [x] `[HIGH]` **Ramped chunk size** (the real win): in streaming mode the decoder thread
+  emits a small FIRST chunk (2 frames) then falls back to the configured chunk size.
+  Validated (0.6B int8, warm): **TTFA 1571→822 ms (−48%) at RTF 1.21** — the low TTFA of a
+  2-frame chunk AND the throughput of a 10-frame chunk. One-time first-chunk decode tax is
+  negligible. (`qwen_tts.c` decoder_thread_fn: `if first_chunk && ctx->stream → target=2`.)
 - Note: the "25-frame left context" idea is moot — our decoder is already chunk-invariant to
   ±1 LSB (see 18.6); chunk SIZE (not left-context) is the TTFA knob.
 

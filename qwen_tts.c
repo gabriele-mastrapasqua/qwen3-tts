@@ -443,7 +443,14 @@ static void *decoder_thread_fn(void *arg) {
     for (;;) {
         int avail, is_done;
         pthread_mutex_lock(&dt->mutex);
-        while (dt->write_pos - dt->read_pos < dt->chunk_frames && !dt->done)
+        /* Ramped chunking: in streaming mode, emit a small FIRST chunk for low
+         * TTFA, then fall back to the full chunk size for throughput. The
+         * one-time small chunk costs a little extra decode (conv_rf recompute)
+         * but only once, so overall RTF is unaffected. */
+        int target = dt->chunk_frames;
+        if (dt->first_chunk_ms == 0 && dt->ctx->stream && target > 2)
+            target = 2;
+        while (dt->write_pos - dt->read_pos < target && !dt->done)
             pthread_cond_wait(&dt->cond, &dt->mutex);
         avail = dt->write_pos - dt->read_pos;
         is_done = dt->done;
