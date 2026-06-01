@@ -682,58 +682,12 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
                            const int8_t *Wk, const float *sk,
                            const int8_t *Wv, const float *sv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
-#if defined(__APPLE__) && defined(__BLOCKS__)
-    int nt = g_n_threads;
-    if (nt > 1) {
-        int total = q_dim + 2 * kv_dim;
-        dispatch_apply((size_t)nt,
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                       ^(size_t tid) {
-            qwen_ftz_on();  /* per GCD worker: flush int8-induced denormals */
-            int r0 = (int)tid * total / nt;
-            int r1 = (int)(tid + 1) * total / nt;
-            for (int r = r0; r < r1; r++) {
-                float *dst;
-                const int8_t *W;
-                const float *sc;
-                int dim;
-                if (r < q_dim) {
-                    dst = q; W = Wq; sc = sq; dim = q_dim;
-                } else if (r < q_dim + kv_dim) {
-                    dst = k; W = Wk; sc = sk; dim = kv_dim;
-                    r -= q_dim;
-                } else {
-                    dst = v; W = Wv; sc = sv; dim = kv_dim;
-                    r -= q_dim + kv_dim;
-                }
-                (void)dim;
-                const int8_t *row = W + (size_t)r * in_dim;
-                float sum = 0.0f;
-#ifdef __ARM_NEON
-                float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
-                int kk = 0;
-                for (; kk + 7 < in_dim; kk += 8) {
-                    int8x8_t rr = vld1_s8(row + kk);
-                    int16x8_t r16 = vmovl_s8(rr);
-                    a0 = vfmaq_f32(a0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(r16))),
-                                   vld1q_f32(x + kk));
-                    a1 = vfmaq_f32(a1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(r16))),
-                                   vld1q_f32(x + kk + 4));
-                }
-                sum = vaddvq_f32(vaddq_f32(a0, a1));
-                for (; kk < in_dim; kk++) sum += (float)row[kk] * x[kk];
-#else
-                for (int kk = 0; kk < in_dim; kk++) sum += (float)row[kk] * x[kk];
-#endif
-                dst[r] = sum * sc[r];
-            }
-        });
-        return;
-    }
-#endif
-    int8_matvec_fused(q, x, Wq, sq, in_dim, q_dim);
-    int8_matvec_fused(k, x, Wk, sk, in_dim, kv_dim);
-    int8_matvec_fused(v, x, Wv, sv, in_dim, kv_dim);
+    /* The inline threaded qkv block hung at 4 threads on int8-induced denormals
+     * even with FTZ set in-block; the per-projection fused matvec is robust.
+     * qwen_matvec_int8 dispatches across threads and sets FTZ in each worker. */
+    qwen_matvec_int8(q, Wq, sq, x, q_dim, in_dim);
+    qwen_matvec_int8(k, Wk, sk, x, kv_dim, in_dim);
+    qwen_matvec_int8(v, Wv, sv, x, kv_dim, in_dim);
 }
 
 int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,

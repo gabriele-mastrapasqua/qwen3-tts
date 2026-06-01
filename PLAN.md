@@ -185,16 +185,26 @@ At 42% bandwidth utilization, the gap is overhead, not raw throughput.
 > never really usable — combined with the old "silently skipped" bug, the "+14%/recommended"
 > claim was never validated against a real int8 run.
 >
-> **STILL OPEN (multi-thread):** with FTZ added to all GCD worker matvec blocks + main thread,
-> `-j1` works but the **default 4-thread run still hangs**. `sample` pins it at 100% in
-> `qwen_matvec_int8_qkv`'s inline GCD block (`__qwen_matvec_int8_qkv_block_invoke`) during
-> `qwen_talker_step` — even though FTZ is set at the top of that block. The fused-path (`-j1`)
-> int8 qkv works but the threaded **inline NEON qkv** path does not. Hypotheses to try next:
-> (1) route int8 qkv through the fused path always (drop the inline block); (2) check whether
-> FZ truly flushes denormal *inputs* in that NEON FMA sequence on Apple Silicon (may need to
-> pre-flush `x`, or the denormals are produced upstream and the real fix is numerical, not FTZ).
-> NOTE: prefill uses `cblas_sgemm` (Accelerate, own threads) — not the cause here (hang is in
-> the per-token step, post-prefill).
+> ✅ **FIXED (June 2026).** Two changes unblocked `--int8`:
+> 1. `qwen_ftz_on()` (FPCR FZ bit24 / x86 MXCSR FTZ+DAZ) set on the main thread and in every
+>    GCD worker matvec block — flushes the int8-induced denormals.
+> 2. **Routed `qwen_matvec_int8_qkv` through the fused path** (`qwen_matvec_int8` per q/k/v)
+>    instead of its hand-written inline GCD/NEON block. `sample` had pinned the 4-thread hang
+>    in that inline block (`__qwen_matvec_int8_qkv_block_invoke`) even with FTZ set in it; the
+>    fused path is robust. (Prefill's `cblas_sgemm` was never the cause — hang was in the
+>    per-token step.)
+>
+> **Validated result (1.7B, Italian, seed 42, ryan, M1 4 threads):**
+> | | BF16 | INT8 | Δ |
+> |---|---|---|---|
+> | Talker | 65.8 ms/f | **45.9 ms/f** | **−30%** |
+> | RTF | 2.66 | **1.88** | **−29%** |
+>
+> INT8 now reaches EOS normally (frame 59 vs bf16 57) and produces coherent speech (rms/max/
+> silence-ratio match bf16). CP unchanged (still gated off, hidden=1024). This is the real,
+> validated INT8 Talker win — the old "+14%" was never actually exercised (silently-skipped
+> bug). NEXT: enable INT8 for the CP too (drop/adjust the `cp_h>=2048` gate now that the
+> denormal hang is fixed) — should speed up the CP (90% matvec) on BOTH models.
 
 INT8 for CP specifically. The CP is greedy (temp=0, argmax) so quantization has zero
 quality impact on output. The Talker INT8 was 0% on 0.6B but the CP has different
