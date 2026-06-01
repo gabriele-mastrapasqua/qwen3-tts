@@ -104,6 +104,15 @@ Two structural facts drive the map:
     fine on the greedy CP AND the sampled 1.7B Talker. Selective-SDOT (down_proj legacy) NOT needed.
 - [ ] `[MED]` **Extend SDOT to CP lm_heads.** `qwen_argmax_matvec_int8` (15 lm_heads/frame, 4.3% of
   CP) still uses the f32 path — small but free. (VNNI is the x86 twin, 21.3, needs the rented box.)
+
+> ⚠️ **SDOT is ARM-only (`vdotq_s32`, guarded by `__ARM_FEATURE_DOTPROD`).** On x86 the whole
+> int8 matvec already falls to **scalar** (no AVX2 — `qwen_tts_kernels_avx.c` is empty, see 21.5),
+> so x86 gets neither the SDOT win nor even the NEON int8 path; it runs scalar + single-thread.
+> **TODO (x86, after ARM lands):** write the equivalent native int8 dot with **VNNI**
+> (`_mm256_dpbusds_epi32` / AVX512-VNNI) PLUS the baseline AVX2 int8/bf16 matvec it builds on, and
+> **re-audit the full x86 path** (today it's all scalar — measure real x86 RTF, it has never been
+> benchmarked). Gated on the rented AVX512 box + Intel SDE in CI (see 21.3 / 21.5). The activation
+> quant (`quantize_act_int8`) is portable C and reusable for the VNNI path.
 - [ ] `[LOW]` No `silvio_17b.qvoice` to test custom voice on 1.7B (needs `qwen3-tts-1.7b-base` to
   create). 1.7B preset already validates the Talker int8+SDOT critical path.
 
