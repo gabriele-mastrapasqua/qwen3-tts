@@ -200,11 +200,25 @@ At 42% bandwidth utilization, the gap is overhead, not raw throughput.
 > | Talker | 65.8 ms/f | **45.9 ms/f** | **−30%** |
 > | RTF | 2.66 | **1.88** | **−29%** |
 >
-> INT8 now reaches EOS normally (frame 59 vs bf16 57) and produces coherent speech (rms/max/
-> silence-ratio match bf16). CP unchanged (still gated off, hidden=1024). This is the real,
-> validated INT8 Talker win — the old "+14%" was never actually exercised (silently-skipped
-> bug). NEXT: enable INT8 for the CP too (drop/adjust the `cp_h>=2048` gate now that the
-> denormal hang is fixed) — should speed up the CP (90% matvec) on BOTH models.
+> INT8 now reaches EOS normally and produces coherent speech. This is the real, validated
+> INT8 Talker win — the old "+14%" was never actually exercised (silently-skipped bug).
+>
+> ✅ **CP INT8 also enabled & validated (June 2026).** Dropped the `cp_h>=2048` gate (it was a
+> workaround for the now-fixed denormal hang). `--int8` now quantizes the CP on BOTH models.
+> Validated (Italian, seed 42, ryan, M1 4 threads, same sentence):
+> | Model | Config | CP ms/f | Talker ms/f | RTF |
+> |---|---|---|---|---|
+> | 0.6B | BF16 | 74.9 | 24.0 | 1.70 |
+> | **0.6B** | **INT8** | **58.2 (−22%)** | 23.2 | **1.29 (−24%)** |
+> | 1.7B | BF16 | ~64 | 65.8 | 2.66 |
+> | **1.7B** | **INT8 (Talker+CP)** | **59.2** | **49.7** | **1.79 (−33%)** |
+>
+> Both EOS normally, coherent speech (rms/max match bf16). **Biggest win is on the 0.6B**:
+> `--int8` previously did NOTHING there (and CP int8 hung); now RTF 1.70→1.29. The CP is ~90%
+> matvec and identical (hidden=1024) on both models, so quantizing it pays off on both.
+> Recommend `--int8` as a default-worthy speed option on 0.6B now (verify perceptual quality).
+> Known minor: `make cp-microbench` leaves -DCP_MICROBENCH .o files that break a subsequent
+> plain `make blas` (undefined `qwen_cp_microbench_report`) → run `make clean` first.
 
 INT8 for CP specifically. The CP is greedy (temp=0, argmax) so quantization has zero
 quality impact on output. The Talker INT8 was 0% on 0.6B but the CP has different

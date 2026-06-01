@@ -271,9 +271,10 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     ctx->cp_rope_cache_len = cp_kv_max;
 
     /* INT8 quantization of CP weights (optional, enabled by --int8 flag).
-     * Skip on 0.6B (hidden=1024): INT8 quantization of small matrices causes
-     * numerical issues (generation never reaches EOS) and no speed benefit. */
-    if (ctx->use_int8 && cp_h >= 2048) {
+     * The old cp_h>=2048 gate was a workaround for the denormal hang (fixed June
+     * 2026 via FTZ + fused int8 qkv). CP is hidden=1024 on BOTH models and is the
+     * per-frame bottleneck (~90% matvec), so quantizing it helps 0.6B and 1.7B. */
+    if (ctx->use_int8) {
         if (!ctx->silent)
             fprintf(stderr, "  Quantizing CP weights to INT8 (per-row absmax)...\n");
         int cp_inter = c->cp_intermediate_size;
@@ -324,7 +325,7 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     if (!ctx->silent)
         fprintf(stderr, "  Code Predictor: %d layers loaded, q_dim=%d kv_dim=%d%s\n",
                 c->cp_num_layers, cp_q_dim, cp_kv_dim,
-                (ctx->use_int8 && cp_h >= 2048) ? " [INT8]" : "");
+                ctx->use_int8 ? " [INT8]" : "");
 
     return 0;
 }
