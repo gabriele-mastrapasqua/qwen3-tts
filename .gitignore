@@ -23,3 +23,5 @@ qvoices/
 .claude/
 server_stderr.log
 qwen_tts_cpbench
+voices/
+*.qvoice
