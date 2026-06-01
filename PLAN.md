@@ -1010,12 +1010,54 @@ User question: a user asked about AVX512 support; dev hardware is **Apple M1 (AR
 
 ### 20.6 Prerequisite — re-download models `[BLOCKER]`
 
-Local model dirs were **removed** and must be re-downloaded before any of the above can be
-tested/benchmarked:
-- [ ] `./download_model.sh --model small`  → `qwen3-tts-0.6b/`
-- [ ] `./download_model.sh --model large`  → `qwen3-tts-1.7b/` (for 1.7B / INT8 work)
-- [ ] base variants if voice-clone prefill work (20.2) is tackled:
-  `--model base-small` / `--model base-large`
+Local model dirs were removed and re-downloaded this session:
+- [x] `qwen3-tts-0.6b/` (small)  [x] `qwen3-tts-1.7b/` (large)  [x] `qwen3-tts-0.6b-base/` (base-small, for `.qvoice` creation)
+- [ ] `qwen3-tts-1.7b-base/` (only if 1.7B voice-clone work is needed)
+
+---
+
+## Phase 21: Quantization productization + extreme quant + op fusion (NEXT)
+
+> Outcome of the June 2026 session. INT8 went from broken→validated, streaming TTFA −64%.
+> Everything below builds on that. All on `feat/labs`.
+
+### Shipped this session (for reference)
+- **INT8 end-to-end** (Talker+CP, preset + WDELTA `.qvoice`): 0.6B RTF 1.70→1.29 (−24%),
+  1.7B 2.66→1.79 (−33%), quality-validated by ear. Fixes: FTZ for denormals; route int8 qkv
+  through fused path; drop CP `cp_h>=2048` gate; re-quantize after WDELTA override; batched
+  int8 prefill. (See 18.2.)
+- **Streaming TTFA 1571→560 ms (−64%)**: wired `--stream-chunk`, ramped first chunk, batched
+  int8 prefill. (See 20.1.)
+- **Corrected facts**: CP is hidden=1024 on BOTH models (not 2048); INT4 is slower than INT8
+  on CPU (unpack overhead); run-to-run non-determinism is benign ±1 LSB.
+
+### 21.1 INT8 by default + on-disk int8 converter `[task #5]`
+- [ ] Evaluate making `--int8` the **default** (0.6B validated good; confirm across
+  voices/languages/instruct before flipping).
+- [ ] **CLI converter**: save quantized weights to disk → ship int8 model files (~half size),
+  no runtime quant, faster load. Add a load path that reads pre-quantized weights.
+- [ ] Apply int8 to `.qvoice`/WDELTA (currently int16 deltas → int8 deltas ≈ half the file).
+- [ ] `download_model.sh --int8`: download pre-quantized models from our HF repo; KEEP the
+  current path (download originals + quantize locally).
+- **LEGAL ✅**: Qwen3-TTS-12Hz CustomVoice is **Apache-2.0** → quantize + redistribute on our
+  HF account is allowed (keep LICENSE/NOTICE, attribute Qwen, state changes; `Naumius/` precedent).
+
+### 21.2 Extreme quant (int4/int2/int1) — analysis-first `[task #6]`
+- [ ] Re-evaluate int4 NOT in isolation but combined with native low-bit dot or packed
+  kernels — does the unpack tax change? Measured so far: int4 64.3 vs int8 45.9 ms/f (1.7B
+  Talker), int4 loses. int2/int1 with simple absmax = quality death (need group-wise/QAT).
+  Find the real floor and whether any low-bit mode beats int8 on CPU.
+
+### 21.3 INT8 op fusion — "1 command vs 4" `[task #6]`
+- [ ] **Native int8 dot** (ARM **SDOT** / x86 **VNNI**): does 4×int8 MACs in ONE instruction
+  vs the current dequant-to-f32 + FMA (~3 SIMD ops / 4 weights). This is the instruction-level
+  "aggregate 4 ops into 1" — biggest fusion lever. See Phase 15 (already scoped).
+- [ ] **Fewer dispatch barriers**: aggregate adjacent matvecs into a single `dispatch_apply`
+  (qkv + gate_up already fused; look for more). The CP runs 80 matvecs/frame → barrier count
+  matters.
+- [ ] **Fuse dequant + matvec + activation** where adjacent (e.g., gate_up matvec → SwiGLU).
+- Measure each in isolation before committing (session learning: many "obvious" wins were
+  noise or regressions until measured).
 
 ---
 
