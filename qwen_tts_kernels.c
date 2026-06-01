@@ -26,9 +26,28 @@
 #endif
 #endif
 
+/* Flush-to-zero for denormals. INT8 dequant can drive activations into the
+ * subnormal range; denormal FP arithmetic is ~100x slower (looks like a hang).
+ * FTZ is per-thread on ARM (FPCR), so it must be set on every compute thread —
+ * including each GCD worker — not just the main thread. Cheap (~1-2 cycles),
+ * called once per matvec, negligible. Inaudible quality impact. */
+static inline void qwen_ftz_on(void) {
+#if defined(__aarch64__)
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    if (!(fpcr & (1ULL << 24))) {
+        fpcr |= (1ULL << 24); /* FZ: flush-to-zero */
+        __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+    }
+#elif defined(__x86_64__)
+    unsigned int mxcsr = __builtin_ia32_stmxcsr();
+    __builtin_ia32_ldmxcsr(mxcsr | 0x8040); /* FTZ (bit15) | DAZ (bit6) */
+#endif
+}
+
 /* Threading */
 static int g_n_threads = 1;
-void qwen_set_threads(int n) { g_n_threads = n > 0 ? n : 1; }
+void qwen_set_threads(int n) { g_n_threads = n > 0 ? n : 1; qwen_ftz_on(); }
 int qwen_get_threads(void) { return g_n_threads; }
 
 int qwen_get_num_cpus(void) {
@@ -47,6 +66,7 @@ void qwen_init_threads(void) {
     /* 4 threads is the sweet spot for bf16 matvec (memory-bandwidth-bound).
      * More threads add GCD dispatch overhead without bandwidth gain. */
     g_n_threads = ncpus < 4 ? ncpus : 4;
+    qwen_ftz_on();  /* main thread: flush denormals (int8 activations) */
 }
 
 #if defined(__APPLE__)
@@ -405,6 +425,7 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
         dispatch_apply((size_t)nt,
                        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                        ^(size_t tid) {
+            qwen_ftz_on();  /* per GCD worker: flush denormals */
             int r0 = (int)tid * rows / nt;
             int r1 = (int)(tid + 1) * rows / nt;
             bf16_matvec_fused(y + r0, x, W + (size_t)r0 * cols, cols, r1 - r0);
@@ -558,6 +579,7 @@ void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
 /* INT8 matvec inner kernel: process 2 rows at a time (NEON). */
 static void int8_matvec_fused(float *y, const float *x, const int8_t *W,
                                const float *scale, int in_dim, int out_dim) {
+    qwen_ftz_on();  /* runs on each GCD worker — flush int8-induced denormals */
     int o = 0;
 #ifdef __ARM_NEON
     for (; o + 1 < out_dim; o += 2) {
@@ -667,6 +689,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
         dispatch_apply((size_t)nt,
                        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                        ^(size_t tid) {
+            qwen_ftz_on();  /* per GCD worker: flush int8-induced denormals */
             int r0 = (int)tid * total / nt;
             int r1 = (int)(tid + 1) * total / nt;
             for (int r = r0; r < r1; r++) {
@@ -715,6 +738,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
 
 int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
                             int in_dim, int out_dim) {
+    qwen_ftz_on();
     int best = 0;
     float best_val = -1e30f;
     for (int o = 0; o < out_dim; o++) {
@@ -886,6 +910,7 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
         dispatch_apply((size_t)nt,
                        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                        ^(size_t tid) {
+            qwen_ftz_on();  /* per GCD worker: flush int8-induced denormals */
             int r0 = (int)tid * total / nt;
             int r1 = (int)(tid + 1) * total / nt;
             for (int r = r0; r < r1; r++) {

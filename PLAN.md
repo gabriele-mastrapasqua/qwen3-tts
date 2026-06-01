@@ -161,14 +161,48 @@ At 42% bandwidth utilization, the gap is overhead, not raw throughput.
   Store cos/sin as a flat [17 × head_dim] array looked up by index — cheaper than
   the generic RoPE function that handles arbitrary positions.
 
-### 18.2 INT8 Code Predictor (cross-platform, primarily 1.7B)
+### 18.2 INT8 Code Predictor (cross-platform, BOTH models)
+
+> ✅ **CORRECTED via safetensors tensor shapes (June 2026).** The Code Predictor is
+> **structurally IDENTICAL on 0.6B and 1.7B**: hidden=1024, inter=3072, q_dim=2048
+> (num_heads 16 × head_dim 128), 5 layers. Verified from `talker.code_predictor.model.*`
+> tensor shapes (`gate_proj [3072,1024]`, `input_layernorm [1024]`) in BOTH model files.
+> Only the **Talker** differs (0.6B hidden=1024 / 1.7B hidden=2048). The earlier belief that
+> "1.7B CP hidden=2048" was WRONG — it conflated the CP q_dim (2048) or the 1.7B Talker
+> hidden (2048) with the CP hidden (1024).
+>
+> Consequences: (a) the gate `cp_h >= 2048` blocks CP INT8 on **both** models (`--int8` only
+> quantizes the Talker, never the CP — confirmed: 1.7B `--int8` prints "Quantizing Talker"
+> but no CP). (b) There is no "easy 1.7B CP win" — the 1.7B CP is the same 1024-hidden
+> matrices as 0.6B and would hit the same hang. (c) Fixing INT8 CP at hidden=1024 benefits
+> **both** models equally (CP ≈ 77–87 ms/f, 90% matvec, the bottleneck on both).
+
+> 🛑 **ROOT CAUSE of the "hang" found (June 2026): DENORMAL floats.** INT8 dequant drives
+> activations into the subnormal range; denormal FP arithmetic is ~100x slower (looks like a
+> hang, not a runaway — the `-m` cap works, each frame just takes seconds). `-ffast-math` does
+> NOT guarantee flush-to-zero (FTZ) at runtime. Proven: enabling FTZ (FPCR bit 24 on ARM) made
+> single-thread (`-j1`) int8 **complete** instead of hang. Also explains why `--int8` 1.7B was
+> never really usable — combined with the old "silently skipped" bug, the "+14%/recommended"
+> claim was never validated against a real int8 run.
+>
+> **STILL OPEN (multi-thread):** with FTZ added to all GCD worker matvec blocks + main thread,
+> `-j1` works but the **default 4-thread run still hangs**. `sample` pins it at 100% in
+> `qwen_matvec_int8_qkv`'s inline GCD block (`__qwen_matvec_int8_qkv_block_invoke`) during
+> `qwen_talker_step` — even though FTZ is set at the top of that block. The fused-path (`-j1`)
+> int8 qkv works but the threaded **inline NEON qkv** path does not. Hypotheses to try next:
+> (1) route int8 qkv through the fused path always (drop the inline block); (2) check whether
+> FZ truly flushes denormal *inputs* in that NEON FMA sequence on Apple Silicon (may need to
+> pre-flush `x`, or the denormals are produced upstream and the real fix is numerical, not FTZ).
+> NOTE: prefill uses `cblas_sgemm` (Accelerate, own threads) — not the cause here (hang is in
+> the per-token step, post-prefill).
 
 INT8 for CP specifically. The CP is greedy (temp=0, argmax) so quantization has zero
 quality impact on output. The Talker INT8 was 0% on 0.6B but the CP has different
-characteristics (17 sequential calls means more weight re-reads, so bandwidth matters more).
+characteristics (15+ sequential calls/frame → many weight re-reads, so bandwidth-bound).
 
-- [ ] `[HIGH]` **INT8 CP weights on 1.7B**: CP hidden=2048, definitely bandwidth-bound.
-  Expected ~20-30% CP speedup on 1.7B (proven: Talker INT8 gives ~14%).
+- [ ] `[HIGH]` **Make INT8 CP work at hidden=1024 (both models)**: the only real task. The
+  forced-on attempt hangs (never reaches EOS) — diagnose precision vs bug, try per-channel
+  scales. Expected CP speedup if solved: the CP is ~90% matvec/bandwidth → meaningful.
 - [ ] `[MED]` **Re-test INT8 CP on 0.6B**: The old "0% speedup" test was for the Talker.
   CP has 15× more weight reads per frame — might cross the bandwidth threshold.
   Must measure, not assume.
@@ -277,7 +311,7 @@ Software prefetch hints can help the memory controller prepare cache lines.
 | Optimization | 0.6B speedup | 1.7B speedup | Effort |
 |---|---|---|---|
 | ~~Pipeline CP↔Talker overlap~~ | ~~10-15%~~ | ~~10-15%~~ | **INFEASIBLE** |
-| INT8 CP on 1.7B (18.2) | N/A | 15-25% | 1 day |
+| INT8 CP (18.2, both models, hidden=1024) | TBD | TBD | needs hang fix |
 | Sliding window CP (18.3) | 5% (long) | 5% | 0.5 days |
 | AVX2 parity (18.4) | N/A (ARM) | N/A (ARM) | 2-3 days |
 | **Combined** | **~25-35%** | **~30-45%** | ~1-2 weeks |
@@ -838,10 +872,11 @@ old "INT8 0.6B = 0%" was measured on the **Talker** (not bandwidth-bound) — th
 
 Corrected levers:
 - [ ] **Both models — CP weight quantization is THE lever** (Phase 18.2). Micro-bench proves
-  91% of CP is weight reads → cutting bytes/weight attacks it directly. Blocker on 0.6B:
-  INT8-CP hangs (numerical at hidden=1024) → retry with **per-channel scales**. INT4 (which
-  LOST on the bandwidth-unbound Talker) may finally WIN on the bandwidth-bound CP — measure,
-  don't assume. 1.7B INT8 CP (hidden=2048) is the safe near-term win (~15-25%).
+  91% of CP is weight reads → cutting bytes/weight attacks it directly. The CP is **identical
+  on both models (hidden=1024)** — verified via tensor shapes — so this is ONE task, not a
+  "1.7B-only win". Blocker: INT8-CP hangs at hidden=1024 (both models would) → retry with
+  **per-channel scales**. INT4 (which LOST on the bandwidth-unbound Talker) may finally WIN on
+  the bandwidth-bound CP — measure, don't assume.
 - [ ] **Secondary — bf16 GEMV bandwidth saturation**: CP matvec sits at ~42% of peak DRAM
   bandwidth → investigate dispatch granularity (small matrices called 80×/frame) + prefetch
   to push higher. Lower ceiling than quantization but stacks with it.
@@ -866,7 +901,8 @@ Prefill 1650 ms (51 tokens, one-time → all TTFA). Speech decoder overlapped (o
 drain additive). Whole run: 9.1s audio in 16.0s → **RTF 1.76**. Confirms: CP is the
 bottleneck (even higher than the old 67% estimate); sampling/decoder are not.
 
-> Net: 0.6B → CP overhead (18.1). 1.7B → INT8 CP (18.2). Quantization is a 1.7B-only lever.
+> Net: CP weight quantization (18.2) is THE lever for BOTH models — the CP is identical
+> (hidden=1024) on 0.6B and 1.7B. The blocker is making INT8 work at hidden=1024.
 > Sampling and decoder are confirmed non-bottlenecks. Prefill (1.65s) is pure TTFA →
 > streaming (20.1) is the latency lever.
 
