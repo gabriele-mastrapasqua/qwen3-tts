@@ -1106,11 +1106,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     double t_prefill = time_ms();
     if (delta_start < prefill_len) {
-        if (delta_start > 0 || ctx->use_int8 || ctx->use_int4) {
-            /* Sequential prefill for delta tokens (or all tokens in quantized mode).
-             * When delta_start > 0, we must use sequential step because the BLAS
-             * batch prefill assumes it processes the full sequence from position 0.
-             * For quantized mode, sequential avoids needing BF16 weights for sgemm. */
+        if (delta_start > 0) {
+            /* Sequential prefill only for the server delta-reuse case (the BLAS
+             * batch prefill assumes it processes the full sequence from pos 0).
+             * NOTE: quantized (int8/int4) mode also uses the BATCHED path now —
+             * the bf16 weights are still mmap-resident (quantization doesn't free
+             * them), so the batched sgemm prefill works and is ~2x faster than the
+             * sequential int8 step path (cuts TTFA). Generation still uses int8. */
             float *dummy_hidden = (float *)malloc(h * sizeof(float));
             for (int t = delta_start; t < prefill_len; t++) {
                 if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
