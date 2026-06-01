@@ -374,6 +374,8 @@ typedef struct {
     /* Context for decoder */
     qwen_tts_ctx_t *ctx;
     double decode_ms;       /* total decode time */
+    double first_chunk_ms;  /* abs timestamp (gettimeofday ms) of first emitted chunk; 0 = none yet */
+    int    chunk_frames;    /* frames to wait for per chunk (from ctx->stream_chunk_frames) */
 } decoder_thread_t;
 
 static void dt_init(decoder_thread_t *dt, qwen_tts_ctx_t *ctx, int max_frames) {
@@ -386,6 +388,10 @@ static void dt_init(decoder_thread_t *dt, qwen_tts_ctx_t *ctx, int max_frames) {
     dt->done = 0;
     dt->ctx = ctx;
     dt->decode_ms = 0;
+    dt->first_chunk_ms = 0;
+    /* Frames per decode chunk: wire --stream-chunk (ctx->stream_chunk_frames),
+     * fall back to the historical default if unset. Smaller = lower TTFA. */
+    dt->chunk_frames = (ctx->stream_chunk_frames > 0) ? ctx->stream_chunk_frames : DT_CHUNK_FRAMES;
     dt->audio_cb = NULL;
     dt->audio_cb_userdata = NULL;
     dt->cb_aborted = 0;
@@ -437,7 +443,7 @@ static void *decoder_thread_fn(void *arg) {
     for (;;) {
         int avail, is_done;
         pthread_mutex_lock(&dt->mutex);
-        while (dt->write_pos - dt->read_pos < DT_CHUNK_FRAMES && !dt->done)
+        while (dt->write_pos - dt->read_pos < dt->chunk_frames && !dt->done)
             pthread_cond_wait(&dt->cond, &dt->mutex);
         avail = dt->write_pos - dt->read_pos;
         is_done = dt->done;
@@ -461,6 +467,10 @@ static void *decoder_thread_fn(void *arg) {
         if (qwen_speech_decoder_decode_streaming(ctx, chunk_codes, avail,
                                                    &chunk_audio, &chunk_samples) == 0) {
             if (chunk_samples > 0 && chunk_audio) {
+                if (dt->first_chunk_ms == 0) {
+                    struct timeval tvf; gettimeofday(&tvf, NULL);
+                    dt->first_chunk_ms = tvf.tv_sec * 1000.0 + tvf.tv_usec / 1000.0;
+                }
                 if (dt->audio_cb) {
                     int ret = dt->audio_cb(chunk_audio, chunk_samples, dt->audio_cb_userdata);
                     if (ret != 0) dt->cb_aborted = 1;
@@ -1326,6 +1336,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     double dt_decode_ms = dt_state.decode_ms;
     double dt_drain_ms = time_ms() - t_dec_start;
+    /* TTFA = time from generation start to first emitted audio chunk. */
+    double ttfa_ms = (dt_state.first_chunk_ms > 0) ? dt_state.first_chunk_ms - t_start : -1;
 
     if (dt_state.audio_cb) {
         /* Streaming mode: audio was already sent via callback, return empty */
@@ -1352,6 +1364,9 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         float proc_time = (time_ms() - t_start) / 1000.0f;
         fprintf(stderr, "Audio: %.1fs generated in %.1fs (RTF %.2f)\n",
                 audio_dur, proc_time, proc_time / audio_dur);
+        if (ttfa_ms >= 0)
+            fprintf(stderr, "  TTFA: %.0f ms (first audio chunk, %d-frame chunk)\n",
+                    ttfa_ms, dt_state.chunk_frames);
     }
 
     return 0;

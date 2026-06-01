@@ -849,12 +849,24 @@ direct inline calls. So:
 ### 20.1 Streaming chunked decode — refine existing infra `[MED]`
 
 We already have streaming scaffolding (`qwen_sd_stream_state_t`, `qwen_sd_stream_free`,
-`decoder_thread_t`, `--stream`). Adopt/verify his concrete params:
-- [ ] **25-frame left-context sliding window** to avoid chunk-boundary artifacts.
-- [ ] `chunk_size=8 → ~667 ms audio/chunk` ratio as reference.
-- [ ] Measure **real TTFA on CPU** with vs without streaming (M1, 4 threads). On CPU,
-  TTFA is higher than GPU so streaming matters *more*: turns "wait for whole utterance"
-  into "hear audio after first chunk". No compute saved, big perceived-latency win.
+`decoder_thread_t`, `--stream`). Progress (June 2026):
+- [x] **TTFA instrumentation**: `decoder_thread_t.first_chunk_ms` → prints `TTFA: N ms` in
+  the summary (time from generation start to first emitted audio chunk).
+- [x] **Wired `--stream-chunk`**: it was parsed into `ctx->stream_chunk_frames` but the
+  decoder thread ignored it and used the hardcoded `DT_CHUNK_FRAMES`. Now the thread uses
+  `dt->chunk_frames` (from `stream_chunk_frames`). The flag finally controls chunk size.
+- [x] **Measured TTFA vs chunk (0.6B int8, M1 4t, warm, Italian):**
+  | chunk | TTFA | RTF |   chunk | TTFA | RTF |
+  |---|---|---|---|---|---|
+  | 10 | 1571 ms | 1.24 |   3 | 866 ms | 1.36 |
+  | 5 | 1080 ms | 1.37 |   2 | **829 ms** | 1.40 |
+  Smaller chunk halves TTFA (10→2: 1571→829) but worsens RTF — the windowed decoder
+  recomputes `conv_rf=20` context frames per chunk, so small chunks waste decode work
+  (chunk 3 decodes 23 frames, keeps 3). TTFA floors at ~830 ms (prefill-dominated).
+- [ ] `[HIGH]` **Ramped chunk size** (the real win): tiny first chunk (2–3) for low TTFA,
+  then ramp to 10+ for throughput → best of both (TTFA ~830 ms AND RTF ~1.24). Andres-style.
+- Note: the "25-frame left context" idea is moot — our decoder is already chunk-invariant to
+  ±1 LSB (see 18.6); chunk SIZE (not left-context) is the TTFA knob.
 
 ### 20.2 Short prefill (x-vector-only voice cloning) — DOES NOT apply to our HQ formats `[LOW / mostly N/A]`
 
