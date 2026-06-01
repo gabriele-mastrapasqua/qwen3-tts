@@ -60,8 +60,14 @@ All major features and optimizations have been implemented and verified:
 ### Experiments That Didn't Work
 - **Metal GPU**: 1.3x SLOWER than CPU on M1 (unified memory = shared bandwidth ceiling). Removed.
 - **NEON SiLU**: 0% speedup (SiLU is <1% of frame time). `-ffast-math` already optimizes expf.
-- **INT4 Q4_0**: 4% SLOWER on 1.7B (nibble unpack overhead > bandwidth savings). Kept as opt-in.
-- **INT8 on 0.6B**: 0% speedup (hidden=1024 too small to be bandwidth-bound).
+- **INT4 Q4_0**: confirmed slower than INT8 (June 2026 re-measure, 1.7B Talker): INT4 64.3
+  ms/f vs INT8 45.9 ms/f (and bf16 65.8). Nibble-unpack compute > the extra bandwidth saved
+  → past int8 you go compute-bound, not bandwidth-bound. INT8 is the sweet spot on CPU. INT4
+  audio is coherent (works), just not worth it; INT2 would be worse (more unpack + quality
+  loss). Kept as opt-in. (The earlier "+14% int8 / int4 slower" numbers predate the int8
+  fixes but the int4<int8 direction holds.)
+- ~~**INT8 on 0.6B**: 0% speedup~~ — that was the 0.6B *Talker*. INT8 on the 0.6B *CP* (now
+  enabled) gives RTF 1.70→1.29 (see 18.2). The CP is bandwidth-bound; the Talker wasn't.
 - **Speculative CP decoding**: ABANDONED (codebook feedback loop makes it structurally unsafe).
 - **Batch text embedding (BLAS sgemm)**: SKIPPED (0.13% of pipeline, not worth it).
 - **Softmax SIMD**: SKIPPED (post-quickselect, sampling is 0.2ms/frame).
