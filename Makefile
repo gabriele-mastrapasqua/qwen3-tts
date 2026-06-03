@@ -1,8 +1,34 @@
 # Makefile for Qwen3-TTS Pure C Inference Engine
 
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 CC = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
+
+# Architecture / SIMD baseline (PLAN 21.3).
+#   - macOS:      -march=native (single-vendor host; Apple Silicon NEON or Intel)
+#   - Linux x86:  PORTABLE -mavx2 -mfma by default (Haswell 2013+). We deliberately
+#                 do NOT use -march=native off-Mac: it locks codegen to the build
+#                 host and SIGILLs on any older CPU in the field (the reported
+#                 "AVX-512 Ryzen ran our scalar/illegal build" bug). Override with:
+#                   SIMD=scalar  -> no AVX2 (pre-2013 CPUs; uses portable C fallback)
+#                   SIMD=avx512  -> add AVX-512 (validate with Intel SDE / real HW)
+#   - Linux ARM:  -march=native (NEON; M1-class and up)
+SIMD ?= auto
+ifeq ($(UNAME_S),Darwin)
+    ARCH_FLAGS = -march=native
+else ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
+    ifeq ($(SIMD),scalar)
+        ARCH_FLAGS =
+    else ifeq ($(SIMD),avx512)
+        ARCH_FLAGS = -mavx512f -mavx512bw -mavx512vl -mavx2 -mfma
+    else
+        ARCH_FLAGS = -mavx2 -mfma
+    endif
+else
+    ARCH_FLAGS = -march=native
+endif
+
+CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -ffast-math
 LDLIBS = -lm -lpthread
 
 # LZ4 (embedded in vendor/ — no external dependency needed)
@@ -338,9 +364,10 @@ test-all: test-small test-large test-regression test-errors test-caps test-golde
 # ── Capability self-report regression (catches "we thought AVX existed") ──
 # Asserts the binary's --caps report is internally consistent with the build arch, so a
 # false "we have AVX2/threading" belief can't survive: the binary states the truth and this
-# test enforces it. On ARM it MUST report NEON; on x86 it MUST currently report SCALAR for
-# matvec (no AVX2 yet) — when the AVX2 path lands, flip this expectation so a regression to
-# scalar fails loudly. Pure introspection, no model needed.
+# test enforces it. On ARM it MUST report NEON; on x86 it MUST report AVX2 (default build) or
+# scalar (SIMD=scalar) for matvec — a regression to the old un-wired SCALAR fails loudly. The
+# threads line must report an active pool (GCD/pthread/Win32), never SINGLE-THREAD (PLAN 21.2).
+# Pure introspection, no model needed.
 
 test-caps: $(TARGET)
 	@echo "=== Capability report test ==="
@@ -352,8 +379,10 @@ test-caps: $(TARGET)
 	@if grep -q "arch:.*arm64" $(TEST_DIR)/caps.txt; then \
 	   grep -q "matvec + attn:    NEON" $(TEST_DIR)/caps.txt || { echo "FAIL: arm64 build must report NEON matvec"; exit 1; }; \
 	 elif grep -q "arch:.*x86-64" $(TEST_DIR)/caps.txt; then \
-	   grep -q "matvec + attn:    SCALAR" $(TEST_DIR)/caps.txt || { echo "NOTE: x86 matvec no longer SCALAR — if AVX2 landed, update this assertion"; exit 1; }; \
+	   grep -qE "matvec \+ attn:    (AVX2|scalar)" $(TEST_DIR)/caps.txt || { echo "FAIL: x86 must report AVX2 (default) or scalar (SIMD=scalar) matvec"; exit 1; }; \
+	   if grep -q "WARNING: built with AVX2 but this CPU lacks it" $(TEST_DIR)/caps.txt; then echo "FAIL: AVX2 build on a non-AVX2 CPU"; exit 1; fi; \
 	 fi
+	@grep -q "matvec threads:" $(TEST_DIR)/caps.txt && ! grep -q "SINGLE-THREAD" $(TEST_DIR)/caps.txt || { echo "FAIL: threads must report an active pool (GCD/pthread/Win32), not SINGLE-THREAD"; exit 1; }
 	@echo "PASS: --caps report consistent with build arch"
 	@echo ""
 

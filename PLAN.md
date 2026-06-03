@@ -155,15 +155,18 @@ thread, a single thread — NOT parallel matvec). No `#pragma omp`, no pthread p
 ARM.** This is the single biggest cross-OS gap — even with NEON, Linux ARM is ~3–4× slower than
 the bench numbers purely from running 1 core.
 
-- [ ] `[HIGH]` **`qwen_parallel_for(n, fn, ctx)` abstraction**, one API, 3 backends, all
-  **persistent pool** (workers spawned once, parked on condvar — NEVER spawn-per-matvec: the
-  CP does ~80 matvecs/frame × 16 passes):
-  - **macOS** → keep `dispatch_apply` (GCD) — the fast path (pthread pool was −8% vs GCD *on
-    Mac*; keep it there only).
-  - **Linux / WSL / POSIX** → pthread persistent pool (cond var + atomic row counter). No GCD
-    here → pthread pool ≫ single-thread (Mac's −8% is irrelevant vs 1 core).
-  - **Windows native** → Win32 threads + condition vars (or pthreads-w64). POSIX path is nearly
-    free since the decoder already uses pthread; Windows is the delta.
+- [x] `[HIGH]` **`qwen_parallel(nt, fn, ctx)` abstraction** — DONE 2026-06-03 (branch
+  `feat/avx2-xos-threading`, `qwen_tts_thread.{c,h}`). One API, 3 backends, all **persistent
+  pool** (workers spawned once via `qwen_threadpool_start`, parked on condvar, chunks claimed
+  by an atomic counter; main participates). The 6 GCD-only `dispatch_apply` sites in
+  `qwen_tts_kernels.c` now route through it:
+  - **macOS** → `dispatch_apply` (GCD), the fast path — unchanged.
+  - **Linux / WSL / POSIX** → pthread persistent pool. Was single-thread before.
+  - **Windows native** → Win32 threads + condition vars (structural; untested — no Win box).
+  - **Validated on M1**: GCD golden mel_corr=1.0; forced-pthread build (`-DQWEN_FORCE_PTHREAD`)
+    mel_corr=1.0 & pool-count-invariant; **full x86_64 scalar+pthread binary under Rosetta →
+    mel_corr=1.0 at 249% CPU** (real cross-ISA + pthread-pool end-to-end proof). `--caps` now
+    reports the active pool (GCD/pthread/Win32), never SINGLE-THREAD.
 
 ### 21.3 x86 enablement (logic/ops we support there too)
 
@@ -197,12 +200,22 @@ blocks, NO `#elif __AVX2__`):
 **Goal (user, 2026-06-03): every NEON-accelerated op must have at least an AVX2 twin + a
 scalar fallback ALWAYS; AVX512/VNNI optional on top.** Plan:
 
-- [ ] `[HIGH]` **AVX2 twin for EVERY hot op** (not just matvecs): the 4 matvecs + attention +
-  RoPE + bf16 pack + swiglu/add/mul/scale + snake. Keep scalar fallback in all. This is the
-  bulk of the work — x86 has zero hot-path SIMD today.
-- [ ] `[HIGH]` **Runtime cpuid dispatch + drop `-march=native` for release** (`Makefile:5` →
-  SIGILL on older CPUs). Baseline `-mavx2 -mfma`; function-multiversioning or a dispatch table
-  so one binary runs SSE→AVX2→AVX512(-VNNI/-BF16) by detected ISA.
+- [x] `[HIGH]` **AVX2 twin for every hot op** — DONE 2026-06-03 (`feat/avx2-xos-threading`).
+  All 4 matvecs (bf16/int8/q4_0 + argmax bf16/int8) + all 3 attention variants (score dot +
+  online-softmax accumulators + bf16-KV) now have a `#elif defined(__AVX2__)` branch, 2-row
+  fused / FMA, scalar fallback preserved. `qwen_quantize_bf16_to_int8` (load-time) too. Simple
+  elementwise (silu/add/mul/scale, swiglu) auto-vectorize under `-ffast-math` — left as-is.
+  **Still scalar on x86 (follow-up, correctness-safe):** the NEON-only inline f32<->bf16 pack +
+  NeoX RoPE in talker/code_predictor/speech_decoder, and snake. **Validated:** x86+AVX2
+  cross-compiles clean (`clang -target x86_64 -mavx2 -mfma`, `-Wall -Wextra`); **runtime AVX2
+  correctness still owed — needs the Ryzen box** (Rosetta has no AVX2, so it can't run here).
+- [~] `[HIGH]` **Drop `-march=native` off-Mac + runtime ISA guard** — DONE (the SIGILL bug).
+  Makefile now: Linux x86 default `-mavx2 -mfma` (portable Haswell+), `SIMD=scalar` for
+  pre-AVX2, `SIMD=avx512` opt-in; macOS/ARM keep `-march=native`. `qwen_check_runtime_isa()`
+  aborts with a clear message if an `-mavx2` binary runs on a non-AVX2 CPU (verified under
+  Rosetta: FATAL + exit, **no SIGILL**); `--caps` prints `runtime cpu:` + a warning. **Still
+  open:** true per-CPU function-multiversioning (one fat binary auto-stepping
+  SSE→AVX2→AVX512) — today it's one ISA per build. AVX-VNNI/AVX512-BF16 below.
   - **PRINCIPLE (user, 2026-06-03): at runtime ALWAYS pick the BEST extension the CPU supports,
     else step down — AVX512 → AVX2 → SSE → scalar (and on ARM: i8mm/bf16 → SDOT → NEON → scalar).
     Never compile-time-lock to the build machine's ISA.**

@@ -93,12 +93,14 @@ void qwen_caps_report(void *out) {
 #ifdef __ARM_NEON
     fprintf(f, "  matvec + attn:    NEON (2-row fused)\n");
 #elif defined(__AVX2__)
-    fprintf(f, "  matvec + attn:    SCALAR  <-- AVX2 present but NOT wired for matvec/attn (PLAN 21.3)\n");
+    fprintf(f, "  matvec + attn:    AVX2 (2-row fused, FMA)\n");
 #else
     fprintf(f, "  matvec + attn:    scalar\n");
 #endif
 #if defined(__ARM_FEATURE_DOTPROD)
     fprintf(f, "  int8 dot:         SDOT vdotq_s32 (native)\n");
+#elif defined(__AVX2__)
+    fprintf(f, "  int8 dot:         widen->FMA (AVX2; no VNNI yet — PLAN 21.3)\n");
 #else
     fprintf(f, "  int8 dot:         dequant->FMA (no SDOT/VNNI)\n");
 #endif
@@ -128,6 +130,33 @@ void qwen_caps_report(void *out) {
     fprintf(f, "  BLAS (prefill):   OpenBLAS\n");
 #else
     fprintf(f, "  BLAS (prefill):   none\n");
+#endif
+#if defined(__x86_64__)
+    /* Runtime ISA actually present on THIS CPU (vs what we compiled for above).
+     * A gap here is exactly the "compiled past what the CPU has -> SIGILL" trap. */
+    __builtin_cpu_init();
+    fprintf(f, "  runtime cpu:      sse2%s%s%s%s\n",
+            __builtin_cpu_supports("avx") ? " avx" : "",
+            __builtin_cpu_supports("avx2") ? " avx2" : "",
+            __builtin_cpu_supports("fma") ? " fma" : "",
+            __builtin_cpu_supports("avx512f") ? " avx512f" : "");
+#if defined(__AVX2__)
+    if (!__builtin_cpu_supports("avx2"))
+        fprintf(f, "  WARNING: built with AVX2 but this CPU lacks it -> will SIGILL. "
+                   "Rebuild with `make blas SIMD=scalar`.\n");
+#endif
+#endif
+}
+
+void qwen_check_runtime_isa(void) {
+#if defined(__x86_64__) && defined(__AVX2__)
+    __builtin_cpu_init();
+    if (!__builtin_cpu_supports("avx2")) {
+        fprintf(stderr,
+            "qwen-tts: FATAL — this binary was built with AVX2 but the CPU does not "
+            "support it.\n  Rebuild a portable binary with: make blas SIMD=scalar\n");
+        exit(1);
+    }
 #endif
 }
 

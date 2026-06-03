@@ -45,6 +45,11 @@ void qwen_init_threads(void);
  * workers — must call it. Cheap (~1-2 cycles); inaudible quality impact. */
 void qwen_ftz_on(void);
 
+/* Abort with a clear message if this binary was compiled for an ISA the running
+ * CPU does not support (x86: -mavx2 build on a CPU without AVX2). No-op on ARM
+ * and on portable builds. Call once at startup before any SIMD kernel runs. */
+void qwen_check_runtime_isa(void);
+
 /* Print the ACTUAL compiled SIMD/threading capabilities of this binary to `out`
  * (derived from the same #ifdef guards the kernels use). Makes the real state
  * visible + testable so a "we thought AVX existed" gap can't hide behind docs.

@@ -534,6 +534,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Fail fast if this binary was built for an ISA the CPU lacks (avoid SIGILL
+     * mid-inference on x86 — e.g. an -mavx2 build on a pre-Haswell core). */
+    qwen_check_runtime_isa();
+
     /* Initialize threading: auto-detect or user override */
     if (threads > 0) qwen_set_threads(threads);
     else qwen_init_threads();
