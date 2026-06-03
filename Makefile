@@ -313,11 +313,53 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression
+test-all: test-small test-large test-regression test-golden
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
 	@echo "========================================="
+
+# ── Golden-reference correctness (mel-correlation + duration) ──
+# Regenerates output deterministically (-j1 --temperature 0 --seed 42) and compares to the
+# committed golden WAVs in tests/golden/ via mel-spectrogram correlation (>=0.99) + duration
+# (<=5%). Unlike validate_wav (which only checks "non-empty + frames"), this catches NUMERICAL
+# regressions — a broken kernel that still emits audio fails here. mel-corr (not md5) is robust
+# to benign +-1 LSB noise AND is the correct cross-ISA check for the future AVX2/x86 work
+# (x86 won't be bit-identical to the ARM golden, but a correct build must still score ~0.99+).
+# Requires python3 + librosa (numpy/scipy). RUN ON A QUIET MACHINE (heavy load can perturb
+# the trajectory). Regenerate goldens after an INTENDED output change: make golden-update.
+GOLDEN_EN = The quick brown fox jumps over the lazy dog on a sunny afternoon.
+GOLDEN_IT = Buongiorno a tutti, questa è una dimostrazione del sistema di sintesi vocale.
+GOLDEN_DET = -j1 --temperature 0 --seed 42
+
+test-golden: $(TARGET)
+	@echo "=== Golden-reference correctness test (mel-corr + duration) ==="
+	@if ! python3 -c "import librosa" 2>/dev/null; then echo "SKIP: python3 librosa not installed (pip install librosa)"; exit 0; fi
+	@mkdir -p $(TEST_DIR)
+	@FAIL=0; \
+	 ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_06b_en.wav >/dev/null 2>&1; \
+	 python3 tests/compare_audio.py tests/golden/golden_06b_en.wav $(TEST_DIR)/gold_06b_en.wav --label "0.6B en" || FAIL=1; \
+	 ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l Italian --text "$(GOLDEN_IT)" -o $(TEST_DIR)/gold_06b_it.wav >/dev/null 2>&1; \
+	 python3 tests/compare_audio.py tests/golden/golden_06b_it.wav $(TEST_DIR)/gold_06b_it.wav --label "0.6B it" || FAIL=1; \
+	 ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --int8 --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_06b_en_int8.wav >/dev/null 2>&1; \
+	 python3 tests/compare_audio.py tests/golden/golden_06b_en_int8.wav $(TEST_DIR)/gold_06b_en_int8.wav --label "0.6B en int8" || FAIL=1; \
+	 if [ -d $(MODEL_LARGE) ]; then \
+	   ./$(TARGET) -d $(MODEL_LARGE) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_17b_en.wav >/dev/null 2>&1; \
+	   python3 tests/compare_audio.py tests/golden/golden_17b_en.wav $(TEST_DIR)/gold_17b_en.wav --label "1.7B en" || FAIL=1; \
+	 else echo "SKIP: 1.7B (model absent)"; fi; \
+	 if [ "$$FAIL" -ne 0 ]; then echo "FAIL: golden-reference mismatch (numerical regression?)"; exit 1; fi; \
+	 echo "PASS: all golden references match"
+	@echo ""
+
+# Regenerate the committed golden WAVs (run after an INTENTIONAL, reviewed output change).
+golden-update: $(TARGET)
+	@echo "=== Regenerating golden references (review the diff before committing!) ==="
+	@mkdir -p tests/golden
+	./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o tests/golden/golden_06b_en.wav
+	./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l Italian --text "$(GOLDEN_IT)" -o tests/golden/golden_06b_it.wav
+	./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --int8 --text "$(GOLDEN_EN)" -o tests/golden/golden_06b_en_int8.wav
+	@if [ -d $(MODEL_LARGE) ]; then ./$(TARGET) -d $(MODEL_LARGE) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o tests/golden/golden_17b_en.wav; fi
+	@echo "Done. git diff tests/golden/ and commit if intended."
 
 # ── HTTP Server ──
 
@@ -599,7 +641,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench \
+.PHONY: all help blas clean debug info serve cp-microbench test-golden golden-update \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-all \
         test-clone test-voice-design \
         demo-clone \
