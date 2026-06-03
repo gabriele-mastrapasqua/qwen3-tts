@@ -1101,6 +1101,18 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         }
     }
 
+    /* BUGFIX (2026-06-03): a FULL prefix match (delta_start == prefill_len) — i.e. two
+     * identical consecutive server requests — skipped the `if (delta_start < prefill_len)`
+     * block entirely, so NO prefill/step ran and ctx->dec_x (read below to seed
+     * last_hidden = the first generated frame) stayed STALE from the PREVIOUS request's
+     * last token step. Identical requests therefore diverged (verified: 3 identical reqs
+     * -> 291884/311084/257324 B, even -j1 temp0). Fix: on a full match, do a full fresh
+     * prefill (delta_start = 0) so the request is bit-identical to a cold run. The
+     * delta-prefill optimization is preserved for PARTIAL matches (the real server case:
+     * same speaker/language prefix, different text) — those re-step the new tokens via
+     * the sequential path and correctly repopulate dec_x at the last position. */
+    if (delta_start >= prefill_len) delta_start = 0;
+
     /* Reset KV cache to the reusable prefix length */
     ctx->kv_len = delta_start;
 
