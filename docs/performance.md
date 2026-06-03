@@ -79,19 +79,24 @@ performance to **RTF ~1.3–1.7** (up to 2.7x total speedup):
 |---|---|---|
 | Cache-line alignment (`posix_memalign(64)`) | **24%** | Aligned all BLAS/SIMD buffers and KV caches |
 | Decoder thread overlap | **14-19%** | Speech decoder runs in background thread during generation |
-| SIMD speech decoder | **11%** | Replaced scalar RMSNorm, RoPE, attention with NEON/AVX |
+| SIMD speech decoder | **11%** | Replaced scalar RMSNorm, RoPE, attention with NEON (AVX2 exists only for RMSNorm; RoPE/attention are NEON-or-scalar) |
 | Persistent prefill buffers | **38% server** | Reuse buffers across generations (zero malloc in decode) |
 | Text embedding cache | **14% server** | LRU cache for token embeddings (skip 2 matvec per cached token) |
 | Batched VQ projection | minor | BLAS sgemm instead of per-frame scalar matvec |
 | Pre-allocated sampling buffers | minor | Zero per-token malloc in generation loop |
 | Top-k quickselect | **4× sampling** | O(n) quickselect replaces O(kn) selection sort |
 | Streaming pipeline parallelism | **RTF 2.0→1.4** | Decoder thread runs in streaming mode too |
-| SIMD element-wise ops | minor | NEON/AVX2 for add/mul/scale inplace |
+| SIMD element-wise ops | minor | NEON for add/mul/scale inplace (scalar on x86 — no AVX2 yet) |
 | Vectorized bf16→f32 codec embeds | **~6% on 1.7B** | Bulk SIMD conversion replaces scalar loops in embedding lookups |
 | Auto-scaled thread count | minor | ncpus/2 (min 4) adapts to larger machines |
 
-All optimizations are cross-platform (POSIX standard `posix_memalign`, conditional NEON/AVX).
-See [blog/optimization-notes.md](../blog/optimization-notes.md) for the full story.
+> **Platform reality (verified 2026-06-03):** these numbers are **Apple M1 only**. The hot
+> matvec/attention kernels are NEON-or-scalar — **there is no AVX2 path for them** (only RMSNorm
+> and the bf16↔f32 conversions have AVX2), and matvec multithreading is **macOS/GCD-only**. So on
+> x86 and on Linux/Windows the decode runs scalar and/or single-threaded today and is materially
+> slower. Cache alignment (`posix_memalign`) is genuinely portable; the SIMD/threading wins are not
+> yet. AVX2/AVX-512 + a cross-OS thread pool are tracked in PLAN.md Phase 21.
+> See [blog/optimization-notes.md](../blog/optimization-notes.md) for the full story.
 
 ## Running Benchmarks
 
@@ -105,8 +110,11 @@ and wall time for each configuration. Logs and WAVs saved in `/tmp/qwen_tts_benc
 
 ## Key Architectural Decisions
 
-- **SIMD-optimized kernels** — NEON on ARM, AVX on x86 for BF16/INT8 matrix-vector ops
+- **SIMD-optimized kernels** — NEON (+ native SDOT int8) on ARM for the BF16/INT8 matrix-vector
+  ops. **x86 has no AVX2 for the matvecs yet — they run scalar** (AVX2/VNNI is WIP, PLAN.md 21.3).
 - **Cache-line aligned buffers** — 64B `posix_memalign` for optimal BLAS/SIMD throughput
-- **Multi-threaded inference** — GCD (`dispatch_apply`) on macOS, pthreads on Linux
+- **Multi-threaded decode** — GCD (`dispatch_apply`) on **macOS only**; off-macOS the decode is
+  **single-threaded** today (a cross-OS pthread/Win32 pool is WIP, PLAN.md 21.2). Prefill uses BLAS
+  (`cblas_sgemm`) and is fast everywhere.
 - **Memory-mapped weights** — BF16 safetensors mmap'd directly, near-instant loading
 - **Pipeline parallelism** — Speech decoder runs in background thread during Talker+CP generation

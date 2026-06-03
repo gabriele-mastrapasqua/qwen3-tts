@@ -111,12 +111,23 @@ curl -s http://localhost:8080/v1/health
 All fields except `text` are optional. Defaults: speaker=ryan, language=English,
 temperature=0.5, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
 
-Each request starts from clean defaults — parameters do not leak between requests.
+Each request resets its **sampling parameters** to defaults (speaker, language, temperature,
+top-k/p, rep-penalty, seed), so those do not leak between requests.
+
+> **Known issue (2026-06-03): generation state is NOT fully reset between requests.** The KV
+> cache / sequence position are not cleared in `reset_request_state()`, so a request inherits the
+> previous request's end-state. Consequence: two *identical* consecutive requests (same text, same
+> seed, even `-j1 --temperature 0`) produce **different** output — the first (cold) request matches
+> the CLI, later ones diverge in length/trajectory. The output stays coherent speech, but server
+> output is **not reproducible across requests** today. Pre-existing and unrelated to `--int8`/SDOT
+> (the engine itself is bit-deterministic via the CLI). Tracked in PLAN.md OPEN TASKS.
 
 ## Performance
 
-Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads. Same text, same seed (`--seed 42`),
-identical output (bit-for-bit):
+Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads (RTF numbers are **Apple-M1-only** — see
+[performance.md](performance.md) for why x86/Linux are slower today). Same text, same seed
+(`--seed 42`) — note the warm call does **not** reproduce the cold call bit-for-bit (see the
+known-issue note above):
 
 | | Short text (~8s audio) | Long text (~16s audio) |
 |---|---|---|

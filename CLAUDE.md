@@ -107,15 +107,15 @@ From `qwen_tts_load()` and CLI:
 - `qwen_tts_safetensors.c`
   - safetensors loading and mmap
 - `qwen_tts_kernels.c`
-  - common math, threading, BLAS paths
-- `qwen_tts_kernels_generic.c`
-  - generic hot kernels
-- `qwen_tts_kernels_neon.c`
-  - ARM NEON hot kernels
-- `qwen_tts_kernels_avx.c`
-  - x86 AVX hot kernels
+  - ALL actual kernels live here (inline `#ifdef __ARM_NEON / __AVX2__ / else-scalar`),
+    plus common math, threading (GCD, macOS-only), BLAS paths
+  - reality (verified 2026-06-03): hot matvecs/attention are NEON-or-scalar — **no AVX2**;
+    only rms_norm + bf16 conversion have an AVX2 path. SDOT int8 is ARM-only. See PLAN.md 21.3.
+- `qwen_tts_kernels_generic.c`, `qwen_tts_kernels_neon.c`, `qwen_tts_kernels_avx.c`
+  - **EMPTY placeholder TUs** (reserved for future split). NOT where kernels live today —
+    everything is inline in `qwen_tts_kernels.c`. `_avx.c` in particular has 0 AVX code.
 - `qwen_tts_kernels_impl.h`
-  - architecture dispatch macros
+  - architecture dispatch macros (currently a stub; dispatch is via #ifdef in kernels.c)
 - `download_model.sh`
   - interactive small/large model downloader
 

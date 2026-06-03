@@ -47,7 +47,7 @@ make blas
 ## Features
 
 - **Pure C, minimal dependencies** — Only requires a C compiler and BLAS. No Python runtime needed.
-- **Cross-platform** — macOS (ARM/x86) and Linux (ARM/x86). NEON and AVX SIMD paths. [Windows/WSL2](docs/building.md) beta.
+- **Runs on macOS and Linux (ARM/x86)** — [Windows/WSL2](docs/building.md) beta. **Performance note:** the hot matvec/attention kernels are fully optimized (NEON SIMD + multithread) **only on Apple Silicon** today. On x86 they currently fall back to scalar, and decode threading is macOS-only — so off-Apple-Silicon runs correctly but slower. AVX2/AVX-512 + cross-OS threading are in progress (see PLAN.md Phase 21).
 - **Both model sizes** — Automatically detects 0.6B or 1.7B from weight files.
 - **9 preset voices** — `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
 - **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
@@ -94,7 +94,7 @@ Optional:
   --voice-design             VoiceDesign mode (create voice from --instruct)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
-  --int8                     INT8 quantized — recommended (0.6B & 1.7B; faster, ~same quality)
+  --int8                     INT8 quantized — recommended on Apple Silicon (0.6B & 1.7B; faster, ~same quality; x86 unverified)
   --int4                     Q4_0 quantized (experimental; slower than --int8 on CPU)
   -j, --threads <n>          Worker threads (default: 4)
   --silent                   Suppress status output
