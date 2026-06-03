@@ -658,9 +658,108 @@ static void int8_matvec_fused(float *y, const float *x, const int8_t *W,
 #endif
 }
 
+#if defined(__ARM_FEATURE_DOTPROD)
+/* Dynamically quantize an f32 activation vector to int8 (per-vector absmax).
+ * Returns the scale (amax/127); writes int8 codes into qx[n]. This is the
+ * activation half that native int8 dot (SDOT) needs: SDOT multiplies int8×int8,
+ * so x must be int8 too (the current dequant→f32→FMA path kept x in f32). */
+static float quantize_act_int8(int8_t *qx, const float *x, int n) {
+    float amax = 0.0f;
+    int i = 0;
+    float32x4_t vmax = vdupq_n_f32(0);
+    for (; i + 3 < n; i += 4)
+        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + i)));
+    amax = vmaxvq_f32(vmax);
+    for (; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    if (amax == 0.0f) { memset(qx, 0, (size_t)n); return 0.0f; }
+    float inv = 127.0f / amax;
+    float32x4_t vinv = vdupq_n_f32(inv);
+    i = 0;
+    for (; i + 15 < n; i += 16) {
+        int32x4_t q0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i),      vinv));
+        int32x4_t q1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 4),  vinv));
+        int32x4_t q2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 8),  vinv));
+        int32x4_t q3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 12), vinv));
+        int16x8_t s01 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+        int16x8_t s23 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+        vst1q_s8(qx + i, vcombine_s8(vqmovn_s16(s01), vqmovn_s16(s23)));
+    }
+    for (; i < n; i++) {
+        int v = (int)lrintf(x[i] * inv);
+        qx[i] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    return amax / 127.0f;
+}
+
+/* Native int8 dot matvec via SDOT: y[o] = scale[o] * sx * Σ_k W[o][k]·qx[k].
+ * 4 int8×int8 MACs per vdotq_s32 instruction — no per-weight dequant. 2-row
+ * fused to amortize the qx loads (matches the bf16/int8 2-row pattern). */
+static void int8_matvec_sdot(float *y, const int8_t *qx, float sx,
+                             const int8_t *W, const float *scale,
+                             int in_dim, int out_dim) {
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
+        int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+        int k = 0;
+        for (; k + 15 < in_dim; k += 16) {
+            int8x16_t xv = vld1q_s8(qx + k);
+            a0 = vdotq_s32(a0, vld1q_s8(w0 + k), xv);
+            a1 = vdotq_s32(a1, vld1q_s8(w1 + k), xv);
+        }
+        int32_t s0 = vaddvq_s32(a0), s1 = vaddvq_s32(a1);
+        for (; k < in_dim; k++) { s0 += (int32_t)w0[k] * qx[k]; s1 += (int32_t)w1[k] * qx[k]; }
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+    }
+    if (o < out_dim) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        int32x4_t a0 = vdupq_n_s32(0);
+        int k = 0;
+        for (; k + 15 < in_dim; k += 16)
+            a0 = vdotq_s32(a0, vld1q_s8(w0 + k), vld1q_s8(qx + k));
+        int32_t s0 = vaddvq_s32(a0);
+        for (; k < in_dim; k++) s0 += (int32_t)w0[k] * qx[k];
+        y[o] = (float)s0 * scale[o] * sx;
+    }
+}
+#endif /* __ARM_FEATURE_DOTPROD */
+
 void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
                       const float *x, int rows, int cols) {
-#if defined(__APPLE__) && defined(__BLOCKS__)
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* SDOT path: quantize the shared activation x once, then int8×int8 dot.
+     * qx is a fixed-size stack buffer (GCD blocks can't capture a VLA); it lives
+     * on this (orchestration) thread's stack and dispatch_apply is synchronous,
+     * so the workers safely read it for the call's duration. cols beyond the cap
+     * (rare; only very large matrices) falls through to the f32 path. */
+    enum { QX_MAX = 8192 };
+    static int sdot_off = -1;  /* QWEN_NO_SDOT=1 forces the legacy f32 path (A/B bench) */
+    if (sdot_off < 0) { const char *e = getenv("QWEN_NO_SDOT"); sdot_off = (e && e[0] == '1'); }
+    if (!sdot_off && cols <= QX_MAX) {
+        int8_t qx_buf[QX_MAX];
+        int8_t *qx = qx_buf;  /* capture a pointer, not the array (blocks can't capture arrays) */
+        float sx = quantize_act_int8(qx, x, cols);
+      #if defined(__APPLE__) && defined(__BLOCKS__)
+        int nt = g_n_threads;
+        if (nt > 1 && rows >= 256) {
+            dispatch_apply((size_t)nt,
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                           ^(size_t tid) {
+                int r0 = (int)tid * rows / nt;
+                int r1 = (int)(tid + 1) * rows / nt;
+                int8_matvec_sdot(y + r0, qx, sx, W + (size_t)r0 * cols,
+                                 scale + r0, cols, r1 - r0);
+            });
+            return;
+        }
+      #endif
+        int8_matvec_sdot(y, qx, sx, W, scale, cols, rows);
+        return;
+    }
+#endif
+  #if defined(__APPLE__) && defined(__BLOCKS__)
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         dispatch_apply((size_t)nt,
@@ -673,7 +772,7 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
         });
         return;
     }
-#endif
+  #endif
     int8_matvec_fused(y, x, W, scale, cols, rows);
 }
 

@@ -16,4 +16,9 @@
  * - qwen_causal_attention_windowed: same with sliding window
  * - qwen_snake_activation: 4-element vectorized (vvsinf on Apple)
  * - NeoX RoPE: 4-element vectorized in talker + speech decoder
+ * - int8_matvec_sdot: native int8 dot (vdotq_s32, #if __ARM_FEATURE_DOTPROD), 2026-06-01
+ *
+ * NOT at peak on post-M1 ARM (M2/M3/M4, Graviton): bf16 matvec still does
+ * dequant->FMA (no vbfdot/vbfmmla, __ARM_FEATURE_BF16) and int8 uses 1-vector
+ * SDOT (no smmla/i8mm, __ARM_FEATURE_MATMUL_INT8). See PLAN.md 21.3b.
  */

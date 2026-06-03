@@ -83,10 +83,50 @@ Two structural facts drive the map:
     2-row q4_0 kernel would not fix the −26% rms. **This is NOT a DS4-style "no quality loss" win.**
   - **Decision: drop int4 on the CP.** int8 is the quality floor; the speed lever is making the
     *already-winning* int8 FASTER (SDOT native dot), not going lower-bit. → Experiment #2 below.
-- [ ] `[HIGH]` **EXPERIMENT #2 — SDOT native int8 dot (the real lever).** M1 has
-  `__ARM_FEATURE_DOTPROD`. Replace int8 dequant→f32→FMA with `vdotq_s32` (4 int8×int8 MACs/instr)
-  + dynamic per-vector int8 quant of the activation `x`. Speeds up the int8 path that ALREADY wins,
-  no quality change vs current int8. Measure on CP FFN via cp-microbench.
+- [x] **EXPERIMENT #2 — SDOT native int8 dot: WON (2026-06-01, `feat/int8-sdot`).** Replaced int8
+  dequant→f32→FMA with `vdotq_s32` (4 int8×int8 MACs/instr, 2-row fused) + dynamic per-vector int8
+  quant of activation `x` (`quantize_act_int8`). Apple clang defines `__ARM_FEATURE_DOTPROD` by
+  default on Apple Silicon (no flag; `make` CC=gcc → /usr/bin/gcc = Apple clang). Runtime opt-out
+  `QWEN_NO_SDOT=1` kept as safety fallback + A/B knob. Validated across the matrix (seed 42, IT,
+  cp-microbench, A/B via the env toggle):
+  | Model / voice | speed | quality |
+  |---|---|---|
+  | 0.6B preset (CP int8) | FFN gate_up −25%, down −28%, **CP TOTAL −24%**, **RTF→0.98** | clean (listened) |
+  | 0.6B Silvio `.qvoice` short | CP −30% | same duration+peak, clean |
+  | 0.6B Silvio `.qvoice` long 30s | CP −19% | clean, rms +23% |
+  | 1.7B preset (Talker+CP int8) | **Talker −23%, CP −21%** (−22%/frame) | clean (listened) |
+  - **Key: weights stay int8** (the validated precision) — SDOT only changes *how* the dot is
+    computed. The only new approximation is mild int8 activation quant. rms drifts both directions
+    by utterance (sampling/trajectory variance, NOT systematic degradation). **This IS the DS4-style
+    clean win** — speed with no quality loss, unlike int4 which lowered weight precision.
+  - **0.6B broke the RTF 1.0 barrier** (preset short, RTF 0.98) — the Phase 18 target.
+  - Activation quant is per-vector absmax; outlier worry did not materialize — listening confirmed
+    fine on the greedy CP AND the sampled 1.7B Talker. Selective-SDOT (down_proj legacy) NOT needed.
+- [ ] `[MED]` **Extend SDOT to CP lm_heads.** `qwen_argmax_matvec_int8` (15 lm_heads/frame, 4.3% of
+  CP) still uses the f32 path — small but free. (VNNI is the x86 twin, 21.3, needs the rented box.)
+
+> ⚠️ **SDOT is ARM-only (`vdotq_s32`, guarded by `__ARM_FEATURE_DOTPROD`).** On x86 the whole
+> int8 matvec already falls to **scalar** (no AVX2 — `qwen_tts_kernels_avx.c` is empty, see 21.5),
+> so x86 gets neither the SDOT win nor even the NEON int8 path; it runs scalar + single-thread.
+> **TODO (x86, after ARM lands):** write the equivalent native int8 dot with **VNNI**
+> (`_mm256_dpbusds_epi32` / AVX512-VNNI) PLUS the baseline AVX2 int8/bf16 matvec it builds on, and
+> **re-audit the full x86 path** (today it's all scalar — measure real x86 RTF, it has never been
+> benchmarked). Gated on the rented AVX512 box + Intel SDE in CI (see 21.3 / 21.5). The activation
+> quant (`quantize_act_int8`) is portable C and reusable for the VNNI path.
+- [ ] `[LOW]` No `silvio_17b.qvoice` to test custom voice on 1.7B (needs `qwen3-tts-1.7b-base` to
+  create). 1.7B preset already validates the Talker int8+SDOT critical path.
+
+> **Next session (2026-06-02) — validation & release gate.** Before merging `feat/int8-sdot`:
+> 0. **FIRST — deep re-analysis of all docs/md/code to re-verify the real x86 state.** The
+>    "x86 matvec is all scalar / AVX file empty" claim came from one Explore pass + a grep; the
+>    user expected x86 support to exist and was surprised. Re-confirm THOROUGHLY whether any
+>    x86/AVX2 matvec code exists before planning the VNNI work (this repo has a history of
+>    assumptions believed-then-wrong — verify, don't trust the first pass).
+> 1. Download `qwen3-tts-1.7b-base`, create `silvio_17b.qvoice`, test custom voice on the 1.7B.
+> 2. Massive total regression: `make test-small`/`test-large`, server (bf16 + int8 + `.qvoice`),
+>    voice-clone e2e, both models, SDOT on AND off (`QWEN_NO_SDOT`).
+> 3. IF all green AND Phase 21 plan is considered done → merge `feat/int8-sdot` → `feat/labs`
+>    (then evaluate → `main`) AND cut a release. ("vediamo" — gated on the tests.)
 - [ ] `[HIGH]` **Group-wise scales for int4** (not per-row absmax like int8). Q4_0 already does
   per-32-block scales — that's the "no big quality loss" enabler. Per-row int4 = quality death.
 - [ ] `[HIGH]` **Native int8 dot (ARM SDOT)** — M1 has `__ARM_FEATURE_DOTPROD`. Today int8 does
@@ -107,8 +147,13 @@ Two structural facts drive the map:
 ### 21.2 Cross-OS threading (Win + Linux + Mac)
 
 Today the matvec dispatch is **Apple/GCD ONLY** (`#if defined(__APPLE__) && defined(__BLOCKS__)`
-at `kernels.c:422/444/663/837/859`). Off macOS the block compiles out → **single-thread** decode.
-So every quant win currently exists **only on Apple Silicon**.
+at `kernels.c:422/444/744/762/936/958` — verified 2026-06-03). Off macOS the block compiles out
+→ **single-thread** decode. So every quant win currently exists **only on Apple Silicon**. The
+ONLY `pthread_create` in the whole repo is `qwen_tts.c:1184` (the decoder-overlap background
+thread, a single thread — NOT parallel matvec). No `#pragma omp`, no pthread pool, no Win32.
+**User requirement (2026-06-03): threading must be offered on Linux/Windows too, not just Mac
+ARM.** This is the single biggest cross-OS gap — even with NEON, Linux ARM is ~3–4× slower than
+the bench numbers purely from running 1 core.
 
 - [ ] `[HIGH]` **`qwen_parallel_for(n, fn, ctx)` abstraction**, one API, 3 backends, all
   **persistent pool** (workers spawned once, parked on condvar — NEVER spawn-per-matvec: the
@@ -122,17 +167,67 @@ So every quant win currently exists **only on Apple Silicon**.
 
 ### 21.3 x86 enablement (logic/ops we support there too)
 
-x86 matvec is **scalar today** (`qwen_tts_kernels_avx.c` is empty — 0 intrinsics; matvecs are
-`#ifdef __ARM_NEON … #else scalar`). For x86 to make sense:
+**STEP 0 deep re-audit DONE (2026-06-03, verified by reading every guard + the AVX2
+intrinsic tally, not a single grep).** The prior "x86 is all scalar" was *substantively*
+correct but mis-framed — the truth is sharper:
 
-- [ ] `[HIGH]` **AVX2 path for the matvecs** (bf16 / int8 / int4) — this is the 90% that falls to
-  scalar on x86 today. Keep the kernel API abstract so AVX2/VNNI slot in without rewriting logic.
+**AVX2 exists, but ONLY on 5 auxiliary/elementwise ops** (the `<3%`-of-time overhead):
+`qwen_rms_norm`, `qwen_rms_norm_residual`, `qwen_rms_norm_per_head`, `qwen_bf16_accum_f32`,
+`qwen_bf16_to_f32_vec`. All 56 `_mm256_*` intrinsics in the repo live in these 5 (all in
+`qwen_tts_kernels.c`; `qwen_tts_kernels_avx.c` is genuinely 0 lines of code).
+
+**Everything on the HOT path falls to scalar on x86** (2-way `#ifdef __ARM_NEON … #else`
+blocks, NO `#elif __AVX2__`):
+- matvecs: `bf16_matvec_fused` (314), `int8_matvec_fused` (584), `q4_0_matvec_inner` (869),
+  `qwen_argmax_matvec_bf16` (1624) / `_int8` — **the 90.7% of decode per the microbench**
+- `int8_matvec_sdot` + `quantize_act_int8` are `#if __ARM_FEATURE_DOTPROD` → **don't exist
+  at all on x86** (no scalar equiv either; callers fall back to `int8_matvec_fused` scalar)
+- attention: `qwen_causal_attention` / `_windowed` / `_bf16kv`
+- inline NEON-only (no AVX2) elsewhere: f32→bf16 pack + bf16→f32 + NeoX RoPE in
+  `talker.c`/`code_predictor.c`/`speech_decoder.c`, `qwen_apply_rope_interleaved`,
+  `qwen_swiglu`/`silu`/`add`/`mul`/`vec_scale`, `qwen_snake_activation` (decoder)
+- decode-step calls the hand matvecs (`qwen_matvec_*`), NOT BLAS → scalar; only **prefill**
+  uses `cblas_sgemm` (OpenBLAS) so prefill is the one fast thing on x86.
+
+> ⚠️ **The comments in `qwen_tts_kernels_avx.c` are FALSE/stale** — they list "bf16_matvec_fused:
+> AVX2", "int8_matvec_fused: AVX2", "qwen_causal_attention: AVX2", "qwen_snake_activation: AVX2"
+> as "Active AVX optimizations". NONE of those have AVX2. This stale doc is very likely what made
+> us believe x86 was covered. **Fix the comments (and `_neon.c`'s, which over-claim too).**
+
+**Goal (user, 2026-06-03): every NEON-accelerated op must have at least an AVX2 twin + a
+scalar fallback ALWAYS; AVX512/VNNI optional on top.** Plan:
+
+- [ ] `[HIGH]` **AVX2 twin for EVERY hot op** (not just matvecs): the 4 matvecs + attention +
+  RoPE + bf16 pack + swiglu/add/mul/scale + snake. Keep scalar fallback in all. This is the
+  bulk of the work — x86 has zero hot-path SIMD today.
 - [ ] `[HIGH]` **Runtime cpuid dispatch + drop `-march=native` for release** (`Makefile:5` →
-  SIGILL on older CPUs). Baseline `-mavx2 -mfma` or multiversioning for release binaries.
-- [ ] `[MED]` **VNNI** (`_mm256_dpbusds_epi32` / AVX512-VNNI) = x86 equivalent of SDOT, for the
-  rented AVX512 box. Prereq: runtime dispatch above. Verify ISA correctness with Intel SDE in
-  CI; tune perf only on real HW (can't tune blind on M1).
-- **Order**: finish ARM first (dev HW, measurable now); x86 after, on a rented AVX512 server.
+  SIGILL on older CPUs). Baseline `-mavx2 -mfma`; function-multiversioning or a dispatch table
+  so one binary runs SSE→AVX2→AVX512(-VNNI/-BF16) by detected ISA.
+  - **PRINCIPLE (user, 2026-06-03): at runtime ALWAYS pick the BEST extension the CPU supports,
+    else step down — AVX512 → AVX2 → SSE → scalar (and on ARM: i8mm/bf16 → SDOT → NEON → scalar).
+    Never compile-time-lock to the build machine's ISA.**
+  - **Real-world evidence:** a user on a brand-new Ryzen (should have AVX-512) reported SLOW perf.
+    Cause = exactly this gap — we have ZERO AVX2/AVX512 on the hot path AND no runtime dispatch, so
+    his AVX-512 silicon ran our scalar single-thread decode. This is the bug to kill.
+- [ ] `[MED]` **VNNI** (`_mm256_dpbusds_epi32` AVX-VNNI / AVX512-VNNI) = x86 SDOT twin for int8,
+  on the rented AVX512 box. Prereq: AVX2 baseline + dispatch above. `quantize_act_int8` is
+  portable C and reused as-is. Verify ISA with Intel SDE in CI; tune perf only on real HW.
+- [ ] `[LOW]` **AVX512-BF16** (`_mm512_dpbf16_ps`) bf16 dot twin, same box.
+- **Order**: finish ARM (incl. the NEON headroom in 21.3b, dev HW measurable now); x86 after, on
+  a rented AVX512 server (can't tune blind on M1).
+
+### 21.3b ARM NEON is NOT at peak either (the SDOT lesson, generalized)
+
+Just like SDOT was *missing on NEON* until 2026-06-01, the NEON matvecs still leave perf on the
+table on **post-M1 ARM** (M2/M3/M4, Graviton3/4) — all behind `#if __ARM_FEATURE_*` with a
+NEON→scalar fallback, so M1 and x86 are unaffected:
+
+- [ ] `[MED]` **bf16 native dot** — `bf16_matvec_fused` does dequant(`vshll`)→FMA. ARMv8.6
+  (`__ARM_FEATURE_BF16`: M2+) has `vbfdot`/`vbfmmla` for native bf16 MACs → skips the widen.
+- [ ] `[MED]` **int8 i8mm** — SDOT (`vdotq_s32`) is 1×vector; `smmla` (`__ARM_FEATURE_MATMUL_INT8`:
+  M2+, Graviton3+) does a 2×2 int8 matmul per instr → ~2× on the int8 matvecs. The 2-row-fused
+  layout already half-fits smmla's shape.
+- [ ] `[LOW]` **SVE/SVE2** — Graviton3/4 + ARM servers: vector-length-agnostic loops. Research only.
 
 ### 21.4 INT8 productization
 
@@ -146,20 +241,39 @@ x86 matvec is **scalar today** (`qwen_tts_kernels_avx.c` is empty — 0 intrinsi
 - **LEGAL ✅**: Qwen3-TTS-12Hz CustomVoice is **Apache-2.0** → quantize + redistribute on our HF
   account is allowed (keep LICENSE/NOTICE, attribute Qwen, state changes; `Naumius/` precedent).
 
-### 21.5 Cross-CPU coverage — current reality (was mis-documented as "cross-platform")
+### 21.5 Cross-CPU coverage — VERIFIED reality (2026-06-03 deep re-audit)
 
-| Platform | Matvec SIMD | Decode threading | Reality |
-|---|---|---|---|
-| **macOS ARM (M1/M2)** | NEON ✅ | GCD 4-thread ✅ | the only truly optimized target (= all benchmarks) |
-| **Linux ARM (aarch64)** | NEON ✅ | **single-thread ❌** | correct but ~3–4× slower than the bench numbers |
-| **Linux/WSL x86-64** | **scalar ❌** | **single-thread ❌** | correct but decode is catastrophic; only prefill (BLAS) is fast |
+| Platform | Hot-path SIMD (matvec+attn = 90%) | Aux SIMD (rms/bf16, <3%) | Decode threading | Reality |
+|---|---|---|---|---|
+| **macOS ARM (M1)** | NEON ✅ (+SDOT int8) | NEON ✅ | GCD 4-thread ✅ | the only truly optimized target (= all benchmarks) |
+| **macOS/Linux ARM (M2+/Graviton)** | NEON ✅ but **bf16/i8mm headroom** (21.3b) | NEON ✅ | GCD ✅ Mac / **single ❌** Linux | works, leaves ~2× on the table on the matvecs |
+| **Linux ARM (aarch64, M1-class)** | NEON ✅ | NEON ✅ | **single-thread ❌** | correct but ~3–4× slower than bench (1 core) |
+| **Linux/WSL/Win x86-64** | **scalar ❌** (no AVX2 on any matvec/attn) | **AVX2 ✅** (only these) | **single-thread ❌** | decode catastrophic; only prefill (`cblas_sgemm`) is fast |
 
-Fixing this = 21.2 (threading) + 21.3 (AVX2). Until then, all RTF numbers are Apple-only.
+**Coverage matrix we OWE users** (goal: NEON-equivalent everywhere SIMD exists, scalar always):
+| Op family | NEON | AVX2 | AVX512/VNNI | scalar | Gap |
+|---|---|---|---|---|---|
+| matvec bf16/int8/q4_0 + argmax | ✅ | ❌ | ❌ | ✅ | **AVX2+VNNI (21.3), bf16/i8mm NEON (21.3b)** |
+| attention (3 variants) | ✅ | ❌ | ❌ | ✅ | **AVX2 (21.3)** |
+| RoPE / bf16 pack / swiglu / add·mul·scale / snake | ✅ | ❌ | ❌ | ✅ | **AVX2 (21.3)** |
+| rms_norm ×3 / bf16_accum / bf16_to_f32 | ✅ | ✅ | ❌ | ✅ | AVX512 optional |
+
+Fixing this = 21.2 (threading) + 21.3 (AVX2 on ALL hot ops + VNNI) + 21.3b (post-M1 NEON).
+Until then, all RTF numbers are **Apple-M1-only**.
 
 ---
 
 ## OPEN FUTURE TASKS (compact — nothing dropped)
 
+- [ ] `[MED]` **Server warm-request reproducibility bug (found 2026-06-03).** `make test-serve-bench`
+  fails its bit-identical assertion: two IDENTICAL consecutive requests (seed 42, same text) produce
+  DIFFERENT output — run1 291884 B, run2 311084 B (~400 ms longer), even at `-j1 --temperature 0`.
+  PROVEN **pre-existing & NOT SDOT** (fails identically with `QWEN_NO_SDOT=1`; engine itself is
+  bit-deterministic — CLI `-j1 temp0` is bit-identical, and the server's COLD run1 == CLI output).
+  Cause = server **delta-prefill / KV-reuse across requests**: the warm 2nd request doesn't get a
+  clean state, so it diverges. Contradicts the "delta prefill = bit-identical" belief. Fix: reset KV
+  state between unrelated requests OR only reuse on a verified-matching prefix. The `test-serve-bench`
+  md5 assertion is also too strict (should compare cold-vs-cold, or mel-corr, not warm-vs-cold md5).
 - **CP sliding window attention** (old 18.3): config has `sliding_window=72`; verify CP attention
   caps at it. `[MED]`, only matters for 200+ frame sequences.
 - **Long-form / audiobook mode** (old Phase 19): chapter/batch mode, progress indicator + ETA/RTF,
