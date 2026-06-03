@@ -285,6 +285,21 @@ test-large: test-large-config test-large-en test-large-it test-large-instruct
 
 # ── Cross-model regression tests ──
 
+# Error-handling regression: bad invocations must FAIL cleanly (non-zero + clear message),
+# never crash or silently succeed. No model needed -> fast + CI-friendly.
+test-errors: $(TARGET)
+	@echo "=== Error-handling test ==="
+	@mkdir -p $(TEST_DIR)
+	@if ./$(TARGET) -d $(MODEL_SMALL) >/dev/null 2>$(TEST_DIR)/err_notext.txt; then echo "FAIL: missing --text/--serve should error (exit 0)"; exit 1; fi
+	@grep -qiE "text.*serve|--text" $(TEST_DIR)/err_notext.txt || { echo "FAIL: no clear message for missing --text"; cat $(TEST_DIR)/err_notext.txt; exit 1; }
+	@echo "  PASS: missing --text/--serve errors cleanly"
+	@if ./$(TARGET) -d /nonexistent_model_dir_xyz --text "x" -o /dev/null >/dev/null 2>$(TEST_DIR)/err_nomodel.txt; then echo "FAIL: nonexistent model dir should error (exit 0)"; exit 1; fi
+	@echo "  PASS: nonexistent model dir errors cleanly"
+	@if ./$(TARGET) --load-voice /nonexistent.qvoice -d $(MODEL_SMALL) --text "x" -o /dev/null >/dev/null 2>$(TEST_DIR)/err_novoice.txt; then echo "FAIL: missing .qvoice should error (exit 0)"; exit 1; fi
+	@echo "  PASS: missing .qvoice errors cleanly"
+	@echo "PASS: error-handling"
+	@echo ""
+
 test-regression:
 	@echo "=== Regression tests ==="
 	@echo ""
@@ -313,7 +328,7 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression test-caps test-golden
+test-all: test-small test-large test-regression test-errors test-caps test-golden
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
@@ -665,7 +680,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-caps test-golden golden-update \
+.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-golden golden-update \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-all \
         test-clone test-voice-design \
         demo-clone \
