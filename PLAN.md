@@ -348,10 +348,20 @@ PASSED. Closed the worst gaps:
   x86/Linux inference in CI** (build-only — add once the Ryzen/WSL2 flow is set up).
 - [ ] `[LOW]` **`test-clone` has the same latent per-line `exit 0` skip bug** as voice-design had — not
   currently broken (base-small model present) but would FAIL instead of SKIP if absent. Same one-shell fix.
-- [ ] `[MED, investigate]` **`-j1 --temperature 0` trajectory changed under heavy load** (seen once
-  during golden-gen while the bg suite contended: 234884 B vs the stable 291884 B — a token flip, NOT
-  ±1 LSB). Greedy single-thread should be load-independent. Possibly the always-on decoder pthread or
-  an uninit/race. `test-golden` (mel-corr, quiet machine) catches it; root-cause later. Run tests quiet.
+- [ ] `[HIGH, investigate — likely the real "tanto" non-determinism]` **`-j1 --temperature 0` output
+  is LOAD-DEPENDENT** (confirmed repeatedly 2026-06-03). On a QUIET machine it's byte-deterministic
+  (10× bursts md5-identical, == golden, 6.08 s). Under CPU load (WindowServer/RDP ~44%, load 2.4–4) it
+  intermittently drifts to a DIFFERENT, usually SHORTER trajectory (5.1–5.4 s; mel-corr 0.3–0.7 vs
+  golden) — a token flip, NOT ±1 LSB. Greedy single-thread MUST be load-invariant, so this is a real
+  bug. **Ruled out:** on-disk cache/state (separate processes, none); EOS-boost timing (it's FRAME-count
+  based, `qwen_tts.c:1219`, deterministic). **Prime suspect:** a race between the always-on decoder
+  overlap pthread and the main gen loop over a shared `ctx` scratch buffer (the code comment claims
+  clean Talker/CP-vs-decoder separation — verify it; if a kernel/ctx scratch is shared, the decoder
+  clobbers a logit mid-frame under unlucky timing → token flip). Next: read the decoder path for shared
+  buffers; test with overlap disabled (add a QWEN_NO_OVERLAP knob) — if load-invariant, decoder thread
+  is the cause. **BLOCKS:** reliable golden/e2e tests AND clean AVX2 benchmarking → fix before perf.
+  **Consequence:** could NOT cleanly measure streaming-vs-normal or SDOT-on-vs-off (those 0.3–0.7
+  numbers were load-contaminated — do NOT conclude "streaming/SDOT broken"; re-measure on an idle box).
 
 ---
 
