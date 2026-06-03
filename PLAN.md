@@ -263,8 +263,57 @@ Until then, all RTF numbers are **Apple-M1-only**.
 
 ---
 
+## 21.6 VERIFIED full-codebase audit (2026-06-03) — master fix backlog
+
+5 parallel audit agents + my own code verification (the lesson: don't trust agent claims either —
+one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` do call
+`qwen_matvec_q4_0*`). Findings below are **verified**; "needs-verify" tagged where not yet confirmed.
+
+**CORRECTNESS (fix first — testable on M1 now):**
+- [ ] `[HIGH]` **Server cross-request reproducibility** — `qwen_tts.c:1089-1105`: delta-prefill reuses
+  the previous request's KV prefix (`ctx->kv_len = delta_start`). Cold request 1 == CLI (correct);
+  request 2+ reuse stale state → identical requests give different length/output (verified: 3 runs
+  291884/311084/257324 B, even `-j1 temp0`). Fix: reset `kv_len=0` per request (or only reuse on a
+  verified-identical prefix AND prove the reused KV equals a fresh prefill). Also reset `cp_kv_len`,
+  `n_prev_tokens`, frame counters; and on error-return the state is left dirty (`n_prev_tokens`).
+- [ ] `[HIGH]` **Server not thread-safe** — single shared `qwen_tts_ctx_t`, no lock, requests
+  serialized; 2 concurrent curls corrupt state. Decide: document single-flight + add a mutex, or
+  per-connection ctx. (`qwen_tts_server.c` accept loop.)
+- [ ] `[MED]` **Server input validation** — no cap on `text` length (OOM), no speaker/lang ID bounds
+  check before embedding lookup (OOB). Add limits + validation.
+- [ ] `[MED]` **Voice-clone ref audio resampling is a STUB** — `qwen_tts_voice_clone.c:894` requires
+  exactly 24 kHz (TODO never shipped); README implies "clone from any WAV". Hit empirically (b1.wav
+  44.1kHz rejected). Fix: built-in resample, or document the 24kHz requirement honestly.
+- [ ] `[LOW]` **Robustness** — `qwen_tts_tokenizer.c` `fread()` returns unchecked (×2);
+  `(size_t)rows*cols` allocs without overflow guard (low risk). `needs-verify` but plausible.
+
+**PERFORMANCE / PORTABILITY (the big gap — see 21.2/21.3/21.3b):**
+- [ ] All 8 hot matvec/attention kernels scalar on x86; matvec threading GCD/Apple-only; SwiGLU exp
+  uses Accelerate `vvexpf` on macOS, scalar `expf` elsewhere (`kernels.c:1433`); post-M1 NEON headroom.
+- [ ] `[HIGH]` **Makefile `-march=native`** (line 5) → SIGILL on older CPUs, no release/portable
+  target, no runtime cpuid dispatch. **Principle: pick best ISA at runtime, else step down.**
+- [ ] **CI is build-only off-Mac** — `.github/workflows` build Linux x86/ARM + macOS-ARM but run only
+  `./qwen_tts --help`; **no inference is ever executed off Apple Silicon, and x86 has NEVER been
+  benchmarked.** No macOS-x86, no Windows. Add a real inference smoke (small model) + SDE for ISA.
+- [ ] **Windows native won't compile** (`mmap`/`pthread`/`gettimeofday`, no Win32 fallback) — WSL2 only.
+
+> ⚠️ **HARD CONSTRAINT: we have NO x86 hardware.** We can WRITE + correctness-verify AVX2/VNNI +
+> threading on the M1 (scalar-equivalence unit tests, Intel SDE in CI for ISA correctness), but we
+> **cannot measure x86 RTF here.** Real x86 perf tuning needs a rented box / CI runner. Plan the
+> code now; gate perf claims on real HW. (This is exactly why x86 silently rotted before.)
+
+**DEBUNKED agent claims (do NOT propagate):** "int4 loaded but never used" (FALSE — int4 wired in
+talker.c forward). "x86 FTZ incomplete" and ".qvoice v1 enc_dim hardcoded" — `needs-verify` before acting.
+
+---
+
 ## OPEN FUTURE TASKS (compact — nothing dropped)
 
+- [ ] `[LOW, AFTER fixes]` **Correct the BLOG docs' false x86/AVX claims.** `blog/optimization-notes.md`
+  (and related) repeat "NEON on ARM, AVX on x86" for matvecs/attention — FALSE (only rms_norm +
+  bf16_accum have AVX2). Authoritative docs (README/CLAUDE/docs/*) fixed 2026-06-03 (commit 7aa0f9b);
+  the blog narrative is deferred until AFTER the real fixes + fresh measurements land, so it's
+  rewritten once against true numbers rather than patched twice.
 - [ ] `[MED]` **Server warm-request reproducibility bug (found 2026-06-03).** `make test-serve-bench`
   fails its bit-identical assertion: two IDENTICAL consecutive requests (seed 42, same text) produce
   DIFFERENT output — run1 291884 B, run2 311084 B (~400 ms longer), even at `-j1 --temperature 0`.
