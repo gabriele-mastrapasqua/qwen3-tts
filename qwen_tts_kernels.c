@@ -363,6 +363,76 @@ static inline float bf16_to_f32(uint16_t bf) {
     return val;
 }
 
+#if defined(__AVX2__)
+/* Horizontal sum of an 8-wide f32 accumulator. */
+static inline float qwen_hsum256_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    __m128 sh = _mm_movehl_ps(lo, lo);
+    lo = _mm_add_ps(lo, sh);
+    sh = _mm_shuffle_ps(lo, lo, 0x1);
+    lo = _mm_add_ss(lo, sh);
+    return _mm_cvtss_f32(lo);
+}
+/* Load 8 bf16 (uint16) and widen to f32 by shifting into the high half. */
+static inline __m256 qwen_loadu_bf16_8(const uint16_t *p) {
+    __m128i b = _mm_loadu_si128((const __m128i *)p);
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16));
+}
+/* f32 dot product, AVX2/FMA with scalar tail (attention score). */
+static inline float qwen_dot_f32_avx2(const float *a, const float *b, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    int d = 0;
+    for (; d + 8 <= n; d += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), _mm256_loadu_ps(b + d), acc);
+    float s = qwen_hsum256_ps(acc);
+    for (; d < n; d++) s += a[d] * b[d];
+    return s;
+}
+/* q·(bf16 k) dot product, AVX2/FMA with scalar tail (bf16-KV attention score). */
+static inline float qwen_dot_f32_bf16_avx2(const float *q, const uint16_t *k, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    int d = 0;
+    for (; d + 8 <= n; d += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + d), qwen_loadu_bf16_8(k + d), acc);
+    float s = qwen_hsum256_ps(acc);
+    for (; d < n; d++) s += q[d] * bf16_to_f32(k[d]);
+    return s;
+}
+/* Attention online-softmax accumulators (AVX2). */
+static inline void qwen_acc_corr_avx2(float *o, const float *v, float c, int n) {
+    __m256 vc = _mm256_set1_ps(c); int d = 0;
+    for (; d + 8 <= n; d += 8)
+        _mm256_storeu_ps(o + d, _mm256_fmadd_ps(_mm256_loadu_ps(o + d), vc, _mm256_loadu_ps(v + d)));
+    for (; d < n; d++) o[d] = o[d] * c + v[d];
+}
+static inline void qwen_acc_wt_avx2(float *o, const float *v, float w, int n) {
+    __m256 vw = _mm256_set1_ps(w); int d = 0;
+    for (; d + 8 <= n; d += 8)
+        _mm256_storeu_ps(o + d, _mm256_fmadd_ps(_mm256_loadu_ps(v + d), vw, _mm256_loadu_ps(o + d)));
+    for (; d < n; d++) o[d] += v[d] * w;
+}
+static inline void qwen_scale_avx2(float *o, float s, int n) {
+    __m256 vs = _mm256_set1_ps(s); int d = 0;
+    for (; d + 8 <= n; d += 8)
+        _mm256_storeu_ps(o + d, _mm256_mul_ps(_mm256_loadu_ps(o + d), vs));
+    for (; d < n; d++) o[d] *= s;
+}
+static inline void qwen_acc_corr_bf16_avx2(float *o, const uint16_t *v, float c, int n) {
+    __m256 vc = _mm256_set1_ps(c); int d = 0;
+    for (; d + 8 <= n; d += 8)
+        _mm256_storeu_ps(o + d, _mm256_fmadd_ps(_mm256_loadu_ps(o + d), vc, qwen_loadu_bf16_8(v + d)));
+    for (; d < n; d++) o[d] = o[d] * c + bf16_to_f32(v[d]);
+}
+static inline void qwen_acc_wt_bf16_avx2(float *o, const uint16_t *v, float w, int n) {
+    __m256 vw = _mm256_set1_ps(w); int d = 0;
+    for (; d + 8 <= n; d += 8)
+        _mm256_storeu_ps(o + d, _mm256_fmadd_ps(qwen_loadu_bf16_8(v + d), vw, _mm256_loadu_ps(o + d)));
+    for (; d < n; d++) o[d] += bf16_to_f32(v[d]) * w;
+}
+#endif
+
 
 /* Fused bf16 matvec: processes 2 output rows at a time to amortize x vector loads.
  * On NEON: 32 elements/iter, 8 accumulators per row pair (from qwen-asr). */
@@ -460,6 +530,33 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
                              vld1q_f32(x + k + 4));
         }
         float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; k < in_dim; k++) sum += bf16_to_f32(w_row[k]) * x[k];
+        y[o] = sum;
+    }
+#elif defined(__AVX2__)
+    /* AVX2: 2 output rows at a time, 8 f32 elements/iter, FMA */
+    for (; o + 1 < out_dim; o += 2) {
+        const uint16_t *w0 = W + (size_t)o * in_dim;
+        const uint16_t *w1 = W + (size_t)(o + 1) * in_dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= in_dim; k += 8) {
+            __m256 xv = _mm256_loadu_ps(x + k);
+            a0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k), xv, a0);
+            a1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k), xv, a1);
+        }
+        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(a1);
+        for (; k < in_dim; k++) { s0 += bf16_to_f32(w0[k]) * x[k]; s1 += bf16_to_f32(w1[k]) * x[k]; }
+        y[o] = s0;
+        y[o + 1] = s1;
+    }
+    if (o < out_dim) {
+        const uint16_t *w_row = W + (size_t)o * in_dim;
+        __m256 acc = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= in_dim; k += 8)
+            acc = _mm256_fmadd_ps(qwen_loadu_bf16_8(w_row + k), _mm256_loadu_ps(x + k), acc);
+        float sum = qwen_hsum256_ps(acc);
         for (; k < in_dim; k++) sum += bf16_to_f32(w_row[k]) * x[k];
         y[o] = sum;
     }
@@ -597,6 +694,20 @@ void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
             float a = fabsf(val);
             if (a > amax) amax = a;
         }
+#elif defined(__AVX2__)
+        __m256 vmax = _mm256_setzero_ps();
+        const __m256 signmask = _mm256_set1_ps(-0.0f);
+        int k = 0;
+        for (; k + 7 < cols; k += 8)
+            vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(signmask, qwen_loadu_bf16_8(row + k)));
+        float mtmp[8]; _mm256_storeu_ps(mtmp, vmax);
+        for (int j = 0; j < 8; j++) if (mtmp[j] > amax) amax = mtmp[j];
+        for (; k < cols; k++) {
+            uint32_t bits = (uint32_t)row[k] << 16;
+            float val; memcpy(&val, &bits, sizeof(float));
+            float a = fabsf(val);
+            if (a > amax) amax = a;
+        }
 #else
         for (int k = 0; k < cols; k++) {
             uint32_t bits = (uint32_t)row[k] << 16;
@@ -624,6 +735,21 @@ void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
             int16x4_t s1 = vqmovn_s32(i1);
             int8x8_t q = vqmovn_s16(vcombine_s16(s0, s1));
             vst1_s8(dst_row + k, q);
+        }
+        for (; k < cols; k++) {
+            uint32_t bits = (uint32_t)row[k] << 16;
+            float val; memcpy(&val, &bits, sizeof(float));
+            int v = (int)roundf(val * inv_s);
+            dst_row[k] = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
+        }
+#elif defined(__AVX2__)
+        __m256 vinv = _mm256_set1_ps(inv_s);
+        k = 0;
+        for (; k + 7 < cols; k += 8) {
+            __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(qwen_loadu_bf16_8(row + k), vinv));
+            __m128i q16 = _mm_packs_epi32(_mm256_castsi256_si128(q),
+                                          _mm256_extracti128_si256(q, 1));
+            _mm_storel_epi64((__m128i *)(dst_row + k), _mm_packs_epi16(q16, q16));
         }
         for (; k < cols; k++) {
             uint32_t bits = (uint32_t)row[k] << 16;
@@ -711,6 +837,36 @@ static void int8_matvec_fused(float *y, const float *x, const int8_t *W,
             acc1 = vfmaq_f32(acc1, f1, vld1q_f32(x + k + 4));
         }
         float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        for (; k < in_dim; k++) sum += (float)w_row[k] * x[k];
+        y[o] = sum * scale[o];
+    }
+#elif defined(__AVX2__)
+    /* AVX2: 2 rows at a time, 8 int8 widened to f32/iter, FMA */
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= in_dim; k += 8) {
+            __m256 xv = _mm256_loadu_ps(x + k);
+            __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(w0 + k))));
+            __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(w1 + k))));
+            a0 = _mm256_fmadd_ps(f0, xv, a0);
+            a1 = _mm256_fmadd_ps(f1, xv, a1);
+        }
+        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(a1);
+        for (; k < in_dim; k++) { s0 += (float)w0[k] * x[k]; s1 += (float)w1[k] * x[k]; }
+        y[o] = s0 * scale[o];
+        y[o + 1] = s1 * scale[o + 1];
+    }
+    if (o < out_dim) {
+        const int8_t *w_row = W + (size_t)o * in_dim;
+        __m256 acc = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= in_dim; k += 8)
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                      _mm_loadl_epi64((const __m128i *)(w_row + k)))), _mm256_loadu_ps(x + k), acc);
+        float sum = qwen_hsum256_ps(acc);
         for (; k < in_dim; k++) sum += (float)w_row[k] * x[k];
         y[o] = sum * scale[o];
     }
@@ -881,6 +1037,14 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
         }
         sum = vaddvq_f32(vaddq_f32(a0, a1));
         for (; k < in_dim; k++) sum += (float)row[k] * x[k];
+#elif defined(__AVX2__)
+        __m256 acc = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= in_dim; k += 8)
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                      _mm_loadl_epi64((const __m128i *)(row + k)))), _mm256_loadu_ps(x + k), acc);
+        sum = qwen_hsum256_ps(acc);
+        for (; k < in_dim; k++) sum += (float)row[k] * x[k];
 #else
         for (int k = 0; k < in_dim; k++) sum += (float)row[k] * x[k];
 #endif
@@ -984,6 +1148,28 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
             acc3 = vfmaq_f32(acc3, vmulq_f32(f7, vscale), vld1q_f32(xb + 28));
 
             sum += vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+        }
+#elif defined(__AVX2__)
+        for (int b = 0; b < blocks_per_row; b++) {
+            float scale = row[b].scale;
+            const uint8_t *qs = row[b].qs;
+            const float *xb = x + b * Q4_0_BLOCK_SIZE;
+            __m128i raw = _mm_loadu_si128((const __m128i *)qs);   /* 16 bytes = 32 nibbles */
+            __m128i lo = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
+            /* Interleave to value order [lo0,hi0,lo1,hi1,...] and bias by -8 */
+            __m128i il0 = _mm_sub_epi8(_mm_unpacklo_epi8(lo, hi), _mm_set1_epi8(8));
+            __m128i il1 = _mm_sub_epi8(_mm_unpackhi_epi8(lo, hi), _mm_set1_epi8(8));
+            __m256 vs = _mm256_set1_ps(scale);
+            __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(il0));
+            __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(il0, 8)));
+            __m256 f2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(il1));
+            __m256 f3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(il1, 8)));
+            __m256 acc = _mm256_mul_ps(_mm256_mul_ps(f0, vs), _mm256_loadu_ps(xb));
+            acc = _mm256_fmadd_ps(_mm256_mul_ps(f1, vs), _mm256_loadu_ps(xb + 8), acc);
+            acc = _mm256_fmadd_ps(_mm256_mul_ps(f2, vs), _mm256_loadu_ps(xb + 16), acc);
+            acc = _mm256_fmadd_ps(_mm256_mul_ps(f3, vs), _mm256_loadu_ps(xb + 24), acc);
+            sum += qwen_hsum256_ps(acc);
         }
 #else
         for (int b = 0; b < blocks_per_row; b++) {
@@ -1119,6 +1305,8 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                     score = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3)));
                     for (; d < head_dim; d++) score += q_row[d] * k_row[d];
                 }
+#elif defined(__AVX2__)
+                score = qwen_dot_f32_avx2(q_row, k_row, head_dim);
 #else
                 score = 0.0f;
                 for (int d = 0; d < head_dim; d++)
@@ -1143,6 +1331,8 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                         for (; d < head_dim; d++)
                             o_row[d] = o_row[d] * correction + v_row[d];
                     }
+#elif defined(__AVX2__)
+                    qwen_acc_corr_avx2(o_row, v_row, correction, head_dim);
 #else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] = o_row[d] * correction + v_row[d];
@@ -1164,6 +1354,8 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                         for (; d < head_dim; d++)
                             o_row[d] += v_row[d] * wt;
                     }
+#elif defined(__AVX2__)
+                    qwen_acc_wt_avx2(o_row, v_row, wt, head_dim);
 #else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] += v_row[d] * wt;
@@ -1185,6 +1377,8 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
                     }
                     for (; d < head_dim; d++) o_row[d] *= inv_sum;
                 }
+#elif defined(__AVX2__)
+                qwen_scale_avx2(o_row, inv_sum, head_dim);
 #else
                 for (int d = 0; d < head_dim; d++)
                     o_row[d] *= inv_sum;
@@ -1237,6 +1431,8 @@ void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, 
                     score = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3)));
                     for (; d < head_dim; d++) score += q_row[d] * k_row[d];
                 }
+#elif defined(__AVX2__)
+                score = qwen_dot_f32_avx2(q_row, k_row, head_dim);
 #else
                 score = 0.0f;
                 for (int d = 0; d < head_dim; d++)
@@ -1260,6 +1456,8 @@ void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, 
                         for (; d < head_dim; d++)
                             o_row[d] = o_row[d] * correction + v_row[d];
                     }
+#elif defined(__AVX2__)
+                    qwen_acc_corr_avx2(o_row, v_row, correction, head_dim);
 #else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] = o_row[d] * correction + v_row[d];
@@ -1281,6 +1479,8 @@ void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, 
                         for (; d < head_dim; d++)
                             o_row[d] += v_row[d] * wt;
                     }
+#elif defined(__AVX2__)
+                    qwen_acc_wt_avx2(o_row, v_row, wt, head_dim);
 #else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] += v_row[d] * wt;
@@ -1302,6 +1502,8 @@ void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, 
                     }
                     for (; d < head_dim; d++) o_row[d] *= inv_sum;
                 }
+#elif defined(__AVX2__)
+                qwen_scale_avx2(o_row, inv_sum, head_dim);
 #else
                 for (int d = 0; d < head_dim; d++)
                     o_row[d] *= inv_sum;
@@ -1362,6 +1564,8 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
                     for (; d < head_dim; d++)
                         score += q_row[d] * bf16_to_f32(k_row_bf16[d]);
                 }
+#elif defined(__AVX2__)
+                score = qwen_dot_f32_bf16_avx2(q_row, k_row_bf16, head_dim);
 #else
                 score = 0.0f;
                 for (int d = 0; d < head_dim; d++)
@@ -1392,6 +1596,8 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
                         for (; d < head_dim; d++)
                             o_row[d] = o_row[d] * correction + bf16_to_f32(v_row_bf16[d]);
                     }
+#elif defined(__AVX2__)
+                    qwen_acc_corr_bf16_avx2(o_row, v_row_bf16, correction, head_dim);
 #else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] = o_row[d] * correction + bf16_to_f32(v_row_bf16[d]);
@@ -1419,6 +1625,8 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
                         for (; d < head_dim; d++)
                             o_row[d] += bf16_to_f32(v_row_bf16[d]) * wt;
                     }
+#elif defined(__AVX2__)
+                    qwen_acc_wt_bf16_avx2(o_row, v_row_bf16, wt, head_dim);
 #else
                     for (int d = 0; d < head_dim; d++)
                         o_row[d] += bf16_to_f32(v_row_bf16[d]) * wt;
@@ -1440,6 +1648,8 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
                     }
                     for (; d < head_dim; d++) o_row[d] *= inv_sum;
                 }
+#elif defined(__AVX2__)
+                qwen_scale_avx2(o_row, inv_sum, head_dim);
 #else
                 for (int d = 0; d < head_dim; d++)
                     o_row[d] *= inv_sum;
@@ -1711,6 +1921,22 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16, int in_dim, 
             s0 += wv0 * x[k];
             s1 += wv1 * x[k];
         }
+        if (s0 > best_val) { best_val = s0; best_idx = o; }
+        if (s1 > best_val) { best_val = s1; best_idx = o + 1; }
+    }
+#elif defined(__AVX2__)
+    for (; o + 1 < out_dim; o += 2) {
+        const uint16_t *w0 = W_bf16 + (size_t)o * in_dim;
+        const uint16_t *w1 = W_bf16 + (size_t)(o + 1) * in_dim;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 8 <= in_dim; k += 8) {
+            __m256 xv = _mm256_loadu_ps(x + k);
+            a0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k), xv, a0);
+            a1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k), xv, a1);
+        }
+        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(a1);
+        for (; k < in_dim; k++) { s0 += bf16_to_f32(w0[k]) * x[k]; s1 += bf16_to_f32(w1[k]) * x[k]; }
         if (s0 > best_val) { best_val = s0; best_idx = o; }
         if (s1 > best_val) { best_val = s1; best_idx = o + 1; }
     }
