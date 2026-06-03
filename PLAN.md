@@ -270,12 +270,14 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
 `qwen_matvec_q4_0*`). Findings below are **verified**; "needs-verify" tagged where not yet confirmed.
 
 **CORRECTNESS (fix first — testable on M1 now):**
-- [ ] `[HIGH]` **Server cross-request reproducibility** — `qwen_tts.c:1089-1105`: delta-prefill reuses
-  the previous request's KV prefix (`ctx->kv_len = delta_start`). Cold request 1 == CLI (correct);
-  request 2+ reuse stale state → identical requests give different length/output (verified: 3 runs
-  291884/311084/257324 B, even `-j1 temp0`). Fix: reset `kv_len=0` per request (or only reuse on a
-  verified-identical prefix AND prove the reused KV equals a fresh prefill). Also reset `cp_kv_len`,
-  `n_prev_tokens`, frame counters; and on error-return the state is left dirty (`n_prev_tokens`).
+- [x] **Server cross-request reproducibility — FIXED 2026-06-03 (commit cbfa979).** Root cause was NOT
+  "kv_len not reset" but: on a FULL prefix match (`delta_start==prefill_len`, identical consecutive
+  request) the prefill block at `qwen_tts.c:1108` was skipped entirely, leaving `ctx->dec_x` (read to
+  seed the first generated frame) STALE from the previous request's last token step. Fix: on full
+  match force `delta_start=0` (full fresh prefill = bit-identical to cold). Partial matches (real
+  server case: shared prefix, different text) untouched → delta-prefill optimization preserved.
+  Verified: 3 identical reqs now bit-identical AND == CLI (327ec448); `test-serve-bench` PASSES (was
+  FAIL); test-small 5/5. Remaining server hardening (below) still open.
 - [ ] `[HIGH]` **Server not thread-safe** — single shared `qwen_tts_ctx_t`, no lock, requests
   serialized; 2 concurrent curls corrupt state. Decide: document single-flight + add a mutex, or
   per-connection ctx. (`qwen_tts_server.c` accept loop.)
@@ -318,15 +320,10 @@ talker.c forward). "x86 FTZ incomplete" and ".qvoice v1 enc_dim hardcoded" — `
   bf16_accum have AVX2). Authoritative docs (README/CLAUDE/docs/*) fixed 2026-06-03 (commit 7aa0f9b);
   the blog narrative is deferred until AFTER the real fixes + fresh measurements land, so it's
   rewritten once against true numbers rather than patched twice.
-- [ ] `[MED]` **Server warm-request reproducibility bug (found 2026-06-03).** `make test-serve-bench`
-  fails its bit-identical assertion: two IDENTICAL consecutive requests (seed 42, same text) produce
-  DIFFERENT output — run1 291884 B, run2 311084 B (~400 ms longer), even at `-j1 --temperature 0`.
-  PROVEN **pre-existing & NOT SDOT** (fails identically with `QWEN_NO_SDOT=1`; engine itself is
-  bit-deterministic — CLI `-j1 temp0` is bit-identical, and the server's COLD run1 == CLI output).
-  Cause = server **delta-prefill / KV-reuse across requests**: the warm 2nd request doesn't get a
-  clean state, so it diverges. Contradicts the "delta prefill = bit-identical" belief. Fix: reset KV
-  state between unrelated requests OR only reuse on a verified-matching prefix. The `test-serve-bench`
-  md5 assertion is also too strict (should compare cold-vs-cold, or mel-corr, not warm-vs-cold md5).
+- [x] **Server warm-request reproducibility bug — FIXED 2026-06-03 (commit cbfa979).** See 21.6 for
+  the verified root cause (stale `ctx->dec_x` on full prefix match) + fix (full match → `delta_start=0`).
+  `test-serve-bench` now PASSES. (The md5-bit-identical assertion turned out fine once the bug was
+  fixed — it was the bug, not the test, that was wrong.)
 - **CP sliding window attention** (old 18.3): config has `sliding_window=72`; verify CP attention
   caps at it. `[MED]`, only matters for 200+ frame sequences.
 - **Long-form / audiobook mode** (old Phase 19): chapter/batch mode, progress indicator + ETA/RTF,
