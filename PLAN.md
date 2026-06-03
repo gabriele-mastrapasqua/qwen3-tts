@@ -297,10 +297,14 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   benchmarked.** No macOS-x86, no Windows. Add a real inference smoke (small model) + SDE for ISA.
 - [ ] **Windows native won't compile** (`mmap`/`pthread`/`gettimeofday`, no Win32 fallback) — WSL2 only.
 
-> ⚠️ **HARD CONSTRAINT: we have NO x86 hardware.** We can WRITE + correctness-verify AVX2/VNNI +
-> threading on the M1 (scalar-equivalence unit tests, Intel SDE in CI for ISA correctness), but we
-> **cannot measure x86 RTF here.** Real x86 perf tuning needs a rented box / CI runner. Plan the
-> code now; gate perf claims on real HW. (This is exactly why x86 silently rotted before.)
+> ✅ **x86 test box NOW available (2026-06-03):** user's **Ryzen 7 6800H** mini PC (Zen 3+, **AVX2+FMA
+> yes, AVX-512 no**) on LAN `192.168.1.93` (RDP; see memory `reference_x86_test_box`). Build under
+> **WSL2** (our Linux x86 path), run a small model, confirm AVX2 is active + get real x86 perf.
+> Workflow: Claude gives build/debug commands → user runs over RDP → pastes logs → verify together.
+> ⟹ This validates the **AVX2 baseline matvec + x86 threading** (the 90% gap). **VNNI/AVX-512** still
+> needs a Zen4+/Intel box. Approach (user): **write + correctness-verify AVX2/threading now** (scalar-
+> equivalence + SDE-in-CI), then **measure on the Ryzen box** — no longer fully blind. (This is exactly
+> the testing that never happened before → why x86 silently rotted.)
 
 **DEBUNKED agent claims (do NOT propagate):** "int4 loaded but never used" (FALSE — int4 wired in
 talker.c forward). "x86 FTZ incomplete" and ".qvoice v1 enc_dim hardcoded" — `needs-verify` before acting.
