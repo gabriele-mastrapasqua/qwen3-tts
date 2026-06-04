@@ -477,6 +477,35 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 
 ---
 
+## Future research (discovered 2026-06-04, to re-analyze)
+
+### A. Prosody/emotion control by perturbing the Code Predictor (instruct is too weak)
+Serendipity: quantizing the CP `down` projection to 2-bit (`QWEN_CP_Q2_FFN=down --int4`)
+makes the voice **intelligible but aggressive/rough** ("death metal"). Perturbation magnitude
+maps to roughness: int8 = identical to bf16, int4 = slightly aggressive, q2 = strong. Mechanism:
+RVQ split — Talker codebook 0 = words (intact), CP codebooks 1-15 = fine texture/prosody;
+perturbing the CP roughens texture without losing intelligibility.
+- **Why it matters:** `--instruct` barely changes delivery (known Qwen3-TTS limitation, even
+  full-size on GPU; community-reported). The acoustic emotion signal is weak in the output.
+- **Principled lever = activation steering / control vectors:** diff CP activations
+  (neutral − instruct-angry) → an "emotion direction" → inject it amplified (×N) at inference →
+  controllable, audible emotion (amplify the weak instruct signal instead of breaking weights
+  at random). The quant-roughness is the crude cousin of this.
+- **Experiments:** (1) tunable `--roughness` = blend bf16↔q2 output on CP `down`
+  (down_out = (1-r)*bf16 + r*q2); (2) control-vector emotion injection on the CP; per-layer and
+  per-speaker/language sensitivity unknown (q2 effect confirmed only on 0.6B/ryan/EN/seed42).
+
+### B. Weight-stationary batching = the throughput lever for the SERVER
+Single-stream (one audio) cannot reorder to keep weights cache-hot: the CP's 16 steps (and the
+Talker's tokens) are a hard autoregressive chain (step g input = step g-1 output), so the weight
+read order `L1..L5 x16` can't be reordered ("weights-outer, steps-inner" needs all step inputs at
+once — they don't exist yet). BUT across **independent concurrent requests** the reorder is valid:
+batch N requests -> each weight read is reused across all N (weight-stationary across the batch) ->
+~Nx throughput. This is standard LLM continuous-batching. **Not a single-file latency win; a big
+multi-request server throughput win.** Re-analyze when optimizing the HTTP server for concurrency.
+
+---
+
 ## References
 
 - [Qwen3-TTS GitHub](https://github.com/QwenLM/Qwen3-TTS) ·
