@@ -325,6 +325,26 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   merges.txt loads now check the read length (short read → error + free, was silently ignored).
   `(size_t)rows*cols` overflow: low risk, cast present; left as-is (would need absurd config dims).
 
+**TEST & VALIDATION BACKLOG (added 2026-06-04 — quant × voice × delivery cross-product + concurrency):**
+- [ ] **Re-run the FULL test matrix with `.qvoice` AFTER clone, crossed with quants.** The 0.6B-Talker
+  int8 change (commit 12b73d7) + WDELTA re-quant path means voice-clone × {bf16, int8, int4} must all be
+  re-validated: create a `.qvoice`, then load it under each quant and check EOS/coherence/RTF + golden-
+  style mel-corr. Today's goldens cover preset voices only — NO `.qvoice`×quant golden exists.
+- [ ] **DESIGN DECISION: should `.qvoice` store quantized weights?** Option A (today): `.qvoice` is bf16
+  WDELTA, quantized at load if `--int8/--int4` (re-quant after WDELTA override). Option B: at voice-CREATE
+  time let the user choose to quantize, SAVE the quantized weights in the `.qvoice`, and load them
+  pre-quantized (faster load, smaller file, fixed precision per voice). Trade-off: B locks the precision
+  into the file (can't switch), A stays flexible. Decide after the int8-default question below. If int8
+  becomes the default, B (save-quantized) gets more attractive.
+- [ ] **Re-run ALL server RTF benchmarks** (cold/warm, bf16/int8/int4, `.qvoice`) now that the 0.6B Talker
+  is int8 under `--int8` — the README server RTF table (1.33/1.34) predates this and is stale.
+- [ ] **NEW concurrency tests (for the batching work):** (a) parallel-request test — N concurrent curls,
+  assert all return valid distinct WAVs (today serialized by `g_synth_lock`; this test must stay green
+  when concurrency is added); (b) race detector — build a `make test-serve-race` that runs the server
+  under TSan (`-fsanitize=thread`) + concurrent load to prove `g_synth_lock` actually guards the shared
+  ctx (and catch any unlocked shared state when batching lands); (c) streaming RTF test + verify streaming
+  works under int8/int4 (TTFA + RTF per quant). All must use the timeout+pkill harness (runaway lesson).
+
 **PERFORMANCE / PORTABILITY (the big gap — see 21.2/21.3/21.3b):**
 - [ ] All 8 hot matvec/attention kernels scalar on x86; matvec threading GCD/Apple-only; SwiGLU exp
   uses Accelerate `vvexpf` on macOS, scalar `expf` elsewhere (`kernels.c:1433`); post-M1 NEON headroom.
@@ -607,6 +627,19 @@ Tested the user's "low-bit early codebooks / high-bit late delicate ones" hybrid
   CP sweet spot — the cost is in the shared FFN/attn.
 - **Only safe low-bit hybrid: int4 on the 15 lm_heads** (84% agreement) → memory saving (60→15 MB),
   but heads are 4.3% of CP time → negligible speed. Marginal, clean, optional.
+- [ ] **OPEN QUESTION (added 2026-06-04): can int4 shed the "anger" and become the TRUE default, or not?**
+  int4 introduced slight aggression (ear), q2 strong "death-metal" — the quant-ladder localised it to
+  the LATE/fine CP codebooks (c11-c15: int4 23-27% vs bf16) that carry texture/prosody. The anger is
+  the SAME perturbation as the prosody knob (track A), just uncontrolled. Question: is there an int4
+  variant that keeps the speed/memory but NOT the roughness? Candidates to test: (a) **int4 transformer
+  + int8 (or bf16) lm_heads** — but Exp1 showed heads aren't the driver (+2%), so unlikely; (b) **finer
+  int4 (per-group scales / smaller block than 32, or int4 + a few high-precision outlier channels** à la
+  AWQ/per-channel) — the block-32 absmax may be too coarse for the sensitive late residuals; (c) **int4
+  everywhere EXCEPT the FFN `down` (kept int8/bf16)** — `down` is the causal driver of the roughness
+  (q2-on-down = death-metal), so int8-down + int4-rest might remove the anger at most of the speed. If
+  any (b)/(c) yields int4-speed + int8-quality → int4 becomes the real default; if not, int8 stays the
+  default and int4 lives only as the deliberate `--roughness` knob. MEASURE with the quant-ladder (code0
+  + per-codebook agreement) AND by ear. Decide the `.qvoice`-save-quantized design (test backlog) after.
 - **Speed must come from compute throughput, not byte-cutting:** the CP is COMPUTE-bound after
   SDOT (the workflow corrected our "bandwidth-bound" framing — int8 weight → one vdotq_s32 vs
   dequant+FMA×8, so the FMA reduction is the limiter; int4's 1-row q4 kernel made x-loads the new
