@@ -633,7 +633,10 @@ q2 "roughness" effect (HIGH); (4) CP attn q/k/v/o (MEDIUM); (5) Talker bf16 KV (
 ConvNeXt pw1/pw2 if ever quantized (MEDIUM-HIGH, currently f32); (7) embeddings + all norms (LOW —
 keep f32/bf16). **codec_head itself is NEVER quantized despite gating intelligibility.**
 
-**Speed levers (ranked):** SDOT (validated, ARM) · **x86 VNNI + cross-OS pool (written, UNVALIDATED —
+**Speed levers (ranked):** SDOT (validated, ARM) · **0.6B Talker int8 — ✅ SHIPPED 2026-06-04**
+(dropped the stale `hidden<2048` gate; --int8 now quantizes the 0.6B Talker too: Talker step
+30→16 ms/f = −47%, 0.6B int8 RTF → 0.87–0.92 sub-1.0, no 4-thread hang, code0 96.9% = int8-gentle on
+words, user ear-approved, int8 golden regenerated) · **x86 VNNI + cross-OS pool (written, UNVALIDATED —
 x86 is scalar+single-thread today, the #1 unblock)** · server continuous-batching (throughput only).
 **Refuted/closed (all verified 2026-06-04):**
 - int4-Q4_0 global on CP, self-speculative (marginal), contextual sparsity (CP FFN dense).

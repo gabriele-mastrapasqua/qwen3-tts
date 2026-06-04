@@ -221,7 +221,11 @@ static void tk_qz(int8_t **dst, float **scale, const uint16_t *src, int rows, in
  * 1.7B (hidden>=2048); the 0.6B Talker is too small to benefit. */
 void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c = &ctx->config;
-    if (!ctx->use_int8 || c->hidden_size < 2048) return;
+    /* The old `hidden < 2048` gate (0.6B Talker stayed bf16 under --int8) was a denormal-hang
+     * workaround, since fixed by FTZ (qwen_ftz_on in every matvec worker) + fused int8 qkv —
+     * same fix that unblocked CP int8 at hidden=1024. Dropping it lets --int8 quantize the
+     * 0.6B Talker too (int8 = the measured quality floor / gold), for the Talker-step speedup. */
+    if (!ctx->use_int8) return;
     int h = c->hidden_size;
     int q_dim = c->num_heads * c->head_dim;
     int kv_dim = c->num_kv_heads * c->head_dim;
