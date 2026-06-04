@@ -102,8 +102,20 @@ Two structural facts drive the map:
   - **0.6B broke the RTF 1.0 barrier** (preset short, RTF 0.98) — the Phase 18 target.
   - Activation quant is per-vector absmax; outlier worry did not materialize — listening confirmed
     fine on the greedy CP AND the sampled 1.7B Talker. Selective-SDOT (down_proj legacy) NOT needed.
-- [ ] `[MED]` **Extend SDOT to CP lm_heads.** `qwen_argmax_matvec_int8` (15 lm_heads/frame, 4.3% of
-  CP) still uses the f32 path — small but free. (VNNI is the x86 twin, 21.3, needs the rented box.)
+- [x] `[REFUTED 2026-06-04]` **SDOT on CP lm_heads — DON'T.** Tried routing `qwen_argmax_matvec_int8`
+  through the SDOT path (quantize x to int8, vdotq_s32). It is NOT free: quantizing the lm_head
+  activation flips enough near-tie argmaxes that — via the CP→Talker code feedback — the int8
+  trajectory FORKS (int8 golden mel-corr 1.0 → **0.51**, duration +11%). The f32-precision activation
+  on this one final matvec is what STABILISES the int8 trajectory. ~0.9% overall speed (4.3%-of-CP ×
+  ~20%) is not worth changing the validated int8 output. Kept on the f32 path; documented in-kernel.
+- [x] `[NO-WIN 2026-06-04]` **q4_0 2-row fuse — reverted.** 2-row-fused the q4 kernel to share x-vector
+  loads across two output rows (bit-identical, verified). Measured on M1 NEON (-j1, 0.6B int4): CP
+  ~167.7 vs ~164.7 ms/f = **no gain, within noise / slightly worse**. The q4 nibble DECODE (unpack +
+  cvt-f32 + scale) dominates; x-loads were never the bottleneck on NEON (the workflow's "+40% x-loads"
+  applied to an older kernel state). Added register pressure (8 x-vectors + 2 accumulator sets) didn't
+  help. Reverted per "no complexity for tiny wins." Re-try only if x86/AVX2 measurement shows x-loads
+  matter there (the AVX2 twin would need the rented box). The real q4 lever, if any, is a DECODE
+  rework (e.g. int8-x + SDOT on decoded nibbles), not x-load sharing.
 
 > ⚠️ **SDOT is ARM-only (`vdotq_s32`, guarded by `__ARM_FEATURE_DOTPROD`).** On x86 the whole
 > int8 matvec already falls to **scalar** (no AVX2 — `qwen_tts_kernels_avx.c` is empty, see 21.5),
@@ -622,10 +634,11 @@ ConvNeXt pw1/pw2 if ever quantized (MEDIUM-HIGH, currently f32); (7) embeddings 
 keep f32/bf16). **codec_head itself is NEVER quantized despite gating intelligibility.**
 
 **Speed levers (ranked):** SDOT (validated, ARM) · **x86 VNNI + cross-OS pool (written, UNVALIDATED —
-x86 is scalar+single-thread today, the #1 unblock)** · 2-row-fuse q4_0 · SDOT on argmax_matvec_int8 ·
-fuse codec_head into final Talker wo · vectorize RoPE + online-softmax attn accumulators (scalar today)
-· server continuous-batching (throughput only). **Refuted:** int4-Q4_0 global on CP, self-speculative
-(marginal), contextual sparsity (CP FFN dense).
+x86 is scalar+single-thread today, the #1 unblock)** · fuse codec_head into final Talker wo ·
+vectorize RoPE + online-softmax attn accumulators (scalar today) · server continuous-batching
+(throughput only). **Refuted/closed:** int4-Q4_0 global on CP, self-speculative (marginal),
+contextual sparsity (CP FFN dense), **SDOT-on-lm_head (forks int8 trajectory, mel-corr→0.51),
+q4_0 2-row-fuse (no win on NEON — decode-bound not x-load-bound)** — both tried & reverted 2026-06-04.
 
 **Prosody/instruct knobs (ranked, concrete):** (1) `--roughness` = bf16↔q2 blend on CP `down`
 (code_predictor.c FFN); (2) steerable prosody vector added to `cp_x` BEFORE CP layer 0 (the single
