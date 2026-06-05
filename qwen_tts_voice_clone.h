@@ -58,6 +58,11 @@ typedef struct {
 
 int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int *out_sample_rate);
 
+/* Trim a contiguous trailing near-silence / fade-out run from a mono [-1,1] clip
+ * in place (so a voice clone doesn't learn an end-of-clip decrescendo). Conservative:
+ * relative energy threshold, never trims >40% or below ~2s. Opt out QWEN_NO_REF_TRIM=1. */
+void qwen_trim_trailing_silence(float *audio, int *n_samples, int sample_rate, int silent);
+
 /* ── Mel spectrogram ────────────────────────────────────────────────── */
 
 int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,

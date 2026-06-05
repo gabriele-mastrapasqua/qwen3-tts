@@ -1005,6 +1005,9 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             if (ref_sr != QWEN_TTS_SAMPLE_RATE && !ctx->silent)
                 fprintf(stderr, "Warning: ref audio sample rate %d, expected %d\n",
                         ref_sr, QWEN_TTS_SAMPLE_RATE);
+            /* Same trailing-fade trim as the ECAPA path: the ICL codec prefix is
+             * what carries prosody, so a fade-out tail here is the real culprit. */
+            qwen_trim_trailing_silence(ref_audio_samples, &ref_n_samples, ref_sr, ctx->silent);
             if (qwen_speech_encoder_encode(ctx, ref_audio_samples, ref_n_samples,
                                             &ref_codes, &ref_n_frames) != 0) {
                 fprintf(stderr, "Error: speech encoder failed\n");

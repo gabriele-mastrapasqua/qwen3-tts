@@ -207,6 +207,49 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
     return 0;
 }
 
+/* Trim a contiguous trailing near-silence / fade-out run in place. A reference
+ * clip that fades to silence at the end (e.g. a YouTube outro, or a clip cut
+ * mid-fade) makes the voice clone learn an end-of-utterance decrescendo that then
+ * reappears on every generation (observed on the Silvio .qvoice). We scan 20 ms
+ * windows from the end and cut everything below a relative-energy threshold,
+ * keeping a small margin. Conservative bounds: never trim >40% or below ~2 s. */
+void qwen_trim_trailing_silence(float *audio, int *n_samples, int sample_rate, int silent) {
+    if (getenv("QWEN_NO_REF_TRIM")) return;
+    int n = *n_samples;
+    if (!audio || n < sample_rate * 3) return;  /* too short to bother */
+
+    /* Global RMS → adaptive threshold (handles quietly-recorded refs). */
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)audio[i] * audio[i];
+    float global_rms = (float)sqrt(sum / n);
+    if (global_rms <= 0.0f) return;
+    float thresh = 0.18f * global_rms;          /* "tail" = below 18% of average energy */
+    if (thresh < 0.004f) thresh = 0.004f;        /* absolute floor (~ -48 dBFS) */
+
+    int win = sample_rate / 50;                  /* 20 ms */
+    int last_voiced_end = -1;
+    for (int i = n; i - win >= 0; i -= win) {
+        double s = 0.0;
+        for (int k = i - win; k < i; k++) s += (double)audio[k] * audio[k];
+        if ((float)sqrt(s / win) >= thresh) { last_voiced_end = i; break; }
+    }
+    if (last_voiced_end < 0) return;             /* whole clip is quiet — leave it */
+
+    int new_n = last_voiced_end + sample_rate / 20;  /* +50 ms margin */
+    if (new_n > n) new_n = n;
+    int max_trim = (int)(n * 0.40f);
+    if (new_n < n - max_trim) new_n = n - max_trim;  /* never cut more than 40% */
+    int min_keep = sample_rate * 2;
+    if (new_n < min_keep) new_n = (n < min_keep) ? n : min_keep;
+
+    if (new_n < n) {
+        if (!silent)
+            fprintf(stderr, "  Voice clone: trimmed %.2fs trailing silence/fade (%.1fs -> %.1fs)\n",
+                    (float)(n - new_n) / sample_rate, (float)n / sample_rate, (float)new_n / sample_rate);
+        *n_samples = new_n;
+    }
+}
+
 
 /* ════════════════════════════════════════════════════════════════════════
  * FFT (radix-2 Cooley-Tukey)
@@ -890,6 +933,9 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
             n_samples = max_samples;
         }
     }
+
+    /* Drop a trailing fade-out / silence so the clone doesn't learn a decrescendo. */
+    qwen_trim_trailing_silence(audio, &n_samples, sample_rate, ctx->silent);
 
     /* By design (decided 2026-06-03; documented in docs/voice-cloning.md + --help):
      * reference audio MUST be 24 kHz. We deliberately do NOT bundle a resampler —
