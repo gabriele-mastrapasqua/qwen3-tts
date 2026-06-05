@@ -47,7 +47,7 @@ make blas
 ## Features
 
 - **Pure C, minimal dependencies** — Only requires a C compiler and BLAS. No Python runtime needed.
-- **Runs on macOS and Linux (ARM/x86)** — [Windows/WSL2](docs/building.md) beta. **Performance note:** the hot matvec/attention kernels are fully optimized (NEON SIMD + multithread) **only on Apple Silicon** today. On x86 they currently fall back to scalar, and decode threading is macOS-only — so off-Apple-Silicon runs correctly but slower. AVX2/AVX-512 + cross-OS threading are in progress (see PLAN.md Phase 21).
+- **Runs on macOS, Linux and Windows/WSL2 (ARM/x86)** — the hot matvec/attention kernels have **NEON+SDOT (ARM), AVX2 and AVX-512/VNNI (x86)** twins with a scalar fallback + runtime ISA guard, and decode threading runs on a **cross-OS pool** (GCD on macOS, pthread elsewhere). Validated on Apple M1, Ryzen 7 6800H, and EPYC 9555P (Zen5). Single-stream RTF is memory/cache-bound, so the chip's cache matters most (see [Performance](#performance)); measure yours with `bash tests/x86_bench.sh`.
 - **Both model sizes** — Automatically detects 0.6B or 1.7B from weight files.
 - **9 preset voices** — `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
 - **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
@@ -94,7 +94,7 @@ Optional:
   --voice-design             VoiceDesign mode (create voice from --instruct)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
-  --int8                     INT8 quantized — recommended on Apple Silicon (0.6B & 1.7B; faster, ~same quality; x86 unverified)
+  --int8                     INT8 quantized (0.6B & 1.7B; faster, ~same quality) — recommended; uses VNNI on AVX-512 x86, SDOT on ARM
   --int4                     Q4_0 quantized (experimental; slower than --int8 on CPU)
   -j, --threads <n>          Worker threads (default: 4)
   --silent                   Suppress status output
@@ -249,6 +249,21 @@ Run benchmarks on your machine:
 make bench         # Quick: short+long, normal+stream (both models)
 make bench-full    # Full: + server, instruct, INT8, .qvoice (if available)
 ```
+
+**Cross-device CPU (single-stream 0.6B, this repo's best config — reproduce with `bash tests/x86_bench.sh`):**
+
+| Device | SIMD + threads | RAM | Best 0.6B RTF | Config |
+|---|---|---|---|---|
+| **Apple M1** 8-core | NEON + SDOT int8, GCD 4-thread | 16 GB | **~1.3 bf16 / sub-1.0 int8** | `--int8 -j4` |
+| **Ryzen 7 6800H** (Zen3+, 16 MB L3, bare metal) | AVX2 + FMA, pthread 4-thread | 32 GB | **2.02** | `--int4 -j4` |
+| **EPYC 9555P** (Zen5, AVX-512+VNNI, Scaleway VM) | AVX-512-VNNI, pthread | 16 GB / 4 vCPU | **1.64** | `--int8 -j1` |
+
+Single-stream RTF is **memory/cache-bound** (the Code Predictor re-reads its weights 16×/frame):
+SIMD width and thread count matter less than fewer weight bytes (`--int8`/`--int4`) and a cache
+that fits the working set (Apple's SLC, an X3D chip's V-cache). On x86 the int8+VNNI kernel stack
+is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.04 → VNNI-int8 `-j1`
+1.64); threading scales on bare metal but a multi-CCD VM limits it. Many-core servers are best for
+**throughput** (concurrent requests), not single-stream latency. Check yours: `./qwen_tts --caps`.
 
 **vs other implementations:**
 

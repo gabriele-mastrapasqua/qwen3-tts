@@ -118,6 +118,23 @@ drawing perf conclusions on x86 — the bottleneck is **not** what you'd expect:
   memory subsystem: the M1's unified memory + large system-level cache handle the Code
   Predictor's 16×-per-frame weight re-read better than a mini-PC's DDR5 at comparable peak GB/s.
 
+### AVX-512 / VNNI (Zen4+/Intel)
+
+On a CPU with AVX-512-VNNI, build the VNNI int8 path:
+
+```bash
+make blas SIMD=avx512vnni     # needs avx512f/bw/vl + avx512_vnni in /proc/cpuinfo
+./qwen_tts --caps             # should report: int8 dot: VNNI _mm512_dpbusd_epi32 (native)
+./qwen_tts --self-test        # kernel numeric correctness, ISA-independent (no model needed)
+```
+
+Validated on an **AMD EPYC 9555P** (Zen5 "Turin", full-width 512-bit AVX-512). The VNNI int8
+kernel is a real **~1.85× win at equal core count** (scalar-bf16 `-j1` RTF 3.04 → VNNI-int8 `-j1`
+1.64). Caveat: this was a 4-vCPU **VM**, where the hypervisor scatters vCPUs across CCDs and
+limits thread scaling (`-j1` beat `-j4`) — threading scales on **bare metal**. The full
+cross-device table (M1 / 6800H / 9555P) and the reproducible A/B harness are in
+[docs/performance.md](performance.md) → run `bash tests/x86_bench.sh` on your own box.
+
 ## Other Build Targets
 
 ```bash
