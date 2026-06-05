@@ -266,6 +266,46 @@ NEON→scalar fallback, so M1 and x86 are unaffected:
   M2+, Graviton3+) does a 2×2 int8 matmul per instr → ~2× on the int8 matvecs. The 2-row-fused
   layout already half-fits smmla's shape.
 - [ ] `[LOW]` **SVE/SVE2** — Graviton3/4 + ARM servers: vector-length-agnostic loops. Research only.
+- [ ] `[LOW/RESEARCH]` **SME/SME2** (Apple M4, ARMv9.2) — scalable matrix extension; the GEMV→GEMM
+  batching path (track B) could map onto it. Only on M4+; research after bf16/i8mm.
+
+> 💡 **Scaleway rents Apple Silicon Mac mini (M1/M2/M3/M4) by the hour** (account already set up).
+> This is the **ARM twin of the x86-VPS workflow** we just used for AVX-512/VNNI: rent a newer Mac
+> mini for a few hours, implement+validate the post-M1 NEON twins on real silicon, then shut down.
+> - **M2/M3** (ARMv8.6: `__ARM_FEATURE_BF16` + `__ARM_FEATURE_MATMUL_INT8`) → validate `vbfdot`
+>   (bf16 dot) and `smmla` (i8mm, ~2× on int8 matvecs) — the two `[MED]` items above. Dev M1 can't
+>   test these (lacks the features); they're written behind `#if __ARM_FEATURE_*` with NEON fallback.
+> - **M4** (ARMv9.2) → also SME/SME2. Likely back-compatible (runs the M1 NEON+SDOT path unchanged),
+>   so it doubles as a "does v0.9.0 still scream on the newest Apple chip" RTF check.
+> - Reuse `tests/x86_bench.sh`'s spirit: a small `bash tests/arm_bench.sh` (TODO) + `--caps` +
+>   `--self-test` (the self-test is ISA-agnostic → it already gates a new ARM kernel for correctness).
+> - Validate each new ARM kernel with `make test-golden` (same-ISA) + `--self-test` before trusting.
+
+### 21.3c Non-Apple ARM — are we safe? (the same question x86 answered)
+
+**Short answer: the code is SAFE and should run correctly on any aarch64, but it's UNVALIDATED on
+non-Apple ARM and leaves the newer SIMD on the table** — exactly the position x86 was in before the
+Ryzen/EPYC runs.
+
+- **Baseline NEON is universal on aarch64** (`#ifdef __ARM_NEON`, present on every ARMv8) → the
+  matvec/attention hot path runs on Graviton, Ampere Altra, Snapdragon, NVIDIA Grace/GB10, etc.
+- **SDOT** is `#if __ARM_FEATURE_DOTPROD` with a NEON fallback → present on Graviton2+/Ampere/
+  ARMv8.2+ (graceful step-down if absent). **Threading**: the cross-OS pthread pool (21.2) already
+  gives Linux ARM multi-thread (was single before). So nothing *breaks* off-Apple.
+- **GAP 1 — never benchmarked on non-Apple ARM** (same gap x86 had). The RTF numbers are Apple-M1-only.
+- **GAP 2 — `-march=native` build portability** (the ARM mirror of the x86 SIGILL fix): a binary
+  built with `-march=native` on a DOTPROD/i8mm-capable host SIGILLs on an older ARM core. We added the
+  x86 runtime ISA guard + portable `-mavx2` default; **ARM needs the same** (portable baseline +
+  `qwen_check_runtime_isa()` for ARM features + runtime step-down i8mm/bf16→SDOT→NEON→scalar).
+- [ ] `[MED]` **Validate the NEON+SDOT path on a non-Apple ARM box.** Scaleway has **COPARM = Ampere
+  Altra** (Neoverse-N1, ARMv8.2, has DOTPROD) — rent it, `--caps`/`--self-test`/`test-golden` + RTF,
+  same flow as the EPYC run. Confirms "ARM-everywhere" the way the EPYC confirmed "x86-everywhere".
+- [ ] `[LOW]` **ARM runtime ISA guard + portable build** (GAP 2 above) for a shippable non-native ARM binary.
+- **NVIDIA DGX Spark (GB10)** is a concrete future target: 20× Arm Neoverse (ARMv9.2 → NEON+SDOT+**i8mm+
+  bf16+SVE2** all present) + 128 GB unified LPDDR5X. Our **CPU path runs correctly today** (NEON+SDOT+
+  pthread) but leaves i8mm/bf16/SVE2 unused; the unified memory is M1-like (good for the 16×-reread →
+  possibly strong RTF). The GB10 **Blackwell GPU is out of scope** (would need a CUDA backend — separate
+  large effort). So on a DGX Spark we're "safe + correct on CPU, with headroom", not "optimal".
 
 ### 21.4 INT8 productization
 

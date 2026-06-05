@@ -224,24 +224,28 @@ Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --
 
 ## Performance
 
-Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads (`make bench-full`):
+> ### ⚡ The sweet spot: `--int8` is **faster than real-time (RTF < 1.0) on Apple Silicon** — CLI, streaming **and** server
+> ~2× faster than bf16 with **no perceptible quality loss** (validated by ear, including cloned `.qvoice` voices).
 
-| Config | 0.6B RTF | 1.7B BF16 RTF | 1.7B INT8 RTF |
-|--------|----------|---------------|---------------|
-| **CLI short** | 1.37–1.69 | 4.10–4.40 | 3.69 |
-| **CLI long** | **1.29–1.32** | **1.97–2.11** | 2.15 |
-| **CLI stream short** | 1.31 | 2.59–4.01 | — |
-| **CLI stream long** | 1.30–1.33 | 2.06–2.43 | — |
-| **Server (cold)** | 1.34 | — | — |
-| **Server (warm)** | **1.33** | — | — |
+**Apple M1** (8-core, 16 GB, 4 threads), 0.6B model — full-precision **bf16** vs **`--int8`**, across every delivery mode:
 
-RTF = processing_time / audio_duration. Lower is better; <1.0 = faster than real-time.
+| Mode | bf16 RTF | **`--int8` RTF** | First audio (TTFA) |
+|---|---|---|---|
+| CLI (short, ~4 s) | 1.5–1.8 | **0.90** ⚡ | 0.96 s |
+| CLI (long, ~14 s) | ~1.3 | **0.80** ⚡ | — |
+| **Streaming** (`--stream`, short) | 1.5–1.8 | **0.89** ⚡ | **0.46 s** |
+| **Streaming** (long) | ~1.3 | **0.81** ⚡ | **0.50 s** |
+| **HTTP server** (`--serve`, warm) | ~1.3 | **0.88** ⚡ | — |
+| **Custom voice** `.qvoice` (streamed) | 1.34 | **0.93** ⚡ | 0.47 s |
 
-Longer audio improves RTF (fixed costs amortize): 0.6B long text reaches **RTF 1.29**.
-Streaming has identical performance to normal mode. **`--int8`** quantizes both the Talker
-and the Code Predictor and is now a real speed win on both models — **0.6B RTF 1.70→1.29
-(−24%)**, **1.7B 2.66→1.79 (−33%)** — with no perceptible quality loss, and it works with
-custom `.qvoice` voices too ([details](docs/quantization.md)).
+Yes — this project ships a **streaming mode** (`--stream`, ~0.5 s to first audio) and an
+**OpenAI-compatible HTTP server** (`--serve`, with `--workers N` request concurrency). With `--int8`,
+**every delivery path runs faster than real time on a 2020 M1** — cloned custom voices included.
+
+RTF = processing_time / audio_duration; **< 1.0 = faster than real-time**. `--int8` quantizes the
+Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B drops from ~1.5 (bf16) to
+~0.8–0.9**, **1.7B 2.66 → 1.79 (−33%)**, no perceptible quality loss, and it works with `.qvoice`
+voices ([details](docs/quantization.md)). 1.7B: bf16 ~2.0–4.1, `--int8` ~1.8–2.4 on longer text.
 
 Run benchmarks on your machine:
 

@@ -6,13 +6,17 @@ reducing memory usage and (for INT8) improving speed.
 > **Updated 2026-06-03 — int8 now helps BOTH models.** The older claim that int8 had "no effect on
 > 0.6B" was **wrong**: it only quantized the Talker, and the 0.6B Talker (hidden=1024) is too small
 > to benefit. Once CP quantization was enabled (the CP is hidden=1024 and the bottleneck on **both**
-> models), `--int8` gives **0.6B RTF 1.70 → 1.29 (−24%)** too. With native int8 SDOT on Apple Silicon
-> it reaches **RTF ~0.98** on 0.6B. On 1.7B: **RTF 2.66 → 1.79 (−33%)**, Talker −23%, CP −29%.
+> models), `--int8` wins big on **both**. With native int8 SDOT on Apple Silicon the 0.6B model goes
+> **sub-realtime (RTF < 1.0) in every mode**: CLI ~0.90 short / **~0.80 long**, streaming ~0.81–0.89
+> (first audio ~0.5 s), HTTP server warm ~0.88, cloned `.qvoice` ~0.93 — at near-bf16 quality. On 1.7B:
+> **RTF 2.66 → 1.79 (−33%)**, Talker −23%, CP −29%. Full table in [Performance](performance.md).
 
-> ⚠️ **Apple-Silicon only.** These speedups rely on the NEON int8 matvec + SDOT (`__ARM_FEATURE_DOTPROD`)
-> + GCD threading. **On x86 the int8 matvec is scalar (no AVX2/VNNI yet) and decode is single-thread**,
-> so `--int8` is **unverified / possibly slower than BF16 there** — measure before using. SDOT can be
-> toggled off with `QWEN_NO_SDOT=1`. See PLAN.md 21.3.
+> **x86 (updated 2026-06-05):** the int8 matvec now has **AVX2 + AVX-512/VNNI** twins (native
+> `_mm512_dpbusd_epi32`) and decode runs on a cross-OS pthread pool — validated on a Ryzen 7 6800H
+> (AVX2) and an EPYC 9555P / Zen5 (AVX-512/VNNI), where the int8 kernel is a ~1.85× win at equal core
+> count. x86 single-stream RTF is memory/cache-bound (so it won't reach Apple's sub-1.0 without a
+> cache-rich chip), but `--int8`/`--int4` are the right levers there too. Toggle SDOT/VNNI off with
+> `QWEN_NO_SDOT=1` / `QWEN_NO_VNNI=1`. Measure your box: `bash tests/x86_bench.sh`. See PLAN.md 21.3.
 
 ## INT8 (Recommended on Apple Silicon, both models)
 

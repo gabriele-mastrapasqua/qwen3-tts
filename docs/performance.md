@@ -4,9 +4,32 @@ All benchmarks on Apple M1 8-core, 16 GB RAM, 4 threads.
 
 ## Summary
 
-- **0.6B**: RTF ~1.3–1.7 depending on audio length and mode
-- **1.7B**: RTF ~2.0–4.1 (BF16), ~2.5–3.6 with `--int8`
+- **0.6B bf16**: RTF ~1.3–1.7 (full precision, reference quality)
+- **0.6B `--int8`**: **RTF < 1.0 — faster than real-time — across CLI, streaming AND the HTTP server**
+  (≈0.80 long / 0.90 short / 0.88 server-warm / 0.93 cloned `.qvoice`), no perceptible quality loss
+- **1.7B**: RTF ~2.0–4.1 (bf16), ~1.8–2.4 with `--int8` (long text)
 - Bottleneck is the Code Predictor (15 sequential autoregressive passes per frame)
+
+## ⚡ Apple Silicon `--int8` sweet spot (sub-realtime, all delivery modes)
+
+The headline result: on a 2020 **Apple M1** the 0.6B model with `--int8` is **faster than real-time
+in every mode** — one-shot CLI, low-latency streaming, and the warm HTTP server — at near-bf16
+quality. Measured 0.6B, M1 8-core, 4 threads, seed 42, speaker `ryan`:
+
+| Mode | bf16 RTF | **`--int8` RTF** | First audio (TTFA) |
+|---|---|---|---|
+| CLI (short, ~4 s audio) | 1.5–1.8 | **0.90** | 0.96 s |
+| CLI (long, ~14 s audio) | ~1.3 | **0.80** | — |
+| **Streaming** `--stream` (short) | 1.5–1.8 | **0.89** | **0.46 s** |
+| **Streaming** `--stream` (long) | ~1.3 | **0.81** | **0.50 s** |
+| **HTTP server** `--serve` (warm) | ~1.3 | **0.88** | — |
+| **Custom voice** `.qvoice` (streamed) | 1.34 | **0.93** | 0.47 s |
+
+`--int8` quantizes the Talker + Code Predictor (native **SDOT** on ARM). The win comes from halving
+the Code Predictor's per-frame weight traffic; longer audio amortizes prefill so RTF keeps dropping
+(~0.80 on a paragraph). Streaming reaches first audio in **~0.5 s** while holding sub-1.0 RTF, and the
+server (delta-prefill + embedding cache + decoder overlap) holds ~0.88 warm. Quality is validated by
+ear vs bf16, including cloned `.qvoice` voices. See [Quantization](quantization.md) for the details.
 
 ## RTF Across Modes
 
