@@ -28,15 +28,17 @@ hr "0. CPU capabilities"
 if command -v lscpu >/dev/null 2>&1; then
     lscpu | grep -iE "model name|^Flags" | sed 's/  */ /g' | head -2 || true
 fi
-# What we actually need: avx512f + avx512vnni (VNNI), avx512bw/vl (the build flags).
-for feat in avx2 avx512f avx512bw avx512vl avx512vnni avx512_bf16; do
+# What we need (NOTE: the Linux /proc/cpuinfo flags use underscores for VNNI/BF16:
+# 'avx512_vnni', 'avx512_bf16' — but 'avx512f/bw/vl/dq/cd' have NO underscore. The gcc
+# build flags are the opposite (-mavx512vnni, no underscore). Don't mix them up.)
+for feat in avx2 avx512f avx512bw avx512vl avx512_vnni avx512_bf16; do
     if grep -qw "$feat" /proc/cpuinfo 2>/dev/null; then
         echo "  HAVE  $feat"
     else
         echo "  MISS  $feat"
     fi
 done
-if ! grep -qw avx512vnni /proc/cpuinfo 2>/dev/null; then
+if ! grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then
     echo "  !! This CPU lacks AVX-512-VNNI. The avx512vnni build will fail the runtime ISA"
     echo "     guard. Use a Zen4+/Intel-with-VNNI box, or build SIMD=avx2 to test AVX2 only."
 fi
@@ -63,7 +65,7 @@ build_one() {
 }
 
 # ---- AVX-512 VNNI build = the target under test ----
-if grep -qw avx512vnni /proc/cpuinfo 2>/dev/null; then
+if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then
     build_one avx512vnni || fail=1
     if [ -x qwen_tts_avx512vnni ]; then
         cp -f qwen_tts_avx512vnni qwen_tts
