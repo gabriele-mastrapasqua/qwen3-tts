@@ -280,6 +280,7 @@ is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.0
 3–4x faster than Python on CPU. Within 2x of an RTX 3090 — on a 2020 laptop with no GPU.
 
 > Per-component breakdown, full GPU table, optimization history → [docs/performance.md](docs/performance.md)
+> x86 AVX2/AVX-512/VNNI findings + how to benchmark your CPU → [docs/x86-optimization.md](docs/x86-optimization.md)
 
 ## Documentation
 
@@ -291,6 +292,7 @@ is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.0
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
 | [Quantization](docs/quantization.md) | INT8/INT4, comparison table, recommendations |
 | [Performance](docs/performance.md) | RTF benchmarks, component breakdown, CPU vs GPU, optimization history |
+| [x86 optimization](docs/x86-optimization.md) | AVX2 / AVX-512 / VNNI findings, why it's memory-bound, how to benchmark your CPU |
 | [Building](docs/building.md) | All platforms, build targets, testing (golden-reference test needs Python + `librosa`) |
 
 ### Blog Posts
