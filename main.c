@@ -267,6 +267,43 @@ static void write_tensor_impl(FILE *vf, FILE *cv_sf, const char *cv_hdr_json, si
     (*count)++;
 }
 
+/* Load a 'QSTV' steering .vec and accumulate scale*data into *acc (alloc'd if NULL).
+ * Validates magic + that dim == expect_dim. Returns 0 on success, -1 on error. */
+static int load_steer_vec_accum(const char *path, float scale, float **acc, int expect_dim) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Error: cannot open steer vector '%s'\n", path); return -1; }
+    uint32_t magic = 0; int32_t dim = 0;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&dim, 4, 1, f) != 1 ||
+        magic != 0x56545351u /* 'QSTV' */ || dim != expect_dim) {
+        fprintf(stderr, "Error: '%s' is not a valid steer vector for this model "
+                        "(dim=%d, expected %d)\n", path, dim, expect_dim);
+        fclose(f); return -1;
+    }
+    float *tmp = (float *)malloc((size_t)dim * sizeof(float));
+    if (!tmp || fread(tmp, sizeof(float), dim, f) != (size_t)dim) {
+        fprintf(stderr, "Error: failed to read steer vector '%s'\n", path);
+        free(tmp); fclose(f); return -1;
+    }
+    fclose(f);
+    if (!*acc) *acc = (float *)calloc(dim, sizeof(float));
+    if (*acc) for (int i = 0; i < dim; i++) (*acc)[i] += scale * tmp[i];
+    free(tmp);
+    return *acc ? 0 : -1;
+}
+
+/* Resolve an emotion preset name to its .vec path (first hit wins):
+ * $QWEN_EMOTION_DIR, then presets/emotions/, then voices/emotions/. */
+static int resolve_emotion_path(const char *name, char *out, size_t outsz) {
+    const char *dirs[] = { getenv("QWEN_EMOTION_DIR"), "presets/emotions", "voices/emotions" };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        if (!dirs[i] || !*dirs[i]) continue;
+        snprintf(out, outsz, "%s/%s.vec", dirs[i], name);
+        FILE *f = fopen(out, "rb");
+        if (f) { fclose(f); return 0; }
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *text = NULL;
@@ -292,6 +329,7 @@ int main(int argc, char **argv) {
     float cp_roughness = 0.0f;        /* --roughness: q2-down blend on the CP (texture knob) */
     const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
     float cp_steer_weight = 1.0f;     /* --steer-weight: injection scale for the control vector */
+    const char *emotion_spec = NULL;  /* --emotion: preset name(s), e.g. "happy" or "happy:0.5,proud:0.5" */
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
@@ -349,6 +387,7 @@ int main(int argc, char **argv) {
         {"roughness",     required_argument, 0, 1028},
         {"steer-vector",  required_argument, 0, 1029},
         {"steer-weight",  required_argument, 0, 1030},
+        {"emotion",       required_argument, 0, 1031},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -392,6 +431,7 @@ int main(int argc, char **argv) {
             case 1028: cp_roughness = (float)atof(optarg); break;
             case 1029: steer_vector_path = optarg; break;
             case 1030: cp_steer_weight = (float)atof(optarg); break;
+            case 1031: emotion_spec = optarg; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -433,8 +473,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
-                fprintf(stderr, "  --steer-vector <file>      Emotion/prosody control vector (.vec from QWEN_STEER_CAPTURE)\n");
-                fprintf(stderr, "  --steer-weight <f>         Injection scale for --steer-vector (default 1.0)\n");
+                fprintf(stderr, "  --emotion <spec>           Emotion preset(s): name, name:scale, or a,b blend (e.g. happy, happy:0.5,proud:0.5)\n");
+                fprintf(stderr, "  --steer-vector <file>      Custom emotion/prosody control vector (.vec from QWEN_STEER_CAPTURE)\n");
+                fprintf(stderr, "  --steer-weight <f>         Global injection scale for --emotion/--steer-vector (default 1.0)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 fprintf(stderr, "  --caps                     Print compiled SIMD/threading capabilities and exit\n");
@@ -598,31 +639,39 @@ int main(int argc, char **argv) {
         ctx->cp_roughness = cp_roughness;
         if (!silent) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", cp_roughness);
     }
-    if (steer_vector_path) {
-        FILE *sf = fopen(steer_vector_path, "rb");
-        if (!sf) {
-            fprintf(stderr, "Error: cannot open steer vector '%s'\n", steer_vector_path);
-            return 1;
+    if (steer_vector_path || emotion_spec) {
+        int cp_h = ctx->config.cp_hidden_size;
+        float *steer_acc = NULL;
+        /* --emotion: comma-separated preset list, each "name" or "name:scale".
+         * Presets are calibrated (recommended weight baked in) → name alone = good. */
+        if (emotion_spec) {
+            char *spec = strdup(emotion_spec);
+            for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
+                float scale = 1.0f;
+                char *colon = strchr(tok, ':');
+                if (colon) { *colon = '\0'; scale = (float)atof(colon + 1); }
+                char path[1024];
+                if (resolve_emotion_path(tok, path, sizeof(path)) != 0) {
+                    fprintf(stderr, "Error: unknown emotion preset '%s' "
+                                    "(looked in $QWEN_EMOTION_DIR, presets/emotions/, voices/emotions/)\n", tok);
+                    free(spec); free(steer_acc); return 1;
+                }
+                if (load_steer_vec_accum(path, scale, &steer_acc, cp_h) != 0) { free(spec); free(steer_acc); return 1; }
+                if (!silent) fprintf(stderr, "Emotion: %s x%.2f (%s)\n", tok, scale, path);
+            }
+            free(spec);
         }
-        uint32_t magic = 0; int32_t dim = 0;
-        if (fread(&magic, 4, 1, sf) != 1 || fread(&dim, 4, 1, sf) != 1 ||
-            magic != 0x56545351u /* 'QSTV' */ || dim != ctx->config.cp_hidden_size) {
-            fprintf(stderr, "Error: '%s' is not a valid steer vector for this model "
-                            "(magic/dim mismatch: dim=%d, expected %d)\n",
-                    steer_vector_path, dim, ctx->config.cp_hidden_size);
-            fclose(sf);
-            return 1;
+        /* --steer-vector: a custom (uncalibrated) vector, summed on top. */
+        if (steer_vector_path &&
+            load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) {
+            free(steer_acc); return 1;
         }
-        ctx->cp_steer_vec = (float *)malloc((size_t)dim * sizeof(float));
-        if (!ctx->cp_steer_vec || fread(ctx->cp_steer_vec, sizeof(float), dim, sf) != (size_t)dim) {
-            fprintf(stderr, "Error: failed to read steer vector '%s'\n", steer_vector_path);
-            fclose(sf);
-            return 1;
+        if (steer_acc) {
+            ctx->cp_steer_vec = steer_acc;
+            ctx->cp_steer_dim = cp_h;
+            ctx->cp_steer_weight = cp_steer_weight;
+            if (!silent) fprintf(stderr, "Steering: active (dim=%d, global weight=%.2f)\n", cp_h, cp_steer_weight);
         }
-        fclose(sf);
-        ctx->cp_steer_dim = dim;
-        ctx->cp_steer_weight = cp_steer_weight;
-        if (!silent) fprintf(stderr, "Steering: loaded vector dim=%d, weight=%.2f\n", dim, cp_steer_weight);
     }
 
     if (voice_design) {
