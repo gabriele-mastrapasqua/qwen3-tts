@@ -610,24 +610,45 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 
 ## Future research (discovered 2026-06-04, to re-analyze)
 
-### A. Prosody/emotion control by perturbing the Code Predictor (instruct is too weak)
-> **Branch plan (2026-06-04):** this becomes its OWN branch (e.g. `feat/expressivity` off `feat/labs`)
-> — segmenter + markup (`<stop>`/`<break>`/`<rough N>`) + CP perturbation knob. Low-risk, hardware-
-> independent, the differentiator. The LIVE track (split-for-quality needs no parallelism).
-Serendipity: quantizing the CP `down` projection to 2-bit (`QWEN_CP_Q2_FFN=down --int4`)
-makes the voice **intelligible but aggressive/rough** ("death metal"). Perturbation magnitude
-maps to roughness: int8 = identical to bf16, int4 = slightly aggressive, q2 = strong. Mechanism:
-RVQ split — Talker codebook 0 = words (intact), CP codebooks 1-15 = fine texture/prosody;
-perturbing the CP roughens texture without losing intelligibility.
-- **Why it matters:** `--instruct` barely changes delivery (known Qwen3-TTS limitation, even
-  full-size on GPU; community-reported). The acoustic emotion signal is weak in the output.
-- **Principled lever = activation steering / control vectors:** diff CP activations
-  (neutral − instruct-angry) → an "emotion direction" → inject it amplified (×N) at inference →
-  controllable, audible emotion (amplify the weak instruct signal instead of breaking weights
-  at random). The quant-roughness is the crude cousin of this.
-- **Experiments:** (1) tunable `--roughness` = blend bf16↔q2 output on CP `down`
-  (down_out = (1-r)*bf16 + r*q2); (2) control-vector emotion injection on the CP; per-layer and
-  per-speaker/language sensitivity unknown (q2 effect confirmed only on 0.6B/ryan/EN/seed42).
+### A. Prosody/emotion control on the Code Predictor — BUILT v1 (`feat/expressivity`), NOT YET AT THE TOP
+> **Status 2026-06-05:** built + ear-validated on branch `feat/expressivity` (6 commits, NOT merged).
+> Two levers ship; the feature WORKS and is a real differentiator, but it is a **v1, not the ceiling** —
+> the control-vector method is crude additive steering and several gaps remain (below). Mechanism
+> (confirmed): RVQ split — Talker codebook 0 = words (intact), CP codebooks 1-15 = fine texture/prosody;
+> perturbing the CP changes delivery without losing intelligibility. `--instruct` alone barely moves
+> delivery (known Qwen3-TTS limit, even full-size on GPU) — these levers amplify it.
+
+**SHIPPED (works):**
+- **`--roughness <0..1>`** — per-frame blend of a q2 copy of CP `down` into the high-prec output
+  (`down` = causal driver of the q2 "death-metal" texture). Continuous grit/anger knob, ear-validated TOP.
+- **`--emotion <name>`** — calibrated control-vector presets (`presets/emotions/` EN + `it/`): 9 tones
+  (happy/excited/eager/proud/sad/gloomy/news/dramatic/calm), weight baked in, **blendable**
+  (`happy:0.5,proud:0.5`), global `--steer-weight` dial. Capture via `QWEN_STEER_CAPTURE` + `tests/steer_make.py`
+  (diff mean(instruct)−mean(neutral) at the single Talker→CP injection point `code_predictor.c:731`).
+  **Cross-model** (CP identical 0.6B/1.7B). Default-off → golden mel-corr 1.0.
+- **Voice-clone auto-trim** (`qwen_trim_trailing_silence`) — drops a faded ref tail so clones don't learn a decrescendo.
+
+**WHY NOT THE TOP YET (open gaps — the honest list):**
+- [ ] **`happy` is a per-voice TIMBRE limit.** Transfers fine on ryan, but on a soft narrator clone (Silvio)
+  it fades at every weight — *even when captured natively on that voice* — because the voice has no bright
+  register to reach. No additive direction creates a register the voice lacks. → some tones are intrinsically
+  voice-bounded; need to detect/flag this, or a non-additive method (pitch/energy contour control?).
+- [ ] **Directions are voice-specific & over-steer differently per voice** (Silvio excited TOP@0.7, voice-drift@1.4;
+  ryan happy needs 1.4). No systematic ryan↔voice calibration map yet — today it's hand-tuned per voice
+  (`presets/emotions/<voice>/`). Want an auto-calibration pass (sweep + pick the clean knee per voice).
+- [ ] **Steering is crude additive `cp_x += w·vec` at ONE point.** Likely better: per-CP-layer injection,
+  normalization to stay on-manifold (over-steer → metallic), contrastive/mean-centered directions captured
+  over MANY sentences+speakers (current = 1 voice, ~100-150 frames), or steering the late codebooks (c11-15 =
+  the measured texture surface) specifically.
+- [ ] **Only ~9 tones mined, EN+IT only.** The "weight = mood crossfade" trick (one capture → 2-3 moods at
+  different weights) is barely scratched; whisper/sarcastic/confidential/ironic/authoritative-variants untouched.
+- [ ] **Mood-blending** (`a:0.5,b:0.5`) implemented but barely explored — could give a continuous 2-D mood space.
+- [ ] **No segmenter/markup yet** (`[pause]`/`[emph]`/`[voice:]`/`[instruct:]`/per-span emotion) — the original
+  long-form/audiobook vision. Per-span emotion switching is the natural next product step.
+- [ ] **Not in the test suite** (no `--emotion` smoke / no steering golden); not merged to feat/labs.
+- **Per-layer & cross-speaker/language sensitivity still largely unmeasured** (validated 0.6B+1.7B / ryan+Silvio / EN+IT).
+
+See [[project_expressivity]] for the full build log, the cross-voice map, and the Silvio re-clone saga.
 
 ### B. Weight-stationary batching = the throughput lever for the SERVER
 > **Branch plan (2026-06-04):** this becomes its OWN branch (e.g. `feat/batched-generation` off
