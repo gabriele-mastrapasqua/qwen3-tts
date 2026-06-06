@@ -760,12 +760,34 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
   the "Chinese instruct on EU text" boost is NOT confirmed. (Lesson: ΔF0 magnitude ≠ perceived anger; ear is truth.)
   Side-obs: `it_neutral` (no instruct) drifted to Chinese-ish PRONUNCIATION while `it_angry` was perfect Italian —
   possible language re-anchoring by instruct/think → folded into the think re-audit task.
-- [ ] **DEEP RE-AUDIT (task #6): is `think`+instruct really language-only, or a strong emotion lever we mis-RE'd?**
-  We ASSUME codec-think (2154-2157) = fixed 4-token language slot. But we RE'd from PyTorch run-by-run; the paper
-  may be oversimplified. Qwen advertises strong emotional instruct yet ours is weak. Re-verify from scratch:
-  does official inference GENERATE a variable-length think/CoT in codec space between think_bos/think_eos (which we
-  skip)? think on/off/levels? instruct placement (system vs user)? InstructTTSEval setup? Run the OFFICIAL PyTorch
-  on the same angry-IT prompt and A/B vs our C — if PyTorch is much angrier, our RE missed something concrete.
+- [x] **DEEP RE-AUDIT (task #6) — DONE, validated against OFFICIAL SOURCE (cloned QwenLM/Qwen3-TTS, not our code).
+  Our RE was CORRECT; no hidden lever. Hypothesis REFUTED.**
+  - `modeling_qwen3_tts.py:2135-2147`: think is a FIXED prefix — `[codec_think_id, think_bos, language_id, think_eos]`
+    with a language, `[codec_nothink_id, think_bos, think_eos]` without. NOT autoregressive reasoning. EXACTLY our
+    qwen_tts.c:947-955. The paper's "probabilistically activated thinking pattern" is a TRAINING thing; inference uses
+    this minimal fixed slot. No `enable_thinking`, no on/off/levels, no generative CoT we skipped.
+  - `modeling_qwen3_tts.py:2075-2080` + wrapper `qwen3_tts_model.py:269-276`: instruct is prepended as text embeddings,
+    format `<|im_start|>user\n{instruct}<|im_end|>\n` then assistant text — IDENTICAL to ours (qwen_tts.c:882). Placement correct.
+  - **Why instruct is weak (externally validated, NOT our bug):** (a) the official voice-CLONE API has NO instruct param
+    (clone = ref_audio/ref_text only) → our `--load-voice + --instruct` is OFF-DISTRIBUTION; community confirms "instruct
+    on cloned voices does nothing" (Qwen Disc #218/#231/#238, mlx-audio #453, HF #38). (b) instruct is Chinese-tuned, weak
+    on EU even on preset voices (our test: ZH +45Hz vs IT +1.5Hz). (c) 1.7B > 0.6B for emotion control.
+  - **CONCLUSION: the model genuinely offers no more via instruct for cloned EU voices → CP-steering (our control-vectors)
+    is the ONLY path for emotion on a cloned Italian voice. All alt levers (think / hidden tags / relax-identity / ref-breath
+    sighs) are closed with proof. Ship what works: centered palette + tempo + pauses.** Official src at /tmp/qwen3tts_src (ephemeral).
+
+- [x] **Cross-LANGUAGE steering validation (2026-06-06, ear-confirmed, ES/FR/DE/JA/KO, centered palette on preset voices).**
+  The IT/EN-captured steering does NOT transfer uniformly across languages (refines the old "presets are cross-lingual"
+  belief → cross-MODEL yes, cross-LANGUAGE only partial): **JA = best** (angry/sad/happy all credible), **DE = weak**
+  (emotions barely differ by ear — my acoustic proxy OVERSTATED it), **ES = broken** (angry sounds SAD, happy sounds
+  aroused/breathy not happy), **FR = happy→sultry/breathy not happy**, **KO = sad+happy don't work**. **`happy` is the
+  most language-FRAGILE direction** — in several langs it LOWERS pitch or induces breathiness that reads as "sultry"
+  (consistent with happy being intrinsically weak + breathiness=happy correlate; `excited` is our real joy lever).
+  → **emotion palette needs PER-LANGUAGE calibration** (or at least re-capture ES/FR/KO); and prefer `excited` over
+  `happy` for joy cross-language (untested — next quick experiment). Voices used: ryan (ES/FR/DE), ono_anna (JA), sohee (KO).
+  Lesson re-confirmed: acoustic ΔF0 proxy ≠ perceived emotion (proxy said DE clean, ear said weak) — ear is truth.
+- [ ] **`--volume` knob (trivial, not yet exposed):** no `--volume` flag exists; volume is pure PCM gain (qwen_tts_audio.c
+  one-liner) or ffmpeg post — unlike pitch (identity-clamped), volume has no obstacle. Fold into the compound-emotion manifest.
 
 See [[project_expressivity]] for the full build log, the cross-voice map, and the Silvio re-clone saga.
 
