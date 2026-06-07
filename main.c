@@ -426,8 +426,8 @@ static const cmacro_t COMPOSE_MACROS[] = {
      * NOTE: keep rate >= ~0.90 — slower stretches the short vowel into a metallic WSOLA
      * artifact. A trailing "..." can make the model emit a 2nd spurious vocalization. */
     /* sighs / relief */
-    { "sigh",    "Hah",       0.0f, 1.10f, 0.67f },  /* "aaaahhhww" sigh of relief — TOP (no "..." = shorter) */
-    { "sighs",   "Hah",       0.0f, 1.10f, 0.67f },
+    { "sigh",    "Hah...",    0.0f, 1.12f, 0.67f },  /* "aaaahhhww" sigh — the "..." IS the sigh (no dots -> a laugh!); rate shaves length */
+    { "sighs",   "Hah...",    0.0f, 1.12f, 0.67f },
     { "ahh",     "Haaa...",   0.0f, 0.90f, 0.70f },  /* "ahhhww" pleasure/relief — TOP */
     { "relief",  "Haaa...",   0.0f, 0.90f, 0.70f },
     { "phew",    "Uao...",    0.0f, 1.00f, 0.82f },  /* big tired relief "ooowww" — TOP */
