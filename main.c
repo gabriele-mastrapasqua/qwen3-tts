@@ -5,6 +5,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_audio.h"
 #include "qwen_tts_emotion.h"
+#include "qwen_tts_batch.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_server.h"
 
@@ -690,6 +691,7 @@ int main(int argc, char **argv) {
     int steer_weight_set = 0, roughness_set = 0, volume_set = 0, rate_set = 0;
     const char *compose_spec = NULL;  /* --compose: multi-span "[mood] text | [mood] text | [pause=0.5]" */
     float compose_pause = 0.12f;      /* --compose-pause: default gap (s) between spoken spans */
+    int run_batch_test = 0;           /* --batch-test: verify batched Talker step vs single-stream, exit */
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
@@ -752,6 +754,7 @@ int main(int argc, char **argv) {
         {"rate",          required_argument, 0, 1033},
         {"compose",       required_argument, 0, 1034},
         {"compose-pause", required_argument, 0, 1035},
+        {"batch-test",    no_argument,       0, 1036},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -800,6 +803,7 @@ int main(int argc, char **argv) {
             case 1033: audio_rate = (float)atof(optarg); rate_set = 1; break;
             case 1034: compose_spec = optarg; break;
             case 1035: compose_pause = (float)atof(optarg); break;
+            case 1036: run_batch_test = 1; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -916,7 +920,7 @@ int main(int argc, char **argv) {
     }
     /* --save-voice without --text = create voice only (no generation) */
     int create_voice_only = (save_voice && !text && serve_port <= 0);
-    if (!text && !compose_spec && serve_port <= 0 && !create_voice_only) {
+    if (!text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test) {
         fprintf(stderr, "Error: --text, --compose or --serve is required\n");
         return 1;
     }
@@ -2029,6 +2033,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Voice profile created. Use --load-voice to generate speech.\n");
         qwen_tts_unload(ctx);
         return 0;
+    }
+
+    /* --batch-test: verify the OPT-IN batched Talker step matches single-stream, then exit. */
+    if (run_batch_test) {
+        int rc = qwen_batch_self_test(ctx);
+        qwen_tts_unload(ctx);
+        return rc;
     }
 
     /* Server mode: start HTTP server and block */

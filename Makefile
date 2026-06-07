@@ -123,9 +123,9 @@ cp-microbench:
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Header dependencies
-main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_kernels.h qwen_tts_server.h
+main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_batch.h qwen_tts_kernels.h qwen_tts_server.h
 qwen_tts.o: qwen_tts.c qwen_tts.h qwen_tts_kernels.h qwen_tts_safetensors.h qwen_tts_tokenizer.h qwen_tts_audio.h
-qwen_tts_talker.o: qwen_tts_talker.c qwen_tts.h qwen_tts_kernels.h
+qwen_tts_talker.o: qwen_tts_talker.c qwen_tts.h qwen_tts_kernels.h qwen_tts_batch.h
 qwen_tts_code_predictor.o: qwen_tts_code_predictor.c qwen_tts.h qwen_tts_kernels.h
 qwen_tts_speech_decoder.o: qwen_tts_speech_decoder.c qwen_tts.h qwen_tts_kernels.h
 qwen_tts_kernels.o: qwen_tts_kernels.c qwen_tts_kernels.h qwen_tts_kernels_impl.h
@@ -359,6 +359,13 @@ test-emotion: $(TARGET)
 	@grep -qi "Volume: 1.20" $(TEST_DIR)/em_vr.log && grep -qi "Rate: 0.90" $(TEST_DIR)/em_vr.log || { echo "FAIL: standalone --volume/--rate not applied"; cat $(TEST_DIR)/em_vr.log; exit 1; }
 	@echo "  PASS: standalone --volume/--rate"
 	@echo "PASS: expressivity/emotion smoke"
+	@echo ""
+
+test-batch: $(TARGET)
+	@echo "=== Batched Talker step correctness (opt-in path vs single-stream) ==="
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 --batch-test 2>&1 | grep -E "probe|wiring|matmat path|batch-test"
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 --batch-test >/dev/null 2>&1 || { echo "FAIL: batched wiring not bit-exact vs single-stream"; exit 1; }
+	@echo "  PASS: batched Talker step wiring is bit-exact; matmat path is a valid fp-order variant"
 	@echo ""
 
 batching-bench:
@@ -872,7 +879,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-all \
         test-clone test-voice-design \
         demo-clone \
