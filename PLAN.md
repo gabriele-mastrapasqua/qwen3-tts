@@ -639,6 +639,17 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   KEY SERENDIPITY: slow+sad config = a controllable paralinguistic GENERATOR (user idea). STILL TODO: server-side
 >   volume/rate/compose (CLI-only); true breaths still absent; tune macro recipes; EN/other-lang sigh quality.
 > (3) optional: dedicated ES palette capture (ES inverts everything); retry sbuffo at lower weight; more macros.
+>
+> **BACKLOG / IDEAS TO ANALYZE+VALIDATE (user, 2026-06-07):**
+> - **Quant:** int2 / int3 where we know it's viable (q2 already exists for the roughness path — extend as a
+>   real quant tier?). Measure quality cliff per codebook (we have the quant-ladder instrument).
+> - **Speed+quality benchmark of voice CLONE and preset voices** (systematic A/B: RTF + mel-corr + ear, per voice).
+> - **Expressivity — EMOJI in the prompt:** what does the model do with 😄 😂 😢 🤔 / "lol"/"ahah"? Does it unlock
+>   laughs/cries? (first quick test 2026-06-07: no error, tokenizer eats them as UTF-8 — needs ear check; samples/emoji/).
+> - **Expressivity — SOUND-DISCOVERY SUITE:** a labeled grid (id → {text, lang, voice, steer/rate/vol}) that mass-
+>   generates onomatopoeia/vowel/emoji combos PER LANGUAGE × PER PRESET VOICE; user listens + annotates the best by id;
+>   bake the winners into a reusable paralinguistic library (macros). Goal: map which strings→sounds (laughs, cries,
+>   gasps, sighs) each voice/language can produce. Faster than the ad-hoc one-off loop we've been doing.
 > Uncommitted at stop: none of the repo (all committed: 52a1cf8→62da9ed→7b60e75→0c8ce04). Local-only: `voices/galatea_06b.qvoice`,
 > `samples/emergent/` (sbuffo audio), `/tmp/qwen3tts_src` (official source, ephemeral). Two stray `analisi_leak*.md` left untracked (not ours — decide later).
 
