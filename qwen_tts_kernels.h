@@ -89,6 +89,13 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
  * NEON-optimized + multi-threaded via dispatch_apply on macOS. */
 void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols);
 
+/* bf16 BATCHED matmat (the batching/spec-decode-verify primitive):
+ *   Y[rows,B] = W[rows,cols] @ X[cols,B]     (W bf16; X,Y f32, row-major)
+ * Each weight element is read from DRAM ONCE and reused across all B columns
+ * (amortizes the per-token weight re-read that bounds single-stream). B<=64.
+ * Threaded by row-slice, matching qwen_matvec_bf16. With B==1 it equals matvec. */
+void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B);
+
 /* Unified QKV matvec: single dispatch for Q, K, V (avoids 3 barriers) */
 void qwen_matvec_bf16_qkv(float *q, float *k, float *v,
                            const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,

@@ -735,6 +735,50 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
     bf16_matvec_fused(y, x, W, cols, rows);
 }
 
+/* ---- Batched matmat: Y[rows,B] = W[rows,cols] @ X[cols,B] (the batching /
+ * spec-decode-verify primitive). Each weight element is loaded ONCE and FMA'd
+ * into all B accumulators, so W streams from DRAM exactly once regardless of B
+ * (X[k][0..B] is contiguous; acc[] stays L1/register-resident for B<=64). ---- */
+static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
+                              int r0, int r1, int cols, int B) {
+    for (int r = r0; r < r1; r++) {
+        const uint16_t *w = W + (size_t)r * cols;
+        float *y = Y + (size_t)r * B;
+        float acc[64];
+        for (int b = 0; b < B; b++) acc[b] = 0.0f;
+        for (int k = 0; k < cols; k++) {
+            float wv = bf16_to_f32(w[k]);
+            const float *xk = X + (size_t)k * B;
+            int b = 0;
+#if defined(__ARM_NEON)
+            float32x4_t wq = vdupq_n_f32(wv);
+            for (; b + 4 <= B; b += 4)
+                vst1q_f32(acc + b, vfmaq_f32(vld1q_f32(acc + b), wq, vld1q_f32(xk + b)));
+#endif
+            for (; b < B; b++) acc[b] += wv * xk[b];
+        }
+        for (int b = 0; b < B; b++) y[b] = acc[b];
+    }
+}
+typedef struct { float *Y; const uint16_t *W; const float *X; int rows, cols, B; } bf16_mm_ctx;
+static void bf16_mm_task(size_t tid, size_t nt, void *vc) {
+    bf16_mm_ctx *c = (bf16_mm_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    bf16_matmat_slice(c->Y, c->W, c->X, r0, r1, c->cols, c->B);
+}
+void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
+    if (B <= 0) return;
+    if (B > 64) B = 64;  /* contract: B<=64 */
+    int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) {
+        bf16_mm_ctx c = { Y, W, X, rows, cols, B };
+        qwen_parallel((size_t)nt, bf16_mm_task, &c);
+        return;
+    }
+    bf16_matmat_slice(Y, W, X, 0, rows, cols, B);
+}
+
 /* Unified QKV matvec: single parallel-for for Q, K, V projections.
  * The concatenated [Q|K|V] row space is partitioned for balance, avoiding 3
  * separate barriers per layer. */
@@ -2408,6 +2452,37 @@ int qwen_kernel_selftest(void *out) {
             double denom = fabs(ref[r]) + 1e-3;
             double rel = fabs((double)y[r] - ref[r]) / denom;
             if (rel > max_rel_bf16) max_rel_bf16 = rel;
+        }
+
+        /* ---- batched matmat: Y[rows,B] must equal B independent matvecs ----
+         * (the batching / spec-decode-verify primitive). Each column b is x scaled,
+         * so qwen_matvec_bf16 gives the per-column reference; only fp accumulation
+         * ORDER differs, so compare with a global L2 relative error. */
+        {
+            const int B = 8;
+            float *Xb  = malloc((size_t)cols * B * sizeof(float));
+            float *Yb  = malloc((size_t)rows * B * sizeof(float));
+            float *xb  = malloc((size_t)cols * sizeof(float));
+            float *yc  = malloc((size_t)rows * sizeof(float));
+            if (Xb && Yb && xb && yc) {
+                for (int k = 0; k < cols; k++)
+                    for (int b = 0; b < B; b++) Xb[(size_t)k * B + b] = x[k] * (1.0f + 0.05f * b);
+                qwen_matmat_bf16(Yb, wb, Xb, rows, cols, B);
+                double l2n = 0.0, l2d = 0.0;
+                for (int b = 0; b < B; b++) {
+                    for (int k = 0; k < cols; k++) xb[k] = x[k] * (1.0f + 0.05f * b);
+                    qwen_matvec_bf16(yc, wb, xb, rows, cols);
+                    for (int r = 0; r < rows; r++) {
+                        double d = (double)Yb[(size_t)r * B + b] - yc[r];
+                        l2n += d * d; l2d += (double)yc[r] * yc[r];
+                    }
+                }
+                double l2rel = l2d > 0 ? sqrt(l2n / l2d) : 0.0;
+                fprintf(f, "  [%4dx%4d] matmat(B=%d) vs B*matvec: L2_rel=%.2e  %s\n",
+                        rows, cols, B, l2rel, l2rel < 1e-4 ? "PASS" : "FAIL");
+                if (!(l2rel < 1e-4)) failures++;
+            }
+            free(Xb); free(Yb); free(xb); free(yc);
         }
 
         /* ---- int8 matvec ---- (reference = exact int8 dot with the SAME scales) */
