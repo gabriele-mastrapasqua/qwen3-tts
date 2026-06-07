@@ -319,6 +319,194 @@ static int resolve_emotion_path(const char *name, const char *language, char *ou
     return -1;
 }
 
+/* Configure ctx's expressivity from an --emotion spec + language. RE-ENTRANT:
+ * frees any previously-set ctx->cp_steer_vec first, so it can be called once per
+ * span in --compose mode. Resolves a manifest mood to its full recipe (or a raw
+ * preset/blend spec), sets ctx->cp_roughness + ctx->cp_steer_vec/dim/weight, and
+ * returns the effective volume/rate (recipe value unless the matching *_set
+ * override is passed). Returns 0 on success, -1 on a hard error (unknown raw preset). */
+static int qwen_apply_emotion(qwen_tts_ctx_t *ctx,
+        const char *emotion_spec, const char *steer_vector_path, const char *language,
+        float sw, int sw_set, float ro, int ro_set,
+        float vo, int vo_set, float ra, int ra_set,
+        float *out_volume, float *out_rate, int silent) {
+    int cp_h = ctx->config.cp_hidden_size;
+    float eff_steer_weight = sw, eff_roughness = ro, eff_volume = vo, eff_rate = ra;
+    const char *vec_spec = emotion_spec;
+    const qwen_emotion_recipe_t *recipe = NULL;
+
+    /* re-entrancy: clear any prior steering/roughness state */
+    if (ctx->cp_steer_vec) { free(ctx->cp_steer_vec); ctx->cp_steer_vec = NULL; ctx->cp_steer_dim = 0; }
+    ctx->cp_roughness = 0.0f;
+
+    if (emotion_spec && !strchr(emotion_spec, ',') && !strchr(emotion_spec, ':'))
+        recipe = qwen_emotion_lookup(emotion_spec);
+    if (recipe) {
+        vec_spec = recipe->vec_spec;
+        if (!sw_set) eff_steer_weight = recipe->steer_weight;
+        if (!ro_set) eff_roughness    = recipe->roughness;
+        if (!vo_set) eff_volume       = recipe->volume;
+        if (!ra_set) eff_rate         = recipe->rate;
+        if (!silent)
+            fprintf(stderr, "Emotion '%s' -> %s\n  (vec=%s weight=%.2f roughness=%.2f volume=%.2f rate=%.2f)\n",
+                    emotion_spec, recipe->desc, vec_spec ? vec_spec : "(none)",
+                    eff_steer_weight, eff_roughness, eff_volume, eff_rate);
+    }
+
+    if (eff_roughness > 0.0f) {
+        if (eff_roughness > 1.0f) eff_roughness = 1.0f;
+        ctx->cp_roughness = eff_roughness;
+        if (!silent && !recipe) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", eff_roughness);
+    }
+
+    if (vec_spec || steer_vector_path) {
+        float *steer_acc = NULL;
+        if (vec_spec) {
+            char *spec = strdup(vec_spec);
+            for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
+                float scale = 1.0f;
+                char *colon = strchr(tok, ':');
+                if (colon) { *colon = '\0'; scale = (float)atof(colon + 1); }
+                char path[1024];
+                if (resolve_emotion_path(tok, language, path, sizeof(path)) != 0) {
+                    if (recipe) {
+                        if (!silent) fprintf(stderr, "Note: mood '%s' has no '%s' vector for this language; "
+                                                     "applying roughness/volume/rate only.\n", emotion_spec, tok);
+                    } else {
+                        fprintf(stderr, "Error: unknown emotion preset '%s' "
+                            "(looked in $QWEN_EMOTION_DIR, presets/emotions/[<lang>/], voices/emotions/)\n", tok);
+                        free(spec); free(steer_acc); return -1;
+                    }
+                } else if (load_steer_vec_accum(path, scale, &steer_acc, cp_h) != 0) {
+                    free(spec); free(steer_acc); return -1;
+                } else if (!silent && !recipe) {
+                    fprintf(stderr, "Emotion: %s x%.2f (%s)\n", tok, scale, path);
+                }
+            }
+            free(spec);
+        }
+        if (steer_vector_path && load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) {
+            free(steer_acc); return -1;
+        }
+        if (steer_acc) {
+            ctx->cp_steer_vec = steer_acc;
+            ctx->cp_steer_dim = cp_h;
+            ctx->cp_steer_weight = eff_steer_weight;
+            if (!silent) fprintf(stderr, "Steering: active (dim=%d, weight=%.2f)\n", cp_h, eff_steer_weight);
+        }
+    }
+    if (out_volume) *out_volume = eff_volume;
+    if (out_rate)   *out_rate   = eff_rate;
+    return 0;
+}
+
+/* Render a --compose spec into one WAV. Spans are separated by '|'; each span is:
+ *   "[mood] text..."  -> synthesize `text` with the --emotion `mood` recipe
+ *   "[pause=0.5]"     -> insert 0.5s of silence (also "[0.5]")
+ *   "text..."         -> synthesize neutral (no emotion)
+ * Each spoken span is post-processed with its recipe's rate/volume, then all spans
+ * are concatenated (model-generated → seamless, same voice/codec) with a small
+ * default gap between spoken spans. Enables e.g. a slow+sad "Ehh..." sigh span
+ * followed by a normally-delivered sentence. Returns 0 on success. */
+static int run_compose(qwen_tts_ctx_t *ctx, const char *spec_in, const char *language,
+                       float default_pause, const char *output, int silent) {
+    const int SR = QWEN_TTS_SAMPLE_RATE;
+    float *out = NULL; size_t out_n = 0, out_cap = 0;
+    #define COMPOSE_APPEND(src, cnt) do {                                  \
+        size_t _c = (cnt);                                                 \
+        if (out_n + _c > out_cap) {                                        \
+            out_cap = (out_n + _c) * 2 + 1024;                             \
+            float *_t = (float *)realloc(out, out_cap * sizeof(float));    \
+            if (!_t) { free(out); free(spec); return -1; }                 \
+            out = _t;                                                      \
+        }                                                                  \
+        if (src) memcpy(out + out_n, (src), _c * sizeof(float));           \
+        else memset(out + out_n, 0, _c * sizeof(float));                   \
+        out_n += _c;                                                       \
+    } while (0)
+
+    char *spec = strdup(spec_in);
+    if (!spec) return -1;
+    int span_idx = 0, spoken = 0;
+    char *saveptr = NULL;
+    for (char *span = strtok_r(spec, "|", &saveptr); span; span = strtok_r(NULL, "|", &saveptr)) {
+        while (*span == ' ' || *span == '\t') span++;
+        char *end = span + strlen(span);
+        while (end > span && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n')) *--end = '\0';
+        if (!*span) continue;
+
+        const char *mood = NULL;
+        const char *text = span;
+        char moodbuf[64];
+        if (*span == '[') {
+            char *close = strchr(span, ']');
+            if (close) {
+                size_t taglen = (size_t)(close - span - 1);
+                if (taglen >= sizeof(moodbuf)) taglen = sizeof(moodbuf) - 1;
+                memcpy(moodbuf, span + 1, taglen); moodbuf[taglen] = '\0';
+                char *t = moodbuf; while (*t == ' ') t++;
+                char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = '\0';
+                text = close + 1; while (*text == ' ' || *text == '\t') text++;
+
+                /* pause span? "[pause=N]", "[pauseN]", or bare "[N]" */
+                int is_pause = 0; float ps = 0.3f;
+                if (strncasecmp(t, "pause", 5) == 0) {
+                    is_pause = 1; const char *num = t + 5;
+                    while (*num && !((*num >= '0' && *num <= '9') || *num == '.')) num++;
+                    if (*num) ps = (float)atof(num);
+                } else if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') {
+                    is_pause = 1; ps = (float)atof(t);
+                }
+                if (is_pause) {
+                    if (ps > 0) COMPOSE_APPEND(NULL, (size_t)(ps * SR));
+                    if (!silent) fprintf(stderr, "  [pause %.2fs]\n", ps);
+                    continue;
+                }
+                /* explicit "no emotion" tags */
+                if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 ||
+                    strcasecmp(t, "normal") == 0 || t[0] == '\0')
+                    mood = NULL;
+                else
+                    mood = t;
+            }
+        }
+        if (!*text) continue;  /* a tag with no spoken text */
+
+        if (spoken > 0 && default_pause > 0) COMPOSE_APPEND(NULL, (size_t)(default_pause * SR));
+
+        float vol = 1.0f, rate = 1.0f;
+        if (qwen_apply_emotion(ctx, mood, NULL, language,
+                               1.0f, 0, 0.0f, 0, 1.0f, 0, 1.0f, 0,
+                               &vol, &rate, silent) != 0) { free(spec); free(out); return -1; }
+        if (!silent) fprintf(stderr, "Span %d: [%s] \"%s\"\n", span_idx, mood ? mood : "neutral", text);
+
+        float *audio = NULL; int n = 0;
+        if (qwen_tts_generate(ctx, text, &audio, &n) != 0 || !audio || n <= 0) {
+            fprintf(stderr, "Compose: synthesis failed for span %d\n", span_idx);
+            free(audio); free(spec); free(out); return -1;
+        }
+        float *seg = audio; int seg_n = n; float *stretched = NULL;
+        if (rate != 1.0f) {
+            int sn = 0;
+            if (qwen_audio_time_stretch(audio, n, rate, SR, &stretched, &sn) == 0) { seg = stretched; seg_n = sn; }
+        }
+        if (vol != 1.0f) qwen_audio_apply_gain(seg, seg_n, vol);
+        COMPOSE_APPEND(seg, (size_t)seg_n);
+        free(stretched); free(audio);
+        spoken++; span_idx++;
+    }
+    free(spec);
+
+    if (out_n == 0) { fprintf(stderr, "Compose: nothing to synthesize\n"); free(out); return -1; }
+    int rc = qwen_tts_write_wav(output, out, (int)out_n, SR);
+    if (rc == 0 && !silent)
+        fprintf(stderr, "Wrote %s (%zu samples, %.2fs) [composed %d spans]\n",
+                output, out_n, (double)out_n / SR, span_idx);
+    free(out);
+    #undef COMPOSE_APPEND
+    return rc;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *text = NULL;
@@ -349,6 +537,8 @@ int main(int argc, char **argv) {
     float audio_rate = 1.0f;          /* --rate: pitch-preserving tempo (>1 faster) */
     /* "_set" = flag was explicitly passed -> overrides any --emotion manifest recipe value */
     int steer_weight_set = 0, roughness_set = 0, volume_set = 0, rate_set = 0;
+    const char *compose_spec = NULL;  /* --compose: multi-span "[mood] text | [mood] text | [pause=0.5]" */
+    float compose_pause = 0.12f;      /* --compose-pause: default gap (s) between spoken spans */
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
@@ -409,6 +599,8 @@ int main(int argc, char **argv) {
         {"emotion",       required_argument, 0, 1031},
         {"volume",        required_argument, 0, 1032},
         {"rate",          required_argument, 0, 1033},
+        {"compose",       required_argument, 0, 1034},
+        {"compose-pause", required_argument, 0, 1035},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -455,6 +647,8 @@ int main(int argc, char **argv) {
             case 1031: emotion_spec = optarg; break;
             case 1032: audio_volume = (float)atof(optarg); volume_set = 1; break;
             case 1033: audio_rate = (float)atof(optarg); rate_set = 1; break;
+            case 1034: compose_spec = optarg; break;
+            case 1035: compose_pause = (float)atof(optarg); break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -500,6 +694,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "                             Also accepts raw preset blends (e.g. happy:0.5,proud:0.5). Explicit knobs override.\n");
                 fprintf(stderr, "  --volume <f>               Output gain (1.0=unchanged, e.g. 1.1 louder, 0.9 softer)\n");
                 fprintf(stderr, "  --rate <f>                 Speaking rate, pitch-preserving (1.0=unchanged, >1 faster, <1 slower)\n");
+                fprintf(stderr, "  --compose <spec>           Multi-span synthesis: '[mood] text | [mood] text | [pause=0.5]'\n");
+                fprintf(stderr, "                             Each span uses its own --emotion recipe; spans joined with pauses (one WAV)\n");
+                fprintf(stderr, "  --compose-pause <s>        Default gap between spoken spans (default 0.12s)\n");
                 fprintf(stderr, "  --steer-vector <file>      Custom emotion/prosody control vector (.vec from QWEN_STEER_CAPTURE)\n");
                 fprintf(stderr, "  --steer-weight <f>         Global injection scale for --emotion/--steer-vector (default 1.0)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
@@ -566,8 +763,8 @@ int main(int argc, char **argv) {
     }
     /* --save-voice without --text = create voice only (no generation) */
     int create_voice_only = (save_voice && !text && serve_port <= 0);
-    if (!text && serve_port <= 0 && !create_voice_only) {
-        fprintf(stderr, "Error: --text or --serve is required\n");
+    if (!text && !compose_spec && serve_port <= 0 && !create_voice_only) {
+        fprintf(stderr, "Error: --text, --compose or --serve is required\n");
         return 1;
     }
 
@@ -663,77 +860,15 @@ int main(int argc, char **argv) {
      * --emotion accepts a compound MOOD name (joy/sad/stern/...) resolved through
      * the manifest to a full recipe {vec, steer_weight, roughness, volume, rate};
      * any explicitly-passed knob overrides its baked value. A blend/scale spec
-     * (e.g. "happy:0.5,proud:0.5") bypasses the manifest and steers raw presets. */
-    {
-        int cp_h = ctx->config.cp_hidden_size;
-        float eff_steer_weight = cp_steer_weight;
-        float eff_roughness    = cp_roughness;
-        const char *vec_spec   = emotion_spec;   /* the .vec spec actually loaded */
-        const qwen_emotion_recipe_t *recipe = NULL;
-
-        if (emotion_spec && !strchr(emotion_spec, ',') && !strchr(emotion_spec, ':'))
-            recipe = qwen_emotion_lookup(emotion_spec);
-        if (recipe) {
-            vec_spec = recipe->vec_spec;
-            if (!steer_weight_set) eff_steer_weight = recipe->steer_weight;
-            if (!roughness_set)    eff_roughness    = recipe->roughness;
-            if (!volume_set)       audio_volume     = recipe->volume;
-            if (!rate_set)         audio_rate       = recipe->rate;
-            if (!silent)
-                fprintf(stderr, "Emotion '%s' -> %s\n  (vec=%s weight=%.2f roughness=%.2f volume=%.2f rate=%.2f)\n",
-                        emotion_spec, recipe->desc, vec_spec ? vec_spec : "(none)",
-                        eff_steer_weight, eff_roughness, audio_volume, audio_rate);
-        }
-
-        /* Roughness (texture grit on the CP). */
-        if (eff_roughness > 0.0f) {
-            if (eff_roughness > 1.0f) eff_roughness = 1.0f;
-            ctx->cp_roughness = eff_roughness;
-            if (!silent && !recipe) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", eff_roughness);
-        }
-
-        /* Steering vector(s): manifest vec OR raw --emotion blend OR --steer-vector. */
-        if (vec_spec || steer_vector_path) {
-            float *steer_acc = NULL;
-            if (vec_spec) {
-                char *spec = strdup(vec_spec);
-                for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
-                    float scale = 1.0f;
-                    char *colon = strchr(tok, ':');
-                    if (colon) { *colon = '\0'; scale = (float)atof(colon + 1); }
-                    char path[1024];
-                    if (resolve_emotion_path(tok, language, path, sizeof(path)) != 0) {
-                        if (recipe) {
-                            /* recipe vector unavailable for this language -> still apply
-                             * the prosody knobs (roughness/volume/rate), just no steering */
-                            if (!silent) fprintf(stderr,
-                                "Note: mood '%s' has no '%s' vector for this language; "
-                                "applying roughness/volume/rate only.\n", emotion_spec, tok);
-                        } else {
-                            fprintf(stderr, "Error: unknown emotion preset '%s' "
-                                "(looked in $QWEN_EMOTION_DIR, presets/emotions/[<lang>/], voices/emotions/)\n", tok);
-                            free(spec); free(steer_acc); return 1;
-                        }
-                    } else if (load_steer_vec_accum(path, scale, &steer_acc, cp_h) != 0) {
-                        free(spec); free(steer_acc); return 1;
-                    } else if (!silent && !recipe) {
-                        fprintf(stderr, "Emotion: %s x%.2f (%s)\n", tok, scale, path);
-                    }
-                }
-                free(spec);
-            }
-            /* --steer-vector: a custom (uncalibrated) vector, summed on top. */
-            if (steer_vector_path &&
-                load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) {
-                free(steer_acc); return 1;
-            }
-            if (steer_acc) {
-                ctx->cp_steer_vec = steer_acc;
-                ctx->cp_steer_dim = cp_h;
-                ctx->cp_steer_weight = eff_steer_weight;
-                if (!silent) fprintf(stderr, "Steering: active (dim=%d, weight=%.2f)\n", cp_h, eff_steer_weight);
-            }
-        }
+     * (e.g. "happy:0.5,proud:0.5") bypasses the manifest and steers raw presets.
+     * (--compose calls the same helper per span; see below.) */
+    if (!compose_spec &&
+        qwen_apply_emotion(ctx, emotion_spec, steer_vector_path, language,
+                           cp_steer_weight, steer_weight_set, cp_roughness, roughness_set,
+                           audio_volume, volume_set, audio_rate, rate_set,
+                           &audio_volume, &audio_rate, silent) != 0) {
+        qwen_tts_unload(ctx);
+        return 1;
     }
 
     if (voice_design) {
@@ -1742,6 +1877,14 @@ int main(int argc, char **argv) {
         int ret = qwen_tts_serve_ex(ctx, serve_port, serve_workers);
         qwen_tts_unload(ctx);
         return ret;
+    }
+
+    /* Compose mode: multi-span synthesis into a single WAV (no streaming). */
+    if (compose_spec) {
+        if (!silent) fprintf(stderr, "Compose mode: rendering spans...\n");
+        int rc = run_compose(ctx, compose_spec, language, compose_pause, output, silent);
+        qwen_tts_unload(ctx);
+        return rc == 0 ? 0 : 1;
     }
 
     /* Streaming setup */
