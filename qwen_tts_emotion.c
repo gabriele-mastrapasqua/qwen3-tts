@@ -29,8 +29,12 @@ static const qwen_emotion_recipe_t MANIFEST[] = {
     { "news",      "proud",    2.0f,  0.00f, 1.00f, 1.00f, "authoritative news-anchor delivery" },
     { "dramatic",  "dramatic", 2.0f,  0.00f, 1.00f, 1.00f, "theatrical, weighty" },
     { "calm",      "calm",     1.6f,  0.00f, 0.95f, 0.96f, "relaxed, unhurried (slightly slower/softer)" },
-    { "sad",       "sad",      2.0f,  0.00f, 0.90f, 0.84f, "downcast (slower + quieter; add ... pauses in text)" },
-    { "gloomy",    "gloomy",   2.0f,  0.00f, 0.90f, 0.85f, "somber, low (slower + quieter)" },
+    /* down-moods: the sadness comes from PROSODY (slow + soft), steering is LOW —
+     * high weight pushes the IT direction off-manifold into a 'Chinese tone' basin
+     * (ear-validated 2026-06-07: sad sweet spot = weight ~1.1 + rate 0.80 + vol 0.86;
+     * the gloomy direction goes off-manifold even at 1.0, so it stays lower). */
+    { "sad",       "sad",      1.1f,  0.00f, 0.86f, 0.80f, "downcast (slow + quiet + slight ache; add ... pauses in text)" },
+    { "gloomy",    "gloomy",   0.5f,  0.00f, 0.88f, 0.82f, "somber, low (mostly prosody; gloomy dir is off-manifold-prone on IT)" },
     { "annoyed",   "angry",    2.6f,  0.32f, 1.05f, 1.05f, "irritated/short-tempered (angry + grit + brisk)" },
     { "stern",     "angry",    2.6f,  0.28f, 1.05f, 1.00f, "firm, authoritative reprimand" },
     { "angry",     "angry",    2.6f,  0.40f, 1.05f, 1.05f, "forceful/heated (full furious rage is out of model reach)" },
