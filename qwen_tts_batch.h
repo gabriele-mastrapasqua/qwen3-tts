@@ -64,4 +64,7 @@ int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
  * fp tolerance). Prints a report; returns 0 on pass. (`./qwen_tts --batch-test`) */
 int qwen_batch_self_test(qwen_tts_ctx_t *ctx);
 
+/* End-to-end batched-compute throughput bench (Talker+CP, batched vs single). */
+int qwen_batch_bench(qwen_tts_ctx_t *ctx);
+
 #endif

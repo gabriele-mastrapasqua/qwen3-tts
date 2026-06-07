@@ -66,6 +66,30 @@ long document where 2× wall-time matters). For single short utterances it does 
 gain is ~2× on M1; a higher-bandwidth box (where single-stream is more memory-bound) could see
 more. Decide based on whether 2× justifies the rewrite + the per-sequence complexity.
 
+## ⚠️ REAL-MODEL result (2026-06-07): batched compute is 4–12× SLOWER on M1
+
+After building the batched Talker step + batched CP (both correctness-verified) and timing the
+**actual per-frame compute** end-to-end (`--batch-bench`, B=8 K=50 on 0.6B M1):
+
+| | single-stream | batched | speedup |
+|---|---|---|---|
+| 4 threads | 13.1 frames/s | 3.2 frames/s | **0.24×** |
+| 1 thread | 11.7 frames/s | 0.9 frames/s | **0.08×** |
+
+**The batched path is a LOSS on M1.** Why the premise microbench mispredicted: it compared two of
+*our own* naive kernels (a simple NEON gemv vs the matmat). The **production `qwen_matvec_bf16` is
+far more optimized** (8-wide NEON, 2 rows at a time, multiple register-resident accumulators to hide
+FMA latency), while our `bf16_matmat_slice` is naive — scalar bf16 decode + an `acc[64]` array that
+lives in **L1, not registers** (load/store every k), plus gather/scatter transposes. So B× the
+production matvec beats our matmat, and on M1 (compute-bound, high per-core bandwidth) batching loses.
+
+**Decision: do NOT build the full `--batch` integration on M1.** The two batched compute kernels are
+built + correctness-verified (reusable), but batching only becomes worth integrating IF: (1) the
+batched matmat is rewritten to production quality (register-blocked B-tiles, 2-rows × B, NEON bf16
+decode like `bf16_matvec_fused`) AND (2) validated on a **memory-bound x86 box** (Ryzen/Turin) where
+single-stream is bandwidth-starved and read-once amortization actually pays. On M1, single-stream wins.
+This confirms the standing finding: M1 is compute-bound; batching is an x86/throughput lever at best.
+
 ## Batching × PRECISION (int8 / int4 / int2)
 
 Re-ran the bench storing weights at their real byte size (`make batching-bench`, 4-thread).

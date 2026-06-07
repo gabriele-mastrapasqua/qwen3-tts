@@ -1071,3 +1071,63 @@ int qwen_batch_self_test(qwen_tts_ctx_t *ctx) {
     free(embeds_all); free(embedsB); free(href); free(hbat); qwen_batch_free(bb);
     return pass ? 0 : 1;
 }
+
+/* End-to-end batched-compute throughput bench: real model, B frames of Talker step +
+ * CP predict, batched vs single-stream. Measures the actual per-frame compute speedup
+ * (the autoregressive bulk; excludes prefill/sampling/decode/scheduler — the remaining
+ * integration). `./qwen_tts -d <model> --batch-bench`. */
+int qwen_batch_bench(qwen_tts_ctx_t *ctx) {
+    qwen_tts_config_t *c = &ctx->config; int h = c->hidden_size;
+    if (ctx->layers[0].wq_bf16 == NULL || !ctx->cp_lm_head_bf16[0]) {
+        fprintf(stderr, "batch-bench: needs a bf16 model (v1)\n"); return 1;
+    }
+    const char *be = getenv("QWEN_BATCH_B"); int B = be ? atoi(be) : 8; if (B < 1 || B > 64) B = 8;
+    const int K = 50;                         /* frames per sequence */
+    qwen_batch_t *bb = qwen_batch_alloc(ctx, B, K + 4);
+    if (!bb) { fprintf(stderr, "batch-bench: alloc failed\n"); return 1; }
+    float *emb = (float *)malloc((size_t)K * h * sizeof(float));
+    float *embB = (float *)malloc((size_t)B * h * sizeof(float));
+    float *hid = (float *)malloc((size_t)B * h * sizeof(float));
+    float *hid1 = (float *)malloc((size_t)h * sizeof(float));
+    int *codes = (int *)malloc((size_t)B * 15 * sizeof(int));
+    int *codes1 = (int *)malloc(15 * sizeof(int));
+    int *c0 = (int *)malloc((size_t)B * sizeof(int));
+    uint64_t rng = 0x1234567ull;
+#define RBF (((double)((rng = rng * 6364136223846793005ull + 1442695040888963407ull) >> 40)) / (double)(1u << 24) * 2.0 - 1.0)
+    for (int i = 0; i < K * h; i++) emb[i] = (float)(RBF * 0.1);
+    for (int b = 0; b < B; b++) c0[b] = 1;
+    struct timespec t0, t1;
+#define NOW(t) clock_gettime(CLOCK_MONOTONIC, &(t))
+#define MS(a,b) (((b).tv_sec-(a).tv_sec)*1e3 + ((b).tv_nsec-(a).tv_nsec)*1e-6)
+
+    /* single-stream: B sequences x K frames (Talker step + CP predict) */
+    NOW(t0);
+    for (int seq = 0; seq < B; seq++) {
+        ctx->kv_len = 0;
+        for (int s = 0; s < K; s++) {
+            qwen_talker_step(ctx, emb + (size_t)s * h, hid1);
+            qwen_cp_predict(ctx, hid1, 1, codes1);
+        }
+    }
+    NOW(t1); double t_single = MS(t0, t1);
+
+    /* batched: K steps, each doing B frames */
+    bb->kv_len = 0; bb->force_matvec = 0;
+    NOW(t0);
+    for (int s = 0; s < K; s++) {
+        for (int b = 0; b < B; b++) memcpy(embB + (size_t)b * h, emb + (size_t)s * h, h * sizeof(float));
+        qwen_batch_talker_step(ctx, bb, embB, hid);
+        qwen_batch_cp_predict(ctx, bb, hid, c0, codes);
+    }
+    NOW(t1); double t_batch = MS(t0, t1);
+
+    double frames = (double)B * K;
+    fprintf(stderr, "batch-bench: B=%d K=%d (%.0f frames) threads=%d\n", B, K, frames, qwen_get_threads());
+    fprintf(stderr, "  single-stream: %8.1f ms  (%6.1f frames/s)\n", t_single, frames / (t_single * 1e-3));
+    fprintf(stderr, "  batched:       %8.1f ms  (%6.1f frames/s)\n", t_batch,  frames / (t_batch  * 1e-3));
+    fprintf(stderr, "  SPEEDUP: %.2fx\n", t_single / t_batch);
+    free(emb); free(embB); free(hid); free(hid1); free(codes); free(codes1); free(c0);
+    qwen_batch_free(bb);
+    ctx->kv_len = 0;
+    return 0;
+}
