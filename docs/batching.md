@@ -1,5 +1,15 @@
 # Text-chunk batching — premise test (feat/batching)
 
+> **Design constraint: batching is an OPT-IN alternative path, never the default.** Like vLLM,
+> you turn it on (`--batch` / a server mode) when the workload fits — many requests, or one long
+> document where throughput matters. The single-stream path (today's code) stays the default and
+> is untouched. Default behavior + golden tests must remain bit-identical.
+>
+> **Validation roadmap (in order):** (1) M1 Mac — build + correctness + RTF; (2) the AMD Ryzen
+> mini-PC (Zen2/3) over RDP; (3) the EPYC **Turin** VPS (AVX-512/VNNI); (4) only *after* those, use
+> the numbers to discuss with Leo. Don't block on hardware we can't drive directly.
+
+
 **Question:** if we split a long text into B chunks and step them *together* (so each bf16
 weight is read from DRAM once and reused across all B chunks — matrix-MATRIX instead of
 matrix-VECTOR), do we get throughput? This is the only lever the earlier analysis left open

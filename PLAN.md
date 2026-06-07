@@ -671,8 +671,25 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 > (3) optional: dedicated ES palette capture (ES inverts everything); retry sbuffo at lower weight; more macros.
 >
 > **BACKLOG / IDEAS TO ANALYZE+VALIDATE (user, 2026-06-07):**
+> - **BATCHING (branch `feat/batching` off feat/expressivity, started 2026-06-07):** OPT-IN alternative path
+>   (vLLM-style — default = today's single-stream, untouched, golden bit-identical). Premise TESTED via
+>   `make batching-bench` (`tests/batching_bench.c`, docs/batching.md): batched GEMM(16) vs 16× GEMV →
+>   **~2× on M1 at bf16** (single-stream is compute-bound there, the FLOOR); **batching is worth MORE at lower
+>   precision** (int4/int2 amortize the costly per-token nibble/bit UNPACK) → **pair batching with int4/int8, not bf16**;
+>   could even make int4 viable on M1 (where nibble-unpack is the slowness today). Cross-CPU prediction: every x86 box
+>   ≥ M1 (Ryzen mini-PC >2×+int4 sweet-spot; EPYC Turin VPS ~2-4×/core × core-scaling = the throughput play; Zen5+VNNI
+>   best target). VALIDATION ORDER: M1 → Ryzen mini-PC (Zen2/3, RDP) → Turin VPS (AVX-512) → ONLY THEN discuss w/ Leo.
+>   Full prototype scope in docs/batching.md (B per-seq KV, GEMM step kernels Talker+CP, ragged-EOS, chunk scheduler,
+>   reuse render_spans for concat). Commits 3e0cb70-area on feat/batching: d175eb1, 5027490.
+> - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
+>   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
+>   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
+>   code0 (Medusa/Eagle OUT — need trained heads); (C) CP residual spec (risky, quality-sensitive); (D) spec-decode ⊂
+>   batching (the parallel-verify IS a batched forward → build batching first). **DECISION NUMBER = 0.6B↔1.7B code0
+>   acceptance rate** — cheap instrument-only experiment (reuse quant-ladder teacher-forcing rails) to run FIRST.
 > - **Quant:** int2 / int3 where we know it's viable (q2 already exists for the roughness path — extend as a
->   real quant tier?). Measure quality cliff per codebook (we have the quant-ladder instrument).
+>   real quant tier?). Measure quality cliff per codebook (we have the quant-ladder instrument). NOTE: int4+batching
+>   synergy (above) raises the value of a solid int4 path.
 > - **Speed+quality benchmark of voice CLONE and preset voices** (systematic A/B: RTF + mel-corr + ear, per voice).
 > - **Expressivity — EMOJI in the prompt:** what does the model do with 😄 😂 😢 🤔 / "lol"/"ahah"? Does it unlock
 >   laughs/cries? (first quick test 2026-06-07: no error, tokenizer eats them as UTF-8 — needs ear check; samples/emoji/).
