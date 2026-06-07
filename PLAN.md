@@ -623,9 +623,14 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   paralinguistic tags, relax-identity (`QWEN_SPK_SCALE` knob added, no-op default), real-breath splice, DSP pauses, hesitant-capture.
 > - **`--volume`/`--rate` flags = trivial future add** (volume=pure PCM gain; not yet exposed).
 > NEXT STEPS (ranked): (1) **reply to Leo** (task #3 — perf leads int8-Talker/Windows-SD-single-thread/9P + his 2 forked
->   params `--emit-tokens`/`--decode-tokens` deduced; re-read his full email first). (2) **compound-emotion MANIFEST as code**
->   (name → {vec, steer_weight, rate, volume, roughness}) so `--emotion joy/sad/stern` sets all knobs — the v2 deliverable.
-> (3) optional: dedicated ES palette capture (ES inverts everything); `--volume`/`--rate` flags; retry sbuffo at lower weight.
+>   params `--emit-tokens`/`--decode-tokens` deduced; re-read his full email first).
+>   (2) ✅ **DONE 2026-06-07 (commit 3e0cb70): compound-emotion MANIFEST as code** — `qwen_tts_emotion.{c,h}`,
+>   13 moods `name → {vec, steer_weight, roughness, volume, rate}`; `--emotion joy/sad/stern/annoyed` sets ALL knobs.
+>   Also shipped: `--volume` (PCM gain) + `--rate` (in-engine WSOLA time-stretch, no ffmpeg) + language-aware
+>   resolver (Italian auto-uses `it_centered/`) + graceful degrade when a mood's vec is missing for a language.
+>   `make test-emotion` (in test-all); golden mel-corr still 1.0 (default-off). STILL TODO: EAR-validate the recipe
+>   numbers (joy/sad/annoyed) sound right; wire volume/rate into the HTTP server path (CLI-only today).
+> (3) optional: dedicated ES palette capture (ES inverts everything); retry sbuffo at lower weight; per-span markup segmenter.
 > Uncommitted at stop: none of the repo (all committed: 52a1cf8→62da9ed→7b60e75→0c8ce04). Local-only: `voices/galatea_06b.qvoice`,
 > `samples/emergent/` (sbuffo audio), `/tmp/qwen3tts_src` (official source, ephemeral). Two stray `analisi_leak*.md` left untracked (not ours — decide later).
 
