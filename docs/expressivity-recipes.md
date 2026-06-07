@@ -45,17 +45,38 @@ The IT/EN-captured palette is **cross-model** (0.6B↔1.7B↔.qvoice) but only *
 
 **Cross-language joy fix: always `excited`, never `happy`** (happy inverts/goes sultry in ES/FR/KO; excited transfers).
 
+## Compound moods (the v2: `--emotion <mood>` sets ALL knobs)
+
+These recipes are now baked into a **manifest** (`qwen_tts_emotion.c`). A single mood name sets the
+whole recipe — vector + steer-weight + roughness + volume + rate — so you don't have to remember the
+numbers:
+
+```bash
+./qwen_tts -d qwen3-tts-0.6b -l Italian -s ryan --emotion joy   --text "..."   # excited @2.6 + rate 1.10 + vol 1.10
+./qwen_tts -d qwen3-tts-0.6b -l Italian -s ryan --emotion sad   --text "..."   # sad @2.0 + rate 0.84 + vol 0.90
+./qwen_tts -d qwen3-tts-0.6b -l Italian -s ryan --emotion annoyed --text "..." # angry @2.6 + roughness 0.32 + brisk
+```
+
+Moods today: `joy, happy, excited, eager, proud, news, dramatic, calm, sad, gloomy, annoyed, stern, angry`.
+Any explicit flag (`--steer-weight`/`--roughness`/`--volume`/`--rate`) **overrides** the baked value.
+The resolver is language-aware: Italian pulls from the centered palette (`it_centered/` then `it/`)
+automatically — no need to set `QWEN_EMOTION_DIR` for IT. If a mood's vector is missing for the active
+language (e.g. `angry` outside IT), the steering is skipped but the prosody knobs still apply.
+
 ## Levers & flags
 
-- `--emotion <name[:scale,...]>` — centered palette directions (blendable).
+- `--emotion <mood | name[:scale,...]>` — a manifest mood (full recipe) OR raw centered-palette
+  directions (blendable, e.g. `happy:0.5,proud:0.5` — a blend/scale spec bypasses the manifest).
 - `--steer-weight <f>` — global scale. **It's a mood crossfade, not just intensity**: push far and
   you land on a neighbour, and at high weight (≳2.6) you push OFF-manifold → language-specific
   emergent deliveries (see below).
 - `--roughness <0..1>` — TIMBRE knob (gravel/worn voice), NOT an emotion. Pairs with `--emotion` for grit.
+- `--volume <f>` — output PCM gain (1.0 = unchanged). Pure gain, applied post-synthesis (also per-chunk
+  in `--stream`).
+- `--rate <f>` — pitch-preserving tempo via in-engine **WSOLA** (`qwen_audio_time_stretch`), >1 faster /
+  <1 slower. No ffmpeg dependency. NOTE: not applied in `--stream` mode (needs the full buffer).
 - `QWEN_SPK_SCALE` (env, default 1.0) — diagnostic; scaling the speaker embedding does NOT free pitch
   range (the register clamp is in the WDELTA weights) — relax-identity is a dead end.
-- volume / rate — currently DSP post (`ffmpeg volume=`, `atempo=`); `--volume`/`--rate` flags are a
-  trivial future add (volume = pure PCM gain, no obstacle unlike pitch).
 
 ## Dead-ends (proven — do not re-attempt)
 

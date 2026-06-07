@@ -4,6 +4,7 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_audio.h"
+#include "qwen_tts_emotion.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_server.h"
 
@@ -147,13 +148,14 @@ typedef struct {
     FILE *file;            /* WAV file or stdout */
     int is_stdout;         /* 1 = raw PCM to stdout, 0 = WAV file */
     int total_samples;     /* running count of samples written */
+    float volume;          /* --volume gain applied per chunk (1.0 = none) */
 } stream_state_t;
 
 static int stream_audio_callback(const float *samples, int n_samples, void *userdata) {
     stream_state_t *st = (stream_state_t *)userdata;
     if (!st->file) return -1;
     for (int i = 0; i < n_samples; i++) {
-        float s = samples[i];
+        float s = samples[i] * st->volume;
         if (s < -1.0f) s = -1.0f;
         if (s > 1.0f) s = 1.0f;
         int16_t sample = (int16_t)(s * 32767);
@@ -291,13 +293,26 @@ static int load_steer_vec_accum(const char *path, float scale, float **acc, int 
     return *acc ? 0 : -1;
 }
 
-/* Resolve an emotion preset name to its .vec path (first hit wins):
- * $QWEN_EMOTION_DIR, then presets/emotions/, then voices/emotions/. */
-static int resolve_emotion_path(const char *name, char *out, size_t outsz) {
-    const char *dirs[] = { getenv("QWEN_EMOTION_DIR"), "presets/emotions", "voices/emotions" };
-    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-        if (!dirs[i] || !*dirs[i]) continue;
-        snprintf(out, outsz, "%s/%s.vec", dirs[i], name);
+/* Resolve an emotion preset name to its .vec path (first hit wins).
+ * Search order, per base dir ($QWEN_EMOTION_DIR, presets/emotions/, voices/emotions/):
+ * language-specific sub-palettes FIRST, then the flat dir. For Italian we prefer
+ * the decorrelated `it_centered/` palette (the validated one), then `it/`.
+ * Other languages fall through to the flat (EN-captured) palette. */
+static int resolve_emotion_path(const char *name, const char *language, char *out, size_t outsz) {
+    const char *bases[] = { getenv("QWEN_EMOTION_DIR"), "presets/emotions", "voices/emotions" };
+    /* language -> ordered list of sub-dirs to try before the flat dir */
+    const char *it_subs[] = { "it_centered", "it", NULL };
+    const char *none[]    = { NULL };
+    const char **subs = none;
+    if (language && strcasecmp(language, "Italian") == 0) subs = it_subs;
+    for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+        if (!bases[i] || !*bases[i]) continue;
+        for (int s = 0; subs[s]; s++) {
+            snprintf(out, outsz, "%s/%s/%s.vec", bases[i], subs[s], name);
+            FILE *f = fopen(out, "rb");
+            if (f) { fclose(f); return 0; }
+        }
+        snprintf(out, outsz, "%s/%s.vec", bases[i], name);
         FILE *f = fopen(out, "rb");
         if (f) { fclose(f); return 0; }
     }
@@ -329,7 +344,11 @@ int main(int argc, char **argv) {
     float cp_roughness = 0.0f;        /* --roughness: q2-down blend on the CP (texture knob) */
     const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
     float cp_steer_weight = 1.0f;     /* --steer-weight: injection scale for the control vector */
-    const char *emotion_spec = NULL;  /* --emotion: preset name(s), e.g. "happy" or "happy:0.5,proud:0.5" */
+    const char *emotion_spec = NULL;  /* --emotion: mood name or preset(s), e.g. "joy", "happy:0.5,proud:0.5" */
+    float audio_volume = 1.0f;        /* --volume: linear PCM gain on the output */
+    float audio_rate = 1.0f;          /* --rate: pitch-preserving tempo (>1 faster) */
+    /* "_set" = flag was explicitly passed -> overrides any --emotion manifest recipe value */
+    int steer_weight_set = 0, roughness_set = 0, volume_set = 0, rate_set = 0;
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
@@ -388,6 +407,8 @@ int main(int argc, char **argv) {
         {"steer-vector",  required_argument, 0, 1029},
         {"steer-weight",  required_argument, 0, 1030},
         {"emotion",       required_argument, 0, 1031},
+        {"volume",        required_argument, 0, 1032},
+        {"rate",          required_argument, 0, 1033},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -428,10 +449,12 @@ int main(int argc, char **argv) {
             case 1025: show_caps = 1; break;
             case 1026: serve_workers = atoi(optarg); break;
             case 1027: run_self_test = 1; break;
-            case 1028: cp_roughness = (float)atof(optarg); break;
+            case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
             case 1029: steer_vector_path = optarg; break;
-            case 1030: cp_steer_weight = (float)atof(optarg); break;
+            case 1030: cp_steer_weight = (float)atof(optarg); steer_weight_set = 1; break;
             case 1031: emotion_spec = optarg; break;
+            case 1032: audio_volume = (float)atof(optarg); volume_set = 1; break;
+            case 1033: audio_rate = (float)atof(optarg); rate_set = 1; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -473,7 +496,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
-                fprintf(stderr, "  --emotion <spec>           Emotion preset(s): name, name:scale, or a,b blend (e.g. happy, happy:0.5,proud:0.5)\n");
+                fprintf(stderr, "  --emotion <spec>           Mood (joy/sad/stern/annoyed/excited/proud/calm/...): sets vec+weight+roughness+volume+rate.\n");
+                fprintf(stderr, "                             Also accepts raw preset blends (e.g. happy:0.5,proud:0.5). Explicit knobs override.\n");
+                fprintf(stderr, "  --volume <f>               Output gain (1.0=unchanged, e.g. 1.1 louder, 0.9 softer)\n");
+                fprintf(stderr, "  --rate <f>                 Speaking rate, pitch-preserving (1.0=unchanged, >1 faster, <1 slower)\n");
                 fprintf(stderr, "  --steer-vector <file>      Custom emotion/prosody control vector (.vec from QWEN_STEER_CAPTURE)\n");
                 fprintf(stderr, "  --steer-weight <f>         Global injection scale for --emotion/--steer-vector (default 1.0)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
@@ -633,44 +659,80 @@ int main(int argc, char **argv) {
     if (max_duration > 0) ctx->max_tokens = (int)(max_duration * 12.5f);
     if (ctx_greedy_warmup > 0) ctx->greedy_warmup = ctx_greedy_warmup;
 
-    /* Expressivity controls (feat/expressivity) */
-    if (cp_roughness > 0.0f) {
-        if (cp_roughness > 1.0f) cp_roughness = 1.0f;
-        ctx->cp_roughness = cp_roughness;
-        if (!silent) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", cp_roughness);
-    }
-    if (steer_vector_path || emotion_spec) {
+    /* ---- Expressivity controls (feat/expressivity) ----
+     * --emotion accepts a compound MOOD name (joy/sad/stern/...) resolved through
+     * the manifest to a full recipe {vec, steer_weight, roughness, volume, rate};
+     * any explicitly-passed knob overrides its baked value. A blend/scale spec
+     * (e.g. "happy:0.5,proud:0.5") bypasses the manifest and steers raw presets. */
+    {
         int cp_h = ctx->config.cp_hidden_size;
-        float *steer_acc = NULL;
-        /* --emotion: comma-separated preset list, each "name" or "name:scale".
-         * Presets are calibrated (recommended weight baked in) → name alone = good. */
-        if (emotion_spec) {
-            char *spec = strdup(emotion_spec);
-            for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
-                float scale = 1.0f;
-                char *colon = strchr(tok, ':');
-                if (colon) { *colon = '\0'; scale = (float)atof(colon + 1); }
-                char path[1024];
-                if (resolve_emotion_path(tok, path, sizeof(path)) != 0) {
-                    fprintf(stderr, "Error: unknown emotion preset '%s' "
-                                    "(looked in $QWEN_EMOTION_DIR, presets/emotions/, voices/emotions/)\n", tok);
-                    free(spec); free(steer_acc); return 1;
+        float eff_steer_weight = cp_steer_weight;
+        float eff_roughness    = cp_roughness;
+        const char *vec_spec   = emotion_spec;   /* the .vec spec actually loaded */
+        const qwen_emotion_recipe_t *recipe = NULL;
+
+        if (emotion_spec && !strchr(emotion_spec, ',') && !strchr(emotion_spec, ':'))
+            recipe = qwen_emotion_lookup(emotion_spec);
+        if (recipe) {
+            vec_spec = recipe->vec_spec;
+            if (!steer_weight_set) eff_steer_weight = recipe->steer_weight;
+            if (!roughness_set)    eff_roughness    = recipe->roughness;
+            if (!volume_set)       audio_volume     = recipe->volume;
+            if (!rate_set)         audio_rate       = recipe->rate;
+            if (!silent)
+                fprintf(stderr, "Emotion '%s' -> %s\n  (vec=%s weight=%.2f roughness=%.2f volume=%.2f rate=%.2f)\n",
+                        emotion_spec, recipe->desc, vec_spec ? vec_spec : "(none)",
+                        eff_steer_weight, eff_roughness, audio_volume, audio_rate);
+        }
+
+        /* Roughness (texture grit on the CP). */
+        if (eff_roughness > 0.0f) {
+            if (eff_roughness > 1.0f) eff_roughness = 1.0f;
+            ctx->cp_roughness = eff_roughness;
+            if (!silent && !recipe) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", eff_roughness);
+        }
+
+        /* Steering vector(s): manifest vec OR raw --emotion blend OR --steer-vector. */
+        if (vec_spec || steer_vector_path) {
+            float *steer_acc = NULL;
+            if (vec_spec) {
+                char *spec = strdup(vec_spec);
+                for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
+                    float scale = 1.0f;
+                    char *colon = strchr(tok, ':');
+                    if (colon) { *colon = '\0'; scale = (float)atof(colon + 1); }
+                    char path[1024];
+                    if (resolve_emotion_path(tok, language, path, sizeof(path)) != 0) {
+                        if (recipe) {
+                            /* recipe vector unavailable for this language -> still apply
+                             * the prosody knobs (roughness/volume/rate), just no steering */
+                            if (!silent) fprintf(stderr,
+                                "Note: mood '%s' has no '%s' vector for this language; "
+                                "applying roughness/volume/rate only.\n", emotion_spec, tok);
+                        } else {
+                            fprintf(stderr, "Error: unknown emotion preset '%s' "
+                                "(looked in $QWEN_EMOTION_DIR, presets/emotions/[<lang>/], voices/emotions/)\n", tok);
+                            free(spec); free(steer_acc); return 1;
+                        }
+                    } else if (load_steer_vec_accum(path, scale, &steer_acc, cp_h) != 0) {
+                        free(spec); free(steer_acc); return 1;
+                    } else if (!silent && !recipe) {
+                        fprintf(stderr, "Emotion: %s x%.2f (%s)\n", tok, scale, path);
+                    }
                 }
-                if (load_steer_vec_accum(path, scale, &steer_acc, cp_h) != 0) { free(spec); free(steer_acc); return 1; }
-                if (!silent) fprintf(stderr, "Emotion: %s x%.2f (%s)\n", tok, scale, path);
+                free(spec);
             }
-            free(spec);
-        }
-        /* --steer-vector: a custom (uncalibrated) vector, summed on top. */
-        if (steer_vector_path &&
-            load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) {
-            free(steer_acc); return 1;
-        }
-        if (steer_acc) {
-            ctx->cp_steer_vec = steer_acc;
-            ctx->cp_steer_dim = cp_h;
-            ctx->cp_steer_weight = cp_steer_weight;
-            if (!silent) fprintf(stderr, "Steering: active (dim=%d, global weight=%.2f)\n", cp_h, cp_steer_weight);
+            /* --steer-vector: a custom (uncalibrated) vector, summed on top. */
+            if (steer_vector_path &&
+                load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) {
+                free(steer_acc); return 1;
+            }
+            if (steer_acc) {
+                ctx->cp_steer_vec = steer_acc;
+                ctx->cp_steer_dim = cp_h;
+                ctx->cp_steer_weight = eff_steer_weight;
+                if (!silent) fprintf(stderr, "Steering: active (dim=%d, weight=%.2f)\n", cp_h, eff_steer_weight);
+            }
         }
     }
 
@@ -1684,8 +1746,11 @@ int main(int argc, char **argv) {
 
     /* Streaming setup */
     stream_state_t stream_state = {0};
+    stream_state.volume = audio_volume;   /* --volume applies per chunk while streaming */
     ctx->stream = do_stream;
     ctx->stream_chunk_frames = stream_chunk;
+    if (do_stream && audio_rate != 1.0f && !silent)
+        fprintf(stderr, "Warning: --rate has no effect in --stream mode (time-stretch needs the full buffer)\n");
 
     if (do_stream) {
         if (do_stdout) {
@@ -1737,15 +1802,34 @@ int main(int argc, char **argv) {
         /* Free the full decode output (streaming already wrote everything) */
         free(audio);
     } else {
-        /* Non-streaming: write WAV from full decode */
+        /* Non-streaming: write WAV from full decode, with optional rate/volume post. */
         if (audio && n_samples > 0) {
-            if (qwen_tts_write_wav(output, audio, n_samples, QWEN_TTS_SAMPLE_RATE) == 0) {
+            float *final_audio = audio;
+            int    final_n     = n_samples;
+            float *stretched   = NULL;
+            if (audio_rate != 1.0f) {
+                int sn = 0;
+                if (qwen_audio_time_stretch(audio, n_samples, audio_rate,
+                                            QWEN_TTS_SAMPLE_RATE, &stretched, &sn) == 0) {
+                    final_audio = stretched; final_n = sn;
+                    if (!silent) fprintf(stderr, "Rate: %.2fx (%d -> %d samples)\n",
+                                         audio_rate, n_samples, sn);
+                } else if (!silent) {
+                    fprintf(stderr, "Warning: time-stretch failed, writing at original rate\n");
+                }
+            }
+            if (audio_volume != 1.0f) {
+                qwen_audio_apply_gain(final_audio, final_n, audio_volume);
+                if (!silent) fprintf(stderr, "Volume: %.2fx\n", audio_volume);
+            }
+            if (qwen_tts_write_wav(output, final_audio, final_n, QWEN_TTS_SAMPLE_RATE) == 0) {
                 if (!silent)
-                    fprintf(stderr, "Wrote %s (%d samples, %.2fs)\n", output, n_samples,
-                            (float)n_samples / QWEN_TTS_SAMPLE_RATE);
+                    fprintf(stderr, "Wrote %s (%d samples, %.2fs)\n", output, final_n,
+                            (float)final_n / QWEN_TTS_SAMPLE_RATE);
             } else {
                 fprintf(stderr, "Failed to write WAV\n");
             }
+            free(stretched);
             free(audio);
         }
     }

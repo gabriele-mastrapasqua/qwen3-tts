@@ -51,6 +51,51 @@ vector captured on 1.7B works unchanged on 0.6B. An Italian palette lives in
 > The strength is also a **mood crossfade**, not just intensity — pushing a direction far
 > can land on a neighbouring emotion. The shipped weights are the sweet spots we tuned by ear.
 
+## Compound moods — one name sets every knob
+
+A single mood name can drive the *whole* recipe — vector **and** steer-weight **and** roughness
+**and** volume **and** rate — because some emotions are prosody, not just a steering direction
+(sadness is slower + quieter; joy is brighter + faster + louder). These live in a manifest
+(`qwen_tts_emotion.c`):
+
+```bash
+./qwen_tts ... -l Italian --emotion joy       # excited @2.6 + rate 1.10 + volume 1.10
+./qwen_tts ... -l Italian --emotion sad       # sad @2.0 + rate 0.84 + volume 0.90
+./qwen_tts ... -l Italian --emotion annoyed   # angry @2.6 + roughness 0.32 + brisk
+```
+
+| mood | recipe (vec · weight · roughness · vol · rate) |
+|---|---|
+| `joy` | excited · 2.6 · — · 1.10 · 1.10 |
+| `excited` / `proud` / `eager` / `dramatic` | self · 2.0–2.2 |
+| `news` | proud · 2.0 |
+| `calm` | calm · 1.6 · — · 0.95 · 0.96 |
+| `sad` | sad · 2.0 · — · 0.90 · 0.84 |
+| `gloomy` | gloomy · 2.0 · — · 0.90 · 0.85 |
+| `annoyed` | angry · 2.6 · 0.32 · 1.05 · 1.05 |
+| `stern` | angry · 2.6 · 0.28 · 1.05 · — |
+| `angry` | angry · 2.6 · 0.40 · 1.05 · 1.05 |
+
+Any explicitly-passed flag **overrides** the baked value, e.g. `--emotion joy --steer-weight 1.4`.
+The resolver is **language-aware**: with `-l Italian` it pulls from the centered palette
+(`it_centered/` then `it/`) automatically. If a mood's vector is missing for the active language
+(e.g. `angry` only exists in the IT-centered palette), steering is skipped but the prosody knobs
+(roughness/volume/rate) still apply. A blend/scale spec (`happy:0.5,proud:0.5`) bypasses the
+manifest and steers the raw presets.
+
+## Prosody knobs — `--volume` and `--rate`
+
+Independent of `--emotion`, two post-synthesis knobs:
+
+- `--volume <f>` — output gain (1.0 = unchanged; 1.1 louder, 0.9 softer). Pure PCM gain; also
+  applied per-chunk in `--stream`.
+- `--rate <f>` — **pitch-preserving** speaking rate via in-engine WSOLA (>1 faster, <1 slower).
+  No ffmpeg dependency. Not applied in `--stream` mode (the time-stretch needs the full buffer).
+
+```bash
+./qwen_tts ... --rate 0.9 --volume 0.95   # slower & softer, pitch unchanged
+```
+
 ### Voice-specific tuning
 
 Steering directions are captured on the *preset* voice (ryan) distribution. Most tones

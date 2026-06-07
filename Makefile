@@ -60,6 +60,7 @@ SRCS = main.c \
        qwen_tts_kernels_neon.c \
        qwen_tts_kernels_avx.c \
        qwen_tts_audio.c \
+       qwen_tts_emotion.c \
        qwen_tts_sampling.c \
        qwen_tts_tokenizer.c \
        qwen_tts_safetensors.c \
@@ -132,6 +133,7 @@ qwen_tts_kernels_generic.o: qwen_tts_kernels_generic.c qwen_tts_kernels_impl.h
 qwen_tts_kernels_neon.o: qwen_tts_kernels_neon.c qwen_tts_kernels_impl.h
 qwen_tts_kernels_avx.o: qwen_tts_kernels_avx.c qwen_tts_kernels_impl.h
 qwen_tts_audio.o: qwen_tts_audio.c qwen_tts_audio.h
+qwen_tts_emotion.o: qwen_tts_emotion.c qwen_tts_emotion.h
 qwen_tts_sampling.o: qwen_tts_sampling.c qwen_tts.h
 qwen_tts_tokenizer.o: qwen_tts_tokenizer.c qwen_tts_tokenizer.h
 qwen_tts_safetensors.o: qwen_tts_safetensors.c qwen_tts_safetensors.h
@@ -330,6 +332,34 @@ test-errors: $(TARGET)
 	@echo "PASS: error-handling"
 	@echo ""
 
+test-emotion: $(TARGET)
+	@echo "=== Expressivity / emotion-manifest smoke test ==="
+	@mkdir -p $(TEST_DIR)
+	@# Manifest mood resolves to a full recipe and writes audio
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion joy \
+		--text "La riunione inizia domani mattina." -o $(TEST_DIR)/em_joy.wav 2>$(TEST_DIR)/em_joy.log
+	@grep -qi "Emotion 'joy'" $(TEST_DIR)/em_joy.log || { echo "FAIL: --emotion joy did not resolve via manifest"; cat $(TEST_DIR)/em_joy.log; exit 1; }
+	@grep -qiE "Rate: 1\.1|Volume: 1\.1" $(TEST_DIR)/em_joy.log || { echo "FAIL: joy recipe rate/volume not applied"; cat $(TEST_DIR)/em_joy.log; exit 1; }
+	@test -s $(TEST_DIR)/em_joy.wav || { echo "FAIL: joy produced no audio"; exit 1; }
+	@echo "  PASS: --emotion joy -> manifest recipe + rate/volume applied"
+	@# Down-mood lengthens audio (rate < 1)
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion sad \
+		--text "La riunione inizia domani mattina." -o $(TEST_DIR)/em_sad.wav 2>$(TEST_DIR)/em_sad.log
+	@grep -qi "Rate: 0\.8" $(TEST_DIR)/em_sad.log || { echo "FAIL: sad recipe did not slow tempo"; cat $(TEST_DIR)/em_sad.log; exit 1; }
+	@echo "  PASS: --emotion sad -> slower tempo"
+	@# Explicit knob overrides the baked recipe value
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion joy --steer-weight 1.0 \
+		--text "Ciao." -o $(TEST_DIR)/em_ovr.wav 2>$(TEST_DIR)/em_ovr.log
+	@grep -qi "weight=1.00" $(TEST_DIR)/em_ovr.log || { echo "FAIL: explicit --steer-weight did not override recipe"; cat $(TEST_DIR)/em_ovr.log; exit 1; }
+	@echo "  PASS: explicit --steer-weight overrides recipe"
+	@# Standalone --volume/--rate without --emotion
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --volume 1.2 --rate 0.9 \
+		--text "Ciao." -o $(TEST_DIR)/em_vr.wav 2>$(TEST_DIR)/em_vr.log
+	@grep -qi "Volume: 1.20" $(TEST_DIR)/em_vr.log && grep -qi "Rate: 0.90" $(TEST_DIR)/em_vr.log || { echo "FAIL: standalone --volume/--rate not applied"; cat $(TEST_DIR)/em_vr.log; exit 1; }
+	@echo "  PASS: standalone --volume/--rate"
+	@echo "PASS: expressivity/emotion smoke"
+	@echo ""
+
 test-regression:
 	@echo "=== Regression tests ==="
 	@echo ""
@@ -358,7 +388,7 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression test-errors test-caps test-selftest test-golden
+test-all: test-small test-large test-regression test-errors test-emotion test-caps test-selftest test-golden
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
@@ -810,7 +840,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench test-errors test-emotion test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-all \
         test-clone test-voice-design \
         demo-clone \
