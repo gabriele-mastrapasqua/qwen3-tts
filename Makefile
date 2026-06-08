@@ -389,6 +389,27 @@ bench-matrix: $(TARGET)
 bench-matrix-full: $(TARGET)
 	@bash tests/bench_matrix.sh $(MODEL_SMALL) --full
 
+# Compile-check the newer-ISA kernel paths that are #ifdef'd OUT on M1 (so their
+# syntax is verified NOW, before any M2+/AVX-512 hardware). Forces the -march so the
+# guarded BFMMLA/SMMLA/VNNI/BF16 paths actually compile; does NOT run (the host may
+# not execute them). The workflow guard for "develop on M1, deploy elsewhere".
+# See docs/hardware-testing.md §7. Syntax-only -> fast, no objects.
+ISACHK = -Wall -Wextra -O3 -Ivendor -ffast-math -fsyntax-only
+check-isa:
+	@echo "=== Compile-check newer-ISA paths (syntax only, not run) ==="
+ifeq ($(UNAME_M),arm64)
+	@$(CC) $(ISACHK) -march=armv8.6-a+bf16+i8mm -DUSE_BLAS -DACCELERATE_NEW_LAPACK qwen_tts_kernels.c \
+	  && echo "  arm armv8.6-a +bf16 +i8mm : OK (M2/M3/M4, Graviton3+)" || echo "  arm armv8.6-a +bf16 +i8mm : FAIL"
+	@$(CC) $(ISACHK) -march=armv9-a+sme2 -DUSE_BLAS -DACCELERATE_NEW_LAPACK qwen_tts_kernels.c 2>/dev/null \
+	  && echo "  arm armv9-a +sme2        : OK (M4/M5)" || echo "  arm armv9-a +sme2        : (toolchain lacks SME2 — skipped)"
+else
+	@$(CC) $(ISACHK) -march=x86-64-v3 -mavx512f -mavx512bw -mavx512vnni -mavx512bf16 qwen_tts_kernels.c \
+	  && echo "  x86 avx512 +vnni +bf16   : OK (Zen4/5, Ice Lake+)" || echo "  x86 avx512 +vnni +bf16   : FAIL"
+	@$(CC) $(ISACHK) -march=sapphirerapids qwen_tts_kernels.c 2>/dev/null \
+	  && echo "  x86 sapphirerapids (AMX) : OK" || echo "  x86 sapphirerapids (AMX) : (toolchain lacks AMX — skipped)"
+endif
+	@echo "  (scalar/NEON #else paths stay the always-correct fallback + --self-test oracle)"
+
 test-compose: $(TARGET)
 	@echo "=== Inline markup / --compose smoke test ==="
 	@mkdir -p $(TEST_DIR)
