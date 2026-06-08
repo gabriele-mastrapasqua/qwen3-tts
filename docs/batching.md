@@ -1,4 +1,20 @@
-# Text-chunk batching — premise test (feat/batching)
+# Batching (feat/batching)
+
+> ## Two products, one engine
+> The batched-compute kernels power **two distinct, both-wanted use cases** (~90% shared code):
+>
+> 1. **`--batch` LONG-FORM (shipped).** ONE user, ONE long text (podcast / audiobook / long article).
+>    Split into sentence-packed chunks → step them together (weights read once) → re-stitch one WAV. A
+>    **throughput/productivity flow for long content** (≈half the wall-time vs single-stream). Decodes
+>    post-hoc → does NOT stream (it's a batch job; that's fine). bf16 1.65–1.74× on M1; int8/int4 supported.
+> 2. **SERVER request-batching (to build, vLLM-style).** N DIFFERENT users' DIFFERENT requests served
+>    concurrently for **max efficiency**. Same kernels; a **continuous-batching scheduler** keeps the batch
+>    full, and **streaming COMPOSES** (step one frame → emit per-request SSE → real parallel streaming to N
+>    users). Throughput + latency together. Pays most on bandwidth-bound x86. See PLAN "BATCHING ARCHITECTURE".
+>
+> Distinction: `--batch` splits ONE long text for ONE user; the server batches N users' DIFFERENT requests.
+
+## (history) Text-chunk batching — premise test
 
 > **Design constraints (non-negotiable):**
 > 1. **OPT-IN alternative path, never the default.** Like vLLM, you turn it on (`--batch` / a

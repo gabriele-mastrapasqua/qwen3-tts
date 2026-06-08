@@ -670,6 +670,36 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   volume/rate/compose (CLI-only); true breaths still absent; tune macro recipes; EN/other-lang sigh quality.
 > (3) optional: dedicated ES palette capture (ES inverts everything); retry sbuffo at lower weight; more macros.
 >
+> ## ★ BATCHING ARCHITECTURE — TWO PRODUCTS, ONE ENGINE (vision, user 2026-06-08)
+>
+> The batched compute kernels (ragged Talker step + per-stream sampling/EOS + batched CP + per-seq
+> prefill — **DONE**) power **two distinct, both-wanted products**. Same engine (~90% shared), slightly
+> different use cases. KEEP BOTH.
+>
+> **PRODUCT 1 — `--batch` LONG-FORM (shipped, this branch).** One user, ONE long text (podcast, audiobook,
+> long article). The CLI splits it into sentence-packed chunks, steps them TOGETHER (weight-stationary),
+> and re-stitches one continuous WAV. A **productivity / throughput flow for long content**: a paragraph
+> that took 10 min single-stream finishes in ~half. Decode is post-hoc (whole text), so it does NOT stream
+> — and that's fine, it's a batch-job lever. bf16 1.65–1.74× on M1; int8/int4 supported. THIS IS DONE and we
+> WANT to keep it — its use case (long-form authoring) is real and distinct from serving.
+>
+> **PRODUCT 2 — SERVER REQUEST-BATCHING (the big feature, dedicated branch, vLLM-style).** N DIFFERENT users,
+> N DIFFERENT short requests, served concurrently with **maximum efficiency**. Reuses the SAME batched
+> kernels, but the B sequences are different users' requests (not chunks of one text), and a **continuous-
+> batching scheduler** keeps the in-flight batch full (admit a new request into the slot a finished one frees
+> — not static batching, which wastes utilization on ragged EOS). **Streaming COMPOSES here**: the batch steps
+> one frame at a time → after each batched step every active request has a new frame → emit it to THAT
+> request's SSE while the Talker+CP compute stays batched → **real parallel streaming to N users** (exactly how
+> vLLM streams tokens). Throughput (batched compute, shared) + latency (per-request streaming decoder + SSE)
+> TOGETHER; good per-request TTFA (prefill + admit in-flight). This is the production-serving architecture.
+> What's missing = scheduler + concurrent server + per-request streaming decode (see the SERVER REQUEST-
+> BATCHING task below). Pays most on bandwidth-bound x86 (EPYC/Sapphire) → build correctness on M1, validate
+> perf on a rented VPS.
+>
+> **One-line distinction to repeat everywhere:** `--batch` = split ONE long text for ONE user (audiobook/
+> podcast throughput, no streaming, shipped); SERVER batching = serve N users' DIFFERENT requests at once
+> (max-efficiency serving, real parallel streaming, to build). Same batched-compute foundation.
+>
 > **BACKLOG / IDEAS TO ANALYZE+VALIDATE (user, 2026-06-07):**
 > - **BATCHING (branch `feat/batching` off feat/expressivity, started 2026-06-07):** OPT-IN alternative path
 >   (vLLM-style — default = today's single-stream, untouched, golden bit-identical). Premise TESTED via
