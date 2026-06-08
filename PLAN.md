@@ -764,8 +764,23 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   Open questions to decide: (a) TTFA — batching prefills ALL chunks before generating → first-audio worse vs single-
 >   stream chunk-1-first (measure); (b) is batched-streaming worth wiring (emit chunk-0's audio as soon as it EOSes while
 >   the rest keep stepping)? (c) server-side request batching = the real throughput play for `--serve` (separate, bigger
->   feature). Likely doc outcome: **batching = throughput/long-form lever; streaming = latency lever — pick per use-case.**
->   Test via `bench_matrix.sh --full` (today it benches single-stream server/streaming; extend to batched once wired).
+>   feature — see next bullet). Likely doc outcome: **batching = throughput/long-form lever; streaming = latency lever —
+>   pick per use-case.** Test via `bench_matrix.sh --full`. DESIGN DECISION (user 2026-06-08, agreed): **streaming stays
+>   single-stream** (latency lever, one progressive sequence — nothing to batch within one request); batching belongs in
+>   the SERVER as concurrent-request batching (below).
+> - **TODO (BIG — the real server throughput feature) — SERVER REQUEST-BATCHING (continuous/dynamic batching).** User's
+>   idea (2026-06-08) and the intended use of the batched kernels: N concurrent requests from DIFFERENT users (different
+>   text/voice/params) stepped TOGETHER through Talker+CP (weight-stationary) → ~N× server throughput on bandwidth-bound
+>   boxes (memory §B: 2.3–3.7× at N≥6–8). **The hard part is DONE**: `qwen_batch_talker_step_ragged` (per-seq pos) +
+>   per-stream sampling/EOS + independent per-seq prefill are exactly this — `qwen_tts_generate_batch` is ~90% reusable
+>   (the B sequences come from different requests instead of chunks of one text). **What's missing = the SCHEDULER +
+>   concurrent server** (today `--serve` is serial single-thread): (1) concurrent accept + request queue; (2) batch
+>   scheduler — start with **dynamic batching** (collect a ~10–50ms window or up to B, run to completion, respond all;
+>   simple) then **continuous batching** (admit new requests into slots freed by EOS'd ones — compact+refill, vLLM-style,
+>   max utilization); (3) per-request response routing (+ per-request SSE if streaming). Each request keeps its own
+>   prompt/prefill (incl. its own `.qvoice`/speaker/temp) — bb already has per-seq KV. This is the CORRECT version of the
+>   old `--workers` dead-end (that was N parallel GEMVs re-reading weights N×; this reads once). Pays most on x86 EPYC/
+>   Sapphire — validate there. Likely its own branch off feat/batching.
 > - **TODO (later, this branch) — `--batch` × `.qvoice` + EMOTION mixing (user's "2 tests in 1", 2026-06-08).** Verify
 >   batched long-form works with a loaded `.qvoice` (e.g. Silvio): the voice is a KV/WDELTA prefix — does each chunk's
 >   cold-prefill (prev_prefill_len=0) correctly RE-APPLY the voice prefix in the batched orchestrator every time (no voice
