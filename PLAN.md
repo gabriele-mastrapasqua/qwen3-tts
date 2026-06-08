@@ -781,6 +781,15 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   prompt/prefill (incl. its own `.qvoice`/speaker/temp) — bb already has per-seq KV. This is the CORRECT version of the
 >   old `--workers` dead-end (that was N parallel GEMVs re-reading weights N×; this reads once). Pays most on x86 EPYC/
 >   Sapphire — validate there. Likely its own branch off feat/batching.
+>   **KEY INSIGHT (user 2026-06-08): continuous batching + STREAMING COMPOSE** (this resolves the "--batch+--stream don't
+>   compose" finding, which was only about LONG-FORM post-hoc decode). Continuous batching steps the whole batch ONE frame
+>   at a time → after each batched Talker+CP step every active request has a new frame → emit it to THAT request's stream
+>   immediately (per-request SSE), decode incrementally per request. So: **batched Talker+CP (throughput, shared) + per-
+>   request streaming decoder + SSE (latency) TOGETHER** — exactly how vLLM streams tokens to N concurrent users. TTFA is
+>   GOOD (a new request is prefilled + admitted in-flight, starts producing frames at once — the "prefill all first" TTFA
+>   worry was only the single-text long-form path). Cost: N per-request streaming decoder states (cheap vs batched Talker+
+>   CP). This is THE production-serving architecture; continuous (not static) batching is the right target (static wastes
+>   utilization on ragged EOS). Most complex feature of the batching arc → dedicated branch, validate on x86.
 > - **TODO (later, this branch) — `--batch` × `.qvoice` + EMOTION mixing (user's "2 tests in 1", 2026-06-08).** Verify
 >   batched long-form works with a loaded `.qvoice` (e.g. Silvio): the voice is a KV/WDELTA prefix — does each chunk's
 >   cold-prefill (prev_prefill_len=0) correctly RE-APPLY the voice prefix in the batched orchestrator every time (no voice
