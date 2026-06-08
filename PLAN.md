@@ -720,6 +720,19 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   (SDOT ARM / VNNI x86)**. NEXT: (1) per-stream sampling + ragged-EOS + chunk scheduler (split text / keep batch full /
 >   re-stitch via render_spans) → wire `--batch` (works at bf16 today, pair with int4); (1b) the int8-SDOT twin; (3)
 >   validate on Ryzen/Turin. See docs/batching.md "CORRECTION (2026-06-08)" + "int8/int4 twins MEASURED".
+> - **`--batch` MILESTONE A DONE (2026-06-08, commit after 720e939): long-form chunked synthesis CLI.** Sentence-aware
+>   splitter (top-player practice: segment on `.!?;`/newline with decimal + abbreviation guards — "18.30"/"Sig."/"Ecc."
+>   NOT split — then greedy-pack sentences up to `--batch-words` N (default 16, min N/3), merge sub-min trailing
+>   fragment). `--batch` synthesizes each chunk via the EXISTING single-stream path + concatenates via `render_spans`
+>   (seams land on sentence pauses → inaudible). `--batch-dry` previews the chunking without synth (tune the policy fast).
+>   Milestone A = correct audio + the sequential baseline, and validates chunk-concat QUALITY before investing in batched
+>   compute. Additive (normal/compose untouched, self-test PASS). **MILESTONE B (NEXT, the speedup): swap the inner
+>   per-chunk loop for the batched compute kernels.** Hard parts: (1) RAGGED — each chunk's prompt prefills to a different
+>   length → need per-sequence `kv_len_b` in `qwen_batch_talker_step` (the attention is ALREADY per-sequence; only the
+>   shared `pos` → per-seq `pos_b` in the per-b RoPE/KV-append/attention loops; batched matvecs are position-agnostic →
+>   unchanged); (2) prefill each chunk's prompt into bb's per-seq KV; (3) per-stream sampling (own RNG/rep-penalty per
+>   chunk) + ragged EOS (drop finished chunks, compact batch); (4) feed sampled codes through batched CP + per-chunk
+>   decoder → concat. Pair `--batch` with int4 (the M1 lever). THEN the Promessi-Sposi single-vs-batched timing test.
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
