@@ -711,9 +711,15 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   cores (bandwidth-bound); batched reads weights ONCE. ~2× = the bf16 ceiling (premise microbench was right); int4/int8
 >   should push past it, x86 (bandwidth-bound) ≥ this. **DECISION REVERSED: the `--batch` integration IS worth building
 >   on M1** — it's the AUDIOBOOK/long-text lever (split a paragraph into 2–4 chunks, step batched → ~2× wall-clock vs
->   sequential, reusing weights). NEXT: (1) per-stream sampling + ragged-EOS + chunk scheduler (split text / keep batch
->   full / re-stitch via render_spans) → wire `--batch`; (2) int8/int4 batched twins (`qwen_matmat_int8/_int4` — batching
->   pays most at low precision); (3) validate on Ryzen/Turin. See docs/batching.md "CORRECTION (2026-06-08)".
+>   sequential, reusing weights). **(2) int8/int4 batched twins DONE (2026-06-08, commit 720e939):** `qwen_matmat_int8`
+>   (int8 W + f32 act) + `qwen_matmat_q4_0` (nibble unpack amortized over B), self-test correctness PASS, `make
+>   matmat-bench` (`--matmat-bench`) times REAL kernels. M1 B=8: **int4+batching WINS at 1T AND 4T (1.1–1.4×) = THE M1
+>   lever** (q4_0 single-stream is unpack-bound → batch unpacks once; int4 otherwise slowest single-stream → exactly
+>   where batching earns its keep); bf16 wins 4T (1.4–1.8× kernel / 2.1× pipeline); **int8 loses/break-even because the
+>   int8 SEQUENTIAL uses fast SDOT and the twin accumulates f32 (throws SDOT away) → TODO: integer-dot int8 twin
+>   (SDOT ARM / VNNI x86)**. NEXT: (1) per-stream sampling + ragged-EOS + chunk scheduler (split text / keep batch full /
+>   re-stitch via render_spans) → wire `--batch` (works at bf16 today, pair with int4); (1b) the int8-SDOT twin; (3)
+>   validate on Ryzen/Turin. See docs/batching.md "CORRECTION (2026-06-08)" + "int8/int4 twins MEASURED".
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
