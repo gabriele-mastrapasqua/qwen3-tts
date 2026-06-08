@@ -373,6 +373,14 @@ batching-bench:
 	$(CC) $(CFLAGS_BASE) -o /tmp/batching_bench tests/batching_bench.c -lm
 	@/tmp/batching_bench
 
+# Real-kernel batched matmat throughput: qwen_matmat_{bf16,int8,q4_0} vs B*matvec,
+# per precision, at the current thread count (override with QWEN_BATCH_B / -j via THREADS).
+matmat-bench: $(TARGET)
+	@echo "=== Batched matmat twins vs B*matvec (real kernels, 4 threads) ==="
+	@./$(TARGET) --matmat-bench
+	@echo "=== (single thread = compute-bound reference) ==="
+	@./$(TARGET) --matmat-bench -j 1
+
 test-compose: $(TARGET)
 	@echo "=== Inline markup / --compose smoke test ==="
 	@mkdir -p $(TEST_DIR)

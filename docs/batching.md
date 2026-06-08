@@ -127,7 +127,38 @@ long paragraph into 2–4 chunks, step them batched → ~2× wall-clock vs seque
 per-stream sampling + ragged-EOS + a chunk scheduler (split text, keep the batch full, re-stitch audio via
 `render_spans`), then the int8/int4 batched twins. Validate on the Ryzen/Turin boxes where it should pay more.
 
-## Batching × PRECISION (int8 / int4 / int2)
+## ✅ int8 / int4 batched twins MEASURED with the REAL kernels (2026-06-08)
+
+Added `qwen_matmat_int8` (W int8 + per-row scale, f32 activation) and `qwen_matmat_q4_0` (q4_0 blocks,
+nibble unpack amortized over B) — same compile-time-B register-blocking as bf16. Correctness in
+`--self-test` (matmat_int8 vs B×matvec_int8 L2_rel ~4e-3 = activation-quant noise; matmat_q4_0 vs
+B×matvec_q4_0 L2_rel ~3e-7). New **`make matmat-bench`** (`./qwen_tts --matmat-bench`) times the REAL
+library kernels (B×matvec [today] vs matmat [batched]) per precision — supersedes the naive premise
+microbench above (which compared two of our own scalar kernels). 0.6B/CP shapes, M1, B=8:
+
+| shape | bf16 4T | int8 4T | int4 4T | bf16 1T | int8 1T | int4 1T |
+|---|---|---|---|---|---|---|
+| 3072×1024 | 1.36× | 0.70× | 1.23× | 0.97× | 0.55× | 1.09× |
+| 1024×3072 | 1.60× | 1.12× | 1.31× | 1.40× | 1.09× | 1.29× |
+| 2048×1024 | 1.77× | 1.16× | 1.35× | 1.54× | 1.18× | 1.38× |
+
+Reading these (kernel-level numbers UNDERSTATE the full pipeline — a single 6 MB matrix partly fits cache,
+so less DRAM-bound than the 28-layer Talker + 16×-per-frame CP where bf16 batching hit 2.1×):
+
+- **int4 + batching = the real M1 lever, confirmed.** It WINS at BOTH 1T and 4T (1.1–1.4×) — the only
+  precision that pays even single-threaded, because q4_0 single-stream is **unpack-bound** and batching
+  does the nibble unpack ONCE for all B. And int4 is otherwise the *slowest* single-stream path on M1, so
+  this is exactly where batching earns its keep → **int4+batching could make int4 viable on M1.** PLAN
+  prediction validated with real kernels (no longer the inflated scalar 6–8×).
+- **bf16 + batching** wins at 4T (1.4–1.8× kernel; 2.1× full pipeline), break-even at 1T — the
+  bandwidth-vs-compute story.
+- **int8 + batching currently LOSES / break-even** — but for an instructive reason: the int8 *sequential*
+  matvec uses **SDOT integer dot** (very fast — 0.22–0.45 ms), while the int8 *twin accumulates in f32*
+  (throwing SDOT away), so it's only as fast as the bf16 matmat. **TODO: an integer-dot int8 batched twin
+  (SDOT on ARM / VNNI on x86)** — quantize each column's activation, accumulate int32 — to beat SDOT
+  sequential. Until then, pair batching with **int4** (where the f32 twin already wins) or bf16, not int8.
+
+## (superseded) Batching × PRECISION — naive premise microbench (int8 / int4 / int2)
 
 Re-ran the bench storing weights at their real byte size (`make batching-bench`, 4-thread).
 Two opposing effects: lower precision shrinks the weight READ (less to amortize → batching

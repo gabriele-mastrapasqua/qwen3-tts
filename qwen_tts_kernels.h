@@ -63,6 +63,11 @@ void qwen_caps_report(void *out);
  * `out` may be NULL -> stdout. Returns 0 on PASS, >0 = number of failed cases. */
 int qwen_kernel_selftest(void *out);
 
+/* Batched matmat throughput microbench: times the real qwen_matmat_{bf16,int8,q4_0}
+ * vs B*qwen_matvec_* per precision/shape at the current thread count (no model).
+ * B via QWEN_BATCH_B (default 8). `out` may be NULL -> stdout. Returns 0. */
+int qwen_matmat_bench(void *out);
+
 /* ========================================================================
  * Norm functions
  * ======================================================================== */
@@ -95,6 +100,13 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
  * (amortizes the per-token weight re-read that bounds single-stream). B<=64.
  * Threaded by row-slice, matching qwen_matvec_bf16. With B==1 it equals matvec. */
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B);
+
+/* INT8 batched matmat twin (Y[rows,B] = (W_int8*scale) @ X[cols,B]). Low precision
+ * is where batching pays MOST: int8 halves the weight read. Same compile-time-B
+ * register-blocking as bf16. X is f32 [cols,B]; weights are the existing int8
+ * per-row-scale format. B<=64. (q4_0 twin declared after the q4_0_block_t typedef.) */
+void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
+                      const float *X, int rows, int cols, int B);
 
 /* Unified QKV matvec: single dispatch for Q, K, V (avoids 3 barriers) */
 void qwen_matvec_bf16_qkv(float *q, float *k, float *v,
@@ -146,6 +158,12 @@ void qwen_quantize_bf16_to_q4_0(const uint16_t *src_bf16, int rows, int cols,
  * NEON-optimized + multi-threaded. */
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols);
+
+/* Q4_0 batched matmat twin: Y[rows,B] = dequant(W_q4) @ X[cols,B]. The nibble
+ * unpack is done once and reused across the B columns (amortized) — where int4
+ * batching pays most. X is f32 [cols,B]. B<=64. */
+void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
+                      int rows, int cols, int B);
 
 /* Unified QKV matvec (Q4_0 variant) */
 void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,

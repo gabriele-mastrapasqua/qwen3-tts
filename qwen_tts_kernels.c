@@ -894,6 +894,198 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
     bf16_matmat_slice(Y, W, X, 0, rows, cols, B);
 }
 
+/* ---- INT8 batched matmat twin: Y[rows,B] = (W_int8[rows,cols]*scale[rows]) @ X[cols,B]
+ * Mirrors qwen_matvec_int8's ARM semantics (int8 weight -> f32, f32 activation,
+ * accumulate in f32, * per-row scale). Weight-stationary: each int8 weight (half
+ * the bytes of bf16) streams from DRAM once and is FMA'd into all B accumulators.
+ * Same compile-time-B register-blocking discipline as bf16; generic fallback for
+ * other B. The activation is kept f32 (no per-column requant) so this is bit-
+ * comparable to B independent qwen_matvec_int8 calls (fp-order aside). */
+static void int8_matmat_generic(float *Y, const int8_t *W, const float *scale,
+                                const float *X, int r0, int r1, int cols, int B) {
+    for (int r = r0; r < r1; r++) {
+        const int8_t *w = W + (size_t)r * cols;
+        float *y = Y + (size_t)r * B;
+        float acc[64];
+        for (int b = 0; b < B; b++) acc[b] = 0.0f;
+        for (int k = 0; k < cols; k++) {
+            float wv = (float)w[k];
+            const float *xk = X + (size_t)k * B;
+            for (int b = 0; b < B; b++) acc[b] += wv * xk[b];
+        }
+        float s = scale[r];
+        for (int b = 0; b < B; b++) y[b] = acc[b] * s;
+    }
+}
+#define DEFINE_MATMAT_INT8_FIXED_B(BV)                                         \
+static void int8_matmat_b##BV(float *Y, const int8_t *W, const float *scale,    \
+                              const float *X, int r0, int r1, int cols) {      \
+    int r = r0;                                                               \
+    for (; r + 1 < r1; r += 2) {                                              \
+        const int8_t *w0 = W + (size_t)r * cols;                              \
+        const int8_t *w1 = W + (size_t)(r + 1) * cols;                        \
+        float *y0 = Y + (size_t)r * (BV);                                     \
+        float *y1 = Y + (size_t)(r + 1) * (BV);                               \
+        float a[BV], b[BV];                                                   \
+        for (int j = 0; j < (BV); j++) { a[j] = 0.0f; b[j] = 0.0f; }          \
+        for (int k = 0; k < cols; k++) {                                      \
+            float w0v = (float)w0[k], w1v = (float)w1[k];                     \
+            const float *xk = X + (size_t)k * (BV);                           \
+            for (int j = 0; j < (BV); j++) {                                  \
+                float xv = xk[j]; a[j] += w0v * xv; b[j] += w1v * xv;         \
+            }                                                                 \
+        }                                                                     \
+        float s0 = scale[r], s1 = scale[r + 1];                              \
+        for (int j = 0; j < (BV); j++) { y0[j] = a[j] * s0; y1[j] = b[j] * s1; } \
+    }                                                                         \
+    for (; r < r1; r++) {                                                     \
+        const int8_t *w = W + (size_t)r * cols;                              \
+        float *y = Y + (size_t)r * (BV);                                     \
+        float acc[BV];                                                        \
+        for (int j = 0; j < (BV); j++) acc[j] = 0.0f;                         \
+        for (int k = 0; k < cols; k++) {                                      \
+            float wv = (float)w[k];                                          \
+            const float *xk = X + (size_t)k * (BV);                           \
+            for (int j = 0; j < (BV); j++) acc[j] += wv * xk[j];              \
+        }                                                                     \
+        float s = scale[r];                                                  \
+        for (int j = 0; j < (BV); j++) y[j] = acc[j] * s;                     \
+    }                                                                         \
+}
+DEFINE_MATMAT_INT8_FIXED_B(2)
+DEFINE_MATMAT_INT8_FIXED_B(3)
+DEFINE_MATMAT_INT8_FIXED_B(4)
+DEFINE_MATMAT_INT8_FIXED_B(6)
+DEFINE_MATMAT_INT8_FIXED_B(8)
+DEFINE_MATMAT_INT8_FIXED_B(16)
+#undef DEFINE_MATMAT_INT8_FIXED_B
+static void int8_matmat_slice(float *Y, const int8_t *W, const float *scale,
+                              const float *X, int r0, int r1, int cols, int B) {
+    qwen_ftz_on();
+    switch (B) {
+        case 2:  int8_matmat_b2 (Y, W, scale, X, r0, r1, cols); return;
+        case 3:  int8_matmat_b3 (Y, W, scale, X, r0, r1, cols); return;
+        case 4:  int8_matmat_b4 (Y, W, scale, X, r0, r1, cols); return;
+        case 6:  int8_matmat_b6 (Y, W, scale, X, r0, r1, cols); return;
+        case 8:  int8_matmat_b8 (Y, W, scale, X, r0, r1, cols); return;
+        case 16: int8_matmat_b16(Y, W, scale, X, r0, r1, cols); return;
+        default: int8_matmat_generic(Y, W, scale, X, r0, r1, cols, B); return;
+    }
+}
+typedef struct { float *Y; const int8_t *W; const float *scale; const float *X; int rows, cols, B; } int8_mm_ctx;
+static void int8_mm_task(size_t tid, size_t nt, void *vc) {
+    int8_mm_ctx *c = (int8_mm_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    int8_matmat_slice(c->Y, c->W, c->scale, c->X, r0, r1, c->cols, c->B);
+}
+void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
+                      const float *X, int rows, int cols, int B) {
+    if (B <= 0) return;
+    if (B > 64) B = 64;
+    int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) {
+        int8_mm_ctx c = { Y, W, scale, X, rows, cols, B };
+        qwen_parallel((size_t)nt, int8_mm_task, &c);
+        return;
+    }
+    int8_matmat_slice(Y, W, scale, X, 0, rows, cols, B);
+}
+
+/* ---- INT4 (Q4_0) batched matmat twin: Y[rows,B] = dequant(W_q4) @ X[cols,B]
+ * THE big batching synergy: the per-nibble UNPACK ((qs>>shift & 0xF) - 8) * scale)
+ * — which dominates the single-stream q4_0 GEMV and is REDONE per token there — is
+ * done ONCE here and reused across all B columns (weight + unpack amortized over B).
+ * Per the PLAN this is where batching pays most, and where int4 could become viable
+ * on M1 (nibble-unpack is exactly what makes int4 slow single-stream). 1-row blocked
+ * (the unpack is per-row; B accumulators stay register-resident at fixed B). */
+static void q4_matmat_generic(float *Y, const q4_0_block_t *W, const float *X,
+                              int r0, int r1, int cols, int B) {
+    int nb = cols / Q4_0_BLOCK_SIZE;
+    for (int r = r0; r < r1; r++) {
+        const q4_0_block_t *wr = W + (size_t)r * nb;
+        float *y = Y + (size_t)r * B;
+        float acc[64];
+        for (int b = 0; b < B; b++) acc[b] = 0.0f;
+        for (int bl = 0; bl < nb; bl++) {
+            float sc = wr[bl].scale;
+            const uint8_t *qs = wr[bl].qs;
+            int k0 = bl * Q4_0_BLOCK_SIZE;
+            for (int i = 0; i < 16; i++) {
+                float wlo = (float)((qs[i] & 0x0F) - 8) * sc;
+                float whi = (float)((qs[i] >> 4)   - 8) * sc;
+                const float *xl = X + (size_t)(k0 + 2 * i) * B;
+                const float *xh = X + (size_t)(k0 + 2 * i + 1) * B;
+                for (int b = 0; b < B; b++) acc[b] += wlo * xl[b] + whi * xh[b];
+            }
+        }
+        for (int b = 0; b < B; b++) y[b] = acc[b];
+    }
+}
+#define DEFINE_MATMAT_Q4_FIXED_B(BV)                                           \
+static void q4_matmat_b##BV(float *Y, const q4_0_block_t *W, const float *X,    \
+                            int r0, int r1, int cols) {                        \
+    int nb = cols / Q4_0_BLOCK_SIZE;                                          \
+    for (int r = r0; r < r1; r++) {                                           \
+        const q4_0_block_t *wr = W + (size_t)r * nb;                          \
+        float *y = Y + (size_t)r * (BV);                                      \
+        float acc[BV];                                                        \
+        for (int j = 0; j < (BV); j++) acc[j] = 0.0f;                         \
+        for (int bl = 0; bl < nb; bl++) {                                     \
+            float sc = wr[bl].scale;                                          \
+            const uint8_t *qs = wr[bl].qs;                                    \
+            int k0 = bl * Q4_0_BLOCK_SIZE;                                    \
+            for (int i = 0; i < 16; i++) {                                    \
+                float wlo = (float)((qs[i] & 0x0F) - 8) * sc;                 \
+                float whi = (float)((qs[i] >> 4)   - 8) * sc;                 \
+                const float *xl = X + (size_t)(k0 + 2 * i) * (BV);            \
+                const float *xh = X + (size_t)(k0 + 2 * i + 1) * (BV);        \
+                for (int j = 0; j < (BV); j++) acc[j] += wlo * xl[j] + whi * xh[j]; \
+            }                                                                 \
+        }                                                                     \
+        for (int j = 0; j < (BV); j++) y[j] = acc[j];                         \
+    }                                                                         \
+}
+DEFINE_MATMAT_Q4_FIXED_B(2)
+DEFINE_MATMAT_Q4_FIXED_B(3)
+DEFINE_MATMAT_Q4_FIXED_B(4)
+DEFINE_MATMAT_Q4_FIXED_B(6)
+DEFINE_MATMAT_Q4_FIXED_B(8)
+DEFINE_MATMAT_Q4_FIXED_B(16)
+#undef DEFINE_MATMAT_Q4_FIXED_B
+static void q4_matmat_slice(float *Y, const q4_0_block_t *W, const float *X,
+                            int r0, int r1, int cols, int B) {
+    qwen_ftz_on();
+    switch (B) {
+        case 2:  q4_matmat_b2 (Y, W, X, r0, r1, cols); return;
+        case 3:  q4_matmat_b3 (Y, W, X, r0, r1, cols); return;
+        case 4:  q4_matmat_b4 (Y, W, X, r0, r1, cols); return;
+        case 6:  q4_matmat_b6 (Y, W, X, r0, r1, cols); return;
+        case 8:  q4_matmat_b8 (Y, W, X, r0, r1, cols); return;
+        case 16: q4_matmat_b16(Y, W, X, r0, r1, cols); return;
+        default: q4_matmat_generic(Y, W, X, r0, r1, cols, B); return;
+    }
+}
+typedef struct { float *Y; const q4_0_block_t *W; const float *X; int rows, cols, B; } q4_mm_ctx;
+static void q4_mm_task(size_t tid, size_t nt, void *vc) {
+    q4_mm_ctx *c = (q4_mm_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_matmat_slice(c->Y, c->W, c->X, r0, r1, c->cols, c->B);
+}
+void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
+                      int rows, int cols, int B) {
+    if (B <= 0) return;
+    if (B > 64) B = 64;
+    int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) {
+        q4_mm_ctx c = { Y, W, X, rows, cols, B };
+        qwen_parallel((size_t)nt, q4_mm_task, &c);
+        return;
+    }
+    q4_matmat_slice(Y, W, X, 0, rows, cols, B);
+}
+
 /* Unified QKV matvec: single parallel-for for Q, K, V projections.
  * The concatenated [Q|K|V] row space is partitioned for balance, avoiding 3
  * separate barriers per layer. */
@@ -2640,10 +2832,166 @@ int qwen_kernel_selftest(void *out) {
                 rel_l2_i8, i8_ok ? "OK" : "FAIL",
                 argmax_ok ? "OK" : "FAIL", amax_ref, amax_got);
 
+        /* ---- int8 batched matmat: Y[rows,B] vs B independent int8 matvecs ----
+         * matmat_int8 keeps the activation f32 (like the ARM matvec) and reuses the
+         * same per-row scales, so it should track B× qwen_matvec_int8 closely; allow
+         * the same activation-quant tolerance the dispatched int8 matvec needs. */
+        {
+            const int B = 8;
+            float *Xb = malloc((size_t)cols * B * sizeof(float));
+            float *Yb = malloc((size_t)rows * B * sizeof(float));
+            float *xb = malloc((size_t)cols * sizeof(float));
+            float *yc = malloc((size_t)rows * sizeof(float));
+            if (Xb && Yb && xb && yc) {
+                for (int k = 0; k < cols; k++)
+                    for (int b = 0; b < B; b++) Xb[(size_t)k * B + b] = x[k] * (1.0f + 0.05f * b);
+                qwen_matmat_int8(Yb, wi, sc, Xb, rows, cols, B);
+                double l2n = 0.0, l2d = 0.0;
+                for (int b = 0; b < B; b++) {
+                    for (int k = 0; k < cols; k++) xb[k] = x[k] * (1.0f + 0.05f * b);
+                    qwen_matvec_int8(yc, wi, sc, xb, rows, cols);
+                    for (int r = 0; r < rows; r++) {
+                        double d = (double)Yb[(size_t)r * B + b] - yc[r];
+                        l2n += d * d; l2d += (double)yc[r] * yc[r];
+                    }
+                }
+                double l2rel = l2d > 0 ? sqrt(l2n / l2d) : 0.0;
+                int ok = l2rel < 3e-2;
+                fprintf(f, "  [%4dx%4d] matmat_int8(B=%d) vs B*matvec_int8: L2_rel=%.2e  %s\n",
+                        rows, cols, B, l2rel, ok ? "PASS" : "FAIL");
+                if (!ok) failures++;
+            }
+            free(Xb); free(Yb); free(xb); free(yc);
+        }
+
+        /* ---- q4_0 batched matmat: Y[rows,B] vs B independent q4_0 matvecs ----
+         * Same dequant + f32 accumulation as the matvec -> only fp-order drift. */
+        if (cols % Q4_0_BLOCK_SIZE == 0) {
+            const int B = 8;
+            int nb = cols / Q4_0_BLOCK_SIZE;
+            q4_0_block_t *wq = malloc((size_t)rows * nb * sizeof(q4_0_block_t));
+            float *Xb = malloc((size_t)cols * B * sizeof(float));
+            float *Yb = malloc((size_t)rows * B * sizeof(float));
+            float *xb = malloc((size_t)cols * sizeof(float));
+            float *yc = malloc((size_t)rows * sizeof(float));
+            if (wq && Xb && Yb && xb && yc) {
+                qwen_quantize_bf16_to_q4_0(wb, rows, cols, wq);
+                for (int k = 0; k < cols; k++)
+                    for (int b = 0; b < B; b++) Xb[(size_t)k * B + b] = x[k] * (1.0f + 0.05f * b);
+                qwen_matmat_q4_0(Yb, wq, Xb, rows, cols, B);
+                double l2n = 0.0, l2d = 0.0;
+                for (int b = 0; b < B; b++) {
+                    for (int k = 0; k < cols; k++) xb[k] = x[k] * (1.0f + 0.05f * b);
+                    qwen_matvec_q4_0(yc, wq, xb, rows, cols);
+                    for (int r = 0; r < rows; r++) {
+                        double d = (double)Yb[(size_t)r * B + b] - yc[r];
+                        l2n += d * d; l2d += (double)yc[r] * yc[r];
+                    }
+                }
+                double l2rel = l2d > 0 ? sqrt(l2n / l2d) : 0.0;
+                int ok = l2rel < 1e-3;
+                fprintf(f, "  [%4dx%4d] matmat_q4_0(B=%d) vs B*matvec_q4_0: L2_rel=%.2e  %s\n",
+                        rows, cols, B, l2rel, ok ? "PASS" : "FAIL");
+                if (!ok) failures++;
+            }
+            free(wq); free(Xb); free(Yb); free(xb); free(yc);
+        }
+
         free(x); free(wf); free(wb); free(wi); free(sc); free(ref); free(y);
     }
     #undef NEXT_F
     fprintf(f, "\n%s (%d case%s failed)\n", failures ? "SELF-TEST FAILED" : "SELF-TEST PASSED",
             failures, failures == 1 ? "" : "s");
     return failures;
+}
+
+/* ========================================================================
+ * Batched matmat throughput microbench (`./qwen_tts --matmat-bench`)
+ *
+ * Times the REAL library kernels (NOT the naive premise bench): for each
+ * precision and shape, B independent qwen_matvec_* calls (= today's single-
+ * stream, weights re-read B×) vs one qwen_matmat_* call (= batched, weights
+ * read once). speedup = t_seq / t_batch. Answers "does batching beat sequential
+ * per precision, and by how much" using the production kernels, at the current
+ * -j thread count. No model needed. Tune B with QWEN_BATCH_B (default 8).
+ * ======================================================================== */
+int qwen_matmat_bench(void *out) {
+    FILE *f = out ? (FILE *)out : stdout;
+    const char *be = getenv("QWEN_BATCH_B"); int B = be ? atoi(be) : 8;
+    if (B < 1 || B > 64) B = 8;
+    const int shapes[][2] = { {3072, 1024}, {1024, 3072}, {2048, 1024} };
+    const int nshapes = (int)(sizeof(shapes) / sizeof(shapes[0]));
+    uint64_t rng = 0x1234567ull;
+    #define RF (((rng = rng * 6364136223846793005ull + 1442695040888963407ull) >> 40) \
+                / (float)(1u << 24) * 2.0f - 1.0f)
+    #define NOW_S(t) clock_gettime(CLOCK_MONOTONIC, &(t))
+    #define MS(a,b) (((b).tv_sec-(a).tv_sec)*1e3 + ((b).tv_nsec-(a).tv_nsec)*1e-6)
+    struct timespec t0, t1;
+
+    fprintf(f, "matmat-bench: B=%d, threads=%d  (B*matvec [seq] vs matmat [batched])\n", B, qwen_get_threads());
+    fprintf(f, "  speedup>1 => batching (weight read+unpack once) beats re-reading per stream\n\n");
+
+    for (int si = 0; si < nshapes; si++) {
+        int rows = shapes[si][0], cols = shapes[si][1];
+        int nb = cols / Q4_0_BLOCK_SIZE;
+        uint16_t *wb = malloc((size_t)rows * cols * sizeof(uint16_t));
+        int8_t   *wi = malloc((size_t)rows * cols * sizeof(int8_t));
+        float    *sc = malloc((size_t)rows * sizeof(float));
+        q4_0_block_t *wq = malloc((size_t)rows * nb * sizeof(q4_0_block_t));
+        float *X  = malloc((size_t)cols * B * sizeof(float));
+        float *xb = malloc((size_t)cols * sizeof(float));
+        float *Y  = malloc((size_t)rows * B * sizeof(float));
+        float *yc = malloc((size_t)rows * sizeof(float));
+        if (!wb || !wi || !sc || !wq || !X || !xb || !Y || !yc) {
+            fprintf(f, "  [%dx%d] OOM, skipped\n", rows, cols);
+            free(wb); free(wi); free(sc); free(wq); free(X); free(xb); free(Y); free(yc); continue;
+        }
+        for (size_t i = 0; i < (size_t)rows * cols; i++) {
+            float v = RF; uint32_t bits; memcpy(&bits, &v, 4);
+            wb[i] = (uint16_t)((bits + 0x8000u) >> 16);
+        }
+        qwen_quantize_bf16_to_int8(wb, rows, cols, wi, sc);
+        qwen_quantize_bf16_to_q4_0(wb, rows, cols, wq);
+        for (int k = 0; k < cols; k++) for (int b = 0; b < B; b++) X[(size_t)k * B + b] = RF;
+        for (int k = 0; k < cols; k++) xb[k] = X[(size_t)k * B];
+
+        /* reps scaled so each timed region is ~hundreds of ms */
+        double mb = (double)rows * cols * 2 / (1024 * 1024);
+        int reps = mb > 8 ? 8 : 24;
+
+        fprintf(f, "  [%4dx%4d]  (%.1f MB bf16)\n", rows, cols, mb);
+        for (int p = 0; p < 3; p++) {
+            const char *pn = p == 0 ? "bf16" : p == 1 ? "int8" : "int4";
+            /* warm */
+            if (p == 0) { qwen_matvec_bf16(yc, wb, xb, rows, cols); qwen_matmat_bf16(Y, wb, X, rows, cols, B); }
+            else if (p == 1) { qwen_matvec_int8(yc, wi, sc, xb, rows, cols); qwen_matmat_int8(Y, wi, sc, X, rows, cols, B); }
+            else { qwen_matvec_q4_0(yc, wq, xb, rows, cols); qwen_matmat_q4_0(Y, wq, X, rows, cols, B); }
+
+            NOW_S(t0);
+            for (int it = 0; it < reps; it++)
+                for (int b = 0; b < B; b++) {
+                    for (int k = 0; k < cols; k++) xb[k] = X[(size_t)k * B + b];
+                    if (p == 0) qwen_matvec_bf16(yc, wb, xb, rows, cols);
+                    else if (p == 1) qwen_matvec_int8(yc, wi, sc, xb, rows, cols);
+                    else qwen_matvec_q4_0(yc, wq, xb, rows, cols);
+                }
+            NOW_S(t1); double t_seq = MS(t0, t1) / reps;
+
+            NOW_S(t0);
+            for (int it = 0; it < reps; it++) {
+                if (p == 0) qwen_matmat_bf16(Y, wb, X, rows, cols, B);
+                else if (p == 1) qwen_matmat_int8(Y, wi, sc, X, rows, cols, B);
+                else qwen_matmat_q4_0(Y, wq, X, rows, cols, B);
+            }
+            NOW_S(t1); double t_batch = MS(t0, t1) / reps;
+
+            fprintf(f, "     %-5s  seq %7.2f ms   batch %7.2f ms   SPEEDUP %.2fx\n",
+                    pn, t_seq, t_batch, t_seq / t_batch);
+        }
+        free(wb); free(wi); free(sc); free(wq); free(X); free(xb); free(Y); free(yc);
+    }
+    #undef RF
+    #undef NOW_S
+    #undef MS
+    return 0;
 }

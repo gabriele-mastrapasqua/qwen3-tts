@@ -681,6 +681,7 @@ int main(int argc, char **argv) {
     int serve_workers = 1;  /* --workers: concurrent synthesis workers (server mode) */
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
+    int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
     float cp_roughness = 0.0f;        /* --roughness: q2-down blend on the CP (texture knob) */
     const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
     float cp_steer_weight = 1.0f;     /* --steer-weight: injection scale for the control vector */
@@ -747,6 +748,7 @@ int main(int argc, char **argv) {
         {"caps",          no_argument,       0, 1025},
         {"workers",       required_argument, 0, 1026},
         {"self-test",     no_argument,       0, 1027},
+        {"matmat-bench",  no_argument,       0, 1038},
         {"roughness",     required_argument, 0, 1028},
         {"steer-vector",  required_argument, 0, 1029},
         {"steer-weight",  required_argument, 0, 1030},
@@ -797,6 +799,7 @@ int main(int argc, char **argv) {
             case 1025: show_caps = 1; break;
             case 1026: serve_workers = atoi(optarg); break;
             case 1027: run_self_test = 1; break;
+            case 1038: run_matmat_bench = 1; break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
             case 1029: steer_vector_path = optarg; break;
             case 1030: cp_steer_weight = (float)atof(optarg); steer_weight_set = 1; break;
@@ -883,6 +886,13 @@ int main(int argc, char **argv) {
     if (run_self_test) {
         qwen_init_threads();
         return qwen_kernel_selftest(stdout);
+    }
+
+    /* --matmat-bench: time the batched matmat twins (bf16/int8/int4) vs B sequential
+     * matvecs, per precision, at the current -j thread count. No model needed. */
+    if (run_matmat_bench) {
+        qwen_init_threads();
+        return qwen_matmat_bench(stdout);
     }
 
     /* Voice library management (no model loading needed) */
