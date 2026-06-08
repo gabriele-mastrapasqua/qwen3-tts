@@ -13,6 +13,7 @@
 #include <lz4.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <getopt.h>
 #include <math.h>
 #include <dirent.h>
@@ -579,6 +580,149 @@ static int text_has_markup(const char *text) {
     return 0;
 }
 
+static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
+                        const char *language, float default_pause,
+                        const char *output, int silent);   /* fwd (defined below) */
+
+/* ============================================================================
+ * Long-text BATCHING: sentence-aware chunk splitter (--batch).
+ *
+ * Top-player practice for long-form TTS: segment on sentence boundaries, then
+ * greedily PACK sentences into chunks up to a word budget (so chunks are balanced
+ * and not micro-fragments). Seams fall on sentence-ending pauses -> inaudible.
+ * v1: greedy packing only; an over-long single sentence becomes its own chunk
+ * (comma sub-split is a TODO). Used by Milestone A (split + sequential synth +
+ * concat, reusing render_spans) and later by the batched-compute path.
+ * ============================================================================ */
+static int qwen_word_count(const char *s, int len) {
+    int n = 0, in_word = 0;
+    for (int i = 0; i < len; i++) {
+        int sp = (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r');
+        if (!sp && !in_word) { n++; in_word = 1; } else if (sp) in_word = 0;
+    }
+    return n;
+}
+/* Is the '.' at text[dot] part of an abbreviation/initial (not a sentence end)? */
+static int qwen_is_abbrev_dot(const char *text, int dot) {
+    int s = dot;
+    while (s > 0 && !(text[s-1] == ' ' || text[s-1] == '\n' || text[s-1] == '\t')) s--;
+    int tl = dot - s;
+    if (tl <= 0 || tl > 4) return 0;
+    char buf[8]; memcpy(buf, text + s, (size_t)tl); buf[tl] = 0;
+    static const char *ab[] = { "Sig","Sigg","Dott","Dr","Prof","Egr","On","Rev",
+                                "St","vs","pag","art","ecc","etc","es","cfr",NULL };
+    for (int i = 0; ab[i]; i++) if (strcasecmp(buf, ab[i]) == 0) return 1;
+    if (tl == 1 && text[s] >= 'A' && text[s] <= 'Z') return 1;   /* "A." initial */
+    return 0;
+}
+static int qwen_push_str(char ***arr, int *n, int *cap, const char *s, int len) {
+    /* trim leading/trailing whitespace */
+    while (len > 0 && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) { s++; len--; }
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\n' || s[len-1] == '\r')) len--;
+    if (len <= 0) return 0;
+    if (*n >= *cap) { int nc = *cap ? *cap * 2 : 16;
+        char **t = (char **)realloc(*arr, (size_t)nc * sizeof(char *)); if (!t) return -1; *arr = t; *cap = nc; }
+    char *c = (char *)malloc((size_t)len + 1); if (!c) return -1;
+    memcpy(c, s, (size_t)len); c[len] = 0; (*arr)[(*n)++] = c;
+    return 0;
+}
+/* Segment `text` into sentences (caller frees each + array). */
+static int qwen_split_sentences(const char *text, char ***out, int *out_n) {
+    int len = (int)strlen(text);
+    char **arr = NULL; int n = 0, cap = 0, start = 0;
+    for (int i = 0; i < len; i++) {
+        char ch = text[i];
+        int is_end = (ch == '.' || ch == '!' || ch == '?' || ch == ';' || ch == '\n');
+        if (ch == '.') {
+            if (i > 0 && i + 1 < len && isdigit((unsigned char)text[i-1]) && isdigit((unsigned char)text[i+1])) is_end = 0;
+            if (qwen_is_abbrev_dot(text, i)) is_end = 0;
+        }
+        if (is_end) {
+            int e = i + 1;
+            while (e < len && (text[e] == '"' || text[e] == '\'' || text[e] == ')' || text[e] == ']')) e++;
+            if (qwen_push_str(&arr, &n, &cap, text + start, e - start) < 0) { goto oom; }
+            start = e; i = e - 1;
+        }
+    }
+    if (start < len) if (qwen_push_str(&arr, &n, &cap, text + start, len - start) < 0) goto oom;
+    *out = arr; *out_n = n; return 0;
+oom:
+    for (int i = 0; i < n; i++) free(arr[i]); free(arr); return -1;
+}
+/* Split long text into chunks: pack sentences up to ~target_words, merge a
+ * trailing sub-min_words fragment into the previous chunk. */
+static int qwen_split_text_for_batch(const char *text, int target_words, int min_words,
+                                     char ***out, int *out_n) {
+    char **sent = NULL; int ns = 0;
+    if (qwen_split_sentences(text, &sent, &ns) != 0) return -1;
+    char **chunks = NULL; int nc = 0, cap = 0;
+    char *acc = NULL; int acc_cap = 0, acc_len = 0, acc_words = 0;
+    #define ACC_APPEND(str, sl) do {                                            \
+        int _sl = (sl); int need = acc_len + (acc_len ? 1 : 0) + _sl + 1;       \
+        if (need > acc_cap) { acc_cap = need * 2; acc = (char *)realloc(acc, (size_t)acc_cap); } \
+        if (acc_len) acc[acc_len++] = ' ';                                      \
+        memcpy(acc + acc_len, (str), (size_t)_sl); acc_len += _sl; acc[acc_len] = 0; \
+    } while (0)
+    for (int i = 0; i < ns; i++) {
+        int sw = qwen_word_count(sent[i], (int)strlen(sent[i]));
+        ACC_APPEND(sent[i], (int)strlen(sent[i]));
+        acc_words += sw;
+        if (acc_words >= target_words) {
+            if (qwen_push_str(&chunks, &nc, &cap, acc, acc_len) < 0) goto oom;
+            acc_len = 0; acc_words = 0; if (acc) acc[0] = 0;
+        }
+    }
+    if (acc_len > 0) {
+        if (nc > 0 && acc_words < min_words) {
+            /* merge trailing fragment into the previous chunk */
+            char *prev = chunks[nc-1]; int pl = (int)strlen(prev);
+            char *m = (char *)malloc((size_t)pl + 1 + (size_t)acc_len + 1);
+            if (!m) goto oom;
+            memcpy(m, prev, (size_t)pl); m[pl] = ' '; memcpy(m + pl + 1, acc, (size_t)acc_len); m[pl + 1 + acc_len] = 0;
+            free(prev); chunks[nc-1] = m;
+        } else {
+            if (qwen_push_str(&chunks, &nc, &cap, acc, acc_len) < 0) goto oom;
+        }
+    }
+    #undef ACC_APPEND
+    free(acc);
+    for (int i = 0; i < ns; i++) free(sent[i]); free(sent);
+    *out = chunks; *out_n = nc; return 0;
+oom:
+    free(acc);
+    for (int i = 0; i < ns; i++) free(sent[i]); free(sent);
+    for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks);
+    return -1;
+}
+
+/* --batch Milestone A: split long text -> synthesize each chunk via the existing
+ * single-stream path -> concatenate (reuses render_spans). Correct audio + the
+ * sequential baseline; Milestone B swaps the inner loop for batched compute. */
+static int run_batch(qwen_tts_ctx_t *ctx, const char *text, int target_words, int dry,
+                     const char *language, float chunk_pause, const char *output, int silent) {
+    char **chunks = NULL; int nc = 0;
+    int min_words = target_words / 3 < 6 ? 6 : target_words / 3;
+    if (qwen_split_text_for_batch(text, target_words, min_words, &chunks, &nc) != 0 || nc == 0) {
+        fprintf(stderr, "--batch: text split failed\n"); return -1;
+    }
+    if (!silent || dry) {
+        fprintf(stderr, "--batch: %d chunk(s) (target ~%d words, min %d):\n", nc, target_words, min_words);
+        for (int i = 0; i < nc; i++)
+            fprintf(stderr, "  [chunk %d, %d words] %s\n", i, qwen_word_count(chunks[i], (int)strlen(chunks[i])), chunks[i]);
+    }
+    if (dry) { for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks); return 0; }
+    cspan_t *spans = (cspan_t *)calloc((size_t)nc, sizeof(cspan_t));
+    if (!spans) { for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks); return -1; }
+    for (int i = 0; i < nc; i++) {
+        spans[i].is_pause = 0; spans[i].mood[0] = 0; spans[i].text = chunks[i];
+        spans[i].steer_weight = -1.0f; spans[i].rate = 0.0f; spans[i].volume = 0.0f;
+    }
+    int rc = render_spans(ctx, spans, nc, language, chunk_pause, output, silent);
+    free(spans);
+    for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks);
+    return rc;
+}
+
 /* Synthesize a parsed span list and concatenate into one WAV. Returns 0 on success. */
 static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                         const char *language, float default_pause,
@@ -692,6 +836,9 @@ int main(int argc, char **argv) {
     int steer_weight_set = 0, roughness_set = 0, volume_set = 0, rate_set = 0;
     const char *compose_spec = NULL;  /* --compose: multi-span "[mood] text | [mood] text | [pause=0.5]" */
     float compose_pause = 0.12f;      /* --compose-pause: default gap (s) between spoken spans */
+    int batch_mode = 0;               /* --batch: split long text into chunks + synth (long-form) */
+    int batch_words = 16;             /* --batch-words: target words/chunk (sentence-packed) */
+    int batch_dry = 0;                /* --batch-dry: print the chunking and exit (no synth) */
     int run_batch_test = 0;           /* --batch-test: verify batched Talker step vs single-stream, exit */
     int run_batch_bench = 0;          /* --batch-bench: batched-compute throughput vs single-stream, exit */
     int seed = -1;       /* -1 = use time-based seed */
@@ -756,6 +903,9 @@ int main(int argc, char **argv) {
         {"volume",        required_argument, 0, 1032},
         {"rate",          required_argument, 0, 1033},
         {"compose",       required_argument, 0, 1034},
+        {"batch",         no_argument,       0, 1039},
+        {"batch-words",   required_argument, 0, 1040},
+        {"batch-dry",     no_argument,       0, 1041},
         {"compose-pause", required_argument, 0, 1035},
         {"batch-test",    no_argument,       0, 1036},
         {"batch-bench",   no_argument,       0, 1037},
@@ -808,6 +958,9 @@ int main(int argc, char **argv) {
             case 1033: audio_rate = (float)atof(optarg); rate_set = 1; break;
             case 1034: compose_spec = optarg; break;
             case 1035: compose_pause = (float)atof(optarg); break;
+            case 1039: batch_mode = 1; break;
+            case 1040: batch_words = atoi(optarg); if (batch_words < 4) batch_words = 4; break;
+            case 1041: batch_mode = 1; batch_dry = 1; break;
             case 1036: run_batch_test = 1; break;
             case 1037: run_batch_bench = 1; break;
             case 1016: list_voices_dir = optarg; break;
@@ -2066,6 +2219,16 @@ int main(int argc, char **argv) {
         int ret = qwen_tts_serve_ex(ctx, serve_port, serve_workers);
         qwen_tts_unload(ctx);
         return ret;
+    }
+
+    /* Batch mode (long-form): split text into sentence-packed chunks, synth each,
+     * concatenate. Milestone A = sequential synth (correct audio + baseline);
+     * Milestone B swaps the inner loop for batched compute. */
+    if (batch_mode && text) {
+        if (!silent) fprintf(stderr, "Batch mode: long-form chunked synthesis...\n");
+        int rc = run_batch(ctx, text, batch_words, batch_dry, language, compose_pause, output, silent);
+        qwen_tts_unload(ctx);
+        return rc == 0 ? 0 : 1;
     }
 
     /* Compose mode: multi-span synthesis into a single WAV (no streaming). */
