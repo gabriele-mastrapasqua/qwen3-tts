@@ -14,6 +14,10 @@
 #endif
 #ifdef __linux__
 #include <unistd.h>
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
 #endif
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -133,20 +137,80 @@ void qwen_caps_report(void *out) {
 #else
     fprintf(f, "  BLAS (prefill):   none\n");
 #endif
+    /* ---- Runtime ISA actually present on THIS CPU (independent of how the binary
+     * was compiled above). This is the "does the extension fire?" check — run it on
+     * a freshly-rented box to see what the CPU offers before deciding the build/kernel
+     * path. A gap vs the compiled features is the "compiled past the CPU -> SIGILL" trap.
+     * See docs/hardware-testing.md for the per-platform plan. */
 #if defined(__x86_64__)
-    /* Runtime ISA actually present on THIS CPU (vs what we compiled for above).
-     * A gap here is exactly the "compiled past what the CPU has -> SIGILL" trap. */
     __builtin_cpu_init();
-    fprintf(f, "  runtime cpu:      sse2%s%s%s%s\n",
-            __builtin_cpu_supports("avx") ? " avx" : "",
-            __builtin_cpu_supports("avx2") ? " avx2" : "",
-            __builtin_cpu_supports("fma") ? " fma" : "",
-            __builtin_cpu_supports("avx512f") ? " avx512f" : "");
+    fprintf(f, "  runtime cpu:      sse2%s%s%s%s%s%s%s%s\n",
+            __builtin_cpu_supports("avx")        ? " avx"          : "",
+            __builtin_cpu_supports("avx2")       ? " avx2"         : "",
+            __builtin_cpu_supports("fma")        ? " fma"          : "",
+            __builtin_cpu_supports("avx512f")    ? " avx512f"      : "",
+            __builtin_cpu_supports("avx512bw")   ? " avx512bw"     : "",
+            __builtin_cpu_supports("avx512vnni") ? " avx512vnni"   : "",
+            __builtin_cpu_supports("avx512bf16") ? " avx512bf16"   : "",
+            __builtin_cpu_supports("amx-int8")   ? " amx-int8"     : "");
+    fprintf(f, "  lever (x86):      %s\n",
+            __builtin_cpu_supports("avx512vnni") ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
+          : __builtin_cpu_supports("avx2")       ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
+          :                                        "no AVX2 — scalar; rebuild SIMD=scalar");
 #if defined(__AVX2__)
     if (!__builtin_cpu_supports("avx2"))
         fprintf(f, "  WARNING: built with AVX2 but this CPU lacks it -> will SIGILL. "
                    "Rebuild with `make blas SIMD=scalar`.\n");
 #endif
+#elif defined(__aarch64__)
+    /* ARM runtime features. macOS: per-feature sysctls (works on every M-series).
+     * Linux: getauxval HWCAP bits (Graviton / Ampere / Grace). */
+    int has_dotprod = 0, has_bf16 = 0, has_i8mm = 0, has_sve = 0, has_sve2 = 0, has_sme = 0;
+#if defined(__APPLE__)
+    { int v; size_t s;
+      #define QFEAT(name) (s = sizeof(v), v = 0, sysctlbyname(name, &v, &s, NULL, 0) == 0 && v)
+      has_dotprod = QFEAT("hw.optional.arm.FEAT_DotProd");
+      has_bf16    = QFEAT("hw.optional.arm.FEAT_BF16");
+      has_i8mm    = QFEAT("hw.optional.arm.FEAT_I8MM");
+      has_sme     = QFEAT("hw.optional.arm.FEAT_SME");
+      #undef QFEAT
+    }
+#elif defined(__linux__)
+    { unsigned long h1 = getauxval(AT_HWCAP), h2 = getauxval(AT_HWCAP2);
+      #ifdef HWCAP_ASIMDDP
+      has_dotprod = (h1 & HWCAP_ASIMDDP) != 0;
+      #endif
+      #ifdef HWCAP_SVE
+      has_sve = (h1 & HWCAP_SVE) != 0;
+      #endif
+      #ifdef HWCAP2_BF16
+      has_bf16 = (h2 & HWCAP2_BF16) != 0;
+      #endif
+      #ifdef HWCAP2_I8MM
+      has_i8mm = (h2 & HWCAP2_I8MM) != 0;
+      #endif
+      #ifdef HWCAP2_SVE2
+      has_sve2 = (h2 & HWCAP2_SVE2) != 0;
+      #endif
+      #ifdef HWCAP2_SME
+      has_sme = (h2 & HWCAP2_SME) != 0;
+      #endif
+      (void)h1; (void)h2;
+    }
+#endif
+    fprintf(f, "  runtime cpu:      NEON%s%s%s%s%s%s\n",
+            has_dotprod ? " dotprod/SDOT" : "",
+            has_bf16    ? " bf16/BFDOT"   : "",
+            has_i8mm    ? " i8mm/SMMLA"   : "",
+            has_sve     ? " SVE"          : "",
+            has_sve2    ? " SVE2"         : "",
+            has_sme     ? " SME"          : "");
+    fprintf(f, "  lever (arm):      %s%s\n",
+            has_i8mm ? "i8mm SMMLA + " : (has_dotprod ? "SDOT + " : ""),
+            has_bf16 ? "bf16 BFDOT/BFMMLA available -> native batched matmat twin (PLAN 21.3b, currently scalar-decode)"
+                     : "no bf16 matmul (M1-class) -> batched matmat uses scalar bf16 decode");
+    if (!has_bf16 && !has_i8mm)
+        fprintf(f, "  note:             M1-class (Armv8.5, dotprod only). M2/M3/M4/M5 add bf16+i8mm -> the native-matmul lever.\n");
 #endif
 }
 
