@@ -122,6 +122,13 @@ cp-microbench:
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# The RVQ nearest-neighbor encode (speech encoder) is numerically sensitive: -ffast-math
+# miscompiles it and SIGSEGVs on 1.7B (a bad codegen in the NN distance search; harmless on
+# 0.6B due to heap layout). It's an offline one-time path (voice creation), NOT a hot loop, so
+# compile this single TU without -ffast-math. See PLAN (icl-encode root-cause TODO).
+qwen_tts_speech_encoder.o: qwen_tts_speech_encoder.c
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -c -o $@ $<
+
 # Header dependencies
 main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_batch.h qwen_tts_kernels.h qwen_tts_server.h
 qwen_tts.o: qwen_tts.c qwen_tts.h qwen_tts_kernels.h qwen_tts_safetensors.h qwen_tts_tokenizer.h qwen_tts_audio.h

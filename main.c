@@ -1518,8 +1518,18 @@ int main(int argc, char **argv) {
                             (int)wh == ctx->config.hidden_size &&
                             (int)wth == ctx->config.text_hidden_size) {
                             int h = (int)wh, th = (int)wth, cv = (int)wcv;
+                            /* graft experiment (QWEN_GRAFT_NO_WOVR, --icl-only only): skip the base-model
+                             * text_projection + codec_embedding override so the graft keeps ALL CV weights
+                             * (pure-CV graft, x-vector only). Tests whether the ~25MB WOVR is needed for the
+                             * graft, or whether the 8KB x-vector alone suffices → minimal "qvoice-lite". */
+                            int graft_no_wovr = (getenv("QWEN_GRAFT_NO_WOVR") != NULL);
+                            if (graft_no_wovr) {
+                                long body = (long)th*th*2 + (long)th*4 + (long)h*th*2 + (long)h*4 + (long)cv*h*2;
+                                fseek(vf, body, SEEK_CUR);
+                                if (!silent) fprintf(stderr, "  QWEN_GRAFT_NO_WOVR: skipped WOVR override (pure-CV graft)\n");
+                            }
                             /* Allocate owned copies (can't write to mmap'd weights) */
-                            uint16_t *fc1 = (uint16_t *)malloc((size_t)th * th * sizeof(uint16_t));
+                            uint16_t *fc1 = graft_no_wovr ? NULL : (uint16_t *)malloc((size_t)th * th * sizeof(uint16_t));
                             float *fc1_b = (float *)malloc((size_t)th * sizeof(float));
                             uint16_t *fc2 = (uint16_t *)malloc((size_t)h * th * sizeof(uint16_t));
                             float *fc2_b = (float *)malloc((size_t)h * sizeof(float));

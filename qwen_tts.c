@@ -379,6 +379,7 @@ typedef struct {
     double decode_ms;       /* total decode time */
     double first_chunk_ms;  /* abs timestamp (gettimeofday ms) of first emitted chunk; 0 = none yet */
     int    chunk_frames;    /* frames to wait for per chunk (from ctx->stream_chunk_frames) */
+    int    trim_head_left;  /* ICL onset fix: samples still to drop from the head of output */
 } decoder_thread_t;
 
 static void dt_init(decoder_thread_t *dt, qwen_tts_ctx_t *ctx, int max_frames) {
@@ -398,6 +399,7 @@ static void dt_init(decoder_thread_t *dt, qwen_tts_ctx_t *ctx, int max_frames) {
     dt->audio_cb = NULL;
     dt->audio_cb_userdata = NULL;
     dt->cb_aborted = 0;
+    dt->trim_head_left = 0;
     /* Pre-allocate audio for ~max_frames worth of audio */
     dt->audio_cap = max_frames * 1920 + 4096;  /* 1920 samples/frame + margin */
     dt->audio_buf = (float *)aligned_malloc(dt->audio_cap * sizeof(float));
@@ -477,16 +479,26 @@ static void *decoder_thread_fn(void *arg) {
         if (qwen_speech_decoder_decode_streaming(ctx, chunk_codes, avail,
                                                    &chunk_audio, &chunk_samples) == 0) {
             if (chunk_samples > 0 && chunk_audio) {
-                if (dt->first_chunk_ms == 0) {
-                    struct timeval tvf; gettimeofday(&tvf, NULL);
-                    dt->first_chunk_ms = tvf.tv_sec * 1000.0 + tvf.tv_usec / 1000.0;
+                float *emit = chunk_audio;
+                int emit_n = chunk_samples;
+                /* ICL onset trim: drop the first N frames of decoder output — the
+                 * reference->target cold-start produces a "tud" transient at frame 0. */
+                if (dt->trim_head_left > 0) {
+                    int cut = dt->trim_head_left < emit_n ? dt->trim_head_left : emit_n;
+                    emit += cut; emit_n -= cut; dt->trim_head_left -= cut;
                 }
-                if (dt->audio_cb) {
-                    int ret = dt->audio_cb(chunk_audio, chunk_samples, dt->audio_cb_userdata);
-                    if (ret != 0) dt->cb_aborted = 1;
-                    dt->audio_len += chunk_samples;
-                } else {
-                    dt_append_audio(dt, chunk_audio, chunk_samples);
+                if (emit_n > 0) {
+                    if (dt->first_chunk_ms == 0) {
+                        struct timeval tvf; gettimeofday(&tvf, NULL);
+                        dt->first_chunk_ms = tvf.tv_sec * 1000.0 + tvf.tv_usec / 1000.0;
+                    }
+                    if (dt->audio_cb) {
+                        int ret = dt->audio_cb(emit, emit_n, dt->audio_cb_userdata);
+                        if (ret != 0) dt->cb_aborted = 1;
+                        dt->audio_len += emit_n;
+                    } else {
+                        dt_append_audio(dt, emit, emit_n);
+                    }
                 }
             }
             free(chunk_audio);
@@ -1397,6 +1409,16 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     if (ctx->stream && ctx->audio_cb) {
         dt_state.audio_cb = ctx->audio_cb;
         dt_state.audio_cb_userdata = ctx->audio_cb_userdata;
+    }
+    /* ICL onset fix: drop the first generated frame(s) of audio. In ICL mode the Talker is
+     * primed with reference frames (which are NOT decoded), so the decoder cold-starts on an
+     * already-loud first frame → a "tud" transient. The non-ICL/qvoice path ramps from silence
+     * and is clean. Tunable via QWEN_ICL_TRIM_FRAMES (default 1, 0 disables). */
+    if (icl_mode) {
+        int trim_frames = 2;  /* ear-tuned: 2 frames (160ms) starts from silence, kills the "tud" */
+        const char *e = getenv("QWEN_ICL_TRIM_FRAMES");
+        if (e) trim_frames = atoi(e);
+        if (trim_frames > 0) dt_state.trim_head_left = trim_frames * 1920;
     }
     if (!dt_no_overlap)
         pthread_create(&dt_thread, NULL, decoder_thread_fn, &dt_state);

@@ -131,8 +131,18 @@ int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, in
     fwrite(&bits, 2, 1, f);
     fwrite("data", 1, 4, f);
     fwrite(&data_size, 4, 1, f);
+    /* Linear fade in/out to kill boundary transients (asymmetric). Fade-in 5ms removes
+     * micro edge-clicks; fade-out 40ms smooths the ICL closing "tic" — the causal ConvNet
+     * decoder's last frame ends mid-energy at the reference->target boundary, whereas the
+     * non-ICL/qvoice path trails into silence. Both are harmless on normal trailing silence. */
+    int fade_in  = sample_rate / 200;        /* 5 ms */
+    int fade_out = sample_rate * 40 / 1000;  /* 40 ms (ear-tuned on ICL closing transient) */
+    if (fade_in  > n_samples / 2) fade_in  = n_samples / 2;
+    if (fade_out > n_samples / 2) fade_out = n_samples / 2;
     for (int i = 0; i < n_samples; i++) {
         float s = samples[i];
+        if (fade_in  > 0 && i < fade_in)                 s *= (float)i / (float)fade_in;
+        if (fade_out > 0 && i >= n_samples - fade_out)   s *= (float)(n_samples - 1 - i) / (float)fade_out;
         if (s < -1) s = -1; if (s > 1) s = 1;
         int16_t sample = (int16_t)(s * 32767);
         fwrite(&sample, 2, 1, f);
