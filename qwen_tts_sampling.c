@@ -124,13 +124,14 @@ static int topp_filter(float *logits, int n, float p) {
         if (cumsum > p) { cutoff = i + 1; break; }
     }
     
-    /* Zero out beyond cutoff */
-    int count = 0;
-    for (int i = 0; i < n; i++) {
-        if (i < cutoff) count++;
-        else logits[i] = 0;
-    }
-    return count;
+    /* Zero out tokens outside the nucleus — in SORTED (probability) order via idx[].
+     * BUG FIX (2026-06-10): the old loop zeroed logits[i] by RAW token index >= cutoff,
+     * which kept low-probability low-id tokens and zeroed high-probability high-id ones —
+     * including the high-id EOS token. With any top_p<1.0 the EOS was always masked out,
+     * so the Talker never terminated (runaway to max_frames). The mask must follow idx[]. */
+    for (int i = cutoff; i < n; i++)
+        logits[idx[i]] = 0.0f;
+    return cutoff;
 }
 
 /* Sample from probability distribution */
