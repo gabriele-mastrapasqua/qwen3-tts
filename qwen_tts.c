@@ -998,8 +998,12 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     int ref_codes_owned = 0;  /* 1 if we allocated ref_codes and must free it */
     int icl_mode = 0;
 
-    /* Check for cached ref_codes from .qvoice file */
-    if (ctx->voice_clone && ctx->cached_ref_codes && ctx->cached_ref_n_frames > 0
+    if (ctx->graft_mode && ctx->cached_ref_codes && !ctx->silent)
+        fprintf(stderr, "ICL: --graft -> ignoring %d ref frames, cloning via x-vector (emotive)\n",
+                ctx->cached_ref_n_frames);
+
+    /* Check for cached ref_codes from .qvoice file (skipped in --graft mode) */
+    if (ctx->voice_clone && !ctx->graft_mode && ctx->cached_ref_codes && ctx->cached_ref_n_frames > 0
         && ctx->ref_text && ref_text_tokens && ref_text_token_len > 0) {
         ref_codes = ctx->cached_ref_codes;
         ref_n_frames = ctx->cached_ref_n_frames;
@@ -1008,7 +1012,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             fprintf(stderr, "ICL: using %d cached ref frames from .qvoice\n", ref_n_frames);
     }
     /* Otherwise encode from ref audio file */
-    else if (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text
+    else if (ctx->voice_clone && !ctx->xvector_only && !ctx->graft_mode && ctx->ref_text
              && ref_text_tokens && ref_text_token_len > 0) {
         icl_mode = 1;
         float *ref_audio_samples = NULL;
@@ -1030,6 +1034,23 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             }
             free(ref_audio_samples);
             ref_codes_owned = 1;
+        }
+    }
+
+    /* --icl-frames N (or QWEN_ICL_FRAMES): cap the reference codec frames fed as the ICL
+     * prosody anchor. The ref_codes are BOTH the identity carrier AND the prosody template
+     * that damps instruct/emotion (RUN-6). Trimming the anchor to the first N frames leaves
+     * the speaker-embedding + ref_text identity binding intact while freeing room for emotion
+     * — interpolating ICL (faithful/flat) toward the x-vector graft (expressive/looser).
+     * 0 = use all (default). Keeps the contiguous head so the codec sequence stays coherent. */
+    if (icl_mode && ref_n_frames > 0) {
+        int cap = ctx->icl_frames_cap;
+        { const char *e = getenv("QWEN_ICL_FRAMES"); if (e && e[0]) cap = atoi(e); }
+        if (cap > 0 && cap < ref_n_frames) {
+            if (!ctx->silent)
+                fprintf(stderr, "ICL: capping ref frames %d -> %d (anchor dilution)\n",
+                        ref_n_frames, cap);
+            ref_n_frames = cap;
         }
     }
 

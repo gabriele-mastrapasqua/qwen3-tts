@@ -413,6 +413,11 @@ typedef struct qwen_tts_ctx {
     /* Cached ICL data (for .qvoice save/load) */
     int *cached_ref_codes;       /* [cached_ref_n_frames × 16] codec tokens from speech encoder */
     int cached_ref_n_frames;     /* Number of reference codec frames */
+    int icl_frames_cap;          /* --icl-frames N: cap ICL ref frames to dilute the prosody
+                                    anchor (more emotion room). 0 = use all (default). */
+    int graft_mode;              /* --graft: ignore cached ref_codes on a lite .qvoice and clone
+                                    via the x-vector path (CV weights + instruct emote = the graft).
+                                    Same 25MB file: default = faithful ICL, --graft = emotive. */
 
     /* Base model type */
     int is_base_model;           /* 1 = Base model, 0 = CustomVoice/VoiceDesign */

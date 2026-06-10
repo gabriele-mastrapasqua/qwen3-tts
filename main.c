@@ -945,6 +945,10 @@ int main(int argc, char **argv) {
     int icl_only = 0;                /* --icl-only: load a .qvoice's ICL prefix (speaker-emb + ref-codes)
                                         but SKIP the WDELTA weight-swap → keep the instruct-capable CV weights
                                         intact = clone-via-ICL + full instruct (the "graft" experiment) */
+    int icl_frames = 0;              /* --icl-frames N: cap ICL ref frames (dilute the prosody anchor for
+                                        more emotion room). 0 = use all (default). */
+    int graft = 0;                   /* --graft: ignore a lite .qvoice's ref_codes, clone via x-vector
+                                        (CV weights + instruct emote). Same file, emotive mode. */
     int use_int8 = 0;
     int use_int4 = 0;
     static struct option long_options[] = {
@@ -976,6 +980,8 @@ int main(int argc, char **argv) {
         {"voice-strength", required_argument, 0, 1049},
         {"vs-layers",     required_argument, 0, 1050},
         {"icl-only",      no_argument,       0, 1051},
+        {"icl-frames",    required_argument, 0, 1052},
+        {"graft",         no_argument,       0, 1053},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"list-voices",   required_argument, 0, 1016},
@@ -1044,6 +1050,8 @@ int main(int argc, char **argv) {
             case 1049: voice_strength = (float)atof(optarg); break;
             case 1050: { int a,b; if (sscanf(optarg,"%d-%d",&a,&b)==2){vs_l0=a;vs_l1=b;} break; }
             case 1051: icl_only = 1; break;
+            case 1052: icl_frames = atoi(optarg); break;
+            case 1053: graft = 1; icl_only = 1; break;  /* --graft implies --icl-only (skip WDELTA too) */
             case 1014: use_int8 = 1; break;
             case 1015: use_int4 = 1; break;
             case 1022: voice_name = optarg; break;
@@ -1113,6 +1121,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --delete-voice <path>      Delete a .qvoice file\n");
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 30, 0=all)\n");
                 fprintf(stderr, "  --voice-strength <a>       .qvoice WDELTA scale (1=full voice; <1=more emotion, less fidelity)\n");
+                fprintf(stderr, "  --icl-frames <N>           Cap ICL ref frames (dilute prosody anchor; more emotion; 0=all)\n");
+                fprintf(stderr, "  --graft                    Ignore lite .qvoice ref_codes; clone via x-vector (emotive; use with --instruct)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
@@ -1299,6 +1309,8 @@ int main(int argc, char **argv) {
     if (seed >= 0) ctx->seed = (uint32_t)seed;
     if (max_duration > 0) ctx->max_tokens = (int)(max_duration * 12.5f);
     if (ctx_greedy_warmup > 0) ctx->greedy_warmup = ctx_greedy_warmup;
+    if (icl_frames > 0) ctx->icl_frames_cap = icl_frames;
+    ctx->graft_mode = graft;
 
     /* ---- Expressivity controls (feat/expressivity) ----
      * --emotion accepts a compound MOOD name (joy/sad/stern/...) resolved through

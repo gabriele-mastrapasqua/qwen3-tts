@@ -42,6 +42,9 @@
 > preset grade (angry mel-vs-neutral 0.57→**0.35**), and emotions are **distinct** again (qvoice ang≈sad
 > 0.74 collapsed → graft 0.42; the matrix even tracks real relations, happy≈excited). At T0.9 it produced a
 > spontaneous trembling sigh before "è incredibile" — preset-grade paralinguistics on a clone.
+> **⚠ The sigh is seed-specific: this exact text + instruct + `-T 0.9` + `--seed 42` = the "ehhhh… è
+> incredibile" sospirato (ear-re-confirmed 2026-06-10, user: "top!"). Change the text/instruct/seed and
+> the spontaneous sigh may not appear — keep all four fixed to reproduce it.**
 >
 > **Recipe knobs (ear-validated on Galatea):**
 > - `--icl-only` (load the `.qvoice` on the **CustomVoice** model, NOT base) + **English** instruct.
