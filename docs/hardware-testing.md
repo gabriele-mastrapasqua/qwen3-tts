@@ -121,7 +121,7 @@ wired yet; a future twin). Zen3 (AVX2-only) is where **int4 + batching** already
 | ARM dotprod-only (M1-like server) | Ampere Altra | **Hetzner Cloud CAX**, Oracle A1 (free tier!), Scaleway | cheap / free |
 | **x86 AVX-512+VNNI+BF16** | Ryzen 7950X (Zen4) | **Hetzner AX102** dedicated | ~€100/mo |
 | x86 Zen5 (Turin) | EPYC 9005 | Scaleway, latitude.sh, OVH | ¢/hr |
-| x86 AVX2-only (no AVX-512) | Ryzen 6800H | our LAN mini-PC (192.168.1.93) | owned |
+| x86 AVX2-only (no AVX-512) | Ryzen 6800H | a local LAN mini-PC | owned |
 | **Intel AMX** (int8/bf16 matrix) | Sapphire Rapids `c7i` | AWS, GCP `c3` | ¢/hr |
 | NVIDIA Grace (ARM V2, high BW) | GH200 | Lambda, CoreWeave | $/hr |
 
