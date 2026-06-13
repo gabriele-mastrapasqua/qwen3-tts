@@ -1108,6 +1108,9 @@ int main(int argc, char **argv) {
     int steer_weight_set = 0, roughness_set = 0, volume_set = 0, rate_set = 0;
     const char *compose_spec = NULL;  /* --compose: multi-span "[mood] text | [mood] text | [pause=0.5]" */
     float compose_pause = 0.12f;      /* --compose-pause: default gap (s) between spoken spans */
+    int no_compose = 0;               /* --no-compose: pass [tags] LITERALLY to the model (don't auto-route
+                                       * through the macro composer) — used to test a paralinguistic LoRA
+                                       * that emits [laugh]/[sigh]/... itself instead of the synth macro. */
     int batch_mode = 0;               /* --batch: split long text into chunks + synth (long-form) */
     int batch_words = 16;             /* --batch-words: target words/chunk (sentence-packed) */
     int batch_dry = 0;                /* --batch-dry: print the chunking and exit (no synth) */
@@ -1203,6 +1206,7 @@ int main(int argc, char **argv) {
         {"volume",        required_argument, 0, 1032},
         {"rate",          required_argument, 0, 1033},
         {"compose",       required_argument, 0, 1034},
+        {"no-compose",    no_argument,       0, 1056},
         {"batch",         no_argument,       0, 1039},
         {"batch-words",   required_argument, 0, 1040},
         {"batch-dry",     no_argument,       0, 1041},
@@ -1271,6 +1275,7 @@ int main(int argc, char **argv) {
             case 1032: audio_volume = (float)atof(optarg); volume_set = 1; break;
             case 1033: audio_rate = (float)atof(optarg); rate_set = 1; break;
             case 1034: compose_spec = optarg; break;
+            case 1056: no_compose = 1; break;
             case 1035: compose_pause = (float)atof(optarg); break;
             case 1039: batch_mode = 1; break;
             case 1040: batch_words = atoi(optarg); if (batch_words < 4) batch_words = 4; break;
@@ -1519,10 +1524,12 @@ int main(int argc, char **argv) {
      * (--compose calls the same helper per span; see below.) */
     /* Auto-route a tagged --text (e.g. "Ciao [sad] ... [sigh]") through the
      * inline-markup composer, so users get expressive markup without a new flag. */
-    if (!compose_spec && text && text_has_markup(text)) {
+    if (!compose_spec && !no_compose && text && text_has_markup(text)) {
         compose_spec = text;
         if (!silent) fprintf(stderr, "Inline markup detected in --text -> compose mode\n");
     }
+    if (no_compose && !silent && text && text_has_markup(text))
+        fprintf(stderr, "--no-compose: passing inline [tags] literally to the model\n");
     if (!compose_spec &&
         qwen_apply_emotion(ctx, emotion_spec, steer_vector_path, language,
                            cp_steer_weight, steer_weight_set, cp_roughness, roughness_set,
