@@ -54,12 +54,13 @@ def main():
         print("JVNV style counts:", dict(c))
         return
 
-    from faster_whisper import WhisperModel
-    asr = WhisperModel(args.whisper_model, device="cuda", compute_type="float16")
+    # openai-whisper (torch-based) — uses CUDA via torch (the GB10's ctranslate2 wheel has no CUDA,
+    # so faster-whisper can't GPU here; torch CUDA works since the LoRA trainer uses it).
+    import whisper
+    asr = whisper.load_model(args.whisper_model, device="cuda")
 
     def transcribe(y16):
-        segs, _info = asr.transcribe(y16, language="ja", beam_size=5, vad_filter=True)
-        return "".join(s.text for s in segs).strip()
+        return asr.transcribe(y16.astype("float32"), language="ja", fp16=True)["text"].strip()
 
     wav_dir = os.path.join(args.out_dir, "wav24k"); os.makedirs(wav_dir, exist_ok=True)
     out_jsonl = os.path.join(args.out_dir, "train_raw.jsonl")
