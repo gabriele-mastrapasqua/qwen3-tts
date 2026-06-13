@@ -152,9 +152,18 @@ strip) — to be wired C-side, see PLAN.
 ## Next-language survey — RU / PT / JA / KO (verified 2026-06-13)
 
 Survey + adversarial license check for the four remaining languages (IT/DE/ES/FR already locked).
-Goal: one shippable emotional corpus per language. **License is the gating axis** — we publish derived
-LoRA weights, so research-only / non-redistributable corpora are LOCAL-PROOF-ONLY (train + keep private,
-don't ship the pack).
+Goal: one usable emotional corpus per language.
+
+> 🔓 **LICENSE CONSTRAINT RELAXED (user 2026-06-13).** We train only a **micro-LoRA per language and do
+> NOT redistribute the datasets**, so **NonCommercial / research-only / non-CC corpora are FINE** as long
+> as they're usable, well-made, correctly emotion-tagged, and (ideally) lightweight. (Caveat noted: an NC
+> source could in theory limit *commercial* shipping of the derived LoRA — acceptable for these
+> experimental packs.) → The real ranking axis is now **DOWNLOADABILITY** (instant vs form/email/gated),
+> not the license. The "ship-safe" tags below still record which packs *could* be published, but no longer
+> gate which datasets we may USE.
+
+**Instant-download + well-tagged + light:** only **RESD** (RU) and **JVNV** (JA). PT (VERBO) needs an
+email request; KO (ETOD/KESDy18) needs a form for the full set. See per-language detail.
 
 ### 🇷🇺 Russian — ✅ RECOMMENDED: **RESD** (cleanest license, ready now)
 - **RESD** — HF `Aniemore/resd` (+ `resd_annotated`). ~**3.5h**, **1,396 utt** (1,116 train + 280 test),
@@ -167,9 +176,12 @@ don't ship the pack).
 
 ### 🇧🇷 Portuguese — ⚠️ VERBO (only real option, license to confirm before SHIP)
 - **VERBO** — Brazilian PT, **7 emotions** (happy/disgust/fear/neutral/anger/surprise/sad), **12 speakers**
-  (6F/6M), 14 phrases, **1,167 recs**. The *only* verified discrete-emotion BR-PT corpus. Site/GitHub:
-  `jrtorresneto/VERBO-emotional-speech-dataset`. **CAVEAT: marked "restricted, research-purposes only"**
-  → fine for a LOCAL proof, but **confirm license / get author permission before publishing the pack**.
+  (6F/6M), 14 phrases, **1,167 recs**. The *only* verified discrete-emotion BR-PT corpus. Research-only
+  (now OK to USE). **DOWNLOAD: email request** — the GitHub repo
+  ([`jrtorresneto/VERBO-emotional-speech-dataset`](https://github.com/jrtorresneto/VERBO-emotional-speech-dataset))
+  is empty and points to [sites.google.com/view/verbodatabase](https://sites.google.com/view/verbodatabase/home/download):
+  fill the form ([drive link](https://drive.google.com/file/d/1X9zT9p2lF3m1dqjfJjnf0QXQ8GvRtzjm/view))
+  and email it to **jrtorresneto@usp.br**. Not instant, but obtainable; Romance → high payoff.
 - **CORAA-SER** ❌ ruled out — ~50min, only 3 coarse classes (neutral / non-neutral F / non-neutral M),
   spontaneous. **TTS-Portuguese** ❌ — single-speaker neutral read TTS, no emotion (CC-BY-4.0).
 - PT is Romance → should **transfer easily like ES/FR** (high payoff for little data); license is the
@@ -183,45 +195,43 @@ don't ship the pack).
 - **STUDIES** (alt) — ~8h, 3 actors, per-line emotion labels, 48kHz studio, higher quality BUT license
   is **research-only + "please refrain from redistribution"** → **blocks public pack release.** Local-only.
 
-### 🇰🇷 Korean — ⚠️ NO SHIP-SAFE OPTION (resolved 2026-06-13) — local-proof only
-**Verdict: there is NO permissively-licensed (MIT/CC-BY/CC0) Korean emotional speech corpus.** An HF
-license-tag scan returned ZERO Korean emotion-speech datasets with any declared license (= all-rights-
-reserved by default). Every real option is **NonCommercial, gated, or unlicensed** → fine for a LOCAL
-proof, NOT for a public pack. Ranked by obtainability:
-- **EmotionTTS Open DB (ETOD)** — `github.com/emotiontts/emotiontts_open_db` — multi-speaker Korean
-  emotional TTS DB (~15 speakers, 4 emotions neutral/happy/sad/angry, ~6k samples). **License
-  CC-BY-NC-SA-4.0** (confirmed from repo README) → **NonCommercial**, ungated/direct GitHub download.
-  → **best LOCAL-PROOF pick** (train it, don't ship the pack).
-- **KESDy18 / KESDy19 (ETRI)** — `nanum.etri.re.kr/share/kjnoh2/KESDy18` — 30 voice actors (15M/15F),
-  4 emotions, 20 sentences/emotion, Shure headset (studio-ish). **Research-only, signed License
-  Agreement required, NO commercial, NO third-party redistribution.** Gated form + non-ship.
-- **AI-Hub 감성/감정 음성** — `aihub.or.kr` — large (~50k wav, 7 emotions) BUT **AI-Hub terms are
-  restrictive** (account typically needs a Korean ID/phone; no redistribution / commercial limits).
-  Gated + non-ship.
-- **KES (Korean Emotional Speech)** — single female speaker, 7 emotions, 22,087 samples — single-speaker
-  (weak for our multi-speaker need) + **license unclear**.
-- **Kratos-AI/korean-voice-emotion-dataset** (HF) — 4 emotions, directly downloadable, BUT **NO license
-  declared** → unusable for a public pack.
+### 🇰🇷 Korean — ✅ USABLE under relaxed license: **ETOD** (well-tagged, light; NC, research)
+No Korean emotional corpus is permissively-licensed (all NC/gated/unlicensed), but with the relaxed
+constraint they're now USABLE. Ranked by quality + downloadability:
+- **EmotionTTS Open DB (ETOD)** — [`github.com/emotiontts/emotiontts_open_db`](https://github.com/emotiontts/emotiontts_open_db)
+  → `Dataset/SpeechCorpus/Emotional/{plain-to-emotional,emotional-to-emotional}`. **15 speakers** (plain
+  2F/3M + emotional 5F/5M), **4 emotions** 일반/기쁨/화남/슬픔 = **neutral/happy/angry/sad**, **100
+  sentences/emotion/speaker** (full = ~6,000 clips). **Cleanly tagged** (emotion = filename range, e.g.
+  `emaNNNNN`: 00001-100 neutral, 101-200 happy, 201-300 angry, 301-400 sad) **+ transcripts** (`script/`
+  + `transcript/`, UTF-8). **PCM WAV 16-bit, 22.05kHz mono** (light; resample up to 24k). License
+  CC-BY-NC-SA-4.0 (research, no-commercial — OK now). **DOWNLOAD REALITY: the GitHub repo is only the
+  5% public sample** (~5 clips/emotion/speaker ≈ **~300 clips total, instant**); the **full 6,000-clip
+  set needs a Google-form request** (free, research) linked in the repo's Emotional/README.md. → **best
+  KO pick**: grab the 5% for a quick proof, or submit the form for the full set.
+- **KESDy18 / KESDy19 (ETRI)** — [`nanum.etri.re.kr/share/kjnoh2/KESDy18`](https://nanum.etri.re.kr/share/kjnoh2/KESDy18?lang=En_us)
+  — 30 voice actors (15M/15F), 4 emotions (neutral/happy/sad/anger), 20 sentences/emotion, Shure headset
+  (clean studio). Full set behind a **signed License Agreement form** (research-only). Good fallback/2nd.
+- **AI-Hub 감성/감정 음성** — [`aihub.or.kr`](https://www.aihub.or.kr) — large (~50k wav, 7 emotions) but
+  **account gating typically needs a Korean ID/phone** → hardest to obtain. Skip unless you have an account.
+- **Kratos-AI/korean-voice-emotion-dataset** (HF) — 4 emotions, BUT listing/download returns auth-required
+  (effectively gated) + no license declared. Skip.
 
-→ **KO is effectively blocked for a SHIPPABLE pack.** Paths: (a) train an ETOD proof and keep it private
-(NC), (b) sign the KESDy18 research agreement (still non-ship), or (c) accept KO as the last/deferred
-language. Don't burn effort here until RU/PT/JA are done.
+### 🇯🇵 Japanese — JVNV best; STUDIES now also usable (relaxed)
+- **JVNV** (above) — instant HF download, 6 emotions, studio, light (3.94h). **Still the JA pick.**
+- **STUDIES** — [`sython.org/Corpus/STUDIES`](https://sython.org/Corpus/STUDIES/) — ~8h, 3 actors, per-line
+  emotion labels, 48kHz studio. Research-only/no-redistribution (now OK to USE), but heavier than JVNV.
+- **JTES** (Twitter scripts, 4 emotions, non-pro) / **OGVC** (NII consortium, application/fee) — both
+  application-gated; not worth it given JVNV is instant.
 
-### 🇯🇵 Japanese — alternatives to JVNV are GATED (checked 2026-06-13) → JVNV stands
-- **JTES** (Twitter-script emotional, 4 emotions, non-pro speakers) — application/research-gated, no
-  clean redistribution license. **OGVC** (NII Speech Resources Consortium) — application + likely fee,
-  research terms. Neither is ship-safe. → **JVNV (CC-BY-SA-4.0) remains the best obtainable JA pick.**
-
-### Priority order (license-clean + downloadable + base-need)
-1. **🇷🇺 RU — RESD** — cleanest license (MIT), ungated, downloadable NOW, and RU is non-native (needs the
-   data most). **Best first target.**
-2. **🇧🇷 PT — VERBO** — Romance, transfers easily = high payoff; train the proof now, **gate the public
-   ship on confirming VERBO's license.**
-3. **🇯🇵 JA — JVNV** — ship-safe (CC-BY-SA), but JA may be **near-native** in Qwen3-TTS → likely only an
-   *emotion* LoRA needed, not language-rendering. **Free check first: listen to base JA (ryan/vivian) BEFORE
-   training** to confirm we only need emotion.
-4. **🇰🇷 KO — LAST / deferred** — no ship-safe corpus exists (all NC/gated/unlicensed). Only a LOCAL
-   proof (ETOD, NC) is possible; a public KO pack needs our own data or explicit permission. Defer.
+### Priority order (relaxed license → rank by downloadability + base-need)
+1. **🇷🇺 RU — RESD** — instant HF download, MIT, RU non-native (needs data most). **In training now.**
+2. **🇯🇵 JA — JVNV** — instant HF download, 6 emotions studio, light. But JA may be **near-native** in
+   Qwen3-TTS → **free ear-check of base JA (ryan/vivian) FIRST**; likely only an *emotion* LoRA needed.
+   Second target precisely because it's the other instant-download set.
+3. **🇧🇷 PT — VERBO** — only discrete-emotion PT set; **email request** (form → jrtorresneto@usp.br) so
+   not instant. Romance → transfers easily like ES/FR (high payoff once obtained).
+4. **🇰🇷 KO — ETOD** — well-tagged/light/studio (4 emotions + transcripts), usable now. **5% sample is
+   instant** (quick proof); full 6,000-clip set via the repo's Google-form. KESDy18 the studio fallback.
 
 > **UNVERIFIED hypothesis (carry forward):** that JA (and maybe KO) prosody is already near-native in
 > Qwen3-TTS (emotion-LoRA-only) while RU (Slavic, non-native) needs a real language-teaching corpus —
