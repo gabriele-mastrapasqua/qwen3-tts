@@ -175,13 +175,19 @@ email request; KO (ETOD/KESDy18) needs a form for the full set. See per-language
   the **podcast audio is non-redistributable**. Too big + dirty + license-murky for our tiny-LoRA need.
 
 ### 🇧🇷 Portuguese — ⚠️ VERBO (only real option, license to confirm before SHIP)
-- **VERBO** — Brazilian PT, **7 emotions** (happy/disgust/fear/neutral/anger/surprise/sad), **12 speakers**
-  (6F/6M), 14 phrases, **1,167 recs**. The *only* verified discrete-emotion BR-PT corpus. Research-only
-  (now OK to USE). **DOWNLOAD: email request** — the GitHub repo
-  ([`jrtorresneto/VERBO-emotional-speech-dataset`](https://github.com/jrtorresneto/VERBO-emotional-speech-dataset))
-  is empty and points to [sites.google.com/view/verbodatabase](https://sites.google.com/view/verbodatabase/home/download):
-  fill the form ([drive link](https://drive.google.com/file/d/1X9zT9p2lF3m1dqjfJjnf0QXQ8GvRtzjm/view))
-  and email it to **jrtorresneto@usp.br**. Not instant, but obtainable; Romance → high payoff.
+**✅ SOLVED via Romance transfer (user ear-confirmed 2026-06-13) — NO PT dataset needed.** PT is Romance
+like ES/FR/IT, and the model's EN→Romance switch is strong: the **Spanish `.expr` pack applied to
+Portuguese text emotes correctly** (user A/B: ES pack on PT clearly lifts emotion). → **Suggested PT pack
+= the Spanish broad-band pack** (shipped as a labelled copy `presets/expr/portuguese_bb027_r32.expr`,
+same weights as `spanish_bb027_ep5_r32`, lang header patched to Portuguese). Use `-l Portuguese --expr
+portuguese_bb027_r32.expr --expr-weight ~0.6` + EN instruct. This sidesteps the dead VERBO download.
+
+- **VERBO** (the only real BR-PT discrete-emotion corpus, 7 emotions / 12 speakers / 1,167 recs) is
+  **effectively DEAD**: the official site's download form 404s and the author email (jrtorresneto@usp.br)
+  is unresponsive (user tried). Kept here only for the record; not obtainable.
+- **CORAA-SER** ❌ (only neutral/non-neutral) and **TTS-Portuguese** ❌ (single-speaker neutral) — no
+  discrete emotions. **F5-TTS-pt-br** is a *model*, not a dataset. → no usable PT corpus exists; the
+  Romance-transfer pack is the answer.
 - **CORAA-SER** ❌ ruled out — ~50min, only 3 coarse classes (neutral / non-neutral F / non-neutral M),
   spontaneous. **TTS-Portuguese** ❌ — single-speaker neutral read TTS, no emotion (CC-BY-4.0).
 - PT is Romance → should **transfer easily like ES/FR** (high payoff for little data); license is the
@@ -228,8 +234,8 @@ constraint they're now USABLE. Ranked by quality + downloadability:
 2. **🇯🇵 JA — JVNV** — instant HF download, 6 emotions studio, light. But JA may be **near-native** in
    Qwen3-TTS → **free ear-check of base JA (ryan/vivian) FIRST**; likely only an *emotion* LoRA needed.
    Second target precisely because it's the other instant-download set.
-3. **🇧🇷 PT — VERBO** — only discrete-emotion PT set; **email request** (form → jrtorresneto@usp.br) so
-   not instant. Romance → transfers easily like ES/FR (high payoff once obtained).
+3. **🇧🇷 PT — ✅ DONE, no dataset** — use the **Spanish pack on PT text** (Romance transfer, ear-confirmed);
+   shipped as `portuguese_bb027_r32.expr`. VERBO is dead; no PT corpus needed.
 4. **🇰🇷 KO — ETOD** — well-tagged/light/studio (4 emotions + transcripts), usable now. **5% sample is
    instant** (quick proof); full 6,000-clip set via the repo's Google-form. KESDy18 the studio fallback.
 
