@@ -148,3 +148,59 @@ strip) — to be wired C-side, see PLAN.
 > ⚠️ **NonverbalTTS is research/prototype ONLY** (CC BY-NC-SA + VoxCeleb/Expresso audio terms). Use it
 > to prove the LoRA learns nonverbals and that EN→IT transfer works; do **not** ship a pack trained on
 > it. For a shippable pack, auto-tag a permissive base (LibriTTS-R, CC BY 4.0) instead.
+
+## Next-language survey — RU / PT / JA / KO (verified 2026-06-13)
+
+Survey + adversarial license check for the four remaining languages (IT/DE/ES/FR already locked).
+Goal: one shippable emotional corpus per language. **License is the gating axis** — we publish derived
+LoRA weights, so research-only / non-redistributable corpora are LOCAL-PROOF-ONLY (train + keep private,
+don't ship the pack).
+
+### 🇷🇺 Russian — ✅ RECOMMENDED: **RESD** (cleanest license, ready now)
+- **RESD** — HF `Aniemore/resd` (+ `resd_annotated`). ~**3.5h**, **1,396 utt** (1,116 train + 280 test),
+  **7 emotions** (anger, disgust, enthusiasm, fear, happiness, neutral, sadness), actor-performed.
+  **License MIT** (research + commercial + **redistribution of derived weights OK**). Direct HF parquet
+  (~486MB), **ungated**. → **the cleanest pick of the whole survey; ship-safe.**
+- **Dusha** (alt, NOT recommended) — ~350h / 300k+ recs but only **4 emotions**, crowdsourced (Yandex
+  Toloka, background noise) + podcast. **License PDF-only** (no commercial/redistribution statement) and
+  the **podcast audio is non-redistributable**. Too big + dirty + license-murky for our tiny-LoRA need.
+
+### 🇧🇷 Portuguese — ⚠️ VERBO (only real option, license to confirm before SHIP)
+- **VERBO** — Brazilian PT, **7 emotions** (happy/disgust/fear/neutral/anger/surprise/sad), **12 speakers**
+  (6F/6M), 14 phrases, **1,167 recs**. The *only* verified discrete-emotion BR-PT corpus. Site/GitHub:
+  `jrtorresneto/VERBO-emotional-speech-dataset`. **CAVEAT: marked "restricted, research-purposes only"**
+  → fine for a LOCAL proof, but **confirm license / get author permission before publishing the pack**.
+- **CORAA-SER** ❌ ruled out — ~50min, only 3 coarse classes (neutral / non-neutral F / non-neutral M),
+  spontaneous. **TTS-Portuguese** ❌ — single-speaker neutral read TTS, no emotion (CC-BY-4.0).
+- PT is Romance → should **transfer easily like ES/FR** (high payoff for little data); license is the
+  only blocker to a *shippable* pack.
+
+### 🇯🇵 Japanese — ✅ RECOMMENDED: **JVNV** (studio, share-alike OK)
+- **JVNV** — HF `asahi417/jvnv-emotional-speech-corpus`. **6 emotions**, **4 pro speakers** (2F/2M),
+  **3.94h / 1,615 utt**, **studio 48kHz/24-bit anechoic** (downsamples cleanly 48→24k). **License
+  CC-BY-SA-4.0** → commercial + redistribution OK **under share-alike** (derived pack must carry SA).
+  → ship-safe with the SA obligation.
+- **STUDIES** (alt) — ~8h, 3 actors, per-line emotion labels, 48kHz studio, higher quality BUT license
+  is **research-only + "please refrain from redistribution"** → **blocks public pack release.** Local-only.
+
+### 🇰🇷 Korean — ❌ UNRESOLVED (needs a dedicated follow-up)
+- **No Korean corpus verified this round.** KESS + AI-Hub emotional sets (KESDy18/19 etc.) named but
+  unconfirmed; **AI-Hub terms are typically restrictive** (signed agreement / Korea-residency /
+  non-redistribution) and likely **block public LoRA release**. → needs its own survey to find ONE
+  downloadable + redistribution-permissive KO emotional set, OR we defer KO.
+
+### Priority order (license-clean + downloadable + base-need)
+1. **🇷🇺 RU — RESD** — cleanest license (MIT), ungated, downloadable NOW, and RU is non-native (needs the
+   data most). **Best first target.**
+2. **🇧🇷 PT — VERBO** — Romance, transfers easily = high payoff; train the proof now, **gate the public
+   ship on confirming VERBO's license.**
+3. **🇯🇵 JA — JVNV** — ship-safe (CC-BY-SA), but JA may be **near-native** in Qwen3-TTS → likely only an
+   *emotion* LoRA needed, not language-rendering. **Free check first: listen to base JA (ryan/vivian) BEFORE
+   training** to confirm we only need emotion.
+4. **🇰🇷 KO — blocked on data** — run the KO follow-up survey (or the free base-quality ear-test) before
+   committing effort.
+
+> **UNVERIFIED hypothesis (carry forward):** that JA (and maybe KO) prosody is already near-native in
+> Qwen3-TTS (emotion-LoRA-only) while RU (Slavic, non-native) needs a real language-teaching corpus —
+> *plausible, consistent with the model's ZH+JA+EN training, but NOT verified against the model card.*
+> The cheap test is the **free base ear-check** per language before spending on a dataset.
