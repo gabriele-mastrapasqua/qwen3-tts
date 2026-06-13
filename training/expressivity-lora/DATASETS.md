@@ -243,3 +243,14 @@ constraint they're now USABLE. Ranked by quality + downloadability:
 > Qwen3-TTS (emotion-LoRA-only) while RU (Slavic, non-native) needs a real language-teaching corpus —
 > *plausible, consistent with the model's ZH+JA+EN training, but NOT verified against the model card.*
 > The cheap test is the **free base ear-check** per language before spending on a dataset.
+
+### Trained packs + recommended `--expr-weight` (ear-tuned 2026-06-13)
+| Lang | Pack | Source | Loss | Recommended weight (ear) |
+|---|---|---|---|---|
+| 🇷🇺 RU | `russian_bb027_r32.expr` | RESD (MIT) | 4.64 | **0.2** (full rushes the pace; 0.2 ≈ natural, base-like duration) |
+| 🇰🇷 KO | `korean_bb027_r32.expr` | ETOD 5% (NC) | 4.30 | **~0.6–1.0** (duration stable at full; sad@0.6+EN-instruct = TOP) |
+| 🇧🇷 PT | `portuguese_bb027_r32.expr` | = Spanish pack (transfer) | — | **~0.6** |
+| 🇯🇵 JA | `japanese_bb027_r32.expr` | JVNV (CC-BY-SA) | _training_ | _TBD after A/B_ |
+All broad-band L00-27 r32, 1.7B, ~90MB factored. Apply: `-l <Lang> --expr <pack> --expr-weight <w>` +
+EN instruct (`-I`) at `-T 1.1` for emotion. RU's low weight = the LoRA over-forces pace on a non-native
+language; KO/PT don't (KO native-ish, PT rides the Spanish pack).
