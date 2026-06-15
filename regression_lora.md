@@ -99,3 +99,55 @@ See the PLAN TODO. Start with Italian (EMOVO is ready), then FR/DE/ES/...
 **Acceptance check:** with `galatea_icl.qvoice` (small ICL) + CV 1.7B + new L16-26 LoRA, SAD must move
 (mel-corr meaningfully < neutral baseline), neutral timbre must NOT drift, duration must stay sane — and the
 new `.expr` must parse as L16-26 only (ICL owns timbre layers, LoRA owns emotion layers).
+
+---
+
+## 7. THE WOW RECIPE FOUND — DENSE full-FT, not LoRA; graft, not full-WDELTA (2026-06-15 pt2)
+
+Ear-testing the L16-26 LoRA showed it moves clones only weakly. Retracing the original "WOW" work: the
+first expressivity result was a **FULL fine-tune** (`dgx_sft_expr.py`, EMOVO Italian, 5 epochs) — NOT a LoRA.
+That FT was **already restricted to L16-26** (`is_trainable()` = L16-26 gate_proj+attn + text_projection); the
+4 GB is just the full checkpoint. So the WOW vs now is **DENSE full-rank vs LoRA low-rank on the SAME L16-26
+layers** — a CAPACITY difference, not a band difference.
+
+- The FT checkpoint is still local: `qwen3-tts-1.7b-expr/` (4.2 GB) and on DGX `out_expr/checkpoint-final`.
+- Regenerated the **dense route-a `.expr`** with `tests/expr_extract.py qwen3-tts-1.7b qwen3-tts-1.7b-expr` →
+  `presets/expr/italian_l1626_dense.expr` (186 MB, 72 tensors = 55 bf16 L16-26 deltas + 17 f32 norms, dtype 4).
+  Lossless: it stores the bf16 BIT delta `(expr_bits − cv_bits)`; apply does `cur_bits + delta`.
+
+**A/B (galatea, T1.1): the LoRA ≈ no-expr (~3 s, "does nothing"); the DENSE radically changes the output.**
+
+**🔴 CRITICAL GOTCHA — the dense (dtype-4 bit-delta) is ONLY valid on CV-INTACT weights:**
+- ✅ preset · ✅ `--icl-only` graft · ✅ small-ICL  (CV weights intact → `cur_bits + delta = expr_bits`, exact)
+- ❌ **full-WDELTA** (`--load-voice x.qvoice` WITHOUT `--icl-only`) → WDELTA replaced the CV bits with the
+  clone dump, so `clone_bits + delta` is a corrupted bf16 → **metallic garble + runaway duration (8.5 s)**.
+  (The LoRA dtype-5 path adds in REAL float so it never garbles — it's just weak.)
+
+**THE RECIPE (ear-confirmed WOW on the clone, 2026-06-15):**
+```
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/galatea_17b.qvoice --icl-only \
+  --expr presets/expr/italian_l1626_dense.expr -l Italian -T 1.1 --seed 42 \
+  --instruct "<EN emotion instruct>" --text "..."
+```
+Graft = x-vector timbre with **no ref_codes prosody anchor**, so emotion (CV + dense FT + instruct) moves
+freely. Small-ICL keeps the 375 ref_codes → more timbre-faithful but emotion is damped (the anchor cascades
+the reference's neutral delivery onto everything downstream). Trade-off: graft = more emotion, slightly less
+timbre lock; small-ICL = more faithful, less emotive.
+
+## 8. Honest ceiling + the real next lever (user's theory, assessed 2026-06-15)
+
+User's architecture — "small x-vector timbre + a heavier per-language DENSE fine-tune (melody/timing/emotion
++ paralinguistics) = native-believable for presets AND clones" — is **correct as an architecture** (strong
+per-language base + light speaker adapter = exactly the graft+dense we found). Corrections:
+1. ref_codes are NOT just prosody — they're full acoustic codec tokens (timbre+prosody+delivery). x-vector is
+   the pure identity. So "keep timbre at x-vector + let the FT drive prosody" IS the graft.
+2. The jump from "moves a bit" → "everything WOW" comes from **DATA + FT CAPACITY**, not more clone tricks:
+   588 EMOVO clips (emotion-only) is tiny. Need a bigger, varied Italian set (prosody + paralinguistics:
+   sighs/laughs) and a **DENSE** FT (optionally a wider-but-DENSE band, NOT the low-rank bb027), tested on the
+   graft. Possibly per-voice FT for a specific clone.
+3. Hard ceiling: Qwen3-TTS does Italian by cross-lingual transfer (mainly from EN/ryan); a small FT improves
+   but can't fully nativize a non-native preset (vivian=Chinese) or an arbitrary clone.
+
+**NEXT (roadmap):** (a) git-track `italian_l1626_dense.expr` (done); (b) re-do FR/DE/ES as DENSE full-FTs on
+the DGX (`dgx_sft_expr.py`, not the LoRA) + extract dense `.expr`; (c) grow the Italian dataset (varied prosody
++ paralinguistics) and train a denser/wider FT; (d) `make test-lora-it` should use the graft+dense recipe.
