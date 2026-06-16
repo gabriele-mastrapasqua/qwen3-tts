@@ -71,3 +71,47 @@ mkdir qwen3-tts-1.7b-expr-multi && scp dgx:.../checkpoint-final/model.safetensor
 python3 tests/expr_extract.py qwen3-tts-1.7b qwen3-tts-1.7b-expr-multi presets/expr/<name>.expr --lang Italian
 # A/B preset ryan IT vs EN, and (separately) the clone — see tests/emo_score.py
 ```
+
+## Where everything lives
+
+REPO (committed, `feat/server-batching`):
+- `training/expressivity-lora/` — all scripts above + this doc.
+- `tests/emo_score.py` (SER), `tests/expr_extract.py` (checkpoint → `.expr`), `tests/compare_audio.py` (mel).
+- `presets/expr/italian_l1626_dense.expr` — the EMOVO-only Italian pack (tracked, validated).
+
+LOCAL only (NOT committed — large / gitignored):
+- `presets/expr/italian_multi_l1626_dense.expr` — UNtagged mixed pack (flawed: corrupts Italian). Diagnostic.
+- `presets/expr/italian_multitag_l1626_dense.expr` — **tagged** mixed pack (the fix, run-1). 197 MB.
+- `qwen3-tts-1.7b-expr-multi*/` — the pulled FT checkpoints (3.8 GB each).
+- `samples/diag/` — the ryan A/B clips (see listening guide); `samples/multispk_ab*/` — clone A/B.
+
+DGX (`~/qwen-ft/`):
+- datasets: `esd/`, `cremad/`, `emovo/` (each has `train_with_codes.jsonl`); merged: `multi_emotion/`,
+  `multi_emotion_tagged/`.
+- checkpoints: `out_multi_l1626/` (untagged 5ep), `out_multi_l1626_tagged/` (tagged 5ep).
+- logs/markers: `multi_emotion.log` + `*.DONE`, `multi_tagged.log` + `multi_tagged.DONE`.
+- images: `qwen-ft:latest` (use this), `nvcr.io/...pytorch` (broken torchaudio — avoid for our code).
+
+## Listening guide (A/B clips, in `samples/diag/`)
+
+The decisive test = does the **language tag** stop the mixed FT from wrecking Italian?
+```
+# ITALIAN  (ryan, T1.1, "Domani vado al mercato...")
+ryan_neu.wav / ryan_anger.wav / ryan_sad.wav            # no expr (baseline)
+ryan_multi_neu.wav / ryan_multi_anger.wav / ...         # UNTAGGED mixed expr (broken: "foreign" Italian)
+ryan_tag_neu.wav  / ryan_tag_anger.wav  / ryan_tag_sad.wav   # TAGGED mixed expr (the fix)
+# ENGLISH  (ryan, T1.1)
+ryanEN_*.wav (no expr) / ryanEN_multi_*.wav (untagged) / ryanEN_tag_*.wav (tagged)
+```
+Clone A/B (`samples/multispk_ab/`): `neu_<cond>.wav`, `<emotion>_<cond>.wav` for cond ∈ {noexpr,emovo,multi}.
+
+## Status & open items (2026-06-16)
+
+- ✅ Pipeline built, language-imbalance bug found, language-tag fix implemented + verified (self-test).
+- ✅ Tagged FT (run-1, same data) trained → `italian_multitag_l1626_dense.expr`. **Ear-verdict on the IT
+  cure = PENDING** (does ryan-IT stop degrading while EN stays strong?).
+- ⏭ **run-2**: if the tag cures it, add MORE Italian emotional data (oversample EMOVO via
+  `concat_manifests.py --repeat`, and/or a new IT corpus) to give the Italian path strength.
+- 🔵 **SEPARATE problem — clone emotion**: a cloned `.qvoice` graft still resists emotion (x-vector OOD).
+  Not solved by multilingual data; needs a different lever (better speaker embedding / disentanglement).
+- knobs: temp ≤ 1.3 (1.5 slurs IT); instruct in English (model is EN/ZH-centric).
