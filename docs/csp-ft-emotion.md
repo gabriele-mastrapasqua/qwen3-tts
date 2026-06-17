@@ -24,6 +24,21 @@ cloned `.qvoice`, in Italian, with no word/length glitches. Ear-validated.
   ones used in training (see `training/expressivity-lora/prepare_emozionalmente.py` EMO map).
 - Per-emotion ear verdict: **anger sensible, sad good, joy so-so** (joy is the hardest).
 
+### Per-emotion / per-voice weight (ear-tuned 2026-06-17 — weight is NOT one global value)
+- **anger → w1.2** (stronger, more incisive, fluid) on both ryan and vivian.
+- **calmer emotions (sad, etc.) → w1.0** (more precise; w1.2 over-pushes prosody).
+- **ryan**: lower volume, tolerates w1.2 well; stays Italian.
+- **vivian**: louder + clearer in Italian than ryan (brighter preset), BUT at **w1.2 on low-arousal emotions
+  it drifts toward a Chinese accent** — vivian's weight ceiling is lower; keep vivian ≤ w1.0 except anger.
+  (Theory: pushing the emotion delta hard surfaces vivian's native-CN manifold.)
+- → recommended default: **w1.0 globally, bump to w1.2 only for anger** (and per-voice cap vivian).
+
+### Known artifacts to investigate (ear, 2026-06-17)
+- **Final-word lengthening** on high-arousal/fear (e.g. fear ends "oggiiii", elongated last word) at w1.2
+  (and sometimes w1.0). The emotion over-extends final duration — try lower weight / check if inherent.
+- **Volume mismatch**: ryan quiet vs vivian loud → loudness-normalize outputs for consistency.
+- **Clone metallic** (galatea) — see refinements below (NOT clipping; graft/lite-qvoice fidelity).
+
 ## How it was built
 
 1. **Data** (`prepare_emozionalmente.py`): EMOVO (0.5h, 6 pro actors) + **Emozionalmente** (~6h, 431 actors,
