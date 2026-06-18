@@ -200,7 +200,10 @@ model. It's a small LoRA delta on the Talker's emotion layers, applied at load w
 - **Preset → `_r32` pack; cloned voice → `_r64`** (clones need more capacity). `--expr-weight <m>` doses it.
   **Clone defaults: T1.3, weight ~1.6–2.0** (preset: T1.1, ~1.0–1.2); above that it over-steers.
 - Instruct in **English/Chinese**, spoken text in the target language, temperature **1.1–1.3**.
-- `.expr` files are artifacts (host on releases); **train your own for any language** with the
+- **Pretrained Italian emotion adapters** (2-block + 4-block "capacity ladder") are on Hugging Face →
+  [**gabrione/qwen3-tts-italian-expr**](https://huggingface.co/gabrione/qwen3-tts-italian-expr). More
+  per-language adapters will be published there.
+- `.expr` files are large artifacts (hosted on HF, not committed); **train your own for any language** with the
   reusable recipe in [`training/expressivity-lora/`](training/expressivity-lora/).
 
 > How it works (which layers, why it's only ~16–63 MB, the file format) → [docs/expressivity-lora.md](docs/expressivity-lora.md)
