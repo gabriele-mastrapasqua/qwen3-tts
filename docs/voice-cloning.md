@@ -9,18 +9,38 @@ server, streaming), see [Custom Voices](custom-voices.md).
 
 ## Quick Start
 
+> **The default clone is x-vector-only** — `--xvector-only`, saved as a tiny 8 KB `.bin`.
+> It carries abstract speaker identity *without* the reference recording's room acoustics,
+> so the clone is clean (no faint "muffled metallic / reverb" leak) and leaves more force
+> headroom for emotion/`.expr` control. The big WDELTA `.qvoice` (GBs) is **not** needed
+> for this path. Use the `.qvoice` / `--icl-only` route only when you want **maximum timbre
+> mimicry** from a studio-clean reference (see [Custom Voices](custom-voices.md)).
+>
+> ```bash
+> # Clone straight to an 8 KB .bin x-vector
+> ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio reference.wav -l Italian \
+>     --xvector-only --save-voice voices/mario.bin
+>
+> # ...or extract the x-vector from an existing .qvoice
+> python3 tests/qvoice_to_xvec.py voices/mario.qvoice    # → voices/mario.bin
+>
+> # Use it on the CustomVoice model (with --expr / emotion control)
+> ./qwen_tts -d qwen3-tts-1.7b --load-voice voices/mario.bin --xvector-only \
+>     --text "Ciao, come stai?" -o output.wav
+> ```
+
 ```bash
 # Download the Base model (has speaker encoder for voice cloning)
 ./download_model.sh --model base-small   # 0.6B-Base (faster, good quality)
 ./download_model.sh --model base-large   # 1.7B-Base (slower, best clone quality)
 
-# Clone a voice from a WAV file
+# Clone a voice from a WAV file (x-vector-only — the default)
 ./qwen_tts -d qwen3-tts-1.7b-base --text "Hello, this is my cloned voice." \
-    --ref-audio reference.wav -o cloned.wav
+    --ref-audio reference.wav --xvector-only --save-voice voices/me.bin
 
 # Clone with Italian text
 ./qwen_tts -d qwen3-tts-1.7b-base --text "Ciao, questa e la mia voce clonata." \
-    --ref-audio reference.wav -l Italian -o cloned_it.wav
+    --ref-audio reference.wav -l Italian --xvector-only -o cloned_it.wav
 ```
 
 ## Model Comparison

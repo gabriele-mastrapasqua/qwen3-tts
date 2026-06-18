@@ -19,7 +19,17 @@
 > ```
 > The `ryan` preset cross-speaks EN/IT/FR/ES well.
 
-> ## ★★ Emotion on a CLONED voice — the `--icl-only` graft (ear-validated 2026-06-09)
+> ## ★★ Emotion on a CLONED voice
+>
+> > **DEFAULT (updated 2026-06-18): x-vector-only from a tiny 8 KB `.bin`.** The ICL graft documented below
+> > works, but the ICL `ref_codes` carry the reference RECORDING'S room acoustics (a faint "muffled metallic /
+> > reverb") that gets re-injected every generation — and an `.expr` amplifies it. The speaker x-vector carries
+> > identity WITHOUT the room → clean clone, identity preserved, and more force headroom for the `.expr`
+> > (`-T 1.3`, weight ~1.6–2.0). Make the `.bin`: `python3 tests/qvoice_to_xvec.py voices/x.qvoice`, then
+> > `--load-voice voices/x.bin --xvector-only`. Keep `--icl-only` (below) only for maximum timbre mimicry from
+> > a studio-clean reference. Full analysis: `docs/csp-ft-emotion.md`, `docs/icl-graft-portability.md`.
+>
+> ### The `--icl-only` graft (ear-validated 2026-06-09) — alternative, max mimicry
 > A normal `.qvoice` **resists instruct**: loading it SWAPS the CustomVoice (CV) weights for the
 > base-cloned weights, and the base weights follow an instruct ~**3.8× weaker** (measured: emotion
 > relative-shift 25% preset → 6.6% qvoice). The voice is faithful but emotionally frozen — and forcing it

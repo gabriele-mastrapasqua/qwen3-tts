@@ -4,7 +4,33 @@ Save a cloned voice to a `.qvoice` file once, then reuse it forever — on the B
 on the CustomVoice model (with `--instruct` style control), on the server, with streaming.
 No re-extraction needed.
 
-## Delta Format (Recommended)
+> **Default clone is now x-vector-only (tiny 8 KB `.bin`).** For most uses — and
+> *especially* for emotion/`.expr`-driven generation — prefer the speaker **x-vector**
+> over a full ICL `.qvoice`. An ICL `.qvoice` carries `ref_codes` (the codec of the
+> reference *recording*), which re-injects that recording's room acoustics (a faint
+> "muffled metallic / reverb") into every generation — and an `.expr` amplifies it.
+> The x-vector carries abstract identity **without the room**: clean clone, identity
+> preserved, and more force headroom for the `.expr`.
+>
+> ```bash
+> # Extract the x-vector from an existing .qvoice into an 8 KB .bin
+> python3 tests/qvoice_to_xvec.py voices/mario.qvoice    # → voices/mario.bin
+>
+> # ...or clone straight to a .bin (no big .qvoice needed)
+> ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio ref24k.wav -l Italian \
+>     --xvector-only --save-voice voices/mario.bin
+>
+> # Use it (x-vector-only path)
+> ./qwen_tts -d qwen3-tts-1.7b --load-voice voices/mario.bin --xvector-only \
+>     --text "Ciao, come stai?" -o output.wav
+> ```
+>
+> Keep the `.qvoice` / `--icl-only` path below as the **alternative for maximum timbre
+> mimicry** from a studio-clean reference. The multi-GB WDELTA `.qvoice` is **not** needed
+> for the x-vector path. See also [CSP-FT emotion](csp-ft-emotion.md) and
+> [ICL graft portability](icl-graft-portability.md).
+
+## Delta Format (`.qvoice` — for maximum timbre mimicry)
 
 The Delta format is the recommended way to create custom voices. It produces output that is
 **bit-identical** to a direct Base model clone, while running on the faster CustomVoice model.
@@ -103,10 +129,18 @@ original clone when loaded on CustomVoice.
 | **Instruct support (1.7B)** | Yes | Yes |
 | **Server support** | Yes | Yes |
 
-**When to use Delta:** Voice accuracy matters — podcasts, audiobooks, production use.
+**When to use Delta:** Maximum timbre mimicry from a studio-clean reference — podcasts,
+audiobooks where you want the exact voice and the reference is acoustically pristine.
 
 **When to use Standard:** You want a small portable file and "close enough" is fine,
 or you only run on the Base model.
+
+**When to use x-vector-only (`.bin`, the default):** Emotion/`.expr`-driven generation,
+or any reference that isn't studio-clean. The x-vector preserves identity without the
+reference recording's room acoustics, and leaves more force headroom for the `.expr`
+(see callout at the top). Recommended emotion/expr settings: x-vector clone @ **T1.3,
+`--expr-weight ~1.6–2.0`** (anger ~2.0); preset voices @ T1.1, ~1.0–1.2. Pushing
+`w2.5/T1.3` over-steers (the voice *svaria* and loses the language).
 
 ## Managing Voice Profiles
 

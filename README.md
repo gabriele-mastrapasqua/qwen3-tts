@@ -89,8 +89,10 @@ Optional:
   --max-duration <secs>      Max audio duration in seconds
   --seed <n>                 Random seed for reproducible output
   --ref-audio <path>         Reference audio for voice cloning (Base model)
-  --save-voice <path>        Save voice profile (.qvoice)
-  --load-voice <path>        Load voice profile (.qvoice)
+  --save-voice <path>        Save voice profile (.qvoice = full, .bin = x-vector only)
+  --load-voice <path>        Load voice profile (.qvoice or .bin)
+  --xvector-only             Clone via speaker x-vector only — clean, 8KB .bin (recommended for expr/emotion)
+  --icl-only                 Graft mode: keep CV weights, use the .qvoice ICL prefix (max timbre mimicry)
   --target-cv <dir>          CV model dir for delta encoding (bit-identical cross-model)
   --list-voices <dir>        List .qvoice files in directory (no model needed)
   --delete-voice <path>      Delete a .qvoice file
@@ -186,13 +188,17 @@ model. It's a small LoRA delta on the Talker's emotion layers, applied at load w
     --instruct "Speak with hot, furious anger, sharp and forceful." \
     --text "Allora, lascia che ti spieghi come stanno le cose." -o angry.wav
 
-# cloned voice (graft) — use the higher-rank pack for clones
-./qwen_tts -d qwen3-tts-1.7b --load-voice voices/myvoice.qvoice --icl-only -l Italian -T 1.1 \
-    --expr presets/expr/italian_r64.expr --instruct "..." --text "..." -o out.wav
+# cloned voice — DEFAULT is x-vector-only from a tiny 8KB .bin: clean (no room-reverb), more force headroom
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/myvoice.bin --xvector-only -l Italian -T 1.3 \
+    --expr presets/expr/italian_r64.expr --expr-weight 2.0 --instruct "..." --text "..." -o out.wav
+# make the .bin once: python3 tests/qvoice_to_xvec.py voices/myvoice.qvoice   (or --ref-audio + --xvector-only --save-voice)
 ```
 
-- **Preset → `_r32` pack; cloned voice → `_r64`** (a clone's identity damps emotion, so it needs
-  more capacity). `--expr-weight <m>` doses it (1.0 = as trained, 0.6 = subtler).
+- **Cloned voices default to `--xvector-only`** (an 8 KB `.bin`): the ICL `.qvoice` carries the reference
+  recording's room reverb (a faint metallic artifact the `.expr` amplifies); the x-vector drops it while
+  keeping identity, and takes higher weight. Use `--icl-only` only for maximum timbre mimicry from a clean ref.
+- **Preset → `_r32` pack; cloned voice → `_r64`** (clones need more capacity). `--expr-weight <m>` doses it.
+  **Clone defaults: T1.3, weight ~1.6–2.0** (preset: T1.1, ~1.0–1.2); above that it over-steers.
 - Instruct in **English/Chinese**, spoken text in the target language, temperature **1.1–1.3**.
 - `.expr` files are artifacts (host on releases); **train your own for any language** with the
   reusable recipe in [`training/expressivity-lora/`](training/expressivity-lora/).

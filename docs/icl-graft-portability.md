@@ -4,6 +4,33 @@ Answers PLAN A2 #1 (ICL vs WDELTA — peso + "funziona ovunque?") and #4 (peso p
 salvare/riusare + compressione → mini `.qvoice-lite`). Measured 2026-06-09 on M1,
 galatea_17b.qvoice (1.7B) + galatea_06b.qvoice (0.6B).
 
+> ## ⭐ DEFAULT clone path = x-vector-only `.bin` (2026-06-18)
+> The default way to clone is now an **8 KB x-vector-only `.bin`**:
+> ```bash
+> ./qwen_tts -d qwen3-tts-1.7b --load-voice voices/X.bin --xvector-only \
+>   -l Italian --expr <emotion.expr> --instruct "<EN instruct>" --text "<IT text>" \
+>   -T 1.3 -o out.wav
+> ```
+> Make the `.bin` from an existing qvoice (or straight from a ref recording):
+> ```bash
+> python3 tests/qvoice_to_xvec.py voices/X.qvoice
+> # or, clone straight to a .bin from a ref recording (the engine, not the helper):
+> ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio ref_24k_mono.wav --xvector-only \
+>   --save-voice voices/X.bin
+> ```
+> **Why x-vector-only is the default (ear-validated 2026-06-18):** the ICL `ref_codes`
+> carry the reference RECORDING's **room acoustics** (a faint "muffled metallic / reverb")
+> which gets re-injected on every generation, and an `.expr` **amplifies** it. The x-vector
+> carries the speaker IDENTITY **without** the room → clean output, identity preserved, and
+> it tolerates a **higher `.expr` weight** (the ICL amplification path is gone, so you can
+> push the expr harder for the same emotional movement). **Key measured fact:** the lite
+> `galatea_icl.qvoice` and the 2.8 GB `galatea_17b.qvoice` have **byte-identical x-vectors**
+> (cosine 1.0000) — so the clean-vs-metallic difference was the **ICL ref_codes, NOT
+> embedding quality**. Defaults: **T1.3, weight ~1.6–2.0** (`w2.5/T1.3` svaria; joy/disgust
+> stay flat with weight → training ceiling, retrain `top_k=4`). Keep `--icl-only` (§5) as the
+> alternative for **max timbre mimicry** from a studio-clean ref. See also
+> `docs/csp-ft-emotion.md`.
+
 ## 1. What a `.qvoice` actually contains (byte breakdown)
 
 Parser: `tests/qvoice_anatomy.py <file.qvoice>`. The file is sequential sections:
@@ -144,16 +171,25 @@ flag (0/6000 differ). Fix: compile that one TU **without `-ffast-math`** (Makefi
 an offline one-time path, not a hot loop. (Belt-and-suspenders root-cause with Valgrind on Linux
 is a PLAN TODO — full-model ASan is unusably slow/stuck on M1.)
 
-### Emotion caveat (still open)
+### Emotion caveat (still open) + the room-reverb cost of ref_codes
 Emotion barely moves on an ICL voice even at T1.3 + extreme instruct: the ref_codes are a very
 strong prosody anchor (that's *why* identity is ~perfect) and they damp the instruct. Trade-off:
 stronger clone anchor → less emotion (x-vector graft emotes more but is a weaker/different voice).
 Next lever: an `--icl-frames N` knob to dilute the anchor (fewer reference frames). Also: aggressive
 sampling knobs (high rep_pen, Dawizzer-style) can break EOS → runaway generation; calibrate gently.
 
+> **There is a second, acoustic cost to ref_codes (why x-vector-only is the DEFAULT now,
+> 2026-06-18):** the ref_codes encode the reference RECORDING's **room acoustics** and re-inject
+> that faint "muffled metallic / reverb" on every generation; an `.expr` amplifies it. We confirmed
+> the x-vector itself is NOT the problem: the lite `galatea_icl.qvoice` and the 2.8 GB
+> `galatea_17b.qvoice` carry **byte-identical x-vectors (cosine 1.0000)** → the clean-vs-metallic
+> difference is the **ICL ref_codes, not embedding quality**. So x-vector-only (`--xvector-only`)
+> is clean and tolerates higher `.expr` weight; ICL stays the choice when you need **max timbre
+> mimicry** from a **studio-clean** ref where the room is already controlled.
+
 ### Size ladder (reusable voice)
 | format | 1.7B | fidelity | emotion | notes |
 |--------|------|----------|---------|-------|
 | full WDELTA qvoice | 2.9 GB | perfect | ✗ frozen | the original |
-| **ICL-lite (ref_codes)** | **~24 MB** | **~perfect** | weak | recommended; instruct-capable |
-| x-vector graft (`--icl-only`) | 8 KB / 24.6 MB | different/androgynous | ✓ | emotes but loses identity |
+| ICL-lite (ref_codes) | ~24 MB | ~perfect | weak | **max timbre mimicry** (studio-clean ref); carries the room reverb |
+| **x-vector-only `.bin` (`--xvector-only`)** | **~8 KB** | **identity preserved, clean** | **✓ (tolerates high `.expr` weight)** | **DEFAULT (2026-06-18)** — no room reverb, byte-identical x-vector to the full qvoice |

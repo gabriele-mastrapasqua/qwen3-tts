@@ -15,17 +15,23 @@ skip all loading overhead and go straight to inference.
 # Basic — preset voices
 ./qwen_tts -d qwen3-tts-0.6b --serve 8080
 
-# With a custom voice preloaded
-./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario.qvoice --serve 8080
+# With a custom voice preloaded — DEFAULT: 8 KB x-vector .bin (clean, no room reverb)
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario.bin --xvector-only --serve 8080
+
+# ALTERNATIVE: ICL .qvoice graft at startup, for max timbre mimicry
+./qwen_tts -d qwen3-tts-0.6b --load-voice voices/mario.qvoice --icl-only --serve 8080
 
 # With INT8 quantization (1.7B)
 ./qwen_tts -d qwen3-tts-1.7b --int8 --serve 8080
 ```
 
-When started with `--load-voice`, the server preloads the `.qvoice` at startup
-(including WDELTA weight deltas if present). The voice language is preserved from
-the `.qvoice` metadata across all requests — clients don't need to specify language
-or speaker.
+Cloning is set **at server start** via `--load-voice` (per-request bodies are preset-only —
+there is no per-request clone field). The recommended default is the 8 KB **x-vector `.bin`**
+with `--xvector-only`: it carries identity without the reference recording's room reverb, so it
+stays clean across requests. Make it with `python3 tests/qvoice_to_xvec.py voices/X.qvoice`. The
+ICL `.qvoice` with `--icl-only` also works at startup (preloading WDELTA weight deltas if present)
+for maximum timbre mimicry. The voice language is preserved from the voice metadata across all
+requests — clients don't need to specify language or speaker.
 
 ## Endpoints
 

@@ -83,6 +83,15 @@ fraction of the size.
 
 ## 4. Per-voice rank: rank compensates the clone's damping
 
+> **Clone DEFAULT = x-vector-only `.bin`.** The recommended clone is now an 8 KB **x-vector
+> `.bin`** (`--load-voice voices/X.bin --xvector-only`), not the ICL `.qvoice`. The `.qvoice`
+> `ref_codes` carry the reference recording's room reverb (a faint "muffled metallic"), re-injected
+> every generation and *amplified* by the `.expr`; the x-vector keeps identity without the room —
+> cleaner, with more force headroom so you can push `--expr-weight` higher (~1.6–2.0, T1.3). Make the
+> `.bin` with `python3 tests/qvoice_to_xvec.py voices/X.qvoice`. Keep `--icl-only` (below) as the
+> alternative when you want maximum timbre mimicry from a clean reference. See
+> [`docs/csp-ft-emotion.md`](csp-ft-emotion.md) and [`docs/icl-graft-portability.md`](icl-graft-portability.md).
+
 A **preset** voice responds strongly to the delta; a **cloned** voice emotes ~3-4× weaker at the same
 delta, because its x-vector identity signal damps the expressive response (a structural cap). The
 fix is **rank**, not magnitude:
@@ -119,20 +128,28 @@ The `B·A` reconstruction is a one-time ~sub-second cost at load.
 ## 6. CLI
 
 ```bash
-# preset
+# preset (T1.1, weight ~1.0–1.2)
 ./qwen_tts -d qwen3-tts-1.7b -s vivian -l Italian -T 1.1 \
   --expr presets/expr/italian_lora_r32.expr \
   --instruct "<vivid English instruction>" --text "<Italian text>" -o out.wav
 
-# cloned voice (graft) — higher rank for the clone
+# cloned voice — DEFAULT: x-vector-only .bin (clean, more force headroom), T1.3 + weight ~1.6–2.0
+python3 tests/qvoice_to_xvec.py voices/myvoice.qvoice         # one-time: make the 8 KB .bin
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/myvoice.bin --xvector-only -l Italian -T 1.3 \
+  --expr presets/expr/italian_lora_r64.expr --expr-weight 1.8 \
+  --instruct "<vivid English instruction>" --text "<Italian text>" -o out.wav
+
+# cloned voice — ALTERNATIVE: ICL .qvoice graft for max timbre mimicry from a clean ref
 ./qwen_tts -d qwen3-tts-1.7b --load-voice voices/myvoice.qvoice --icl-only -l Italian -T 1.1 \
   --expr presets/expr/italian_lora_r64.expr \
   --instruct "<vivid English instruction>" --text "<Italian text>" -o out.wav
 ```
 
 - `--expr <file>` — apply the expressivity delta on top of the loaded voice (1.7B only).
-- `--expr-weight <m>` — scale a **factored-LoRA** `.expr` at load (1.0 = as trained, 0.6 = subtler;
-  useful range ~0.5–1.1; dense `.expr` can't be scaled meaningfully). No retraining needed.
+- `--expr-weight <m>` — scale a **factored-LoRA** `.expr` at load (1.0 = as trained, 0.6 = subtler).
+  On a **preset** ~1.0–1.2; on the **x-vector clone** push higher ~1.6–2.0 (anger ~2.0) at T1.3 —
+  the clean x-vector identity gives the headroom (`w2.5/T1.3` over-steers). Dense `.expr` can't be
+  scaled meaningfully. No retraining needed.
 
 Recipe note: the spoken text is in the target language (`-l`), but the **instruct stays in English/
 Chinese** (the model's instruct-following is EN/ZH-centric) — see `docs/expressivity.md`.

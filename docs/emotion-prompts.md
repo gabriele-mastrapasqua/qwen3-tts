@@ -13,8 +13,13 @@ knobs (those only add arousal — see `docs/expressivity.md` and PLAN RUN-7).
   -T 1.1 --seed 42 --text "<your text>" -o out.wav
 ```
 
-- **Preset voice** (`-s ryan`) follows instruct strongest. **Cloned voice**: load a `.qvoice`
-  with `--icl-only` (the graft) — emotion works but is capped at *moderate* (no screaming/sobbing).
+- **Preset voice** (`-s ryan`) follows instruct strongest. **Cloned voice — DEFAULT**: load an
+  8 KB **x-vector `.bin`** with `--xvector-only` (`--load-voice voices/X.bin --xvector-only`) at
+  **T1.3** — it keeps identity without the reference recording's room reverb, so it's cleaner and
+  has more force headroom. Make the `.bin` with `python3 tests/qvoice_to_xvec.py voices/X.qvoice`.
+  *Alternative*: load a `.qvoice` with `--icl-only` (the ICL graft) for max timbre mimicry from a
+  clean ref — emotion works but is capped at *moderate* (no screaming/sobbing). See
+  [`docs/csp-ft-emotion.md`](csp-ft-emotion.md) and [`docs/icl-graft-portability.md`](icl-graft-portability.md).
 - **English instruct even for non-English speech** — the model's instruct-following is EN/ZH-centric.
 - **Temperature 1.1–1.3** (never `-T 0` = flat). **Seed-audition**: re-run with several `--seed`
   values and keep the best take — spontaneous paralinguistics (sighs, "ehhh…") emerge on *some* seeds.
