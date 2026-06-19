@@ -1101,6 +1101,7 @@ int main(int argc, char **argv) {
     const char *language = NULL;
     const char *instruct = NULL;
     float temperature = 0.9f;
+    int   temp_set = 0;              /* did the user pass -T explicitly? (for the emo-bump) */
     int top_k = 50;
     float top_p = 1.0f;
     float rep_penalty = 1.05f;
@@ -1256,7 +1257,7 @@ int main(int argc, char **argv) {
             case 'o': output = optarg; break;
             case 's': speaker_id = qwen_tts_speaker_id(optarg); break;
             case 'l': language = optarg; break;
-            case 'T': temperature = (float)atof(optarg); break;
+            case 'T': temperature = (float)atof(optarg); temp_set = 1; break;
             case 'k': top_k = atoi(optarg); break;
             case 'p': top_p = (float)atof(optarg); break;
             case 'r': rep_penalty = (float)atof(optarg); break;
@@ -1531,6 +1532,15 @@ int main(int argc, char **argv) {
         if (ml_decay != 1.0f || ml_frames > 0)
             fprintf(stderr, "ML-steer schedule: decay=%.3f/frame, first-frames=%d (0=all)\n",
                     ml_decay, ml_frames);
+    }
+
+    /* Emo-bump: when emotion is requested (--expr or --instruct) and the user did NOT set -T,
+     * raise the temperature so the emotion isn't flat — the neutral 0.9 default reads weak for
+     * emotional delivery (the recipe wants ~1.1–1.3). Neutral speech (no expr/instruct) keeps the
+     * stable 0.9 default. An explicit -T always wins. */
+    if (!temp_set && (expr_path || instruct)) {
+        temperature = 1.1f;
+        if (!silent) fprintf(stderr, "Emotion requested without -T -> temperature %.1f (emo-bump)\n", temperature);
     }
 
     /* Set parameters */
