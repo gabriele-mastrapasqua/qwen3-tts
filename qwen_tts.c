@@ -94,12 +94,14 @@ static int load_config(qwen_tts_ctx_t *ctx) {
     while (*tc_end && brace > 0) { if (*tc_end == '{') brace++; else if (*tc_end == '}') brace--; tc_end++; }
     
     long tc_len = tc_end - p; char *tc_json = (char *)malloc(tc_len + 1);
+    if (!tc_json) { free(json); return -1; }            /* leaks-audit #9: OOM NULL-check */
     memcpy(tc_json, p, tc_len); tc_json[tc_len] = '\0';
     
     /* Build a flat version of talker_config with nested objects removed.
      * This prevents json_find_key from matching keys inside nested objects
      * like code_predictor_config (whose fields shadow talker-level fields). */
     char *talker_only_json = strdup(tc_json);
+    if (!talker_only_json) { free(tc_json); free(json); return -1; }   /* leaks-audit #9 */
     {
         /* Repeatedly find and blank out nested {...} blocks */
         char *scan = talker_only_json;
@@ -157,6 +159,7 @@ static int load_config(qwen_tts_ctx_t *ctx) {
             const char *cp_close = strchr(cp_open, '}');
             if (cp_close) {
                 long cp_len = cp_close - cp_open + 1; char *cp_json = (char *)malloc(cp_len + 1);
+                if (!cp_json) { free(talker_only_json); free(tc_json); free(json); return -1; }  /* leaks-audit #9 */
                 memcpy(cp_json, cp_open, cp_len); cp_json[cp_len] = '\0';
                 c->cp_hidden_size = json_get_int(cp_json, "hidden_size", 1024);
                 c->cp_num_layers = json_get_int(cp_json, "num_hidden_layers", 5);
@@ -169,6 +172,7 @@ static int load_config(qwen_tts_ctx_t *ctx) {
             }
         }
     }
+    free(talker_only_json);   /* leaks-audit #9 bonus: was never freed (one-time load leak) */
     free(tc_json); free(json);
 
     snprintf(path, sizeof(path), "%s/speech_tokenizer/config.json", ctx->model_dir);
@@ -185,6 +189,7 @@ static int load_config(qwen_tts_ctx_t *ctx) {
                 const char *dc_close = dc_open + 1; int brace = 1;
                 while (*dc_close && brace > 0) { if (*dc_close == '{') brace++; else if (*dc_close == '}') brace--; dc_close++; }
                 long dc_len = dc_close - dc_open; char *dc_json = (char *)malloc(dc_len + 1);
+                if (!dc_json) { free(json); return -1; }            /* leaks-audit #9: OOM NULL-check */
                 memcpy(dc_json, dc_open, dc_len); dc_json[dc_len] = '\0';
                 c->dec_hidden_size = json_get_int(dc_json, "hidden_size", 512);
                 c->dec_num_layers = json_get_int(dc_json, "num_hidden_layers", 8);
@@ -429,11 +434,19 @@ static void dt_finish(decoder_thread_t *dt) {
 }
 
 static void dt_append_audio(decoder_thread_t *dt, const float *samples, int n) {
+    if (n <= 0) return;
     if (dt->audio_len + n > dt->audio_cap) {
-        dt->audio_cap = (dt->audio_len + n) * 2;
-        dt->audio_buf = (float *)realloc(dt->audio_buf, dt->audio_cap * sizeof(float));
+        /* Leaks-audit fix (#5): the old int `(audio_len+n)*2` overflowed on long audio → an
+         * undersized realloc then a memcpy heap-overflow. Size the growth in size_t and NULL-check
+         * realloc before the memcpy. (audio_len stays int — bounded well under INT_MAX by the
+         * sample-count pipeline; clamp the stored cap to avoid an int-cast UB at the extreme.) */
+        size_t newcap = ((size_t)dt->audio_len + (size_t)n) * 2;
+        float *nb = (float *)realloc(dt->audio_buf, newcap * sizeof(float));
+        if (!nb) return;   /* OOM: keep the old buffer and drop this chunk rather than crash */
+        dt->audio_buf = nb;
+        dt->audio_cap = newcap > (size_t)0x7FFFFFFF ? 0x7FFFFFFF : (int)newcap;
     }
-    memcpy(dt->audio_buf + dt->audio_len, samples, n * sizeof(float));
+    memcpy(dt->audio_buf + dt->audio_len, samples, (size_t)n * sizeof(float));
     dt->audio_len += n;
 }
 

@@ -183,6 +183,7 @@ static int stream_audio_callback(const float *samples, int n_samples, void *user
     if (!st->file) return -1;
     for (int i = 0; i < n_samples; i++) {
         float s = samples[i] * st->volume;
+        if (s != s) s = 0.0f;               /* leaks-audit #7: NaN passes both clamps → (int16_t)(NaN*32767) UB */
         if (s < -1.0f) s = -1.0f;
         if (s > 1.0f) s = 1.0f;
         int16_t sample = (int16_t)(s * 32767);
@@ -195,19 +196,25 @@ static int stream_audio_callback(const float *samples, int n_samples, void *user
 
 /* Write a WAV header with placeholder data size (will be updated at end) */
 static void write_wav_header(FILE *f, int sample_rate) {
-    int bits = 16, channels = 1;
-    int data_size = 0x7FFFFFFF;  /* placeholder for unknown length */
-    int file_size = 36 + data_size;
-    int byte_rate = sample_rate * channels * (bits/8);
-    short block_align = channels * (bits/8);
-    int fmt_size = 16; short audio_fmt = 1;
+    /* Leaks-audit fix (#4): WAV size fields are uint32 LE. The old code used signed int with a
+     * 0x7FFFFFFF placeholder, so `file_size = 36 + 0x7FFFFFFF` overflowed to a negative int (UB).
+     * Use uint32 and the conventional unknown-length streaming placeholder; finalize_wav_header
+     * overwrites both with the real (clamped) sizes when the stream ends. */
+    uint16_t bits = 16, channels = 1;
+    uint16_t block_align = channels * (bits/8);
+    uint16_t audio_fmt = 1;
+    uint32_t data_size = 0xFFFFFFFFu;            /* placeholder for unknown stream length */
+    uint32_t file_size = 0xFFFFFFFFu;
+    uint32_t byte_rate = (uint32_t)sample_rate * channels * (bits/8);
+    uint32_t fmt_size = 16;
+    uint32_t sr = (uint32_t)sample_rate;
     fwrite("RIFF", 1, 4, f);
     fwrite(&file_size, 4, 1, f);
     fwrite("WAVEfmt ", 1, 8, f);
     fwrite(&fmt_size, 4, 1, f);
     fwrite(&audio_fmt, 2, 1, f);
     fwrite(&channels, 2, 1, f);
-    fwrite(&sample_rate, 4, 1, f);
+    fwrite(&sr, 4, 1, f);
     fwrite(&byte_rate, 4, 1, f);
     fwrite(&block_align, 2, 1, f);
     fwrite(&bits, 2, 1, f);
@@ -215,14 +222,18 @@ static void write_wav_header(FILE *f, int sample_rate) {
     fwrite(&data_size, 4, 1, f);
 }
 
-/* Update WAV header with actual data size */
+/* Update WAV header with actual data size. Clamps to 0xFFFFFFFF so a >4GB / >~12h stream can't
+ * wrap the uint32 size fields (or overflow signed int as the old `total_samples*2` did). */
 static void finalize_wav_header(FILE *f, int total_samples) {
-    int data_size = total_samples * 2;  /* 16-bit mono */
-    int file_size = 36 + data_size;
+    uint64_t data_size = (uint64_t)(unsigned)total_samples * 2u;  /* 16-bit mono */
+    if (data_size > 0xFFFFFFFFu) data_size = 0xFFFFFFFFu;
+    uint64_t file_size = 36u + data_size;
+    if (file_size > 0xFFFFFFFFu) file_size = 0xFFFFFFFFu;
+    uint32_t ds = (uint32_t)data_size, fs = (uint32_t)file_size;
     fseek(f, 4, SEEK_SET);
-    fwrite(&file_size, 4, 1, f);
+    fwrite(&fs, 4, 1, f);
     fseek(f, 40, SEEK_SET);
-    fwrite(&data_size, 4, 1, f);
+    fwrite(&ds, 4, 1, f);
 }
 
 /* Write a tensor to .qvoice file, optionally as WDELTA (int8 compressed delta vs CV) */
