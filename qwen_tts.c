@@ -1590,6 +1590,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         double t_step_start = time_ms();
         if (qwen_talker_step(ctx, step_embed, last_hidden) != 0) {
             free(step_embed); free(last_hidden);
+            /* Leaks-audit fix (decoder-thread USE-AFTER-FREE): the decoder thread was spawned
+             * with &dt_state on THIS stack frame. Returning here without finishing+joining it
+             * leaves a live thread reading freed stack memory (UAF) and leaks dt_state buffers.
+             * Mirror the normal-exit cleanup (cf. the codec_frames==0 path below). */
+            dt_finish(&dt_state);
+            if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
+            qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
             return -1;
         }
         t_talker_step_total += time_ms() - t_step_start;
