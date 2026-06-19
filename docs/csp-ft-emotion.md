@@ -45,19 +45,23 @@ push the `.expr` harder for the same emotional movement). See `docs/icl-graft-po
   cap vivian ≤ w1.0 except anger.
 - → preset default: **w1.0 globally, bump anger to w1.2**. x-vector-clone default: **T1.3 + per-emotion above**.
 
-### Spanish & Romance transfer (ES / PT / FR) — `spanish_csp.expr`
+### Romance transfer (ES / PT / FR) — no separate file, just use the Italian pack
 The Italian CSP pack **transfers to Romance languages with NO retraining** — Spanish/Portuguese/French are close
-to Italian and the model's EN→Romance switch is strong. Ear-validated on **Spanish** (2026-06-18): same WIN
-weights, `-l Spanish`, **English** instruct, **T1.3**. Shipped as `spanish_csp.expr` = byte-identical WIN weights
-with the header language relabeled to Spanish (the `.expr` lang field is informational, not enforced against `-l`).
+to Italian and the base model's EN→Romance switch is strong. There is **no separate `spanish_csp.expr`**: the
+weights would be byte-identical, so for Spanish you simply load `italian_csp.expr` with `-l Spanish` (the `.expr`
+lang field is informational, not enforced against `-l`). A separate per-language file is reserved for when a
+**native** Spanish/etc. FT is trained on that language's own data.
 
 ```bash
 ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Spanish -T 1.3 \
-  --expr presets/expr/spanish_csp.expr --expr-weight 1.6 \
+  --expr presets/expr/italian_csp.expr --expr-weight 1.6 \
   -I "Speak with hot, furious anger, sharp and forceful." \
   --text "No puedo creer lo que ha pasado hoy." -o anger_es.wav
 ```
-- **All emotions: w1.6, T1.3** on the `ryan` preset (anger window 1.5–1.7; **>1.8 goes metallic, <1.4 whispers**).
+- **Spanish / Portuguese / French: ear-validated (2026-06-18/19)** — all emotions clean at **w1.6, T1.3** on
+  `ryan` (anger window 1.5–1.7; **>1.8 metallic, <1.4 whispers**). Just swap `-l Spanish|Portuguese|French`.
+  One caveat hit on French *sad* (a tail-degenerate glitch on the default seed): fixed by picking a non-glitch
+  seed — see the seed note below.
 - **Use the 2-block WIN pack, NOT the 4-block `topk4` on presets:** topk4 over-steers a clean preset and **drifts
   the language** (sad → French). topk4 is only for voices that already drift.
 - **Seed matters:** at T1.3 a few unlucky seeds land on a glitch trajectory (e.g. disgust glitched on seed 777,

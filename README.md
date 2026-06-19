@@ -202,10 +202,10 @@ model. It's a small LoRA delta on the Talker's emotion layers, applied at load w
 - Instruct in **English/Chinese**, spoken text in the target language, temperature **1.1–1.3**.
 - **Pretrained Italian emotion adapters** (2-block + 4-block "capacity ladder") are on Hugging Face →
   [**gabrione/qwen3-tts-italian-expr**](https://huggingface.co/gabrione/qwen3-tts-italian-expr).
-- **Spanish** (Romance cross-lingual transfer of the Italian pack, ear-validated) →
-  [**gabrione/qwen3-tts-spanish-expr**](https://huggingface.co/gabrione/qwen3-tts-spanish-expr). Apply with
-  `-l Spanish --expr spanish_csp.expr --expr-weight 1.6 -T 1.3` + an English instruct. The Italian CSP pack
-  transfers to Romance languages (ES/PT/FR) with no retraining; see [docs/csp-ft-emotion.md](docs/csp-ft-emotion.md).
+- **Romance transfer (ES / PT / FR), ear-validated:** the Italian pack doubles as the Romance emotion pack —
+  **no separate file**. Load it with the target language: `-l Spanish --expr italian_csp.expr --expr-weight 1.6
+  -T 1.3` + an English instruct (same for `Portuguese` / `French`). A dedicated per-language pack is reserved
+  for a future **native** FT. See [docs/csp-ft-emotion.md](docs/csp-ft-emotion.md).
 - `.expr` files are large artifacts (hosted on HF, not committed); **train your own for any language** with the
   reusable recipe in [`training/expressivity-lora/`](training/expressivity-lora/).
 
