@@ -150,3 +150,101 @@ int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, in
     fclose(f);
     return 0;
 }
+
+/* ---- Edge cleanup + glitch scoring (feat: onset-leveling / tail-trim / seed-audition) ----
+ * All operate on the decoded float PCM in place / read-only; default-OFF in main.c so the
+ * shipped golden output is bit-identical unless a flag opts in. */
+
+/* Index of the first sample where a 5ms window's RMS rises above a silence floor (~-50 dB).
+ * Skips the ~80ms of leading digital silence every render has, so an onset fade lands on the
+ * REAL attack, not on silence. Returns 0 if nothing crosses the floor. */
+int qwen_audio_first_onset(const float *s, int n, int sample_rate) {
+    int win = sample_rate / 200; if (win < 1) win = 1;          /* 5 ms */
+    const float floor_rms = 3.16e-3f;                            /* ~-50 dBFS */
+    for (int i = 0; i + win <= n; i += win) {
+        double e = 0.0;
+        for (int k = 0; k < win; k++) { float v = s[i+k]; e += (double)v * v; }
+        if (e / win > (double)floor_rms * floor_rms) return i;
+    }
+    return 0;
+}
+
+/* Apply a linear fade-in of fade_ms over the REAL onset (post leading-silence) to kill the
+ * attack "CRR" transient that strong emotion steering produces. In place. fade_ms<=0 = no-op. */
+void qwen_audio_onset_fade(float *s, int n, int sample_rate, int fade_ms) {
+    if (fade_ms <= 0 || n <= 0) return;
+    int onset = qwen_audio_first_onset(s, n, sample_rate);
+    int f = sample_rate * fade_ms / 1000;
+    if (f > (n - onset)) f = n - onset;
+    for (int k = 0; k < f; k++) s[onset + k] *= (float)k / (float)f;
+}
+
+/* Heuristic 0..1 score of a DEGENERATE TAIL (the "metallic/electric" noise some seeds emit
+ * after stopping the sentence early). Higher = worse. Read-only. Method: 10ms frames; find the
+ * loud region (RMS > -45 dB); take the speech-body median zero-crossing rate over its first 70%;
+ * flag a contiguous TRAILING run of loud frames whose ZCR exceeds 2.5x the body median (noise is
+ * high-ZCR vs voiced speech). score = min(1, flagged_ms/300). out_trim_at (optional) = sample
+ * index where the flagged tail begins (for trimming). */
+float qwen_audio_tail_glitch_score(const float *s, int n, int sample_rate, int *out_trim_at) {
+    if (out_trim_at) *out_trim_at = n;
+    int fr = sample_rate / 100; if (fr < 1) fr = 1;             /* 10 ms */
+    int nf = n / fr;
+    if (nf < 8) return 0.0f;
+    const float floor_rms = 5.62e-3f;                           /* ~-45 dBFS = "loud" gate */
+    float *zcr = (float *)malloc((size_t)nf * sizeof(float));
+    float *rms = (float *)malloc((size_t)nf * sizeof(float));
+    char  *loud = (char *)malloc((size_t)nf);
+    if (!zcr || !rms || !loud) { free(zcr); free(rms); free(loud); return 0.0f; }
+    for (int i = 0; i < nf; i++) {
+        const float *b = s + (size_t)i * fr;
+        double e = 0.0; int zc = 0;
+        for (int k = 0; k < fr; k++) { e += (double)b[k]*b[k]; if (k && ((b[k]>=0)!=(b[k-1]>=0))) zc++; }
+        rms[i]  = (float)sqrt(e / fr);
+        loud[i] = (rms[i] > floor_rms) ? 1 : 0;
+        zcr[i]  = (float)zc / (float)fr;
+    }
+    int last = -1; for (int i = nf - 1; i >= 0; i--) if (loud[i]) { last = i; break; }
+    int first = -1; for (int i = 0; i < nf; i++) if (loud[i]) { first = i; break; }
+    if (last < 0 || first < 0 || last - first < 6) { free(zcr); free(rms); free(loud); return 0.0f; }
+    /* speech-body medians (ZCR + RMS) over the loud frames in the first 70% of the span */
+    int body_end = first + (int)((last - first) * 0.7f);
+    float zb[4096], rb[4096]; int m = 0;
+    for (int i = first; i <= body_end && m < 4096; i++) if (loud[i]) { zb[m] = zcr[i]; rb[m] = rms[i]; m++; }
+    if (m < 3) { free(zcr); free(rms); free(loud); return 0.0f; }
+    for (int a = 1; a < m; a++) { float v=zb[a]; int b=a-1; while(b>=0&&zb[b]>v){zb[b+1]=zb[b];b--;} zb[b+1]=v; }
+    for (int a = 1; a < m; a++) { float v=rb[a]; int b=a-1; while(b>=0&&rb[b]>v){rb[b+1]=rb[b];b--;} rb[b+1]=v; }
+    /* A degenerate metallic tail is high-ZCR AND loud AND sustained — a clean fricative/breath
+     * ending is high-ZCR but QUIET, a loud release is short. Gate on all three. */
+    float zthr = zb[m/2] * 2.5f;  if (zthr < 0.20f) zthr = 0.20f;
+    float ethr = rb[m/2] * 0.6f;  if (ethr < 0.10f) ethr = 0.10f;
+    int run = 0, cur = -1, best_len = 0, best_start = -1;
+    for (int i = body_end + 1; i <= last; i++) {
+        if (loud[i] && zcr[i] > zthr && rms[i] > ethr) {
+            if (run == 0) cur = i;
+            run++;
+            if (run > best_len) { best_len = run; best_start = cur; }
+        } else run = 0;
+    }
+    free(zcr); free(rms); free(loud);
+    if (best_len < 8) return 0.0f;                              /* require >=80ms sustained noise */
+    int flagged = (last + 1) - best_start;
+    if (out_trim_at) *out_trim_at = best_start * fr;
+    float ms = (float)flagged * (float)fr * 1000.0f / (float)sample_rate;
+    float score = ms / 300.0f; if (score > 1.0f) score = 1.0f;
+    return score;
+}
+
+/* Conservative tail-trim: if the degenerate-tail score is high enough, cut the flagged trailing
+ * run (keeping a 15ms guard so a clean release isn't clipped). In place via *n. Returns samples
+ * trimmed. Gated default-off in main.c. */
+int qwen_audio_tail_trim(float *s, int *n, int sample_rate, float min_score) {
+    int trim_at = *n;
+    float sc = qwen_audio_tail_glitch_score(s, *n, sample_rate, &trim_at);
+    if (sc < min_score || trim_at >= *n) return 0;
+    int guard = sample_rate * 15 / 1000;                        /* keep 15ms of the release */
+    int new_n = trim_at + guard; if (new_n > *n) new_n = *n;
+    int trimmed = *n - new_n;
+    (void)s;
+    *n = new_n;
+    return trimmed;
+}

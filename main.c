@@ -1141,6 +1141,9 @@ int main(int argc, char **argv) {
     const char *load_voice = NULL;
     const char *expr_path = NULL;    /* --expr: additive expressivity weight delta (<lang>.expr) */
     float expr_weight = 1.0f;        /* --expr-weight: dose a factored-LoRA .expr (1=as trained) */
+    int   onset_fade_ms = 0;         /* --onset-fade <ms>: fade-in over the REAL attack (0=off) */
+    int   tail_trim = 0;             /* --tail-trim: cut a degenerate metallic tail (default off) */
+    int   seed_audition = 0;         /* --seed-audition <N>: render N seeds, keep cleanest (0=off) */
     const char *list_voices_dir = NULL;
     const char *delete_voice = NULL;
     const char *voice_name = NULL;
@@ -1227,6 +1230,9 @@ int main(int argc, char **argv) {
         {"batch-test",    no_argument,       0, 1036},
         {"batch-bench",   no_argument,       0, 1037},
         {"batch-multi-test", required_argument, 0, 1042},
+        {"onset-fade",    required_argument, 0, 1057},
+        {"tail-trim",     no_argument,       0, 1058},
+        {"seed-audition", required_argument, 0, 1059},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -1296,6 +1302,9 @@ int main(int argc, char **argv) {
             case 1036: run_batch_test = 1; break;
             case 1037: run_batch_bench = 1; break;
             case 1042: batch_multi_test = atoi(optarg); if (batch_multi_test < 1) batch_multi_test = 1; break;
+            case 1057: onset_fade_ms = atoi(optarg); if (onset_fade_ms < 0) onset_fade_ms = 0; break;
+            case 1058: tail_trim = 1; break;
+            case 1059: seed_audition = atoi(optarg); if (seed_audition < 1) seed_audition = 1; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -2720,7 +2729,41 @@ int main(int argc, char **argv) {
     int n_samples = 0;
 
     if (!silent) fprintf(stderr, "Starting generation...\n");
-    if (qwen_tts_generate(ctx, text, &audio, &n_samples) != 0) {
+    if (seed_audition > 1 && !do_stream) {
+        /* Best-of-N seed audition: render N seeds SEQUENTIALLY (one process), keep the cleanest
+         * take. Rejects degenerate metallic tails via the glitch score and truncation/runaway via
+         * duration deviation from the median. The seed is the only entropy source, so different
+         * seeds realize different valid renderings — this picks a clean+complete one. */
+        uint32_t base_seed = ctx->seed;
+        float *cand_a[64]; int cand_n[64]; uint32_t cand_s[64]; float cand_g[64];
+        int N = seed_audition > 64 ? 64 : seed_audition, got = 0;
+        for (int i = 0; i < N; i++) {
+            ctx->seed = base_seed + (uint32_t)i;
+            float *a = NULL; int an = 0;
+            if (qwen_tts_generate(ctx, text, &a, &an) == 0 && a && an > 0) {
+                cand_a[got] = a; cand_n[got] = an; cand_s[got] = ctx->seed;
+                cand_g[got] = qwen_audio_tail_glitch_score(a, an, QWEN_TTS_SAMPLE_RATE, NULL);
+                if (!silent) fprintf(stderr, "  audition seed %u: %.2fs glitch=%.2f\n",
+                                     ctx->seed, (float)an / QWEN_TTS_SAMPLE_RATE, cand_g[got]);
+                got++;
+            } else if (a) free(a);
+        }
+        if (got == 0) { fprintf(stderr, "Generation failed\n"); qwen_tts_unload(ctx); return 1; }
+        int tmp[64]; for (int i = 0; i < got; i++) tmp[i] = cand_n[i];
+        for (int a = 1; a < got; a++) { int v = tmp[a], b = a-1; while (b>=0 && tmp[b]>v){tmp[b+1]=tmp[b];b--;} tmp[b+1]=v; }
+        int med_n = tmp[got/2];
+        int best = 0; float best_cost = 1e30f;
+        for (int i = 0; i < got; i++) {
+            float dd = med_n > 0 ? (float)(cand_n[i] - med_n) / (float)med_n : 0.0f;
+            if (dd < 0) dd = -dd;
+            float cost = cand_g[i] * 10.0f + dd;        /* glitch dominates; duration breaks ties */
+            if (cost < best_cost) { best_cost = cost; best = i; }
+        }
+        if (!silent) fprintf(stderr, "  audition -> picked seed %u (glitch=%.2f, %.2fs of %d takes)\n",
+                             cand_s[best], cand_g[best], (float)cand_n[best] / QWEN_TTS_SAMPLE_RATE, got);
+        audio = cand_a[best]; n_samples = cand_n[best]; ctx->seed = cand_s[best];
+        for (int i = 0; i < got; i++) if (i != best) free(cand_a[i]);
+    } else if (qwen_tts_generate(ctx, text, &audio, &n_samples) != 0) {
         fprintf(stderr, "Generation failed\n");
         if (do_stream && !do_stdout && stream_state.file) fclose(stream_state.file);
         qwen_tts_unload(ctx);
@@ -2759,6 +2802,17 @@ int main(int argc, char **argv) {
             if (audio_volume != 1.0f) {
                 qwen_audio_apply_gain(final_audio, final_n, audio_volume);
                 if (!silent) fprintf(stderr, "Volume: %.2fx\n", audio_volume);
+            }
+            /* Edge cleanup (default-off; golden bit-identical unless opted in). */
+            if (tail_trim) {
+                int cut = qwen_audio_tail_trim(final_audio, &final_n, QWEN_TTS_SAMPLE_RATE, 0.30f);
+                if (cut > 0 && !silent)
+                    fprintf(stderr, "Tail-trim: cut %.2fs degenerate tail (%d samples)\n",
+                            (float)cut / QWEN_TTS_SAMPLE_RATE, cut);
+            }
+            if (onset_fade_ms > 0) {
+                qwen_audio_onset_fade(final_audio, final_n, QWEN_TTS_SAMPLE_RATE, onset_fade_ms);
+                if (!silent) fprintf(stderr, "Onset-fade: %d ms over the real attack\n", onset_fade_ms);
             }
             if (qwen_tts_write_wav(output, final_audio, final_n, QWEN_TTS_SAMPLE_RATE) == 0) {
                 if (!silent)
