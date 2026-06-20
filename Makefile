@@ -91,6 +91,7 @@ help:
 	@echo "  make test-large-int8 - Run 1.7B INT8 tests (Italian + English, seed 42)"
 	@echo "  make test-large-int4 - Run 1.7B INT4 tests (Italian + English, seed 42)"
 	@echo "  make test-large-quant - Run all 1.7B quantization tests (INT8 + INT4)"
+	@echo "  make test-emotion-ft - Emotion fine-tune (.expr graft) smoke: CSP Italian on 1.7B (preset+clone, seed 42)"
 	@echo "  make test-lora-it    - Emotion×voice×temp listening matrix (L16-26 LoRA; afplay links + full cmds)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
@@ -369,6 +370,39 @@ test-emotion: $(TARGET)
 	@echo "PASS: expressivity/emotion smoke"
 	@echo ""
 
+# Emotion fine-tune (.expr graft) SMOKE — the CSP Italian emotion FT this branch ships.
+# The WOW recipe: 1.7B + EN instruct + T1.1 + the dense .expr applied on a preset and on an
+# --icl-only clone graft. 2 short renders (seed 42 = stable; some seeds glitch). Asserts the
+# pack loads (N tensors applied) + non-empty audio. The .expr packs are local-only (large),
+# so SKIP cleanly when absent instead of failing a fresh checkout. Pack override: EXPR_FT=...
+EXPR_FT ?= presets/expr/italian_csp.expr
+EMO_FT_INSTR = Speak with warm, bright happiness, smiling through the words.
+EMO_FT_TEXT  = Che bella notizia, sono davvero felicissimo oggi!
+test-emotion-ft: $(TARGET)
+	@echo "=== Emotion fine-tune (.expr graft) smoke — CSP Italian on 1.7B ==="
+	@mkdir -p $(TEST_DIR)
+	@test -f $(EXPR_FT) || { echo "  SKIP: $(EXPR_FT) not present (local-only emotion FT pack)"; exit 0; }
+	@test -d $(MODEL_LARGE) || { echo "  SKIP: $(MODEL_LARGE) not present"; exit 0; }
+	@# (1) PRESET ryan + emotion FT pack + EN instruct
+	@./$(TARGET) -d $(MODEL_LARGE) -j1 -T 1.1 --seed 42 -s ryan -l Italian \
+		--expr $(EXPR_FT) --instruct "$(EMO_FT_INSTR)" \
+		--text "$(EMO_FT_TEXT)" -o $(TEST_DIR)/ft_ryan.wav 2>$(TEST_DIR)/ft_ryan.log
+	@grep -qiE "Expressivity: applied [1-9][0-9]*/" $(TEST_DIR)/ft_ryan.log || { echo "FAIL: .expr pack not applied (preset)"; cat $(TEST_DIR)/ft_ryan.log; exit 1; }
+	@test -s $(TEST_DIR)/ft_ryan.wav || { echo "FAIL: preset+FT produced no audio"; exit 1; }
+	@echo "  PASS: emotion FT pack applied on preset ryan -> audio"
+	@# (2) CLONE graft (--icl-only keeps CV weights so the FT pack restores cleanly)
+	@if [ -f voices/galatea_icl.qvoice ]; then \
+		./$(TARGET) -d $(MODEL_LARGE) -j1 -T 1.1 --seed 42 -l Italian \
+			--load-voice voices/galatea_icl.qvoice --icl-only \
+			--expr $(EXPR_FT) --instruct "$(EMO_FT_INSTR)" \
+			--text "$(EMO_FT_TEXT)" -o $(TEST_DIR)/ft_clone.wav 2>$(TEST_DIR)/ft_clone.log; \
+		grep -qiE "Expressivity: applied [1-9][0-9]*/" $(TEST_DIR)/ft_clone.log || { echo "FAIL: .expr pack not applied (clone graft)"; cat $(TEST_DIR)/ft_clone.log; exit 1; }; \
+		test -s $(TEST_DIR)/ft_clone.wav || { echo "FAIL: clone+FT produced no audio"; exit 1; }; \
+		echo "  PASS: emotion FT pack applied on galatea --icl-only graft -> audio"; \
+	else echo "  SKIP: voices/galatea_icl.qvoice not present (clone-graft case)"; fi
+	@echo "PASS: emotion fine-tune (.expr) smoke"
+	@echo ""
+
 # Emotion × voice × temp LISTENING matrix for the L16-26 emotion LoRA. Prints, per clip,
 # a comment (voice/emotion/temp/.expr + instruct) + the FULL command + a `cd ... && afplay` link,
 # so you can verify what produced each sound (e.g. SMALL ICL file, NOT the heavy qvoice WDELTA).
@@ -487,7 +521,7 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression test-errors test-emotion test-compose test-caps test-selftest test-golden
+test-all: test-small test-large test-regression test-errors test-emotion test-emotion-ft test-compose test-caps test-selftest test-golden
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
@@ -954,7 +988,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-serve-all \
         test-clone test-voice-design \
         demo-clone \
