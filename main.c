@@ -1160,6 +1160,7 @@ int main(int argc, char **argv) {
     int   onset_fade_ms = 0;         /* --onset-fade <ms>: fade-in over the REAL attack (0=off) */
     int   tail_trim = 0;             /* --tail-trim: cut a degenerate metallic tail (default off) */
     int   seed_audition = 0;         /* --seed-audition <N>: render N seeds, keep cleanest (0=off) */
+    int   audition_keep = 0;         /* --audition-keep: also write every audition take as <out>.seedNN.wav */
     const char *list_voices_dir = NULL;
     const char *delete_voice = NULL;
     const char *voice_name = NULL;
@@ -1249,6 +1250,7 @@ int main(int argc, char **argv) {
         {"onset-fade",    required_argument, 0, 1057},
         {"tail-trim",     no_argument,       0, 1058},
         {"seed-audition", required_argument, 0, 1059},
+        {"audition-keep", no_argument,       0, 1060},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -1321,6 +1323,7 @@ int main(int argc, char **argv) {
             case 1057: onset_fade_ms = atoi(optarg); if (onset_fade_ms < 0) onset_fade_ms = 0; break;
             case 1058: tail_trim = 1; break;
             case 1059: seed_audition = atoi(optarg); if (seed_audition < 1) seed_audition = 1; break;
+            case 1060: audition_keep = 1; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -2777,6 +2780,8 @@ int main(int argc, char **argv) {
     int n_samples = 0;
 
     if (!silent) fprintf(stderr, "Starting generation...\n");
+    if (audition_keep && (seed_audition <= 1 || do_stream) && !silent)
+        fprintf(stderr, "Warning: --audition-keep has no effect without --seed-audition N (N>1, non-stream)\n");
     if (seed_audition > 1 && !do_stream) {
         /* Best-of-N seed audition: render N seeds SEQUENTIALLY (one process), keep the cleanest
          * take. Rejects degenerate metallic tails via the glitch score and truncation/runaway via
@@ -2793,6 +2798,19 @@ int main(int argc, char **argv) {
                 cand_g[got] = qwen_audio_tail_glitch_score(a, an, QWEN_TTS_SAMPLE_RATE, NULL);
                 if (!silent) fprintf(stderr, "  audition seed %u: %.2fs glitch=%.2f\n",
                                      ctx->seed, (float)an / QWEN_TTS_SAMPLE_RATE, cand_g[got]);
+                if (audition_keep) {
+                    /* --audition-keep: save EVERY take as <out>.seed<seed>.wav so the user can
+                     * browse the palette and pick by ear (the glitch+duration pick is only a guess). */
+                    char keep_path[1100];
+                    const char *dot = strrchr(output, '.');
+                    int stem = dot ? (int)(dot - output) : (int)strlen(output);
+                    snprintf(keep_path, sizeof(keep_path), "%.*s.seed%u.wav", stem, output, ctx->seed);
+                    if (qwen_tts_write_wav(keep_path, a, an, QWEN_TTS_SAMPLE_RATE) == 0) {
+                        if (!silent) fprintf(stderr, "    kept -> %s\n", keep_path);
+                    } else {
+                        fprintf(stderr, "    Warning: could not write audition take %s\n", keep_path);
+                    }
+                }
                 got++;
             } else if (a) free(a);
         }
