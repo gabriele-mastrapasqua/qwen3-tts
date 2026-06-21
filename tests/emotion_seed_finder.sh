@@ -30,7 +30,7 @@ cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 
 OUT_MD="${1:-docs/emotion-seeds.md}"
-N="${2:-${N:-8}}"
+N="${2:-${N:-5}}"    # 4-5 is enough: a broken seed is obvious in the table, no need for 8
 BASE_SEED="${BASE_SEED:-42}"
 MODEL="${MODEL:-qwen3-tts-1.7b}"
 THREADS="${THREADS:-4}"
@@ -74,20 +74,25 @@ voice_args() {
   esac
 }
 
-# Recipe (pack|temp|weight) per (lang, voice, emo) — the validated capacity ladder (plan_emo_v2):
-#   IT ryan→WIN T1.1 (anger 1.2 else 1.0); IT vivian→k4 T1.1 cap (anger 1.2 else 1.0);
-#   IT galatea(clone)→k4 T1.3 (high-arousal 2.0 else 1.6); ES (transfer)→WIN T1.3 w1.6.
+# Recipe (pack|temp|weight) per (lang, voice, emo) — REVISED from hands-on CLI calibration
+# (user 2026-06-21, see [[project_seed_and_onset_emotion]] #4):
+#   - k4 (top4k) is the DEFAULT/recommended pack: more robust at high weight than WIN, and vivian
+#     reacts with more energy. WIN reachable via env PACK_DEFAULT=$PACK_WIN (cap w≈1.8).
+#   - TEMPERATURE is the language-error dial: IT sweet spot T0.5–1.0 (NOT 1.1–1.3). >1.2 eats words,
+#     1.8 code-switches to Chinese, 0.1 is deterministic+flat. We use T0.8 for calm emotions,
+#     T1.0 for high-arousal (anger/fear/surprise — k4 holds w2.0 @ T1.0 with zero IT errors).
+#   - WEIGHT: high-arousal w2.0 (k4 takes it), calm w1.6 (preset) / 1.8 (clone needs a touch more push).
+#   - ES (transfer): keep WIN @ T1.0 w1.6 (k4 over-steered ES sad→French in earlier tests; revisit).
+PACK_DEFAULT="${PACK_DEFAULT:-$PACK_K4}"
+is_high_arousal() { case "$1" in anger|fear|surprise) return 0 ;; *) return 1 ;; esac; }
 recipe_for() {
   local lang="$1" voice="$2" emo="$3" pack temp w
   if [ "$lang" = "Spanish" ]; then
-    pack="$PACK_WIN"; temp="1.3"; w="1.6"
+    pack="$PACK_WIN"; temp="1.0"; w="1.6"
   else
-    case "$voice" in
-      ryan)    pack="$PACK_WIN"; temp="1.1"; w="1.0"; [ "$emo" = "anger" ] && w="1.2" ;;
-      vivian)  pack="$PACK_K4";  temp="1.1"; w="1.0"; [ "$emo" = "anger" ] && w="1.2" ;;
-      galatea) pack="$PACK_K4";  temp="1.3"; w="1.6"
-               case "$emo" in anger|fear|surprise) w="2.0" ;; esac ;;
-    esac
+    pack="$PACK_DEFAULT"
+    if is_high_arousal "$emo"; then temp="1.0"; w="2.0";
+    else temp="0.8"; [ "$voice" = "galatea" ] && w="1.8" || w="1.6"; fi
   fi
   echo "$pack|$temp|$w"
 }
@@ -111,21 +116,26 @@ cat <<EOF
 The expressive emotion is a small **characteristic-specific fine-tune** (CSP-FT) shipped as an additive
 weight delta you apply on top of any voice at generation time:
 
-- **\`$PACK_WIN\`** — 2-block FT ("WIN"): for a voice that already speaks the language well (e.g. \`ryan\`).
-- **\`$PACK_K4\`** — 4-block FT ("k4"): more capacity, for **clones** and voices that drift (e.g. \`vivian\`).
+- **\`$PACK_K4\`** — 4-block FT ("k4", **recommended default**): more capacity, robust at high weight, reacts with more energy.
+- **\`$PACK_WIN\`** — 2-block FT ("WIN"): gentler/lighter; cap the weight around 1.8.
 
-Recipe = **spoken text in the target language + \`-l <Lang>\` + an instruct in ENGLISH + temperature + the \`.expr\` pack at a per-emotion weight**. The instruct is followed best in English even when speaking another language. Spanish reuses the Italian WIN pack (\`--expr $PACK_WIN -l Spanish\`) — the FT transfers to close Romance languages.
+Recipe = **spoken text in the target language + \`-l <Lang>\` + an instruct in ENGLISH + temperature + the \`.expr\` pack at a per-emotion weight**. The instruct is followed best in English even when speaking another language. Spanish reuses the Italian pack (\`--expr … -l Spanish\`) — the FT transfers to close Romance languages.
+
+### The two dials (hands-on calibration)
+
+- **Temperature = the language-cleanliness dial.** Italian sweet spot **T0.5–1.0**. Higher = more emotional variety but more errors: **T1.2 eats words**, **T1.8 leaves Italian / mixes Chinese**. **T≈0.1 is deterministic** (the softmax is near-greedy → the seed has *no* effect, all takes identical) and flat. Use ~**T0.8** for calm emotions, **T1.0** for high-arousal (anger/fear/surprise).
+- **Weight = the emotion-strength dial.** Push it up for stronger emotion; **k4 holds w2.0 cleanly at T1.0**, WIN starts breaking past ~1.8. Calm emotions ≈ **w1.6**, high-arousal ≈ **w2.0**.
 
 ### Finding a good seed
-At temperature, the **seed selects a sub-mode** of the emotion (and a fixed seed can damp it / glitch on some text). Use the built-in best-of-N audition:
+At temperature the **seed selects a sub-mode** of the emotion; a fixed seed can damp it or, at high weight/temp, *break* it (gibberish, or a second of noise then stop). Use the built-in best-of-N audition — it rejects the broken takes and keeps the cleanest:
 
 \`\`\`bash
-$BIN -d $MODEL -s ryan -l Italian -T 1.1 --expr $PACK_WIN --expr-weight 1.0 \\
+$BIN -d $MODEL -s ryan -l Italian -T 1.0 --expr $PACK_K4 --expr-weight 2.0 \\
   --instruct "Speak with hot, furious anger, sharp and forceful." \\
-  --seed-audition 8 --audition-keep --text "$TEXT_IT" -o anger.wav
+  --seed-audition 5 --audition-keep --text "$TEXT_IT" -o anger.wav
 \`\`\`
 
-\`--seed-audition N\` renders N seeds and keeps the cleanest; \`--audition-keep\` also saves **every** take as \`<out>.seed<seed>.wav\` so you can browse and pick by ear. The tables below are that audition, run across the whole emotion × language × voice matrix.
+\`--seed-audition N\` renders N seeds and keeps the cleanest (a take much shorter than the median = truncated, or a metallic runaway tail, is rejected); \`--audition-keep\` also saves **every** take as \`<out>.seed<seed>.wav\` so you can browse and pick by ear. ⚠ in a table flags a take whose duration is out of the plausible band (likely broken). The tables below are that audition across the whole emotion × language × voice matrix.
 
 EOF
 } >> "$OUT_MD"
@@ -175,6 +185,9 @@ run_cell() { # $1 lang  $2 voice  $3 emo
     echo "$cmdstr"
     echo '```'
     if grep -qE 'audition seed' "$log"; then
+      # Median take-duration for this cell → flag out-of-band takes (⚠ = likely broken).
+      local med
+      med="$(grep -E 'audition seed' "$log" | sed -E 's/.*: ([0-9.]+)s glitch.*/\1/' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')"
       echo "| seed | dur (s) | glitch | listen |"
       echo "|---|---|---|---|"
       grep -E 'audition seed' "$log" | while read -r line; do
@@ -184,7 +197,8 @@ run_cell() { # $1 lang  $2 voice  $3 emo
         g="$(echo "$line"  | sed -E 's/.*glitch=([0-9.]+).*/\1/')"
         sf="$cdir/${emo}.seed${s}.wav"   # relative to repo root → portable in the committed doc
         local mark=""; [ "$s" = "$picked" ] && mark=" ⭐"
-        echo "| $s$mark | $d | $g | \`afplay $sf\` |"
+        local warn; warn="$(awk -v d="$d" -v m="$med" 'BEGIN{ if(m>0){r=d/m; if(r<0.55||r>2.5) printf "⚠"} }')"
+        echo "| $s$mark$warn | $d | $g | \`afplay $sf\` |"
       done
     fi
   } >> "$OUT_MD"

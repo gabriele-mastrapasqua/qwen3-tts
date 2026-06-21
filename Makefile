@@ -418,7 +418,7 @@ test-lora-it: $(TARGET)
 # auto-pick (glitch+dur) + every take, and writes a usage doc with afplay links + full commands.
 # Opt-in + SLOW (full IT+ES+clone matrix on 1.7B). Override scope via env: LANGS/VOICES_IT/EMOS_IT/N.
 emotion-seeds: $(TARGET)
-	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),docs/emotion-seeds.md) $(if $(N),$(N),8)
+	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),docs/emotion-seeds.md) $(if $(N),$(N),5)
 
 test-batch: $(TARGET)
 	@echo "=== Batched Talker step correctness (opt-in path vs single-stream) ==="

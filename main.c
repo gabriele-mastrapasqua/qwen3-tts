@@ -2818,15 +2818,24 @@ int main(int argc, char **argv) {
         int tmp[64]; for (int i = 0; i < got; i++) tmp[i] = cand_n[i];
         for (int a = 1; a < got; a++) { int v = tmp[a], b = a-1; while (b>=0 && tmp[b]>v){tmp[b+1]=tmp[b];b--;} tmp[b+1]=v; }
         int med_n = tmp[got/2];
+        /* "Realistically OK" filter for high-weight/high-temp breakage: a take much SHORTER than the
+         * median is a truncated noise-then-stop (the "1s of noise and done" case); an EXTREMELY longer
+         * one is a runaway. Hard-penalize those (a survivor always wins; if all break we still return
+         * the least-bad). We do NOT reject merely-long takes — those are the expressive variants
+         * (e.g. a longer "menacing" anger) — the glitch score already catches the metallic runaway tail. */
+        int n_rej = 0;
         int best = 0; float best_cost = 1e30f;
         for (int i = 0; i < got; i++) {
-            float dd = med_n > 0 ? (float)(cand_n[i] - med_n) / (float)med_n : 0.0f;
-            if (dd < 0) dd = -dd;
-            float cost = cand_g[i] * 10.0f + dd;        /* glitch dominates; duration breaks ties */
+            float r  = med_n > 0 ? (float)cand_n[i] / (float)med_n : 1.0f;
+            float dd = r - 1.0f; if (dd < 0) dd = -dd;
+            int   bad = (r < 0.55f || r > 2.50f         /* truncated-short or extreme-runaway */
+                         || cand_g[i] >= 0.5f);          /* sustained metallic/noise tail */
+            if (bad) n_rej++;
+            float cost = cand_g[i] * 10.0f + dd + (bad ? 100.0f : 0.0f);
             if (cost < best_cost) { best_cost = cost; best = i; }
         }
-        if (!silent) fprintf(stderr, "  audition -> picked seed %u (glitch=%.2f, %.2fs of %d takes)\n",
-                             cand_s[best], cand_g[best], (float)cand_n[best] / QWEN_TTS_SAMPLE_RATE, got);
+        if (!silent) fprintf(stderr, "  audition -> picked seed %u (glitch=%.2f, %.2fs of %d takes; %d rejected as broken)\n",
+                             cand_s[best], cand_g[best], (float)cand_n[best] / QWEN_TTS_SAMPLE_RATE, got, n_rej);
         audio = cand_a[best]; n_samples = cand_n[best]; ctx->seed = cand_s[best];
         for (int i = 0; i < got; i++) if (i != best) free(cand_a[i]);
     } else if (qwen_tts_generate(ctx, text, &audio, &n_samples) != 0) {
