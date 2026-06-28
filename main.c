@@ -865,7 +865,6 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
     const int SR = QWEN_TTS_SAMPLE_RATE;
     float *out = NULL; size_t out_n = 0, out_cap = 0;
     int spoken = 0, idx = 0, last_spoken = 0, prev_filler = 0;
-    int para_n = 0;  /* count of paralinguistic [tag] spans seen, for per-occurrence seed variation */
     #define RS_APPEND(src, cnt) do {                                       \
         size_t _c = (cnt);                                                 \
         if (out_n + _c > out_cap) {                                        \
@@ -925,8 +924,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                  * We deliberately KEEP the base seed for ALL of them: CORRECTNESS FIRST — varying the seed on
                  * the short isolated anchor span pushes it off-distribution (ear 2026-06-28: seed+1 → sigh,
                  * seed+2 → language drift). Variety must come from a VALIDATED-safe source (good-seed pool /
-                 * richer anchor), not arbitrary offsets. para_n kept for diagnostics only. */
-                para_n++;
+                 * richer anchor), not arbitrary offsets. */
                 if (!silent) fprintf(stderr, "  [paraling steer: %s w%.0f L%d-%d seed %u]\n",
                                      spans[i].ml_steer_path, spans[i].ml_steer_weight, spans[i].ml_l0, spans[i].ml_l1, ctx->seed);
             }
