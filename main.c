@@ -538,13 +538,21 @@ static const cmacro_t COMPOSE_MACROS[] = {
  * vector SHAPES it into the real event. VOCAL family only (laugh/sigh — articulatory events hit the
  * decoder ceiling). RAW vectors, inject L21-25. Default weight ~8 (ryan over-steers a bit at 8, wants
  * ~6). Checked BEFORE COMPOSE_MACROS so laugh/sigh use the vector path, not the old DSP filler. */
-typedef struct { const char *tag; const char *anchor; const char *vec; float weight; int l0, l1; } pvec_t;
+/* Ear-validated clean+varied laugh seeds (galatea, anchor 'ahahah', 2026-06-28): repeated [laugh]
+ * tags cycle these so each differs in length/shape WITHOUT drifting. seeds 100 (cry), 256 (exasperated
+ * "ehh ehh"), 777 (perplexing) were rejected by ear. Variety from a validated pool, not arbitrary offsets. */
+static const int LAUGH_SEEDS[] = { 42, 7, 2024 };
+
+typedef struct { const char *tag; const char *anchor; const char *vec; float weight; int l0, l1;
+                 const int *seeds; int nseeds; } pvec_t;
 static const pvec_t PARA_VECTORS[] = {
-    { "sigh",   "haaah", "presets/steer/paraling/sigh_vs_laugh.qlsteer", 8.0f, 21, 25 },
-    { "sighs",  "haaah", "presets/steer/paraling/sigh_vs_laugh.qlsteer", 8.0f, 21, 25 },
-    { "laugh",  "ahah",  "presets/steer/paraling/laugh_vs_cry.qlsteer",  8.0f, 21, 25 },
-    { "laughs", "ahah",  "presets/steer/paraling/laugh_vs_cry.qlsteer",  8.0f, 21, 25 },
-    { NULL, NULL, NULL, 0.0f, 0, 0 }
+    { "sigh",   "haaah", "presets/steer/paraling/sigh_vs_laugh.qlsteer", 8.0f, 21, 25, NULL, 0 },
+    { "sighs",  "haaah", "presets/steer/paraling/sigh_vs_laugh.qlsteer", 8.0f, 21, 25, NULL, 0 },
+    /* anchor 'ahahah' = the ear sweet spot (2026-06-28): 'ahah' too short, 'ahahaha' tips into cry
+     * (laugh & cry are the same convulsion — longer anchor over-tips), 'ah ah ah' reads as words. */
+    { "laugh",  "ahahah", "presets/steer/paraling/laugh_vs_cry.qlsteer",  8.0f, 21, 25, LAUGH_SEEDS, 3 },
+    { "laughs", "ahahah", "presets/steer/paraling/laugh_vs_cry.qlsteer",  8.0f, 21, 25, LAUGH_SEEDS, 3 },
+    { NULL, NULL, NULL, 0.0f, 0, 0, NULL, 0 }
 };
 
 static int cspan_push(cspan_t **arr, int *n, int *cap, cspan_t s) {
@@ -865,6 +873,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
     const int SR = QWEN_TTS_SAMPLE_RATE;
     float *out = NULL; size_t out_n = 0, out_cap = 0;
     int spoken = 0, idx = 0, last_spoken = 0, prev_filler = 0;
+    int occ[16] = {0};  /* per-PARA_VECTORS-row occurrence count, for cycling the validated seed pool */
     #define RS_APPEND(src, cnt) do {                                       \
         size_t _c = (cnt);                                                 \
         if (out_n + _c > out_cap) {                                        \
@@ -920,11 +929,19 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                 ctx->ml_steer_weight = spans[i].ml_steer_weight;
                 ctx->ml_steer_l0 = spans[i].ml_l0; ctx->ml_steer_l1 = spans[i].ml_l1;
                 ctx->ml_steer_decay = 0.985f; ctx->ml_steer_frames = 0;
-                /* NOTE: every span resets RNG to ctx->seed, so repeated identical [tag]s render bit-identical.
-                 * We deliberately KEEP the base seed for ALL of them: CORRECTNESS FIRST — varying the seed on
-                 * the short isolated anchor span pushes it off-distribution (ear 2026-06-28: seed+1 → sigh,
-                 * seed+2 → language drift). Variety must come from a VALIDATED-safe source (good-seed pool /
-                 * richer anchor), not arbitrary offsets. */
+                /* VARIETY (safe): every generate() resets RNG to ctx->seed, so repeated identical [tag]s
+                 * would be bit-identical robotic copies. Tags WITH a validated seed pool cycle it so each
+                 * repeat differs in length/shape WITHOUT drifting (arbitrary offsets drifted — ear 2026-06-28:
+                 * seed+1 → sigh, seed+2 → language; the pool seeds are hand-validated clean). Tags with no
+                 * pool keep the base seed. seed is saved/restored around this span (sv_seed). */
+                for (int m = 0; PARA_VECTORS[m].tag; m++) {
+                    if (PARA_VECTORS[m].seeds && PARA_VECTORS[m].nseeds > 0 &&
+                        strcmp(spans[i].ml_steer_path, PARA_VECTORS[m].vec) == 0) {
+                        ctx->seed = (uint32_t)PARA_VECTORS[m].seeds[occ[m] % PARA_VECTORS[m].nseeds];
+                        occ[m]++;
+                        break;
+                    }
+                }
                 if (!silent) fprintf(stderr, "  [paraling steer: %s w%.0f L%d-%d seed %u]\n",
                                      spans[i].ml_steer_path, spans[i].ml_steer_weight, spans[i].ml_l0, spans[i].ml_l1, ctx->seed);
             }
