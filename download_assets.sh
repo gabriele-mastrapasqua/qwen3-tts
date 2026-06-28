@@ -13,8 +13,8 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 DEST=presets/expr
-# TODO: set to the release/HF path where the win .expr are uploaded (filename appended).
-BASE_URL="${BASE_URL:-https://github.com/gabriele-mastrapasqua/qwen3-tts/releases/download/v-expr-assets}"
+# HF repo hosting the win .expr (filename appended). Override with BASE_URL=... if you mirror elsewhere.
+BASE_URL="${BASE_URL:-https://huggingface.co/gabrione/qwen3-tts-italian-expr/resolve/main}"
 mkdir -p "$DEST"
 
 # filename  sha256  (the 9 validated wins — see presets/expr/MANIFEST.md)
