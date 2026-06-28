@@ -80,8 +80,18 @@ Per-voice weight: **galatea 8 · vivian 8 · ryan 6** (ryan caps at 6; `w12` ove
 Only the **vocal family (laugh, sigh)** works via steering; articulatory events (cough/sneeze/…) do not —
 use native-trigger onomatopoeia inline (`ugh`, `ahem`, `tsk`, `haaa`) for those.
 
-> The `[sigh]`/`[laugh]` inline-tag auto-routing (write the tag in `--text`, no flags) is being wired to
-> this recipe — until then use the explicit flags above.
+### ⭐ Easiest way — just write the tag (auto, no flags)
+Put `[sigh]` or `[laugh]` directly in `--text` and the engine auto-applies the recipe above (anchor
+onomatopoeia + the matching steering vector, localized to the tag). No `--ml-steer` needed:
+```bash
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/galatea_graft.qvoice --icl-only -l Italian -T 1.1 \
+  --expr presets/expr/italian_csp_topk6.expr --expr-weight 1.0 -I "Speak in a weary, exhausted tone." \
+  --text "Sono così stanca [sigh] è stata una giornata lunghissima."
+```
+The sentence is split at the tag; the event span gets the vector (w8), the rest stays clean; any
+global emotion (`--expr` / `--ml-steer`) still applies to the spoken parts. `--no-compose` disables
+auto-routing (passes the literal tag to the model). Note: default weight is 8 (great for clones/vivian;
+**ryan** prefers ~6 — over-steers slightly at 8).
 
 ## 4. License / attribution
 The Italian emotion FT data uses the **Emozionalmente** dataset (CC-BY 4.0) — cite F. Catania, J. W. Wilke,
