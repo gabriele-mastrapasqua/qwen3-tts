@@ -555,6 +555,150 @@ static const pvec_t PARA_VECTORS[] = {
     { NULL, NULL, NULL, 0.0f, 0, 0, NULL, 0 }
 };
 
+/* ── --emotion auto-router (1.7B): the ear-validated per-(voice×emotion) recipe ────────────────
+ * `--emotion <name>` reproduces the weeks-long shippable recipe table (plan_emo_v3 §8.3 recipe_final,
+ * CLEAN+decay default, user-validated 2026-06-24): ONE flag instead of hand-wiring --expr/--ml-steer.
+ * CRUCIAL: it is NOT "always combine". Each (voice,emotion) cell has a specific MODE —
+ *   EXPR-only  (e.g. ryan/vivian anger — steer goes metallic, the FT carries it),
+ *   STEER-only (most cells — the clean steer @ L21-25 IS the emotion; adding expr SOFTENS it → e.g.
+ *               galatea anger went "sad" when expr was wrongly added),
+ *   COMBINE    (ryan/vivian joy, galatea disgust/fear — expr renders + steer pushes).
+ * Plus the PRIMARY levers (memory): a default English instruct + temp 1.1(preset)/1.3(clone), set early.
+ * Cross-language (§8.6): for FAR languages (ZH/JA/KO/RU) the IT expr is added as a stabilizer even on
+ * STEER cells. Manual --expr/--ml-steer override. 0.6B keeps the legacy .vec path. */
+typedef struct { const char *name; const char *tok; } emo_name_t;
+static const emo_name_t EMOTION_NAMES[] = {
+    { "sad", "sad" }, { "sadness", "sad" },
+    { "joy", "joy" }, { "happy", "joy" }, { "joyful", "joy" },
+    { "anger", "ang" }, { "angry", "ang" }, { "rage", "ang" },
+    { "fear", "fear" }, { "afraid", "fear" },
+    { "disgust", "disgust" }, { "disgusted", "disgust" },
+    { "surprise", "surprise" }, { "surprised", "surprise" },
+    { NULL, NULL }
+};
+/* Canonical filename token for an --emotion spec, or NULL if it isn't a routed emotion. */
+static const char *emotion_tok(const char *spec) {
+    if (!spec) return NULL;
+    for (int i = 0; EMOTION_NAMES[i].name; i++)
+        if (strcasecmp(spec, EMOTION_NAMES[i].name) == 0) return EMOTION_NAMES[i].tok;
+    return NULL;
+}
+/* The shippable per-(voice×emotion) recipe (plan §8.3). use_expr/use_steer pick the cell's MODE. */
+typedef struct { const char *voice; const char *tok; int use_expr; float expr_w; int use_steer; float steer_w; } emo_cell_t;
+static const emo_cell_t EMOTION_CELLS[] = {
+    /* ryan (preset): anger=EXPR(1.2) · disgust/sad=STEER w8 · fear/surprise=STEER w4 · joy=COMBINE(ew1.2,w8) */
+    { "ryan", "ang", 1, 1.2f, 0, 0.0f }, { "ryan", "disgust", 0, 0.0f, 1, 8.0f },
+    { "ryan", "fear", 0, 0.0f, 1, 4.0f }, { "ryan", "joy", 1, 1.2f, 1, 8.0f },
+    { "ryan", "sad", 0, 0.0f, 1, 8.0f }, { "ryan", "surprise", 0, 0.0f, 1, 4.0f },
+    /* vivian (preset, drifts language): anger=EXPR(1.2) · joy=COMBINE(ew1.2,w8) · rest=STEER (disgust w4) */
+    { "vivian", "ang", 1, 1.2f, 0, 0.0f }, { "vivian", "disgust", 0, 0.0f, 1, 4.0f },
+    { "vivian", "fear", 0, 0.0f, 1, 8.0f }, { "vivian", "joy", 1, 1.2f, 1, 8.0f },
+    { "vivian", "sad", 0, 0.0f, 1, 8.0f }, { "vivian", "surprise", 0, 0.0f, 1, 8.0f },
+    /* galatea (clone): anger/joy/sad/surprise=STEER w8 (NO expr — it softens them) · disgust/fear=COMBINE(ew1.0,w8) */
+    { "galatea", "ang", 0, 0.0f, 1, 8.0f }, { "galatea", "disgust", 1, 1.0f, 1, 8.0f },
+    { "galatea", "fear", 1, 1.0f, 1, 8.0f }, { "galatea", "joy", 0, 0.0f, 1, 8.0f },
+    { "galatea", "sad", 0, 0.0f, 1, 8.0f }, { "galatea", "surprise", 0, 0.0f, 1, 8.0f },
+    { NULL, NULL, 0, 0.0f, 0, 0.0f }
+};
+/* Resolve the recipe cell for (voice,emotion). Exact voice match first; else a validated default by
+ * voice type: preset → mirror ryan; clone → STEER-clean everywhere (es_quijote generalization §8.5),
+ * expr ADDS only on anger. */
+static emo_cell_t emotion_cell(const char *voice_key, const char *tok, int is_clone) {
+    for (int i = 0; EMOTION_CELLS[i].voice; i++)
+        if (voice_key && strcasecmp(EMOTION_CELLS[i].voice, voice_key) == 0 && strcmp(EMOTION_CELLS[i].tok, tok) == 0)
+            return EMOTION_CELLS[i];
+    emo_cell_t c = { "*", tok, 0, 0.0f, 1, 8.0f };
+    int low = (strcmp(tok, "fear") == 0 || strcmp(tok, "surprise") == 0);
+    if (is_clone) {
+        /* generic clone (galatea/es_quijote pattern): STEER-clean everywhere, NO expr (it softens). */
+        c.use_expr = 0; c.use_steer = 1; c.steer_w = low ? 4.0f : 8.0f;
+    } else if (strcmp(tok, "ang") == 0) {
+        /* generic preset = ryan rule: anger via EXPR only (steer goes metallic). */
+        c.use_expr = 1; c.expr_w = 1.2f; c.use_steer = 0; c.steer_w = 0.0f;
+    } else {
+        c.use_steer = 1; c.steer_w = low ? 4.0f : 8.0f;
+    }
+    return c;
+}
+/* THE per-language emotion recipe (docs/emotion-THE-recipe.md, ear-validated 2026-06-29). Fills `cell` and
+ * `temp` for `language`. Non-Italian/English languages use a per-language policy (the best-voice guidance is in
+ * the doc; the engine applies the mode to whatever voice was passed). Italian/English fall through to the
+ * per-(voice×emotion) EMOTION_CELLS. */
+static void resolve_emotion_recipe(const char *language, const char *voice_key, int is_clone,
+                                   const char *tok, emo_cell_t *cell, float *temp) {
+    *temp = 1.1f;
+    if (language) {
+        /* DE/FR/ES: the language .expr carries it, EXPR (no steer). Best on vivian. ear-validated 2026-06-29:
+         * DE/FR k6 beat r32; ES vivian+topk6 (k6) beat native-r32 AND ryan-romance. (resolve_emotion_expr maps
+         * German→german_csp_k6, French→french_csp_k6, Spanish→italian_csp_topk6.) */
+        if (!strcasecmp(language, "German") || !strcasecmp(language, "French") || !strcasecmp(language, "Spanish")) {
+            *cell = (emo_cell_t){ "*", tok, 1, 1.2f, 0, 0.0f }; return; }
+        /* Chinese: native preset (vivian) → STEER (same-language, max emotion), no expr. */
+        if (!strcasecmp(language, "Chinese")) {
+            *cell = (emo_cell_t){ "*", tok, 0, 0.0f, 1, 8.0f }; return; }
+        /* JA/KO/RU: COMBINE — IT expr renders the far language, steer pushes emotion (best on the galatea graft). */
+        if (!strcasecmp(language, "Japanese") || !strcasecmp(language, "Korean") || !strcasecmp(language, "Russian")) {
+            *cell = (emo_cell_t){ "*", tok, 1, 1.0f, 1, 8.0f }; return; }
+    }
+    *cell = emotion_cell(voice_key, tok, is_clone);   /* Italian / English / unspecified */
+}
+/* Recommended GOLD preset/voice per language (for a hint when the user picked a weaker one). NULL = no preference. */
+static const char *recommended_voice_for_language(const char *language) {
+    if (!language) return NULL;
+    if (!strcasecmp(language, "German") || !strcasecmp(language, "French") ||
+        !strcasecmp(language, "Chinese") || !strcasecmp(language, "Spanish"))
+        return "vivian";
+    if (!strcasecmp(language, "Japanese") || !strcasecmp(language, "Korean") || !strcasecmp(language, "Russian"))
+        return "the galatea graft clone";
+    return NULL;
+}
+/* Pick the .qlsteer for an emotion. The validated recipe (recipe_final.sh) uses the **ryan_<tok>**
+ * CLEAN palette for ALL voices incl. clones — the `*_ft` voice-native dirs were an idea-2 experiment
+ * that did NOT win (galatea_ang_ft is weaker/sad-ish, captured WITH expr). So: always ryan_<tok>. */
+static int resolve_emotion_qlsteer(const char *voice_key, const char *tok, char *out, size_t outsz) {
+    (void)voice_key;
+    snprintf(out, outsz, "presets/steer/emotion/ryan_%s.qlsteer", tok);
+    FILE *f = fopen(out, "rb"); if (f) { fclose(f); return 0; }
+    return -1;
+}
+/* Per-language expr (FT): native DE/FR where trained, else the IT pack as the cross-language renderer. */
+static const char *resolve_emotion_expr(const char *language) {
+    if (language && strcasecmp(language, "German") == 0) return "presets/expr/german_csp_k6.expr";
+    if (language && strcasecmp(language, "French") == 0) return "presets/expr/french_csp_k6.expr";
+    return "presets/expr/italian_csp_topk6.expr";
+}
+/* Derive a voice key for the steer palette: clone basename ("voices/galatea_graft.qvoice" -> "galatea")
+ * or the preset speaker name. Returns a pointer into `buf` (clone) or `speaker_name` (preset), or NULL. */
+static const char *emotion_voice_key(int is_clone, const char *load_voice, const char *speaker_name,
+                                     char *buf, size_t bufsz) {
+    if (is_clone && load_voice) {
+        const char *b = strrchr(load_voice, '/'); b = b ? b + 1 : load_voice;
+        size_t n = 0; while (b[n] && b[n] != '.' && n < bufsz - 1) { buf[n] = b[n]; n++; }
+        buf[n] = '\0';
+        char *us;
+        if ((us = strstr(buf, "_graft"))) *us = '\0';   /* galatea_graft -> galatea */
+        if ((us = strstr(buf, "_06b")))   *us = '\0';
+        return buf[0] ? buf : NULL;
+    }
+    return speaker_name;   /* preset name (NULL = default → ryan palette) */
+}
+/* Default vivid ENGLISH instruct per routed emotion. The instruct (in English/Chinese, the model's
+ * training languages) is the PRIMARY emotion lever (memory: temp + EN-instruct >> steer alone) — without
+ * it `--emotion` renders flat. The model follows it verbatim while speaking the target `-l` language.
+ * Returns NULL for non-routed moods. A user `--instruct` always overrides this. */
+static const char *default_emotion_instruct(const char *spec) {
+    const char *tok = emotion_tok(spec);
+    if (!tok) return NULL;
+    /* The exact validated instructs from recipe_final.sh (ear-validated 2026-06-24). */
+    if (!strcmp(tok, "sad"))      return "Speak in a sad, sorrowful, gloomy and downcast tone, voice low and heavy, on the verge of tears.";
+    if (!strcmp(tok, "joy"))      return "Speak with bright, radiant joy, light and warm, smiling through every word.";
+    if (!strcmp(tok, "ang"))      return "Speak in a furious, seething, enraged tone, voice sharp and hard, barely holding back the rage.";
+    if (!strcmp(tok, "fear"))     return "Speak in a frightened, trembling, anxious tone, voice shaky and breathless with dread.";
+    if (!strcmp(tok, "disgust"))  return "Speak with deep disgust and revulsion, lip-curling contempt, as if something repels you.";
+    if (!strcmp(tok, "surprise")) return "Speak with sudden astonishment and surprise, gasping and caught off guard.";
+    return NULL;
+}
+
 static int cspan_push(cspan_t **arr, int *n, int *cap, cspan_t s) {
     if (*n >= *cap) {
         int nc = *cap * 2 + 8;
@@ -1255,6 +1399,7 @@ int main(int argc, char **argv) {
     const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
     float cp_steer_weight = 1.0f;     /* --steer-weight: injection scale for the control vector */
     const char *emotion_spec = NULL;  /* --emotion: mood name or preset(s), e.g. "joy", "happy:0.5,proud:0.5" */
+    const char *speaker_name = NULL;  /* -s preset name kept verbatim (id discards it) for the emotion router */
     float audio_volume = 1.0f;        /* --volume: linear PCM gain on the output */
     float audio_rate = 1.0f;          /* --rate: pitch-preserving tempo (>1 faster) */
     /* "_set" = flag was explicitly passed -> overrides any --emotion manifest recipe value */
@@ -1385,7 +1530,7 @@ int main(int argc, char **argv) {
             case 'd': model_dir = optarg; break;
             case 't': text = optarg; break;
             case 'o': output = optarg; break;
-            case 's': speaker_id = qwen_tts_speaker_id(optarg); break;
+            case 's': speaker_id = qwen_tts_speaker_id(optarg); speaker_name = optarg; break;
             case 'l': language = optarg; break;
             case 'T': temperature = (float)atof(optarg); temp_set = 1; break;
             case 'k': top_k = atoi(optarg); break;
@@ -1495,8 +1640,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
-                fprintf(stderr, "  --emotion <spec>           Mood (joy/sad/stern/annoyed/excited/proud/calm/...): sets vec+weight+roughness+volume+rate.\n");
-                fprintf(stderr, "                             Also accepts raw preset blends (e.g. happy:0.5,proud:0.5). Explicit knobs override.\n");
+                fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag. On 1.7B, sad/joy/anger/fear/disgust/surprise auto-load the\n");
+                fprintf(stderr, "                             validated COMBINE stack (per-language .expr + per-voice .qlsteer @ L21-25) — works in\n");
+                fprintf(stderr, "                             every language; a vivid English/Chinese --instruct on top is recommended. Manual\n");
+                fprintf(stderr, "                             --expr/--ml-steer override. Other moods (excited/proud/calm/...) use the legacy palette.\n");
                 fprintf(stderr, "  --volume <f>               Output gain (1.0=unchanged, e.g. 1.1 louder, 0.9 softer)\n");
                 fprintf(stderr, "  --rate <f>                 Speaking rate, pitch-preserving (1.0=unchanged, >1 faster, <1 slower)\n");
                 fprintf(stderr, "  --compose <spec>           Inline markup synthesis (also works inside --text):\n");
@@ -1665,6 +1812,27 @@ int main(int argc, char **argv) {
                     ml_decay, ml_frames);
     }
 
+    /* --emotion DEFAULTS — match recipe_final.sh exactly: temperature 1.1 for ALL (preset AND clone), and
+     * a vivid English instruct ONLY on EXPR/COMBINE cells (validated STEER cells use NO instruct — the steer
+     * vector carries the emotion). instruct + temperature are CONSUMED before the late router, so set them
+     * here. The user's -I / -T always override. 1.7B routed emotions only. */
+    if (emotion_spec && !compose_spec && ctx->config.hidden_size >= 2048 && emotion_tok(emotion_spec)) {
+        const char *etok = emotion_tok(emotion_spec);
+        char evk[64];
+        const char *evoice = emotion_voice_key(load_voice != NULL, load_voice, speaker_name, evk, sizeof(evk));
+        emo_cell_t ecell; float etemp;
+        resolve_emotion_recipe(language, evoice, load_voice != NULL, etok, &ecell, &etemp);
+        if (!instruct && ecell.use_expr) {   /* instruct only when the recipe uses expr (EXPR/COMBINE) */
+            instruct = default_emotion_instruct(emotion_spec);
+            if (instruct && !silent)
+                fprintf(stderr, "Emotion '%s': default English instruct \"%s\" (override with -I)\n", emotion_spec, instruct);
+        }
+        if (!temp_set) {
+            temperature = etemp; temp_set = 1;
+            if (!silent) fprintf(stderr, "Emotion '%s': temperature %.1f (override with -T)\n", emotion_spec, temperature);
+        }
+    }
+
     /* Emo-bump: when emotion is requested (--expr or --instruct) and the user did NOT set -T,
      * raise the temperature so the emotion isn't flat — the neutral 0.9 default reads weak for
      * emotional delivery (the recipe wants ~1.1–1.3). Neutral speech (no expr/instruct) keeps the
@@ -1708,7 +1876,12 @@ int main(int argc, char **argv) {
     }
     if (no_compose && !silent && text && text_has_markup(text))
         fprintf(stderr, "--no-compose: passing inline [tags] literally to the model\n");
-    if (!compose_spec &&
+    /* On the 1.7B model, a routed --emotion (anger/sad/joy/fear/disgust/surprise) is handled by the
+     * COMBINE auto-router AFTER the voice block (expr+qlsteer), NOT the legacy .vec CP-steer here —
+     * skip it so we don't double-apply. The inline-tag/compose path keeps using qwen_apply_emotion. */
+    int emotion_routed = emotion_spec && !compose_spec &&
+                         ctx->config.hidden_size >= 2048 && emotion_tok(emotion_spec) != NULL;
+    if (!compose_spec && !emotion_routed &&
         qwen_apply_emotion(ctx, emotion_spec, steer_vector_path, language,
                            cp_steer_weight, steer_weight_set, cp_roughness, roughness_set,
                            audio_volume, volume_set, audio_rate, rate_set,
@@ -2766,6 +2939,60 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Voice profile created. Use --load-voice to generate speech.\n");
         qwen_tts_unload(ctx);
         return 0;
+    }
+
+    /* --emotion AUTO-ROUTER: on 1.7B, --emotion <sad|joy|anger|fear|disgust|surprise> applies the
+     * ear-validated per-(voice×emotion) recipe CELL (plan §8.3) — NOT a blanket combine. Each cell's
+     * mode (EXPR-only / STEER-only / COMBINE) is chosen by use_expr/use_steer; adding expr to a STEER
+     * cell softens the emotion (galatea anger → "sad"). Runs here (voice+lang+ctx known). Manual
+     * --expr/--ml-steer override; instruct+temp were defaulted earlier. */
+    if (emotion_spec && !compose_spec && ctx->config.hidden_size >= 2048) {
+        const char *tok = emotion_tok(emotion_spec);
+        if (tok) {
+            char vkbuf[64];
+            const char *voice_key = emotion_voice_key(ctx->voice_clone, load_voice, speaker_name,
+                                                      vkbuf, sizeof(vkbuf));
+            /* THE recipe — per-language policy (DE/FR/ZH/JA/KO/RU/ES) or per-(voice×emotion) for IT/EN.
+             * docs/emotion-THE-recipe.md is the aligned single source of truth. */
+            emo_cell_t cell; float rtemp;
+            resolve_emotion_recipe(language, voice_key, ctx->voice_clone, tok, &cell, &rtemp);
+            int want_expr = cell.use_expr;
+            float ew = cell.use_expr ? cell.expr_w : 1.0f;
+
+            /* (1) per-language .expr (FT). Skip if the user passed --expr (their override applies below). */
+            if (want_expr && !expr_path) {
+                const char *ep = resolve_emotion_expr(language);
+                FILE *ef = fopen(ep, "rb");
+                if (ef) {
+                    fclose(ef);
+                    if (apply_expr_file(ctx, ep, ew, silent) != 0)
+                        fprintf(stderr, "Warning: --emotion: failed to apply %s\n", ep);
+                    else if (!silent)
+                        fprintf(stderr, "Emotion '%s': +expr %s (weight %.1f)\n", emotion_spec, ep, ew);
+                } else if (!silent) {
+                    fprintf(stderr, "Note: --emotion: %s missing — run `bash download_assets.sh`\n", ep);
+                }
+            }
+            /* (2) clean .qlsteer steer @ L21-25 (ryan_<emo> palette, all voices) */
+            if (cell.use_steer && cell.steer_w > 0.0f) {
+                char qs[256];
+                if (resolve_emotion_qlsteer(voice_key, tok, qs, sizeof(qs)) == 0) {
+                    load_ml_steer(ctx, qs, cell.steer_w, 21, 25);
+                    ctx->ml_steer_decay = ml_decay; ctx->ml_steer_frames = ml_frames;
+                } else if (!silent) {
+                    fprintf(stderr, "Note: --emotion: no .qlsteer for '%s' — expr only\n", tok);
+                }
+            } else if (!silent) {
+                fprintf(stderr, "Emotion '%s': expr-carried (steer disabled for this voice/emotion)\n", emotion_spec);
+            }
+            if (!silent) {
+                const char *mode = cell.use_steer ? (want_expr ? "COMBINE" : "STEER") : "EXPR";
+                fprintf(stderr, "Emotion '%s': mode=%s (voice=%s)\n", emotion_spec, mode, voice_key ? voice_key : "default");
+                const char *rec = recommended_voice_for_language(language);
+                if (rec && (!voice_key || !strstr(rec, voice_key)))
+                    fprintf(stderr, "  tip: for %s the strongest voice is %s.\n", language, rec);
+            }
+        }
     }
 
     /* --expr: apply the expressivity weight delta on top of the loaded (preset/clone)

@@ -37,18 +37,20 @@ scripts/dgx_*
 
 # expressivity artifacts (host on GH release/HF, do not commit big binaries)
 qwen3-tts-1.7b-expr/
+# The big .expr weight-deltas are hosted on HF (gabrione/qwen3-tts-italian-expr) and fetched
+# on demand by download_assets.sh (sha256-verified against presets/expr/MANIFEST.md, which IS
+# tracked). HF is the durable backup now, so we no longer track any .expr in git — this also
+# closes the loss-risk behind the 2026-06-15 regression (validated .expr lost with no backup).
 presets/expr/*.expr
-# BUT track the ear-validated emotion-band (L16-26) packs in git — the regression of
-# 2026-06-15 was caused by a validated .expr being gitignored, overwritten and lost with
-# no backup (see regression_lora.md). Tracking the *_l1626_* packs prevents a recurrence.
-# (Broad-band *_bb027_* and paralinguistic_* experiments stay ignored — heavy + unvalidated.)
-!presets/expr/*_l1626_*.expr
 !training/expressivity-lora/*.py
 # local training data (prep outputs: wav24k + manifests + codes) — never commit
 training/expressivity-lora/data*/
 
-# Old experimental DENSE L16-26 multi/multitag packs (pre-CSP experiments, NOT shipped).
-# The current Italian emotion winners are the CSP packs (italian_csp*.expr) hosted on HF.
-# Re-ignored AFTER the !*_l1626_* exception (last-match wins) so the broad glob doesn't sweep them into git.
-presets/expr/italian_multi_l1626_dense.expr
-presets/expr/italian_multitag_l1626_dense.expr
+# Internal planning / analysis / process docs — LOCAL-ONLY, never commit to the public repo.
+# (Cleanup of already-tracked extras like PLAN.md = a later TODO, not today.)
+docs/PROJECT-COMPASS.md
+plan_emo_v*.md
+analisi_*.md
+audit_*.md
+docs/paralinguistics-*.md
+samples/tests/

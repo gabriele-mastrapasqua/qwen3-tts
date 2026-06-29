@@ -1,9 +1,16 @@
 ---
 license: cc-by-4.0
 language:
+  - en
   - it
   - de
   - fr
+  - es
+  - pt
+  - zh
+  - ja
+  - ko
+  - ru
 tags:
   - text-to-speech
   - qwen3-tts
@@ -22,9 +29,12 @@ they do not replace the base model. All for the **1.7B** model.
 
 | folder | what it does | type | size |
 |---|---|---|---|
-| `expr/` | **emotion fine-tunes** (per-language CSP weight-deltas) — apply with `--expr` | `.expr` weight-delta | 30–203 MB each |
-| `steer/emotion/` | **emotion steering vectors** — apply with `--ml-steer` | `.qlsteer` activation dir | ~232 KB each |
-| `steer/paraling/` | **paralinguistic vectors** (laugh / sigh) — apply with `--ml-steer` | `.qlsteer` | ~232 KB each |
+| `expr/` | **emotion fine-tunes** (per-language CSP weight-deltas) — auto-loaded by `--emotion` | `.expr` weight-delta | 30–203 MB each |
+| `steer/emotion/` | **emotion steering vectors** — auto-loaded by `--emotion` | `.qlsteer` activation dir | ~232 KB each |
+| `steer/paraling/` | **paralinguistic vectors** (laugh / sigh) — auto-loaded by `[laugh]`/`[sigh]` tags in the text | `.qlsteer` | ~232 KB each |
+
+> You normally don't touch these files directly — `--emotion <name>` and inline `[tags]` load the right ones
+> automatically (see **How to activate**). The raw `--expr`/`--ml-steer` flags are an advanced manual override.
 
 > The tiny `steer/` vectors also ship inside the GitHub repo (`presets/steer/`). The big `expr/`
 > files live here on HF because they are too large for git.
@@ -47,25 +57,39 @@ curl -L -o presets/expr/italian_csp_topk6.expr \
 ```
 Disk: the full `expr/` set ≈ 1.4 GB; Italian-only emotion needs just `italian_csp_topk6.expr` (203 MB).
 
-## How to activate
-See **[docs/expressivity-assets.md](https://github.com/gabriele-mastrapasqua/qwen3-tts/blob/main/docs/expressivity-assets.md)**
-for full recipes. Short version:
+## How to activate — it's automatic
 
-**Emotion** (steer is the main lever; `w8` sweet spot, `w12` over-steers):
+You don't wire these files by hand. The engine composes the right stack for you.
+
+**Emotion → one flag, `--emotion`.** Pick an emotion and the engine auto-loads the **COMBINE** win
+recipe (the fine-tune `.expr` for your language **+** the steering vector for that voice/emotion, at the
+ear-validated weights). A vivid **English or Chinese** `--instruct` on top is optional but **recommended**
+— it's what drives the strongest, most natural emotion.
+
 ```bash
-./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.1 --text "..." \
-  --ml-steer presets/steer/emotion/ryan_sad.qlsteer --ml-range 21-25 --ml-weight 8
-# far language / language-drifting voice → add  --expr presets/expr/italian_csp_topk6.expr --expr-weight 1.0
+# emotion in ONE flag — engine picks expr + steer automatically
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.1 --emotion sad \
+  --instruct "Speak softly, with quiet sadness." \
+  --text "Allora, lascia che ti spieghi come stanno le cose." -o sad.wav
 ```
+`--emotion` accepts: `sad · joy · anger · fear · disgust · surprise` (synonyms like `happy`/`angry` work too).
 
-**Paralinguistics (laugh / sigh)** — needs the onomatopoeia inline in the text **plus** the vector:
+**Works in every Qwen3-TTS language**, not just IT/DE/FR. The steering vector carries the emotion
+(it's a language-agnostic activation direction); the `.expr` renders/stabilizes the language. **DE / FR / IT
+have a native `.expr`**; for **ES / PT / RU / ZH / JA / KO** the engine uses the Italian pack as a universal
+cross-language renderer (ear-validated on IT/ES/RU/ZH/JA/KO). Just set `-l <Language>` and go.
+
+**Paralinguistics → inline `[tags]` in the text.** No flags: write `[laugh]` or `[sigh]` in `--text` and
+the engine performs the event automatically (it picks the onomatopoeia anchor + the right vector for you).
+
 ```bash
 ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.1 \
-  --text "Haaah... che giornata, haaah." \
-  --ml-steer presets/steer/paraling/sigh_vs_laugh.qlsteer --ml-range 21-25 --ml-weight 6
-# laugh: put 'ahah' in the text + sigh_vs_laugh → laugh_vs_cry
+  --text "Che giornata... [sigh] non ce la faccio più. [laugh]" -o para.wav
 ```
-Per-voice paralinguistic weight: galatea 8 · vivian 8 · ryan 6.
+
+> **Advanced / manual override.** Power users can still wire the raw pieces — `--expr <file> --expr-weight`,
+> `--ml-steer <file> --ml-range 21-25 --ml-weight <w>` — and a manual flag always overrides the auto-router.
+> Full recipes, per-voice weights and the tuning notes: **[docs/expressivity-assets.md](https://github.com/gabriele-mastrapasqua/qwen3-tts/blob/main/docs/expressivity-assets.md)**.
 
 ## License / attribution
 **CC-BY 4.0.** The Italian emotion fine-tune uses the **Emozionalmente** dataset — please cite:

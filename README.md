@@ -54,8 +54,7 @@ make blas
 - **9 preset voices** — `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
 - **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 - **Memory-mapped weights** — BF16 safetensors mmap'd directly. 0.6B ~3 GB, 1.7B ~8 GB.
-- **Voice cloning** — Clone any voice from a short WAV clip. Save as reusable `.qvoice` profile.
-- **Custom voices with Delta `.qvoice`** — Bit-identical cloned voices on CustomVoice model. Create once, use forever — with style control, streaming, server.
+- **Voice cloning** — Clone any voice from a short WAV clip. Ship it as a compact **~25 MB graft `.qvoice`** (`tests/qvoice_to_graft.py` → `--icl-only`): keeps the CustomVoice weights so emotion levers (`--instruct`, `--expr`, `--ml-steer`) all work, with full prosody (sighs/pauses). An 8 KB `--xvector-only` `.bin` is the ultra-lean alternative (identity only). See `docs/icl-graft-portability.md`.
 - **Voice management** — List, inspect, delete `.qvoice` profiles (`--list-voices`, `--delete-voice`). No model required.
 - **Style control** — `--instruct` for emotion/style on 1.7B: angry, whisper, cheerful, and more.
 - **Expressivity presets** — `--emotion <mood>` drives a full ear-validated recipe at once (vector + steer-weight + roughness + volume + rate): compound moods `joy, sad, annoyed, stern, angry` plus the base palette `happy, excited, eager, proud, sad, gloomy, news, dramatic, calm`, for controllable delivery where `--instruct` is weak. Language-aware (Italian uses the centered palette), blendable (`happy:0.5,proud:0.5`), dial with `--steer-weight`, plus a `--roughness` grit knob and pitch-preserving `--rate`/`--volume`. Cross-model, works on custom voices. See [docs/expressivity.md](docs/expressivity.md).
@@ -175,41 +174,64 @@ Works with `--instruct`, streaming, and the HTTP server.
 
 > Full guide: delta vs standard, format internals, troubleshooting → [docs/custom-voices.md](docs/custom-voices.md)
 
-### Expressivity packs `.expr` (per-language emotion, 1.7B)
+### Emotion & expressivity (1.7B)
 
-A tiny, composable **expressivity adapter** that makes any voice — a preset or a cloned
-`.qvoice` — speak a language more naturally **and** emote, without shipping a second multi-GB
-model. It's a small LoRA delta on the Talker's emotion layers, applied at load with `--expr`.
+Emotion is **one flag**. Pick an emotion with `--emotion` and the engine auto-composes the validated
+**COMBINE** stack for you — the per-language fine-tune (`.expr`) **plus** the steering vector for that
+voice and emotion, at the ear-validated weights. No file paths, no layer ranges. A vivid **English or
+Chinese** `--instruct` on top is optional but **recommended** — it drives the strongest, most natural result.
 
 ```bash
-# preset voice + Italian expressivity pack
-./qwen_tts -d qwen3-tts-1.7b -s vivian -l Italian -T 1.1 \
-    --expr presets/expr/italian_r32.expr \
-    --instruct "Speak with hot, furious anger, sharp and forceful." \
-    --text "Allora, lascia che ti spieghi come stanno le cose." -o angry.wav
-
-# cloned voice — DEFAULT is x-vector-only from a tiny 8KB .bin: clean (no room-reverb), more force headroom
-./qwen_tts -d qwen3-tts-1.7b --load-voice voices/myvoice.bin --xvector-only -l Italian -T 1.3 \
-    --expr presets/expr/italian_r64.expr --expr-weight 2.0 --instruct "..." --text "..." -o out.wav
-# make the .bin once: python3 tests/qvoice_to_xvec.py voices/myvoice.qvoice   (or --ref-audio + --xvector-only --save-voice)
+# emotion in ONE flag — works on presets AND cloned voices
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.1 --emotion sad \
+    --instruct "Speak softly, with quiet sadness." \
+    --text "Allora, lascia che ti spieghi come stanno le cose." -o sad.wav
 ```
 
-- **Cloned voices default to `--xvector-only`** (an 8 KB `.bin`): the ICL `.qvoice` carries the reference
-  recording's room reverb (a faint metallic artifact the `.expr` amplifies); the x-vector drops it while
-  keeping identity, and takes higher weight. Use `--icl-only` only for maximum timbre mimicry from a clean ref.
-- **Preset → `_r32` pack; cloned voice → `_r64`** (clones need more capacity). `--expr-weight <m>` doses it.
-  **Clone defaults: T1.3, weight ~1.6–2.0** (preset: T1.1, ~1.0–1.2); above that it over-steers.
-- Instruct in **English/Chinese**, spoken text in the target language, temperature **1.1–1.3**.
-- **Pretrained Italian emotion adapters** (2-block + 4-block "capacity ladder") are on Hugging Face →
-  [**gabrione/qwen3-tts-italian-expr**](https://huggingface.co/gabrione/qwen3-tts-italian-expr).
-- **Romance transfer (ES / PT / FR), ear-validated:** the Italian pack doubles as the Romance emotion pack —
-  **no separate file**. Load it with the target language: `-l Spanish --expr italian_csp.expr --expr-weight 1.6
-  -T 1.3` + an English instruct (same for `Portuguese` / `French`). A dedicated per-language pack is reserved
-  for a future **native** FT. See [docs/csp-ft-emotion.md](docs/csp-ft-emotion.md).
-- `.expr` files are large artifacts (hosted on HF, not committed); **train your own for any language** with the
-  reusable recipe in [`training/expressivity-lora/`](training/expressivity-lora/).
+- **Emotions:** `sad · joy · anger · fear · disgust · surprise` (synonyms like `happy`/`angry` work too).
+- **Works in every Qwen3-TTS language** (EN, IT, DE, ZH, RU, KO, JA, ES, FR, PT) — just set `-l <Language>`.
+  The steering vector carries the emotion (a language-agnostic activation direction); the `.expr` renders and
+  stabilizes the language. **DE / FR / IT have a native `.expr`**; the other languages use the Italian pack as
+  a universal cross-language renderer (ear-validated on IT/ES/RU/ZH/JA/KO).
+- **Cloned voices** emote with the same one flag (the engine picks the clone's own steer dir when it has one,
+  else a universal palette). Clones default to a clean **x-vector** load; see [Voice Cloning](#voice-cloning).
+- **Paralinguistics → inline `[tags]`, also automatic.** Write `[laugh]` or `[sigh]` in `--text` and the engine
+  performs the event (it picks the onomatopoeia anchor + the right vector for you) — no flags:
+  ```bash
+  ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.1 \
+      --text "Che giornata... [sigh] non ce la faccio più. [laugh]" -o para.wav
+  ```
 
-> How it works (which layers, why it's only ~16–63 MB, the file format) → [docs/expressivity-lora.md](docs/expressivity-lora.md)
+**Get the assets** (needed once, for the `.expr` fine-tunes — the steering vectors already ship in this repo):
+
+```bash
+bash download_assets.sh            # fetch the .expr packs into presets/expr/ (sha256-verified)
+bash download_assets.sh --verify   # re-check integrity of what you already have
+```
+They are hosted on Hugging Face → [**gabrione/qwen3-tts-italian-expr**](https://huggingface.co/gabrione/qwen3-tts-italian-expr)
+(one repo, folders by purpose). The full set ≈ 1.4 GB; Italian-only emotion needs just `italian_csp_topk6.expr` (203 MB).
+
+<details>
+<summary><b>Under the hood</b> — what each file is, and the manual override flags (advanced)</summary>
+
+You normally never touch these — `--emotion` and `[tags]` load the right ones. But if you want to tune by hand:
+
+| File | Where | What it is | Manual flag |
+|------|-------|------------|-------------|
+| `.expr` | `presets/expr/` (HF) | **Per-language emotion fine-tune** — a weight-delta on the Talker's emotion layers; fixes/renders the language *and* gives the base emotion. | `--expr <file> --expr-weight <m>` |
+| `.qlsteer` | `presets/steer/emotion/` (git) | **Emotion steering vector** — an inference-time activation direction (per voice × emotion). Changes no weights; carries the emotion, transfers cross-voice/language. | `--ml-steer <file> --ml-range 21-25 --ml-weight <w>` |
+| `.qlsteer` | `presets/steer/paraling/` (git) | **Paralinguistic vector** — `laugh_vs_cry`, `sigh_vs_laugh`. Speaker/language-agnostic. | (auto via `[laugh]`/`[sigh]`) |
+| `.qamp` | `presets/steer/paraling/` (git) | **Raw activation fingerprint** — the source a `.qlsteer` is built from (reproducibility). | (build input) |
+
+A manual `--expr` / `--ml-steer` always **overrides** the `--emotion` auto-router. Validated tuning notes:
+steer `w8` sweet spot (`w12` over-steers); ryan-anger uses expr only (steer goes metallic); clones take
+`--expr-weight ~1.2`. **Train your own `.expr` for any language** with [`training/expressivity-lora/`](training/expressivity-lora/).
+</details>
+
+**Deeper docs:** [docs/expressivity-assets.md](docs/expressivity-assets.md) (asset catalog + recipes) ·
+[docs/csp-ft-emotion.md](docs/csp-ft-emotion.md) (how the `.expr` packs were trained, cross-language transfer) ·
+[docs/expressivity-lora.md](docs/expressivity-lora.md) (which layers, the `.expr` format, train your own) ·
+[docs/paralinguistics-tags.md](docs/paralinguistics-tags.md) (laugh/sigh tags + vectors).
 
 ### HTTP Server
 
