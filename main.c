@@ -585,71 +585,33 @@ static const char *emotion_tok(const char *spec) {
 }
 /* The shippable per-(voice×emotion) recipe (plan §8.3). use_expr/use_steer pick the cell's MODE. */
 typedef struct { const char *voice; const char *tok; int use_expr; float expr_w; int use_steer; float steer_w; } emo_cell_t;
-static const emo_cell_t EMOTION_CELLS[] = {
-    /* ryan (preset): anger=EXPR(1.2) · disgust/sad=STEER w8 · fear/surprise=STEER w4 · joy=COMBINE(ew1.2,w8) */
-    { "ryan", "ang", 1, 1.2f, 0, 0.0f }, { "ryan", "disgust", 0, 0.0f, 1, 8.0f },
-    { "ryan", "fear", 0, 0.0f, 1, 4.0f }, { "ryan", "joy", 1, 1.2f, 1, 8.0f },
-    { "ryan", "sad", 0, 0.0f, 1, 8.0f }, { "ryan", "surprise", 0, 0.0f, 1, 4.0f },
-    /* vivian (preset, drifts language): anger=EXPR(1.2) · joy=COMBINE(ew1.2,w8) · rest=STEER (disgust w4) */
-    { "vivian", "ang", 1, 1.2f, 0, 0.0f }, { "vivian", "disgust", 0, 0.0f, 1, 4.0f },
-    { "vivian", "fear", 0, 0.0f, 1, 8.0f }, { "vivian", "joy", 1, 1.2f, 1, 8.0f },
-    { "vivian", "sad", 0, 0.0f, 1, 8.0f }, { "vivian", "surprise", 0, 0.0f, 1, 8.0f },
-    /* galatea (clone): anger/joy/sad/surprise=STEER w8 (NO expr — it softens them) · disgust/fear=COMBINE(ew1.0,w8) */
-    { "galatea", "ang", 0, 0.0f, 1, 8.0f }, { "galatea", "disgust", 1, 1.0f, 1, 8.0f },
-    { "galatea", "fear", 1, 1.0f, 1, 8.0f }, { "galatea", "joy", 0, 0.0f, 1, 8.0f },
-    { "galatea", "sad", 0, 0.0f, 1, 8.0f }, { "galatea", "surprise", 0, 0.0f, 1, 8.0f },
-    { NULL, NULL, 0, 0.0f, 0, 0.0f }
-};
-/* Resolve the recipe cell for (voice,emotion). Exact voice match first; else a validated default by
- * voice type: preset → mirror ryan; clone → STEER-clean everywhere (es_quijote generalization §8.5),
- * expr ADDS only on anger. */
-static emo_cell_t emotion_cell(const char *voice_key, const char *tok, int is_clone) {
-    for (int i = 0; EMOTION_CELLS[i].voice; i++)
-        if (voice_key && strcasecmp(EMOTION_CELLS[i].voice, voice_key) == 0 && strcmp(EMOTION_CELLS[i].tok, tok) == 0)
-            return EMOTION_CELLS[i];
-    emo_cell_t c = { "*", tok, 0, 0.0f, 1, 8.0f };
-    int low = (strcmp(tok, "fear") == 0 || strcmp(tok, "surprise") == 0);
-    if (is_clone) {
-        /* generic clone (galatea/es_quijote pattern): STEER-clean everywhere, NO expr (it softens). */
-        c.use_expr = 0; c.use_steer = 1; c.steer_w = low ? 4.0f : 8.0f;
-    } else if (strcmp(tok, "ang") == 0) {
-        /* generic preset = ryan rule: anger via EXPR only (steer goes metallic). */
-        c.use_expr = 1; c.expr_w = 1.2f; c.use_steer = 0; c.steer_w = 0.0f;
-    } else {
-        c.use_steer = 1; c.steer_w = low ? 4.0f : 8.0f;
-    }
-    return c;
-}
-/* THE per-language emotion recipe (docs/emotion-THE-recipe.md, ear-validated 2026-06-29). Fills `cell` and
- * `temp` for `language`. Non-Italian/English languages use a per-language policy (the best-voice guidance is in
- * the doc; the engine applies the mode to whatever voice was passed). Italian/English fall through to the
- * per-(voice×emotion) EMOTION_CELLS. */
+/* THE emotion recipe (docs/emotion-THE-recipe.md, ear-validated 2026-06-29 across ALL languages):
+ * pure STEER WINS everywhere, clean, timbre intact — `ryan_<emo>` @ **w12** (w10 also good) — so the recipe is
+ * DEAD SIMPLE. The earlier per-(voice×emotion) cells and per-language EXPR/COMBINE policy are SUPERSEDED.
+ *   PRESET voice → STEER ryan_<emo> @ w12 (no expr, no instruct). Use the NATIVE preset per language.
+ *   CLONE  voice → COMBINE: the language .expr @1.0 renders/stabilizes + STEER @ w12 + EN instruct
+ *                  (the one easy clone recipe — expr keeps a cross-language clone clean).
+ * anger/fear confirmed best at w12; the rest win at w10 or w12 → w12 everywhere is the single safe default. */
 static void resolve_emotion_recipe(const char *language, const char *voice_key, int is_clone,
                                    const char *tok, emo_cell_t *cell, float *temp) {
+    (void)language; (void)voice_key;
     *temp = 1.1f;
-    if (language) {
-        /* DE/FR/ES: the language .expr carries it, EXPR (no steer). Best on vivian. ear-validated 2026-06-29:
-         * DE/FR k6 beat r32; ES vivian+topk6 (k6) beat native-r32 AND ryan-romance. (resolve_emotion_expr maps
-         * German→german_csp_k6, French→french_csp_k6, Spanish→italian_csp_topk6.) */
-        if (!strcasecmp(language, "German") || !strcasecmp(language, "French") || !strcasecmp(language, "Spanish")) {
-            *cell = (emo_cell_t){ "*", tok, 1, 1.2f, 0, 0.0f }; return; }
-        /* Chinese: native preset (vivian) → STEER (same-language, max emotion), no expr. */
-        if (!strcasecmp(language, "Chinese")) {
-            *cell = (emo_cell_t){ "*", tok, 0, 0.0f, 1, 8.0f }; return; }
-        /* JA/KO/RU: COMBINE — IT expr renders the far language, steer pushes emotion (best on the galatea graft). */
-        if (!strcasecmp(language, "Japanese") || !strcasecmp(language, "Korean") || !strcasecmp(language, "Russian")) {
-            *cell = (emo_cell_t){ "*", tok, 1, 1.0f, 1, 8.0f }; return; }
-    }
-    *cell = emotion_cell(voice_key, tok, is_clone);   /* Italian / English / unspecified */
+    if (is_clone)
+        *cell = (emo_cell_t){ "*", tok, 1, 1.0f, 1, 12.0f };   /* clone: COMBINE (expr renders the language) + steer w12 */
+    else
+        *cell = (emo_cell_t){ "*", tok, 0, 0.0f, 1, 12.0f };   /* preset: STEER w12 — clean, every language */
 }
-/* Recommended GOLD preset/voice per language (for a hint when the user picked a weaker one). NULL = no preference. */
+/* Recommended NATIVE preset per language (hint when the user picked a weaker voice). Qwen presets:
+ * ryan (EN → Romance), vivian/uncle_fu (ZH), ono_anna (JA), sohee (KO). NULL = no strong preference. */
 static const char *recommended_voice_for_language(const char *language) {
     if (!language) return NULL;
-    if (!strcasecmp(language, "German") || !strcasecmp(language, "French") ||
-        !strcasecmp(language, "Chinese") || !strcasecmp(language, "Spanish"))
+    if (!strcasecmp(language, "Japanese")) return "ono_anna";
+    if (!strcasecmp(language, "Korean"))   return "sohee";
+    if (!strcasecmp(language, "Chinese"))  return "vivian";
+    if (!strcasecmp(language, "German") || !strcasecmp(language, "French") || !strcasecmp(language, "Spanish"))
         return "vivian";
-    if (!strcasecmp(language, "Japanese") || !strcasecmp(language, "Korean") || !strcasecmp(language, "Russian"))
-        return "the galatea graft clone";
+    if (!strcasecmp(language, "Italian") || !strcasecmp(language, "English") || !strcasecmp(language, "Portuguese"))
+        return "ryan";
     return NULL;
 }
 /* Pick the .qlsteer for an emotion. The validated recipe (recipe_final.sh) uses the **ryan_<tok>**
@@ -1625,9 +1587,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
                 fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model; must be 24 kHz mono WAV: ffmpeg -i in -ar 24000 -ac 1 out.wav)\n");
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
-                fprintf(stderr, "  --save-voice <path>        Save voice (.qvoice = full profile, .bin = embedding only)\n");
-                fprintf(stderr, "                             Without --text: create voice profile and exit\n");
-                fprintf(stderr, "  --load-voice <path>        Load voice (.qvoice = full profile, .bin = embedding only)\n");
+                fprintf(stderr, "  --save-voice <path>        Save voice. DEFAULT .qvoice = ~16-25MB GRAFT (identity+prosody,\n");
+                fprintf(stderr, "                             instruct/expr/steer all work). .bin = 8KB x-vector only. Heavy WDELTA\n");
+                fprintf(stderr, "                             qvoice (~0.8-3GB, exact-identity) ONLY with --target-cv. Without --text: create+exit\n");
+                fprintf(stderr, "  --load-voice <path>        Load voice (.qvoice graft/heavy or .bin x-vector; use --icl-only for the graft)\n");
                 fprintf(stderr, "  --voice-name <name>        Name for the voice (stored in .qvoice metadata)\n");
                 fprintf(stderr, "  --list-voices <dir>        List .qvoice files in directory\n");
                 fprintf(stderr, "  --delete-voice <path>      Delete a .qvoice file\n");
@@ -1640,10 +1603,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
-                fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag. On 1.7B, sad/joy/anger/fear/disgust/surprise auto-load the\n");
-                fprintf(stderr, "                             validated COMBINE stack (per-language .expr + per-voice .qlsteer @ L21-25) — works in\n");
-                fprintf(stderr, "                             every language; a vivid English/Chinese --instruct on top is recommended. Manual\n");
-                fprintf(stderr, "                             --expr/--ml-steer override. Other moods (excited/proud/calm/...) use the legacy palette.\n");
+                fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B): sad/joy/anger/fear/disgust/surprise. PRESET voice =\n");
+                fprintf(stderr, "                             STEER ryan_<emo> @ w12 (clean, every language); CLONE = COMBINE (lang .expr + steer).\n");
+                fprintf(stderr, "                             Use the NATIVE preset per language (JA ono_anna, KO sohee, ZH vivian, EN/Romance ryan).\n");
+                fprintf(stderr, "                             Optional --instruct/--expr/--ml-steer override. Other moods (excited/proud/...) = legacy palette.\n");
                 fprintf(stderr, "  --volume <f>               Output gain (1.0=unchanged, e.g. 1.1 louder, 0.9 softer)\n");
                 fprintf(stderr, "  --rate <f>                 Speaking rate, pitch-preserving (1.0=unchanged, >1 faster, <1 slower)\n");
                 fprintf(stderr, "  --compose <spec>           Inline markup synthesis (also works inside --text):\n");

@@ -21,42 +21,33 @@ explicit `-T` always override. On the 0.6B model `--emotion` falls back to the l
 ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian --emotion sad --text "…" -o out.wav
 ```
 
-## The mechanism (three modes)
-- **STEER** — multi-layer activation steer `presets/steer/emotion/ryan_<emo>.qlsteer` @ `--ml-range 21-25`,
-  `--ml-weight 8` (fear/surprise 4), `--ml-decay 0.985`. The ryan-captured CLEAN palette is used for **all voices**
-  (it transfers cross-voice/cross-language). NO instruct on pure-STEER cells. Carries the emotion.
-- **EXPR** — a per-language fine-tune `.expr` weight-delta + an English instruct, no steer. Renders/stabilizes the
-  language and gives the base emotion. Used where steer goes metallic (preset anger) or the language needs the FT.
-- **COMBINE** — EXPR + STEER together. The expr renders the language, the steer pushes the emotion.
+## The recipe — ONE rule (ear-validated 2026-06-29, full per-language sweep)
 
-## The table (voice × language × emotion)
+**Pure STEER wins everywhere** — clean timbre, no noise, emotes in every language. So:
 
-### Italian / English (per-(voice×emotion) — `EMOTION_CELLS[]`)
-| voice | anger | sad | joy | fear | disgust | surprise | T |
-|---|---|---|---|---|---|---|---|
-| ryan (preset) | EXPR 1.2 | STEER w8 | COMBINE 1.2/w8 | STEER w4 | STEER w8 | STEER w4 | 1.1 |
-| vivian (preset) | EXPR 1.2 | STEER w8 | COMBINE 1.2/w8 | STEER w8 | STEER w4 | STEER w8 | 1.1 |
-| galatea / clone | STEER w8 | STEER w8 | STEER w8 | COMBINE 1.0/w8 | COMBINE 1.0/w8 | STEER w8 | 1.1 |
-expr = `italian_csp_topk6.expr`. Clone = the 25 MB graft (`--icl-only`). IT ear-validated 2026-06-24; galatea anger
-= STEER `ryan_ang` (NOT galatea_ang_ft — that idea-2 dir is weaker/sad-ish).
+- **PRESET voice → STEER**: `presets/steer/emotion/ryan_<emo>.qlsteer` @ `--ml-range 21-25`, **`--ml-weight 12`**
+  (w10 also good), `--ml-decay 0.985`, **no expr, no instruct**. The ryan CLEAN palette is used for ALL voices
+  (it transfers cross-voice/cross-language).
+- **CLONE voice → COMBINE**: the language `.expr` @1.0 (renders/stabilizes a cross-language clone) **+** STEER @ w12
+  **+** a default English instruct. The one easy clone recipe.
 
-### Other languages (per-language policy — `resolve_emotion_recipe()`), ear-validated 2026-06-29
-| language | best voice | mode | expr | steer | T | verdict |
-|---|---|---|---|---|---|---|
-| **German** | **vivian** | EXPR | `german_csp_k6.expr` @1.2 | — | 1.1 | ✅ k6 wins (vs r32) |
-| **French** | **vivian** | EXPR | `french_csp_k6.expr` @1.2 | — | 1.1 | ✅ k6 wins (vs r32) |
-| **Chinese** | **vivian** (native) | STEER | — | ryan_<emo> w8 | 1.1 | ✅ good |
-| **Japanese** | **galatea-graft** (clone) | COMBINE | `italian_csp_topk6` @1.0 | ryan_<emo> w8 | 1.1 | ✅ good |
-| **Korean** | **galatea-graft** | COMBINE | `italian_csp_topk6` @1.0 | ryan_<emo> w8 | 1.1 | ✅ good (joy MUST be COMBINE — steer alone runs away) |
-| **Russian** | **galatea-graft** | COMBINE | `italian_csp_topk6` @1.0 | ryan_<emo> w8 | 1.1 | ✅ good |
-| **Spanish** | **vivian** | EXPR | `italian_csp_topk6` @1.2 | — | 1.1 | ✅ k6 wins (beat native MESD r32 AND ryan-romance @1.6) |
+**weight:** anger & fear are best at **w12**; the rest win at w10 *or* w12 → **w12 is the single default**.
+(Earlier per-(voice×emotion) EXPR/COMBINE tables are SUPERSEDED — pure STEER at w12 beat them with the right speaker.)
+
+**Use the NATIVE preset per language** (the engine applies STEER to *whatever* voice you pass, but the GOLD
+voice is the language-native one; the router prints a hint):
+
+| language | native preset | language | native preset |
+|---|---|---|---|
+| Japanese | **ono_anna** | Italian / English / Portuguese | **ryan** |
+| Korean | **sohee** | German / French / Spanish | **vivian** (ryan also good for Romance) |
+| Chinese | **vivian** / uncle_fu | (cloned voice, any language) | the clone → COMBINE |
 
 Notes:
-- **Best voice differs per language** — the engine applies the recipe to *whatever voice you pass*, but for the
-  GOLD result use the recommended voice (German/French/Chinese/**Spanish** → `-s vivian`; JA/KO/RU → the galatea
-  graft clone; Italian → `-s ryan` or the clone). The router prints a hint when your voice isn't the recommended one.
-- All instructs are **English** (the model follows EN/ZH, not the spoken language). Defaults baked per emotion.
-- seed 42 is the reference; the per-language scripts all use it.
+- `--instruct` (vivid English) and `--expr` are **optional manual overrides** on a preset — not in the default.
+  COMBINE (expr+steer) gave anger/fear a "touch of class" in some languages but **broke Spanish (noise)** → it's
+  the clone default, not the preset default.
+- seed 42 is the reference. Temperature 1.1.
 
 ## Assets
 - expr packs (`presets/expr/`): `italian_csp_topk6`, `german_csp_k6`, `french_csp_k6` (shipped on HF, fetch with
