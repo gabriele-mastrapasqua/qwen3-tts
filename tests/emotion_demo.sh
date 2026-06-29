@@ -42,13 +42,14 @@ gen ryan_it_fear.wav     -s ryan -- fear     Italian "C'è qualcuno in casa, ho 
 gen ryan_it_disgust.wav  -s ryan -- disgust  Italian "Ma che roba è questa? Fa davvero schifo, non riesco nemmeno a guardarla."
 gen ryan_it_surprise.wav -s ryan -- surprise Italian "Cosa?! Non me lo aspettavo per niente, è incredibile, sono sbalordito!"
 
-echo "== ryan (preset) — multilingual highlights (emotion works in every Qwen language) =="
-gen ryan_de_anger.wav -s ryan -- anger German   "Also, lass mich dir in Ruhe erklaeren, wie die Dinge wirklich stehen."
-gen ryan_fr_sad.wav   -s ryan -- sad   French   "Bon, laisse-moi t'expliquer calmement comment les choses se passent vraiment."
-gen ryan_es_joy.wav   -s ryan -- joy   Spanish  "Bueno, dejame explicarte con calma como estan realmente las cosas."
-gen ryan_ru_anger.wav -s ryan -- anger Russian  "Как ты смеешь так со мной разговаривать? Это неприемлемо, я этого не потерплю!"
-gen ryan_zh_joy.wav   -s ryan -- joy   Chinese  "我简直不敢相信，这是我一生中最好的消息，我太高兴了！"
-gen ryan_ja_sad.wav   -s ryan -- sad   Japanese "私が持っていたものを全て失って、もうどうすればいいのか分からない。"
+echo "== multilingual highlights (emotion works in every Qwen language, on the NATIVE preset per language) =="
+gen de_vivian_anger.wav   -s vivian   -- anger German   "Also, lass mich dir in Ruhe erklaeren, wie die Dinge wirklich stehen."
+gen fr_vivian_sad.wav     -s vivian   -- sad   French   "Bon, laisse-moi t'expliquer calmement comment les choses se passent vraiment."
+gen es_vivian_joy.wav     -s vivian   -- joy   Spanish  "Bueno, dejame explicarte con calma como estan realmente las cosas."
+gen ru_vivian_anger.wav   -s vivian   -- anger Russian  "Как ты смеешь так со мной разговаривать? Это неприемлемо, я этого не потерплю!"
+gen zh_vivian_joy.wav     -s vivian   -- joy   Chinese  "我简直不敢相信，这是我一生中最好的消息，我太高兴了！"
+gen ja_ono_anna_sad.wav   -s ono_anna -- sad   Japanese "私が持っていたものを全て失って、もうどうすればいいのか分からない。"
+gen ko_sohee_anger.wav    -s sohee    -- anger Korean   "네가 어떻게 나한테 그렇게 말할 수 있어? 이건 절대 받아들일 수 없어!"
 
 if [ -f voices/galatea_graft.qvoice ]; then
   echo "== galatea (25 MB cloned voice) — Italian, the clone emotes too =="

@@ -2,7 +2,7 @@
 # ============================================================================================
 # emo_matrix_all.sh — FULL re-verification matrix: every language × every emotion, driven by the
 # C engine's `--emotion` flag (THE recipe, docs/emotion-THE-recipe.md). Recommended GOLD voice per
-# language (ryan = IT/EN/PT-Romance; vivian = DE/FR/ES/ZH; galatea-graft clone = JA/KO/RU). One neutral
+# language (ryan = IT/EN/PT-Romance; vivian = DE/FR/ES/ZH; ono_anna = JA; sohee = KO). One neutral
 # carrier per language → the emotion comes purely from the recipe (instruct/steer/expr the router applies).
 # Output: samples/tests/2026-06-29_emo-matrix-all/  (gitignored). 1.7B CustomVoice, seed 42.
 # ============================================================================================
@@ -21,9 +21,9 @@ LANGS=(
 "fr|French|-s vivian|Bon, laisse-moi t'expliquer calmement comment les choses se passent vraiment."
 "es|Spanish|-s vivian|Bueno, dejame explicarte con calma como estan realmente las cosas."
 "zh|Chinese|-s vivian|那么，让我来跟你解释一下事情到底是怎么回事。"
-"ja|Japanese|--load-voice voices/galatea_graft.qvoice --icl-only|では、物事が実際にどうなっているのか説明させてください。"
-"ko|Korean|--load-voice voices/galatea_graft.qvoice --icl-only|그럼, 상황이 실제로 어떤지 설명해 드릴게요."
-"ru|Russian|--load-voice voices/galatea_graft.qvoice --icl-only|Итак, позвольте мне объяснить, как обстоят дела на самом деле."
+"ja|Japanese|-s ono_anna|では、物事が実際にどうなっているのか説明させてください。"
+"ko|Korean|-s sohee|그럼, 상황이 실제로 어떤지 설명해 드릴게요."
+"ru|Russian|-s vivian|Итак, позвольте мне объяснить, как обстоят дела на самом деле."
 "pt|Portuguese|-s ryan|Bem, deixa-me explicar-te com calma como as coisas realmente são."
 )
 

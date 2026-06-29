@@ -32,9 +32,10 @@ need `italian_csp_topk6.expr` (203 MB). German/French add `german_csp_k6.expr` /
 
 ## 2. Activate EMOTION
 
-Emotion = a **steering vector** (the main lever) optionally combined with an **`.expr`** (for language
-correction / anger / far languages). All on the 1.7B model. Per-voice steer weight matters; `w8` is the
-global sweet spot, `w12` over-steers.
+Emotion = a **steering vector** (the main lever) optionally combined with an **`.expr`** (clones / language
+correction). All on the 1.7B model. **Validated default (2026-06-29): pure STEER @ `w12`** wins clean in every
+language on the native preset (w10 also good); the per-language EXPR/COMBINE complexity is superseded — see
+[emotion-THE-recipe.md](emotion-THE-recipe.md). The manual recipes below still work as overrides.
 
 **A) Same / close language → STEER (max emotion):**
 ```bash

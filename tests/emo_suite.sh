@@ -12,7 +12,7 @@
 #       <lang>_<voice>_<emo>_combine_w8_expr.wav       (expr + steer w8 + instruct)
 #   • GALATEA clone folder: contrasting emotions across a few languages (COMBINE, the clone cross-lang win).
 #
-# GOLD voice per language (the recommended one): ryan = IT/EN/PT ; vivian = DE/FR/ES/ZH ; galatea-graft = JA/KO/RU.
+# GOLD native preset per language: ryan = IT/EN/PT ; vivian = DE/FR/ES/ZH ; ono_anna = JA ; sohee = KO.
 # 1.7B CustomVoice, seed 42, ml-range 21-25, ml-decay 0.985 (engine default).
 #
 # Scope to a subset: LANGS="de fr es" bash tests/emo_suite.sh   (default = all). EMOS="anger sad" to subset emotions.
@@ -46,9 +46,9 @@ declare -A LCFG=(
  [fr]="French|-s vivian|vivian|presets/expr/french_csp_k6.expr"
  [es]="Spanish|-s vivian|vivian|presets/expr/italian_csp_topk6.expr"
  [zh]="Chinese|-s vivian|vivian|presets/expr/italian_csp_topk6.expr"
- [ja]="Japanese|--load-voice voices/galatea_graft.qvoice --icl-only|galatea|presets/expr/italian_csp_topk6.expr"
- [ko]="Korean|--load-voice voices/galatea_graft.qvoice --icl-only|galatea|presets/expr/italian_csp_topk6.expr"
- [ru]="Russian|--load-voice voices/galatea_graft.qvoice --icl-only|galatea|presets/expr/italian_csp_topk6.expr"
+ [ja]="Japanese|-s ono_anna|ono_anna|presets/expr/italian_csp_topk6.expr"
+ [ko]="Korean|-s sohee|sohee|presets/expr/italian_csp_topk6.expr"
+ [ru]="Russian|-s vivian|vivian|presets/expr/italian_csp_topk6.expr"
  [pt]="Portuguese|-s ryan|ryan|presets/expr/italian_csp_topk6.expr")
 
 # EMOTION-MATCHED prompts: "tag_emo" -> sentence whose meaning fits the emotion.

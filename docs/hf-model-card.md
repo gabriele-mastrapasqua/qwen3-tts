@@ -61,10 +61,10 @@ Disk: the full `expr/` set ≈ 1.4 GB; Italian-only emotion needs just `italian_
 
 You don't wire these files by hand. The engine composes the right stack for you.
 
-**Emotion → one flag, `--emotion`.** Pick an emotion and the engine auto-loads the **COMBINE** win
-recipe (the fine-tune `.expr` for your language **+** the steering vector for that voice/emotion, at the
-ear-validated weights). A vivid **English or Chinese** `--instruct` on top is optional but **recommended**
-— it's what drives the strongest, most natural emotion.
+**Emotion → one flag, `--emotion`.** Pick an emotion and the engine applies the ear-validated recipe:
+**a preset voice → pure STEER** (the steering vector `ryan_<emo>` @ w12 — clean, every language); **a cloned
+voice → COMBINE** (the language `.expr` + steer). Use the **native preset per language** (JA `ono_anna`, KO
+`sohee`, ZH `vivian`, EN/Romance `ryan`). A vivid **English** `--instruct` is an optional override.
 
 ```bash
 # emotion in ONE flag — engine picks expr + steer automatically

@@ -232,9 +232,10 @@ You normally never touch these — `--emotion` and `[tags]` load the right ones.
 | `.qlsteer` | `presets/steer/paraling/` (git) | **Paralinguistic vector** — `laugh_vs_cry`, `sigh_vs_laugh`. Speaker/language-agnostic. | (auto via `[laugh]`/`[sigh]`) |
 | `.qamp` | `presets/steer/paraling/` (git) | **Raw activation fingerprint** — the source a `.qlsteer` is built from (reproducibility). | (build input) |
 
-A manual `--expr` / `--ml-steer` always **overrides** the `--emotion` auto-router. Validated tuning notes:
-steer `w8` sweet spot (`w12` over-steers); ryan-anger uses expr only (steer goes metallic); clones take
-`--expr-weight ~1.2`. **Train your own `.expr` for any language** with [`training/expressivity-lora/`](training/expressivity-lora/).
+A manual `--expr` / `--ml-steer` always **overrides** the `--emotion` auto-router. Validated recipe (2026-06-29):
+**preset → pure STEER `ryan_<emo>` @ `w12`** (clean, every language; w10 also good); **clone → COMBINE** (language
+`.expr` + steer). Use the native preset per language (JA `ono_anna`, KO `sohee`, ZH `vivian`, EN/Romance `ryan`).
+**Train your own `.expr` for any language** with [`training/expressivity-lora/`](training/expressivity-lora/).
 </details>
 
 **Deeper docs:** [docs/expressivity-assets.md](docs/expressivity-assets.md) (asset catalog + recipes) ·
@@ -389,7 +390,7 @@ total throughput on bandwidth-bound boxes. Measure it on your CPU with `make ben
 | [HTTP Server](docs/server.md) | All endpoints, request body, streaming, server performance |
 | [Server request-batching](docs/server-batching.md) | vLLM-style `--batch-size N`: serve N concurrent users together, continuous batching, per-request streaming |
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
-| [Emotion — THE recipe](docs/emotion-THE-recipe.md) | The one-and-only `--emotion` recipe (voice×language×emotion: EXPR/STEER/COMBINE), the single source of truth |
+| [Emotion — THE recipe](docs/emotion-THE-recipe.md) | The one-and-only `--emotion` recipe: preset → STEER @ w12, clone → COMBINE; native preset per language. Single source of truth |
 | [Expressivity packs `.expr`](docs/expressivity-lora.md) | Per-language emotion LoRA: which layers, why it's ~16–63 MB, file format, `--expr`/`--expr-weight`, per-voice rank. Train your own: [`training/expressivity-lora/`](training/expressivity-lora/) |
 | [Inline markup](docs/markup.md) | Audiobook/podcast tags in `--text`: `[sad]`/`[excited]` mid-text emotion switches, `[sigh]`/`[huff]` fillers, `[pause:400ms]` |
 | [Quantization](docs/quantization.md) | INT8/INT4, comparison table, recommendations |
