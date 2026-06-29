@@ -23,7 +23,7 @@ BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42
 ROOT="${EMO_SUITE_DIR:-samples/tests/2026-06-29_emo-suite}"; mkdir -p "$ROOT"
 [ -d "$M" ] || { echo "SKIP: $M not present"; exit 0; }
 QL=presets/steer/emotion
-WEIGHTS_DEFAULT="6 8 10"   # steer sweep around the w8 sweet spot
+WEIGHTS_DEFAULT="8 10 12"   # steer sweep around the w8 sweet spot
 EMOS="${EMOS:-sad joy anger fear disgust surprise}"
 LANGS="${LANGS:-it en de fr es zh ja ko ru pt}"
 
