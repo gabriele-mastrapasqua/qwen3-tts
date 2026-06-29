@@ -4,6 +4,14 @@
 > The reasoning behind what we do — objectives, WHY, methodology, what's already decided/tried — lives there,
 > not just in code. Do NOT re-derive from scratch or re-ask what was settled days ago. Keep the thread.
 > When you finish a meaningful thread or experiment, UPDATE the Compass experiment-index + the relevant memory.
+>
+> 🎯 **EMOTION IS SOLVED — THE recipe is `docs/emotion-THE-recipe.md` (single source of truth, mirrored in
+> `main.c`).** ONE rule: **preset voice → pure STEER `ryan_<emo>` @ w12** (clean, every language); **cloned voice
+> → COMBINE** (language `.expr` + steer). Use the **native preset per language** (JA `ono_anna`, KO `sohee`, ZH
+> `vivian`, EN/Romance `ryan`). Exposed as the `--emotion <sad|joy|anger|fear|disgust|surprise>` flag. Ear-validated
+> 2026-06-29, committed + pushed. Paralinguistics = inline `[laugh]`/`[sigh]` tags. **Do NOT re-derive from the old
+> abandoned methods** (graft/x-vector/τ-vectors/`.vec`/dense-FT/per-language EXPR-COMBINE — all archived in
+> `docs/archive/`). Read THE recipe, don't re-spelunk weeks of experiments.
 
 This file is the practical guide for agents working on this repository.
 It is intentionally implementation-oriented: what to change, where, how to test,
@@ -238,6 +246,10 @@ curl -s http://localhost:8000/v1/tts -d '{"text":"Test phrase here.","seed":42,"
 prompts (e.g. different codec token counts), making outputs non-comparable.
 
 ## Expressivity Plugins: Emotion vs Paralinguistics (Design Contract)
+
+> ✅ **Emotion shipped (2026-06-29): the recipe is `docs/emotion-THE-recipe.md` — preset → STEER w12, clone →
+> COMBINE, native preset per language, via `--emotion`.** The notes below are the para-vs-emo design contract
+> (still relevant for the paralinguistics FT, future work); the emotion side is DONE — follow THE recipe.
 
 Emotion and paralinguistics (`[laugh]`/`[sigh]`/`[cough]`/`[breath]`…) are **SEPARATE, COMPOSABLE plugin fine-tunes**, NOT one model:
 
