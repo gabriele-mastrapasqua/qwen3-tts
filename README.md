@@ -249,6 +249,28 @@ unstable** across some languages/voices (work in progress) — the clearest resu
 | Spanish | vivian | 😄 joy + `[laugh]` | *No me lo puedo creer, `[laugh]` ¡es la mejor noticia de mi vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_joy_laugh.wav) |
 | Italian | galatea (cloned voice) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/galatea_it_joy_laugh.wav) |
 
+#### Tuning the `--instruct` (strength & speed)
+
+`--instruct` is an **optional** vivid English (or Chinese) line that rides on top of the emotion recipe (1.7B; it
+matters for **cloned voices** and preset+instruct — preset pure-emotion needs none). Two things it controls well:
+
+- **Strength** — a stronger, more vivid instruct pushes emotion harder. Escalate the wording when you want more
+  (e.g. anger gets raspier and angrier); back off if it starts to sound noisy. Write it as **plain prose**, not a
+  parameter list.
+- **Speed** — say it in words: `"… and speak a little faster"` / `"speak slowly"` shifts pacing (~±15 %);
+  `"in a higher voice"` lifts the pitch a touch.
+
+```bash
+# mild vs strong wording — same recipe, more push
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English -T 1.1 --emotion anger \
+    --instruct "Speak in an absolutely furious, explosive, screaming rage, voice cracking with violent anger." \
+    --text "How dare you talk to me like that? I will not accept this!" -o anger.wav
+```
+
+> **Don't** use a slot/parameter template (`VoiceStyle: … Tempo: +15% Pitch: higher`). Qwen3-TTS does **not** parse
+> the slots — `Tempo:+40%` even comes out *slower*. Plain vivid prose wins. Full findings + a ready per-emotion
+> `strong`/`very-strong` instruct library → [docs/emotion-instruct-control.md](docs/emotion-instruct-control.md).
+
 **Get the assets** (needed once, for the `.expr` fine-tunes — the steering vectors already ship in this repo):
 
 ```bash

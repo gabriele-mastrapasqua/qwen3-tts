@@ -76,6 +76,14 @@ the steering vector; `[huff]`/`[ugh]`/`[hmm]`/`[mmm]`/`[phew]`/… are soft onom
 > cold-prefill span) can sound slightly detached/off-timbre (the seam, not audio-splice). Provenance of the
 > per-voice weights + the "anchor + vector" rule: memory `project_paralinguistic_steering_vector` (ear 2026-06-25/28).
 
+## Instruct control (strength & speed) — the `--instruct` lever
+`--instruct` (1.7B, COMBINE/clone path only — preset pure-STEER needs none) is a secondary flavour on top of the
+recipe. Two things it CAN do: (1) **strength** — a vivid free-form instruct pushes emotion; `strong` is the default,
+`very-strong` pushes further (anger raspier); (2) **speed** — plain English `"speak faster/slower"` shifts pacing
+(~±15%), pitch-up a little. What it CANNOT do: a **slot template** (`Tempo:+15%/Pitch:higher`) — Qwen doesn't parse
+it (`Tempo:+40%` comes out *slower*). Full findings + the per-emotion strong/very-strong instruct library:
+**`docs/emotion-instruct-control.md`**.
+
 ## Try it
 - `make emotion-demo` (Italian ×6 + multilingual + galatea clone) → `samples/tests/emotion_demo/`.
 - `make emotion-para-demo` (emotion + inline `[tag]` across langs/speakers) → `samples/tests/emotion_para_demo/`.
