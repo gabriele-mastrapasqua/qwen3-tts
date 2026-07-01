@@ -89,6 +89,35 @@ These did NOT laugh but produced a **clean, distinct OTHER event in-voice** — 
 
 ---
 
+## Cross-voice validation (2026-07-01) — `哈哈哈` s7 is the UNIVERSAL laugh; `唉` sigh fails on vivian
+Validated the galatea wins on the ryan/vivian presets (EN + IT) to confirm the mapping generalizes.
+
+### 😄 LAUGH `哈哈哈` (CN, 3-char) @ **seed 7** — WIN across voices AND languages
+| voice · lang | seed | verdict | ear note |
+|---|---|---|---|
+| ryan · EN | 7 | ✅ **WIN** | 2 risate forti/lunghe belle; lieve metallico a fine |
+| ryan · IT | 7 | ✅ **WIN** | risata lunga `ehehe`, lieve metallico ma poco |
+| vivian · IT | 7 | ✅ **WIN — breve e precisa** | ride pulito, corto |
+| galatea (clone) · IT | 7 | ✅ WIN (prior) | ride con voce clonata |
+| ryan · IT | 42 | 🟡 interesting | ride ma un po' forzata (`ahahah ahhh ah`) |
+| vivian · IT | 42 | ❌ KO | metallico, rallenta, allunga ogni `eh eh eh` |
+| **`haha` (Latin) @ T1.0** · vivian · EN | 42 | ❌ KO | NON ride: sospira `ah ahhh` sfinita/godimento — `haha` is **ryan-specific**, doesn't generalize |
+
+**⇒ LAUGH final mapping: `[laugh]` → `哈哈哈` (CN) @ seed 7 — ONE onomatopoeia, all voices + languages.**
+Seed 7 is decisive (s42 forces/derails). `haha`@T1.0 stays a ryan-EN-only clean alt; `哈哈哈` s7 is universal
+(mild metallic tail on ryan is the only nit → later: trim tail or seed-tune).
+
+### 😮‍💨 SIGH `唉` (CN) @ seed 42
+| voice · lang | verdict | ear note |
+|---|---|---|
+| ryan · IT | ✅ **WIN** | perfetto `ehhh` sigh |
+| galatea (clone) · IT | ✅ WIN (prior) | `ehh` breve, controllo perfetto |
+| vivian · IT | ❌ KO | ansima di stanchezza/godimento, metallico — **vivian over-does para**; needs a shorter sigh / different seed (TODO) |
+
+**⇒ SIGH mapping: `[sigh]` → `唉` @ seed 42 for ryan/clone. vivian is the open case (over-sighs) — TODO.**
+
+---
+
 ## Status legend
 ✅ WIN (promote to the `[tag]` map) · 🟡 interesting/partial (keep, needs a pick) · ❌ KO (do not re-run) · ↪ produced a different event.
 
