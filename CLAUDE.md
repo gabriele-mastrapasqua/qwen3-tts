@@ -18,7 +18,9 @@
 > voice's own timbre, mixed in). ❌ **NEVER the split-span / steering-span "splice"** (separate cold-prefill span
 > = sounds like a different voice — rejected by ear 2026-07-01). The doc is the durable WIN/KO table by
 > onomatopoeia × seed × language × emotion × speaker — do NOT re-run a KO combo; promote WINs into the `[tag]`
-> map. (Known open: in Italian the onomatopoeia SIGHS not laughs — inline laugh in IT still unsolved.)
+> map. Companion **`docs/para-target.md`** = the desiderata menu (what pros do, what we want, variants).
+> Shipped mapping: `[laugh]`→`哈哈哈` s7 (universal); `[sigh]`→`唉` s42 (ryan/clone) / `ahh` s7 (vivian); comma-
+> delimited inline, one generation, seed pinned per-tag. The split-span "splice" is DELETED — never bring it back.
 
 This file is the practical guide for agents working on this repository.
 It is intentionally implementation-oriented: what to change, where, how to test,
