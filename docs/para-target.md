@@ -21,6 +21,25 @@ seed. (3) A Chinese-trained model (Step-Audio-EditX) exposing exactly laughter/s
 **confirms Chinese onomatopoeia is the right lever** (as we found: `哈哈哈`/`唉`/`嗯`). (4) Nobody exposes *named
 duration variants* per event — an opening for us (`[sigh:long]`).
 
+## 1b. HOW they map it (mechanism) — and what we can BORROW
+- **CosyVoice2/3**: tags are **literal inline markers** (`[laughter]`, `[breath]`, `[cough]`, `[sigh]`, `[gasp]`;
+  user-friendly `<breath>/<laughter>/<cough>/<sigh>/<gasp>/<mn>/<lipsmack>/…` auto-converted to `[...]`; wrapper
+  spans `<laughing>text</laughing>`, `<strong>text</strong>`) — BUT they are **special tokens the model was TRAINED
+  on** (1500h instructed data, expanded token vocab). So `[laughter]` works because it was *learned*. **We cannot
+  copy the token** (Qwen has no trained `[laughter]`; its `[sigh]` sub-word-splits in BPE — that's why our FT
+  failed). We CAN copy their **vocabulary + syntax ideas**.
+- **Step-Audio-EditX** (Chinese): its 10 paralinguistic labels are essentially **Chinese interjection characters** —
+  surprise-wa=`哇`, surprise-ah=`啊`, surprise-oh=`哦`, confirmation-en=`嗯`, dissatisfaction-hnn=`哼`,
+  question-ei=`诶`, uhm=`呃`, laughter=`哈哈`, sigh, breathing. **This is our onomatopoeia lever, validated by a
+  Chinese model** → use their CN interjections as our trigger candidates instead of guessing.
+- **Borrowable syntax ideas (not the trained tokens):** (a) **wrapper span** `<laughing>text</laughing>` = speak an
+  affect OVER a span → our T5 style-carryover; (b) **intensity number** `<Laughter:2>` (Step) → our T4 variants
+  `[laugh:2]`/`[sigh:long]`. Nobody ships named duration variants → still our opening.
+
+**⇒ T2 candidate triggers (CN-first, from Step's interjection map + our finds):**
+`[gasp]/[surprise]`→`哇`/`啊`/`哦` · `[groan]/[dissatisfaction]`→`哼` · `[mmm]/[pleasure]`→`嗯` · `[uhm]`→`呃`/`诶`
+· `[chuckle]`→`呵呵`/`嘿嘿` · `[cry]`→`呜呜` · `[yawn]`→`哈啊`. Test these with the RELATED emotion (§T3).
+
 ## 2. The TARGET menu — VOCAL family (what Qwen can plausibly do inline)
 Legend: **HAVE** = shipped/validated (see para-experiments.md) · **CAND** = serendipitous candidate, validate ·
 **TRY** = pros have it, not yet tested on Qwen · family per NVBench taxonomy (laugh/cry/scream/moan/sigh + subtypes).
