@@ -107,14 +107,19 @@ Validated the galatea wins on the ryan/vivian presets (EN + IT) to confirm the m
 Seed 7 is decisive (s42 forces/derails). `haha`@T1.0 stays a ryan-EN-only clean alt; `哈哈哈` s7 is universal
 (mild metallic tail on ryan is the only nit → later: trim tail or seed-tune).
 
-### 😮‍💨 SIGH `唉` (CN) @ seed 42
-| voice · lang | verdict | ear note |
-|---|---|---|
-| ryan · IT | ✅ **WIN** | perfetto `ehhh` sigh |
-| galatea (clone) · IT | ✅ WIN (prior) | `ehh` breve, controllo perfetto |
-| vivian · IT | ❌ KO | ansima di stanchezza/godimento, metallico — **vivian over-does para**; needs a shorter sigh / different seed (TODO) |
+### 😮‍💨 SIGH — `唉` (CN) for ryan/clone; `ahh` (Latin) for vivian (fixed 2026-07-01)
+| voice · lang | onomatopoeia | seed · T | verdict | ear note |
+|---|---|---|---|---|
+| ryan · IT | `唉` (CN) | 42 · 1.1 | ✅ **WIN** | perfetto `ehhh` sigh |
+| galatea (clone) · IT | `唉` (CN) | 42 · 1.1 | ✅ WIN (prior) | `ehh` breve, controllo perfetto |
+| **vivian · IT** | **`ahh`** | **7 · 1.1** | ✅✅ **TOP WIN** | sigh sospirato medio, molto bello |
+| vivian · IT | `ahh` | 42 · 1.1 | ✅ **WIN** | sospiro breve |
+| vivian · IT | `唉` (CN) | 42 · **0.9** | ✅ **WIN** | pulito (la temp più bassa calma il CN) |
+| vivian · IT | `唉` (CN) | 42 · 1.1 | ❌ KO | ansima stanchezza/godimento, metallico (vivian over-does 唉 at T1.1) |
 
-**⇒ SIGH mapping: `[sigh]` → `唉` @ seed 42 for ryan/clone. vivian is the open case (over-sighs) — TODO.**
+**⇒ SIGH mapping: ryan/clone → `唉` @ s42 T1.1 · vivian → `ahh` @ s7 (medium) / s42 (short) T1.1.**
+Sigh is more voice-dependent than laugh. `ahh` looks like a candidate UNIVERSAL sigh (wins on vivian AND
+galatea `ahh` s2024) — TODO: confirm `ahh` sighs on ryan-IT too → if yes, unify `[sigh]` → `ahh`.
 
 ---
 
