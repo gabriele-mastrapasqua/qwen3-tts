@@ -555,6 +555,77 @@ static const pvec_t PARA_VECTORS[] = {
     { NULL, NULL, NULL, 0.0f, 0, 0, NULL, 0 }
 };
 
+/* INLINE paralinguistics — the shipped method (2026-07-01, docs/para-experiments.md). A `[laugh]`/`[sigh]`
+ * is replaced by a validated ONOMATOPOEIA *inside* the sentence, so the event is produced in the active
+ * voice's own timbre within ONE generation — NEVER a separate "splice" span (which mixed voices). The
+ * mapping is universal across voices AND languages (ear-validated on ryan EN/IT, vivian IT, galatea clone):
+ *   [laugh] → 哈哈哈 (CN 3-char)   [sigh] → ahh (Latin)
+ * and seed 7 makes BOTH fire (哈哈哈 s7 laughs / s42 hyperventilates; ahh s7 = clean sigh). SHORT form only
+ * (哈哈哈 not longer; long over-laughs into a pant); no event-instruct (goes metallic). See the doc for WIN/KO. */
+/* Per-(tag × voice) onomatopoeia + validated seed. The mapping is VOICE-DEPENDENT (ear 2026-07-01,
+ * docs/para-experiments.md): laugh is universal (哈哈哈 s7) but sigh differs — 唉 s42 on ryan/clone,
+ * `ahh` s7 on vivian (which over-does 唉). voice_class: 0 = ryan/clone/default, 1 = vivian. */
+static void para_pick(const char *tag, int voice_class, const char **onom, int *seed) {
+    *onom = NULL; *seed = 7;
+    if (!strcasecmp(tag, "laugh") || !strcasecmp(tag, "laughs")) {
+        *onom = "\xe5\x93\x88\xe5\x93\x88\xe5\x93\x88"; *seed = 7;              /* 哈哈哈 — all voices */
+    } else if (!strcasecmp(tag, "sigh") || !strcasecmp(tag, "sighs")) {
+        if (voice_class == 1) { *onom = "ahh"; *seed = 7; }                    /* vivian */
+        else                  { *onom = "\xe5\x94\x89"; *seed = 42; }          /* 唉 — ryan/clone */
+    }
+}
+/* Replace every [laugh]/[sigh] tag in `text` with its validated onomatopoeia, COMMA-DELIMITED (the win
+ * carriers set the event off with commas — "…credere, 哈哈哈, è…" — so it renders as a discrete event;
+ * without the trailing comma it slurs into the next word). Other tags ([sad]/[pause]/…) pass through.
+ * Returns a new string (caller owns); sets *did=1 and *seed to the FIRST substituted tag's validated seed. */
+static char *para_inline_substitute(const char *text, int voice_class, int *did, int *seed) {
+    *did = 0;
+    if (!text) return NULL;
+    size_t cap = strlen(text) + 48, n = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    #define PIS_ENS(extra) do { while (n + (extra) + 1 > cap) { cap *= 2; char *nb = (char *)realloc(out, cap); if (!nb) { free(out); return NULL; } out = nb; } } while (0)
+    const char *p = text;
+    while (*p) {
+        if (*p == '[') {
+            const char *c = strchr(p, ']');
+            if (c) {
+                size_t tl = (size_t)(c - p - 1);
+                char tag[32];
+                if (tl < sizeof(tag)) {
+                    memcpy(tag, p + 1, tl); tag[tl] = 0;
+                    char *t = tag; while (*t == ' ') t++;
+                    char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
+                    const char *onom; int sd;
+                    para_pick(t, voice_class, &onom, &sd);
+                    if (onom) {
+                        /* comma BEFORE: strip trailing spaces + one comma in out, then emit ", " */
+                        while (n > 0 && out[n - 1] == ' ') n--;
+                        if (n > 0 && out[n - 1] == ',') n--;
+                        size_t ol = strlen(onom);
+                        PIS_ENS(ol + 4);
+                        if (n > 0) { out[n++] = ','; out[n++] = ' '; }         /* not at sentence start */
+                        memcpy(out + n, onom, ol); n += ol;
+                        out[n++] = ','; out[n++] = ' ';                        /* comma AFTER (the pause) */
+                        if (!*did) *seed = sd;                                 /* pin the first tag's seed */
+                        *did = 1;
+                        p = c + 1;
+                        while (*p == ' ') p++;                                 /* absorb following spaces */
+                        if (*p == ',') p++;                                    /* and a redundant comma */
+                        while (*p == ' ') p++;
+                        continue;
+                    }
+                }
+            }
+        }
+        PIS_ENS(1);
+        out[n++] = *p++;
+    }
+    #undef PIS_ENS
+    out[n] = 0;
+    return out;
+}
+
 /* ── --emotion auto-router (1.7B): the ear-validated per-(voice×emotion) recipe ────────────────
  * `--emotion <name>` reproduces the weeks-long shippable recipe table (plan_emo_v3 §8.3 recipe_final,
  * CLEAN+decay default, user-validated 2026-06-24): ONE flag instead of hand-wiring --expr/--ml-steer.
@@ -1806,10 +1877,26 @@ int main(int argc, char **argv) {
      * a vivid English instruct ONLY on EXPR/COMBINE cells (validated STEER cells use NO instruct — the steer
      * vector carries the emotion). instruct + temperature are CONSUMED before the late router, so set them
      * here. The user's -I / -T always override. 1.7B routed emotions only. */
-    /* Para-active = the --text carries a paralinguistic event tag ([laugh]/[sigh]/[huff]/…). ONLY then does
-     * a routed emotion switch to the validated para+emo setup (COMBINE: the .expr language-correction stops
-     * the EN-captured para anchor from drifting the accent + the emotion instruct). The pure-emotion path
-     * (no para) is untouched — presets stay STEER-only as shipped. */
+    /* INLINE paralinguistics (shipped 2026-07-01): rewrite [laugh]/[sigh] → onomatopoeia IN the text so the
+     * event renders in the voice's own timbre in ONE generation (no "splice" span). Done BEFORE the emotion
+     * router / compose / seed so the tags become plain text and the whole sentence is one --emotion take.
+     * Pin the para-validated seed 7 (both 哈哈哈 and ahh fire at 7) and T1.1 when the user gave no --seed/-T. */
+    char *para_sub_text = NULL;
+    if (text && !no_compose) {
+        int did = 0, para_seed = 7;
+        int para_voice = (!load_voice && speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0;
+        para_sub_text = para_inline_substitute(text, para_voice, &did, &para_seed);
+        if (para_sub_text && did) {
+            text = para_sub_text;
+            if (seed < 0) seed = para_seed;      /* pin the validated per-tag seed (laugh 7 / sigh 42) */
+            if (!temp_set) { temperature = 1.1f; temp_set = 1; }
+            if (!silent) fprintf(stderr, "Paralinguistics: inline [tag]->onomatopoeia (seed %d, T%.1f): \"%s\"\n",
+                                 seed, (double)temperature, text);
+        } else { free(para_sub_text); para_sub_text = NULL; }
+    }
+
+    /* Para-active (legacy): kept only for the explicit --compose per-span path; the --text auto path above
+     * has already inlined [laugh]/[sigh], so text_has_para_event(text) is normally 0 here. */
     int para_active = text && !no_compose && text_has_para_event(text);
     if (emotion_spec && !compose_spec && ctx->config.hidden_size >= 2048 && emotion_tok(emotion_spec)) {
         const char *etok = emotion_tok(emotion_spec);
