@@ -47,7 +47,7 @@ Legend: **HAVE** = shipped/validated (see para-experiments.md) · **CAND** = ser
 | tag | should sound like | family | typical duration / when | pros with it | Qwen status | variants wanted |
 |---|---|---|---|---|---|---|
 | `[laugh]` | genuine laugh/giggle | laughter | 1–3s · joy, relief, mirth | EL, Bark, Step, CV | ✅ **HAVE** `哈哈哈` s7 | short giggle / medium / long belly-laugh; chuckle |
-| `[chuckle]` | soft short laugh | laughter | ~0.6–1s · amused, wry | EL (implied) | TRY (`哈`? `呵呵`?) | 1 short |
+| `[chuckle]` | soft SHORT laugh | laughter | ~0.6–1s · amused, wry | EL (implied) | = **a laugh VARIANT** (T4), not a new event — use a shorter laugh (`哈`/`哈哈`) + seed | it IS `[laugh:short]` |
 | `[sigh]` | breathy exhale | sigh/resp. | 1–2s · resignation, tiredness, relief | EL, Bark, Step | ✅ **HAVE** `唉`(ryan/clone) / `ahh`(vivian) | short / medium / long; "defeated" |
 | `[scoff]` / `[sneer]` | scornful short laugh | laughter | ~0.8s · contempt, derision | — (novel) | 🆕 **CAND** `哈哈` s42 (galatea) | 1 |
 | `[pant]` / `[moan]` | panting / aroused exhale | moan | 1–2s · exertion, pleasure | — | 🆕 **CAND** `哈哈` s2024 (galatea) | 1–2 (careful: NSFW-adjacent) |

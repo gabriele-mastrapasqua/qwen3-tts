@@ -157,12 +157,29 @@ while gasp/mmm work at s7 — **each (event × trigger × voice) has its own win
 | **`[groan]` / `[growl]`** | `哼` (CN) | anger | **42** | ✅ **WIN** | rabbia + `arggg/grrr` — molto bello (⚠️ s7 = renders NOTHING) |
 | **`[mmm]` / `[pleasure]`** | `嗯` (CN) | joy | **7** | ✅ **WIN** | "mmm" breve, "davvero delizioso" (s42 = drifts language, KO) |
 | **`[yawn]`** | `哈啊` (CN) | sad/tired | **42** | ✅ **TOP WIN** | sbadiglio stanco `ahh` (s7 = weaker/less effective) |
-| chuckle | `呵呵` (CN) | joy | 7/42 | ❌ KO (→ sigh) | fa `awww`/uff sospirato, non una risatina — needs another trigger |
-| cry | `呜呜` (CN) | sad | 7/42 | ❌ KO (→ yawn) | esce uno sbadiglio, non pianto (s42 also a bit of tail noise). laugh≈cry≈yawn confusable |
-| gasp | `哇` (CN) | surprise | 42 | 🟡 undefined | "waaah" — unclear how to map |
+| chuckle→**sigh** | `呵呵` (CN) | joy | 7 | ↪ **WIN (re-mapped)** | didn't chuckle — makes a nice sighed `awww`/uff → keep as a 2nd **sigh** trigger |
+| cry→**yawn** | `呜呜` (CN) | sad | 7 | ↪ **WIN (re-mapped)** | didn't cry — makes a clean **yawn** → keep as a 2nd **yawn** trigger (s42 has slight tail noise) |
+| gasp | `哇` (CN) | surprise | 42 | 🟡 undefined | "waaah" — nice but unclear which tag; park it |
+
+> **PRINCIPLE (user 2026-07-01): keep a WIN even if it's a DIFFERENT event than the trigger name suggested.**
+> The trigger→event map is EMPIRICAL — if `呜呜` makes a lovely yawn (not the cry we aimed for), it's a WIN for
+> `[yawn]`, not a KO. Build the menu from what actually sounds good; re-label freely. (cry/laugh/yawn are
+> acoustically confusable, so triggers cross over — harvest whatever lands clean.)
 
 **⇒ NEW events to add to the map (pending cross-voice validation on ryan/vivian):** `[gasp]`→`啊` s7 ·
-`[groan]`→`哼` s42 · `[mmm]`→`嗯` s7 · `[yawn]`→`哈啊` s42. Still open: chuckle (呵呵→sigh), cry (呜呜→yawn).
+`[groan]`→`哼` s42 · `[mmm]`→`嗯` s7 · `[yawn]`→`哈啊` s42 (+ alt `呜呜`) · **`[sigh]` gains an alt trigger `呵呵`**.
+Genuinely still-open: a real **cry** (crosses over to yawn/sigh). **chuckle is NOT a separate hunt** — it's a
+short **laugh variant** (`[laugh:short]`, T4: shorter `哈`/`哈哈` + seed).
+
+### CRY — dedicated hunt plan (user 2026-07-01: "a real cry almost came with strongly-pushed sad + steer in some sentences")
+Cry needs its own sweep — it's the hardest (acoustically ≈ laugh/yawn, and low-arousal). Ideas to try:
+- **Onomatopoeia candidates:** `呜呜` (wuwu — gave yawn here), `呜咽` (sob), `啜泣`, `哇` (loud wail — also surprise),
+  Latin `uhuh`/`sob`/`snif`/`buaa`, and a broken `...ah...ah...`.
+- **Strong sad push:** `--emotion sad` + a very vivid crying `--instruct` ("Break down crying, voice trembling and
+  sobbing, on the verge of tears") — the user saw cry emerge under strongly-pushed sad.
+- **WIDE seed pool** (the key — cry is seed-fragile): sweep {7, 42, 100, 256, 777, 2024, 1234, 88, 333} not just 7/42.
+- **Sentence-dependent:** try several emotional carriers (grief-loaded text) — cry surfaced only in some sentences.
+- Harvest anything clean even if re-labeled (per the PRINCIPLE above).
 
 ---
 
