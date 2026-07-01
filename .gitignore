@@ -35,6 +35,8 @@ ab_*.sh
 
 # Local-only infra/dev scripts (private LAN, never commit)
 scripts/dgx_*
+training/expressivity-lora/dgx_*
+training/expressivity-lora/sync_*to_dgx.sh
 
 # expressivity artifacts (host on GH release/HF, do not commit big binaries)
 qwen3-tts-1.7b-expr/
