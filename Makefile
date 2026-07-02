@@ -139,16 +139,24 @@ metal_build: $(OBJS) $(GPU_OBJS) qwen_tts_metal.o
 qwen_tts_metal.o: qwen_tts_metal.m qwen_tts_metal.h qwen_tts_kernels.h
 	clang -fobjc-arc -O3 -Wall -Wextra -Ivendor -c -o $@ $<
 
-# CUDA (Linux/DGX): cuBLAS-first v1. Needs the CUDA toolkit on the build box.
+# CUDA (Linux/DGX): cuBLAS-first + custom .cu kernels (nvcc). Needs the CUDA
+# toolkit on the build box. NVCC_ARCH overrides the gencode (default sm_80 = Ampere+,
+# bf16 tensor cores). qwen_tts_cuda_kernels.cu is compiled by nvcc, the rest by gcc.
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+NVCC_ARCH ?= -arch=sm_80
 cuda:
 	$(MAKE) clean
 	$(MAKE) cuda_build
 cuda_build: EXTRA_CFLAGS += -DQWEN_HAVE_CUDA -I$(CUDA_HOME)/include
-cuda_build: $(OBJS) $(GPU_OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) $(LDLIBS) \
+cuda_build: $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o $(LDLIBS) \
 		-L$(CUDA_HOME)/lib64 -lcublas -lcudart
 	@echo ""
 	@echo "Built ./$(TARGET) with CUDA backend. Try: ./$(TARGET) --gpu-selftest --backend cuda"
+
+# The .cu compute kernels are nvcc-only (host code stays gcc/cuBLAS).
+qwen_tts_cuda_kernels.o: qwen_tts_cuda_kernels.cu
+	$(NVCC) $(NVCC_ARCH) -O3 -c -o $@ $<
 
 # CP micro-benchmark: separate binary instrumented with -DCP_MICROBENCH.
 # Partitions per-frame Code Predictor time among sub-ops (QKV/attn/FFN/norm/lm_head).
@@ -193,7 +201,7 @@ qwen_tts_cuda.o: qwen_tts_cuda.c qwen_tts_cuda.h
 # Clean (also the opt-in GPU objects, which are NOT in $(OBJS) — else a stale
 # stub .o from a `make metal` build would silently be reused by `make cuda`).
 clean:
-	rm -f $(OBJS) $(TARGET) qwen_tts_backend.o qwen_tts_cuda.o qwen_tts_metal.o
+	rm -f $(OBJS) $(TARGET) qwen_tts_backend.o qwen_tts_cuda.o qwen_tts_metal.o qwen_tts_cuda_kernels.o
 
 # Debug build
 debug: CFLAGS = $(CFLAGS_BASE) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
