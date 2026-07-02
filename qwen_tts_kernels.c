@@ -790,7 +790,13 @@ static void bf16_mv_task(size_t tid, size_t nt, void *vc) {
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     bf16_matvec_fused(c->y + r0, c->x, c->W + (size_t)r0 * c->cols, c->cols, r1 - r0);
 }
+/* Optional GPU offload hook: installed by the Metal/CUDA backend when --backend
+ * is set. NULL = CPU default (the always-on path). Additive + opt-in — one
+ * predictable, not-taken branch when GPU is off. */
+void (*g_qwen_matvec_bf16_hook)(float *, const uint16_t *, const float *, int, int) = NULL;
+
 void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
+    if (g_qwen_matvec_bf16_hook) { g_qwen_matvec_bf16_hook(y, W, x, rows, cols); return; }
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         bf16_mv_ctx c = { y, W, x, rows, cols };
@@ -1272,6 +1278,12 @@ static void bf16_qkv_task(size_t tid, size_t nt, void *vc) {
 void qwen_matvec_bf16_qkv(float *q, float *k, float *v,
                            const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
+    if (g_qwen_matvec_bf16_hook) {
+        g_qwen_matvec_bf16_hook(q, Wq, x, q_dim, in_dim);
+        g_qwen_matvec_bf16_hook(k, Wk, x, kv_dim, in_dim);
+        g_qwen_matvec_bf16_hook(v, Wv, x, kv_dim, in_dim);
+        return;
+    }
     int nt = g_n_threads;
     int total_dim = q_dim + 2 * kv_dim;
     if (nt > 1 && total_dim >= 256) {

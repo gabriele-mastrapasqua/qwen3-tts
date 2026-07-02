@@ -1831,6 +1831,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+#if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
+    /* Optional GPU offload (opt-in): route the bf16 matvec hot path through the
+     * selected backend. CPU stays the default everywhere else; passing no
+     * --backend (or --backend cpu) leaves the engine 100% on the CPU path. */
+    if (gpu_backend_str) {
+        qwen_backend_kind_t bk = qwen_backend_kind_from_str(gpu_backend_str);
+        if (bk != QWEN_BACKEND_CPU) {
+            qwen_backend_t *gpu_backend = qwen_backend_init(bk);
+            qwen_backend_install_global(gpu_backend);
+            fprintf(stderr, "GPU offload: bf16 matvec via '%s' backend "
+                            "(EXPERIMENTAL; CPU stays default elsewhere)\n", gpu_backend->name);
+        }
+    }
+#endif
+
     /* Multi-layer emotion steer (.qlsteer), if requested */
     if (ml_steer_path) {
         load_ml_steer(ctx, ml_steer_path, ml_steer_weight, ml_l0, ml_l1);

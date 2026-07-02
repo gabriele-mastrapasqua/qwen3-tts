@@ -61,6 +61,11 @@ void qwen_backend_free(qwen_backend_t *b);
 /* 1 if a real GPU backend of this kind is compiled in AND its device exists. */
 int qwen_backend_available(qwen_backend_kind_t kind);
 
+/* Install `b` as the global offload target: routes qwen_matvec_bf16 (+ the bf16
+ * QKV fused path) through b->matvec_bf16. Pass NULL to restore the CPU default.
+ * This is the opt-in wiring for end-to-end synthesis on the GPU. */
+void qwen_backend_install_global(qwen_backend_t *b);
+
 /* Correctness + rough-throughput selftest: runs matvec_bf16 and matmat_bf16 on
  * the requested backend vs the CPU reference on deterministic random data,
  * prints max abs/rel diff and CPU-vs-GPU timing to `out` (NULL → stdout).

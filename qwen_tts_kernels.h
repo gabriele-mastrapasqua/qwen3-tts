@@ -94,6 +94,10 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
  * NEON-optimized + multi-threaded via dispatch_apply on macOS. */
 void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols);
 
+/* Optional GPU offload hook for qwen_matvec_bf16 (and the bf16 QKV fused path).
+ * NULL = CPU default. Installed by the Metal/CUDA backend when --backend is set. */
+extern void (*g_qwen_matvec_bf16_hook)(float *, const uint16_t *, const float *, int, int);
+
 /* bf16 BATCHED matmat (the batching/spec-decode-verify primitive):
  *   Y[rows,B] = W[rows,cols] @ X[cols,B]     (W bf16; X,Y f32, row-major)
  * Each weight element is read from DRAM ONCE and reused across all B columns

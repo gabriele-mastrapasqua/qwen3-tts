@@ -153,6 +153,21 @@ void qwen_backend_free(qwen_backend_t *b) {
     if (b && b->free) b->free(b);
 }
 
+/* ---- global offload wiring --------------------------------------------- */
+static qwen_backend_t *g_active_backend = NULL;
+static void hook_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
+    g_active_backend->matvec_bf16(g_active_backend, y, W, x, rows, cols);
+}
+void qwen_backend_install_global(qwen_backend_t *b) {
+    if (b && b->kind != QWEN_BACKEND_CPU) {
+        g_active_backend = b;
+        g_qwen_matvec_bf16_hook = hook_matvec_bf16;
+    } else {
+        g_active_backend = NULL;
+        g_qwen_matvec_bf16_hook = NULL;
+    }
+}
+
 /* ---- selftest ----------------------------------------------------------- */
 #include <time.h>
 #include <math.h>
