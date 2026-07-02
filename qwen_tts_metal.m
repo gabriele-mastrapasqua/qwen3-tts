@@ -49,29 +49,32 @@ static const char *QWEN_METAL_SRC =
 "    acc = simd_sum(acc); if (tiisg == 0) y[row] = acc;\n"
 "}\n"
 "\n"
-/* simdgroup matmat: one output row per simdgroup, B accumulators in registers,
- * coalesced ushort4 weight reads (read once, reused across all B columns — the
- * compute-bound batched win). Y[rows,B] = W[rows,cols] @ X[cols,B], row-major. */
+/* MMA matmat: simdgroup_matrix 8x8 tiles (the GPU matrix units, 512 MAC/instr).
+ * One simdgroup computes an 8-row x 8-B output tile; K looped in 8-tiles staged
+ * to threadgroup memory (bf16->float on load). Y[rows,B]=W[rows,cols]@X[cols,B].
+ * Grid = (ceil(rows/8), ceil(B/8)); 32 threads/threadgroup. Handles ragged
+ * rows/B via zero-pad. cols assumed %8==0 (all model dims are). */
 "kernel void matmat_bf16(device const ushort *W [[buffer(0)]],\n"
 "    device const float *X [[buffer(1)]], device float *Y [[buffer(2)]],\n"
 "    constant uint &cols [[buffer(3)]], constant uint &B [[buffer(4)]],\n"
 "    constant uint &rows [[buffer(5)]],\n"
-"    uint3 tgpig [[threadgroup_position_in_grid]],\n"
-"    uint tiisg [[thread_index_in_simdgroup]],\n"
-"    uint sgitg [[simdgroup_index_in_threadgroup]],\n"
-"    uint nsg [[simdgroups_per_threadgroup]]) {\n"
-"    uint row = tgpig.x * nsg + sgitg; if (row >= rows) return;\n"
-"    device const ushort4 *w4 = (device const ushort4 *)(W + (ulong)row * cols);\n"
-"    float acc[64]; for (uint b = 0; b < B; ++b) acc[b] = 0.0f;\n"
-"    uint n4 = cols >> 2;\n"
-"    for (uint c = tiisg; c < n4; c += 32) { ushort4 bw = w4[c];\n"
-"        float4 wf = float4(as_type<float>(uint(bw.x)<<16), as_type<float>(uint(bw.y)<<16),\n"
-"                           as_type<float>(uint(bw.z)<<16), as_type<float>(uint(bw.w)<<16));\n"
-"        uint base = (c << 2) * B;\n"
-"        for (uint b = 0; b < B; ++b)\n"
-"            acc[b] += wf.x*X[base+b] + wf.y*X[base+B+b] + wf.z*X[base+2*B+b] + wf.w*X[base+3*B+b]; }\n"
-"    device float *yr = Y + (ulong)row * B;\n"
-"    for (uint b = 0; b < B; ++b) { float s = simd_sum(acc[b]); if (tiisg == 0) yr[b] = s; }\n"
+"    uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_simdgroup]]) {\n"
+"    threadgroup float Ws[64]; threadgroup float Xs[64]; threadgroup float Ys[64];\n"
+"    uint row0 = tgid.x * 8, col0 = tgid.y * 8;\n"
+"    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float,8,8>(0.0f);\n"
+"    for (uint k0 = 0; k0 < cols; k0 += 8) {\n"
+"        for (uint i = tid; i < 64; i += 32) { uint r = i >> 3, k = i & 7; uint gr = row0 + r;\n"
+"            Ws[i] = (gr < rows) ? bf16_to_f32(W[(ulong)gr * cols + k0 + k]) : 0.0f; }\n"
+"        for (uint i = tid; i < 64; i += 32) { uint k = i >> 3, b = i & 7; uint gb = col0 + b;\n"
+"            Xs[i] = (gb < B) ? X[(ulong)(k0 + k) * B + gb] : 0.0f; }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        simdgroup_float8x8 wm, xm; simdgroup_load(wm, Ws, 8); simdgroup_load(xm, Xs, 8);\n"
+"        simdgroup_multiply_accumulate(acc, wm, xm, acc);\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    simdgroup_store(acc, Ys, 8);\n"
+"    for (uint i = tid; i < 64; i += 32) { uint r = i >> 3, b = i & 7; uint gr = row0 + r, gb = col0 + b;\n"
+"        if (gr < rows && gb < B) Y[(ulong)gr * B + gb] = Ys[i]; }\n"
 "}\n"
 "\n"
 "kernel void matvec_int8(device const char *W [[buffer(0)]],\n"
@@ -291,9 +294,9 @@ void qwen_metal_matmat_bf16(void *ctx, float *Y, const uint16_t *W,
         uint32_t cc = (uint32_t)cols, cB = (uint32_t)B, rr = (uint32_t)rows;
         [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&cB length:4 atIndex:4];
         [e setBytes:&rr length:4 atIndex:5];
-        const NSUInteger NSG = 8; NSUInteger ntg = ((NSUInteger)rows + NSG - 1) / NSG;
-        [e dispatchThreadgroups:MTLSizeMake(ntg,1,1)
-        threadsPerThreadgroup:MTLSizeMake(NSG * 32,1,1)];
+        /* one simdgroup (32 threads) per 8x8 output tile */
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows+7)/8, ((NSUInteger)B+7)/8, 1)
+        threadsPerThreadgroup:MTLSizeMake(32,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
         memcpy(Y, bY.contents, (size_t)rows * B * sizeof(float));
     }
