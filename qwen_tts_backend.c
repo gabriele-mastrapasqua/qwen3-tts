@@ -174,6 +174,11 @@ static float rnd_unit(void) {
 
 int qwen_gpu_selftest(qwen_backend_kind_t kind, void *out) {
     FILE *f = out ? (FILE *)out : stdout;
+#ifdef QWEN_HAVE_METAL
+    /* Metal has a full per-op suite (all tensors, resident weights). */
+    if (kind == QWEN_BACKEND_METAL && qwen_metal_available())
+        return qwen_metal_selftest(out);
+#endif
     const int rows = 2048, cols = 2048, B = 8;
     int fails = 0;
 

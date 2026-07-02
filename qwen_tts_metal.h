@@ -2,41 +2,66 @@
  * qwen_tts_metal.h — Apple Metal backend (G2), C-callable surface.
  *
  * Implemented in qwen_tts_metal.m (Objective-C, clang -fobjc-arc). Only built
- * by `make metal` (defines QWEN_HAVE_METAL). The functions are plain C linkage
- * so the rest of the engine (gcc-compiled) can call them.
+ * by `make metal` (defines QWEN_HAVE_METAL). Plain C linkage so the gcc-compiled
+ * engine can call it.
  *
- * v1 scope: matvec_bf16 (correctness vehicle) + matmat_bf16 (the compute-bound
- * primitive that can actually beat CPU on M1). Weights are read as raw bf16
- * uint16 and reconstructed to f32 in-shader via a bit-shift, so no dependency
- * on MSL `bfloat` type availability.
+ * ARCHITECTURE (the important part): weights are RESIDENT. A weight pointer is
+ * uploaded to a device MTLBuffer ONCE and cached by pointer; every later call
+ * reuses it — NO per-call allocation or re-upload (the naive-loop trap). IO
+ * (activations/scales) reuse a small pool of persistent shared buffers. This is
+ * additive: the CPU path stays the default; Metal only runs when selected.
+ *
+ * bf16/int8/q4_0 weights are read raw and dequantized IN-SHADER, matching the
+ * CPU kernels bit-for-bit (int8 scale=amax/127; q4_0 scale=amax/7, even idx→low
+ * nibble/odd→high, val=(nib-8)*scale).
  */
 
 #ifndef QWEN_TTS_METAL_H
 #define QWEN_TTS_METAL_H
 
 #include <stdint.h>
+#include "qwen_tts_kernels.h"   /* q4_0_block_t layout shared with the CPU path */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* 1 if a Metal device exists on this machine (and this TU is compiled in). */
 int   qwen_metal_available(void);
-
-/* Create the Metal context (device, queue, compiled pipeline states).
- * Returns an opaque handle, or NULL on failure (no device / shader compile). */
 void *qwen_metal_init(void);
 void  qwen_metal_free(void *ctx);
 
-/* y[rows] = W[rows,cols] @ x[cols]   (W bf16, x/y f32). */
-void  qwen_metal_matvec_bf16(void *ctx, float *y,
-                             const uint16_t *W, const float *x,
-                             int rows, int cols);
+/* ---- linear / matmul ---- */
+/* y[rows] = W[rows,cols] @ x[cols]   (W bf16, x/y f32) */
+void  qwen_metal_matvec_bf16(void *ctx, float *y, const uint16_t *W,
+                             const float *x, int rows, int cols);
+/* Y[rows,B] = W[rows,cols] @ X[cols,B]  (row-major f32; B<=64) */
+void  qwen_metal_matmat_bf16(void *ctx, float *Y, const uint16_t *W,
+                             const float *X, int rows, int cols, int B);
+/* y[rows] = scale[rows] * (W_int8[rows,cols] @ x[cols]) */
+void  qwen_metal_matvec_int8(void *ctx, float *y, const int8_t *W,
+                             const float *scale, const float *x, int rows, int cols);
+/* y[rows] = dequant(W_q4[rows, cols/32]) @ x[cols] */
+void  qwen_metal_matvec_q4_0(void *ctx, float *y, const q4_0_block_t *W,
+                             const float *x, int rows, int cols);
 
-/* Y[rows,B] = W[rows,cols] @ X[cols,B]  (row-major f32; B<=64). */
-void  qwen_metal_matmat_bf16(void *ctx, float *Y,
-                             const uint16_t *W, const float *X,
-                             int rows, int cols, int B);
+/* ---- norm / activation / elementwise / rope ---- */
+/* out[dim] = x/sqrt(mean(x^2)+eps) * weight   (single row) */
+void  qwen_metal_rms_norm(void *ctx, float *out, const float *x,
+                          const float *weight, int dim, float eps);
+/* out[n] = silu(gate_up[2i]) * gate_up[2i+1]  (interleaved SwiGLU) */
+void  qwen_metal_swiglu(void *ctx, float *out, const float *gate_up, int n);
+/* out[n] = x/(1+exp(-x)) */
+void  qwen_metal_silu(void *ctx, float *out, const float *x, int n);
+void  qwen_metal_add(void *ctx, float *out, const float *a, const float *b, int n);
+void  qwen_metal_mul(void *ctx, float *out, const float *a, const float *b, int n);
+void  qwen_metal_scale(void *ctx, float *out, const float *a, float s, int n);
+/* interleaved RoPE on x[n_heads*head_dim] for a single position (cos/sin over pairs) */
+void  qwen_metal_rope(void *ctx, float *x, const float *cosv, const float *sinv,
+                      int n_heads, int head_dim);
+
+/* Full per-op correctness + resident-timing suite vs the CPU kernels.
+ * out (FILE*) may be NULL → stdout. Returns number of failing ops (0 = PASS). */
+int   qwen_metal_selftest(void *out);
 
 #ifdef __cplusplus
 }

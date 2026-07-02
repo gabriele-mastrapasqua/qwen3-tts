@@ -136,8 +136,8 @@ metal_build: $(OBJS) $(GPU_OBJS) qwen_tts_metal.o
 	@echo "Built ./$(TARGET) with Metal backend. Try: ./$(TARGET) --gpu-selftest --backend metal"
 
 # The ObjC TU is clang-only (gcc can't build ObjC); ARC manages the Metal objects.
-qwen_tts_metal.o: qwen_tts_metal.m qwen_tts_metal.h
-	clang -fobjc-arc -O3 -Wall -Wextra -c -o $@ $<
+qwen_tts_metal.o: qwen_tts_metal.m qwen_tts_metal.h qwen_tts_kernels.h
+	clang -fobjc-arc -O3 -Wall -Wextra -Ivendor -c -o $@ $<
 
 # CUDA (Linux/DGX): cuBLAS-first v1. Needs the CUDA toolkit on the build box.
 cuda:
