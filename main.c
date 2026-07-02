@@ -316,27 +316,8 @@ static void write_tensor_impl(FILE *vf, FILE *cv_sf, const char *cv_hdr_json, si
 
 /* Load a 'QSTV' steering .vec and accumulate scale*data into *acc (alloc'd if NULL).
  * Validates magic + that dim == expect_dim. Returns 0 on success, -1 on error. */
-static int load_steer_vec_accum(const char *path, float scale, float **acc, int expect_dim) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "Error: cannot open steer vector '%s'\n", path); return -1; }
-    uint32_t magic = 0; int32_t dim = 0;
-    if (fread(&magic, 4, 1, f) != 1 || fread(&dim, 4, 1, f) != 1 ||
-        magic != 0x56545351u /* 'QSTV' */ || dim != expect_dim) {
-        fprintf(stderr, "Error: '%s' is not a valid steer vector for this model "
-                        "(dim=%d, expected %d)\n", path, dim, expect_dim);
-        fclose(f); return -1;
-    }
-    float *tmp = (float *)malloc((size_t)dim * sizeof(float));
-    if (!tmp || fread(tmp, sizeof(float), dim, f) != (size_t)dim) {
-        fprintf(stderr, "Error: failed to read steer vector '%s'\n", path);
-        free(tmp); fclose(f); return -1;
-    }
-    fclose(f);
-    if (!*acc) *acc = (float *)calloc(dim, sizeof(float));
-    if (*acc) for (int i = 0; i < dim; i++) (*acc)[i] += scale * tmp[i];
-    free(tmp);
-    return *acc ? 0 : -1;
-}
+/* load_steer_vec_accum + resolve_emotion_path + qwen_apply_emotion moved to
+ * qwen_tts_emotion.c so the CLI and the HTTP server apply the SAME recipe. */
 
 /* Load a multi-layer Talker steer (.qlsteer: 'QLST' magic + int32 L + int32 D + L*D float32)
  * into a FRESH buffer (does NOT touch ctx state). L must be num_layers+1, D = hidden.
@@ -375,112 +356,8 @@ static int load_ml_steer(qwen_tts_ctx_t *ctx, const char *path, float weight, in
     return 0;
 }
 
-/* Resolve an emotion preset name to its .vec path (first hit wins).
- * Search order, per base dir ($QWEN_EMOTION_DIR, presets/emotions/, voices/emotions/):
- * language-specific sub-palettes FIRST, then the flat dir. For Italian we prefer
- * the decorrelated `it_centered/` palette (the validated one), then `it/`.
- * Other languages fall through to the flat (EN-captured) palette. */
-static int resolve_emotion_path(const char *name, const char *language, char *out, size_t outsz) {
-    const char *bases[] = { getenv("QWEN_EMOTION_DIR"), "presets/emotions", "voices/emotions" };
-    /* language -> ordered list of sub-dirs to try before the flat dir */
-    const char *it_subs[] = { "it_centered", "it", NULL };
-    const char *none[]    = { NULL };
-    const char **subs = none;
-    if (language && strcasecmp(language, "Italian") == 0) subs = it_subs;
-    for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
-        if (!bases[i] || !*bases[i]) continue;
-        for (int s = 0; subs[s]; s++) {
-            snprintf(out, outsz, "%s/%s/%s.vec", bases[i], subs[s], name);
-            FILE *f = fopen(out, "rb");
-            if (f) { fclose(f); return 0; }
-        }
-        snprintf(out, outsz, "%s/%s.vec", bases[i], name);
-        FILE *f = fopen(out, "rb");
-        if (f) { fclose(f); return 0; }
-    }
-    return -1;
-}
-
-/* Configure ctx's expressivity from an --emotion spec + language. RE-ENTRANT:
- * frees any previously-set ctx->cp_steer_vec first, so it can be called once per
- * span in --compose mode. Resolves a manifest mood to its full recipe (or a raw
- * preset/blend spec), sets ctx->cp_roughness + ctx->cp_steer_vec/dim/weight, and
- * returns the effective volume/rate (recipe value unless the matching *_set
- * override is passed). Returns 0 on success, -1 on a hard error (unknown raw preset). */
-static int qwen_apply_emotion(qwen_tts_ctx_t *ctx,
-        const char *emotion_spec, const char *steer_vector_path, const char *language,
-        float sw, int sw_set, float ro, int ro_set,
-        float vo, int vo_set, float ra, int ra_set,
-        float *out_volume, float *out_rate, int silent) {
-    int cp_h = ctx->config.cp_hidden_size;
-    float eff_steer_weight = sw, eff_roughness = ro, eff_volume = vo, eff_rate = ra;
-    const char *vec_spec = emotion_spec;
-    const qwen_emotion_recipe_t *recipe = NULL;
-
-    /* re-entrancy: clear any prior steering/roughness state */
-    if (ctx->cp_steer_vec) { free(ctx->cp_steer_vec); ctx->cp_steer_vec = NULL; ctx->cp_steer_dim = 0; }
-    ctx->cp_roughness = 0.0f;
-
-    if (emotion_spec && !strchr(emotion_spec, ',') && !strchr(emotion_spec, ':'))
-        recipe = qwen_emotion_lookup(emotion_spec);
-    if (recipe) {
-        vec_spec = recipe->vec_spec;
-        if (!sw_set) eff_steer_weight = recipe->steer_weight;
-        if (!ro_set) eff_roughness    = recipe->roughness;
-        if (!vo_set) eff_volume       = recipe->volume;
-        if (!ra_set) eff_rate         = recipe->rate;
-        if (!silent)
-            fprintf(stderr, "Emotion '%s' -> %s\n  (vec=%s weight=%.2f roughness=%.2f volume=%.2f rate=%.2f)\n",
-                    emotion_spec, recipe->desc, vec_spec ? vec_spec : "(none)",
-                    eff_steer_weight, eff_roughness, eff_volume, eff_rate);
-    }
-
-    if (eff_roughness > 0.0f) {
-        if (eff_roughness > 1.0f) eff_roughness = 1.0f;
-        ctx->cp_roughness = eff_roughness;
-        if (!silent && !recipe) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", eff_roughness);
-    }
-
-    if (vec_spec || steer_vector_path) {
-        float *steer_acc = NULL;
-        if (vec_spec) {
-            char *spec = strdup(vec_spec);
-            for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
-                float scale = 1.0f;
-                char *colon = strchr(tok, ':');
-                if (colon) { *colon = '\0'; scale = (float)atof(colon + 1); }
-                char path[1024];
-                if (resolve_emotion_path(tok, language, path, sizeof(path)) != 0) {
-                    if (recipe) {
-                        if (!silent) fprintf(stderr, "Note: mood '%s' has no '%s' vector for this language; "
-                                                     "applying roughness/volume/rate only.\n", emotion_spec, tok);
-                    } else {
-                        fprintf(stderr, "Error: unknown emotion preset '%s' "
-                            "(looked in $QWEN_EMOTION_DIR, presets/emotions/[<lang>/], voices/emotions/)\n", tok);
-                        free(spec); free(steer_acc); return -1;
-                    }
-                } else if (load_steer_vec_accum(path, scale, &steer_acc, cp_h) != 0) {
-                    free(spec); free(steer_acc); return -1;
-                } else if (!silent && !recipe) {
-                    fprintf(stderr, "Emotion: %s x%.2f (%s)\n", tok, scale, path);
-                }
-            }
-            free(spec);
-        }
-        if (steer_vector_path && load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) {
-            free(steer_acc); return -1;
-        }
-        if (steer_acc) {
-            ctx->cp_steer_vec = steer_acc;
-            ctx->cp_steer_dim = cp_h;
-            ctx->cp_steer_weight = eff_steer_weight;
-            if (!silent) fprintf(stderr, "Steering: active (dim=%d, weight=%.2f)\n", cp_h, eff_steer_weight);
-        }
-    }
-    if (out_volume) *out_volume = eff_volume;
-    if (out_rate)   *out_rate   = eff_rate;
-    return 0;
-}
+/* resolve_emotion_path + qwen_apply_emotion moved to qwen_tts_emotion.c
+ * (shared by CLI + server). CLI calls qwen_tts_apply_emotion(). */
 
 /* ---- Inline expressive markup (ElevenLabs/Bark-style square-bracket tags) ----
  * One text body; tags are ENGLISH and inline, switchable mid-text:
@@ -1074,7 +951,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
         float vol = 1.0f, rate = 1.0f;
         int   sw_set = spans[i].steer_weight >= 0.0f;          /* macro -> explicit (0 = no steer) */
         float sw     = sw_set ? spans[i].steer_weight : 1.0f;
-        if (qwen_apply_emotion(ctx, mood, NULL, language, sw, sw_set, 0.0f, 0, 1.0f, 0, 1.0f, 0,
+        if (qwen_tts_apply_emotion(ctx, mood, NULL, language, sw, sw_set, 0.0f, 0, 1.0f, 0, 1.0f, 0,
                                &vol, &rate, silent) != 0) { free(out); return -1; }
         if (spans[i].rate   > 0.0f) rate = spans[i].rate;     /* macro filler overrides recipe rate */
         if (spans[i].volume > 0.0f) vol  = spans[i].volume;   /* and volume */
@@ -1952,7 +1829,7 @@ int main(int argc, char **argv) {
     int emotion_routed = emotion_spec && !compose_spec &&
                          ctx->config.hidden_size >= 2048 && emotion_tok(emotion_spec) != NULL;
     if (!compose_spec && !emotion_routed &&
-        qwen_apply_emotion(ctx, emotion_spec, steer_vector_path, language,
+        qwen_tts_apply_emotion(ctx, emotion_spec, steer_vector_path, language,
                            cp_steer_weight, steer_weight_set, cp_roughness, roughness_set,
                            audio_volume, volume_set, audio_rate, rate_set,
                            &audio_volume, &audio_rate, silent) != 0) {

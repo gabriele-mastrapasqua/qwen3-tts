@@ -13,6 +13,8 @@
 #include "qwen_tts_server.h"
 #include "qwen_tts.h"
 #include "qwen_tts_thread.h"   /* qwen_parallel_is_reentrant() */
+#include "qwen_tts_emotion.h"  /* qwen_tts_apply_emotion() — server --emotion support */
+#include "qwen_tts_audio.h"    /* qwen_audio_apply_gain / qwen_audio_time_stretch */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +168,7 @@ static void send_error(int fd, int status, const char *msg) {
 typedef struct {
     int fd;
     int total_samples;
+    float volume;   /* per-chunk gain (emotion/volume); 1.0 = no-op */
 } stream_http_state_t;
 
 static void send_chunked_header(int fd) {
@@ -184,10 +187,11 @@ static void send_chunked_header(int fd) {
 
 static int stream_http_callback(const float *samples, int n_samples, void *userdata) {
     stream_http_state_t *st = (stream_http_state_t *)userdata;
-    /* Convert float to s16le */
+    float g = st->volume;
+    /* Convert float to s16le (applying the emotion/volume gain per chunk) */
     int16_t *pcm = (int16_t *)malloc(n_samples * sizeof(int16_t));
     for (int i = 0; i < n_samples; i++) {
-        float s = samples[i];
+        float s = samples[i] * g;
         if (s < -1.0f) s = -1.0f;
         if (s > 1.0f) s = 1.0f;
         pcm[i] = (int16_t)(s * 32767);
@@ -292,14 +296,22 @@ static void reset_request_state(qwen_tts_ctx_t *ctx) {
     free(ctx->instruct);
     ctx->instruct = NULL;
 
+    /* Clear any emotion steering from a prior request (must not leak between requests).
+     * qwen_tts_apply_emotion also clears it, but a request with NO emotion needs this. */
+    if (ctx->cp_steer_vec) { free(ctx->cp_steer_vec); ctx->cp_steer_vec = NULL; ctx->cp_steer_dim = 0; }
+    ctx->cp_roughness = 0.0f;
+
     /* Fresh seed per request (time-based) */
     struct timeval tv;
     gettimeofday(&tv, NULL);
     ctx->seed = (uint32_t)(tv.tv_sec ^ tv.tv_usec);
 }
 
-/* Apply TTS params from JSON body to context. Returns text (malloc'd) or NULL on error. */
-static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
+/* Apply TTS params from JSON body to context. Returns text (malloc'd) or NULL on error.
+ * out_volume/out_rate receive the effective DSP gain/tempo (from --emotion recipe or
+ * explicit "volume"/"rate"), to be applied to the rendered audio by the caller. */
+static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
+                               float *out_volume, float *out_rate) {
     /* Start from clean defaults — prevents state leaking between requests */
     reset_request_state(ctx);
 
@@ -325,11 +337,10 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
         free(speaker);
     }
 
-    char *language = json_extract_string(body, "language");
+    char *language = json_extract_string(body, "language");  /* kept for the emotion resolver below */
     if (language) {
         int lid = qwen_tts_language_id(language);
         if (lid >= 0) ctx->language_id = lid;
-        free(language);
     }
 
     /* Instruct (1.7B only) */
@@ -360,6 +371,30 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
     int seed = (int)json_extract_number(body, "seed", -1);
     if (seed >= 0) ctx->seed = (uint32_t)seed;
 
+    /* Emotion (CLI --emotion parity): sets the CP steering vector for
+     * (emotion, language) on ctx (applied during generation for BOTH the full
+     * and streaming paths) + returns the effective volume/rate DSP. Explicit
+     * "volume"/"rate" in the body override the recipe value. Best-effort: an
+     * unknown emotion degrades to volume/rate only (or no-op). */
+    float eff_vol = 1.0f, eff_rate = 1.0f;
+    int vol_present  = strstr(body, "\"volume\"") != NULL;
+    int rate_present = strstr(body, "\"rate\"") != NULL;
+    float req_vol  = (float)json_extract_number(body, "volume", 1.0);
+    float req_rate = (float)json_extract_number(body, "rate", 1.0);
+    char *emotion = json_extract_string(body, "emotion");
+    if (emotion && emotion[0]) {
+        qwen_tts_apply_emotion(ctx, emotion, NULL, language,
+                               1.0f, 0, 0.0f, 0, req_vol, vol_present, req_rate, rate_present,
+                               &eff_vol, &eff_rate, 0);
+    } else {
+        eff_vol  = vol_present  ? req_vol  : 1.0f;
+        eff_rate = rate_present ? req_rate : 1.0f;
+    }
+    free(emotion);
+    free(language);
+    if (out_volume) *out_volume = eff_vol;
+    if (out_rate)   *out_rate   = eff_rate;
+
     return text;
 }
 
@@ -370,7 +405,8 @@ static double server_time_ms(void) {
 }
 
 static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
-    char *text = parse_tts_request(ctx, body);
+    float volume = 1.0f, rate = 1.0f;
+    char *text = parse_tts_request(ctx, body, &volume, &rate);
     if (!text) {
         send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)");
         return;
@@ -398,6 +434,15 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         return;
     }
 
+    /* Emotion/volume/rate DSP: gain then pitch-preserving tempo (matches CLI --emotion). */
+    if (volume != 1.0f) qwen_audio_apply_gain(audio, n_samples, volume);
+    if (rate != 1.0f) {
+        float *stretched = NULL; int stretched_n = 0;
+        if (qwen_audio_time_stretch(audio, n_samples, rate, QWEN_TTS_SAMPLE_RATE, &stretched, &stretched_n) == 0) {
+            free(audio); audio = stretched; n_samples = stretched_n;
+        }
+    }
+
     /* Build WAV in memory and send */
     int wav_size = 0;
     void *wav = build_wav(audio, n_samples, &wav_size);
@@ -414,7 +459,9 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
 }
 
 static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
-    char *text = parse_tts_request(ctx, body);
+    float volume = 1.0f, rate = 1.0f;
+    char *text = parse_tts_request(ctx, body, &volume, &rate);
+    (void)rate;  /* pitch-preserving tempo isn't applied on the streaming path (needs full buffer) */
     if (!text) {
         send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)");
         return;
@@ -429,8 +476,8 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
             text, ctx->speaker_id, ctx->language_id, ctx->seed);
     double t0 = server_time_ms();
 
-    /* Set up streaming */
-    stream_http_state_t state = { .fd = fd, .total_samples = 0 };
+    /* Set up streaming (emotion steering is already set on ctx; volume applied per chunk) */
+    stream_http_state_t state = { .fd = fd, .total_samples = 0, .volume = volume };
     ctx->stream = 1;
     ctx->stream_chunk_frames = 10;
     qwen_tts_set_audio_callback(ctx, stream_http_callback, &state);

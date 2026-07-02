@@ -32,4 +32,16 @@ const qwen_emotion_recipe_t *qwen_emotion_lookup(const char *name);
 /* Full manifest table (NULL-name-terminated) + count, for help/listing. */
 const qwen_emotion_recipe_t *qwen_emotion_table(int *count);
 
+/* Apply an emotion recipe to a context (shared by the CLI and the HTTP server).
+ * Resolves a manifest mood (or raw .vec spec/blend) for `language`, loads the
+ * steering vector into ctx->cp_steer_vec/dim/weight, sets ctx->cp_roughness, and
+ * returns the effective volume/rate via out params (recipe value unless the
+ * matching *_set override is passed). Returns 0 on success, -1 on hard error. */
+typedef struct qwen_tts_ctx qwen_tts_ctx_t;
+int qwen_tts_apply_emotion(qwen_tts_ctx_t *ctx,
+        const char *emotion_spec, const char *steer_vector_path, const char *language,
+        float sw, int sw_set, float ro, int ro_set,
+        float vo, int vo_set, float ra, int ra_set,
+        float *out_volume, float *out_rate, int silent);
+
 #endif
