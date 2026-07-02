@@ -97,6 +97,8 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
 /* Optional GPU offload hook for qwen_matvec_bf16 (and the bf16 QKV fused path).
  * NULL = CPU default. Installed by the Metal/CUDA backend when --backend is set. */
 extern void (*g_qwen_matvec_bf16_hook)(float *, const uint16_t *, const float *, int, int);
+/* Optional GPU offload hook for the batched matmat (where the MMA win lands). */
+extern void (*g_qwen_matmat_bf16_hook)(float *, const uint16_t *, const float *, int, int, int);
 
 /* bf16 BATCHED matmat (the batching/spec-decode-verify primitive):
  *   Y[rows,B] = W[rows,cols] @ X[cols,B]     (W bf16; X,Y f32, row-major)

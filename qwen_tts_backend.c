@@ -158,13 +158,18 @@ static qwen_backend_t *g_active_backend = NULL;
 static void hook_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
     g_active_backend->matvec_bf16(g_active_backend, y, W, x, rows, cols);
 }
+static void hook_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
+    g_active_backend->matmat_bf16(g_active_backend, Y, W, X, rows, cols, B);
+}
 void qwen_backend_install_global(qwen_backend_t *b) {
     if (b && b->kind != QWEN_BACKEND_CPU) {
         g_active_backend = b;
         g_qwen_matvec_bf16_hook = hook_matvec_bf16;
+        g_qwen_matmat_bf16_hook = hook_matmat_bf16;
     } else {
         g_active_backend = NULL;
         g_qwen_matvec_bf16_hook = NULL;
+        g_qwen_matmat_bf16_hook = NULL;
     }
 }
 

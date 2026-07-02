@@ -953,7 +953,12 @@ static void bf16_mm_task(size_t tid, size_t nt, void *vc) {
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     bf16_matmat_slice(c->Y, c->W, c->X, r0, r1, c->cols, c->B);
 }
+/* Optional GPU offload hook for the batched matmat (server --batch-size path).
+ * NULL = CPU default. This is where the GPU's matrix-unit (MMA) win lands. */
+void (*g_qwen_matmat_bf16_hook)(float *, const uint16_t *, const float *, int, int, int) = NULL;
+
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
+    if (g_qwen_matmat_bf16_hook) { g_qwen_matmat_bf16_hook(Y, W, X, rows, cols, B); return; }
     if (B <= 0) return;
     if (B > 64) B = 64;  /* contract: B<=64 */
     int nt = g_n_threads;
