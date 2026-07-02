@@ -10,6 +10,7 @@
 #include "qwen_tts_tokenizer.h"
 #include "qwen_tts_audio.h"
 #include "qwen_tts_batch.h"
+#include "qwen_tts_thread.h"   /* qwen_parallel_is_reentrant() (A1 prefill helper gate) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2151,6 +2152,123 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
  * job source every frame (continuous/vLLM-style); EOS'd requests are decoded and
  * delivered immediately, freeing their slot for the next queued request — no
  * waiting for the slowest in a static group. */
+/* ================= A1: async admission-prefill pipeline =================
+ * The ~1-2s single-stream prefill of a newly admitted request used to run inline in
+ * the scheduler's frame loop, stalling every active slot. A1 moves it to a HELPER
+ * thread with its own cloned ctx: the helper prefills, snapshots the KV + seed hidden
+ * into a bounded ready-queue, and the scheduler admits pre-prefilled slots without
+ * stalling. Gated on qwen_parallel_is_reentrant(): only a reentrant kernel pool
+ * (macOS GCD) lets the helper's qwen_parallel run concurrently with the scheduler's;
+ * on a non-reentrant pool (Linux pthread / Win32) we keep the inline prefill (correct,
+ * blocking) — the pre-A1 behavior. */
+typedef struct prefilled_s {
+    void *tag;
+    qwen_batch_req_t req;
+    int ok;                 /* 0 = prefill failed / rejected */
+    int pl;                 /* prefill length (frames) */
+    int tcl;                /* bg_text_content_len */
+    uint16_t *kv_k, *kv_v;  /* [num_layers * pl * kvd] snapshot from the clone */
+    float *last_hidden;     /* [h] */
+    struct prefilled_s *next;
+} prefilled_t;
+
+typedef struct {
+    prefilled_t *head, *tail;
+    int count, cap, shutdown;
+    pthread_mutex_t mtx;
+    pthread_cond_t not_empty, not_full;
+} prefill_q_t;
+
+static void pfq_init(prefill_q_t *q, int cap) {
+    q->head = q->tail = NULL; q->count = 0; q->cap = cap; q->shutdown = 0;
+    pthread_mutex_init(&q->mtx, NULL);
+    pthread_cond_init(&q->not_empty, NULL); pthread_cond_init(&q->not_full, NULL);
+}
+static void pfq_destroy(prefill_q_t *q) {
+    pthread_mutex_destroy(&q->mtx);
+    pthread_cond_destroy(&q->not_empty); pthread_cond_destroy(&q->not_full);
+}
+/* Returns 1 if queued, 0 if the queue was shut down (caller owns p and must free it). */
+static int pfq_push(prefill_q_t *q, prefilled_t *p) {
+    pthread_mutex_lock(&q->mtx);
+    while (q->count >= q->cap && !q->shutdown) pthread_cond_wait(&q->not_full, &q->mtx);
+    if (q->shutdown) { pthread_mutex_unlock(&q->mtx); return 0; }
+    p->next = NULL;
+    if (q->tail) q->tail->next = p; else q->head = p;
+    q->tail = p; q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+    return 1;
+}
+/* block=1 waits for a job (or shutdown); block=0 returns NULL immediately if empty. */
+static prefilled_t *pfq_pop(prefill_q_t *q, int block) {
+    pthread_mutex_lock(&q->mtx);
+    if (block) while (q->count == 0 && !q->shutdown) pthread_cond_wait(&q->not_empty, &q->mtx);
+    if (q->count == 0) { pthread_mutex_unlock(&q->mtx); return NULL; }
+    prefilled_t *p = q->head; q->head = p->next; if (!q->head) q->tail = NULL;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mtx);
+    return p;
+}
+static void pfq_shutdown(prefill_q_t *q) {
+    pthread_mutex_lock(&q->mtx);
+    q->shutdown = 1;
+    pthread_cond_broadcast(&q->not_empty); pthread_cond_broadcast(&q->not_full);
+    pthread_mutex_unlock(&q->mtx);
+}
+static void prefilled_free(prefilled_t *p) {
+    if (!p) return;
+    free(p->kv_k); free(p->kv_v); free(p->last_hidden); free(p);
+}
+
+typedef struct {
+    qwen_tts_ctx_t *pf_ctx;          /* cloned ctx owned by the helper */
+    qwen_batch_sink_t *sink;
+    prefill_q_t *q;
+    int num_layers, kvd, h, MAXPROMPT;
+    float eps;
+} prefill_helper_arg_t;
+
+static void *prefill_helper_main(void *arg) {
+    prefill_helper_arg_t *a = (prefill_helper_arg_t *)arg;
+    qwen_tts_ctx_t *pf = a->pf_ctx;
+    for (;;) {
+        qwen_batch_req_t req; void *tag = NULL;
+        if (!a->sink->next_job(a->sink->ud, &req, &tag, 1)) break;  /* shutdown + drained */
+        pf->speaker_id = req.speaker_id; pf->language_id = req.language_id;
+        pf->prev_prefill_len = 0; pf->prefill_only = 1;
+        int prc = qwen_tts_generate(pf, req.text, NULL, NULL);
+        pf->prefill_only = 0;
+        int pl = pf->kv_len;
+        prefilled_t *p = (prefilled_t *)calloc(1, sizeof(prefilled_t));
+        if (!p) { a->sink->on_done(a->sink->ud, tag, NULL, 0); continue; }
+        p->tag = tag; p->req = req;
+        if (prc == 0 && pl > 0 && pl <= a->MAXPROMPT) {
+            size_t klen = (size_t)a->num_layers * pl * a->kvd;
+            p->kv_k = (uint16_t *)malloc(klen * sizeof(uint16_t));
+            p->kv_v = (uint16_t *)malloc(klen * sizeof(uint16_t));
+            p->last_hidden = (float *)malloc((size_t)a->h * sizeof(float));
+            if (p->kv_k && p->kv_v && p->last_hidden) {
+                for (int L = 0; L < a->num_layers; L++) {
+                    size_t d = (size_t)L * pl * a->kvd;
+                    size_t s = (size_t)L * pf->kv_max * a->kvd;
+                    memcpy(p->kv_k + d, pf->kv_cache_k + s, (size_t)pl * a->kvd * sizeof(uint16_t));
+                    memcpy(p->kv_v + d, pf->kv_cache_v + s, (size_t)pl * a->kvd * sizeof(uint16_t));
+                }
+                qwen_rms_norm(p->last_hidden, pf->dec_x, pf->talker_norm, 1, a->h, a->eps);
+                p->ok = 1; p->pl = pl; p->tcl = pf->bg_text_content_len;
+            } else {
+                free(p->kv_k); free(p->kv_v); free(p->last_hidden);
+                p->kv_k = p->kv_v = NULL; p->last_hidden = NULL;  /* p->ok stays 0 */
+            }
+        }
+        if (!pfq_push(a->q, p)) { prefilled_free(p); break; }  /* shutdown mid-run */
+    }
+    pfq_shutdown(a->q);   /* wake a scheduler blocked on pop */
+    return NULL;
+}
+
 int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sink) {
     if (B < 1) B = 1;
     if (ctx->layers[0].wq_bf16 == NULL) return -2;   /* bf16 batched step only */
@@ -2217,10 +2335,51 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         active[b] = 0; tag[b] = NULL; n_active--;                                  \
     } while (0)
 
+    /* ---- A1: spawn the async prefill helper (reentrant pool only) ---- */
+    int use_helper = qwen_parallel_is_reentrant();
+    qwen_tts_ctx_t *pf_ctx = use_helper ? qwen_tts_clone_for_worker(ctx) : NULL;
+    prefill_q_t pfq; pthread_t pf_thr; prefill_helper_arg_t pf_arg;
+    if (pf_ctx) {
+        int cap = (B < 2) ? B : 2; if (cap < 1) cap = 1;   /* one prefill hidden behind gen */
+        pfq_init(&pfq, cap);
+        pf_arg.pf_ctx = pf_ctx; pf_arg.sink = sink; pf_arg.q = &pfq;
+        pf_arg.num_layers = num_layers; pf_arg.kvd = kvd; pf_arg.h = h;
+        pf_arg.MAXPROMPT = MAXPROMPT; pf_arg.eps = eps;
+        if (pthread_create(&pf_thr, NULL, prefill_helper_main, &pf_arg) != 0) {
+            qwen_tts_free_clone(pf_ctx); pf_ctx = NULL; pfq_destroy(&pfq);
+        }
+    }
+    use_helper = (pf_ctx != NULL);   /* fell back to inline prefill if clone/thread failed */
+
     while (sink->running(sink->ud) || n_active > 0) {
         /* ---- admit queued jobs into free slots ---- */
         for (int b = 0; b < B; b++) {
             if (active[b]) continue;
+            if (use_helper) {
+                /* A1: admit a slot that the helper thread already prefilled — the
+                 * scheduler never blocks on prefill, only on the (cheap) KV copy. */
+                if (!sink->running(sink->ud) && n_active > 0) break;  /* draining: stop admitting */
+                int block = (n_active == 0);   /* fully idle → wait for the first ready job */
+                prefilled_t *p = pfq_pop(&pfq, block);
+                if (!p) break;                 /* nothing ready (or shutdown) this frame */
+                if (!p->ok) { sink->on_done(sink->ud, p->tag, NULL, 0); prefilled_free(p); continue; }
+                for (int L = 0; L < num_layers; L++) {
+                    size_t dst = ((size_t)b * num_layers + L) * kv_max * kvd;
+                    memcpy(bb->kv_k + dst, p->kv_k + (size_t)L * p->pl * kvd, (size_t)p->pl * kvd * sizeof(uint16_t));
+                    memcpy(bb->kv_v + dst, p->kv_v + (size_t)L * p->pl * kvd, (size_t)p->pl * kvd * sizeof(uint16_t));
+                }
+                memcpy(last_hidden + (size_t)b * h, p->last_hidden, (size_t)h * sizeof(float));
+                tcl[b] = p->tcl; pos[b] = p->pl;
+                p_temp[b] = p->req.temperature; p_topk[b] = p->req.top_k; p_topp[b] = p->req.top_p;
+                p_rep[b] = p->req.rep_penalty; p_gw[b] = p->req.greedy_warmup; rng[b] = p->req.seed;
+                nprev[b] = 0; chframes[b] = 0; sframe[b] = 0;
+                want_stream[b] = (p->req.want_stream && sink->on_chunk) ? 1 : 0;
+                if (want_stream[b]) qwen_sd_stream_init(&sstate[b]);
+                tag[b] = p->tag; active[b] = 1; n_active++;
+                prefilled_free(p);
+                continue;
+            }
+            /* ---- inline fallback (non-reentrant pool): prefill blocks the batch ---- */
             if (!sink->running(sink->ud)) break;
             int block = (n_active == 0);   /* block only when fully idle (no spin) */
             qwen_batch_req_t req;
@@ -2334,6 +2493,24 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     }
 
     #undef FINALIZE_SLOT
+
+    /* A1: stop the prefill helper and reclaim any not-yet-admitted prefilled jobs.
+     * The helper unblocks from sink->next_job when the server shuts jq down (serve_batched
+     * calls jq_shutdown before joining this scheduler thread), or from a blocked push via
+     * pfq_shutdown here; either way it exits and this join returns. Leftover ready jobs get
+     * a failure on_done so their clients aren't left hanging. */
+    if (use_helper) {
+        pfq_shutdown(&pfq);
+        pthread_join(pf_thr, NULL);
+        prefilled_t *p;
+        while ((p = pfq_pop(&pfq, 0)) != NULL) {
+            sink->on_done(sink->ud, p->tag, NULL, 0);
+            prefilled_free(p);
+        }
+        pfq_destroy(&pfq);
+        qwen_tts_free_clone(pf_ctx);
+    }
+
     for (int b = 0; b < B; b++) { if (want_stream[b]) qwen_sd_stream_free(&sstate[b]); free(prev_tok[b]); free(chcodes[b]); }
     free(want_stream); free(sstate);
     free(active); free(tag); free(pos); free(tcl);
