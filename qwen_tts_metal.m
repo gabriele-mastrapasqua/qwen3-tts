@@ -79,24 +79,30 @@ static const char *QWEN_METAL_SRC =
 "\n"
 "kernel void matvec_int8(device const char *W [[buffer(0)]],\n"
 "    device const float *scale [[buffer(1)]], device const float *x [[buffer(2)]],\n"
-"    device float *y [[buffer(3)]], constant uint &cols [[buffer(4)]],\n"
-"    uint row [[thread_position_in_grid]]) {\n"
-"    float acc = 0.0f; device const char *w = W + (ulong)row * cols;\n"
-"    for (uint c = 0; c < cols; ++c) acc += float(w[c]) * x[c];\n"
-"    y[row] = acc * scale[row];\n"
+"    device float *y [[buffer(3)]], constant uint &cols [[buffer(4)]], constant uint &rows [[buffer(5)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]], uint tiisg [[thread_index_in_simdgroup]],\n"
+"    uint sgitg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {\n"
+"    uint row = tgpig.x*nsg + sgitg; if (row >= rows) return;\n"
+"    device const char4 *w4 = (device const char4 *)(W + (ulong)row * cols);\n"
+"    device const float4 *x4 = (device const float4 *)x; uint n4 = cols >> 2; float acc = 0.0f;\n"
+"    for (uint c = tiisg; c < n4; c += 32) { char4 wv = w4[c]; float4 xv = x4[c];\n"
+"        acc += float(wv.x)*xv.x + float(wv.y)*xv.y + float(wv.z)*xv.z + float(wv.w)*xv.w; }\n"
+"    acc = simd_sum(acc); if (tiisg == 0) y[row] = acc * scale[row];\n"
 "}\n"
 "\n"
 "kernel void matvec_q4_0(device const q4blk *W [[buffer(0)]],\n"
 "    device const float *x [[buffer(1)]], device float *y [[buffer(2)]],\n"
-"    constant uint &cols [[buffer(3)]], uint row [[thread_position_in_grid]]) {\n"
-"    uint bpr = cols / 32; device const q4blk *wr = W + (ulong)row * bpr;\n"
-"    float acc = 0.0f;\n"
-"    for (uint b = 0; b < bpr; ++b) { float s = wr[b].scale;\n"
+"    constant uint &cols [[buffer(3)]], constant uint &rows [[buffer(4)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]], uint tiisg [[thread_index_in_simdgroup]],\n"
+"    uint sgitg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {\n"
+"    uint row = tgpig.x*nsg + sgitg; if (row >= rows) return;\n"
+"    uint bpr = cols / 32; device const q4blk *wr = W + (ulong)row * bpr; float acc = 0.0f;\n"
+"    for (uint b = tiisg; b < bpr; b += 32) { float s = wr[b].scale;\n"
 "        for (uint i = 0; i < 16; ++i) { uchar q = wr[b].qs[i];\n"
 "            int lo = int(q & 0x0f) - 8; int hi = int(q >> 4) - 8;\n"
 "            acc += float(lo) * s * x[b*32 + 2*i];\n"
 "            acc += float(hi) * s * x[b*32 + 2*i + 1]; } }\n"
-"    y[row] = acc;\n"
+"    acc = simd_sum(acc); if (tiisg == 0) y[row] = acc;\n"
 "}\n"
 "\n"
 "kernel void rms_norm(device const float *x [[buffer(0)]],\n"
@@ -116,6 +122,23 @@ static const char *QWEN_METAL_SRC =
 "kernel void swiglu(device const float *in [[buffer(0)]], device float *out [[buffer(1)]],\n"
 "    uint i [[thread_position_in_grid]]) {\n"
 "    float g = in[2*i], u = in[2*i + 1]; out[i] = g / (1.0f + exp(-g)) * u;\n"
+"}\n"
+"kernel void rms_norm_batched(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],\n"
+"    device float *y [[buffer(2)]], constant uint &dim [[buffer(3)]], constant uint &B [[buffer(4)]],\n"
+"    constant float &eps [[buffer(5)]], uint b [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_position_in_threadgroup]], uint tc [[threads_per_threadgroup]]) {\n"
+"    threadgroup float part[256]; float s = 0.0f;\n"
+"    for (uint i = tid; i < dim; i += tc) { float v = x[(ulong)i*B + b]; s += v*v; }\n"
+"    part[tid] = s; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint st = tc/2; st > 0; st >>= 1) { if (tid < st) part[tid] += part[tid+st]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"    float inv = 1.0f / sqrt(part[0]/float(dim) + eps);\n"
+"    for (uint i = tid; i < dim; i += tc) y[(ulong)i*B + b] = x[(ulong)i*B + b]*inv*w[i];\n"
+"}\n"
+"kernel void swiglu_batched(device const float *gu [[buffer(0)]], device float *h [[buffer(1)]],\n"
+"    constant uint &inter [[buffer(2)]], constant uint &B [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+"    uint i = gid / B, b = gid % B; if (i >= inter) return;\n"
+"    float g = gu[(ulong)(2*i)*B + b], u = gu[(ulong)(2*i+1)*B + b];\n"
+"    h[(ulong)i*B + b] = g / (1.0f + exp(-g)) * u;\n"
 "}\n"
 "kernel void silu(device const float *x [[buffer(0)]], device float *out [[buffer(1)]],\n"
 "    uint i [[thread_position_in_grid]]) { float v = x[i]; out[i] = v / (1.0f + exp(-v)); }\n"
@@ -235,6 +258,7 @@ typedef struct {
     void *pso_matvec_bf16, *pso_matmat_bf16, *pso_matvec_int8, *pso_matvec_q4_0;
     void *pso_rms, *pso_swiglu, *pso_silu, *pso_add, *pso_mul, *pso_scale, *pso_rope;
     void *pso_snake, *pso_attn, *pso_matmat_f32, *pso_conv1d, *pso_convt1d;
+    void *pso_rms_b, *pso_swiglu_b;
     /* resident weight cache (by pointer) */
     wcache_ent *wc; int wc_n, wc_cap;
     /* reusable IO buffers (grow on demand) */
@@ -287,10 +311,13 @@ void *qwen_metal_init(void) {
         c->pso_matmat_f32 = make_pso(dev, lib, "matmat_f32");
         c->pso_conv1d = make_pso(dev, lib, "conv1d");
         c->pso_convt1d = make_pso(dev, lib, "conv_transpose1d");
+        c->pso_rms_b = make_pso(dev, lib, "rms_norm_batched");
+        c->pso_swiglu_b = make_pso(dev, lib, "swiglu_batched");
         if (!c->pso_matvec_bf16 || !c->pso_matmat_bf16 || !c->pso_matvec_int8 ||
             !c->pso_matvec_q4_0 || !c->pso_rms || !c->pso_swiglu || !c->pso_silu ||
             !c->pso_add || !c->pso_mul || !c->pso_scale || !c->pso_rope ||
-            !c->pso_snake || !c->pso_attn || !c->pso_matmat_f32 || !c->pso_conv1d || !c->pso_convt1d) {
+            !c->pso_snake || !c->pso_attn || !c->pso_matmat_f32 || !c->pso_conv1d || !c->pso_convt1d ||
+            !c->pso_rms_b || !c->pso_swiglu_b) {
             qwen_metal_free(c); return NULL;
         }
         return c;
@@ -312,6 +339,7 @@ void qwen_metal_free(void *ctx) {
     release_ptr(&c->pso_rope);
     release_ptr(&c->pso_snake); release_ptr(&c->pso_attn); release_ptr(&c->pso_matmat_f32);
     release_ptr(&c->pso_conv1d); release_ptr(&c->pso_convt1d);
+    release_ptr(&c->pso_rms_b); release_ptr(&c->pso_swiglu_b);
     release_ptr(&c->queue); release_ptr(&c->device);
     free(c);
 }
@@ -330,6 +358,14 @@ static id<MTLBuffer> weight_buf(qwen_metal_ctx *c, const void *ptr, size_t bytes
     c->wc[c->wc_n].buf = (__bridge_retained void *)b;
     c->wc_n++;
     return b;
+}
+
+/* Drop all cached resident weights. Real engine: never needed (mmap pointers are
+ * stable). Selftest only: it frees+reallocs weight arrays, so a reused malloc
+ * address must not return a stale cached device buffer. */
+static void flush_weights(qwen_metal_ctx *c) {
+    for (int i = 0; i < c->wc_n; ++i) { void *b = c->wc[i].buf; release_ptr(&b); }
+    c->wc_n = 0;
 }
 
 /* Reusable IO buffer at a slot, grown as needed (shared storage → CPU can r/w). */
@@ -417,9 +453,10 @@ void qwen_metal_matvec_int8(void *ctx, float *y, const int8_t *W,
         [e setComputePipelineState:pso];
         [e setBuffer:bW offset:0 atIndex:0]; [e setBuffer:bS offset:0 atIndex:1];
         [e setBuffer:bx offset:0 atIndex:2]; [e setBuffer:by offset:0 atIndex:3];
-        uint32_t cc = (uint32_t)cols; [e setBytes:&cc length:4 atIndex:4];
-        [e dispatchThreads:MTLSizeMake((NSUInteger)rows,1,1)
-        threadsPerThreadgroup:MTLSizeMake(cap256(pso),1,1)];
+        uint32_t cc = (uint32_t)cols, rr = (uint32_t)rows;
+        [e setBytes:&cc length:4 atIndex:4]; [e setBytes:&rr length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows+7)/8,1,1)
+        threadsPerThreadgroup:MTLSizeMake(8*32,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
         memcpy(y, by.contents, (size_t)rows * sizeof(float));
     }
@@ -441,9 +478,10 @@ void qwen_metal_matvec_q4_0(void *ctx, float *y, const q4_0_block_t *W,
         [e setComputePipelineState:pso];
         [e setBuffer:bW offset:0 atIndex:0]; [e setBuffer:bx offset:0 atIndex:1];
         [e setBuffer:by offset:0 atIndex:2];
-        uint32_t cc = (uint32_t)cols; [e setBytes:&cc length:4 atIndex:3];
-        [e dispatchThreads:MTLSizeMake((NSUInteger)rows,1,1)
-        threadsPerThreadgroup:MTLSizeMake(cap256(pso),1,1)];
+        uint32_t cc = (uint32_t)cols, rr = (uint32_t)rows;
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows+7)/8,1,1)
+        threadsPerThreadgroup:MTLSizeMake(8*32,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
         memcpy(y, by.contents, (size_t)rows * sizeof(float));
     }
@@ -804,6 +842,64 @@ void qwen_metal_ffn_swiglu(void *ctx, float *out, const float *x, const float *n
     }
 }
 
+/* BATCHED fused FFN: B tokens, [dim,B]-native; gate_up + down are MMA matmats
+ * (the 6.96x compute-bound win), rms/swiglu batched, residual — ONE command
+ * buffer, activations resident. This is #3: the FFN heavy matmuls at MMA speed. */
+void qwen_metal_ffn_swiglu_batched(void *ctx, float *out, const float *x, const float *norm_w,
+                                   const uint16_t *Wgu, const uint16_t *Wd,
+                                   int H, int inter, int B, float eps) {
+    @autoreleasepool {
+        qwen_metal_ctx *c = ctx;
+        id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)c->queue;
+        id<MTLComputePipelineState> rmsb = (__bridge id<MTLComputePipelineState>)c->pso_rms_b;
+        id<MTLComputePipelineState> mm  = (__bridge id<MTLComputePipelineState>)c->pso_matmat_bf16;
+        id<MTLComputePipelineState> sgb = (__bridge id<MTLComputePipelineState>)c->pso_swiglu_b;
+        id<MTLComputePipelineState> add = (__bridge id<MTLComputePipelineState>)c->pso_add;
+        id<MTLBuffer> bWgu  = weight_buf(c, Wgu,   (size_t)(2*inter)*H*sizeof(uint16_t));
+        id<MTLBuffer> bWd   = weight_buf(c, Wd,    (size_t)H*inter*sizeof(uint16_t));
+        id<MTLBuffer> bnorm = weight_buf(c, norm_w,(size_t)H*sizeof(float));
+        id<MTLBuffer> bx  = io_buf(c, 0, (size_t)H*B*sizeof(float));
+        id<MTLBuffer> bxn = io_buf(c, 1, (size_t)H*B*sizeof(float));
+        id<MTLBuffer> bgu = io_buf(c, 2, (size_t)(2*inter)*B*sizeof(float));
+        id<MTLBuffer> bh  = io_buf(c, 3, (size_t)inter*B*sizeof(float));
+        id<MTLBuffer> bout= io_buf(c, 4, (size_t)H*B*sizeof(float));
+        memcpy(bx.contents, x, (size_t)H*B*sizeof(float));
+        uint32_t uH=(uint32_t)H, uI=(uint32_t)inter, uB=(uint32_t)B, uGU=(uint32_t)(2*inter); float ep=eps;
+
+        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        /* 1) rms_norm per token */
+        [e setComputePipelineState:rmsb];
+        [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:bnorm offset:0 atIndex:1]; [e setBuffer:bxn offset:0 atIndex:2];
+        [e setBytes:&uH length:4 atIndex:3]; [e setBytes:&uB length:4 atIndex:4]; [e setBytes:&ep length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)B,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        /* 2) gate_up = Wgu @ xn  (MMA) */
+        [e setComputePipelineState:mm];
+        [e setBuffer:bWgu offset:0 atIndex:0]; [e setBuffer:bxn offset:0 atIndex:1]; [e setBuffer:bgu offset:0 atIndex:2];
+        [e setBytes:&uH length:4 atIndex:3]; [e setBytes:&uB length:4 atIndex:4]; [e setBytes:&uGU length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)(2*inter)+7)/8,((NSUInteger)B+7)/8,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        /* 3) swiglu batched */
+        [e setComputePipelineState:sgb];
+        [e setBuffer:bgu offset:0 atIndex:0]; [e setBuffer:bh offset:0 atIndex:1];
+        [e setBytes:&uI length:4 atIndex:2]; [e setBytes:&uB length:4 atIndex:3];
+        [e dispatchThreads:MTLSizeMake((NSUInteger)inter*B,1,1) threadsPerThreadgroup:MTLSizeMake(cap256(sgb),1,1)];
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        /* 4) down = Wd @ h  (MMA) */
+        [e setComputePipelineState:mm];
+        [e setBuffer:bWd offset:0 atIndex:0]; [e setBuffer:bh offset:0 atIndex:1]; [e setBuffer:bout offset:0 atIndex:2];
+        [e setBytes:&uI length:4 atIndex:3]; [e setBytes:&uB length:4 atIndex:4]; [e setBytes:&uH length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+7)/8,((NSUInteger)B+7)/8,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        /* 5) residual */
+        [e setComputePipelineState:add];
+        [e setBuffer:bout offset:0 atIndex:0]; [e setBuffer:bx offset:0 atIndex:1]; [e setBuffer:bout offset:0 atIndex:2];
+        [e dispatchThreads:MTLSizeMake((NSUInteger)H*B,1,1) threadsPerThreadgroup:MTLSizeMake(cap256(add),1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(out, bout.contents, (size_t)H*B*sizeof(float));
+    }
+}
+
 /* ---- per-op selftest vs CPU kernels ------------------------------------- */
 static uint32_t g_rng = 0x1234567u;
 static float rnd(void) {
@@ -955,6 +1051,7 @@ int qwen_metal_selftest(void *out) {
       fails += check(f, "attention", og, oc, sq*nh*hd, 1e-3); free(Q);free(Kk);free(Vv);free(oc);free(og); }
 
     /* ---- matmat_f32 (prefill GEMM) ---- */
+    flush_weights((qwen_metal_ctx *)ctx);
     { int r=512, cc=512, b2=16; float *Wf=malloc((size_t)r*cc*4), *Xf=malloc((size_t)cc*b2*4);
       float *yc=malloc((size_t)r*b2*4), *yg=malloc((size_t)r*b2*4);
       for (int i=0;i<r*cc;++i) Wf[i]=rnd()*0.1f; for (int i=0;i<cc*b2;++i) Xf[i]=rnd();
@@ -963,6 +1060,7 @@ int qwen_metal_selftest(void *out) {
       fails += check(f, "matmat_f32", yg, yc, r*b2, 1e-3); free(Wf);free(Xf);free(yc);free(yg); }
 
     /* ---- conv1d + conv_transpose1d (local CPU ref matches the decoder naive) ---- */
+    flush_weights((qwen_metal_ctx *)ctx);
     { int ic=8, oc=8, L=64, ks=7, dil=1; int pad=(ks-1)*dil;
       float *in=malloc((size_t)ic*L*4), *w=malloc((size_t)oc*ic*ks*4), *bi=malloc((size_t)oc*4);
       float *cc=malloc((size_t)oc*L*4), *gg=malloc((size_t)oc*L*4);
@@ -980,10 +1078,12 @@ int qwen_metal_selftest(void *out) {
           if (p<full-trim) for (int k=0;k<ks;++k){ int sh=p-k; if(sh<0||sh%st) continue; int tt=sh/st; if(tt<0||tt>=il) continue;
               for (int i=0;i<ic;++i) s+=in[(size_t)i*il+tt]*w[((size_t)i*oc+o)*ks+k]; }
           cc[(size_t)o*ol+p]=s; }
+      flush_weights((qwen_metal_ctx *)ctx);
       qwen_metal_conv_transpose1d(ctx, gg, in, w, bi, ic, oc, il, ol, ks, st);
       fails += check(f, "conv_transpose1d", gg, cc, oc*ol, 1e-3); free(in);free(w);free(bi);free(cc);free(gg); }
 
     /* ---- FUSED RESIDENT FFN (the heavy block, 1.7B Talker sizes) ---- */
+    flush_weights((qwen_metal_ctx *)ctx);
     {
         int H = 2048, inter = 6144;
         uint16_t *Wgu = malloc((size_t)(2*inter)*H*2);
@@ -1010,6 +1110,36 @@ int qwen_metal_selftest(void *out) {
         fprintf(f, "  FFN FUSED (H=2048 inter=6144, 1 cmdbuf): cpu=%.3f ms  metal=%.3f ms  (%.2fx)\n",
                 tcf, tgf, tgf>0?tcf/tgf:0);
         free(Wgu); free(Wd); free(nw); free(xf); free(ocpu); free(ogpu); free(xn); free(guf); free(tmp);
+    }
+
+    /* ---- BATCHED fused FFN (B=16, MMA matmuls) ---- */
+    flush_weights((qwen_metal_ctx *)ctx);
+    {
+        int H = 2048, inter = 6144, B = 16;
+        uint16_t *Wgu = malloc((size_t)(2*inter)*H*2), *Wd = malloc((size_t)H*inter*2);
+        float *nw = malloc((size_t)H*4), *xb = malloc((size_t)H*B*4);
+        float *ocpu = malloc((size_t)H*B*4), *ogpu = malloc((size_t)H*B*4);
+        float *xg = malloc((size_t)H*4), *xn = malloc((size_t)H*4), *guf = malloc((size_t)(2*inter)*4), *tmp = malloc((size_t)inter*4), *ob = malloc((size_t)H*4);
+        for (size_t i=0;i<(size_t)(2*inter)*H;++i) Wgu[i]=to_bf16(rnd()*0.05f);
+        for (size_t i=0;i<(size_t)H*inter;++i) Wd[i]=to_bf16(rnd()*0.05f);
+        for (int i=0;i<H;++i) nw[i]=rnd()*0.3f+1.0f; for (int i=0;i<H*B;++i) xb[i]=rnd();
+        /* CPU ref: per token (gather [dim,B] column → contiguous) */
+        for (int b=0;b<B;++b){ for (int i=0;i<H;++i) xg[i]=xb[(size_t)i*B+b];
+            qwen_rms_norm(xn, xg, nw, 1, H, 1e-6f); qwen_matvec_bf16(guf, Wgu, xn, 2*inter, H);
+            qwen_swiglu_inplace(guf, tmp, inter); qwen_matvec_bf16(ob, Wd, guf, H, inter);
+            for (int i=0;i<H;++i) ocpu[(size_t)i*B+b]=ob[i]+xg[i]; }
+        qwen_metal_ffn_swiglu_batched(ctx, ogpu, xb, nw, Wgu, Wd, H, inter, B, 1e-6f);
+        fails += check(f, "ffn_batched", ogpu, ocpu, H*B, 5e-3);
+        int itb=20; double b0=nowms();
+        for (int k=0;k<itb;++k) for (int b=0;b<B;++b){ for (int i=0;i<H;++i) xg[i]=xb[(size_t)i*B+b];
+            qwen_rms_norm(xn,xg,nw,1,H,1e-6f); qwen_matvec_bf16(guf,Wgu,xn,2*inter,H);
+            qwen_swiglu_inplace(guf,tmp,inter); qwen_matvec_bf16(ob,Wd,guf,H,inter);
+            for (int i=0;i<H;++i) ocpu[(size_t)i*B+b]=ob[i]+xg[i]; }
+        double bc=(nowms()-b0)/itb;
+        b0=nowms(); for (int k=0;k<itb;++k) qwen_metal_ffn_swiglu_batched(ctx,ogpu,xb,nw,Wgu,Wd,H,inter,B,1e-6f);
+        double bg=(nowms()-b0)/itb;
+        fprintf(f, "  FFN BATCHED B=16 (MMA, 1 cmdbuf): cpu=%.3f ms  metal=%.3f ms  (%.2fx)\n", bc, bg, bg>0?bc/bg:0);
+        free(Wgu);free(Wd);free(nw);free(xb);free(ocpu);free(ogpu);free(xg);free(xn);free(guf);free(tmp);free(ob);
     }
 
     /* ---- resident timing: matvec bf16 + matmat bf16 (weights already cached) ---- */

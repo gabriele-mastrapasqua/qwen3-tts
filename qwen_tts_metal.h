@@ -83,6 +83,11 @@ void  qwen_metal_conv_transpose1d(void *ctx, float *out, const float *in, const 
 void  qwen_metal_ffn_swiglu(void *ctx, float *out, const float *x, const float *norm_w,
                             const uint16_t *Wgu, const uint16_t *Wd,
                             int H, int inter, float eps);
+/* BATCHED fused FFN (B tokens, [dim,B]-native): gate_up + down are MMA matmats
+ * (the compute-bound win), one command buffer, activations resident. */
+void  qwen_metal_ffn_swiglu_batched(void *ctx, float *out, const float *x, const float *norm_w,
+                                    const uint16_t *Wgu, const uint16_t *Wd,
+                                    int H, int inter, int B, float eps);
 
 /* Amortized matvec cost with K dispatches in ONE command buffer (ms/op) —
  * the fused regime a real decode step runs in (isolates kernel throughput from
