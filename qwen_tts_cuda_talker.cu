@@ -53,6 +53,28 @@ __global__ void k_matvec_bf16(const __nv_bfloat16 *W, const float *x, float *y, 
     if (lane == 0) y[row] = s;
 }
 
+/* q4_0 block: 32 weights = fp32 scale + 16 bytes (low nibble=even idx, high=odd), val=(nib-8)*scale.
+ * MUST match qwen_tts_kernels.h q4_0_block_t exactly. */
+typedef struct { float scale; unsigned char qs[16]; } q4blk;
+/* warp-per-row q4_0 matvec: int4 weight (0.5 byte) × f32 activation. Half the bytes of int8. */
+__global__ void k_matvec_q4_0(const q4blk *W, const float *x, float *y, int rows, int cols) {
+    int row = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    int nb = cols >> 5;
+    const q4blk *wr = W + (size_t)row * nb;
+    float s = 0.f;
+    for (int c = lane; c < cols; c += 32) {
+        const q4blk *b = wr + (c>>5); int ic = c & 31;
+        unsigned char byte = b->qs[ic>>1];
+        int nib = (ic&1) ? (byte>>4) : (byte&0x0F);
+        s += (float)(nib-8) * b->scale * x[c];
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (lane == 0) y[row] = s;
+}
+
 /* Same, int8 weight (1 byte) × f32 activation, per-row scale. Warp-per-row. */
 __global__ void k_matvec_int8(const int8_t *W, const float *scale, const float *x, float *y, int rows, int cols) {
     int row = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
@@ -164,6 +186,7 @@ typedef struct {
     float *tnorm, *rope_cos, *rope_sin;
     float *kcache,*vcache;                           /* [n_layers*kv_max*kv_dim] f32 */
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;     /* work buffers */
+    int prec;   /* 0=bf16 1=int8 2=q4_0 */
     int *d_pos;                                      /* device position (graph-invariant) */
     cudaGraphExec_t exec; int cap_ready;             /* CUDA graph of the 28-layer step */
 } cuda_talker_t;
@@ -181,17 +204,23 @@ static float *up_f32(const float *w, size_t n) {
     float *d=NULL; CK(cudaMalloc(&d,n*sizeof(float)));
     CK(cudaMemcpy(d,w,n*sizeof(float),cudaMemcpyHostToDevice)); return d;
 }
-/* dispatch: scale!=NULL → int8 weight path; else bf16. Warp-per-row: one warp (32 lanes) per
- * output row, TPB/32 rows per block. No shared mem. */
-static inline void mv(const void *W, const float *scale, const float *dX, float *dY, int rows, int cols) {
-    int grid = CEIL(rows*32, TPB);
-    if (scale) k_matvec_int8<<<grid,TPB>>>((const int8_t*)W, scale, dX, dY, rows, cols);
-    else       k_matvec_bf16<<<grid,TPB>>>((const __nv_bfloat16*)W, dX, dY, rows, cols);
+static void *up_q4(const void *w, size_t nblocks) {   /* q4_0 blocks (20 bytes each), raw */
+    void *d=NULL; size_t bytes=nblocks*sizeof(q4blk);
+    CK(cudaMalloc(&d,bytes)); CK(cudaMemcpy(d,w,bytes,cudaMemcpyHostToDevice)); return d;
 }
-/* per-weight upload: prefer int8 (half the bytes of bf16) when the engine quantized it. */
-#define UPW(dst, dsts, w8, w8s, wbf, n, rows) do { \
-    if (w8) { (dst)=up_int8((w8),(n)); (dsts)=up_f32((w8s),(rows)); } \
-    else    { (dst)=up_bf16((wbf),(n)); (dsts)=NULL; } } while(0)
+/* dispatch by precision (0=bf16, 1=int8, 2=q4_0). Warp-per-row: one warp per output row. */
+static inline void mv(int prec, const void *W, const float *scale, const float *dX, float *dY, int rows, int cols) {
+    int grid = CEIL(rows*32, TPB);
+    if (prec==2)      k_matvec_q4_0<<<grid,TPB>>>((const q4blk*)W, dX, dY, rows, cols);
+    else if (prec==1) k_matvec_int8<<<grid,TPB>>>((const int8_t*)W, scale, dX, dY, rows, cols);
+    else              k_matvec_bf16<<<grid,TPB>>>((const __nv_bfloat16*)W, dX, dY, rows, cols);
+}
+/* per-weight upload: q4_0 (0.5 byte) → int8 (1 byte) → bf16 (2 byte), whichever the engine quantized.
+ * rows×cols weight; q4 has rows*(cols/32) blocks. Sets *pprec to the chosen precision. */
+#define UPW(dst, dsts, w4, w8, w8s, wbf, rows, cols, pprec) do { \
+    if (w4)      { (dst)=up_q4((const void*)(w4),(size_t)(rows)*((cols)/32)); (dsts)=NULL; *(pprec)=2; } \
+    else if (w8) { (dst)=up_int8((w8),(size_t)(rows)*(cols)); (dsts)=up_f32((w8s),(rows)); *(pprec)=1; } \
+    else         { (dst)=up_bf16((wbf),(size_t)(rows)*(cols)); (dsts)=NULL; *(pprec)=0; } } while(0)
 
 extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c=&ctx->config;
@@ -212,14 +241,14 @@ extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     int used_int8=0;
     for (int l=0;l<L;++l){
         qwen_talker_layer_t *ly=&ctx->layers[l];
-        if (!ly->wq_bf16 && !ly->wq_int8){ fprintf(stderr,"CUDA talker: layer %d has no bf16/int8 weights\n",l); return NULL; }
-        UPW(s->wq[l], s->wqs[l], ly->wq_int8, ly->wq_scale, ly->wq_bf16, (size_t)s->q_dim*H, s->q_dim);
-        UPW(s->wk[l], s->wks[l], ly->wk_int8, ly->wk_scale, ly->wk_bf16, (size_t)s->kv_dim*H, s->kv_dim);
-        UPW(s->wv[l], s->wvs[l], ly->wv_int8, ly->wv_scale, ly->wv_bf16, (size_t)s->kv_dim*H, s->kv_dim);
-        UPW(s->wo[l], s->wos[l], ly->wo_int8, ly->wo_scale, ly->wo_bf16, (size_t)H*s->q_dim, H);
-        UPW(s->wgu[l],s->wgus[l],ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_bf16, (size_t)2*s->inter*H, 2*s->inter);
-        UPW(s->wdn[l],s->wdns[l],ly->down_int8, ly->down_scale, ly->down_bf16, (size_t)H*s->inter, H);
-        if (ly->wq_int8) used_int8=1;
+        if (!ly->wq_bf16 && !ly->wq_int8 && !ly->wq_q4){ fprintf(stderr,"CUDA talker: layer %d has no weights\n",l); return NULL; }
+        UPW(s->wq[l], s->wqs[l], ly->wq_q4, ly->wq_int8, ly->wq_scale, ly->wq_bf16, s->q_dim, H, &s->prec);
+        UPW(s->wk[l], s->wks[l], ly->wk_q4, ly->wk_int8, ly->wk_scale, ly->wk_bf16, s->kv_dim, H, &s->prec);
+        UPW(s->wv[l], s->wvs[l], ly->wv_q4, ly->wv_int8, ly->wv_scale, ly->wv_bf16, s->kv_dim, H, &s->prec);
+        UPW(s->wo[l], s->wos[l], ly->wo_q4, ly->wo_int8, ly->wo_scale, ly->wo_bf16, H, s->q_dim, &s->prec);
+        UPW(s->wgu[l],s->wgus[l],ly->gate_up_fused_q4, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_bf16, 2*s->inter, H, &s->prec);
+        UPW(s->wdn[l],s->wdns[l],ly->down_q4, ly->down_int8, ly->down_scale, ly->down_bf16, H, s->inter, &s->prec);
+        used_int8 = (s->prec==1);
         s->inorm[l]=up_f32(ly->input_norm,H); s->pnorm[l]=up_f32(ly->post_attn_norm,H);
         s->qn[l]=up_f32(ly->q_norm,hd); s->kn[l]=up_f32(ly->k_norm,hd);
     }
@@ -234,7 +263,7 @@ extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     CK(cudaMalloc(&s->proj,H*sizeof(float))); CK(cudaMalloc(&s->gate,s->inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)2*s->inter*sizeof(float)));
     CK(cudaMalloc(&s->d_pos,sizeof(int)));
-    fprintf(stderr,"CUDA talker: resident fused step ready (%d layers, hidden=%d, %s weights, CUDA graph)\n",L,H,used_int8?"int8":"bf16");
+    fprintf(stderr,"CUDA talker: resident fused step ready (%d layers, hidden=%d, %s weights, CUDA graph)\n",L,H,s->prec==2?"q4_0":s->prec==1?"int8":"bf16");
     return s;
 }
 
@@ -248,9 +277,9 @@ static void talker_body(cuda_talker_t *s) {
     float scale=1.f/sqrtf((float)hd);
     for (int l=0;l<s->n_layers;++l){
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
-        mv(s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
-        mv(s->wk[l],s->wks[l],s->xn,s->k,kvd,H);
-        mv(s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
+        mv(s->prec,s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
+        mv(s->prec,s->wk[l],s->wks[l],s->xn,s->k,kvd,H);
+        mv(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
         k_rmsnorm_ph<<<nh, TPB, TPB*sizeof(float)>>>(s->q,s->qn[l],hd,s->eps);
         k_rmsnorm_ph<<<nkv,TPB, TPB*sizeof(float)>>>(s->k,s->kn[l],hd,s->eps);
         k_rope_neox<<<CEIL(nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos);
@@ -260,12 +289,12 @@ static void talker_body(cuda_talker_t *s) {
         float *Kl=s->kcache+(size_t)l*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*s->kv_max*kvd;
         k_kv_store<<<CEIL(kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos);
         k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos);
-        mv(s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
+        mv(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
-        mv(s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H);
+        mv(s->prec,s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H);
         k_swiglu_il<<<CEIL(inter,TPB),TPB>>>(s->gu,s->gate,inter);
-        mv(s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
+        mv(s->prec,s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
     k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->tnorm,s->xn,H,s->eps);
@@ -322,7 +351,7 @@ typedef struct {
     float *rope_cos,*rope_sin;
     float *kcache,*vcache;
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;
-    int *d_pos; cudaGraphExec_t exec; int cap_ready;   /* CUDA graph of the 5-layer CP step */
+    int prec; int *d_pos; cudaGraphExec_t exec; int cap_ready;   /* CUDA graph of the 5-layer CP step */
 } cuda_cp_t;
 
 extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
@@ -344,14 +373,14 @@ extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
     int used_int8=0;
     for (int l=0;l<L;++l){
         qwen_cp_layer_t *ly=&ctx->cp_layers[l];
-        if (!ly->wq_bf16 && !ly->wq_int8){ fprintf(stderr,"CUDA CP: layer %d has no bf16/int8 weights\n",l); return NULL; }
-        UPW(s->wq[l], s->wqs[l], ly->wq_int8, ly->wq_scale, ly->wq_bf16, (size_t)s->q_dim*H, s->q_dim);
-        UPW(s->wk[l], s->wks[l], ly->wk_int8, ly->wk_scale, ly->wk_bf16, (size_t)s->kv_dim*H, s->kv_dim);
-        UPW(s->wv[l], s->wvs[l], ly->wv_int8, ly->wv_scale, ly->wv_bf16, (size_t)s->kv_dim*H, s->kv_dim);
-        UPW(s->wo[l], s->wos[l], ly->wo_int8, ly->wo_scale, ly->wo_bf16, (size_t)H*s->q_dim, H);
-        UPW(s->wgu[l],s->wgus[l],ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_bf16, (size_t)2*s->inter*H, 2*s->inter);
-        UPW(s->wdn[l],s->wdns[l],ly->down_int8, ly->down_scale, ly->down_bf16, (size_t)H*s->inter, H);
-        if (ly->wq_int8) used_int8=1;
+        if (!ly->wq_bf16 && !ly->wq_int8 && !ly->wq_q4){ fprintf(stderr,"CUDA CP: layer %d has no weights\n",l); return NULL; }
+        UPW(s->wq[l], s->wqs[l], ly->wq_q4, ly->wq_int8, ly->wq_scale, ly->wq_bf16, s->q_dim, H, &s->prec);
+        UPW(s->wk[l], s->wks[l], ly->wk_q4, ly->wk_int8, ly->wk_scale, ly->wk_bf16, s->kv_dim, H, &s->prec);
+        UPW(s->wv[l], s->wvs[l], ly->wv_q4, ly->wv_int8, ly->wv_scale, ly->wv_bf16, s->kv_dim, H, &s->prec);
+        UPW(s->wo[l], s->wos[l], ly->wo_q4, ly->wo_int8, ly->wo_scale, ly->wo_bf16, H, s->q_dim, &s->prec);
+        UPW(s->wgu[l],s->wgus[l],ly->gate_up_fused_q4, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_bf16, 2*s->inter, H, &s->prec);
+        UPW(s->wdn[l],s->wdns[l],ly->down_q4, ly->down_int8, ly->down_scale, ly->down_bf16, H, s->inter, &s->prec);
+        used_int8 = (s->prec==1);
         s->inorm[l]=up_f32(ly->input_norm,H); s->pnorm[l]=up_f32(ly->post_attn_norm,H);
         s->qn[l]=up_f32(ly->q_norm,hd); s->kn[l]=up_f32(ly->k_norm,hd);
     }
@@ -365,7 +394,7 @@ extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
     CK(cudaMalloc(&s->proj,H*sizeof(float))); CK(cudaMalloc(&s->gate,s->inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)2*s->inter*sizeof(float)));
     CK(cudaMalloc(&s->d_pos,sizeof(int)));
-    fprintf(stderr,"CUDA CP: resident fused step ready (%d layers, hidden=%d, %s, CUDA graph)\n",L,H,used_int8?"int8":"bf16");
+    fprintf(stderr,"CUDA CP: resident fused step ready (%d layers, hidden=%d, %s, CUDA graph)\n",L,H,s->prec==2?"q4_0":s->prec==1?"int8":"bf16");
     return s;
 }
 
@@ -376,9 +405,9 @@ static void cp_body(cuda_cp_t *s) {
     float scale=1.f/sqrtf((float)hd);
     for (int l=0;l<s->n_layers;++l){
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
-        mv(s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
-        mv(s->wk[l],s->wks[l],s->xn,s->k,kvd,H);
-        mv(s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
+        mv(s->prec,s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
+        mv(s->prec,s->wk[l],s->wks[l],s->xn,s->k,kvd,H);
+        mv(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
         k_rmsnorm_ph<<<nh, TPB, TPB*sizeof(float)>>>(s->q,s->qn[l],hd,s->eps);
         k_rmsnorm_ph<<<nkv,TPB, TPB*sizeof(float)>>>(s->k,s->kn[l],hd,s->eps);
         k_rope_neox<<<CEIL(nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos);
@@ -388,12 +417,12 @@ static void cp_body(cuda_cp_t *s) {
         float *Kl=s->kcache+(size_t)l*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*s->kv_max*kvd;
         k_kv_store<<<CEIL(kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos);
         k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos);
-        mv(s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
+        mv(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
-        mv(s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H);
+        mv(s->prec,s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H);
         k_swiglu_il<<<CEIL(inter,TPB),TPB>>>(s->gu,s->gate,inter);
-        mv(s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
+        mv(s->prec,s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
 }
