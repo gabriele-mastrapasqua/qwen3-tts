@@ -8,6 +8,7 @@
  * by pointer. Mirrors conv_decoder_forward() in qwen_tts_speech_decoder.c EXACTLY.
  */
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -73,6 +74,21 @@ __global__ void kd_gamma_res(float *sig,const float *res,const float *gamma,int 
     size_t idx=(size_t)c*length+t; sig[idx]=res[idx]+sig[idx]*gamma[c];
 }
 __global__ void kd_add(float *a,const float *b,size_t n){ size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n) a[i]+=b[i]; }
+/* out[oc,t] += bias[oc] (broadcast over t) */
+__global__ void kd_add_bias(float *out,const float *bias,int oc_n,int length){
+    int t=blockIdx.x*blockDim.x+threadIdx.x, oc=blockIdx.y; if(t>=length||oc>=oc_n||!bias) return;
+    out[(size_t)oc*length+t]+=bias[oc];
+}
+
+/* pointwise conv (ksz=1) = matmul out[M,N] = W[M,K] @ in[K,N], ALL resident on device → cuBLAS
+ * (the compute-bound 40× regime, no transfer). Row-major identity: cublas(N,N,N,M,K,in,W,out). */
+static cublasHandle_t g_dh=NULL;
+static void dmatmul(float *out,const float *W,const float *in,int M,int K,int N){
+    if(!g_dh){ if(cublasCreate(&g_dh)!=CUBLAS_STATUS_SUCCESS){g_dh=NULL;return;} }
+    cublasSetStream(g_dh,cudaStreamPerThread);   /* same per-thread stream as the kernels → ordered */
+    const float a=1.f,b=0.f;
+    cublasSgemm(g_dh,CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,&a,in,N,W,K,&b,out,N);
+}
 
 /* ---- resident weight cache (by host pointer) ---------------------------- */
 typedef struct { const void *key; float *dbuf; } dwc;
@@ -142,10 +158,12 @@ extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cu
         SWAP();
         kd_layernorm_ct<<<cur_len,TPB,TPB*sizeof(float)>>>(cur,dev_w(cn->norm_weight,cur_ch),dev_w(cn->norm_bias,cur_ch),cur_ch,cur_len,1e-5f);
         float *pw=dbg(&P,(size_t)4096*cur_len);
-        kd_conv1d<<<GRID2(cur_len,4096),TPB>>>(cur,dev_w(cn->pwconv1_weight,(size_t)4096*cur_ch),dev_w(cn->pwconv1_bias,4096),pw,cur_ch,4096,cur_len,1,1);
+        dmatmul(pw,dev_w(cn->pwconv1_weight,(size_t)4096*cur_ch),cur,4096,cur_ch,cur_len);   /* pw1 = matmul (cuBLAS, resident) */
+        kd_add_bias<<<GRID2(cur_len,4096),TPB>>>(pw,dev_w(cn->pwconv1_bias,4096),4096,cur_len);
         kd_gelu<<<CEIL((size_t)4096*cur_len,TPB),TPB>>>(pw,(size_t)4096*cur_len);
         float *o2=dbg(&O,(size_t)cur_ch*cur_len);
-        kd_conv1d<<<GRID2(cur_len,cur_ch),TPB>>>(pw,dev_w(cn->pwconv2_weight,(size_t)cur_ch*4096),dev_w(cn->pwconv2_bias,cur_ch),o2,4096,cur_ch,cur_len,1,1);
+        dmatmul(o2,dev_w(cn->pwconv2_weight,(size_t)cur_ch*4096),pw,cur_ch,4096,cur_len);     /* pw2 = matmul */
+        kd_add_bias<<<GRID2(cur_len,cur_ch),TPB>>>(o2,dev_w(cn->pwconv2_bias,cur_ch),cur_ch,cur_len);
         SWAP();
         kd_gamma_res<<<GRID2(cur_len,cur_ch),TPB>>>(cur,res,dev_w(cn->gamma,cur_ch),cur_ch,cur_len);
     }
@@ -176,7 +194,8 @@ extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cu
             if(ub->res_blocks[r].snake2_alpha)
                 kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].snake2_alpha,cur_ch),dev_w(ub->res_blocks[r].snake2_beta,cur_ch),cur_ch,cur_len);
             float *c2=dbg(&O,(size_t)cur_ch*cur_len);
-            kd_conv1d<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].conv2_weight,(size_t)cur_ch*cur_ch*1),dev_w(ub->res_blocks[r].conv2_bias,cur_ch),c2,cur_ch,cur_ch,cur_len,1,1);
+            dmatmul(c2,dev_w(ub->res_blocks[r].conv2_weight,(size_t)cur_ch*cur_ch),cur,cur_ch,cur_ch,cur_len);   /* conv2 k=1 = matmul */
+            kd_add_bias<<<GRID2(cur_len,cur_ch),TPB>>>(c2,dev_w(ub->res_blocks[r].conv2_bias,cur_ch),cur_ch,cur_len);
             SWAP();
             kd_add<<<CEIL((size_t)cur_ch*cur_len,TPB),TPB>>>(cur,res,(size_t)cur_ch*cur_len);   /* cur = c2 + res */
         }
