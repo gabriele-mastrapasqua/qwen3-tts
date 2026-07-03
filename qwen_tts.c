@@ -1522,6 +1522,12 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * into dt->codes during generation and are drained by a single synchronous
      * decoder_thread_fn() call at the end (done=1 → it processes all and returns). */
     int dt_no_overlap = (getenv("QWEN_NO_OVERLAP") != NULL);
+#ifdef QWEN_HAVE_CUDA
+    /* The GPU-resident decoder shares the one GPU with the fused Talker+CP; a background
+     * decoder thread would CONTEND with generation and slow it. Force synchronous decode so
+     * the two run sequentially on the device (gen then decoder) — no contention. */
+    { extern int g_cuda_decoder_conv_on; if (g_cuda_decoder_conv_on && !ctx->stream) dt_no_overlap = 1; }
+#endif
     qwen_sd_stream_init(&ctx->sd_stream);
     dt_init(&dt_state, ctx, max_frames);
     if (ctx->stream && ctx->audio_cb) {
