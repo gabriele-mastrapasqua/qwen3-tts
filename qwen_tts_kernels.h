@@ -56,8 +56,8 @@ void qwen_check_runtime_isa(void);
  * `out` may be NULL -> stderr. */
 void qwen_caps_report(void *out);
 
-/* Kernel numeric self-test: runs the dispatched matvecs (bf16/int8/argmax-int8)
- * against an f32 reference on deterministic random data. Cross-ISA correctness
+/* Kernel numeric self-test: runs the dispatched matvecs (bf16/int8/argmax-int8/
+ * q4_0/argmax-q4_0) against an f32 reference on deterministic random data. Cross-ISA correctness
  * proof for the SIMD kernels (esp. the AVX-512/VNNI paths) that does NOT depend
  * on a full-pipeline golden, so it's immune to the greedy trajectory fork.
  * `out` may be NULL -> stdout. Returns 0 on PASS, >0 = number of failed cases. */
@@ -122,11 +122,14 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
                                  int8_t *dst_int8, float *dst_scale);
 
-/* Q4_0 block: 32 weights packed into 18 bytes (16 nibble-pairs + fp32 scale) */
+/* Q4_0 block: 32 weights packed into 16 nibble-pair bytes + fp32 scale.
+ * DEINTERLEAVED packing: qs[i] low 4 bits = weight i, high 4 bits = weight
+ * i+16 — so SIMD unpack (and 0x0F / shr 4) yields the two 16-weight halves
+ * already in natural order (no zip), which is what the SDOT path needs. */
 #define Q4_0_BLOCK_SIZE 32
 typedef struct {
     float scale;           /* per-block scale factor */
-    uint8_t qs[16];        /* 32 nibbles: low 4 bits = even idx, high 4 bits = odd idx */
+    uint8_t qs[16];        /* 32 nibbles: lo = weights 0-15, hi = weights 16-31 */
 } q4_0_block_t;            /* 20 bytes per 32 weights */
 
 /* Quantize bf16 weight matrix to Q4_0 blocks.

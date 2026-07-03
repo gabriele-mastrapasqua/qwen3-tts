@@ -119,6 +119,25 @@ Two structural facts drive the map:
   help. Reverted per "no complexity for tiny wins." Re-try only if x86/AVX2 measurement shows x-loads
   matter there (the AVX2 twin would need the rented box). The real q4 lever, if any, is a DECODE
   rework (e.g. int8-x + SDOT on decoded nibbles), not x-load sharing.
+- [x] **WON (2026-07-03, `feature/q4-sdot`) — q4_0 DECODE rework: SDOT on decoded nibbles.** Exactly
+  the lever predicted above. Two changes: (1) `qwen_quantize_bf16_to_q4_0` now packs nibbles
+  **DEINTERLEAVED** (lo nibbles = weights 0-15, hi = 16-31) so `vand`/`vshr` yield two `int8x16` in
+  natural order — no zip; (2) new `q4_0_matvec_sdot_inner` (2-row fused) does int8-x (reuses
+  `quantize_act_int8`) → 2 chained `vdotq_s32` per block → one cvt+FMA for the per-block scale:
+  ~10 instr per 32 weights vs ~40 on the old int16→f32 unpack. Wired into `qwen_matvec_q4_0`,
+  `qwen_matvec_q4_0_qkv` and (via the former) `qwen_argmax_matvec_q4_0`; `QWEN_NO_SDOT=1` opts out
+  (same switch as int8). Old float path kept for the fallback, updated to the new packing —
+  full-pipeline **bit-identical** to the old kernel under `QWEN_NO_SDOT=1` (seed-42 wav cmp).
+  Measured on Oracle 4-core Neoverse-N1 (0.6B-base, seed 42, ryan, EN, `--int4 -j4 --stream
+  --stream-chunk 150`, 3 runs): Talker 50.7→**~18.7 ms/f (2.7×)**, CP 139→**~43.2 ms/f (3.2×)**;
+  same-session int8 = 18.2 + 50.9 ms/f → **int4 total ~62 vs int8 ~69 ms/f, RTF ~1.63 vs 1.71** —
+  int4 finally BEATS int8 end-to-end. `--self-test` extended with a q4_0-vs-f32-reference case
+  (SDOT rel_L2 ~4e-3, fallback ~1e-7, argmax exact on all 3 shapes).
+  - Caveats: (a) Talker is now at int8 parity (~18.7 vs 18.2), not 2× faster — at h=1024 the
+    decode+scale work per byte makes q4 compute-bound where int8 SDOT streams; the win is all CP.
+    (b) int8-x on the q4 **lm_heads** (unlike int8, which keeps them f32 per the 2026-06-04
+    refutation) plus per-block rounding forks the greedy trajectory (seed-42 EOS 83→87 frames) —
+    audio sounds equivalent but **quality must be A/B-approved before deploying to the services**.
 
 > ⚠️ **SDOT is ARM-only (`vdotq_s32`).** Its x86 equivalents are now WRITTEN (2026-06-04):
 > the **AVX2 int8/bf16 matvec twins** (`#elif __AVX2__`, validated on the Ryzen box — see 21.3)

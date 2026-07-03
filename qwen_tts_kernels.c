@@ -1370,10 +1370,13 @@ void qwen_quantize_bf16_to_q4_0(const uint16_t *src_bf16, int rows, int cols,
             dst_row[b].scale = s;
             float inv_s = (s > 0) ? 1.0f / s : 0.0f;
 
-            /* Quantize: round to [-8, 7], store as unsigned [0, 15] */
+            /* Quantize: round to [-8, 7], store as unsigned [0, 15].
+             * DEINTERLEAVED packing: lo nibbles = weights 0-15, hi nibbles =
+             * weights 16-31, so SIMD unpack (and 0x0F / shr 4) yields two
+             * vectors already in natural order — no zip/interleave needed. */
             for (int i = 0; i < 16; i++) {
-                int lo = (int)roundf(vals[2*i] * inv_s);
-                int hi = (int)roundf(vals[2*i+1] * inv_s);
+                int lo = (int)roundf(vals[i] * inv_s);
+                int hi = (int)roundf(vals[i + 16] * inv_s);
                 lo = lo < -8 ? -8 : (lo > 7 ? 7 : lo);
                 hi = hi < -8 ? -8 : (hi > 7 ? 7 : hi);
                 dst_row[b].qs[i] = (uint8_t)((lo + 8) | ((hi + 8) << 4));
@@ -1395,41 +1398,36 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
             const uint8_t *qs = row[b].qs;
             const float *xb = x + b * Q4_0_BLOCK_SIZE;
 
-            /* Load 16 bytes = 32 nibbles */
+            /* Load 16 bytes = 32 nibbles. DEINTERLEAVED layout:
+             * lo nibbles = weights 0-15, hi nibbles = weights 16-31 (natural order). */
             uint8x16_t raw = vld1q_u8(qs);
             uint8x16_t lo_nibble = vandq_u8(raw, vdupq_n_u8(0x0F));
             uint8x16_t hi_nibble = vshrq_n_u8(raw, 4);
 
-            /* Interleave: [lo0,hi0,lo1,hi1,...] to get 32 values in order */
             /* Convert to signed: subtract 8 */
-            int16x8_t s0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(lo_nibble), vdup_n_u8(8)));
-            int16x8_t s1 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(hi_nibble), vdup_n_u8(8)));
-            int16x8_t s2 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(lo_nibble), vdup_n_u8(8)));
-            int16x8_t s3 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(hi_nibble), vdup_n_u8(8)));
-
-            /* s0 has lo[0..7], s1 has hi[0..7] — need to zip them:
-             * [lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3] and [lo4,hi4,...,lo7,hi7] */
-            int16x8x2_t z0 = vzipq_s16(s0, s1);  /* z0.val[0]=[lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3] */
-            int16x8x2_t z1 = vzipq_s16(s2, s3);  /* z1.val[0]=[lo8,hi8,lo9,hi9,...] */
+            int16x8_t s0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(lo_nibble), vdup_n_u8(8)));   /* w0-7 */
+            int16x8_t s1 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(lo_nibble), vdup_n_u8(8)));  /* w8-15 */
+            int16x8_t s2 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(hi_nibble), vdup_n_u8(8)));   /* w16-23 */
+            int16x8_t s3 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(hi_nibble), vdup_n_u8(8)));  /* w24-31 */
 
             /* Convert to f32 and FMA with x — 8 groups of 4 */
             float32x4_t vscale = vdupq_n_f32(scale);
             float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
             float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
 
-            float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[0])));
-            float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[0])));
-            float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[1])));
-            float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[1])));
+            float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0)));
+            float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0)));
+            float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1)));
+            float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1)));
             acc0 = vfmaq_f32(acc0, vmulq_f32(f0, vscale), vld1q_f32(xb));
             acc1 = vfmaq_f32(acc1, vmulq_f32(f1, vscale), vld1q_f32(xb + 4));
             acc2 = vfmaq_f32(acc2, vmulq_f32(f2, vscale), vld1q_f32(xb + 8));
             acc3 = vfmaq_f32(acc3, vmulq_f32(f3, vscale), vld1q_f32(xb + 12));
 
-            float32x4_t f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[0])));
-            float32x4_t f5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[0])));
-            float32x4_t f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[1])));
-            float32x4_t f7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[1])));
+            float32x4_t f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s2)));
+            float32x4_t f5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s2)));
+            float32x4_t f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s3)));
+            float32x4_t f7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s3)));
             acc0 = vfmaq_f32(acc0, vmulq_f32(f4, vscale), vld1q_f32(xb + 16));
             acc1 = vfmaq_f32(acc1, vmulq_f32(f5, vscale), vld1q_f32(xb + 20));
             acc2 = vfmaq_f32(acc2, vmulq_f32(f6, vscale), vld1q_f32(xb + 24));
@@ -1449,9 +1447,9 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
             __m128i raw = _mm_loadu_si128((const __m128i *)qs);   /* 16 bytes = 32 nibbles */
             __m128i lo = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
             __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
-            /* Interleave to value order [lo0,hi0,lo1,hi1,...] and bias by -8 */
-            __m128i il0 = _mm_sub_epi8(_mm_unpacklo_epi8(lo, hi), _mm_set1_epi8(8));
-            __m128i il1 = _mm_sub_epi8(_mm_unpackhi_epi8(lo, hi), _mm_set1_epi8(8));
+            /* DEINTERLEAVED layout: lo = weights 0-15, hi = weights 16-31; bias by -8 */
+            __m128i il0 = _mm_sub_epi8(lo, _mm_set1_epi8(8));
+            __m128i il1 = _mm_sub_epi8(hi, _mm_set1_epi8(8));
             __m256 vs = _mm256_set1_ps(scale);
             __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(il0));
             __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(il0, 8)));
@@ -1469,16 +1467,88 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
             const uint8_t *qs = row[b].qs;
             const float *xb = x + b * Q4_0_BLOCK_SIZE;
             for (int i = 0; i < 16; i++) {
-                int lo = (int)(qs[i] & 0x0F) - 8;
-                int hi = (int)(qs[i] >> 4) - 8;
-                sum += scale * (float)lo * xb[2*i];
-                sum += scale * (float)hi * xb[2*i+1];
+                int lo = (int)(qs[i] & 0x0F) - 8;   /* weight i */
+                int hi = (int)(qs[i] >> 4) - 8;     /* weight i+16 */
+                sum += scale * (float)lo * xb[i];
+                sum += scale * (float)hi * xb[i + 16];
             }
         }
 #endif
         y[o] = sum;
     }
 }
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/* Q4_0 matvec via SDOT: y[o] = sx * Σ_b scale[o][b] · Σ_k W[o][b][k]·qx[b][k].
+ * The old path unpacked nibbles to int16→int32→f32 and did f32 FMA (~40 instr
+ * per 32 weights); with the deinterleaved packing this is ~10: vand/vshr/2×vsub
+ * to get two int8x16 in natural order, 2 chained vdotq_s32 against the int8
+ * activations, then one cvt+FMA to apply the per-block scale. 2-row fused to
+ * amortize the qx loads (same pattern as int8_matvec_sdot). Activations are
+ * quantized once per call by the dispatcher (quantize_act_int8). */
+static void q4_0_matvec_sdot_inner(float *y, const int8_t *qx, float sx,
+                                   const q4_0_block_t *W, int cols, int out_dim) {
+    int blocks_per_row = cols / Q4_0_BLOCK_SIZE;
+    const uint8x16_t mlo = vdupq_n_u8(0x0F);
+    const int8x16_t v8 = vdupq_n_s8(8);
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const q4_0_block_t *r0 = W + (size_t)o * blocks_per_row;
+        const q4_0_block_t *r1 = r0 + blocks_per_row;
+        float32x4_t fa = vdupq_n_f32(0), fb = vdupq_n_f32(0);
+        for (int b = 0; b < blocks_per_row; b++) {
+            int8x16_t xlo = vld1q_s8(qx + b * Q4_0_BLOCK_SIZE);
+            int8x16_t xhi = vld1q_s8(qx + b * Q4_0_BLOCK_SIZE + 16);
+
+            uint8x16_t raw0 = vld1q_u8(r0[b].qs);
+            int8x16_t w0lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw0, mlo)), v8);
+            int8x16_t w0hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4)), v8);
+            int32x4_t d0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w0lo, xlo), w0hi, xhi);
+            fa = vfmaq_n_f32(fa, vcvtq_f32_s32(d0), r0[b].scale);
+
+            uint8x16_t raw1 = vld1q_u8(r1[b].qs);
+            int8x16_t w1lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw1, mlo)), v8);
+            int8x16_t w1hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw1, 4)), v8);
+            int32x4_t d1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w1lo, xlo), w1hi, xhi);
+            fb = vfmaq_n_f32(fb, vcvtq_f32_s32(d1), r1[b].scale);
+        }
+        y[o]     = vaddvq_f32(fa) * sx;
+        y[o + 1] = vaddvq_f32(fb) * sx;
+    }
+    if (o < out_dim) {
+        const q4_0_block_t *r0 = W + (size_t)o * blocks_per_row;
+        float32x4_t fa = vdupq_n_f32(0);
+        for (int b = 0; b < blocks_per_row; b++) {
+            uint8x16_t raw0 = vld1q_u8(r0[b].qs);
+            int8x16_t w0lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(raw0, mlo)), v8);
+            int8x16_t w0hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(raw0, 4)), v8);
+            int32x4_t d0 = vdotq_s32(vdupq_n_s32(0), w0lo, vld1q_s8(qx + b * Q4_0_BLOCK_SIZE));
+            d0 = vdotq_s32(d0, w0hi, vld1q_s8(qx + b * Q4_0_BLOCK_SIZE + 16));
+            fa = vfmaq_n_f32(fa, vcvtq_f32_s32(d0), r0[b].scale);
+        }
+        y[o] = vaddvq_f32(fa) * sx;
+    }
+}
+
+typedef struct {
+    float *y; const int8_t *qx; float sx; const q4_0_block_t *W; int rows, cols, blocks_per_row;
+} q4_0_sdot_ctx;
+static void q4_0_sdot_task(size_t tid, size_t nt, void *vc) {
+    q4_0_sdot_ctx *c = (q4_0_sdot_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_0_matvec_sdot_inner(c->y + r0, c->qx, c->sx,
+                           c->W + (size_t)r0 * c->blocks_per_row, c->cols, r1 - r0);
+}
+
+/* Shared QWEN_NO_SDOT check (same env var as the int8 path — one switch
+ * disables all native int8-dot kernels for A/B benchmarking). */
+static int q4_sdot_disabled(void) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("QWEN_NO_SDOT"); off = (e && e[0] == '1'); }
+    return off;
+}
+#endif /* __ARM_FEATURE_DOTPROD */
 
 typedef struct {
     float *y; const q4_0_block_t *W; const float *x; int rows, cols, blocks_per_row;
@@ -1493,6 +1563,22 @@ static void q4_0_mv_task(size_t tid, size_t nt, void *vc) {
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
     int nt = g_n_threads;
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* SDOT path: quantize the shared activation x once, then int8×int8 dot
+     * against the unpacked nibbles (same shape as the int8 SDOT dispatch). */
+    enum { QX_MAX = 8192 };
+    if (!q4_sdot_disabled() && cols <= QX_MAX) {
+        int8_t qx_buf[QX_MAX];
+        float sx = quantize_act_int8(qx_buf, x, cols);
+        if (nt > 1 && rows >= 256) {
+            q4_0_sdot_ctx c = { y, qx_buf, sx, W, rows, cols, cols / Q4_0_BLOCK_SIZE };
+            qwen_parallel((size_t)nt, q4_0_sdot_task, &c);
+            return;
+        }
+        q4_0_matvec_sdot_inner(y, qx_buf, sx, W, cols, rows);
+        return;
+    }
+#endif
     if (nt > 1 && rows >= 256) {
         q4_0_mv_ctx c = { y, W, x, rows, cols, cols / Q4_0_BLOCK_SIZE };
         qwen_parallel((size_t)nt, q4_0_mv_task, &c);
@@ -1537,11 +1623,67 @@ static void q4_0_qkv_task(size_t tid, size_t nt, void *vc) {
         }
     }
 }
+#if defined(__ARM_FEATURE_DOTPROD)
+/* SDOT twin of q4_0_qkv_task: same [Q|K|V] row-space partition, int8 activations. */
+typedef struct {
+    float *q, *k, *v;
+    const q4_0_block_t *Wq, *Wk, *Wv;
+    const int8_t *qx; float sx;
+    int in_dim, q_dim, kv_dim, blocks_per_row;
+} q4_0_qkv_sdot_ctx;
+static void q4_0_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
+    q4_0_qkv_sdot_ctx *c = (q4_0_qkv_sdot_ctx *)vc;
+    int total = c->q_dim + 2 * c->kv_dim;
+    int r0 = (int)(tid * (size_t)total / nt);
+    int r1 = (int)((tid + 1) * (size_t)total / nt);
+    for (int r = r0; r < r1; ) {
+        if (r < c->q_dim) {
+            int end = r1 < c->q_dim ? r1 : c->q_dim;
+            q4_0_matvec_sdot_inner(c->q + r, c->qx, c->sx,
+                                   c->Wq + (size_t)r * c->blocks_per_row,
+                                   c->in_dim, end - r);
+            r = end;
+        } else if (r < c->q_dim + c->kv_dim) {
+            int local = r - c->q_dim;
+            int end = r1 < c->q_dim + c->kv_dim ? r1 : c->q_dim + c->kv_dim;
+            int local_end = end - c->q_dim;
+            q4_0_matvec_sdot_inner(c->k + local, c->qx, c->sx,
+                                   c->Wk + (size_t)local * c->blocks_per_row,
+                                   c->in_dim, local_end - local);
+            r = end;
+        } else {
+            int local = r - c->q_dim - c->kv_dim;
+            int local_end = r1 - c->q_dim - c->kv_dim;
+            q4_0_matvec_sdot_inner(c->v + local, c->qx, c->sx,
+                                   c->Wv + (size_t)local * c->blocks_per_row,
+                                   c->in_dim, local_end - local);
+            r = r1;
+        }
+    }
+}
+#endif /* __ARM_FEATURE_DOTPROD */
 void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
     int nt = g_n_threads;
+#if defined(__ARM_FEATURE_DOTPROD)
+    enum { QX_MAX = 8192 };
+    if (!q4_sdot_disabled() && in_dim <= QX_MAX) {
+        int8_t qx_buf[QX_MAX];
+        float sx = quantize_act_int8(qx_buf, x, in_dim);
+        if (nt > 1) {
+            q4_0_qkv_sdot_ctx c = { q, k, v, Wq, Wk, Wv, qx_buf, sx,
+                                    in_dim, q_dim, kv_dim, in_dim / Q4_0_BLOCK_SIZE };
+            qwen_parallel((size_t)nt, q4_0_qkv_sdot_task, &c);
+            return;
+        }
+        q4_0_matvec_sdot_inner(q, qx_buf, sx, Wq, in_dim, q_dim);
+        q4_0_matvec_sdot_inner(k, qx_buf, sx, Wk, in_dim, kv_dim);
+        q4_0_matvec_sdot_inner(v, qx_buf, sx, Wv, in_dim, kv_dim);
+        return;
+    }
+#endif
     if (nt > 1) {
         q4_0_qkv_ctx c = { q, k, v, Wq, Wk, Wv, x, in_dim, q_dim, kv_dim,
                            in_dim / Q4_0_BLOCK_SIZE };
@@ -2346,8 +2488,9 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16, int in_dim, 
  * Cross-ISA correctness proof for the matvec kernels that does NOT depend on a
  * full-pipeline golden — immune to the greedy-decode trajectory fork that makes
  * cross-ISA / cross-precision audio mel-corr drop benignly. Runs each dispatched
- * matvec (bf16 / int8 / argmax-int8) against an independent f32 reference on
- * deterministic pseudo-random data and checks the error is within tolerance.
+ * matvec (bf16 / int8 / argmax-int8 / q4_0 / argmax-q4_0) against an independent
+ * f32 reference on deterministic pseudo-random data and checks the error is
+ * within tolerance.
  *
  * On x86 with SIMD=avx512vnni this exercises the VNNI int8 dot (`_mm512_dpbusd`)
  * and the __m512 bf16 matvec (the two UNVALIDATED AVX-512 paths). On ARM it
@@ -2442,13 +2585,61 @@ int qwen_kernel_selftest(void *out) {
                         (amax_got >= 0 && amax_got < rows &&
                          (amax_val - ref[amax_got]) < 0.02 * (fabs(amax_val) + 1e-3));
 
+        /* ---- q4_0 matvec ---- (reference = f32 dot with exactly-dequantized q4
+         * weights, decoded per the DEINTERLEAVED layout: lo nibbles = weights
+         * 0-15, hi = 16-31 — validates pack+unpack consistency AND the SDOT
+         * kernel in one shot; activation quant makes the same near-zero-per-row
+         * noise as int8, so use the same global L2 metric). */
+        int nblk = cols / Q4_0_BLOCK_SIZE;
+        q4_0_block_t *wq4 = malloc((size_t)rows * nblk * sizeof(q4_0_block_t));
+        double rel_l2_q4 = 1.0;
+        int q4_argmax_ok = 0, q4amax_ref = 0, q4amax_got = -1;
+        if (wq4) {
+            qwen_quantize_bf16_to_q4_0(wb, rows, cols, wq4);
+            for (int r = 0; r < rows; r++) {
+                const q4_0_block_t *row = wq4 + (size_t)r * nblk;
+                float s = 0.0f;
+                for (int b = 0; b < nblk; b++) {
+                    const float *xb = x + b * Q4_0_BLOCK_SIZE;
+                    float bs = 0.0f;
+                    for (int i = 0; i < 16; i++) {
+                        bs += (float)((int)(row[b].qs[i] & 0x0F) - 8) * xb[i];
+                        bs += (float)((int)(row[b].qs[i] >> 4)   - 8) * xb[i + 16];
+                    }
+                    s += row[b].scale * bs;
+                }
+                ref[r] = s;
+            }
+            qwen_matvec_q4_0(y, wq4, x, rows, cols);
+            l2_num = 0.0; l2_den = 0.0;
+            for (int r = 0; r < rows; r++) {
+                double d = (double)y[r] - ref[r];
+                l2_num += d * d;
+                l2_den += (double)ref[r] * ref[r];
+            }
+            rel_l2_q4 = sqrt(l2_num / (l2_den + 1e-12));
+
+            float q4amax_val = ref[0];
+            for (int r = 1; r < rows; r++)
+                if (ref[r] > q4amax_val) { q4amax_val = ref[r]; q4amax_ref = r; }
+            q4amax_got = qwen_argmax_matvec_q4_0(x, wq4, cols, rows);
+            q4_argmax_ok = (q4amax_got == q4amax_ref) ||
+                           (q4amax_got >= 0 && q4amax_got < rows &&
+                            (q4amax_val - ref[q4amax_got]) < 0.02 * (fabs(q4amax_val) + 1e-3));
+            free(wq4);
+        }
+
         int bf16_ok = max_rel_bf16 < 1e-2;   /* bf16: only fp accumulation-order drift */
         int i8_ok   = rel_l2_i8    < 3e-2;   /* int8: activation-quant noise (~0.7% expected) */
-        if (!bf16_ok || !i8_ok || !argmax_ok) failures++;
-        fprintf(f, "  [%4dx%-4d] bf16 max_rel=%.2e %s | int8 rel_L2=%.2e %s | argmax %s (ref=%d got=%d)\n",
+        int q4_ok   = rel_l2_q4    < 3e-2;   /* q4_0: same activation-quant noise on SDOT */
+        if (!bf16_ok || !i8_ok || !argmax_ok || !q4_ok || !q4_argmax_ok) failures++;
+        fprintf(f, "  [%4dx%-4d] bf16 max_rel=%.2e %s | int8 rel_L2=%.2e %s | argmax %s (ref=%d got=%d)\n"
+                   "             q4_0 rel_L2=%.2e %s | q4 argmax %s (ref=%d got=%d)\n",
                 rows, cols, max_rel_bf16, bf16_ok ? "OK" : "FAIL",
                 rel_l2_i8, i8_ok ? "OK" : "FAIL",
-                argmax_ok ? "OK" : "FAIL", amax_ref, amax_got);
+                argmax_ok ? "OK" : "FAIL", amax_ref, amax_got,
+                rel_l2_q4, q4_ok ? "OK" : "FAIL",
+                q4_argmax_ok ? "OK" : "FAIL", q4amax_ref, q4amax_got);
 
         free(x); free(wf); free(wb); free(wi); free(sc); free(ref); free(y);
     }

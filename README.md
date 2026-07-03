@@ -95,7 +95,7 @@ Optional:
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
   --int8                     INT8 quantized (0.6B & 1.7B; faster, ~same quality) — recommended; uses VNNI on AVX-512 x86, SDOT on ARM
-  --int4                     Q4_0 quantized (experimental; slower than --int8 on CPU)
+  --int4                     Q4_0 quantized (SDOT kernel on ARM: faster than --int8; quality validation pending)
   -j, --threads <n>          Worker threads (default: 4)
   --silent                   Suppress status output
   --debug                    Verbose diagnostics

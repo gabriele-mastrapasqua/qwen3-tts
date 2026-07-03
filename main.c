@@ -422,7 +422,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --delete-voice <path>      Delete a .qvoice file\n");
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 30, 0=all)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
-                fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
+                fprintf(stderr, "  --int4                     Q4_0 quantized Talker + Code Predictor (SDOT on ARM: faster than --int8)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 fprintf(stderr, "  --caps                     Print compiled SIMD/threading capabilities and exit\n");
