@@ -50,6 +50,19 @@ __global__ void k_matvec_bf16(const __nv_bfloat16 *W, const float *x, float *y, 
     if (threadIdx.x == 0) y[row] = red[0];
 }
 
+/* y[rows] = diag(scale) · (W_int8[rows,cols] @ x[cols]).  int8 weight (1 byte, half of bf16) ×
+ * f32 activation, per-row scale. Bandwidth-optimal for the decode; keeps the activation f32. */
+__global__ void k_matvec_int8(const int8_t *W, const float *scale, const float *x, float *y, int rows, int cols) {
+    int row = blockIdx.x; if (row >= rows) return;
+    const int8_t *wr = W + (size_t)row * cols;
+    extern __shared__ float red[];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) s += (float)wr[i] * x[i];
+    red[threadIdx.x] = s; __syncthreads();
+    for (int st = blockDim.x/2; st > 0; st >>= 1) { if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x+st]; __syncthreads(); }
+    if (threadIdx.x == 0) y[row] = scale[row] * red[0];
+}
+
 __global__ void k_rmsnorm_full(const float *x, const float *w, float *y, int dim, float eps) {
     extern __shared__ float part[];
     int tid = threadIdx.x, tc = blockDim.x;
@@ -132,8 +145,9 @@ __global__ void k_attn(const float *Q, const float *K, const float *V, float *O,
 typedef struct {
     int hidden, q_dim, kv_dim, inter, n_heads, n_kv, head_dim, n_layers, kv_max;
     float eps;
-    __nv_bfloat16 **wq,**wk,**wv,**wo,**wgu,**wdn;   /* resident bf16 weights, per layer */
-    float **inorm,**pnorm,**qn,**kn;                 /* f32 norms, per layer */
+    void **wq,**wk,**wv,**wo,**wgu,**wdn;             /* resident weights (bf16 or int8), per layer */
+    float **wqs,**wks,**wvs,**wos,**wgus,**wdns;      /* per-row scales (NULL = bf16) */
+    float **inorm,**pnorm,**qn,**kn;                  /* f32 norms, per layer */
     float *tnorm, *rope_cos, *rope_sin;
     float *kcache,*vcache;                           /* [n_layers*kv_max*kv_dim] f32 */
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;     /* work buffers */
@@ -144,10 +158,23 @@ static __nv_bfloat16 *up_bf16(const uint16_t *w, size_t n) {
     CK(cudaMemcpy(d,w,n*sizeof(uint16_t),cudaMemcpyHostToDevice));  /* bf16 bits == uint16 bits */
     return d;
 }
+static int8_t *up_int8(const int8_t *w, size_t n) {
+    int8_t *d=NULL; CK(cudaMalloc(&d,n*sizeof(int8_t)));
+    CK(cudaMemcpy(d,w,n*sizeof(int8_t),cudaMemcpyHostToDevice)); return d;
+}
 static float *up_f32(const float *w, size_t n) {
     float *d=NULL; CK(cudaMalloc(&d,n*sizeof(float)));
     CK(cudaMemcpy(d,w,n*sizeof(float),cudaMemcpyHostToDevice)); return d;
 }
+/* dispatch: scale!=NULL → int8 weight path; else bf16. */
+static inline void mv(const void *W, const float *scale, const float *dX, float *dY, int rows, int cols) {
+    if (scale) k_matvec_int8<<<rows,TPB,TPB*sizeof(float)>>>((const int8_t*)W, scale, dX, dY, rows, cols);
+    else       k_matvec_bf16<<<rows,TPB,TPB*sizeof(float)>>>((const __nv_bfloat16*)W, dX, dY, rows, cols);
+}
+/* per-weight upload: prefer int8 (half the bytes of bf16) when the engine quantized it. */
+#define UPW(dst, dsts, w8, w8s, wbf, n, rows) do { \
+    if (w8) { (dst)=up_int8((w8),(n)); (dsts)=up_f32((w8s),(rows)); } \
+    else    { (dst)=up_bf16((wbf),(n)); (dsts)=NULL; } } while(0)
 
 extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c=&ctx->config;
@@ -157,20 +184,25 @@ extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     s->q_dim=c->num_heads*c->head_dim; s->kv_dim=c->num_kv_heads*c->head_dim;
     s->eps=c->rms_norm_eps; s->kv_max=ctx->kv_max;
     int L=s->n_layers, H=s->hidden, hd=s->head_dim, half=hd/2;
-    s->wq=(__nv_bfloat16**)calloc(L,sizeof(void*)); s->wk=(__nv_bfloat16**)calloc(L,sizeof(void*));
-    s->wv=(__nv_bfloat16**)calloc(L,sizeof(void*)); s->wo=(__nv_bfloat16**)calloc(L,sizeof(void*));
-    s->wgu=(__nv_bfloat16**)calloc(L,sizeof(void*)); s->wdn=(__nv_bfloat16**)calloc(L,sizeof(void*));
+    s->wq=(void**)calloc(L,sizeof(void*)); s->wk=(void**)calloc(L,sizeof(void*));
+    s->wv=(void**)calloc(L,sizeof(void*)); s->wo=(void**)calloc(L,sizeof(void*));
+    s->wgu=(void**)calloc(L,sizeof(void*)); s->wdn=(void**)calloc(L,sizeof(void*));
+    s->wqs=(float**)calloc(L,sizeof(float*)); s->wks=(float**)calloc(L,sizeof(float*));
+    s->wvs=(float**)calloc(L,sizeof(float*)); s->wos=(float**)calloc(L,sizeof(float*));
+    s->wgus=(float**)calloc(L,sizeof(float*)); s->wdns=(float**)calloc(L,sizeof(float*));
     s->inorm=(float**)calloc(L,sizeof(float*)); s->pnorm=(float**)calloc(L,sizeof(float*));
     s->qn=(float**)calloc(L,sizeof(float*)); s->kn=(float**)calloc(L,sizeof(float*));
+    int used_int8=0;
     for (int l=0;l<L;++l){
         qwen_talker_layer_t *ly=&ctx->layers[l];
-        if (!ly->wq_bf16 || !ly->gate_up_fused_bf16){ fprintf(stderr,"CUDA talker: layer %d not bf16 (int8/q4 unsupported in M1)\n",l); return NULL; }
-        s->wq[l]=up_bf16(ly->wq_bf16,(size_t)s->q_dim*H);
-        s->wk[l]=up_bf16(ly->wk_bf16,(size_t)s->kv_dim*H);
-        s->wv[l]=up_bf16(ly->wv_bf16,(size_t)s->kv_dim*H);
-        s->wo[l]=up_bf16(ly->wo_bf16,(size_t)H*s->q_dim);
-        s->wgu[l]=up_bf16(ly->gate_up_fused_bf16,(size_t)2*s->inter*H);
-        s->wdn[l]=up_bf16(ly->down_bf16,(size_t)H*s->inter);
+        if (!ly->wq_bf16 && !ly->wq_int8){ fprintf(stderr,"CUDA talker: layer %d has no bf16/int8 weights\n",l); return NULL; }
+        UPW(s->wq[l], s->wqs[l], ly->wq_int8, ly->wq_scale, ly->wq_bf16, (size_t)s->q_dim*H, s->q_dim);
+        UPW(s->wk[l], s->wks[l], ly->wk_int8, ly->wk_scale, ly->wk_bf16, (size_t)s->kv_dim*H, s->kv_dim);
+        UPW(s->wv[l], s->wvs[l], ly->wv_int8, ly->wv_scale, ly->wv_bf16, (size_t)s->kv_dim*H, s->kv_dim);
+        UPW(s->wo[l], s->wos[l], ly->wo_int8, ly->wo_scale, ly->wo_bf16, (size_t)H*s->q_dim, H);
+        UPW(s->wgu[l],s->wgus[l],ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_bf16, (size_t)2*s->inter*H, 2*s->inter);
+        UPW(s->wdn[l],s->wdns[l],ly->down_int8, ly->down_scale, ly->down_bf16, (size_t)H*s->inter, H);
+        if (ly->wq_int8) used_int8=1;
         s->inorm[l]=up_f32(ly->input_norm,H); s->pnorm[l]=up_f32(ly->post_attn_norm,H);
         s->qn[l]=up_f32(ly->q_norm,hd); s->kn[l]=up_f32(ly->k_norm,hd);
     }
@@ -184,13 +216,10 @@ extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     CK(cudaMalloc(&s->v,s->kv_dim*sizeof(float))); CK(cudaMalloc(&s->attn,s->q_dim*sizeof(float)));
     CK(cudaMalloc(&s->proj,H*sizeof(float))); CK(cudaMalloc(&s->gate,s->inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)2*s->inter*sizeof(float)));
-    fprintf(stderr,"CUDA talker: resident fused step ready (%d layers, hidden=%d, bf16 weights)\n",L,H);
+    fprintf(stderr,"CUDA talker: resident fused step ready (%d layers, hidden=%d, %s weights)\n",L,H,used_int8?"int8":"bf16");
     return s;
 }
 
-static inline void mv(const __nv_bfloat16 *dW, const float *dX, float *dY, int rows, int cols) {
-    k_matvec_bf16<<<rows, TPB, TPB*sizeof(float)>>>(dW, dX, dY, rows, cols);
-}
 
 extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidden_out, int pos) {
     cuda_talker_t *s=(cuda_talker_t*)st;
@@ -200,9 +229,9 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
     CK(cudaMemcpy(s->x,embed,H*sizeof(float),cudaMemcpyHostToDevice));
     for (int l=0;l<s->n_layers;++l){
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
-        mv(s->wq[l],s->xn,s->q,qd,H);
-        mv(s->wk[l],s->xn,s->k,kvd,H);
-        mv(s->wv[l],s->xn,s->v,kvd,H);
+        mv(s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
+        mv(s->wk[l],s->wks[l],s->xn,s->k,kvd,H);
+        mv(s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
         k_rmsnorm_ph<<<nh, TPB, TPB*sizeof(float)>>>(s->q,s->qn[l],hd,s->eps);
         k_rmsnorm_ph<<<nkv,TPB, TPB*sizeof(float)>>>(s->k,s->kn[l],hd,s->eps);
         const float *cosp=s->rope_cos+(size_t)pos*half, *sinp=s->rope_sin+(size_t)pos*half;
@@ -216,12 +245,12 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
         CK(cudaMemcpyAsync(vc,s->v,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
         float *Kl=s->kcache+(size_t)l*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*s->kv_max*kvd;
         k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,pos+1,nh,nkv,hd,scale,pos);
-        mv(s->wo[l],s->attn,s->proj,H,qd);
+        mv(s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
-        mv(s->wgu[l],s->xn,s->gu,2*inter,H);
+        mv(s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H);
         k_swiglu_il<<<CEIL(inter,TPB),TPB>>>(s->gu,s->gate,inter);
-        mv(s->wdn[l],s->gate,s->proj,H,inter);
+        mv(s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
     k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->tnorm,s->xn,H,s->eps);
@@ -255,7 +284,8 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
 typedef struct {
     int hidden, q_dim, kv_dim, inter, n_heads, n_kv, head_dim, n_layers, kv_max;
     float eps;
-    __nv_bfloat16 **wq,**wk,**wv,**wo,**wgu,**wdn;
+    void **wq,**wk,**wv,**wo,**wgu,**wdn;            /* bf16 or int8 */
+    float **wqs,**wks,**wvs,**wos,**wgus,**wdns;     /* per-row scales (NULL = bf16) */
     float **inorm,**pnorm,**qn,**kn;
     float *rope_cos,*rope_sin;
     float *kcache,*vcache;
@@ -270,20 +300,25 @@ extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
     s->q_dim=c->cp_num_heads*c->cp_head_dim; s->kv_dim=c->cp_num_kv_heads*c->cp_head_dim;
     s->eps=c->rms_norm_eps; s->kv_max=ctx->cp_kv_max;
     int L=s->n_layers, H=s->hidden, hd=s->head_dim, half=hd/2;
-    s->wq=(__nv_bfloat16**)calloc(L,sizeof(void*)); s->wk=(__nv_bfloat16**)calloc(L,sizeof(void*));
-    s->wv=(__nv_bfloat16**)calloc(L,sizeof(void*)); s->wo=(__nv_bfloat16**)calloc(L,sizeof(void*));
-    s->wgu=(__nv_bfloat16**)calloc(L,sizeof(void*)); s->wdn=(__nv_bfloat16**)calloc(L,sizeof(void*));
+    s->wq=(void**)calloc(L,sizeof(void*)); s->wk=(void**)calloc(L,sizeof(void*));
+    s->wv=(void**)calloc(L,sizeof(void*)); s->wo=(void**)calloc(L,sizeof(void*));
+    s->wgu=(void**)calloc(L,sizeof(void*)); s->wdn=(void**)calloc(L,sizeof(void*));
+    s->wqs=(float**)calloc(L,sizeof(float*)); s->wks=(float**)calloc(L,sizeof(float*));
+    s->wvs=(float**)calloc(L,sizeof(float*)); s->wos=(float**)calloc(L,sizeof(float*));
+    s->wgus=(float**)calloc(L,sizeof(float*)); s->wdns=(float**)calloc(L,sizeof(float*));
     s->inorm=(float**)calloc(L,sizeof(float*)); s->pnorm=(float**)calloc(L,sizeof(float*));
     s->qn=(float**)calloc(L,sizeof(float*)); s->kn=(float**)calloc(L,sizeof(float*));
+    int used_int8=0;
     for (int l=0;l<L;++l){
         qwen_cp_layer_t *ly=&ctx->cp_layers[l];
-        if (!ly->wq_bf16 || !ly->gate_up_fused_bf16){ fprintf(stderr,"CUDA CP: layer %d not bf16\n",l); return NULL; }
-        s->wq[l]=up_bf16(ly->wq_bf16,(size_t)s->q_dim*H);
-        s->wk[l]=up_bf16(ly->wk_bf16,(size_t)s->kv_dim*H);
-        s->wv[l]=up_bf16(ly->wv_bf16,(size_t)s->kv_dim*H);
-        s->wo[l]=up_bf16(ly->wo_bf16,(size_t)H*s->q_dim);
-        s->wgu[l]=up_bf16(ly->gate_up_fused_bf16,(size_t)2*s->inter*H);
-        s->wdn[l]=up_bf16(ly->down_bf16,(size_t)H*s->inter);
+        if (!ly->wq_bf16 && !ly->wq_int8){ fprintf(stderr,"CUDA CP: layer %d has no bf16/int8 weights\n",l); return NULL; }
+        UPW(s->wq[l], s->wqs[l], ly->wq_int8, ly->wq_scale, ly->wq_bf16, (size_t)s->q_dim*H, s->q_dim);
+        UPW(s->wk[l], s->wks[l], ly->wk_int8, ly->wk_scale, ly->wk_bf16, (size_t)s->kv_dim*H, s->kv_dim);
+        UPW(s->wv[l], s->wvs[l], ly->wv_int8, ly->wv_scale, ly->wv_bf16, (size_t)s->kv_dim*H, s->kv_dim);
+        UPW(s->wo[l], s->wos[l], ly->wo_int8, ly->wo_scale, ly->wo_bf16, (size_t)H*s->q_dim, H);
+        UPW(s->wgu[l],s->wgus[l],ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_bf16, (size_t)2*s->inter*H, 2*s->inter);
+        UPW(s->wdn[l],s->wdns[l],ly->down_int8, ly->down_scale, ly->down_bf16, (size_t)H*s->inter, H);
+        if (ly->wq_int8) used_int8=1;
         s->inorm[l]=up_f32(ly->input_norm,H); s->pnorm[l]=up_f32(ly->post_attn_norm,H);
         s->qn[l]=up_f32(ly->q_norm,hd); s->kn[l]=up_f32(ly->k_norm,hd);
     }
@@ -296,7 +331,7 @@ extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
     CK(cudaMalloc(&s->v,s->kv_dim*sizeof(float))); CK(cudaMalloc(&s->attn,s->q_dim*sizeof(float)));
     CK(cudaMalloc(&s->proj,H*sizeof(float))); CK(cudaMalloc(&s->gate,s->inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)2*s->inter*sizeof(float)));
-    fprintf(stderr,"CUDA CP: resident fused step ready (%d layers, hidden=%d, bf16)\n",L,H);
+    fprintf(stderr,"CUDA CP: resident fused step ready (%d layers, hidden=%d, %s)\n",L,H,used_int8?"int8":"bf16");
     return s;
 }
 
@@ -309,9 +344,9 @@ extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
     CK(cudaMemcpy(s->x,x,H*sizeof(float),cudaMemcpyHostToDevice));
     for (int l=0;l<s->n_layers;++l){
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
-        mv(s->wq[l],s->xn,s->q,qd,H);
-        mv(s->wk[l],s->xn,s->k,kvd,H);
-        mv(s->wv[l],s->xn,s->v,kvd,H);
+        mv(s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
+        mv(s->wk[l],s->wks[l],s->xn,s->k,kvd,H);
+        mv(s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
         k_rmsnorm_ph<<<nh, TPB, TPB*sizeof(float)>>>(s->q,s->qn[l],hd,s->eps);
         k_rmsnorm_ph<<<nkv,TPB, TPB*sizeof(float)>>>(s->k,s->kn[l],hd,s->eps);
         const float *cosp=s->rope_cos+(size_t)pos*half, *sinp=s->rope_sin+(size_t)pos*half;
@@ -325,12 +360,12 @@ extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
         CK(cudaMemcpyAsync(vc,s->v,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
         float *Kl=s->kcache+(size_t)l*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*s->kv_max*kvd;
         k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,pos+1,nh,nkv,hd,scale,pos);
-        mv(s->wo[l],s->attn,s->proj,H,qd);
+        mv(s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
-        mv(s->wgu[l],s->xn,s->gu,2*inter,H);
+        mv(s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H);
         k_swiglu_il<<<CEIL(inter,TPB),TPB>>>(s->gu,s->gate,inter);
-        mv(s->wdn[l],s->gate,s->proj,H,inter);
+        mv(s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
     CK(cudaDeviceSynchronize());
@@ -341,8 +376,10 @@ extern "C" void qwen_cuda_cp_free(void *st) {
     cuda_cp_t *s=(cuda_cp_t*)st; if(!s) return;
     for(int l=0;l<s->n_layers;++l){ cudaFree(s->wq[l]);cudaFree(s->wk[l]);cudaFree(s->wv[l]);
         cudaFree(s->wo[l]);cudaFree(s->wgu[l]);cudaFree(s->wdn[l]);cudaFree(s->inorm[l]);
-        cudaFree(s->pnorm[l]);cudaFree(s->qn[l]);cudaFree(s->kn[l]); }
+        cudaFree(s->pnorm[l]);cudaFree(s->qn[l]);cudaFree(s->kn[l]);
+        cudaFree(s->wqs[l]);cudaFree(s->wks[l]);cudaFree(s->wvs[l]);cudaFree(s->wos[l]);cudaFree(s->wgus[l]);cudaFree(s->wdns[l]); }
     free(s->wq);free(s->wk);free(s->wv);free(s->wo);free(s->wgu);free(s->wdn);
+    free(s->wqs);free(s->wks);free(s->wvs);free(s->wos);free(s->wgus);free(s->wdns);
     free(s->inorm);free(s->pnorm);free(s->qn);free(s->kn);
     cudaFree(s->rope_cos);cudaFree(s->rope_sin);cudaFree(s->kcache);cudaFree(s->vcache);
     cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);cudaFree(s->k);cudaFree(s->v);
@@ -354,8 +391,10 @@ extern "C" void qwen_cuda_talker_free(void *st) {
     cuda_talker_t *s=(cuda_talker_t*)st; if(!s) return;
     for(int l=0;l<s->n_layers;++l){ cudaFree(s->wq[l]);cudaFree(s->wk[l]);cudaFree(s->wv[l]);
         cudaFree(s->wo[l]);cudaFree(s->wgu[l]);cudaFree(s->wdn[l]);cudaFree(s->inorm[l]);
-        cudaFree(s->pnorm[l]);cudaFree(s->qn[l]);cudaFree(s->kn[l]); }
+        cudaFree(s->pnorm[l]);cudaFree(s->qn[l]);cudaFree(s->kn[l]);
+        cudaFree(s->wqs[l]);cudaFree(s->wks[l]);cudaFree(s->wvs[l]);cudaFree(s->wos[l]);cudaFree(s->wgus[l]);cudaFree(s->wdns[l]); }
     free(s->wq);free(s->wk);free(s->wv);free(s->wo);free(s->wgu);free(s->wdn);
+    free(s->wqs);free(s->wks);free(s->wvs);free(s->wos);free(s->wgus);free(s->wdns);
     free(s->inorm);free(s->pnorm);free(s->qn);free(s->kn);
     cudaFree(s->tnorm);cudaFree(s->rope_cos);cudaFree(s->rope_sin);cudaFree(s->kcache);cudaFree(s->vcache);
     cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);cudaFree(s->k);cudaFree(s->v);
