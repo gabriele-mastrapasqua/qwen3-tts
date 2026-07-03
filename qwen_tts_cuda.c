@@ -38,6 +38,11 @@ void  qwen_cuda_matmat_bf16(void *ctx, float *Y, const uint16_t *W,
                             const float *X, int rows, int cols, int B) {
     (void)ctx; (void)Y; (void)W; (void)X; (void)rows; (void)cols; (void)B;
 }
+int g_cuda_decoder_on = 0;
+void qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,float alpha,const float *A,int lda,
+                        const float *B,int ldb,float beta,float *C,int ldc) {
+    (void)transA;(void)transB;(void)M;(void)N;(void)K;(void)alpha;(void)A;(void)lda;(void)B;(void)ldb;(void)beta;(void)C;(void)ldc;
+}
 
 #else /* QWEN_HAVE_CUDA */
 
@@ -132,6 +137,40 @@ void qwen_cuda_matmat_bf16(void *ctx, float *Y, const uint16_t *W,
 void qwen_cuda_matvec_bf16(void *ctx, float *y, const uint16_t *W,
                            const float *x, int rows, int cols) {
     qwen_cuda_matmat_bf16(ctx, y, W, x, rows, cols, 1);
+}
+
+/* ── Speech-decoder cuBLAS sgemm (M3) ──────────────────────────────────────
+ * Drop-in for the decoder's cblas_sgemm (RowMajor): its convs are im2col+sgemm on LONG
+ * upsampled sequences = big matmuls = the compute-bound 40× cuBLAS regime (unlike the
+ * matvec decode). Reusable device buffers (no per-call alloc). beta==0 in the decoder
+ * (overwrite). Row-major identity: cblas(RowMajor,opA,opB,M,N,K,A,B,C) == cublas(opB,opA,
+ * N,M,K,B,A,C) with dC col-major[N,M] == row-major[M,N]. Own handle+stream (the decoder
+ * thread runs concurrently with the Talker/CP handle). */
+int g_cuda_decoder_on = 0;
+
+static cublasHandle_t g_sd_handle = NULL;
+static float *g_sdA=NULL,*g_sdB=NULL,*g_sdC=NULL,*g_sdCT=NULL;
+static size_t g_sdA_cap=0,g_sdB_cap=0,g_sdC_cap=0,g_sdCT_cap=0;
+static float *sd_grow(float **buf,size_t *cap,size_t need){ if(*cap<need){ if(*buf)cudaFree(*buf); if(cudaMalloc((void**)buf,need*sizeof(float))!=cudaSuccess){*buf=NULL;*cap=0;return NULL;} *cap=need; } return *buf; }
+
+void qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,
+                        float alpha,const float *A,int lda,const float *B,int ldb,
+                        float beta,float *C,int ldc) {
+    if (!g_sd_handle) { if (cublasCreate(&g_sd_handle)!=CUBLAS_STATUS_SUCCESS){ g_cuda_decoder_on=0; return; } }
+    size_t Asz=(size_t)(transA?K:M)*lda, Bsz=(size_t)(transB?N:K)*ldb, Csz=(size_t)M*N;
+    float *dA=sd_grow(&g_sdA,&g_sdA_cap,Asz), *dB=sd_grow(&g_sdB,&g_sdB_cap,Bsz), *dC=sd_grow(&g_sdC,&g_sdC_cap,Csz);
+    if(!dA||!dB||!dC) return;
+    cudaMemcpy(dA,A,Asz*sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(dB,B,Bsz*sizeof(float),cudaMemcpyHostToDevice);
+    cublasOperation_t oa=transA?CUBLAS_OP_T:CUBLAS_OP_N, ob=transB?CUBLAS_OP_T:CUBLAS_OP_N;
+    cublasSgemm(g_sd_handle, ob, oa, N, M, K, &alpha, dB, ldb, dA, lda, &beta, dC, N);  /* dC col-major[N,M]=row-major[M,N] */
+    if (ldc==N) {
+        cudaMemcpy(C,dC,Csz*sizeof(float),cudaMemcpyDeviceToHost);
+    } else {
+        float *t=sd_grow(&g_sdCT,&g_sdCT_cap,Csz); if(!t) return;
+        cudaMemcpy(t,dC,Csz*sizeof(float),cudaMemcpyDeviceToHost);
+        for(int m=0;m<M;m++) memcpy(C+(size_t)m*ldc, t+(size_t)m*N, (size_t)N*sizeof(float));  /* scatter to strided C */
+    }
 }
 
 #endif /* QWEN_HAVE_CUDA */

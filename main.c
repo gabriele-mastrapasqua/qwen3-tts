@@ -1453,6 +1453,12 @@ int main(int argc, char **argv) {
                 if (g_cuda_talker_state && g_cuda_cp_state)
                     fprintf(stderr, "GPU fused Talker+CP steps ENABLED (resident, 1 sync/step each)\n");
             }
+            /* M3: route the Speech-decoder convs to cuBLAS (big matmuls) — QWEN_CUDA_DECODER=1. */
+            if (bk == QWEN_BACKEND_CUDA && getenv("QWEN_CUDA_DECODER")) {
+                extern int g_cuda_decoder_on;
+                g_cuda_decoder_on = 1;
+                fprintf(stderr, "GPU Speech-decoder convs via cuBLAS ENABLED\n");
+            }
 #endif
         }
     }
