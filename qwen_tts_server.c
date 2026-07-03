@@ -419,10 +419,15 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
             text, ctx->speaker_id, ctx->language_id, ctx->seed);
     double t0 = server_time_ms();
 
-    /* Set up streaming */
+    /* Set up streaming. Default 50 frames/chunk: fewer chunk boundaries mean less
+     * decoder context recompute (benchmarked ~13% faster total than 10 on 4-core N1);
+     * TTFA is unaffected because the decoder always ramps with a small first chunk. */
     stream_http_state_t state = { .fd = fd, .total_samples = 0 };
     ctx->stream = 1;
-    ctx->stream_chunk_frames = 10;
+    int chunk_frames = (int)json_extract_number(body, "chunk_frames", 50);
+    if (chunk_frames < 2)   chunk_frames = 2;
+    if (chunk_frames > 250) chunk_frames = 250;
+    ctx->stream_chunk_frames = chunk_frames;
     qwen_tts_set_audio_callback(ctx, stream_http_callback, &state);
 
     /* Send chunked response header */
