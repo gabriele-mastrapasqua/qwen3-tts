@@ -160,6 +160,16 @@ int qwen_parallel_is_reentrant(void) { return 0; }
 #include <stdatomic.h>
 #include <stdlib.h>
 
+/* Hybrid spin-then-sleep pool. During the token loop, qwen_parallel dispatches
+ * arrive back-to-back (hundreds per frame), and pure condvar handoff costs a
+ * futex round-trip per dispatch — measured ~7300 futex calls per generated
+ * frame on a 4-core Neoverse-N1. Workers therefore spin briefly for the next
+ * job before sleeping, and the dispatcher only touches the condvar when a
+ * worker is actually asleep. Chunk claiming stays dynamic, so outputs are
+ * bit-identical to the sleeping pool. */
+
+#define QWEN_POOL_SPIN 8192   /* yield iterations (~40-80us) before sleeping */
+
 typedef struct {
     qwen_task_fn fn;
     void *ctx;
@@ -171,14 +181,24 @@ static struct {
     pthread_t *threads;
     int nworkers;
     pthread_mutex_t mtx;
-    pthread_cond_t wake;       /* workers wait for a new job */
-    pthread_cond_t complete;   /* main waits for job completion */
+    pthread_cond_t wake;       /* workers wait for a new job (sleep phase only) */
+    pthread_cond_t complete;   /* main waits for job completion (sleep phase only) */
     qwen_job_t *job;
-    unsigned long generation;  /* bumped per dispatch; workers compare to detect new work */
-    int completed;             /* workers that finished the current job */
-    int stop;
+    _Atomic unsigned long generation;  /* bumped per dispatch (release) */
+    _Atomic int completed;     /* workers that finished the current job */
+    _Atomic int sleeping;      /* workers inside the condvar sleep phase */
+    _Atomic int main_sleeping; /* main is sleeping in the completion wait */
+    _Atomic int stop;
 } P;
 static int g_inited = 0;
+
+static inline void qwen_cpu_relax(void) {
+#if defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#endif
+}
 
 static void run_chunks(qwen_job_t *job) {
     size_t i;
@@ -189,28 +209,44 @@ static void run_chunks(qwen_job_t *job) {
 static void *worker_main(void *arg) {
     (void)arg;
     qwen_ftz_on();             /* per-thread FTZ (int8 denormals) — set once */
-    pthread_mutex_lock(&P.mtx);
-    unsigned long seen = P.generation;
+    unsigned long seen = atomic_load(&P.generation);
     for (;;) {
-        while (!P.stop && P.generation == seen)
-            pthread_cond_wait(&P.wake, &P.mtx);
-        if (P.stop) break;
-        seen = P.generation;
-        qwen_job_t *job = P.job;
-        pthread_mutex_unlock(&P.mtx);
+        /* Spin phase: catch back-to-back dispatches without a futex trip. */
+        int spins = 0;
+        while (!atomic_load_explicit(&P.stop, memory_order_relaxed) &&
+               atomic_load_explicit(&P.generation, memory_order_acquire) == seen) {
+            if (++spins >= QWEN_POOL_SPIN) {
+                /* Sleep phase. Re-check generation under the mutex before
+                 * waiting so a dispatch between our last spin check and the
+                 * cond_wait cannot be missed. */
+                pthread_mutex_lock(&P.mtx);
+                atomic_fetch_add(&P.sleeping, 1);
+                while (!atomic_load(&P.stop) && atomic_load(&P.generation) == seen)
+                    pthread_cond_wait(&P.wake, &P.mtx);
+                atomic_fetch_sub(&P.sleeping, 1);
+                pthread_mutex_unlock(&P.mtx);
+                break;
+            }
+            qwen_cpu_relax();
+        }
+        if (atomic_load(&P.stop)) break;
+        seen = atomic_load_explicit(&P.generation, memory_order_acquire);
+        qwen_job_t *job = P.job;   /* published before the generation bump */
         if (job) run_chunks(job);
-        pthread_mutex_lock(&P.mtx);
-        if (++P.completed == P.nworkers)
+        if (atomic_fetch_add(&P.completed, 1) + 1 == P.nworkers &&
+            atomic_load(&P.main_sleeping)) {
+            pthread_mutex_lock(&P.mtx);
             pthread_cond_signal(&P.complete);
+            pthread_mutex_unlock(&P.mtx);
+        }
     }
-    pthread_mutex_unlock(&P.mtx);
     return NULL;
 }
 
 void qwen_threadpool_stop(void) {
     if (!g_inited || !P.threads) return;
     pthread_mutex_lock(&P.mtx);
-    P.stop = 1;
+    atomic_store(&P.stop, 1);
     pthread_cond_broadcast(&P.wake);
     pthread_mutex_unlock(&P.mtx);
     for (int i = 0; i < P.nworkers; i++)
@@ -218,7 +254,7 @@ void qwen_threadpool_stop(void) {
     free(P.threads);
     P.threads = NULL;
     P.nworkers = 0;
-    P.stop = 0;
+    atomic_store(&P.stop, 0);
 }
 
 void qwen_threadpool_start(int n_threads) {
@@ -227,7 +263,11 @@ void qwen_threadpool_start(int n_threads) {
         pthread_mutex_init(&P.mtx, NULL);
         pthread_cond_init(&P.wake, NULL);
         pthread_cond_init(&P.complete, NULL);
-        P.generation = 0;
+        atomic_init(&P.generation, 0);
+        atomic_init(&P.completed, 0);
+        atomic_init(&P.sleeping, 0);
+        atomic_init(&P.main_sleeping, 0);
+        atomic_init(&P.stop, 0);
         g_inited = 1;
     }
     if (want == P.nworkers) return;
@@ -249,20 +289,35 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     job.fn = fn; job.ctx = ctx; job.nt = nt;
     atomic_init(&job.next, 0);
 
-    pthread_mutex_lock(&P.mtx);
     P.job = &job;
-    P.completed = 0;
-    P.generation++;
-    pthread_cond_broadcast(&P.wake);
-    pthread_mutex_unlock(&P.mtx);
+    atomic_store(&P.completed, 0);
+    atomic_fetch_add_explicit(&P.generation, 1, memory_order_release);
+    /* Only pay the futex wake if someone is actually asleep. A worker that was
+     * about to sleep re-checks the generation under the mutex, so it cannot
+     * miss this dispatch even if we skip the broadcast here. */
+    if (atomic_load(&P.sleeping) > 0) {
+        pthread_mutex_lock(&P.mtx);
+        pthread_cond_broadcast(&P.wake);
+        pthread_mutex_unlock(&P.mtx);
+    }
 
     run_chunks(&job);              /* main participates */
 
-    pthread_mutex_lock(&P.mtx);
-    while (P.completed != P.nworkers)
-        pthread_cond_wait(&P.complete, &P.mtx);
+    /* Completion: spin briefly, then sleep. */
+    int spins = 0;
+    while (atomic_load_explicit(&P.completed, memory_order_acquire) != P.nworkers) {
+        if (++spins >= QWEN_POOL_SPIN) {
+            pthread_mutex_lock(&P.mtx);
+            atomic_store(&P.main_sleeping, 1);
+            while (atomic_load(&P.completed) != P.nworkers)
+                pthread_cond_wait(&P.complete, &P.mtx);
+            atomic_store(&P.main_sleeping, 0);
+            pthread_mutex_unlock(&P.mtx);
+            break;
+        }
+        qwen_cpu_relax();
+    }
     P.job = NULL;
-    pthread_mutex_unlock(&P.mtx);
 }
 
 /* Single global job slot → NOT safe to submit from two threads at once. */
