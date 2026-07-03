@@ -39,9 +39,9 @@ void  qwen_cuda_matmat_bf16(void *ctx, float *Y, const uint16_t *W,
     (void)ctx; (void)Y; (void)W; (void)X; (void)rows; (void)cols; (void)B;
 }
 int g_cuda_decoder_on = 0;
-void qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,float alpha,const float *A,int lda,
+int qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,float alpha,const float *A,int lda,
                         const float *B,int ldb,float beta,float *C,int ldc) {
-    (void)transA;(void)transB;(void)M;(void)N;(void)K;(void)alpha;(void)A;(void)lda;(void)B;(void)ldb;(void)beta;(void)C;(void)ldc;
+    (void)transA;(void)transB;(void)M;(void)N;(void)K;(void)alpha;(void)A;(void)lda;(void)B;(void)ldb;(void)beta;(void)C;(void)ldc; return -1;
 }
 
 #else /* QWEN_HAVE_CUDA */
@@ -50,6 +50,7 @@ void qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,float alpha,cons
 #include <cublas_v2.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>   /* memcpy — the sd_sgemm strided-C scatter needs the real prototype (size_t args) */
 
 typedef struct { const void *key; float *dbuf; } wc_ent;   /* resident weight (device fp32) */
 
@@ -153,24 +154,33 @@ static float *g_sdA=NULL,*g_sdB=NULL,*g_sdC=NULL,*g_sdCT=NULL;
 static size_t g_sdA_cap=0,g_sdB_cap=0,g_sdC_cap=0,g_sdCT_cap=0;
 static float *sd_grow(float **buf,size_t *cap,size_t need){ if(*cap<need){ if(*buf)cudaFree(*buf); if(cudaMalloc((void**)buf,need*sizeof(float))!=cudaSuccess){*buf=NULL;*cap=0;return NULL;} *cap=need; } return *buf; }
 
-void qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,
-                        float alpha,const float *A,int lda,const float *B,int ldb,
-                        float beta,float *C,int ldc) {
-    if (!g_sd_handle) { if (cublasCreate(&g_sd_handle)!=CUBLAS_STATUS_SUCCESS){ g_cuda_decoder_on=0; return; } }
+/* Returns 0 if computed on the GPU, -1 to tell the caller to fall back to CPU cblas.
+ * The huge convs on the final upsampled sequence hang/oversubscribe on GB10 unified memory;
+ * cap the work and fall back for those (still offloads the bulk of medium convs). */
+#define SD_SGEMM_MAX_ELEMS (32u*1024u*1024u)   /* 32M floats = 128 MB per buffer */
+int qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,
+                       float alpha,const float *A,int lda,const float *B,int ldb,
+                       float beta,float *C,int ldc) {
+    if (beta != 0.0f) return -1;   /* accumulate not supported (decoder uses beta=0) */
     size_t Asz=(size_t)(transA?K:M)*lda, Bsz=(size_t)(transB?N:K)*ldb, Csz=(size_t)M*N;
+    if (Asz>SD_SGEMM_MAX_ELEMS || Bsz>SD_SGEMM_MAX_ELEMS || Csz>SD_SGEMM_MAX_ELEMS) return -1;  /* too big → CPU */
+    if (!g_sd_handle) { if (cublasCreate(&g_sd_handle)!=CUBLAS_STATUS_SUCCESS){ g_cuda_decoder_on=0; return -1; } }
     float *dA=sd_grow(&g_sdA,&g_sdA_cap,Asz), *dB=sd_grow(&g_sdB,&g_sdB_cap,Bsz), *dC=sd_grow(&g_sdC,&g_sdC_cap,Csz);
-    if(!dA||!dB||!dC) return;
+    if(!dA||!dB||!dC) return -1;
     cudaMemcpy(dA,A,Asz*sizeof(float),cudaMemcpyHostToDevice);
     cudaMemcpy(dB,B,Bsz*sizeof(float),cudaMemcpyHostToDevice);
     cublasOperation_t oa=transA?CUBLAS_OP_T:CUBLAS_OP_N, ob=transB?CUBLAS_OP_T:CUBLAS_OP_N;
-    cublasSgemm(g_sd_handle, ob, oa, N, M, K, &alpha, dB, ldb, dA, lda, &beta, dC, N);  /* dC col-major[N,M]=row-major[M,N] */
+    cublasStatus_t st = cublasSgemm(g_sd_handle, ob, oa, N, M, K, &alpha, dB, ldb, dA, lda, &beta, dC, N);  /* dC col-major[N,M]=row-major[M,N] */
+    if (st != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "sd_sgemm: cublasSgemm status=%d (M=%d N=%d K=%d ta=%d tb=%d)\n", (int)st, M,N,K,transA,transB); }
+    { cudaError_t e = cudaDeviceSynchronize(); if (e != cudaSuccess) fprintf(stderr, "sd_sgemm: sync err %s (M=%d N=%d K=%d)\n", cudaGetErrorString(e), M,N,K); }
     if (ldc==N) {
         cudaMemcpy(C,dC,Csz*sizeof(float),cudaMemcpyDeviceToHost);
     } else {
-        float *t=sd_grow(&g_sdCT,&g_sdCT_cap,Csz); if(!t) return;
+        float *t=sd_grow(&g_sdCT,&g_sdCT_cap,Csz); if(!t) return -1;
         cudaMemcpy(t,dC,Csz*sizeof(float),cudaMemcpyDeviceToHost);
         for(int m=0;m<M;m++) memcpy(C+(size_t)m*ldc, t+(size_t)m*N, (size_t)N*sizeof(float));  /* scatter to strided C */
     }
+    return 0;
 }
 
 #endif /* QWEN_HAVE_CUDA */

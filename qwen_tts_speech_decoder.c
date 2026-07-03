@@ -55,8 +55,10 @@
 #include "qwen_tts_cuda.h"
 static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float *A,int lda,
                            const float *B,int ldb,float be,float *C,int ldc){
-    if (g_cuda_decoder_on) qwen_cuda_sd_sgemm(ta==CblasTrans, tb==CblasTrans, M,N,K, al,A,lda,B,ldb,be,C,ldc);
-    else cblas_sgemm(CblasRowMajor,(CBLAS_TRANSPOSE)ta,(CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
+    if (g_cuda_decoder_on &&
+        qwen_cuda_sd_sgemm(ta==CblasTrans, tb==CblasTrans, M,N,K, al,A,lda,B,ldb,be,C,ldc) == 0)
+        return;   /* did it on the GPU; else fall through to CPU (too big / unsupported) */
+    cblas_sgemm(CblasRowMajor,(CBLAS_TRANSPOSE)ta,(CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
 }
 #else
 static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float *A,int lda,

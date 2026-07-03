@@ -55,7 +55,7 @@ void  qwen_cuda_conv_transpose1d(float *out, const float *in, const float *weigh
 /* Speech-decoder cuBLAS sgemm (M3): drop-in for the decoder's RowMajor cblas_sgemm — its
  * convs are big matmuls (compute-bound, the 40x cuBLAS regime). g_cuda_decoder_on gates it. */
 extern int g_cuda_decoder_on;
-void qwen_cuda_sd_sgemm(int transA, int transB, int M, int N, int K,
+int qwen_cuda_sd_sgemm(int transA, int transB, int M, int N, int K,
                         float alpha, const float *A, int lda, const float *B, int ldb,
                         float beta, float *C, int ldc);
 
