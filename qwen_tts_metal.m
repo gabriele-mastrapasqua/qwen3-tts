@@ -1278,7 +1278,7 @@ static void enc_bar(id<MTLComputeCommandEncoder> e){ [e memoryBarrierWithScope:M
 /* precision-dispatched matvec: y[rows] = W[rows,cols] @ x, resident buffers. */
 static void enc_mv(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s,
                    const uint16_t *wbf, const int8_t *wi8, const float *wsc, const q4_0_block_t *wq4,
-                   id<MTLBuffer> xb, id<MTLBuffer> yb, int rows, int cols) {
+                   id<MTLBuffer> xb, id<MTLBuffer> yb, int rows, int cols, int bar) {
     qwen_metal_ctx *c = s->mc; uint32_t cc=(uint32_t)cols, rr=(uint32_t)rows;
     MTLSize tg = MTLSizeMake(((NSUInteger)rows+7)/8,1,1), tp = MTLSizeMake(8*32,1,1);
     if (wq4) {
@@ -1298,37 +1298,37 @@ static void enc_mv(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s,
         [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:yb offset:0 atIndex:2];
         [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4];
     }
-    [e dispatchThreadgroups:tg threadsPerThreadgroup:tp]; enc_bar(e);
+    [e dispatchThreadgroups:tg threadsPerThreadgroup:tp]; if(bar) enc_bar(e);
 }
 /* full RMSNorm: y[dim] = rmsnorm(x, w). */
 static void enc_rms(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s,
-                    id<MTLBuffer> xb, id<MTLBuffer> yb, const float *w, int dim) {
+                    id<MTLBuffer> xb, id<MTLBuffer> yb, const float *w, int dim, int bar) {
     qwen_metal_ctx *c = s->mc; uint32_t d=(uint32_t)dim; float ep=s->eps;
     [e setComputePipelineState:MTB(c->pso_rms)];
     [e setBuffer:xb offset:0 atIndex:0];
     [e setBuffer:weight_buf(c,w,(size_t)dim*sizeof(float)) offset:0 atIndex:1];
     [e setBuffer:yb offset:0 atIndex:2];
     [e setBytes:&d length:4 atIndex:3]; [e setBytes:&ep length:4 atIndex:4];
-    [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; enc_bar(e);
+    [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; if(bar) enc_bar(e);
 }
 static void enc_rms_ph(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s,
-                       id<MTLBuffer> xb, const float *w, int n_heads) {
+                       id<MTLBuffer> xb, const float *w, int n_heads, int bar) {
     qwen_metal_ctx *c = s->mc; uint32_t hd=(uint32_t)s->hd; float ep=s->eps;
     [e setComputePipelineState:MTB(c->pso_rms_ph)];
     [e setBuffer:xb offset:0 atIndex:0];
     [e setBuffer:weight_buf(c,w,(size_t)s->hd*sizeof(float)) offset:0 atIndex:1];
     [e setBytes:&hd length:4 atIndex:2]; [e setBytes:&ep length:4 atIndex:3];
     NSUInteger tp = (NSUInteger)s->hd; if (tp > 256) tp = 256;
-    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; if(bar) enc_bar(e);
 }
-static void enc_rope(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s, id<MTLBuffer> xb, int n_heads, uint32_t pos) {
+static void enc_rope(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s, id<MTLBuffer> xb, int n_heads, uint32_t pos, int bar) {
     qwen_metal_ctx *c = s->mc; uint32_t nh=(uint32_t)n_heads, hd=(uint32_t)s->hd;
     [e setComputePipelineState:MTB(c->pso_rope_neox)];
     [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:MTB(s->rope_cos) offset:0 atIndex:1];
     [e setBuffer:MTB(s->rope_sin) offset:0 atIndex:2];
     [e setBytes:&nh length:4 atIndex:3]; [e setBytes:&hd length:4 atIndex:4]; [e setBytes:&pos length:4 atIndex:5];
     NSUInteger n = (NSUInteger)n_heads*(s->hd/2), tp = n<256?n:256;
-    [e dispatchThreadgroups:MTLSizeMake((n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+    [e dispatchThreadgroups:MTLSizeMake((n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; if(bar) enc_bar(e);
 }
 
 void *qwen_metal_talker_init(void *metal_ctx, qwen_tts_ctx_t *ctx) {
@@ -1372,19 +1372,22 @@ void qwen_metal_talker_step(void *st, const float *embed, float *hidden_out, int
         memcpy(xb.contents, embed, (size_t)s->H*sizeof(float));
         int H=s->H, qd=s->qd, kvd=s->kvd, hd=s->hd, nh=s->nh, nkv=s->nkv, inter=s->inter;
         float scale = 1.0f/sqrtf((float)hd); uint32_t upos=(uint32_t)pos;
+        static int mprof=-1; if(mprof<0) mprof=getenv("QWEN_METAL_PROFILE")?1:0;
+        static double t_enc=0,t_gpu=0; static long np=0; double te0 = mprof?nowms():0;
         id<MTLCommandBuffer> cb = [q commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         for (int l=0; l<s->L; ++l) {
             qwen_talker_layer_t *ly = &s->ctx->layers[l];
             uint32_t kvbase = (uint32_t)((size_t)l*s->kv_max*kvd);
-            enc_rms(e, s, xb, xnb, ly->input_norm, H);
-            enc_mv(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xnb, qb, qd, H);
-            enc_mv(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xnb, kb, kvd, H);
-            enc_mv(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xnb, vb, kvd, H);
-            enc_rms_ph(e, s, qb, ly->q_norm, nh);
-            enc_rms_ph(e, s, kb, ly->k_norm, nkv);
-            enc_rope(e, s, qb, nh, upos);
-            enc_rope(e, s, kb, nkv, upos);
+            enc_rms(e, s, xb, xnb, ly->input_norm, H, 1);
+            /* q/k/v read the same xnb, write different buffers → NO barrier between (overlap) */
+            enc_mv(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xnb, qb, qd, H, 0);
+            enc_mv(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xnb, kb, kvd, H, 0);
+            enc_mv(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xnb, vb, kvd, H, 1);
+            enc_rms_ph(e, s, qb, ly->q_norm, nh, 0);
+            enc_rms_ph(e, s, kb, ly->k_norm, nkv, 1);
+            enc_rope(e, s, qb, nh, upos, 0);
+            enc_rope(e, s, kb, nkv, upos, 1);
             /* kv_store (bf16-trunc) at pos into layer l */
             { uint32_t ukvd=(uint32_t)kvd;
               [e setComputePipelineState:MTB(c->pso_kv_store)];
@@ -1401,24 +1404,30 @@ void qwen_metal_talker_step(void *st, const float *embed, float *hidden_out, int
               [e setBytes:&unh length:4 atIndex:4]; [e setBytes:&unkv length:4 atIndex:5]; [e setBytes:&uhd length:4 atIndex:6];
               [e setBytes:&scale length:4 atIndex:7]; [e setBytes:&upos length:4 atIndex:8]; [e setBytes:&kvbase length:4 atIndex:9];
               [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nh,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)hd,1,1)]; enc_bar(e); }
-            enc_mv(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd);
+            enc_mv(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd, 1);
             /* x += proj */
             [e setComputePipelineState:MTB(c->pso_eadd_ip)];
             [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
             { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
-            enc_rms(e, s, xb, xnb, ly->post_attn_norm, H);
-            enc_mv(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xnb, gub, 2*inter, H);
+            enc_rms(e, s, xb, xnb, ly->post_attn_norm, H, 1);
+            enc_mv(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xnb, gub, 2*inter, H, 1);
             /* swiglu gub -> gateb */
             [e setComputePipelineState:MTB(c->pso_swiglu)];
             [e setBuffer:gub offset:0 atIndex:0]; [e setBuffer:gateb offset:0 atIndex:1];
             { NSUInteger tp=(NSUInteger)inter<256?(NSUInteger)inter:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)inter+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
-            enc_mv(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter);
+            enc_mv(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter, 1);
             [e setComputePipelineState:MTB(c->pso_eadd_ip)];
             [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
             { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
         }
-        enc_rms(e, s, xb, xnb, s->ctx->talker_norm, H);
-        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        enc_rms(e, s, xb, xnb, s->ctx->talker_norm, H, 1);
+        [e endEncoding];
+        if(mprof) t_enc += nowms()-te0;
+        double tg0 = mprof?nowms():0;
+        [cb commit]; [cb waitUntilCompleted];
+        if(mprof){ t_gpu += nowms()-tg0; if(++np%50==0)
+            fprintf(stderr,"[MTL-PROF] avg encode=%.2f ms | gpu(commit+wait)=%.2f ms | total=%.2f ms/step (%ld steps)\n",
+                    t_enc/np, t_gpu/np, (t_enc+t_gpu)/np, np); }
         memcpy(hidden_out, xnb.contents, (size_t)H*sizeof(float));
     }
 }
@@ -1498,14 +1507,15 @@ void qwen_metal_cp_step(void *st, float *x, int pos) {
         for (int l=0; l<s->L; ++l) {
             qwen_cp_layer_t *ly = &s->ctx->cp_layers[l];
             uint32_t kvbase = (uint32_t)((size_t)l*s->kv_max*kvd);
-            enc_rms(e, s, xb, xnb, ly->input_norm, H);
-            enc_mv(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xnb, qb, qd, H);
-            enc_mv(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xnb, kb, kvd, H);
-            enc_mv(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xnb, vb, kvd, H);
-            enc_rms_ph(e, s, qb, ly->q_norm, nh);
-            enc_rms_ph(e, s, kb, ly->k_norm, nkv);
-            enc_rope(e, s, qb, nh, upos);
-            enc_rope(e, s, kb, nkv, upos);
+            enc_rms(e, s, xb, xnb, ly->input_norm, H, 1);
+            /* q/k/v read the same xnb, write different buffers → NO barrier between (overlap) */
+            enc_mv(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xnb, qb, qd, H, 0);
+            enc_mv(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xnb, kb, kvd, H, 0);
+            enc_mv(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xnb, vb, kvd, H, 1);
+            enc_rms_ph(e, s, qb, ly->q_norm, nh, 0);
+            enc_rms_ph(e, s, kb, ly->k_norm, nkv, 1);
+            enc_rope(e, s, qb, nh, upos, 0);
+            enc_rope(e, s, kb, nkv, upos, 1);
             { uint32_t ukvd=(uint32_t)kvd;
               [e setComputePipelineState:MTB(c->pso_kv_store)];
               [e setBuffer:kc offset:0 atIndex:0]; [e setBuffer:vc offset:0 atIndex:1];
@@ -1520,16 +1530,16 @@ void qwen_metal_cp_step(void *st, float *x, int pos) {
               [e setBytes:&unh length:4 atIndex:4]; [e setBytes:&unkv length:4 atIndex:5]; [e setBytes:&uhd length:4 atIndex:6];
               [e setBytes:&scale length:4 atIndex:7]; [e setBytes:&upos length:4 atIndex:8]; [e setBytes:&kvbase length:4 atIndex:9];
               [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nh,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)hd,1,1)]; enc_bar(e); }
-            enc_mv(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd);
+            enc_mv(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd, 1);
             [e setComputePipelineState:MTB(c->pso_eadd_ip)];
             [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
             { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
-            enc_rms(e, s, xb, xnb, ly->post_attn_norm, H);
-            enc_mv(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xnb, gub, 2*inter, H);
+            enc_rms(e, s, xb, xnb, ly->post_attn_norm, H, 1);
+            enc_mv(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xnb, gub, 2*inter, H, 1);
             [e setComputePipelineState:MTB(c->pso_swiglu)];
             [e setBuffer:gub offset:0 atIndex:0]; [e setBuffer:gateb offset:0 atIndex:1];
             { NSUInteger tp=(NSUInteger)inter<256?(NSUInteger)inter:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)inter+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
-            enc_mv(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter);
+            enc_mv(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter, 1);
             [e setComputePipelineState:MTB(c->pso_eadd_ip)];
             [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
             { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
