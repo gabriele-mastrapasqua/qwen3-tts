@@ -99,6 +99,13 @@ double qwen_metal_matvec_bench_fused(void *ctx, const uint16_t *W, const float *
  * out (FILE*) may be NULL → stdout. Returns number of failing ops (0 = PASS). */
 int   qwen_metal_selftest(void *out);
 
+/* GPU-resident fused Talker step (G2, mirrors the CUDA path). metal_ctx = the backend
+ * impl (qwen_backend_t.impl from qwen_backend_init). ctx supplies config + weight pointers. */
+struct qwen_tts_ctx;
+void *qwen_metal_talker_init(void *metal_ctx, struct qwen_tts_ctx *ctx);
+void  qwen_metal_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+void  qwen_metal_talker_free(void *state);
+
 #ifdef __cplusplus
 }
 #endif

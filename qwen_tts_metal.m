@@ -16,6 +16,7 @@
 #import <Foundation/Foundation.h>
 #include "qwen_tts_metal.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -246,7 +247,65 @@ static const char *QWEN_METAL_SRC =
 "            for (uint ic = 0; ic < in_ch; ++ic)\n"
 "                sum += in[(ulong)ic*in_len + tt] * w[((ulong)ic*out_ch + oc)*ksz + k]; } }\n"
 "    out[(ulong)oc*out_len + p] = sum;\n"
-"}\n";
+"}\n"
+"\n"
+/* ---- fused-step kernels (resident Talker/CP) ---------------------------- */
+/* NeoX split-half RoPE at a given position (cos/sin base tables indexed by pos). */
+"kernel void rope_neox(device float *x [[buffer(0)]], device const float *cos_base [[buffer(1)]],\n"
+"    device const float *sin_base [[buffer(2)]], constant uint &n_heads [[buffer(3)]],\n"
+"    constant uint &head_dim [[buffer(4)]], constant uint &pos [[buffer(5)]],\n"
+"    uint gid [[thread_position_in_grid]]) {\n"
+"    uint hd2 = head_dim/2; if (gid >= n_heads*hd2) return;\n"
+"    device const float *cosp = cos_base + (ulong)pos*hd2; device const float *sinp = sin_base + (ulong)pos*hd2;\n"
+"    uint h = gid/hd2, i = gid%hd2; device float *xh = x + (ulong)h*head_dim;\n"
+"    float c = cosp[i], sn = sinp[i], x1 = xh[i], x2 = xh[i+hd2];\n"
+"    xh[i] = x1*c - x2*sn; xh[i+hd2] = x2*c + x1*sn;\n"
+"}\n"
+/* per-head RMSNorm: one threadgroup per head, weight w[head_dim] shared. */
+"kernel void rms_norm_ph(device float *x [[buffer(0)]], device const float *w [[buffer(1)]],\n"
+"    constant uint &head_dim [[buffer(2)]], constant float &eps [[buffer(3)]],\n"
+"    uint hh [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],\n"
+"    uint tc [[threads_per_threadgroup]]) {\n"
+"    threadgroup float part[256]; device float *xh = x + (ulong)hh*head_dim; float s = 0.0f;\n"
+"    for (uint i = tid; i < head_dim; i += tc) s += xh[i]*xh[i];\n"
+"    part[tid]=s; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint st=tc/2; st>0; st>>=1){ if(tid<st) part[tid]+=part[tid+st]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"    float inv = 1.0f/sqrt(part[0]/float(head_dim)+eps);\n"
+"    for (uint i = tid; i < head_dim; i += tc) xh[i]=xh[i]*inv*w[i];\n"
+"}\n"
+/* store k,v into KV cache at pos, bf16-TRUNCATED (match CPU bf16 KV: bits & 0xFFFF0000). */
+"kernel void kv_store(device float *kc [[buffer(0)]], device float *vc [[buffer(1)]],\n"
+"    device const float *k [[buffer(2)]], device const float *v [[buffer(3)]],\n"
+"    constant uint &kvd [[buffer(4)]], constant uint &pos [[buffer(5)]], constant uint &base [[buffer(6)]],\n"
+"    uint i [[thread_position_in_grid]]) {\n"
+"    if (i >= kvd) return; ulong off = (ulong)base + (ulong)pos*kvd + i;\n"
+"    kc[off] = as_type<float>(as_type<uint>(k[i]) & 0xFFFF0000u);\n"
+"    vc[off] = as_type<float>(as_type<uint>(v[i]) & 0xFFFF0000u);\n"
+"}\n"
+/* single-token causal GQA attention over resident KV[0..pos]. One threadgroup per head,\n"
+ * head_dim threads, online softmax (flash-style). head_dim must be a power of 2 (<=256). */
+"kernel void attn_resident(device const float *Q [[buffer(0)]], device const float *K [[buffer(1)]],\n"
+"    device const float *V [[buffer(2)]], device float *O [[buffer(3)]],\n"
+"    constant uint &n_heads [[buffer(4)]], constant uint &n_kv [[buffer(5)]],\n"
+"    constant uint &head_dim [[buffer(6)]], constant float &scale [[buffer(7)]], constant uint &pos [[buffer(8)]],\n"
+"    constant uint &kvbase [[buffer(9)]],\n"
+"    uint h [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]]) {\n"
+"    if (t >= head_dim) return; uint kvh = h/(n_heads/n_kv); uint valid = pos+1;\n"
+"    threadgroup float sh[256]; float qt = Q[(ulong)h*head_dim + t];\n"
+"    float m = -1e30f, denom = 0.0f, acc = 0.0f;\n"
+"    for (uint j = 0; j < valid; ++j) {\n"
+"        device const float *k = K + (ulong)kvbase + ((ulong)j*n_kv + kvh)*head_dim;\n"
+"        sh[t] = qt * k[t]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        for (uint s = head_dim/2; s > 0; s >>= 1) { if (t < s) sh[t] += sh[t+s]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"        float score = sh[0]*scale; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        float mn = max(m, score), corr = exp(m-mn), p = exp(score-mn);\n"
+"        denom = denom*corr + p; acc = acc*corr + p*V[(ulong)kvbase + ((ulong)j*n_kv + kvh)*head_dim + t]; m = mn;\n"
+"    }\n"
+"    O[(ulong)h*head_dim + t] = acc/denom;\n"
+"}\n"
+/* in-place a += b */
+"kernel void eadd_ip(device float *a [[buffer(0)]], device const float *b [[buffer(1)]],\n"
+"    uint i [[thread_position_in_grid]]) { a[i] += b[i]; }\n";
 
 /* ---- context: device, queue, pipelines, resident weight cache, IO pool --- */
 typedef struct { const void *key; void *buf; } wcache_ent;   /* buf = bridge-retained id<MTLBuffer> */
@@ -259,6 +318,8 @@ typedef struct {
     void *pso_rms, *pso_swiglu, *pso_silu, *pso_add, *pso_mul, *pso_scale, *pso_rope;
     void *pso_snake, *pso_attn, *pso_matmat_f32, *pso_conv1d, *pso_convt1d;
     void *pso_rms_b, *pso_swiglu_b;
+    /* fused-step pipelines (resident Talker/CP) */
+    void *pso_rope_neox, *pso_rms_ph, *pso_kv_store, *pso_attn_res, *pso_eadd_ip;
     /* resident weight cache (by pointer) */
     wcache_ent *wc; int wc_n, wc_cap;
     /* reusable IO buffers (grow on demand) */
@@ -313,11 +374,17 @@ void *qwen_metal_init(void) {
         c->pso_convt1d = make_pso(dev, lib, "conv_transpose1d");
         c->pso_rms_b = make_pso(dev, lib, "rms_norm_batched");
         c->pso_swiglu_b = make_pso(dev, lib, "swiglu_batched");
+        c->pso_rope_neox = make_pso(dev, lib, "rope_neox");
+        c->pso_rms_ph = make_pso(dev, lib, "rms_norm_ph");
+        c->pso_kv_store = make_pso(dev, lib, "kv_store");
+        c->pso_attn_res = make_pso(dev, lib, "attn_resident");
+        c->pso_eadd_ip = make_pso(dev, lib, "eadd_ip");
         if (!c->pso_matvec_bf16 || !c->pso_matmat_bf16 || !c->pso_matvec_int8 ||
             !c->pso_matvec_q4_0 || !c->pso_rms || !c->pso_swiglu || !c->pso_silu ||
             !c->pso_add || !c->pso_mul || !c->pso_scale || !c->pso_rope ||
             !c->pso_snake || !c->pso_attn || !c->pso_matmat_f32 || !c->pso_conv1d || !c->pso_convt1d ||
-            !c->pso_rms_b || !c->pso_swiglu_b) {
+            !c->pso_rms_b || !c->pso_swiglu_b ||
+            !c->pso_rope_neox || !c->pso_rms_ph || !c->pso_kv_store || !c->pso_attn_res || !c->pso_eadd_ip) {
             qwen_metal_free(c); return NULL;
         }
         return c;
@@ -340,6 +407,8 @@ void qwen_metal_free(void *ctx) {
     release_ptr(&c->pso_snake); release_ptr(&c->pso_attn); release_ptr(&c->pso_matmat_f32);
     release_ptr(&c->pso_conv1d); release_ptr(&c->pso_convt1d);
     release_ptr(&c->pso_rms_b); release_ptr(&c->pso_swiglu_b);
+    release_ptr(&c->pso_rope_neox); release_ptr(&c->pso_rms_ph); release_ptr(&c->pso_kv_store);
+    release_ptr(&c->pso_attn_res); release_ptr(&c->pso_eadd_ip);
     release_ptr(&c->queue); release_ptr(&c->device);
     free(c);
 }
@@ -1183,4 +1252,180 @@ int qwen_metal_selftest(void *out) {
     free(ca); free(cb2); free(rc); free(rs); free(cpu); free(gpu); free(cpu2); free(gpu2);
     qwen_metal_free(ctx);
     return fails;
+}
+
+/* ======================================================================== *
+ *  GPU-RESIDENT FUSED TALKER STEP (Metal, G2) — mirrors qwen_cuda_talker_step.
+ *  Weights + KV + activations stay in MTLBuffers; the whole 28-layer step is
+ *  encoded into ONE command buffer (dispatches ordered by buffer barriers),
+ *  one commit/wait per step. Base = M1 and up (simdgroup matvec, threadgroup
+ *  reductions, unified shared buffers). Precision picked per weight (bf16/int8/q4).
+ * ======================================================================== */
+#define MTB(x) ((__bridge id<MTLBuffer>)(x))
+typedef struct {
+    qwen_metal_ctx *mc; qwen_tts_ctx_t *ctx;
+    int H, qd, kvd, inter, nh, nkv, hd, L, kv_max; float eps;
+    void *kcache, *vcache, *xb, *xnb, *qb, *kb, *vb, *attnb, *projb, *gateb, *gub;
+    void *rope_cos, *rope_sin;
+} qwen_metal_talker_t;
+
+static id<MTLBuffer> mk_buf(qwen_metal_ctx *c, size_t bytes) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)c->device;
+    return [dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+}
+static void enc_bar(id<MTLComputeCommandEncoder> e){ [e memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
+
+/* precision-dispatched matvec: y[rows] = W[rows,cols] @ x, resident buffers. */
+static void enc_mv(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s,
+                   const uint16_t *wbf, const int8_t *wi8, const float *wsc, const q4_0_block_t *wq4,
+                   id<MTLBuffer> xb, id<MTLBuffer> yb, int rows, int cols) {
+    qwen_metal_ctx *c = s->mc; uint32_t cc=(uint32_t)cols, rr=(uint32_t)rows;
+    MTLSize tg = MTLSizeMake(((NSUInteger)rows+7)/8,1,1), tp = MTLSizeMake(8*32,1,1);
+    if (wq4) {
+        [e setComputePipelineState:MTB(c->pso_matvec_q4_0)];
+        [e setBuffer:weight_buf(c,wq4,(size_t)rows*(cols/32)*sizeof(q4_0_block_t)) offset:0 atIndex:0];
+        [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:yb offset:0 atIndex:2];
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4];
+    } else if (wi8) {
+        [e setComputePipelineState:MTB(c->pso_matvec_int8)];
+        [e setBuffer:weight_buf(c,wi8,(size_t)rows*cols) offset:0 atIndex:0];
+        [e setBuffer:weight_buf(c,wsc,(size_t)rows*sizeof(float)) offset:0 atIndex:1];
+        [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:yb offset:0 atIndex:3];
+        [e setBytes:&cc length:4 atIndex:4]; [e setBytes:&rr length:4 atIndex:5];
+    } else {
+        [e setComputePipelineState:MTB(c->pso_matvec_bf16)];
+        [e setBuffer:weight_buf(c,wbf,(size_t)rows*cols*sizeof(uint16_t)) offset:0 atIndex:0];
+        [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:yb offset:0 atIndex:2];
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4];
+    }
+    [e dispatchThreadgroups:tg threadsPerThreadgroup:tp]; enc_bar(e);
+}
+/* full RMSNorm: y[dim] = rmsnorm(x, w). */
+static void enc_rms(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s,
+                    id<MTLBuffer> xb, id<MTLBuffer> yb, const float *w, int dim) {
+    qwen_metal_ctx *c = s->mc; uint32_t d=(uint32_t)dim; float ep=s->eps;
+    [e setComputePipelineState:MTB(c->pso_rms)];
+    [e setBuffer:xb offset:0 atIndex:0];
+    [e setBuffer:weight_buf(c,w,(size_t)dim*sizeof(float)) offset:0 atIndex:1];
+    [e setBuffer:yb offset:0 atIndex:2];
+    [e setBytes:&d length:4 atIndex:3]; [e setBytes:&ep length:4 atIndex:4];
+    [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; enc_bar(e);
+}
+static void enc_rms_ph(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s,
+                       id<MTLBuffer> xb, const float *w, int n_heads) {
+    qwen_metal_ctx *c = s->mc; uint32_t hd=(uint32_t)s->hd; float ep=s->eps;
+    [e setComputePipelineState:MTB(c->pso_rms_ph)];
+    [e setBuffer:xb offset:0 atIndex:0];
+    [e setBuffer:weight_buf(c,w,(size_t)s->hd*sizeof(float)) offset:0 atIndex:1];
+    [e setBytes:&hd length:4 atIndex:2]; [e setBytes:&ep length:4 atIndex:3];
+    NSUInteger tp = (NSUInteger)s->hd; if (tp > 256) tp = 256;
+    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+static void enc_rope(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s, id<MTLBuffer> xb, int n_heads, uint32_t pos) {
+    qwen_metal_ctx *c = s->mc; uint32_t nh=(uint32_t)n_heads, hd=(uint32_t)s->hd;
+    [e setComputePipelineState:MTB(c->pso_rope_neox)];
+    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:MTB(s->rope_cos) offset:0 atIndex:1];
+    [e setBuffer:MTB(s->rope_sin) offset:0 atIndex:2];
+    [e setBytes:&nh length:4 atIndex:3]; [e setBytes:&hd length:4 atIndex:4]; [e setBytes:&pos length:4 atIndex:5];
+    NSUInteger n = (NSUInteger)n_heads*(s->hd/2), tp = n<256?n:256;
+    [e dispatchThreadgroups:MTLSizeMake((n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+
+void *qwen_metal_talker_init(void *metal_ctx, qwen_tts_ctx_t *ctx) {
+    if (!ctx || !metal_ctx) return NULL;
+    @autoreleasepool {
+        qwen_metal_ctx *c = (qwen_metal_ctx *)metal_ctx;
+        qwen_tts_config_t *cf = &ctx->config;
+        qwen_metal_talker_t *s = calloc(1, sizeof(*s));
+        s->mc = c; s->ctx = ctx;
+        s->H = cf->hidden_size; s->nh = cf->num_heads; s->nkv = cf->num_kv_heads; s->hd = cf->head_dim;
+        s->inter = cf->intermediate_size; s->L = cf->num_layers; s->kv_max = ctx->kv_max;
+        s->qd = s->nh*s->hd; s->kvd = s->nkv*s->hd; s->eps = cf->rms_norm_eps;
+        int half = s->hd/2;
+        id<MTLDevice> dev = (__bridge id<MTLDevice>)c->device;
+        s->rope_cos = (__bridge_retained void *)[dev newBufferWithBytes:ctx->rope_cos length:(size_t)s->kv_max*half*sizeof(float) options:MTLResourceStorageModeShared];
+        s->rope_sin = (__bridge_retained void *)[dev newBufferWithBytes:ctx->rope_sin length:(size_t)s->kv_max*half*sizeof(float) options:MTLResourceStorageModeShared];
+        s->kcache = (__bridge_retained void *)mk_buf(c,(size_t)s->L*s->kv_max*s->kvd*sizeof(float));
+        s->vcache = (__bridge_retained void *)mk_buf(c,(size_t)s->L*s->kv_max*s->kvd*sizeof(float));
+        s->xb    = (__bridge_retained void *)mk_buf(c,(size_t)s->H*sizeof(float));
+        s->xnb   = (__bridge_retained void *)mk_buf(c,(size_t)s->H*sizeof(float));
+        s->qb    = (__bridge_retained void *)mk_buf(c,(size_t)s->qd*sizeof(float));
+        s->kb    = (__bridge_retained void *)mk_buf(c,(size_t)s->kvd*sizeof(float));
+        s->vb    = (__bridge_retained void *)mk_buf(c,(size_t)s->kvd*sizeof(float));
+        s->attnb = (__bridge_retained void *)mk_buf(c,(size_t)s->qd*sizeof(float));
+        s->projb = (__bridge_retained void *)mk_buf(c,(size_t)s->H*sizeof(float));
+        s->gateb = (__bridge_retained void *)mk_buf(c,(size_t)s->inter*sizeof(float));
+        s->gub   = (__bridge_retained void *)mk_buf(c,(size_t)2*s->inter*sizeof(float));
+        fprintf(stderr,"Metal talker: resident fused step ready (%d layers, hidden=%d, kv_max=%d)\n", s->L, s->H, s->kv_max);
+        return s;
+    }
+}
+
+void qwen_metal_talker_step(void *st, const float *embed, float *hidden_out, int pos) {
+    qwen_metal_talker_t *s = st; if (!s) return;
+    @autoreleasepool {
+        qwen_metal_ctx *c = s->mc;
+        id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)c->queue;
+        id<MTLBuffer> xb=MTB(s->xb), xnb=MTB(s->xnb), qb=MTB(s->qb), kb=MTB(s->kb), vb=MTB(s->vb);
+        id<MTLBuffer> attnb=MTB(s->attnb), projb=MTB(s->projb), gateb=MTB(s->gateb), gub=MTB(s->gub);
+        id<MTLBuffer> kc=MTB(s->kcache), vc=MTB(s->vcache);
+        memcpy(xb.contents, embed, (size_t)s->H*sizeof(float));
+        int H=s->H, qd=s->qd, kvd=s->kvd, hd=s->hd, nh=s->nh, nkv=s->nkv, inter=s->inter;
+        float scale = 1.0f/sqrtf((float)hd); uint32_t upos=(uint32_t)pos;
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        for (int l=0; l<s->L; ++l) {
+            qwen_talker_layer_t *ly = &s->ctx->layers[l];
+            uint32_t kvbase = (uint32_t)((size_t)l*s->kv_max*kvd);
+            enc_rms(e, s, xb, xnb, ly->input_norm, H);
+            enc_mv(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xnb, qb, qd, H);
+            enc_mv(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xnb, kb, kvd, H);
+            enc_mv(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xnb, vb, kvd, H);
+            enc_rms_ph(e, s, qb, ly->q_norm, nh);
+            enc_rms_ph(e, s, kb, ly->k_norm, nkv);
+            enc_rope(e, s, qb, nh, upos);
+            enc_rope(e, s, kb, nkv, upos);
+            /* kv_store (bf16-trunc) at pos into layer l */
+            { uint32_t ukvd=(uint32_t)kvd;
+              [e setComputePipelineState:MTB(c->pso_kv_store)];
+              [e setBuffer:kc offset:0 atIndex:0]; [e setBuffer:vc offset:0 atIndex:1];
+              [e setBuffer:kb offset:0 atIndex:2]; [e setBuffer:vb offset:0 atIndex:3];
+              [e setBytes:&ukvd length:4 atIndex:4]; [e setBytes:&upos length:4 atIndex:5]; [e setBytes:&kvbase length:4 atIndex:6];
+              NSUInteger tp=(NSUInteger)kvd<256?(NSUInteger)kvd:256;
+              [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)kvd+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e); }
+            /* attention over resident KV */
+            { uint32_t unh=(uint32_t)nh, unkv=(uint32_t)nkv, uhd=(uint32_t)hd;
+              [e setComputePipelineState:MTB(c->pso_attn_res)];
+              [e setBuffer:qb offset:0 atIndex:0]; [e setBuffer:kc offset:0 atIndex:1]; [e setBuffer:vc offset:0 atIndex:2];
+              [e setBuffer:attnb offset:0 atIndex:3];
+              [e setBytes:&unh length:4 atIndex:4]; [e setBytes:&unkv length:4 atIndex:5]; [e setBytes:&uhd length:4 atIndex:6];
+              [e setBytes:&scale length:4 atIndex:7]; [e setBytes:&upos length:4 atIndex:8]; [e setBytes:&kvbase length:4 atIndex:9];
+              [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nh,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)hd,1,1)]; enc_bar(e); }
+            enc_mv(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd);
+            /* x += proj */
+            [e setComputePipelineState:MTB(c->pso_eadd_ip)];
+            [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
+            { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
+            enc_rms(e, s, xb, xnb, ly->post_attn_norm, H);
+            enc_mv(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xnb, gub, 2*inter, H);
+            /* swiglu gub -> gateb */
+            [e setComputePipelineState:MTB(c->pso_swiglu)];
+            [e setBuffer:gub offset:0 atIndex:0]; [e setBuffer:gateb offset:0 atIndex:1];
+            { NSUInteger tp=(NSUInteger)inter<256?(NSUInteger)inter:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)inter+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
+            enc_mv(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter);
+            [e setComputePipelineState:MTB(c->pso_eadd_ip)];
+            [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
+            { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
+        }
+        enc_rms(e, s, xb, xnb, s->ctx->talker_norm, H);
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(hidden_out, xnb.contents, (size_t)H*sizeof(float));
+    }
+}
+
+void qwen_metal_talker_free(void *st) {
+    qwen_metal_talker_t *s = st; if (!s) return;
+    void *ps[] = {s->kcache,s->vcache,s->xb,s->xnb,s->qb,s->kb,s->vb,s->attnb,s->projb,s->gateb,s->gub,s->rope_cos,s->rope_sin};
+    for (unsigned i=0;i<sizeof(ps)/sizeof(ps[0]);++i){ void *p=ps[i]; if(p){ id o=(__bridge_transfer id)p; (void)o; } }
+    free(s);
 }

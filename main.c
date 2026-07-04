@@ -12,6 +12,9 @@
 #if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
 #include "qwen_tts_backend.h"   /* experimental GPU backends (make metal / make cuda) */
 #endif
+#if defined(QWEN_HAVE_METAL)
+#include "qwen_tts_metal.h"     /* fused Talker step + selftest */
+#endif
 
 #include <stdio.h>
 #include <lz4.h>
@@ -1443,6 +1446,48 @@ int main(int argc, char **argv) {
     }
 #endif
 
+#if defined(QWEN_HAVE_METAL)
+    /* --gpu-selftest-talker (Metal): GPU-resident fused Talker step vs the CPU qwen_talker_step. */
+    if (run_gpu_selftest_talker) {
+        extern int qwen_talker_step(qwen_tts_ctx_t *, float *, float *);
+        int h = ctx->config.hidden_size, N = 6, fail = 0;
+        float *emb = (float *)malloc((size_t)N * h * sizeof(float));
+        float *hc  = (float *)malloc((size_t)N * h * sizeof(float));
+        float *hg  = (float *)malloc((size_t)N * h * sizeof(float));
+        uint64_t rng = 0x1234567ull;
+        for (int i = 0; i < N * h; i++) { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+            emb[i] = (float)((rng >> 40) / (double)(1u << 24)) * 2.0f - 1.0f; }
+        ctx->ml_steer = NULL; ctx->kv_len = 0;
+        for (int s = 0; s < N; s++) qwen_talker_step(ctx, emb + (size_t)s * h, hc + (size_t)s * h);
+        void *mc = qwen_metal_init();
+        if (!mc) { fprintf(stderr, "gpu-selftest-talker(metal): metal init failed\n"); return 1; }
+        void *st = qwen_metal_talker_init(mc, ctx);
+        if (!st) { fprintf(stderr, "gpu-selftest-talker(metal): talker init failed\n"); return 1; }
+        for (int s = 0; s < N; s++) qwen_metal_talker_step(st, emb + (size_t)s * h, hg + (size_t)s * h, s);
+        qwen_metal_talker_free(st); qwen_metal_free(mc);
+        for (int s = 0; s < N; s++) {
+            double mx = 0, ref = 0, se = 0, sr = 0; int argmax_c = 0, argmax_g = 0; double bc = -1e30, bg = -1e30;
+            for (int i = 0; i < h; i++) {
+                double c = hc[s*h+i], g = hg[s*h+i], d = fabs(c - g);
+                if (d > mx) mx = d; if (fabs(c) > ref) ref = fabs(c); se += d*d; sr += c*c;
+                if (c > bc) { bc = c; argmax_c = i; } if (g > bg) { bg = g; argmax_g = i; }
+            }
+            double rel = mx / (ref + 1e-9), rmsrel = sqrt(se) / (sqrt(sr) + 1e-9);
+            /* Gate = ARGMAX match (drives sampling); RMS-rel ~6-8e-3 is benign fp-accumulation
+             * fork over 28 deep fused layers (same magnitude as the CUDA path). */
+            int ok = (argmax_c == argmax_g) && (rmsrel < 1.5e-2);
+            printf("  step %d: max-rel=%.3e  RMS-rel=%.3e  argmax(cpu=%d gpu=%d %s)  %s\n",
+                   s, rel, rmsrel, argmax_c, argmax_g, argmax_c==argmax_g?"match":"FORK",
+                   ok ? "PASS" : "FAIL");
+            if (!ok) fail = 1;
+        }
+        printf("gpu-selftest-talker (metal): %s\n", fail ? "FAIL" : "PASS");
+        free(emb); free(hc); free(hg);
+        qwen_tts_unload(ctx);
+        return fail;
+    }
+#endif
+
 #if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
     /* Optional GPU offload (opt-in): route the bf16 matvec hot path through the
      * selected backend. CPU stays the default everywhere else; passing no
@@ -1451,7 +1496,13 @@ int main(int argc, char **argv) {
         qwen_backend_kind_t bk = qwen_backend_kind_from_str(gpu_backend_str);
         if (bk != QWEN_BACKEND_CPU) {
             qwen_backend_t *gpu_backend = qwen_backend_init(bk);
-            qwen_backend_install_global(gpu_backend);
+            /* When a fused resident step is active it owns the GPU work; the per-op matvec hook
+             * would only slow the OTHER components (e.g. CP) with sync round-trips → skip it. */
+            int metal_fused = 0;
+#if defined(QWEN_HAVE_METAL)
+            metal_fused = (bk == QWEN_BACKEND_METAL && getenv("QWEN_METAL_FUSED_TALKER") != NULL);
+#endif
+            if (!metal_fused) qwen_backend_install_global(gpu_backend);
             fprintf(stderr, "GPU offload: bf16 matvec via '%s' backend "
                             "(EXPERIMENTAL; CPU stays default elsewhere)\n", gpu_backend->name);
 #if defined(QWEN_HAVE_CUDA)
@@ -1478,6 +1529,16 @@ int main(int argc, char **argv) {
                 extern int g_cuda_decoder_conv_on;
                 g_cuda_decoder_conv_on = 1;
                 fprintf(stderr, "GPU-RESIDENT ConvNet decoder ENABLED\n");
+            }
+#endif
+#if defined(QWEN_HAVE_METAL)
+            /* G2: QWEN_METAL_FUSED_TALKER=1 → run the whole Talker step GPU-resident on Metal
+             * (weights+KV in MTLBuffers, one command buffer/step) instead of the per-op hook. */
+            if (bk == QWEN_BACKEND_METAL && getenv("QWEN_METAL_FUSED_TALKER")) {
+                extern void *g_metal_talker_state;
+                g_metal_talker_state = qwen_metal_talker_init(gpu_backend->impl, ctx);
+                if (g_metal_talker_state)
+                    fprintf(stderr, "GPU fused Talker step ENABLED (Metal, resident)\n");
             }
 #endif
         }

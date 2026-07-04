@@ -493,6 +493,11 @@ void *g_cuda_talker_state = NULL;
  * delegates to it (maintains its OWN device KV [B][kv_max][kvd]; seeded per slot on admit via
  * qwen_cuda_talker_batch_upload_slot). Created by qwen_tts_serve_continuous when QWEN_CUDA_BATCH=1. */
 void *g_cuda_talker_batch_state = NULL;
+#ifdef QWEN_HAVE_METAL
+/* GPU-resident fused Talker step (Metal, G2). Same delegation as CUDA. */
+void *g_metal_talker_state = NULL;
+extern void qwen_metal_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+#endif
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
 extern void qwen_cuda_talker_step(void *state, const float *embed, float *hidden_out, int pos);
@@ -510,6 +515,13 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
 #ifdef QWEN_HAVE_CUDA
     if (g_cuda_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
         qwen_cuda_talker_step(g_cuda_talker_state, embed, hidden_out, pos);
+        ctx->kv_len = pos + 1;
+        return 0;
+    }
+#endif
+#ifdef QWEN_HAVE_METAL
+    if (g_metal_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
+        qwen_metal_talker_step(g_metal_talker_state, embed, hidden_out, pos);
         ctx->kv_len = pos + 1;
         return 0;
     }
