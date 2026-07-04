@@ -1450,7 +1450,7 @@ int main(int argc, char **argv) {
     /* --gpu-selftest-talker (Metal): GPU-resident fused Talker step vs the CPU qwen_talker_step. */
     if (run_gpu_selftest_talker) {
         extern int qwen_talker_step(qwen_tts_ctx_t *, float *, float *);
-        int h = ctx->config.hidden_size, N = 6, fail = 0;
+        int h = ctx->config.hidden_size, N = 48, fail = 0;
         float *emb = (float *)malloc((size_t)N * h * sizeof(float));
         float *hc  = (float *)malloc((size_t)N * h * sizeof(float));
         float *hg  = (float *)malloc((size_t)N * h * sizeof(float));

@@ -1423,6 +1423,26 @@ void qwen_metal_talker_step(void *st, const float *embed, float *hidden_out, int
     }
 }
 
+/* Seed the device KV from the CPU batched prefill (ctx->kv_cache_{k,v} bf16), so the fused
+ * decode steps attend to the prompt. Mirrors qwen_cuda_talker_upload_kv. bf16->f32 = bits<<16
+ * (= the bf16-truncated f32 kv_store also writes). Shared buffers → write .contents directly. */
+void qwen_metal_talker_upload_kv(void *st, qwen_tts_ctx_t *ctx, int prefill_len) {
+    qwen_metal_talker_t *s = st; if (!s || prefill_len <= 0) return;
+    @autoreleasepool {
+        int L=s->L, kvd=s->kvd, kvm=s->kv_max;
+        float *kcp = (float *)((__bridge id<MTLBuffer>)s->kcache).contents;
+        float *vcp = (float *)((__bridge id<MTLBuffer>)s->vcache).contents;
+        for (int l=0; l<L; ++l) {
+            const uint16_t *ck = ctx->kv_cache_k + (size_t)l*kvm*kvd;
+            const uint16_t *cv = ctx->kv_cache_v + (size_t)l*kvm*kvd;
+            float *dk = kcp + (size_t)l*kvm*kvd, *dv = vcp + (size_t)l*kvm*kvd;
+            size_t n = (size_t)prefill_len*kvd;
+            for (size_t i=0;i<n;++i){ union{uint32_t u;float f;}a,b;
+                a.u=(uint32_t)ck[i]<<16; dk[i]=a.f; b.u=(uint32_t)cv[i]<<16; dv[i]=b.f; }
+        }
+    }
+}
+
 void qwen_metal_talker_free(void *st) {
     qwen_metal_talker_t *s = st; if (!s) return;
     void *ps[] = {s->kcache,s->vcache,s->xb,s->xnb,s->qb,s->kb,s->vb,s->attnb,s->projb,s->gateb,s->gub,s->rope_cos,s->rope_sin};

@@ -104,6 +104,7 @@ int   qwen_metal_selftest(void *out);
 struct qwen_tts_ctx;
 void *qwen_metal_talker_init(void *metal_ctx, struct qwen_tts_ctx *ctx);
 void  qwen_metal_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+void  qwen_metal_talker_upload_kv(void *state, struct qwen_tts_ctx *ctx, int prefill_len);
 void  qwen_metal_talker_free(void *state);
 
 #ifdef __cplusplus
