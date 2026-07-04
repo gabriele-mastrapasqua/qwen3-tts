@@ -1502,6 +1502,8 @@ void qwen_metal_cp_step(void *st, float *x, int pos) {
         memcpy(xb.contents, x, (size_t)s->H*sizeof(float));
         int H=s->H, qd=s->qd, kvd=s->kvd, hd=s->hd, nh=s->nh, nkv=s->nkv, inter=s->inter;
         float scale = 1.0f/sqrtf((float)hd); uint32_t upos=(uint32_t)pos;
+        static int cprof=-1; if(cprof<0) cprof=getenv("QWEN_METAL_PROFILE")?1:0;
+        static double c_enc=0,c_gpu=0; static long cnp=0; double ce0 = cprof?nowms():0;
         id<MTLCommandBuffer> cb = [q commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         for (int l=0; l<s->L; ++l) {
@@ -1544,7 +1546,14 @@ void qwen_metal_cp_step(void *st, float *x, int pos) {
             [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
             { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
         }
-        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        [e endEncoding];
+        if(cprof) c_enc += nowms()-ce0;
+        double cg0 = cprof?nowms():0;
+        static int cnosync=-1; if(cnosync<0) cnosync=getenv("QWEN_METAL_CP_NOSYNC")?1:0;
+        [cb commit]; if(!cnosync) [cb waitUntilCompleted];   /* PROBE: skip wait to measure the sync ceiling */
+        if(cprof){ c_gpu += nowms()-cg0; if(++cnp%800==0)
+            fprintf(stderr,"[MTL-CP-PROF] per-pass: encode=%.3f ms | gpu(commit+wait)=%.3f ms | total=%.3f ms (x16/frame=%.1f ms/f)\n",
+                    c_enc/cnp, c_gpu/cnp, (c_enc+c_gpu)/cnp, 16*(c_enc+c_gpu)/cnp); }
         memcpy(x, xb.contents, (size_t)H*sizeof(float));   /* residual, NOT normed */
     }
 }
