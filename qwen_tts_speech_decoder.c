@@ -44,8 +44,13 @@
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+/* Modern Accelerate (ACCELERATE_NEW_LAPACK, cblas_new.h) declares `enum CBLAS_TRANSPOSE`
+ * (C-style tag) rather than the old `typedef ... CBLAS_TRANSPOSE`, so the cast needs the
+ * `enum` keyword. OpenBLAS keeps the typedef. Portable alias: */
+#define QWEN_CBLAS_TRANSPOSE enum CBLAS_TRANSPOSE
 #else
 #include <cblas.h>
+#define QWEN_CBLAS_TRANSPOSE CBLAS_TRANSPOSE
 #endif
 #define CONV_TILE_MAX_BYTES (256 * 1024 * 1024)
 
@@ -58,12 +63,12 @@ static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float 
     if (g_cuda_decoder_on &&
         qwen_cuda_sd_sgemm(ta==CblasTrans, tb==CblasTrans, M,N,K, al,A,lda,B,ldb,be,C,ldc) == 0)
         return;   /* did it on the GPU; else fall through to CPU (too big / unsupported) */
-    cblas_sgemm(CblasRowMajor,(CBLAS_TRANSPOSE)ta,(CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
+    cblas_sgemm(CblasRowMajor,(QWEN_CBLAS_TRANSPOSE)ta,(QWEN_CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
 }
 #else
 static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float *A,int lda,
                            const float *B,int ldb,float be,float *C,int ldc){
-    cblas_sgemm(CblasRowMajor,(CBLAS_TRANSPOSE)ta,(CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
+    cblas_sgemm(CblasRowMajor,(QWEN_CBLAS_TRANSPOSE)ta,(QWEN_CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
 }
 #endif
 #endif
