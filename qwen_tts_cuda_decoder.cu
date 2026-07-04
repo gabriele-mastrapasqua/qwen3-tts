@@ -99,6 +99,24 @@ __global__ void kd_im2col(const float *in,float *col,int in_ch,int length,int ks
     int ic=row/ksz, k=row%ksz, pad=(ksz-1)*dil, ip=t-pad+k*dil;
     col[(size_t)row*length+t] = (ip>=0&&ip<length) ? in[(size_t)ic*length+ip] : 0.f;
 }
+/* --- conv_transpose1d via gemm+gather (kd_convT was 74% of decoder GPU time, naive) --------
+ * Repack weight w[in_ch,out_ch,ksz] -> WM[out_ch*ksz, in_ch]; P2[out_ch*ksz, in_len]=WM@in (cuBLAS);
+ * then gather out[oc,p]=bias[oc]+Σ_{k: (p-k)%stride==0, tt=(p-k)/stride<in_len} P2[oc*ksz+k, tt].
+ * Same terms as kd_convT (out_len==in_len*stride so the causal trim is implicit), gemm-reassociated. */
+__global__ void kd_wpack_convT(const float *w,float *wm,int in_ch,int out_ch,int ksz){
+    int ic=blockIdx.x*blockDim.x+threadIdx.x, row=blockIdx.y;   /* row = oc*ksz + k */
+    if(ic>=in_ch||row>=out_ch*ksz) return;
+    int oc=row/ksz, k=row%ksz;
+    wm[(size_t)row*in_ch+ic] = w[((size_t)ic*out_ch+oc)*ksz+k];
+}
+__global__ void kd_convT_gather(const float *P2,const float *bias,float *out,
+                                int out_ch,int out_len,int in_len,int ksz,int stride){
+    int p=blockIdx.x*blockDim.x+threadIdx.x, oc=blockIdx.y; if(p>=out_len||oc>=out_ch) return;
+    float s=bias?bias[oc]:0.f;
+    for(int k=0;k<ksz;++k){ int sh=p-k; if(sh<0||sh%stride) continue; int tt=sh/stride; if(tt>=in_len) continue;
+        s+=P2[((size_t)oc*ksz+k)*in_len+tt]; }
+    out[(size_t)oc*out_len+p]=s;
+}
 
 /* ---- resident weight cache (by host pointer) ---------------------------- */
 typedef struct { const void *key; float *dbuf; } dwc;
@@ -110,6 +128,17 @@ static float *dev_w(const float *W,size_t n){
     cudaMemcpy(d,W,n*sizeof(float),cudaMemcpyHostToDevice);
     if(g_dwc_n==g_dwc_cap){ g_dwc_cap=g_dwc_cap?g_dwc_cap*2:128; g_dwc=(dwc*)realloc(g_dwc,g_dwc_cap*sizeof(dwc)); }
     g_dwc[g_dwc_n].key=W; g_dwc[g_dwc_n].dbuf=d; g_dwc_n++; return d;
+}
+/* repacked conv_transpose weights WM[out_ch*ksz, in_ch] (built once per host weight, cached) */
+static dwc *g_wmc=NULL; static int g_wmc_n=0,g_wmc_cap=0;
+static float *dev_wT_convT(const float *w_host,int in_ch,int out_ch,int ksz){
+    if(!w_host) return NULL;
+    for(int i=0;i<g_wmc_n;++i) if(g_wmc[i].key==w_host) return g_wmc[i].dbuf;
+    const float *dw=dev_w(w_host,(size_t)in_ch*out_ch*ksz); if(!dw) return NULL;
+    float *wm=NULL; if(cudaMalloc(&wm,(size_t)out_ch*ksz*in_ch*sizeof(float))!=cudaSuccess) return NULL;
+    kd_wpack_convT<<<dim3(CEIL(in_ch,TPB),out_ch*ksz),TPB>>>(dw,wm,in_ch,out_ch,ksz);
+    if(g_wmc_n==g_wmc_cap){ g_wmc_cap=g_wmc_cap?g_wmc_cap*2:32; g_wmc=(dwc*)realloc(g_wmc,g_wmc_cap*sizeof(dwc)); }
+    g_wmc[g_wmc_n].key=w_host; g_wmc[g_wmc_n].dbuf=wm; g_wmc_n++; return wm;
 }
 /* device scratch buffers (grown, reused) */
 static float *g_a=NULL,*g_b=NULL,*g_c=NULL; static size_t g_ac=0,g_bc=0,g_cc=0;
@@ -144,7 +173,7 @@ static float *grow(float **buf,size_t *cap,size_t need){ if(*cap<need){ if(*buf)
 /* ping-pong device buffers */
 typedef struct { float *p; size_t cap; } DB;
 static float *dbg(DB *d,size_t need){ if(d->cap<need){ if(d->p)cudaFree(d->p); if(cudaMalloc(&d->p,need*sizeof(float))!=cudaSuccess){d->p=NULL;d->cap=0;return NULL;} d->cap=need; } return d->p; }
-static DB S={0,0},O={0,0},R={0,0},P={0,0},Col={0,0};   /* signal / op-out / residual / pointwise / im2col */
+static DB S={0,0},O={0,0},R={0,0},P={0,0},Col={0,0},T={0,0};   /* signal / op-out / residual / pointwise / im2col / convT-P2 */
 #define SWAP() do{ DB _t=S; S=O; O=_t; cur=S.p; }while(0)
 #define GRID2(len,ch) dim3(CEIL((len),TPB),(ch))
 
@@ -161,6 +190,19 @@ static void conv1d_gemm(const float *cur,const float *W,const float *bias,float 
     if(bias) kd_add_bias<<<GRID2(length,out_ch),TPB>>>(out,bias,out_ch,length);
 }
 
+/* causal conv_transpose1d via gemm+gather, all resident. Bit-equivalent to kd_convT up to gemm
+ * fp-accumulation order. QWEN_DEC_NAIVET=1 keeps the old kernel for A/B. */
+static int g_naivet=-1;
+static void convT_gemm(const float *in,const float *w_host,const float *bias,float *out,
+                       int in_ch,int out_ch,int in_len,int out_len,int ksz,int stride){
+    if(g_naivet<0) g_naivet = getenv("QWEN_DEC_NAIVET") ? 1 : 0;
+    float *WM = g_naivet ? NULL : dev_wT_convT(w_host,in_ch,out_ch,ksz);
+    if(!WM){ kd_convT<<<GRID2(out_len,out_ch),TPB>>>(in,dev_w(w_host,(size_t)in_ch*out_ch*ksz),bias,out,in_ch,out_ch,in_len,out_len,ksz,stride); return; }
+    float *P2=dbg(&T,(size_t)out_ch*ksz*in_len); if(!P2){ kd_convT<<<GRID2(out_len,out_ch),TPB>>>(in,dev_w(w_host,(size_t)in_ch*out_ch*ksz),bias,out,in_ch,out_ch,in_len,out_len,ksz,stride); return; }
+    dmatmul(P2,WM,in,out_ch*ksz,in_ch,in_len);            /* P2[out_ch*ksz,in_len]=WM[out_ch*ksz,in_ch]@in[in_ch,in_len] */
+    kd_convT_gather<<<GRID2(out_len,out_ch),TPB>>>(P2,bias,out,out_ch,out_len,in_len,ksz,stride);
+}
+
 extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cur_ch, int cur_len,
                                           float **audio_out, int *n_out) {
     qwen_tts_ctx_t *ctx=(qwen_tts_ctx_t*)ctxv;
@@ -173,7 +215,7 @@ extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cu
         qwen_sd_convnext_t *cn=&sd->convnext[b];
         int nl=cur_len*2;
         float *up=dbg(&O,(size_t)cur_ch*nl);
-        kd_convT<<<GRID2(nl,cur_ch),TPB>>>(cur,dev_w(cn->conv_weight,(size_t)cur_ch*cur_ch*2),dev_w(cn->conv_bias,cur_ch),up,cur_ch,cur_ch,cur_len,nl,2,2);
+        convT_gemm(cur,cn->conv_weight,dev_w(cn->conv_bias,cur_ch),up,cur_ch,cur_ch,cur_len,nl,2,2);
         SWAP(); cur_len=nl;
         float *res=dbg(&R,(size_t)cur_ch*cur_len); cudaMemcpy(res,cur,(size_t)cur_ch*cur_len*sizeof(float),cudaMemcpyDeviceToDevice);
         float *dw=dbg(&O,(size_t)cur_ch*cur_len);
@@ -204,7 +246,7 @@ extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cu
         if(ub->upsample.snake_alpha)
             kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,ub->upsample.snake_alpha?dev_w(ub->upsample.snake_alpha,cur_ch):NULL,dev_w(ub->upsample.snake_beta,cur_ch),cur_ch,cur_len);
         int ul=cur_len*rate; float *o=dbg(&O,(size_t)oc*ul);
-        kd_convT<<<GRID2(ul,oc),TPB>>>(cur,dev_w(ub->upsample.conv_weight,(size_t)cur_ch*oc*ksz),dev_w(ub->upsample.conv_bias,oc),o,cur_ch,oc,cur_len,ul,ksz,rate);
+        convT_gemm(cur,ub->upsample.conv_weight,dev_w(ub->upsample.conv_bias,oc),o,cur_ch,oc,cur_len,ul,ksz,rate);
         SWAP(); cur_ch=oc; cur_len=ul;
         for(int r=0;r<3;++r){
             int dil=dils[r];
