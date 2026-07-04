@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 extern "C" {
 #include "qwen_tts.h"
@@ -333,6 +334,239 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
         CK(cudaMemcpy(s->vcache+(size_t)l*kvm*kvd, hv, nper*sizeof(float), cudaMemcpyHostToDevice));
     }
     free(hk); free(hv);
+}
+
+/* ======================================================================== *
+ *  BATCHED fused Talker/CP steps (throughput epic). B sequences share the
+ *  resident weights (uploaded ONCE); activations are [B][dim], KV is [B][kv_max][kvd].
+ *  The matvec→MATMAT kernels read each weight row ONCE and apply it to all B activation
+ *  columns (register accumulator s[B]) → weight DRAM traffic amortized over B = the win.
+ *  Single-stream gen is idle/sync-bound; B rides that idle capacity for near-free until
+ *  compute-bound. Lockstep (all B at same pos) first cut; d_pos[B] is per-sequence so it
+ *  generalizes to ragged/continuous batching. B capped at QB_MAX.
+ * ======================================================================== */
+#define QB_MAX 8
+
+/* batched matmat: X[B][cols], Y[B][rows]; warp per output row reads W[row,:] once → B dots. */
+__global__ void k_matmat_bf16(const __nv_bfloat16 *W,const float *X,float *Y,int rows,int cols,int B){
+    int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
+    const __nv_bfloat16 *wr=W+(size_t)row*cols; float s[QB_MAX];
+    #pragma unroll
+    for(int b=0;b<QB_MAX;++b) s[b]=0.f;
+    for(int i=lane;i<cols;i+=32){ float w=__bfloat162float(wr[i]);
+        for(int b=0;b<B;++b) s[b]+=w*X[(size_t)b*cols+i]; }
+    for(int b=0;b<B;++b){ float v=s[b];
+        #pragma unroll
+        for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
+        if(lane==0) Y[(size_t)b*rows+row]=v; }
+}
+__global__ void k_matmat_int8(const int8_t *W,const float *scale,const float *X,float *Y,int rows,int cols,int B){
+    int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
+    const int8_t *wr=W+(size_t)row*cols; float s[QB_MAX];
+    #pragma unroll
+    for(int b=0;b<QB_MAX;++b) s[b]=0.f;
+    for(int i=lane;i<cols;i+=32){ float w=(float)wr[i];
+        for(int b=0;b<B;++b) s[b]+=w*X[(size_t)b*cols+i]; }
+    float sc=scale[row];
+    for(int b=0;b<B;++b){ float v=s[b];
+        #pragma unroll
+        for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
+        if(lane==0) Y[(size_t)b*rows+row]=sc*v; }
+}
+__global__ void k_matmat_q4_0(const q4blk *W,const float *X,float *Y,int rows,int cols,int B){
+    int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
+    int nb=cols>>5; const q4blk *wr=W+(size_t)row*nb; float s[QB_MAX];
+    #pragma unroll
+    for(int b=0;b<QB_MAX;++b) s[b]=0.f;
+    for(int c=lane;c<cols;c+=32){ const q4blk *bk=wr+(c>>5); int ic=c&31;
+        unsigned char byte=bk->qs[ic>>1]; int nib=(ic&1)?(byte>>4):(byte&0x0F);
+        float w=(float)(nib-8)*bk->scale;
+        for(int b=0;b<B;++b) s[b]+=w*X[(size_t)b*cols+c]; }
+    for(int b=0;b<B;++b){ float v=s[b];
+        #pragma unroll
+        for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
+        if(lane==0) Y[(size_t)b*rows+row]=v; }
+}
+static inline void mvB(int prec,const void*W,const float*scale,const float*X,float*Y,int rows,int cols,int B){
+    int grid=CEIL(rows*32,TPB);
+    if(prec==2) k_matmat_q4_0<<<grid,TPB>>>((const q4blk*)W,X,Y,rows,cols,B);
+    else if(prec==1) k_matmat_int8<<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B);
+    else k_matmat_bf16<<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
+}
+/* one block per sequence */
+__global__ void k_rmsnorm_full_b(const float *X,const float *w,float *Y,int dim,float eps){
+    int b=blockIdx.x; const float *x=X+(size_t)b*dim; float *y=Y+(size_t)b*dim;
+    extern __shared__ float part[]; int tid=threadIdx.x,tc=blockDim.x;
+    float s=0.f; for(int i=tid;i<dim;i+=tc) s+=x[i]*x[i];
+    part[tid]=s; __syncthreads();
+    for(int st=tc/2;st>0;st>>=1){ if(tid<st) part[tid]+=part[tid+st]; __syncthreads(); }
+    float inv=rsqrtf(part[0]/(float)dim+eps);
+    for(int i=tid;i<dim;i+=tc) y[i]=x[i]*inv*w[i];
+}
+/* one block per (b,head): blk = b*nh + h; stride = per-seq q_dim or kv_dim */
+__global__ void k_rmsnorm_ph_b(float *X,const float *w,int head_dim,int nh,int stride,float eps){
+    int blk=blockIdx.x, b=blk/nh, h=blk%nh; float *xh=X+(size_t)b*stride+(size_t)h*head_dim;
+    extern __shared__ float part[]; int tid=threadIdx.x,tc=blockDim.x;
+    float s=0.f; for(int i=tid;i<head_dim;i+=tc) s+=xh[i]*xh[i];
+    part[tid]=s; __syncthreads();
+    for(int st=tc/2;st>0;st>>=1){ if(tid<st) part[tid]+=part[tid+st]; __syncthreads(); }
+    float inv=rsqrtf(part[0]/(float)head_dim+eps);
+    for(int i=tid;i<head_dim;i+=tc) xh[i]=xh[i]*inv*w[i];
+}
+__global__ void k_rope_neox_b(float *X,const float *cos_base,const float *sin_base,
+                              int n_heads,int head_dim,const int *d_pos,int stride,int B){
+    int half=head_dim/2, per=n_heads*half, gid=blockIdx.x*blockDim.x+threadIdx.x;
+    if(gid>=B*per) return; int b=gid/per, rem=gid%per;
+    const float *cosp=cos_base+(size_t)d_pos[b]*half, *sinp=sin_base+(size_t)d_pos[b]*half;
+    int h=rem/half, i=rem%half; float *xh=X+(size_t)b*stride+(size_t)h*head_dim;
+    float c=cosp[i], sn=sinp[i], x1=xh[i], x2=xh[i+half];
+    xh[i]=x1*c-x2*sn; xh[i+half]=x2*c+x1*sn;
+}
+/* KV per sequence: kc/vc layer base = [B][kv_max][kvd]; K/V = [B][kvd] */
+__global__ void k_kv_store_b(float *kc,float *vc,const float *K,const float *V,int kvd,const int *d_pos,int kv_max,int B){
+    int gid=blockIdx.x*blockDim.x+threadIdx.x; if(gid>=B*kvd) return; int b=gid/kvd, i=gid%kvd;
+    size_t off=(size_t)b*kv_max*kvd+(size_t)d_pos[b]*kvd+i;
+    kc[off]=K[(size_t)b*kvd+i]; vc[off]=V[(size_t)b*kvd+i];
+}
+/* one block per (b,head): blk=b*n_heads+h, blockDim=hd. KV base per seq = [kv_max][kvd] */
+__global__ void k_attn_b(const float *Q,const float *K,const float *V,float *O,
+                         int n_heads,int n_kv,int hd,float scale,const int *d_pos,int kv_max,int qd,int kvd){
+    int blk=blockIdx.x, b=blk/n_heads, h=blk%n_heads, t=threadIdx.x; if(t>=hd) return;
+    int kvh=h/(n_heads/n_kv), valid=d_pos[b]+1;
+    const float *Kb=K+(size_t)b*kv_max*kvd, *Vb=V+(size_t)b*kv_max*kvd;
+    float qt=Q[(size_t)b*qd+(size_t)h*hd+t];
+    extern __shared__ float sh[];
+    float m=-1e30f, denom=0.f, acc=0.f;
+    for(int j=0;j<valid;++j){ const float *k=Kb+((size_t)j*n_kv+kvh)*hd;
+        sh[t]=qt*k[t]; __syncthreads();
+        for(int s=hd/2;s>0;s>>=1){ if(t<s) sh[t]+=sh[t+s]; __syncthreads(); }
+        float score=sh[0]*scale; __syncthreads();
+        float mn=fmaxf(m,score), corr=expf(m-mn), p=expf(score-mn);
+        denom=denom*corr+p; acc=acc*corr+p*Vb[((size_t)j*n_kv+kvh)*hd+t]; m=mn; }
+    O[(size_t)b*qd+(size_t)h*hd+t]=acc/denom;
+}
+/* in=[B][2inter], out=[B][inter] */
+__global__ void k_swiglu_il_b(const float *in,float *out,int inter,int B){
+    int e=blockIdx.x*blockDim.x+threadIdx.x; if(e>=B*inter) return; int b=e/inter, j=e%inter;
+    const float *ib=in+(size_t)b*2*inter; float g=ib[2*j], u=ib[2*j+1];
+    out[(size_t)b*inter+j]=g/(1.f+expf(-g))*u;
+}
+
+typedef struct {
+    int B, hidden, q_dim, kv_dim, inter, n_heads, n_kv, head_dim, n_layers, kv_max; float eps;
+    void **wq,**wk,**wv,**wo,**wgu,**wdn; float **wqs,**wks,**wvs,**wos,**wgus,**wdns;
+    float **inorm,**pnorm,**qn,**kn; float *tnorm,*rope_cos,*rope_sin;
+    float *kcache,*vcache;                            /* [L][B][kv_max][kvd] */
+    float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;      /* [B][dim] */
+    int prec; int *d_pos;                             /* device int[B] */
+} cuda_talker_batch_t;
+
+static void talker_body_batch(cuda_talker_batch_t *s){
+    int B=s->B,H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,hd=s->head_dim,half=hd/2;
+    int nh=s->n_heads,nkv=s->n_kv,inter=s->inter; float scale=1.f/sqrtf((float)hd);
+    for(int l=0;l<s->n_layers;++l){
+        k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
+        mvB(s->prec,s->wq[l],s->wqs[l],s->xn,s->q,qd,H,B);
+        mvB(s->prec,s->wk[l],s->wks[l],s->xn,s->k,kvd,H,B);
+        mvB(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H,B);
+        k_rmsnorm_ph_b<<<B*nh,TPB,TPB*sizeof(float)>>>(s->q,s->qn[l],hd,nh,qd,s->eps);
+        k_rmsnorm_ph_b<<<B*nkv,TPB,TPB*sizeof(float)>>>(s->k,s->kn[l],hd,nkv,kvd,s->eps);
+        k_rope_neox_b<<<CEIL(B*nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos,qd,B);
+        k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B);
+        k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->k,B*kvd);
+        k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
+        float *Kl=s->kcache+(size_t)l*B*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*B*s->kv_max*kvd;
+        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B);
+        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd);
+        mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
+        k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
+        k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
+        mvB(s->prec,s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H,B);
+        k_swiglu_il_b<<<CEIL(B*inter,TPB),TPB>>>(s->gu,s->gate,inter,B);
+        mvB(s->prec,s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter,B);
+        k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
+    }
+    k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->tnorm,s->xn,H,s->eps);
+}
+
+/* Build a batched Talker state, SHARING the already-resident weights of a single state `ss`
+ * (weights uploaded once — B multiplies only activations + KV). */
+extern "C" void *qwen_cuda_talker_batch_init(void *single, int B){
+    cuda_talker_t *ss=(cuda_talker_t*)single; if(!ss||B<1||B>QB_MAX) return NULL;
+    cuda_talker_batch_t *s=(cuda_talker_batch_t*)calloc(1,sizeof(*s));
+    s->B=B; s->hidden=ss->hidden; s->q_dim=ss->q_dim; s->kv_dim=ss->kv_dim; s->inter=ss->inter;
+    s->n_heads=ss->n_heads; s->n_kv=ss->n_kv; s->head_dim=ss->head_dim; s->n_layers=ss->n_layers;
+    s->kv_max=ss->kv_max; s->eps=ss->eps; s->prec=ss->prec;
+    /* share weight pointers (do NOT free them in batch_free) */
+    s->wq=ss->wq; s->wk=ss->wk; s->wv=ss->wv; s->wo=ss->wo; s->wgu=ss->wgu; s->wdn=ss->wdn;
+    s->wqs=ss->wqs; s->wks=ss->wks; s->wvs=ss->wvs; s->wos=ss->wos; s->wgus=ss->wgus; s->wdns=ss->wdns;
+    s->inorm=ss->inorm; s->pnorm=ss->pnorm; s->qn=ss->qn; s->kn=ss->kn;
+    s->tnorm=ss->tnorm; s->rope_cos=ss->rope_cos; s->rope_sin=ss->rope_sin;
+    int L=s->n_layers,H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,inter=s->inter;
+    CK(cudaMalloc(&s->kcache,(size_t)L*B*s->kv_max*kvd*sizeof(float)));
+    CK(cudaMalloc(&s->vcache,(size_t)L*B*s->kv_max*kvd*sizeof(float)));
+    CK(cudaMalloc(&s->x,(size_t)B*H*sizeof(float)));   CK(cudaMalloc(&s->xn,(size_t)B*H*sizeof(float)));
+    CK(cudaMalloc(&s->q,(size_t)B*qd*sizeof(float)));   CK(cudaMalloc(&s->k,(size_t)B*kvd*sizeof(float)));
+    CK(cudaMalloc(&s->v,(size_t)B*kvd*sizeof(float)));  CK(cudaMalloc(&s->attn,(size_t)B*qd*sizeof(float)));
+    CK(cudaMalloc(&s->proj,(size_t)B*H*sizeof(float))); CK(cudaMalloc(&s->gate,(size_t)B*inter*sizeof(float)));
+    CK(cudaMalloc(&s->gu,(size_t)B*2*inter*sizeof(float)));
+    CK(cudaMalloc(&s->d_pos,B*sizeof(int)));
+    return s;
+}
+/* embeds=[B][H] host, pos_arr=[B] host; hidden_out=[B][H] host (final-normed). */
+extern "C" void qwen_cuda_talker_batch_step(void *st,const float *embeds,const int *pos_arr,float *hidden_out){
+    cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; int B=s->B,H=s->hidden;
+    CK(cudaMemcpy(s->x,embeds,(size_t)B*H*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(s->d_pos,pos_arr,B*sizeof(int),cudaMemcpyHostToDevice));
+    talker_body_batch(s);
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+    if(hidden_out) CK(cudaMemcpy(hidden_out,s->xn,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
+}
+extern "C" void qwen_cuda_talker_batch_free(void *st){
+    cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; if(!s) return;
+    cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
+    cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
+    cudaFree(s->gu);cudaFree(s->d_pos); free(s);   /* weights are shared — not freed here */
+}
+
+/* Correctness (batched row b MUST equal a single-stream run with the same embeds/pos) +
+ * throughput scaling (batched ms/frame for B seqs vs single ms/frame for 1 seq). */
+static double now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e3+t.tv_nsec/1e6; }
+extern "C" void qwen_cuda_talker_free(void *);   /* defined below (after the CP section) */
+extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
+    int H=ctx->config.hidden_size, kvm=ctx->kv_max;
+    if(frames>kvm-2) frames=kvm-2; if(frames<8) frames=8;
+    void *S=qwen_cuda_talker_init(ctx); if(!S){ fprintf(stderr,"batch selftest: single init failed\n"); return -1; }
+    void *Bs=qwen_cuda_talker_batch_init(S,B); if(!Bs){ fprintf(stderr,"batch selftest: batch init failed (B=%d>max %d?)\n",B,QB_MAX); return -1; }
+    float *e1=(float*)malloc(H*sizeof(float)), *eB=(float*)malloc((size_t)B*H*sizeof(float));
+    float *h1=(float*)malloc(H*sizeof(float)), *hB=(float*)malloc((size_t)B*H*sizeof(float));
+    int *posB=(int*)malloc(B*sizeof(int));
+    /* --- correctness: first min(frames,32) lockstep steps, same embed to single + all B rows --- */
+    double maxdiff=0; int chk=frames<32?frames:32;
+    for(int p=0;p<chk;++p){
+        for(int i=0;i<H;++i) e1[i]=0.02f*sinf(0.11f*(i+1)+0.3f*p);
+        for(int b=0;b<B;++b){ memcpy(eB+(size_t)b*H,e1,H*sizeof(float)); posB[b]=p; }
+        qwen_cuda_talker_step(S,e1,h1,p);
+        qwen_cuda_talker_batch_step(Bs,eB,posB,hB);
+        for(int b=0;b<B;++b) for(int i=0;i<H;++i){ double d=fabs(hB[(size_t)b*H+i]-h1[i]); if(d>maxdiff)maxdiff=d; }
+    }
+    fprintf(stderr,"batch selftest: correctness max|batched-single|=%.2e over %d steps (%s)\n",
+            maxdiff,chk, maxdiff<1e-3?"PASS":"FAIL");
+    qwen_cuda_talker_batch_free(Bs); qwen_cuda_talker_free(S);
+    /* --- throughput: fresh states, time single (1 seq) vs batched (B seq) --- */
+    S=qwen_cuda_talker_init(ctx); Bs=qwen_cuda_talker_batch_init(S,B);
+    for(int i=0;i<H;++i) e1[i]=0.02f*sinf(0.11f*(i+1));
+    for(int b=0;b<B;++b){ memcpy(eB+(size_t)b*H,e1,H*sizeof(float)); posB[b]=0; }
+    qwen_cuda_talker_step(S,e1,h1,0); qwen_cuda_talker_batch_step(Bs,eB,posB,hB);  /* warmup */
+    double t0=now_ms(); for(int p=1;p<=frames;++p) qwen_cuda_talker_step(S,e1,h1,p);
+    double ts=(now_ms()-t0)/frames;
+    t0=now_ms(); for(int p=1;p<=frames;++p){ for(int b=0;b<B;++b) posB[b]=p; qwen_cuda_talker_batch_step(Bs,eB,posB,hB); }
+    double tb=(now_ms()-t0)/frames;
+    fprintf(stderr,"batch Talker throughput (B=%d, %d frames): single %.2f ms/f (1 seq) | batched %.2f ms/f (%d seq) | per-seq %.2f ms | GAIN %.2fx\n",
+            B,frames,ts,tb,B,tb/B, B*ts/tb);
+    free(e1);free(eB);free(h1);free(hB);free(posB);
+    qwen_cuda_talker_batch_free(Bs); qwen_cuda_talker_free(S);
+    return maxdiff<1e-3?0:1;
 }
 
 /* ======================================================================== *

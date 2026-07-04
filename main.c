@@ -946,6 +946,7 @@ int main(int argc, char **argv) {
     int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
     int run_gpu_selftest = 0; /* --gpu-selftest: GPU-vs-CPU matvec/matmat correctness + timing, exit (GPU builds) */
     int run_gpu_selftest_talker = 0; /* --gpu-selftest-talker: fused resident Talker step vs CPU (needs model) */
+    int run_gpu_batch_bench = 0; int gpu_batch_B = 4; /* --gpu-batch-bench N: batched Talker correctness + throughput */
     const char *gpu_backend_str = NULL; /* --backend cpu|metal|cuda (v1: selects the --gpu-selftest target) */
     float cp_roughness = 0.0f;        /* --roughness: q2-down blend on the CP (texture knob) */
     const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
@@ -1057,6 +1058,7 @@ int main(int argc, char **argv) {
         {"gpu-selftest",  no_argument,       0, 1070},
         {"backend",       required_argument, 0, 1071},
         {"gpu-selftest-talker", no_argument, 0, 1072},
+        {"gpu-batch-bench", required_argument, 0, 1074},
         {"roughness",     required_argument, 0, 1028},
         {"steer-vector",  required_argument, 0, 1029},
         {"steer-weight",  required_argument, 0, 1030},
@@ -1134,6 +1136,7 @@ int main(int argc, char **argv) {
             case 1070: run_gpu_selftest = 1; break;
             case 1071: gpu_backend_str = optarg; break;
             case 1072: run_gpu_selftest_talker = 1; break;
+            case 1074: run_gpu_batch_bench = 1; gpu_batch_B = atoi(optarg); break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
             case 1029: steer_vector_path = optarg; break;
             case 1030: cp_steer_weight = (float)atof(optarg); steer_weight_set = 1; break;
@@ -1308,7 +1311,7 @@ int main(int argc, char **argv) {
     /* --save-voice without --text = create voice only (no generation) */
     int create_voice_only = (save_voice && !text && serve_port <= 0);
     if (!text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test && !run_batch_bench
-        && !run_gpu_selftest_talker) {
+        && !run_gpu_selftest_talker && !run_gpu_batch_bench) {
         fprintf(stderr, "Error: --text, --compose or --serve is required\n");
         return 1;
     }
@@ -1429,6 +1432,14 @@ int main(int argc, char **argv) {
         free(emb); free(hc); free(hg);
         qwen_tts_unload(ctx);
         return fail;
+    }
+    /* --gpu-batch-bench N: batched fused Talker — correctness (batched row == single) +
+     * throughput scaling (B seqs/frame vs 1). Needs the model + --int8/--quant-mixed. */
+    if (run_gpu_batch_bench) {
+        extern int qwen_cuda_batch_selftest(qwen_tts_ctx_t *, int, int);
+        int rc = qwen_cuda_batch_selftest(ctx, gpu_batch_B, 200);
+        qwen_tts_unload(ctx);
+        return rc;
     }
 #endif
 
