@@ -461,11 +461,12 @@ Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDI
 
 | Device | 0.6B RTF | 1.7B RTF | Streaming TTFA (single client) |
 |---|---|---|---|
-| **Apple M1** 8-core (dev box) | ~0.60 (int4) | — | — |
+| **Apple M1** 8-core (dev box) | ~0.60 (int4) | — | **469 ms** (0.6B) |
 | **Apple M2 Pro** 16-core GPU | **0.36–0.39** | **0.48–0.53** | **314 ms** / 517 ms |
 
 RTF = processing_time ÷ audio_duration (**< 1.0 = faster than real time**); TTFA = time to first audio for a
-single `--stream` client. Metal beats the native M2 CPU path ~1.5–2×; **int8 is the sweet spot** on Apple Silicon
+single `--stream` client, **warm server** (the first request after startup pays a one-time weight→GPU-buffer
+upload — e.g. ~3.6 s cold vs 469 ms warm on M1-0.6B). Metal beats the native M2 CPU path ~1.5–2×; **int8 is the sweet spot** on Apple Silicon
 (bandwidth-rich → int4's nibble-unpack doesn't pay). Resident decode is bit-identical to the CPU path.
 *(Multi-user concurrency → the batching table below.)*
 
