@@ -114,6 +114,14 @@ void *qwen_metal_cp_frame_init(void *metal_ctx, struct qwen_tts_ctx *ctx);
 void  qwen_metal_cp_frame(void *state, const float *talker_hidden, int code0, int *out_codes);
 void  qwen_metal_cp_frame_free(void *state);
 
+/* BATCHED fused Talker step (throughput epic): B sequences share the single state's weights.
+ * embeds=[B][H], pos_arr=[B], hidden_out=[B][H]. Mirrors qwen_cuda_talker_batch_*. */
+void *qwen_metal_talker_batch_init(void *single_state, int B);
+void  qwen_metal_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
+void  qwen_metal_talker_batch_upload_slot(void *state, int b, const uint16_t *kv_k, const uint16_t *kv_v,
+                                          int src_kv_max, int prefill_len);
+void  qwen_metal_talker_batch_free(void *state);
+
 #ifdef __cplusplus
 }
 #endif

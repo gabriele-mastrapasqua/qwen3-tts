@@ -367,6 +367,101 @@ static const char *QWEN_METAL_SRC =
 "    mv[tid]=best; mi[tid]=bi; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 "    for (uint st=tc/2;st>0;st>>=1){ if(tid<st){ if(mv[tid+st]>mv[tid]){mv[tid]=mv[tid+st];mi[tid]=mi[tid+st];} } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
 "    if (tid==0) code[cslot] = mi[0];\n"
+"}\n"
+/* ===== BATCHED fused-step kernels (throughput epic) — direct port of the CUDA k_*_b path.
+ * Layout [B][dim] (B-major, like CUDA); KV [B][kv_max][kvd]; d_pos[B] per-slot. mv_b_* = one
+ * simdgroup per output row, reads W[row,:] ONCE, accumulates s[B] (weight DRAM amortized over B). */
+"kernel void mv_b_bf16(device const ushort *W [[buffer(0)]],\n"
+"    device const float *X [[buffer(1)]], device float *Y [[buffer(2)]],\n"
+"    constant uint &cols [[buffer(3)]], constant uint &rows [[buffer(4)]], constant uint &B [[buffer(5)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]], uint tiisg [[thread_index_in_simdgroup]],\n"
+"    uint sgitg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {\n"
+"    uint row = tgpig.x*nsg + sgitg; if (row >= rows) return;\n"
+"    device const ushort *wr = W + (ulong)row*cols; float s[8]; for (uint b=0;b<8;++b) s[b]=0.0f;\n"
+"    for (uint i=tiisg; i<cols; i+=32) { float w = as_type<float>(uint(wr[i])<<16);\n"
+"        for (uint b=0;b<B;++b) s[b] += w * X[(ulong)b*cols + i]; }\n"
+"    for (uint b=0;b<B;++b) { float v = simd_sum(s[b]); if (tiisg==0) Y[(ulong)b*rows+row]=v; }\n"
+"}\n"
+"kernel void mv_b_int8(device const char *W [[buffer(0)]], device const float *scale [[buffer(1)]],\n"
+"    device const float *X [[buffer(2)]], device float *Y [[buffer(3)]],\n"
+"    constant uint &cols [[buffer(4)]], constant uint &rows [[buffer(5)]], constant uint &B [[buffer(6)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]], uint tiisg [[thread_index_in_simdgroup]],\n"
+"    uint sgitg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {\n"
+"    uint row = tgpig.x*nsg + sgitg; if (row >= rows) return;\n"
+"    device const char *wr = W + (ulong)row*cols; float sc = scale[row]; float s[8]; for (uint b=0;b<8;++b) s[b]=0.0f;\n"
+"    for (uint i=tiisg; i<cols; i+=32) { float w = float(wr[i]);\n"
+"        for (uint b=0;b<B;++b) s[b] += w * X[(ulong)b*cols + i]; }\n"
+"    for (uint b=0;b<B;++b) { float v = simd_sum(s[b]); if (tiisg==0) Y[(ulong)b*rows+row]=sc*v; }\n"
+"}\n"
+"kernel void mv_b_q4(device const q4blk *W [[buffer(0)]],\n"
+"    device const float *X [[buffer(1)]], device float *Y [[buffer(2)]],\n"
+"    constant uint &cols [[buffer(3)]], constant uint &rows [[buffer(4)]], constant uint &B [[buffer(5)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]], uint tiisg [[thread_index_in_simdgroup]],\n"
+"    uint sgitg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {\n"
+"    uint row = tgpig.x*nsg + sgitg; if (row >= rows) return;\n"
+"    uint nb = cols >> 5; device const q4blk *wr = W + (ulong)row*nb; float s[8]; for (uint b=0;b<8;++b) s[b]=0.0f;\n"
+"    for (uint c=tiisg; c<cols; c+=32) { device const q4blk *bk = wr + (c>>5); uint ic = c & 31;\n"
+"        uchar byte = bk->qs[ic>>1]; int nib = (ic&1) ? (byte>>4) : (byte&0x0F); float w = float(nib-8) * bk->scale;\n"
+"        for (uint b=0;b<B;++b) s[b] += w * X[(ulong)b*cols + c]; }\n"
+"    for (uint b=0;b<B;++b) { float v = simd_sum(s[b]); if (tiisg==0) Y[(ulong)b*rows+row]=v; }\n"
+"}\n"
+"kernel void rmsnorm_full_b(device const float *X [[buffer(0)]], device const float *w [[buffer(1)]],\n"
+"    device float *Y [[buffer(2)]], constant uint &dim [[buffer(3)]], constant float &eps [[buffer(4)]],\n"
+"    uint b [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]], uint tc [[threads_per_threadgroup]]) {\n"
+"    threadgroup float part[256]; device const float *x = X + (ulong)b*dim; device float *y = Y + (ulong)b*dim;\n"
+"    float s=0.0f; for (uint i=tid;i<dim;i+=tc){ float v=x[i]; s+=v*v; }\n"
+"    part[tid]=s; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint st=tc/2;st>0;st>>=1){ if(tid<st) part[tid]+=part[tid+st]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"    float inv = 1.0f/sqrt(part[0]/float(dim)+eps); for (uint i=tid;i<dim;i+=tc) y[i]=x[i]*inv*w[i];\n"
+"}\n"
+"kernel void rmsnorm_ph_b(device float *X [[buffer(0)]], device const float *w [[buffer(1)]],\n"
+"    constant uint &head_dim [[buffer(2)]], constant uint &nh [[buffer(3)]], constant uint &stride [[buffer(4)]],\n"
+"    constant float &eps [[buffer(5)]], uint blk [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_position_in_threadgroup]], uint tc [[threads_per_threadgroup]]) {\n"
+"    uint b = blk/nh, h = blk%nh; device float *xh = X + (ulong)b*stride + (ulong)h*head_dim;\n"
+"    threadgroup float part[256]; float s=0.0f; for (uint i=tid;i<head_dim;i+=tc){ float v=xh[i]; s+=v*v; }\n"
+"    part[tid]=s; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint st=tc/2;st>0;st>>=1){ if(tid<st) part[tid]+=part[tid+st]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"    float inv = 1.0f/sqrt(part[0]/float(head_dim)+eps); for (uint i=tid;i<head_dim;i+=tc) xh[i]=xh[i]*inv*w[i];\n"
+"}\n"
+"kernel void rope_neox_b(device float *X [[buffer(0)]], device const float *cos_base [[buffer(1)]],\n"
+"    device const float *sin_base [[buffer(2)]], constant uint &n_heads [[buffer(3)]], constant uint &head_dim [[buffer(4)]],\n"
+"    device const int *d_pos [[buffer(5)]], constant uint &stride [[buffer(6)]], constant uint &B [[buffer(7)]],\n"
+"    uint gid [[thread_position_in_grid]]) {\n"
+"    uint hf = head_dim/2, per = n_heads*hf; if (gid >= B*per) return; uint b = gid/per, rem = gid%per;\n"
+"    device const float *cosp = cos_base + (ulong)d_pos[b]*hf; device const float *sinp = sin_base + (ulong)d_pos[b]*hf;\n"
+"    uint h = rem/hf, i = rem%hf; device float *xh = X + (ulong)b*stride + (ulong)h*head_dim;\n"
+"    float c=cosp[i], sn=sinp[i], x1=xh[i], x2=xh[i+hf]; xh[i]=x1*c - x2*sn; xh[i+hf]=x2*c + x1*sn;\n"
+"}\n"
+"kernel void trunc_bf16_b(device float *x [[buffer(0)]], constant uint &n [[buffer(1)]], uint i [[thread_position_in_grid]]) {\n"
+"    if (i>=n) return; uint u = as_type<uint>(x[i]) & 0xFFFF0000u; x[i] = as_type<float>(u);\n"
+"}\n"
+"kernel void kv_store_b(device float *kc [[buffer(0)]], device float *vc [[buffer(1)]],\n"
+"    device const float *K [[buffer(2)]], device const float *V [[buffer(3)]], constant uint &kvd [[buffer(4)]],\n"
+"    device const int *d_pos [[buffer(5)]], constant uint &kv_max [[buffer(6)]], constant uint &B [[buffer(7)]],\n"
+"    uint gid [[thread_position_in_grid]]) { if (gid >= B*kvd) return; uint b=gid/kvd, i=gid%kvd;\n"
+"    ulong off = (ulong)b*kv_max*kvd + (ulong)d_pos[b]*kvd + i; kc[off]=K[(ulong)b*kvd+i]; vc[off]=V[(ulong)b*kvd+i];\n"
+"}\n"
+"kernel void attn_b(device const float *Q [[buffer(0)]], device const float *K [[buffer(1)]],\n"
+"    device const float *V [[buffer(2)]], device float *O [[buffer(3)]], constant uint &n_heads [[buffer(4)]],\n"
+"    constant uint &n_kv [[buffer(5)]], constant uint &hd [[buffer(6)]], constant float &scale [[buffer(7)]],\n"
+"    device const int *d_pos [[buffer(8)]], constant uint &kv_max [[buffer(9)]], constant uint &qd [[buffer(10)]],\n"
+"    constant uint &kvd [[buffer(11)]], uint blk [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]]) {\n"
+"    uint b = blk/n_heads, h = blk%n_heads; if (t >= hd) return; uint kvh = h/(n_heads/n_kv); uint valid = uint(d_pos[b])+1;\n"
+"    device const float *Kb = K + (ulong)b*kv_max*kvd; device const float *Vb = V + (ulong)b*kv_max*kvd;\n"
+"    float qt = Q[(ulong)b*qd + (ulong)h*hd + t]; threadgroup float sh[256]; float m=-1e30f, denom=0.0f, acc=0.0f;\n"
+"    for (uint j=0;j<valid;++j) { device const float *k = Kb + ((ulong)j*n_kv+kvh)*hd;\n"
+"        sh[t] = qt*k[t]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        for (uint sr=hd/2;sr>0;sr>>=1){ if(t<sr) sh[t]+=sh[t+sr]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"        float score = sh[0]*scale; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        float mn = max(m,score), corr=exp(m-mn), p=exp(score-mn);\n"
+"        denom=denom*corr+p; acc=acc*corr + p*Vb[((ulong)j*n_kv+kvh)*hd + t]; m=mn; }\n"
+"    O[(ulong)b*qd + (ulong)h*hd + t] = acc/denom;\n"
+"}\n"
+"kernel void swiglu_il_b(device const float *in [[buffer(0)]], device float *out [[buffer(1)]],\n"
+"    constant uint &inter [[buffer(2)]], constant uint &B [[buffer(3)]], uint e [[thread_position_in_grid]]) {\n"
+"    if (e >= B*inter) return; uint b=e/inter, j=e%inter;\n"
+"    device const float *ib = in + (ulong)b*2*inter; float g=ib[2*j], u=ib[2*j+1]; out[(ulong)b*inter+j] = g/(1.0f+exp(-g))*u;\n"
 "}\n";
 
 /* ---- context: device, queue, pipelines, resident weight cache, IO pool --- */
@@ -384,6 +479,9 @@ typedef struct {
     void *pso_rope_neox, *pso_rms_ph, *pso_kv_store, *pso_attn_res, *pso_eadd_ip;
     void *pso_embed_gather, *pso_copy_vec, *pso_argmax;   /* device-frame CP */
     void *pso_qnorm_rope, *pso_knorm_rope_store, *pso_add_rms;   /* fused attention preamble + add+norm */
+    /* batched-step pipelines (throughput epic) */
+    void *pso_mvb_bf16, *pso_mvb_int8, *pso_mvb_q4, *pso_rmsf_b, *pso_rmsph_b;
+    void *pso_ropeneox_b, *pso_trunc_b, *pso_kvstore_b, *pso_attnb, *pso_swiglu_ilb;
     /* resident weight cache (by pointer) */
     wcache_ent *wc; int wc_n, wc_cap;
     /* reusable IO buffers (grow on demand) */
@@ -449,6 +547,20 @@ void *qwen_metal_init(void) {
         c->pso_qnorm_rope = make_pso(dev, lib, "qnorm_rope");
         c->pso_knorm_rope_store = make_pso(dev, lib, "knorm_rope_store");
         c->pso_add_rms = make_pso(dev, lib, "add_rms");
+        c->pso_mvb_bf16 = make_pso(dev, lib, "mv_b_bf16");
+        c->pso_mvb_int8 = make_pso(dev, lib, "mv_b_int8");
+        c->pso_mvb_q4 = make_pso(dev, lib, "mv_b_q4");
+        c->pso_rmsf_b = make_pso(dev, lib, "rmsnorm_full_b");
+        c->pso_rmsph_b = make_pso(dev, lib, "rmsnorm_ph_b");
+        c->pso_ropeneox_b = make_pso(dev, lib, "rope_neox_b");
+        c->pso_trunc_b = make_pso(dev, lib, "trunc_bf16_b");
+        c->pso_kvstore_b = make_pso(dev, lib, "kv_store_b");
+        c->pso_attnb = make_pso(dev, lib, "attn_b");
+        c->pso_swiglu_ilb = make_pso(dev, lib, "swiglu_il_b");
+        if (!c->pso_mvb_bf16 || !c->pso_mvb_int8 || !c->pso_mvb_q4 || !c->pso_rmsf_b || !c->pso_rmsph_b ||
+            !c->pso_ropeneox_b || !c->pso_trunc_b || !c->pso_kvstore_b || !c->pso_attnb || !c->pso_swiglu_ilb) {
+            qwen_metal_free(c); return NULL;
+        }
         if (!c->pso_matvec_bf16 || !c->pso_matmat_bf16 || !c->pso_matvec_int8 ||
             !c->pso_matvec_q4_0 || !c->pso_rms || !c->pso_swiglu || !c->pso_silu ||
             !c->pso_add || !c->pso_mul || !c->pso_scale || !c->pso_rope ||
@@ -1552,6 +1664,208 @@ void qwen_metal_talker_free(void *st) {
     qwen_metal_talker_t *s = st; if (!s) return;
     void *ps[] = {s->kcache,s->vcache,s->xb,s->xnb,s->qb,s->kb,s->vb,s->attnb,s->projb,s->gateb,s->gub,s->rope_cos,s->rope_sin};
     for (unsigned i=0;i<sizeof(ps)/sizeof(ps[0]);++i){ void *p=ps[i]; if(p){ id o=(__bridge_transfer id)p; (void)o; } }
+    free(s);
+}
+
+/* ======================================================================== *
+ *  BATCHED fused Talker step (Metal, throughput epic) — mirrors qwen_cuda_talker_batch_*.
+ *  Shares the single state's resident weights (via ctx->layers + weight_buf cache); activations
+ *  [B][dim], KV [L][B][kv_max][kvd], d_pos[B] per-slot. Every dispatch is barrier-serialized
+ *  (correctness-first; overlap tuning later). B<=QMB_MAX. bf16/int8/q4 via mv_b_* (weight read
+ *  once, s[B] accumulator = the amortization win). Validate B=1==single before trusting B>1.
+ * ======================================================================== */
+#define QMB_MAX 8
+typedef struct {
+    qwen_metal_ctx *mc; qwen_tts_ctx_t *ctx; qwen_metal_talker_t *single;
+    int B, H, qd, kvd, inter, nh, nkv, hd, L, kv_max; float eps;
+    void *kcache, *vcache;                              /* [L][B][kv_max][kvd] */
+    void *x, *xn, *q, *k, *v, *attn, *proj, *gate, *gu; /* [B][dim] */
+    void *d_pos;                                        /* int[B] */
+} qwen_metal_talker_batch_t;
+
+/* precision-dispatched BATCHED matmat: Y[B][rows] = W[rows,cols] @ X[B][cols]. */
+static void enc_mvb(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s,
+                    const uint16_t *wbf, const int8_t *wi8, const float *wsc, const q4_0_block_t *wq4,
+                    id<MTLBuffer> xb, id<MTLBuffer> yb, int rows, int cols, int bar) {
+    qwen_metal_ctx *c=s->mc; uint32_t cc=(uint32_t)cols, rr=(uint32_t)rows, BB=(uint32_t)s->B;
+    MTLSize tg=MTLSizeMake(((NSUInteger)rows+7)/8,1,1), tp=MTLSizeMake(8*32,1,1);
+    if (wq4) {
+        [e setComputePipelineState:MTB(c->pso_mvb_q4)];
+        [e setBuffer:weight_buf(c,wq4,(size_t)rows*(cols/32)*sizeof(q4_0_block_t)) offset:0 atIndex:0];
+        [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:yb offset:0 atIndex:2];
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4]; [e setBytes:&BB length:4 atIndex:5];
+    } else if (wi8) {
+        [e setComputePipelineState:MTB(c->pso_mvb_int8)];
+        [e setBuffer:weight_buf(c,wi8,(size_t)rows*cols) offset:0 atIndex:0];
+        [e setBuffer:weight_buf(c,wsc,(size_t)rows*sizeof(float)) offset:0 atIndex:1];
+        [e setBuffer:xb offset:0 atIndex:2]; [e setBuffer:yb offset:0 atIndex:3];
+        [e setBytes:&cc length:4 atIndex:4]; [e setBytes:&rr length:4 atIndex:5]; [e setBytes:&BB length:4 atIndex:6];
+    } else {
+        [e setComputePipelineState:MTB(c->pso_mvb_bf16)];
+        [e setBuffer:weight_buf(c,wbf,(size_t)rows*cols*sizeof(uint16_t)) offset:0 atIndex:0];
+        [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:yb offset:0 atIndex:2];
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4]; [e setBytes:&BB length:4 atIndex:5];
+    }
+    [e dispatchThreadgroups:tg threadsPerThreadgroup:tp]; if(bar) enc_bar(e);
+}
+static void enc_rmsf_b(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s,
+                       id<MTLBuffer> xb, const float *w, id<MTLBuffer> yb, int dim) {
+    qwen_metal_ctx *c=s->mc; uint32_t d=(uint32_t)dim; float ep=s->eps;
+    [e setComputePipelineState:MTB(c->pso_rmsf_b)];
+    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:weight_buf(c,w,(size_t)dim*sizeof(float)) offset:0 atIndex:1];
+    [e setBuffer:yb offset:0 atIndex:2]; [e setBytes:&d length:4 atIndex:3]; [e setBytes:&ep length:4 atIndex:4];
+    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)s->B,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; enc_bar(e);
+}
+static void enc_rmsph_b(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s,
+                        id<MTLBuffer> xb, const float *w, int n_heads, int stride) {
+    qwen_metal_ctx *c=s->mc; uint32_t uhd=(uint32_t)s->hd, unh=(uint32_t)n_heads, ust=(uint32_t)stride; float ep=s->eps;
+    [e setComputePipelineState:MTB(c->pso_rmsph_b)];
+    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:weight_buf(c,w,(size_t)s->hd*sizeof(float)) offset:0 atIndex:1];
+    [e setBytes:&uhd length:4 atIndex:2]; [e setBytes:&unh length:4 atIndex:3]; [e setBytes:&ust length:4 atIndex:4]; [e setBytes:&ep length:4 atIndex:5];
+    NSUInteger tp=(NSUInteger)s->hd<256?(NSUInteger)s->hd:256;
+    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(s->B*n_heads),1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+static void enc_ropeneox_b(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s,
+                           id<MTLBuffer> xb, int n_heads, int stride) {
+    qwen_metal_ctx *c=s->mc; uint32_t unh=(uint32_t)n_heads, uhd=(uint32_t)s->hd, ust=(uint32_t)stride, uB=(uint32_t)s->B;
+    [e setComputePipelineState:MTB(c->pso_ropeneox_b)];
+    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:MTB(s->single->rope_cos) offset:0 atIndex:1]; [e setBuffer:MTB(s->single->rope_sin) offset:0 atIndex:2];
+    [e setBytes:&unh length:4 atIndex:3]; [e setBytes:&uhd length:4 atIndex:4];
+    [e setBuffer:MTB(s->d_pos) offset:0 atIndex:5]; [e setBytes:&ust length:4 atIndex:6]; [e setBytes:&uB length:4 atIndex:7];
+    NSUInteger n=(NSUInteger)s->B*n_heads*(s->hd/2), tp=n<256?n:256;
+    [e dispatchThreadgroups:MTLSizeMake((n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+static void enc_trunc_b(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s, id<MTLBuffer> xb, int n) {
+    qwen_metal_ctx *c=s->mc; uint32_t un=(uint32_t)n;
+    [e setComputePipelineState:MTB(c->pso_trunc_b)]; [e setBuffer:xb offset:0 atIndex:0]; [e setBytes:&un length:4 atIndex:1];
+    NSUInteger tp=(NSUInteger)n<256?(NSUInteger)n:256;
+    [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+static void enc_eadd_flat(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s, id<MTLBuffer> a, id<MTLBuffer> b, int n) {
+    qwen_metal_ctx *c=s->mc;
+    [e setComputePipelineState:MTB(c->pso_eadd_ip)]; [e setBuffer:a offset:0 atIndex:0]; [e setBuffer:b offset:0 atIndex:1];
+    NSUInteger tp=(NSUInteger)n<256?(NSUInteger)n:256;
+    [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+static void enc_kvstore_b(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s,
+                          id<MTLBuffer> kc, id<MTLBuffer> vc, size_t kvoff) {
+    qwen_metal_ctx *c=s->mc; uint32_t ukvd=(uint32_t)s->kvd, ukvm=(uint32_t)s->kv_max, uB=(uint32_t)s->B;
+    [e setComputePipelineState:MTB(c->pso_kvstore_b)];
+    [e setBuffer:kc offset:kvoff atIndex:0]; [e setBuffer:vc offset:kvoff atIndex:1];
+    [e setBuffer:MTB(s->k) offset:0 atIndex:2]; [e setBuffer:MTB(s->v) offset:0 atIndex:3];
+    [e setBytes:&ukvd length:4 atIndex:4]; [e setBuffer:MTB(s->d_pos) offset:0 atIndex:5];
+    [e setBytes:&ukvm length:4 atIndex:6]; [e setBytes:&uB length:4 atIndex:7];
+    NSUInteger n=(NSUInteger)s->B*s->kvd, tp=n<256?n:256;
+    [e dispatchThreadgroups:MTLSizeMake((n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+static void enc_attnb(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s,
+                      id<MTLBuffer> kc, id<MTLBuffer> vc, size_t kvoff, float scale) {
+    qwen_metal_ctx *c=s->mc; uint32_t unh=(uint32_t)s->nh, unkv=(uint32_t)s->nkv, uhd=(uint32_t)s->hd, uqd=(uint32_t)s->qd, ukvd=(uint32_t)s->kvd, ukvm=(uint32_t)s->kv_max;
+    [e setComputePipelineState:MTB(c->pso_attnb)];
+    [e setBuffer:MTB(s->q) offset:0 atIndex:0]; [e setBuffer:kc offset:kvoff atIndex:1]; [e setBuffer:vc offset:kvoff atIndex:2]; [e setBuffer:MTB(s->attn) offset:0 atIndex:3];
+    [e setBytes:&unh length:4 atIndex:4]; [e setBytes:&unkv length:4 atIndex:5]; [e setBytes:&uhd length:4 atIndex:6]; [e setBytes:&scale length:4 atIndex:7];
+    [e setBuffer:MTB(s->d_pos) offset:0 atIndex:8]; [e setBytes:&ukvm length:4 atIndex:9]; [e setBytes:&uqd length:4 atIndex:10]; [e setBytes:&ukvd length:4 atIndex:11];
+    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(s->B*s->nh),1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)s->hd,1,1)]; enc_bar(e);
+}
+static void enc_swiglu_ilb(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s, id<MTLBuffer> gub, id<MTLBuffer> gateb) {
+    qwen_metal_ctx *c=s->mc; uint32_t uinter=(uint32_t)s->inter, uB=(uint32_t)s->B;
+    [e setComputePipelineState:MTB(c->pso_swiglu_ilb)];
+    [e setBuffer:gub offset:0 atIndex:0]; [e setBuffer:gateb offset:0 atIndex:1]; [e setBytes:&uinter length:4 atIndex:2]; [e setBytes:&uB length:4 atIndex:3];
+    NSUInteger n=(NSUInteger)s->B*s->inter, tp=n<256?n:256;
+    [e dispatchThreadgroups:MTLSizeMake((n+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+}
+static void enc_talker_batch_body(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s) {
+    int B=s->B, H=s->H, qd=s->qd, kvd=s->kvd, nh=s->nh, nkv=s->nkv, inter=s->inter;
+    float scale=1.0f/sqrtf((float)s->hd);
+    id<MTLBuffer> x=MTB(s->x), xn=MTB(s->xn), qb=MTB(s->q), kb=MTB(s->k), vb=MTB(s->v);
+    id<MTLBuffer> attnb=MTB(s->attn), projb=MTB(s->proj), gateb=MTB(s->gate), gub=MTB(s->gu);
+    id<MTLBuffer> kc=MTB(s->kcache), vc=MTB(s->vcache);
+    for (int l=0; l<s->L; ++l) {
+        qwen_talker_layer_t *ly = &s->ctx->layers[l];
+        size_t kvoff = (size_t)l*B*s->kv_max*kvd*sizeof(float);
+        enc_rmsf_b(e, s, x, ly->input_norm, xn, H);
+        enc_mvb(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xn, qb, qd, H, 1);
+        enc_mvb(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xn, kb, kvd, H, 1);
+        enc_mvb(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xn, vb, kvd, H, 1);
+        enc_rmsph_b(e, s, qb, ly->q_norm, nh, qd);
+        enc_rmsph_b(e, s, kb, ly->k_norm, nkv, kvd);
+        enc_ropeneox_b(e, s, qb, nh, qd);
+        enc_ropeneox_b(e, s, kb, nkv, kvd);
+        enc_trunc_b(e, s, kb, B*kvd);
+        enc_trunc_b(e, s, vb, B*kvd);
+        enc_kvstore_b(e, s, kc, vc, kvoff);
+        enc_attnb(e, s, kc, vc, kvoff, scale);
+        enc_mvb(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd, 1);
+        enc_eadd_flat(e, s, x, projb, B*H);
+        enc_rmsf_b(e, s, x, ly->post_attn_norm, xn, H);
+        enc_mvb(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xn, gub, 2*inter, H, 1);
+        enc_swiglu_ilb(e, s, gub, gateb);
+        enc_mvb(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter, 1);
+        enc_eadd_flat(e, s, x, projb, B*H);
+    }
+    enc_rmsf_b(e, s, x, s->ctx->talker_norm, xn, H);
+}
+
+void *qwen_metal_talker_batch_init(void *single_state, int B) {
+    qwen_metal_talker_t *ss = single_state; if (!ss || B<1 || B>QMB_MAX) return NULL;
+    @autoreleasepool {
+        qwen_metal_ctx *c = ss->mc;
+        qwen_metal_talker_batch_t *s = calloc(1, sizeof(*s));
+        s->mc=c; s->ctx=ss->ctx; s->single=ss; s->B=B;
+        s->H=ss->H; s->qd=ss->qd; s->kvd=ss->kvd; s->inter=ss->inter;
+        s->nh=ss->nh; s->nkv=ss->nkv; s->hd=ss->hd; s->L=ss->L; s->kv_max=ss->kv_max; s->eps=ss->eps;
+        int H=s->H,qd=s->qd,kvd=s->kvd,inter=s->inter,L=s->L,kvm=s->kv_max;
+        s->kcache=(__bridge_retained void*)mk_buf(c,(size_t)L*B*kvm*kvd*sizeof(float));
+        s->vcache=(__bridge_retained void*)mk_buf(c,(size_t)L*B*kvm*kvd*sizeof(float));
+        s->x =(__bridge_retained void*)mk_buf(c,(size_t)B*H*sizeof(float));
+        s->xn=(__bridge_retained void*)mk_buf(c,(size_t)B*H*sizeof(float));
+        s->q =(__bridge_retained void*)mk_buf(c,(size_t)B*qd*sizeof(float));
+        s->k =(__bridge_retained void*)mk_buf(c,(size_t)B*kvd*sizeof(float));
+        s->v =(__bridge_retained void*)mk_buf(c,(size_t)B*kvd*sizeof(float));
+        s->attn=(__bridge_retained void*)mk_buf(c,(size_t)B*qd*sizeof(float));
+        s->proj=(__bridge_retained void*)mk_buf(c,(size_t)B*H*sizeof(float));
+        s->gate=(__bridge_retained void*)mk_buf(c,(size_t)B*inter*sizeof(float));
+        s->gu =(__bridge_retained void*)mk_buf(c,(size_t)B*2*inter*sizeof(float));
+        s->d_pos=(__bridge_retained void*)mk_buf(c,(size_t)B*sizeof(int));
+        fprintf(stderr,"Metal talker BATCH ready (B=%d, %d layers, hidden=%d)\n", B, L, H);
+        return s;
+    }
+}
+/* embeds=[B][H] host, pos_arr=[B] host; hidden_out=[B][H] host (final-normed). */
+void qwen_metal_talker_batch_step(void *st, const float *embeds, const int *pos_arr, float *hidden_out) {
+    qwen_metal_talker_batch_t *s = st; if (!s) return;
+    @autoreleasepool {
+        qwen_metal_ctx *c=s->mc; id<MTLCommandQueue> q=(__bridge id<MTLCommandQueue>)c->queue;
+        int B=s->B, H=s->H;
+        id<MTLBuffer> xb=MTB(s->x), dpos=MTB(s->d_pos), xnb=MTB(s->xn);
+        memcpy(xb.contents, embeds, (size_t)B*H*sizeof(float));
+        memcpy(dpos.contents, pos_arr, (size_t)B*sizeof(int));
+        id<MTLCommandBuffer> cb=[q commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+        enc_talker_batch_body(e, s);
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        if (hidden_out) memcpy(hidden_out, xnb.contents, (size_t)B*H*sizeof(float));
+    }
+}
+/* Seed slot b's device KV from the CPU batch engine bf16 KV (layout ((b*L+l)*src_kv_max+pos)*kvd). */
+void qwen_metal_talker_batch_upload_slot(void *st, int b, const uint16_t *kv_k, const uint16_t *kv_v,
+                                         int src_kv_max, int prefill_len) {
+    qwen_metal_talker_batch_t *s = st; if (!s || prefill_len<=0) return;
+    @autoreleasepool {
+        int L=s->L, B=s->B, kvd=s->kvd, dkvm=s->kv_max;
+        float *kcp=(float*)((__bridge id<MTLBuffer>)s->kcache).contents;
+        float *vcp=(float*)((__bridge id<MTLBuffer>)s->vcache).contents;
+        size_t nper=(size_t)prefill_len*kvd;
+        for (int l=0; l<L; ++l) {
+            const uint16_t *ck=kv_k+(((size_t)b*L+l)*src_kv_max)*kvd, *cv=kv_v+(((size_t)b*L+l)*src_kv_max)*kvd;
+            float *dk=kcp+(((size_t)l*B+b)*dkvm)*kvd, *dv=vcp+(((size_t)l*B+b)*dkvm)*kvd;
+            for (size_t i=0;i<nper;++i){ union{uint32_t u;float f;}a,cc; a.u=(uint32_t)ck[i]<<16; dk[i]=a.f; cc.u=(uint32_t)cv[i]<<16; dv[i]=cc.f; }
+        }
+    }
+}
+void qwen_metal_talker_batch_free(void *st) {
+    qwen_metal_talker_batch_t *s=st; if(!s) return;
+    void *ps[]={s->kcache,s->vcache,s->x,s->xn,s->q,s->k,s->v,s->attn,s->proj,s->gate,s->gu,s->d_pos};
+    for(unsigned i=0;i<sizeof(ps)/sizeof(ps[0]);++i){ void*p=ps[i]; if(p){ id o=(__bridge_transfer id)p; (void)o; } }
     free(s);
 }
 

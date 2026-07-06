@@ -1464,6 +1464,36 @@ int main(int argc, char **argv) {
         void *st = qwen_metal_talker_init(mc, ctx);
         if (!st) { fprintf(stderr, "gpu-selftest-talker(metal): talker init failed\n"); return 1; }
         for (int s = 0; s < N; s++) qwen_metal_talker_step(st, emb + (size_t)s * h, hg + (size_t)s * h, s);
+        /* ---- BATCHED step validation (the check that was missing last time): B replicas of the
+         * SAME stream must match the single Metal step (argmax + RMS-rel). Fresh KV, pos 0..N-1. ---- */
+        { int B = 4, bfail = 0;
+          void *bs = qwen_metal_talker_batch_init(st, B);
+          if (!bs) { fprintf(stderr, "gpu-selftest-batch(metal): batch init failed (B=%d)\n", B); fail = 1; }
+          else {
+            float *embB = (float*)malloc((size_t)B*h*sizeof(float));
+            float *hB   = (float*)malloc((size_t)B*h*sizeof(float));
+            int   *posB = (int*)malloc((size_t)B*sizeof(int));
+            double worst = 0;
+            for (int s = 0; s < N; s++) {
+                for (int b=0;b<B;b++){ posB[b]=s; memcpy(embB+(size_t)b*h, emb+(size_t)s*h, (size_t)h*sizeof(float)); }
+                qwen_metal_talker_batch_step(bs, embB, posB, hB);
+                for (int b=0;b<B;b++){
+                    double se=0, sr=0; int am_s=0, am_b=0; double bsg=-1e30, bbg=-1e30;
+                    for (int i=0;i<h;i++){ double g=hg[(size_t)s*h+i], gb=hB[(size_t)b*h+i], d=g-gb; se+=d*d; sr+=g*g;
+                        if (g>bsg){bsg=g;am_s=i;} if (gb>bbg){bbg=gb;am_b=i;} }
+                    double rmsrel = sqrt(se)/(sqrt(sr)+1e-9); if (rmsrel>worst) worst=rmsrel;
+                    /* Gate = argmax match (drives sampling). RMS-rel up to ~2e-2 is the benign fp fork
+                     * over 28 fused layers (mv_b scalar accum vs single float4) — same as single-vs-CPU. */
+                    if (am_s != am_b || rmsrel > 2.5e-2) { bfail=1;
+                        printf("  BATCH step %d slot %d: RMS-rel=%.3e argmax(single=%d batch=%d) FAIL\n", s, b, rmsrel, am_s, am_b); }
+                }
+            }
+            printf("gpu-selftest-batch (metal, B=%d): worst RMS-rel=%.3e  %s\n", B, worst, bfail?"FAIL":"PASS");
+            if (bfail) fail = 1;
+            free(embB); free(hB); free(posB);
+            qwen_metal_talker_batch_free(bs);
+          }
+        }
         qwen_metal_talker_free(st); qwen_metal_free(mc);
         for (int s = 0; s < N; s++) {
             double mx = 0, ref = 0, se = 0, sr = 0; int argmax_c = 0, argmax_g = 0; double bc = -1e30, bg = -1e30;
