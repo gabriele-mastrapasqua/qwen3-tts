@@ -177,9 +177,16 @@ CLI); **streaming TTFA = 269 ms to first audio** (chunk = 10 frames), stream RTF
 
 4 requests served in 27.7s vs ~78s serial → **2.81× throughput**; streaming **TTFA 314 ms**. batch==single
 audio bit-identical (mv_b float4). Trade-off: per-request latency rises to RTF ~1 (each step does B-slot work)
-but aggregate multi-user throughput scales ~2.8× at B=4 — the vLLM-style lever, now working on Metal. Headroom:
-mv_b is simdgroup-per-row (float4); switching the batched matvecs to the simdgroup_float8x8 MMA (matmat) would
-push the speedup toward the theoretical N×. (CUDA batch = 3.35×; CPU + CUDA + Metal now all batch.)
+but aggregate multi-user throughput scales ~2.8× at B=4 — the vLLM-style lever, now working on Metal.
+(CUDA batch = 3.35×; CPU + CUDA + Metal now all batch.)
+
+**MMA experiment (opt-in `QWEN_METAL_BATCH_MMA`, measured 2026-07-06 — REJECTED at B≤8):** replacing the
+simdgroup-per-row float4 `mv_b` with a simdgroup_float8x8 MMA matmat gave a better *scaling ratio* (3.27× vs
+2.81× at B=4) but a **2× worse baseline** (per-req RTF 1.88 vs 0.99, wall4 34s vs 20s) → net LOSS in absolute
+throughput. Reason: at B=4 the 8×8 MMA tile is half-empty (4 of 8 B-cols) and the kernel uses only 32
+threads/threadgroup → GPU underutilized for a matvec. MMA wins only at large B (≥16, compute-bound; cf. the
+matmat selftest 4.61× at B=32) — not our batch sizes. **float4 mv_b stays the default** (bit-identical + faster
+here). MMA kept opt-in (may pay off at large B on M4). Kernel-level lever measured, like ICB.
 
 **Findings:** (1) **Metal M2 beats native CPU M2 ~1.5–2×** everywhere. (2) Best = **0.6B Metal int8 = 0.39**
 (M1 floor was 0.60 → **1.54×**); **1.7B now sub-realtime** (0.50). (3) On M2 **int8 > int4 for Metal**
