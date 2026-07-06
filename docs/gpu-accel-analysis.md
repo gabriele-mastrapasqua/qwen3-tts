@@ -72,13 +72,13 @@ beyond macOS* (true — it's Metal underneath) with *no build dependency* (false
   and prints "CUDA backend unavailable". `make blas` untouched; `make cuda` adds one TU.
 - **Arch support**: CUDA 13 dropped Maxwell/Pascal/Volta → **Turing (sm_75) is the floor** (Pascal needs
   CUDA ≤12.x). bf16 native from **Ampere (sm_80)**; on Turing fall back to fp16-convert or int8. Blackwell
-  is two families: sm_100/103 (B100/B200) vs **sm_120 (RTX 5090, RTX PRO 6000) / sm_121 (DGX Spark GB10,
+  is two families: sm_100/103 (B100/B200) vs **sm_120 (RTX 5090, RTX PRO 6000) / sm_121 (a ~270 GB/s unified-memory NVIDIA part,
   aarch64 Grace)**. cuBLAS-only integration dodges all gencode pain (NVIDIA ships the kernels).
 - **Expected wins** (1.7B bf16 ≈ 3.4 GB/step, decode bandwidth-bound):
   - **RTX 5090 / PRO 6000** (~1.79 TB/s): ~26× M1 bandwidth; watch kernel-launch overhead (16 sequential
     CP passes/frame = hundreds of tiny launches → CUDA Graphs). Realistic end-to-end **5–15×** vs M1 CPU
     ⇒ RTF ~0.1–0.3 and huge batched-server headroom.
-  - **DGX Spark GB10** (273 GB/s LPDDR5x, cache-coherent unified memory): only ~4× M1 bandwidth —
+  - **a ~270 GB/s unified-memory NVIDIA part** (273 GB/s LPDDR5x, cache-coherent unified memory): only ~4× M1 bandwidth —
     llama.cpp there confirms dense decode is bandwidth-capped. Expect **~3–4× single-stream** (RTF
     ~0.3–0.5 bf16), excellent prefill/batch. Unified memory ⇒ the mmap-and-share trick works
     (`cudaHostRegister`/HMM), echoing the Metal story.
@@ -99,7 +99,7 @@ beyond macOS* (true — it's Metal underneath) with *no build dependency* (false
 |---|---|---|---|---|---|
 | **Metal direct** | none (macOS SDK) | +1 `.m` +1 `.metal`, 2 Makefile lines | M (4–8 d; +2–3 d decoder) | M1 ~1.0–1.2× (honest) | decoder-offload+overlap 1.2–1.5× e2e; batch 2–4×; forces the resident-weights architecture every backend reuses |
 | MLX / mlx-c | libmlx+libmlxc, CMake, C++17 | heavy | M–L | same silicon ceiling | **skip** |
-| **CUDA cuBLAS-first** | toolkit on the GPU box only; dlopen ⇒ binary dep-free | +1 `.c`, gcc-compilable | S–M (2–4 d prefill/batch) → M–L (8–15 d full resident decode + CUDA Graphs) | 5090: 5–15×; GB10: 3–4× | Turing+ (CUDA 13); bf16 sm_80+ |
+| **CUDA cuBLAS-first** | toolkit on the GPU box only; dlopen ⇒ binary dep-free | +1 `.c`, gcc-compilable | S–M (2–4 d prefill/batch) → M–L (8–15 d full resident decode + CUDA Graphs) | 5090: 5–15×; ~270 GB/s-class: 3–4× | Turing+ (CUDA 13); bf16 sm_80+ |
 | ROCm/HIP | multi-GB stack | hipify of CUDA TU | S after CUDA | ≈CUDA-class on supported HW | port only |
 | Vulkan | libvulkan; glslc build-time (SPIR-V committable) | most code | L (2–4 wk) | between ROCm and CUDA | on demand |
 
@@ -110,5 +110,5 @@ workflow; (3) HIP port if an AMD box appears; (4) Vulkan only on demonstrated de
 
 Key references: llama.cpp `ggml-metal.m` + Metal backend internals (deepwiki.com/ggml-org/llama.cpp),
 apple/metal-cpp, ml-explore/mlx-c, llama.cpp M-series bench (discussion #4167), CUDA 13 release notes,
-DGX Spark llama.cpp (discussion #16578), llama.cpp Vulkan (discussion #10879), Phoronix ROCm-vs-Vulkan
+unified-memory llama.cpp (discussion #16578), llama.cpp Vulkan (discussion #10879), Phoronix ROCm-vs-Vulkan
 (2025-11), machinethink.net MPS matmul.

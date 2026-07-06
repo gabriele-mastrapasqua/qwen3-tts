@@ -14,7 +14,7 @@ CPU kernels (bf16-exact within fp-order).
 
 ## Master table
 
-Status: ✅ = implemented + correctness-gated · 🔷 = implemented, DGX-compile-pending (nvcc; logic mirrors the
+Status: ✅ = implemented + correctness-gated · 🔷 = implemented, GPU-compile-pending (nvcc; logic mirrors the
 M1-validated Metal twin) · ⏳ = optimization TODO.
 
 | # | Op (code point) | Bound | CPU — SIMD path | Metal — kernel + M1 result | CUDA | Commit |
@@ -34,7 +34,7 @@ M1-validated Metal twin) · ⏳ = optimization TODO.
 | 13 | **quantize** bf16→int8/q4 (load-time) | — | NEON | n/a (host) | n/a (host) | — |
 
 **Metal column: COMPLETE** (19 ops, all `--gpu-selftest` PASS). **CUDA column: cuBLAS GEMM done + all compute
-kernels written** (🔷 DGX-compile-pending — no nvcc on the M1 dev box; each mirrors a validated Metal twin).
+kernels written** (🔷 GPU-compile-pending — no nvcc on the M1 dev box; each mirrors a validated Metal twin).
 
 ### Measured M1 wins (compute-bound → GPU wins)
 | block | CPU | Metal | speedup |
@@ -47,7 +47,7 @@ kernels written** (🔷 DGX-compile-pending — no nvcc on the M1 dev box; each 
 1. **CUDA Graphs / one command buffer per Talker+CP step** — collapse the 16×5-pass launch overhead. (Metal
    fusion pattern proven by the batched FFN; the full per-step resident decode is the remaining integration.)
 2. **int8/q4 dp4a decode** (halve bytes on the memory-bound CP path — the discrete-GPU/high-BW lever).
-3. **DGX**: `make cuda NVCC_ARCH=sm_XX` → `--gpu-selftest --backend cuda` → real cuBLAS RTF + tensor-core GemmEx.
+3. **NVIDIA box**: `make cuda NVCC_ARCH=sm_XX` → `--gpu-selftest --backend cuda` → real cuBLAS RTF + tensor-core GemmEx.
 
 ## Backend architecture (all three)
 - **Seam** `qwen_tts_backend.{h,c}` — vtable (resolver metal→cuda→cpu) + global offload hooks
@@ -55,7 +55,7 @@ kernels written** (🔷 DGX-compile-pending — no nvcc on the M1 dev box; each 
 - **Metal** `qwen_tts_metal.{h,m}` — clang ObjC + runtime-compiled MSL; **weights RESIDENT** (cached by
   pointer, uploaded once), IO buffers pooled; fused blocks via on-GPU `memoryBarrier` in one command buffer.
 - **CUDA** `qwen_tts_cuda.{h,c}` — cuBLAS-first (gcc, no nvcc); **weights RESIDENT** (converted+uploaded once,
-  cached), dX/dY reused. bf16 GemmEx tensor cores + custom decode matvec + CUDA Graphs = G3b (DGX).
+  cached), dX/dY reused. bf16 GemmEx tensor cores + custom decode matvec + CUDA Graphs = G3b (NVIDIA GPU).
 
 ## Ranked next (from the ggml/llama.cpp study — docs/gpu-accel-analysis.md + agent report)
 1. **One command buffer / CUDA-graph per Talker+CP step** — kills the 16×5-pass launch-overhead trap (the
@@ -64,10 +64,10 @@ kernels written** (🔷 DGX-compile-pending — no nvcc on the M1 dev box; each 
    (compute-bound; also frees CPU bandwidth for the next frame's Talker/CP). ~1.2–1.5× e2e.
 3. **Prefill/batch matmat** — Metal `mul_mm` (done as `matmat_bf16` MMA) wired into prefill; CUDA cuBLAS.
    Cuts the ~1.65 s TTFA floor; server batch 2–4× (M1), much more on discrete.
-4. **Batched bf16 matvec** (`ncols_dst≤8`) — CP cross-request batching; M1-neutral, 5090 5–15× / GB10 3–4×.
+4. **Batched bf16 matvec** (`ncols_dst≤8`) — CP cross-request batching; M1-neutral, 5090 5–15× / ~270 GB/s-class 3–4×.
 5. RMSNorm+RoPE fused into matvec epilogue · int8/q4 dp4a decode · flash-attn KV-resident.
 
-## CUDA correctness gotchas (for the DGX run)
+## CUDA correctness gotchas (for the GPU run)
 Row-major↔column-major (compute `Cᵀ=Bᵀ·Aᵀ`, swap operands — never transpose data; validate vs CPU golden) ·
 bf16 GemmEx needs sm_80+ (Turing fp16 fallback) · tensor-core tiles want M/N/K %8 + 16-byte-aligned ·
 **fp32 accumulate mandatory** (bf16 accumulate diverges from golden) · reproduce q8_1 act-quant + q4 −8 bias
