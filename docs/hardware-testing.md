@@ -150,6 +150,30 @@ Run all four delivery modes with **identical explicit params** (per CLAUDE.md te
 default thread count and `-j1`, for bf16 / int8 / int4. Text = one paragraph (~6–8 sentences) so
 `--batch` has something to split.
 
+### ✅ Measured: Mac mini **M2 Pro** (16-core GPU, 200 GB/s, macOS 26.3, rented) — 2026-07-06
+
+First GPU-inclusive rental. `bootstrap_m2.sh` (curl one-liner) → native `make metal CC=clang` (Xcode
+preinstalled) → `bench_m2.sh`. RTF = audio_s / gen_s, seed 42, ryan/Italian, fused Metal pipeline
+(resident Talker + device-frame CP). CPU column is the **native M2** path (`i8mm/SMMLA + bf16/BFDOT`
+fired — confirmed via `--caps`).
+
+| Model | Backend | bf16 | int8 | int4 |
+|---|---|---|---|---|
+| **0.6B** | **Metal** | 0.53 | **0.39** ⭐ | 0.44 |
+| 0.6B | CPU (M2) | 0.89 | 0.62 | 1.09 |
+| **1.7B** | **Metal** | 0.79 | 0.53 | **0.50** ⭐ |
+| 1.7B | CPU (M2) | 1.33 | 0.79 | 1.47–1.85 |
+
+**Findings:** (1) **Metal M2 beats native CPU M2 ~1.5–2×** everywhere. (2) Best = **0.6B Metal int8 = 0.39**
+(M1 floor was 0.60 → **1.54×**); **1.7B now sub-realtime** (0.50). (3) On M2 **int8 > int4 for Metal**
+(bandwidth-rich → nibble-unpack of int4 not worth it; int8 is the M-series GPU sweet spot). **int4 on
+CPU is a trap** (1.09→1.85 — nibble-unpack dominates). Use int8 on Apple Silicon. (4) 1.7B **int4 hurts
+quality** (gen ran long, 10s audio vs ~6s) → prefer 1.7B int8. (5) Bandwidth is 2.9× M1 but RTF only
+1.54× → **now dispatch/compute-bound, not bandwidth-bound.** `QWEN_METAL_PROFILE`: Talker step = encode
+0.96ms (12%) + GPU commit+wait 7.31ms (88%); **CP dominates** (1017ms vs Talker 603ms). So the remaining
+lever is **cutting GPU dispatch/work in the CP** (fusion / fewer weight re-reads), **not ICB** (ICB only
+removes the 12% encode → ~6–8% overall, not worth the epic — measured, not assumed).
+
 ```bash
 TXT="<a ~7-sentence paragraph>"
 SEED=42; V=ryan; L=Italian; D=qwen3-tts-0.6b
