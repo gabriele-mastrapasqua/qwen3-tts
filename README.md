@@ -57,7 +57,7 @@ make blas
 - **Voice cloning** — Clone any voice from a short WAV clip. Ship it as a compact **~25 MB graft `.qvoice`** (`tests/qvoice_to_graft.py` → `--icl-only`): keeps the CustomVoice weights so emotion levers (`--instruct`, `--expr`, `--ml-steer`) all work, with full prosody (sighs/pauses). An 8 KB `--xvector-only` `.bin` is the ultra-lean alternative (identity only). See `docs/icl-graft-portability.md`.
 - **Voice management** — List, inspect, delete `.qvoice` profiles (`--list-voices`, `--delete-voice`). No model required.
 - **Style control** — `--instruct` for emotion/style on 1.7B: angry, whisper, cheerful, and more.
-- **Emotion in one flag** — `--emotion <sad\|joy\|anger\|fear\|disgust\|surprise>` (1.7B) auto-applies the ear-validated recipe (per-language fine-tune `.expr` + steering vector + a default English instruct + temperature), on presets **and** cloned voices, in every Qwen language. A vivid English `--instruct` and `-T` override. Pitch-preserving `--rate`/`--volume` and a `--roughness` grit knob are still available. See [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
+- **Emotion in one flag** (🧪 **beta**; paralinguistics `[laugh]`/`[sigh]` 🧪 **alpha**) — `--emotion <sad\|joy\|anger\|fear\|disgust\|surprise>` (1.7B) auto-applies the ear-validated recipe (per-language fine-tune `.expr` + steering vector + a default English instruct + temperature), on presets **and** cloned voices, in every Qwen language. A vivid English `--instruct` and `-T` override. Pitch-preserving `--rate`/`--volume` and a `--roughness` grit knob are still available. See [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
 - **Inline markup for audiobooks** — write one text with ElevenLabs/Bark-style tags and get a multi-emotion take in one pass: `--text "I won! [excited] ...amazing! [pause:500ms] [sad] But it's over. [sigh]"`. Mid-text emotion switches, `[pause:400ms]`/`[break:1s]` pauses, and `[sigh]`/`[huff]` paralinguistic fillers — auto-detected in `--text` (no flag) or explicit via `--compose`. Spans are model-generated and concatenated seamlessly. See [docs/markup.md](docs/markup.md).
 - **VoiceDesign** — Create new voices from text descriptions.
 - **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`; JSON body takes `emotion`/`instruct`/`volume`/`rate` (same recipe as the CLI). **Inline `[mood]` markup works over the API too** — one request can switch emotion sentence-by-sentence (`"text":"[joy] Great news! [sad] But I must go."`), auto-detected and streamed span-by-span. See [docs/server.md](docs/server.md).
@@ -189,8 +189,12 @@ tiniest & cleanest) · **heavy WDELTA** (`--target-cv`, ~0.8–3 GB, bit-identic
 
 > Full guide: delta vs standard, format internals, troubleshooting → [docs/custom-voices.md](docs/custom-voices.md)
 
-### Emotion & expressivity (1.7B)
+### Emotion & expressivity (1.7B) · 🧪 Beta
 
+> 🧪 **Beta quality.** Ear-validated after ~a month of tuning, but results vary by language/voice and can still
+> be imprecise — expect rough edges (please gauge that before filing issues 🙏). Improvements will come, just
+> not today.
+>
 > ⚙️ **Setup (once):** run **`bash download_assets.sh`** to fetch the emotion fine-tunes (`.expr`, ~200 MB for
 > Italian) from Hugging Face → [**gabrione/qwen3-tts-italian-expr**](https://huggingface.co/gabrione/qwen3-tts-italian-expr).
 > The steering vectors already ship in this repo. **`--emotion` then works on the 9 presets AND on your own
@@ -247,8 +251,9 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
   `ono_anna`, KO `sohee`, ZH `vivian`, EN/Romance `ryan`); the engine prints a hint. Full recipe →
   [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
 - **Works in every Qwen3-TTS language** (EN, IT, DE, ZH, RU, KO, JA, ES, FR, PT) — just set `-l <Language>`.
-- **Paralinguistics → inline `[tags]`, also automatic.** Write `[laugh]` or `[sigh]` in `--text` and the engine
-  performs the event (it picks the onomatopoeia anchor + the right vector for you) — no flags:
+- **Paralinguistics → inline `[tags]`, also automatic · 🧪 Alpha.** Write `[laugh]` or `[sigh]` in `--text` and
+  the engine performs the event (it picks the onomatopoeia anchor + the right vector for you) — no flags.
+  *Alpha quality:* hit-or-miss across voices/languages (laughs land best); expect misses for now:
   ```bash
   ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.1 \
       --text "Che giornata... [sigh] non ce la faccio più. [laugh]" -o para.wav
