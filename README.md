@@ -450,6 +450,43 @@ total throughput on bandwidth-bound boxes. Measure it on your CPU with `make ben
 > Per-component breakdown, full GPU table, optimization history → [docs/performance.md](docs/performance.md)
 > x86 AVX2/AVX-512/VNNI findings + how to benchmark your CPU → [docs/x86-optimization.md](docs/x86-optimization.md)
 
+### 🖥️ GPU backends — Apple Metal & NVIDIA CUDA (opt-in)
+
+Optional `--backend metal|cuda` runs the **whole fused pipeline resident on the GPU** (weights + KV +
+activations on device, one command buffer / step). The CPU path stays the default — GPU is purely additive.
+Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDIA](docs/cuda-performance.md).
+
+**Apple Metal** — `make metal CC=clang`, then `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`:
+
+| Device | 0.6B RTF | 1.7B RTF | Streaming TTFA |
+|---|---|---|---|
+| **Apple M1** 8-core (dev box) | ~0.60 (int4) | — | — |
+| **Apple M2 Pro** 16-core GPU | **0.36–0.39** | **0.48–0.53** | **314 ms** / 517 ms |
+
+Metal beats the native M2 CPU path ~1.5–2×; **int8 is the sweet spot** on Apple Silicon (bandwidth-rich →
+int4's nibble-unpack doesn't pay). Resident decode is bit-identical to the CPU path.
+
+**NVIDIA CUDA** — `make cuda` (resident fused + cuBLAS pointwise convs + CUDA graphs), 1.7B, on a mainstream
+**~270 GB/s GPU (RTX 4060-class)**:
+
+| Config | RTF |
+|---|---|
+| Resident fused (`--quant-mixed`: int4 Talker + int8 CP) | **0.44** |
+
+Decode is bandwidth-bound, so RTF scales with memory bandwidth: RTX 3060 ~0.33 · 4070 ~0.24 · 4090 ~0.12
+(estimates; 4060-class is measured).
+
+**Throughput — server request-batching** (`--serve --batch-size N`, continuous batching + per-request
+streaming). Batching is a **throughput / parallelism** lever, *not* a per-request speedup — it serves N
+concurrent users in roughly the time of one by reading each weight once for all B sequences (matvec → matmat).
+**CPU, CUDA and Metal all batch:**
+
+| Backend | Batch speedup | Notes |
+|---|---|---|
+| **CUDA** (RTX 4060-class) | **~3.35× at B=8** | per-step (Talker 4.1× · CP 2.7×), ~3× end-to-end; output bit-identical solo-vs-batch |
+| **Apple Metal** (M2 Pro) | **~2.8× at B=4** | 0.6B 2.81× · 1.7B 2.82× (consistent); batch output bit-identical to single-stream |
+| **CPU** | ~N on bandwidth-bound x86 servers | ~1× on cache-rich M1 (single-stream is already fast) |
+
 ## Documentation
 
 | Guide | Contents |
