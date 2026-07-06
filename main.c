@@ -1494,6 +1494,39 @@ int main(int argc, char **argv) {
             qwen_metal_talker_batch_free(bs);
           }
         }
+        /* ---- PROMPT-KV test: reproduce the SERVER flow — seed a prompt KV, then ONE decode step.
+         * single(upload_kv) vs batch(upload_slot, slot 0) must match. This exercises upload_slot +
+         * the batch step reading pre-seeded prompt KV (the path --gpu-selftest-talker's fresh-KV run
+         * does NOT cover). If this FORKs, the bug is upload_slot/batch-step; if it matches, it's the
+         * server integration around them. ---- */
+        {
+            int pl = 20, Ln = ctx->config.num_layers, kvd = ctx->config.num_kv_heads*ctx->config.head_dim, kvm = ctx->kv_max;
+            uint64_t r2 = 0xBEEF1234ull;
+            for (int l=0;l<Ln;l++) for (int p=0;p<pl;p++) for (int i=0;i<kvd;i++) {
+                r2 = r2*6364136223846793005ull+1442695040888963407ull; float fv=(float)((r2>>40)/(double)(1u<<24))*2.0f-1.0f;
+                uint32_t u; memcpy(&u,&fv,4); ctx->kv_cache_k[(size_t)l*kvm*kvd+(size_t)p*kvd+i]=(uint16_t)(u>>16);
+                r2 = r2*6364136223846793005ull+1442695040888963407ull; float fw=(float)((r2>>40)/(double)(1u<<24))*2.0f-1.0f;
+                memcpy(&u,&fw,4); ctx->kv_cache_v[(size_t)l*kvm*kvd+(size_t)p*kvd+i]=(uint16_t)(u>>16);
+            }
+            void *ss = qwen_metal_talker_init(mc, ctx);
+            qwen_metal_talker_upload_kv(ss, ctx, pl);
+            float *he = (float*)malloc((size_t)h*sizeof(float));
+            qwen_metal_talker_step(ss, emb, he, pl);
+            void *bs2 = qwen_metal_talker_batch_init(ss, 2);
+            qwen_metal_talker_batch_upload_slot(bs2, 0, ctx->kv_cache_k, ctx->kv_cache_v, kvm, pl);
+            float *embB2=(float*)calloc((size_t)2*h,sizeof(float)); memcpy(embB2, emb, (size_t)h*sizeof(float));
+            int posB2[2]={pl,0}; float *hB2=(float*)malloc((size_t)2*h*sizeof(float));
+            qwen_metal_talker_batch_step(bs2, embB2, posB2, hB2);
+            double se2=0, sr2=0; int am_s=0, am_b=0; double bsg=-1e30, bbg=-1e30;
+            for (int i=0;i<h;i++){ double a=he[i], bc2=hB2[i], d=a-bc2; se2+=d*d; sr2+=a*a;
+                if(a>bsg){bsg=a;am_s=i;} if(bc2>bbg){bbg=bc2;am_b=i;} }
+            double rr = sqrt(se2)/(sqrt(sr2)+1e-9);
+            printf("gpu-selftest-batch-promptKV (pl=%d): RMS-rel=%.3e argmax(single=%d batch=%d) %s\n",
+                   pl, rr, am_s, am_b, (am_s==am_b && rr<2.5e-2)?"PASS":"FAIL");
+            if (!(am_s==am_b && rr<2.5e-2)) fail=1;
+            free(he); free(embB2); free(hB2);
+            qwen_metal_talker_batch_free(bs2); qwen_metal_talker_free(ss);
+        }
         qwen_metal_talker_free(st); qwen_metal_free(mc);
         for (int s = 0; s < N; s++) {
             double mx = 0, ref = 0, se = 0, sr = 0; int argmax_c = 0, argmax_g = 0; double bc = -1e30, bg = -1e30;
