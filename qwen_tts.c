@@ -2304,7 +2304,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     { extern void *g_cuda_talker_state, *g_cuda_cp_state;
       want_cuda_batch = (getenv("QWEN_CUDA_BATCH") && g_cuda_talker_state && g_cuda_cp_state && B <= 8); }
 #endif
-    if (ctx->layers[0].wq_bf16 == NULL && !want_cuda_batch) return -2;   /* CPU batched step is bf16 only */
+    int want_metal_batch = 0;
+#ifdef QWEN_HAVE_METAL
+    { extern void *g_metal_talker_state;
+      want_metal_batch = (getenv("QWEN_METAL_BATCH") && g_metal_talker_state && B <= 8); }
+#endif
+    if (ctx->layers[0].wq_bf16 == NULL && !want_cuda_batch && !want_metal_batch) return -2;   /* CPU batched step is bf16 only */
     int h = ctx->config.hidden_size;
     int kvd = ctx->config.num_kv_heads * ctx->config.head_dim;
     int num_layers = ctx->config.num_layers;
@@ -2339,6 +2344,28 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         else fprintf(stderr, "[serve] GPU batched init failed — falling back to CPU batch path\n");
     } else if (getenv("QWEN_CUDA_BATCH") && B > 8) {
         fprintf(stderr, "[serve] QWEN_CUDA_BATCH: batch-size %d > 8 (QB_MAX) — using CPU batch path\n", B);
+    }
+#endif
+
+    /* Metal batched Talker+CP (throughput): opt-in QWEN_METAL_BATCH, needs the fused single Talker
+     * (QWEN_METAL_FUSED_TALKER --backend metal). Both batch states derive from g_metal_talker_state. */
+    int metal_batch = 0;
+#ifdef QWEN_HAVE_METAL
+    extern void *g_metal_talker_state, *g_metal_talker_batch_state, *g_metal_cp_batch_state;
+    extern void *qwen_metal_talker_batch_init(void *, int);
+    extern void *qwen_metal_cp_batch_init(void *, int);
+    extern void  qwen_metal_talker_batch_upload_slot(void *, int, const uint16_t *, const uint16_t *, int, int);
+    extern void  qwen_metal_talker_batch_free(void *);
+    extern void  qwen_metal_cp_batch_free(void *);
+    if (want_metal_batch) {
+        g_metal_talker_batch_state = qwen_metal_talker_batch_init(g_metal_talker_state, B);
+        if (!getenv("QWEN_METAL_BATCH_NOCP"))   /* diag: keep CP on CPU to isolate talker-batch vs CP-batch */
+            g_metal_cp_batch_state = qwen_metal_cp_batch_init(g_metal_talker_state, B);
+        metal_batch = (g_metal_talker_batch_state != NULL);
+        if (metal_batch) fprintf(stderr, "[serve] Metal batched Talker+CP ENABLED (B=%d, matvec->matmat)\n", B);
+        else fprintf(stderr, "[serve] Metal batched init failed — falling back to CPU batch path\n");
+    } else if (getenv("QWEN_METAL_BATCH") && B > 8) {
+        fprintf(stderr, "[serve] QWEN_METAL_BATCH: batch-size %d > 8 — using CPU batch path\n", B);
     }
 #endif
 
@@ -2441,6 +2468,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 #ifdef QWEN_HAVE_CUDA
                 if (cuda_batch) qwen_cuda_talker_batch_upload_slot(g_cuda_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
 #endif
+#ifdef QWEN_HAVE_METAL
+                if (metal_batch) qwen_metal_talker_batch_upload_slot(g_metal_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
+#endif
                 p_temp[b] = p->req.temperature; p_topk[b] = p->req.top_k; p_topp[b] = p->req.top_p;
                 p_rep[b] = p->req.rep_penalty; p_gw[b] = p->req.greedy_warmup; rng[b] = p->req.seed;
                 nprev[b] = 0; chframes[b] = 0; sframe[b] = 0;
@@ -2482,6 +2512,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             pos[b] = pl;
 #ifdef QWEN_HAVE_CUDA
             if (cuda_batch) qwen_cuda_talker_batch_upload_slot(g_cuda_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
+#endif
+#ifdef QWEN_HAVE_METAL
+            if (metal_batch) qwen_metal_talker_batch_upload_slot(g_metal_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
 #endif
             p_temp[b] = req.temperature; p_topk[b] = req.top_k; p_topp[b] = req.top_p;
             p_rep[b] = req.rep_penalty; p_gw[b] = req.greedy_warmup; rng[b] = req.seed;
@@ -2606,6 +2639,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     if (cuda_batch) {
         qwen_cuda_talker_batch_free(g_cuda_talker_batch_state); g_cuda_talker_batch_state = NULL;
         qwen_cuda_cp_batch_free(g_cuda_cp_batch_state); g_cuda_cp_batch_state = NULL;
+    }
+#endif
+#ifdef QWEN_HAVE_METAL
+    if (metal_batch) {
+        qwen_metal_talker_batch_free(g_metal_talker_batch_state); g_metal_talker_batch_state = NULL;
+        qwen_metal_cp_batch_free(g_metal_cp_batch_state); g_metal_cp_batch_state = NULL;
     }
 #endif
     return 0;

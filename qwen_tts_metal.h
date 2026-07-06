@@ -121,6 +121,11 @@ void  qwen_metal_talker_batch_step(void *state, const float *embeds, const int *
 void  qwen_metal_talker_batch_upload_slot(void *state, int b, const uint16_t *kv_k, const uint16_t *kv_v,
                                           int src_kv_max, int prefill_len);
 void  qwen_metal_talker_batch_free(void *state);
+/* BATCHED CP step (reuses the talker-batch machinery, CP dims): x=[B][cp_h] residual in/out.
+ * Takes the single TALKER state (for mc+ctx); builds CP dims + cp rope from ctx->config.cp_*. */
+void *qwen_metal_cp_batch_init(void *single_talker_state, int B);
+void  qwen_metal_cp_batch_step(void *state, float *x, const int *pos_arr);
+void  qwen_metal_cp_batch_free(void *state);
 
 #ifdef __cplusplus
 }

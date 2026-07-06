@@ -749,6 +749,8 @@ void *g_cuda_cp_batch_state = NULL;
 #ifdef QWEN_HAVE_METAL
 void *g_metal_cp_state = NULL;   /* GPU-resident fused CP step (Metal, G2) */
 void *g_metal_cp_frame_state = NULL;   /* device-frame CP (whole 16-pass loop on GPU, 1 sync/frame) */
+void *g_metal_cp_batch_state = NULL;   /* batched CP step (server throughput) */
+extern void qwen_metal_cp_batch_step(void *state, float *x, const int *pos_arr);
 #endif
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_cp_step(void *state, float *x, int pos);
@@ -1007,6 +1009,13 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         return;
     }
 #endif
+#ifdef QWEN_HAVE_METAL
+    if (g_metal_cp_batch_state && B <= 8) {
+        int pos_arr[8]; for (int b = 0; b < B; b++) pos_arr[b] = pos;
+        qwen_metal_cp_batch_step(g_metal_cp_batch_state, x, pos_arr);
+        return;
+    }
+#endif
     for (int b = 0; b < B; b++)
         qwen_rms_norm(x_norm + (size_t)b * ch, x + (size_t)b * ch, ctx->cp_layers[0].input_norm, 1, ch, eps);
     for (int layer = 0; layer < c->cp_num_layers; layer++)
@@ -1022,6 +1031,9 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     int cp_gpu = 0;
 #ifdef QWEN_HAVE_CUDA
     { extern void *g_cuda_cp_batch_state; cp_gpu = (g_cuda_cp_batch_state != NULL); }
+#endif
+#ifdef QWEN_HAVE_METAL
+    if (g_metal_cp_batch_state) cp_gpu = 1;
 #endif
     if (!cp_gpu && (!ctx->cp_layers[0].wq_bf16 || !ctx->cp_lm_head_bf16[0])) return -2;  /* v1 CPU: bf16 only */
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;

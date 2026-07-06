@@ -1676,11 +1676,12 @@ void qwen_metal_talker_free(void *st) {
  * ======================================================================== */
 #define QMB_MAX 8
 typedef struct {
-    qwen_metal_ctx *mc; qwen_tts_ctx_t *ctx; qwen_metal_talker_t *single;
+    qwen_metal_ctx *mc; qwen_tts_ctx_t *ctx;
     int B, H, qd, kvd, inter, nh, nkv, hd, L, kv_max; float eps;
     void *kcache, *vcache;                              /* [L][B][kv_max][kvd] */
     void *x, *xn, *q, *k, *v, *attn, *proj, *gate, *gu; /* [B][dim] */
     void *d_pos;                                        /* int[B] */
+    void *rope_cos, *rope_sin;                          /* owned (talker rope or cp rope) */
 } qwen_metal_talker_batch_t;
 
 /* precision-dispatched BATCHED matmat: Y[B][rows] = W[rows,cols] @ X[B][cols]. */
@@ -1729,7 +1730,7 @@ static void enc_ropeneox_b(id<MTLComputeCommandEncoder> e, qwen_metal_talker_bat
                            id<MTLBuffer> xb, int n_heads, int stride) {
     qwen_metal_ctx *c=s->mc; uint32_t unh=(uint32_t)n_heads, uhd=(uint32_t)s->hd, ust=(uint32_t)stride, uB=(uint32_t)s->B;
     [e setComputePipelineState:MTB(c->pso_ropeneox_b)];
-    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:MTB(s->single->rope_cos) offset:0 atIndex:1]; [e setBuffer:MTB(s->single->rope_sin) offset:0 atIndex:2];
+    [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:MTB(s->rope_cos) offset:0 atIndex:1]; [e setBuffer:MTB(s->rope_sin) offset:0 atIndex:2];
     [e setBytes:&unh length:4 atIndex:3]; [e setBytes:&uhd length:4 atIndex:4];
     [e setBuffer:MTB(s->d_pos) offset:0 atIndex:5]; [e setBytes:&ust length:4 atIndex:6]; [e setBytes:&uB length:4 atIndex:7];
     NSUInteger n=(NSUInteger)s->B*n_heads*(s->hd/2), tp=n<256?n:256;
@@ -1811,10 +1812,13 @@ void *qwen_metal_talker_batch_init(void *single_state, int B) {
     @autoreleasepool {
         qwen_metal_ctx *c = ss->mc;
         qwen_metal_talker_batch_t *s = calloc(1, sizeof(*s));
-        s->mc=c; s->ctx=ss->ctx; s->single=ss; s->B=B;
+        s->mc=c; s->ctx=ss->ctx; s->B=B;
         s->H=ss->H; s->qd=ss->qd; s->kvd=ss->kvd; s->inter=ss->inter;
         s->nh=ss->nh; s->nkv=ss->nkv; s->hd=ss->hd; s->L=ss->L; s->kv_max=ss->kv_max; s->eps=ss->eps;
-        int H=s->H,qd=s->qd,kvd=s->kvd,inter=s->inter,L=s->L,kvm=s->kv_max;
+        int H=s->H,qd=s->qd,kvd=s->kvd,inter=s->inter,L=s->L,kvm=s->kv_max, half=s->hd/2;
+        id<MTLDevice> dev=(__bridge id<MTLDevice>)c->device;
+        s->rope_cos=(__bridge_retained void*)[dev newBufferWithBytes:ss->ctx->rope_cos length:(size_t)kvm*half*sizeof(float) options:MTLResourceStorageModeShared];
+        s->rope_sin=(__bridge_retained void*)[dev newBufferWithBytes:ss->ctx->rope_sin length:(size_t)kvm*half*sizeof(float) options:MTLResourceStorageModeShared];
         s->kcache=(__bridge_retained void*)mk_buf(c,(size_t)L*B*kvm*kvd*sizeof(float));
         s->vcache=(__bridge_retained void*)mk_buf(c,(size_t)L*B*kvm*kvd*sizeof(float));
         s->x =(__bridge_retained void*)mk_buf(c,(size_t)B*H*sizeof(float));
@@ -1864,10 +1868,90 @@ void qwen_metal_talker_batch_upload_slot(void *st, int b, const uint16_t *kv_k, 
 }
 void qwen_metal_talker_batch_free(void *st) {
     qwen_metal_talker_batch_t *s=st; if(!s) return;
-    void *ps[]={s->kcache,s->vcache,s->x,s->xn,s->q,s->k,s->v,s->attn,s->proj,s->gate,s->gu,s->d_pos};
+    void *ps[]={s->kcache,s->vcache,s->x,s->xn,s->q,s->k,s->v,s->attn,s->proj,s->gate,s->gu,s->d_pos,s->rope_cos,s->rope_sin};
     for(unsigned i=0;i<sizeof(ps)/sizeof(ps[0]);++i){ void*p=ps[i]; if(p){ id o=(__bridge_transfer id)p; (void)o; } }
     free(s);
 }
+
+/* BATCHED CP body: same machinery as the Talker batch body but reads ctx->cp_layers and has NO
+ * final norm — returns the residual x (caller applies cp_norm + lm-head + argmax per slot). Mirrors
+ * cp_body_batch. Reuses qwen_metal_talker_batch_t/init/free (init from a single CP state = CP dims). */
+static void enc_cp_batch_body(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s) {
+    int B=s->B, H=s->H, qd=s->qd, kvd=s->kvd, nh=s->nh, nkv=s->nkv, inter=s->inter;
+    float scale=1.0f/sqrtf((float)s->hd);
+    id<MTLBuffer> x=MTB(s->x), xn=MTB(s->xn), qb=MTB(s->q), kb=MTB(s->k), vb=MTB(s->v);
+    id<MTLBuffer> attnb=MTB(s->attn), projb=MTB(s->proj), gateb=MTB(s->gate), gub=MTB(s->gu);
+    id<MTLBuffer> kc=MTB(s->kcache), vc=MTB(s->vcache);
+    for (int l=0; l<s->L; ++l) {
+        qwen_cp_layer_t *ly = &s->ctx->cp_layers[l];
+        size_t kvoff = (size_t)l*B*s->kv_max*kvd*sizeof(float);
+        enc_rmsf_b(e, s, x, ly->input_norm, xn, H);
+        enc_mvb(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xn, qb, qd, H, 1);
+        enc_mvb(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xn, kb, kvd, H, 1);
+        enc_mvb(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xn, vb, kvd, H, 1);
+        enc_rmsph_b(e, s, qb, ly->q_norm, nh, qd);
+        enc_rmsph_b(e, s, kb, ly->k_norm, nkv, kvd);
+        enc_ropeneox_b(e, s, qb, nh, qd);
+        enc_ropeneox_b(e, s, kb, nkv, kvd);
+        enc_trunc_b(e, s, kb, B*kvd);
+        enc_trunc_b(e, s, vb, B*kvd);
+        enc_kvstore_b(e, s, kc, vc, kvoff);
+        enc_attnb(e, s, kc, vc, kvoff, scale);
+        enc_mvb(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd, 1);
+        enc_eadd_flat(e, s, x, projb, B*H);
+        enc_rmsf_b(e, s, x, ly->post_attn_norm, xn, H);
+        enc_mvb(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xn, gub, 2*inter, H, 1);
+        enc_swiglu_ilb(e, s, gub, gateb);
+        enc_mvb(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter, 1);
+        enc_eadd_flat(e, s, x, projb, B*H);
+    }
+    /* NO final norm — the CP caller norms + lm-heads + argmaxes each slot. */
+}
+void *qwen_metal_cp_batch_init(void *single_talker_state, int B) {
+    qwen_metal_talker_t *ss = single_talker_state; if (!ss || B<1 || B>QMB_MAX) return NULL;
+    @autoreleasepool {
+        qwen_metal_ctx *c = ss->mc; qwen_tts_ctx_t *ctx = ss->ctx; qwen_tts_config_t *cf = &ctx->config;
+        qwen_metal_talker_batch_t *s = calloc(1, sizeof(*s));
+        s->mc=c; s->ctx=ctx; s->B=B;
+        s->H=cf->cp_hidden_size; s->nh=cf->cp_num_heads; s->nkv=cf->cp_num_kv_heads; s->hd=cf->cp_head_dim;
+        s->inter=cf->cp_intermediate_size; s->L=cf->cp_num_layers; s->kv_max=ctx->cp_kv_max; s->eps=cf->rms_norm_eps;
+        s->qd=s->nh*s->hd; s->kvd=s->nkv*s->hd;
+        int H=s->H,qd=s->qd,kvd=s->kvd,inter=s->inter,L=s->L,kvm=s->kv_max, half=s->hd/2;
+        id<MTLDevice> dev=(__bridge id<MTLDevice>)c->device;
+        s->rope_cos=(__bridge_retained void*)[dev newBufferWithBytes:ctx->cp_rope_cos length:(size_t)kvm*half*sizeof(float) options:MTLResourceStorageModeShared];
+        s->rope_sin=(__bridge_retained void*)[dev newBufferWithBytes:ctx->cp_rope_sin length:(size_t)kvm*half*sizeof(float) options:MTLResourceStorageModeShared];
+        s->kcache=(__bridge_retained void*)mk_buf(c,(size_t)L*B*kvm*kvd*sizeof(float));
+        s->vcache=(__bridge_retained void*)mk_buf(c,(size_t)L*B*kvm*kvd*sizeof(float));
+        s->x=(__bridge_retained void*)mk_buf(c,(size_t)B*H*sizeof(float));
+        s->xn=(__bridge_retained void*)mk_buf(c,(size_t)B*H*sizeof(float));
+        s->q=(__bridge_retained void*)mk_buf(c,(size_t)B*qd*sizeof(float));
+        s->k=(__bridge_retained void*)mk_buf(c,(size_t)B*kvd*sizeof(float));
+        s->v=(__bridge_retained void*)mk_buf(c,(size_t)B*kvd*sizeof(float));
+        s->attn=(__bridge_retained void*)mk_buf(c,(size_t)B*qd*sizeof(float));
+        s->proj=(__bridge_retained void*)mk_buf(c,(size_t)B*H*sizeof(float));
+        s->gate=(__bridge_retained void*)mk_buf(c,(size_t)B*inter*sizeof(float));
+        s->gu=(__bridge_retained void*)mk_buf(c,(size_t)B*2*inter*sizeof(float));
+        s->d_pos=(__bridge_retained void*)mk_buf(c,(size_t)B*sizeof(int));
+        fprintf(stderr,"Metal CP BATCH ready (B=%d, %d layers, cp_hidden=%d)\n", B, L, H);
+        return s;
+    }
+}
+/* x=[B][cp_h] host residual in/out; pos_arr=[B] host (the CP pass position per slot). */
+void qwen_metal_cp_batch_step(void *st, float *x, const int *pos_arr) {
+    qwen_metal_talker_batch_t *s = st; if (!s) return;
+    @autoreleasepool {
+        qwen_metal_ctx *c=s->mc; id<MTLCommandQueue> q=(__bridge id<MTLCommandQueue>)c->queue;
+        int B=s->B, H=s->H;
+        id<MTLBuffer> xb=MTB(s->x), dpos=MTB(s->d_pos);
+        memcpy(xb.contents, x, (size_t)B*H*sizeof(float));
+        memcpy(dpos.contents, pos_arr, (size_t)B*sizeof(int));
+        id<MTLCommandBuffer> cb=[q commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+        enc_cp_batch_body(e, s);
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(x, xb.contents, (size_t)B*H*sizeof(float));   /* residual out (NOT normed) */
+    }
+}
+void qwen_metal_cp_batch_free(void *st) { qwen_metal_talker_batch_free(st); }
 
 /* ======================================================================== *
  *  GPU-RESIDENT FUSED CODE PREDICTOR STEP (Metal, G2). Same machinery as the

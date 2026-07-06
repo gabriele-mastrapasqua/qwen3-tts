@@ -496,7 +496,9 @@ void *g_cuda_talker_batch_state = NULL;
 #ifdef QWEN_HAVE_METAL
 /* GPU-resident fused Talker step (Metal, G2). Same delegation as CUDA. */
 void *g_metal_talker_state = NULL;
+void *g_metal_talker_batch_state = NULL;   /* batched fused Talker step (server throughput) */
 extern void qwen_metal_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+extern void qwen_metal_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
 #endif
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
@@ -1159,6 +1161,12 @@ int qwen_batch_talker_step_ragged(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     extern void *g_cuda_talker_batch_state;
     if (g_cuda_talker_batch_state) {
         qwen_cuda_talker_batch_step(g_cuda_talker_batch_state, embeds, pos_arr, hidden_out);
+        return 0;
+    }
+#endif
+#ifdef QWEN_HAVE_METAL
+    if (g_metal_talker_batch_state) {
+        qwen_metal_talker_batch_step(g_metal_talker_batch_state, embeds, pos_arr, hidden_out);
         return 0;
     }
 #endif
