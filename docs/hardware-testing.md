@@ -165,9 +165,21 @@ fired — confirmed via `--caps`).
 | 1.7B | CPU (M2) | 1.33 | 0.79 | 1.47–1.85 |
 
 **Server mode** (Metal fused, 0.6B int8, `--serve`): **sequential steady-state RTF ~0.37** (no overhead vs
-CLI); **streaming TTFA = 269 ms to first audio** (chunk = 10 frames), stream RTF 0.36. ⚠️ **Concurrent
-requests stall** on the plain server (single Metal device-state + accept-loop blocks during synth) →
-multi-user throughput needs the batched Metal step (see below), not wired yet.
+CLI); **streaming TTFA = 269 ms to first audio** (chunk = 10 frames), stream RTF 0.36.
+
+**⭐ Batched Metal server (throughput, `QWEN_METAL_BATCH=1 --batch-size N`, 0.6B, temp0, measured 2026-07-06):**
+
+| N concurrent | wall | per-req RTF | **batching speedup** (N·wall₁/wallₙ) |
+|---|---|---|---|
+| 1 | 19.5s | 1.01 | baseline (B=4 server does B× work even for 1 req) |
+| 2 | 21.9s | 1.13 | **1.78×** |
+| 4 | 27.7s | 0.99 | **2.81×** |
+
+4 requests served in 27.7s vs ~78s serial → **2.81× throughput**; streaming **TTFA 314 ms**. batch==single
+audio bit-identical (mv_b float4). Trade-off: per-request latency rises to RTF ~1 (each step does B-slot work)
+but aggregate multi-user throughput scales ~2.8× at B=4 — the vLLM-style lever, now working on Metal. Headroom:
+mv_b is simdgroup-per-row (float4); switching the batched matvecs to the simdgroup_float8x8 MMA (matmat) would
+push the speedup toward the theoretical N×. (CUDA batch = 3.35×; CPU + CUDA + Metal now all batch.)
 
 **Findings:** (1) **Metal M2 beats native CPU M2 ~1.5–2×** everywhere. (2) Best = **0.6B Metal int8 = 0.39**
 (M1 floor was 0.60 → **1.54×**); **1.7B now sub-realtime** (0.50). (3) On M2 **int8 > int4 for Metal**
