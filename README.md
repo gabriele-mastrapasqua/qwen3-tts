@@ -147,31 +147,37 @@ bash download_voices.sh    # fetch galatea(IT)/quijote(ES)/ohenry(EN)/hugo(FR) i
 ```
 Hosted on Hugging Face → [**gabrione/qwen3-tts-voices**](https://huggingface.co/gabrione/qwen3-tts-voices) (CC0, LibriVox attribution).
 
-### Custom Voices with Delta `.qvoice`
+### Custom Voices — small, portable, and *emotable* `.qvoice`
 
-The killer feature: clone a voice once, save it as a `.qvoice` with `--target-cv`,
-and use it forever on the CustomVoice model — **bit-identical** to the original clone.
-Works with `--instruct`, streaming, and the HTTP server.
+Clone a voice once, save it as a portable `.qvoice`, reuse it forever on the CustomVoice model — with
+`--instruct`, `--emotion`, streaming, and the HTTP server.
+
+**The default `.qvoice` is now a ~25 MB "graft"** — it keeps the CustomVoice weights, so it stays small,
+carries full prosody, **and the emotion / instruct levers still work on your clone** (no more multi-GB
+weight-delta files):
 
 ```bash
-# Create (one-time: needs both Base + CV models)
+# Create — default = ~25 MB graft (one-time; needs the Base model)
 ./qwen_tts -d qwen3-tts-0.6b-base --ref-audio mario.wav -l Italian \
-    --voice-name "Mario" --target-cv qwen3-tts-0.6b \
-    --save-voice mario.qvoice
+    --voice-name "Mario" --save-voice mario.qvoice
 
-# Use forever (only CV model + .qvoice needed)
-./qwen_tts -d qwen3-tts-0.6b --load-voice mario.qvoice \
+# Use it on CustomVoice — --icl-only keeps the CV weights (→ instruct/emotion work)
+./qwen_tts -d qwen3-tts-0.6b --load-voice mario.qvoice --icl-only \
     --text "Ciao, come stai?" -o output.wav
 
-# On the server
-./qwen_tts -d qwen3-tts-0.6b --load-voice mario.qvoice --serve 8080
+# ...with an emotion, on your OWN cloned voice:
+./qwen_tts -d qwen3-tts-0.6b --load-voice mario.qvoice --icl-only \
+    --emotion joy -l Italian --text "Ce l'abbiamo fatta!" -o joy.wav
 
-# Manage voice profiles (no model needed)
+# Server / manage
+./qwen_tts -d qwen3-tts-0.6b --load-voice mario.qvoice --icl-only --serve 8080
 ./qwen_tts --list-voices ./my_voices/
-./qwen_tts --delete-voice ./my_voices/old.qvoice
 ```
 
-**Voice clone samples** — all generated via `.qvoice` delta on 0.6B CustomVoice:
+**Other formats** → [docs/custom-voices.md](docs/custom-voices.md): **8 KB `.bin` x-vector** (`--xvector-only`,
+tiniest & cleanest) · **heavy WDELTA** (`--target-cv`, ~0.8–3 GB, bit-identical — only if you need exact fidelity).
+
+**Voice clone samples** — cloned voices on 0.6B CustomVoice (25 MB grafts):
 
 | Language | Voice | Source | Output | Text |
 |----------|-------|--------|--------|------|
@@ -185,10 +191,22 @@ Works with `--instruct`, streaming, and the HTTP server.
 
 ### Emotion & expressivity (1.7B)
 
+> ⚙️ **Setup (once):** run **`bash download_assets.sh`** to fetch the emotion fine-tunes (`.expr`, ~200 MB for
+> Italian) from Hugging Face → [**gabrione/qwen3-tts-italian-expr**](https://huggingface.co/gabrione/qwen3-tts-italian-expr).
+> The steering vectors already ship in this repo. **`--emotion` then works on the 9 presets AND on your own
+> cloned voices.** No clone yet? Grab ready-made **CC0 graft voices** with `bash download_voices.sh` →
+> [**gabrione/qwen3-tts-voices**](https://huggingface.co/gabrione/qwen3-tts-voices) and emote them straight away.
+
 Emotion is **one flag**. Pick an emotion with `--emotion` and the engine auto-composes the validated
 **COMBINE** stack for you — the per-language fine-tune (`.expr`) **plus** the steering vector for that
 voice and emotion, at the ear-validated weights. No file paths, no layer ranges. A vivid **English or
 Chinese** `--instruct` on top is optional but **recommended** — it drives the strongest, most natural result.
+
+```bash
+# emotion on a CLONED voice (galatea = a ready-made CC0 graft) — same one flag
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/galatea_graft.qvoice --icl-only \
+    -l Italian --emotion sad --text "Ho perso tutto, e adesso non so più cosa fare." -o sad.wav
+```
 
 ```bash
 # emotion in ONE flag — works on presets AND cloned voices
