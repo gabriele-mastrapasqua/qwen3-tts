@@ -265,6 +265,29 @@ trigger discovery for vivian/clone (find their yawn/throat onom, as `ahh` was fo
 ryan-gated; (c) park as ryan candidates. Audio: `samples/tests/2026-07-07_{yawn_xvoice,groan_throat_xvoice}/`.
 CLAP uncalibrated for these events → ear should confirm the vivian-laughs / clone-hums reads before finalizing.
 
+> ⚠️ **CORRECTION (2026-07-07): the yawn "KO" above is likely a CLAP artifact, not a real KO.** CLAP is
+> calibrated ONLY for laugh+sigh; a breathy YAWN is acoustically ≈ a breathy laugh, so CLAP labeling
+> vivian's `哈啊` "laugh 0.54" is probably a MISLABEL. **T3-val (2026-07-01) already ear-validated `哈啊`
+> yawn on vivian (s7/s42) AND galatea clone (s42).** ⇒ `[yawn]` `哈啊` is most likely ALREADY universal;
+> re-ear the existing `samples/tests/2026-07-07_yawn_xvoice/` clips to confirm, then wire. Lesson: do NOT
+> trust the uncalibrated screener to REJECT an event it can't score — only to shortlist. Only `[throat]`
+> (`嗯嗯`→hum on vivian/clone) genuinely needs a per-voice trigger.
+
+### `[throat]` per-voice discovery (2026-07-07, vivian+clone, triggers `嗯哼`/`咳`/`呃`) — ❌ KO, articulatory ceiling
+All 12 → hum/sigh/yawn, P≈0, and the CN triggers **derail the sentence** (garbled multilingual output:
+"¡Oh no de ti no hago!", "云束株オリー"). No clean throat-clear on vivian/clone. Throat-clear is
+**articulatory** (cough-family, which the doc already logs as decoder-ceiling KO) — ryan's `嗯嗯` tsk was a
+lucky *vocal* rendering that doesn't reproduce. ⇒ **`[throat]` stays ryan-only / PARK** (real throat-clear
+likely needs FT, same as cough/cry). Only the VOCAL family (laugh/sigh/yawn/moan/gasp/groan-哼) generalizes.
+
+### ⇒ Session net (2026-07-07): what's wireable
+- **`[yawn]` `哈啊`** — VOCAL, cross-voice OK per T3 ear (preset s7 / clone s42). Wireable into `para_pick`
+  once the ear re-confirms the existing xvoice clips. NOTE: needs a **preset-vs-clone** seed split (s7/s42),
+  which `para_pick`'s current `voice_class` (vivian-vs-rest) doesn't encode → small code add.
+- **`[moan]` `哈啊` s42** — pleasure variant, ryan-validated; ear-check other voices before universal wiring.
+- **`[throat]`** — ryan-only, articulatory ceiling → PARK.
+- **cry** — EXHAUSTED (needs FT).
+
 ### Step-2 iteration (2026-07-07, ryan IT) — gasp alt-triggers KO, CRY hunt #2 KO (3rd fail)
 - **gasp `倒吸` / `嘶` (sharp-inhale candidates):** all MISS/DRIFT (→yawn/hum, P≤0.10). No new gasp win.
   `啊` stays the gasp trigger (ear-validated in T3-val; CLAP just can't score gasp — a screener gap, not a
