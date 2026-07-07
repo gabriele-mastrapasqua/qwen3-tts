@@ -30,16 +30,27 @@ BIN=${BIN:-./qwen_tts}
 DATE=$(date +%F)
 OUTDIR=${OUTDIR:-samples/tests/${DATE}_${TAG}_${NAME}}
 
-# default emotion per event (sigh pairs with sad, laugh with joy)
-if [ -z "$EMO" ]; then case "$TAG" in sigh) EMO=sad;; laugh) EMO=joy;; *) EMO=neutral;; esac; fi
+# default emotion per event (empty -> --emotion omitted; "none" also omits)
+if [ -z "$EMO" ]; then case "$TAG" in
+  sigh) EMO=sad;; laugh) EMO=joy;; cry) EMO=sad;; gasp) EMO=surprise;;
+  groan) EMO=disgust;; yawn) EMO=none;; *) EMO=none;; esac; fi
 
-# carrier per (tag,lang): %s is where the onomatopoeia goes (comma-delimited inline)
+# carrier per (tag,lang): %s is where the onomatopoeia goes (comma-delimited inline).
+# New-event carriers are emotionally primed so the model has context for the vocalization.
 carrier() { # $1=tag $2=lang
   case "$1:$2" in
     sigh:Italian)  echo "Ho perso tutto quello che avevo, %s e adesso non so più cosa fare.";;
     sigh:*)        echo "I lost everything I had, %s and now I don't know what to do.";;
     laugh:Italian) echo "Non ci posso credere, %s, è la notizia più bella della mia vita!";;
     laugh:*)       echo "I can't believe it, %s, this is the best news of my whole life!";;
+    cry:Italian)   echo "Mi manca da morire, %s non riesco proprio a smettere.";;
+    cry:*)         echo "I miss her so much, %s I just can't stop.";;
+    gasp:Italian)  echo "Aspetta, %s ma sei davvero tu?!";;
+    gasp:*)        echo "Wait, %s is that really you?!";;
+    yawn:Italian)  echo "È talmente tardi, %s non riesco a tenere gli occhi aperti.";;
+    yawn:*)        echo "It's so late, %s I can barely keep my eyes open.";;
+    groan:Italian) echo "Oh no, %s di nuovo no, che disastro.";;
+    groan:*)       echo "Oh no, %s not again, this is awful.";;
     *:Italian)     echo "E poi, %s, la storia è andata proprio così.";;
     *)             echo "And then, %s, the story went exactly like that.";;
   esac
@@ -68,9 +79,10 @@ for voice in "${VOICE_A[@]}"; do
       for seed in "${SEED_A[@]}"; do
         txt=$(printf "$(carrier "$TAG" "$lang")" "$onom")
         wav="$OUTDIR/${TAG}_${vlabel}_${lang}_o${oi}_s${seed}.wav"
-        echo ">> [$((++n))] $vlabel/$lang onom='$onom' seed=$seed emo=$EMO"
+        emoflag=(); [ -n "$EMO" ] && [ "$EMO" != none ] && emoflag=(--emotion "$EMO")
+        echo ">> [$((++n))] $vlabel/$lang onom='$onom' seed=$seed emo=${EMO:-none}"
         "$BIN" -d "$MODEL" "${vflag[@]}" -l "$lang" -T "$TEMP" --seed "$seed" \
-               --emotion "$EMO" --text "$txt" -o "$wav" --silent 2>/dev/null || { echo "  gen FAILED"; continue; }
+               "${emoflag[@]}" --text "$txt" -o "$wav" --silent 2>/dev/null || { echo "  gen FAILED"; continue; }
         printf '{"file": "%s", "tag": "%s", "onom": "%s", "seed": %s, "voice": "%s", "lang": "%s", "emo": "%s"}\n' \
                "$(cd "$(dirname "$wav")" && pwd)/$(basename "$wav")" "$TAG" "$onom" "$seed" "$vlabel" "$lang" "$EMO" >> "$ROWS"
       done
