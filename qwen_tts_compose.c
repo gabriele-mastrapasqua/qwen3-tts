@@ -72,6 +72,9 @@ static void para_pick(const char *tag, int voice_class, const char **onom, int *
         *onom = "\xe5\x98\xbf\xe5\x98\xbf"; *seed = 42;                        /* 嘿嘿 — sly giggle, universal (ear 2026-07-07) */
     } else if (!strcasecmp(tag, "scoff")) {
         *onom = "\xe5\x88\x87"; *seed = 7; *temp = 1.0f;                       /* 切 — disdain/scoff; T1.0 (1.1 over-drives pitch); pair w/ --emotion disgust */
+    } else if (!strcasecmp(tag, "phew")) {
+        if (voice_class == 2) { *onom = "\xe5\x94\x89"; *seed = 42; }          /* clone READS 呼 → graceful fallback to sad-sigh 唉 */
+        else { *onom = "\xe5\x91\xbc"; *seed = (voice_class == 1) ? 42 : 7; }  /* 呼 — relief exhale; preset (vivian s42 / ryan s7) */
     }
 }
 
