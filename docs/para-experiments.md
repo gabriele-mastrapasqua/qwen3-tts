@@ -242,16 +242,28 @@ signal; ear is decisive (verdicts below are the USER's ear, 2026-07-07).
 | tag | trigger | voice · lang · seed · emo | CLAP | EAR verdict |
 |---|---|---|---|---|
 | **`[yawn]`** (tired) | `哈啊` | ryan · EN · **s7** · (no emo) | 0.36 WIN | ✅ **TOP** — sbadiglio di stanchezza. Nit: the following speech comes out *slightly faster* (minor). Re-confirms the shipped preset seed. |
-| **`[yawn:pleasure]`** (NEW variant) | `哈啊` | ryan · EN · **s42** · (no emo) | 0.29 WIN | ✅ **WIN** — a *pleasure/godimento* yawn (satisfied stretch), distinct from the tired `[yawn]`. Named `[yawn:pleasure]` (T4 variant); veto the name if you prefer `[moan]`-family. |
+| **`[moan]`** (NEW, pleasure) | `哈啊` | ryan · EN · **s42** · (no emo) | 0.29 WIN | ✅ **WIN** — a *pleasure/godimento* yawn (satisfied stretch), distinct from the tired `[yawn]`. Named **`[moan]`** (user-approved 2026-07-07) — pleasure/godimento vocalization, own tag. |
 | **`[throat]` / tsk** (NEW trigger) | `嗯嗯` | ryan · IT · **s42** · disgust | 0.20 (labeled groan) | ✅ **TOP** — a "tsk-tsk" throat-clear (pulirsi la voce/gola). Serendipity: swept as *groan*, landed as **throat-clear** (per the PRINCIPLE, keep it). New trigger — the shipped groan stays `哼` s42. |
 | groan | `嗯嗯` | ryan · EN · s42 · disgust | 0.24 WIN | ❌ separates the two "gr-gr" too much — not a clean groan. |
 | gasp | `啊` | ryan · EN/IT · s7/42/2024 | all DRIFT/MISS | ❌ this pass — `啊` derailed to groan/yawn/laugh (note: `啊` DID win as gasp in the T3 runs above at the per-class seed; this carrier/lang combo didn't). |
 | cry | `呜呜` | ryan · EN/IT · s7/42/2024 | P(cry)=0.00, →yawn | ❌ consistent with hunt #1: `呜呜` performs yawn/sigh-ish, never a cry. |
 
-⇒ **3 saves (user-validated):** `[yawn]`=`哈啊` s7 (tired, re-confirmed) · `[yawn:pleasure]`=`哈啊` s42 (NEW) ·
+⇒ **3 saves (user-validated):** `[yawn]`=`哈啊` s7 (tired, re-confirmed) · `[moan]`=`哈啊` s42 (NEW) ·
 `[throat]`=`嗯嗯` s42 IT (NEW, tsk throat-clear). Audio in `samples/tests/2026-07-07_{yawn,groan}_discovery/`.
-**Pending:** cross-voice (vivian/clone) seed check before wiring into `para_pick`; then decide `[yawn:pleasure]`
-final name + whether `[throat]` needs its own preset/clone seed. Harness proved the discovery loop works.
+**Pending:** cross-voice (vivian/clone) seed check before wiring into `para_pick`; then confirm `[moan]`
+seed + whether `[throat]` needs its own preset/clone seed. Harness proved the discovery loop works.
+
+### Cross-voice check (2026-07-07, vivian preset + galatea clone, CLAP screen) — ⚠️ ryan-SPECIFIC, did NOT generalize
+Swept the 3 ryan wins on vivian + galatea to lock per-class seeds. They **do NOT transfer** (screener):
+| trigger | vivian | galatea clone | read |
+|---|---|---|---|
+| `哈啊` (yawn/moan) | → **laugh** (P0.22–0.54, all seeds) | → nothing (top 'hum' ~0.00) | vivian LAUGHS on `哈啊`; clone at most hums — NOT a yawn |
+| `嗯嗯` (throat/tsk) | → **hum** (P0.57–0.72) | → **hum** (P0.25–0.95) | `嗯`="mmm/hum" literal on these voices; the ryan tsk was voice-specific |
+⇒ Like `haha` (ryan-EN-only laugh) and sigh needing `ahh` for vivian, **`[yawn]`/`[moan]`/`[throat]` are so far
+ryan-only**. NOT wired into `para_pick` (would ship a broken tag on vivian/clones). Options: (a) per-voice
+trigger discovery for vivian/clone (find their yawn/throat onom, as `ahh` was found for vivian sigh); (b) ship
+ryan-gated; (c) park as ryan candidates. Audio: `samples/tests/2026-07-07_{yawn_xvoice,groan_throat_xvoice}/`.
+CLAP uncalibrated for these events → ear should confirm the vivian-laughs / clone-hums reads before finalizing.
 
 ---
 
