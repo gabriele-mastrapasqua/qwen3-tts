@@ -75,6 +75,8 @@ static void para_pick(const char *tag, int voice_class, const char **onom, int *
     } else if (!strcasecmp(tag, "phew")) {
         if (voice_class == 2) { *onom = "\xe5\x94\x89"; *seed = 42; }          /* clone READS 呼 → graceful fallback to sad-sigh 唉 */
         else { *onom = "\xe5\x91\xbc"; *seed = (voice_class == 1) ? 42 : 7; }  /* 呼 — relief exhale; preset (vivian s42 / ryan s7) */
+    } else if (!strcasecmp(tag, "huff")) {
+        *onom = "\xe5\x97\xa4"; *seed = 7;                                     /* 嗤 — "uff uff" tired/exertion huff, universal (ear 2026-07-07) */
     }
 }
 

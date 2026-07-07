@@ -258,7 +258,7 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
   `ono_anna`, KO `sohee`, ZH `vivian`, EN/Romance `ryan`); the engine prints a hint. Full recipe →
   [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
 - **Works in every Qwen3-TTS language** (EN, IT, DE, ZH, RU, KO, JA, ES, FR, PT) — just set `-l <Language>`.
-- **Paralinguistics → inline `[tags]`, also automatic · 🧪 Alpha.** Write `[laugh]`, `[sigh]`, `[yawn]`, `[wow]` or `[giggle]` in
+- **Paralinguistics → inline `[tags]`, also automatic · 🧪 Alpha.** Write `[laugh]`, `[sigh]`, `[yawn]`, `[wow]`, `[giggle]`, `[scoff]`, `[phew]` or `[huff]` in
   `--text` and the engine performs the event (it picks the onomatopoeia anchor + the right seed per voice for
   you) — no flags. *Alpha quality:* hit-or-miss across voices/languages (laughs land best); expect misses for now:
   ```bash

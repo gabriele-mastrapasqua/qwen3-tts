@@ -141,6 +141,7 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 | **`[giggle]`** | `嘿嘿` (CN) | **42** | universal — sly giggle (pair with `--emotion joy`) |
 | **`[scoff]`** | `切` (CN) | **7** | disdain/scoff · **T1.0** (per-tag; 1.1 over-drives pitch) · pair with `--emotion disgust` |
 | **`[phew]`** | `呼` preset / `唉` clone | ryan 7 · vivian 42 · clone 42 | relief exhale; clone READS 呼 → graceful `唉` sigh fallback |
+| **`[huff]`** | `嗤` (CN) | **7** | universal — "uff uff" tired/exertion huff (pair with `--emotion joy`) |
 
 `[yawn]` added 2026-07-07 (discovered + ear-validated via the E1 harness; wired w/ a preset-vs-clone
 `voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized
