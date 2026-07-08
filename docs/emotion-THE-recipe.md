@@ -49,6 +49,35 @@ Notes:
   the clone default, not the preset default.
 - seed 42 is the reference. Temperature 1.1.
 
+## Blended emotions (dyads) — the shelf composes (2026-07-08)
+Emotion steering **directions ADD**: a 50/50 sum of two primary `ryan_<emo>.qlsteer` vectors renders a coherent
+NEW emotion (ear-validated ryan EN+IT, `samples/tests/2026-07-08_emotion-dyads/`). Seven ship as first-class
+`--emotion` values — no new capture, no FT:
+
+| dyad | blend | mix |
+|---|---|---|
+| `contempt`    | anger + disgust  | 50/50 |
+| `awe`         | fear + surprise  | 50/50 |
+| `nostalgia`   | joy + sad        | **40/60** (sad-lean; 50/50 read too light in EN) |
+| `disapproval` | surprise + sad   | 50/50 |
+| `remorse`     | sad + disgust    | 50/50 |
+| `outrage`     | anger + surprise | 50/50 |
+| `despair`     | fear + sad       | 50/50 |
+
+Built with `tools/steer/dyad_mix.py OUT A.qlsteer:0.5 B.qlsteer:0.5` → `presets/steer/emotion/ryan_<dyad>.qlsteer`.
+Same STEER recipe as the primaries (preset @ w12 L21-25). **Insight:** `joy`-paired blends over-drive on long EN
+carriers — mind the ratio; the others compose cleanly at 50/50.
+
+## Inline `[emotion]` switching — per-sentence, one generation
+Write `[emotion]` tags inside `--text` (any primary or dyad) and the engine switches emotion **span-by-span in a
+single generation**, in the voice's own timbre, clean at the seams (ear-validated 2026-07-08). `[neutral]`/`[none]`
+resets. Same qlsteer STEER recipe as `--emotion`, applied per sentence (compose path, `qwen_emotion_steer_install`
+saves/restores the global steer per span). Also works in the HTTP server. The old `.vec` per-span palette is retired.
+```
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English -T 1.1 --text \
+  "[contempt] Oh, sure, that's a brilliant idea. [nostalgia] We used to spend every summer by the sea. [despair] And now there's nothing left." -o switch.wav
+```
+
 ## Assets
 - expr packs (`presets/expr/`): `italian_csp_topk6`, `german_csp_k6`, `french_csp_k6` (shipped on HF, fetch with
   `bash download_assets.sh`). Native `{german,french,spanish}_r32` re-exportable from the GPU box checkpoints

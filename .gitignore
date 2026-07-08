@@ -3,6 +3,7 @@
 !samples/*.wav
 !samples/voice_clone_refs/**
 !samples/emotion_examples/**
+!samples/emotion_dyads/**
 !tests/golden/*.wav
 *.py
 !tests/*.py

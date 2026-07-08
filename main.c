@@ -1220,10 +1220,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --quant-mixed              int4 Talker + int8 CP (best CUDA quant: q4 Talker win, no CP degradation)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
-                fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B): sad/joy/anger/fear/disgust/surprise. PRESET voice =\n");
-                fprintf(stderr, "                             STEER ryan_<emo> @ w12 (clean, every language); CLONE = COMBINE (lang .expr + steer).\n");
-                fprintf(stderr, "                             Use the NATIVE preset per language (JA ono_anna, KO sohee, ZH vivian, EN/Romance ryan).\n");
-                fprintf(stderr, "                             Optional --instruct/--expr/--ml-steer override. Other moods (excited/proud/...) = legacy palette.\n");
+                fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B). Primaries: sad/joy/anger/fear/disgust/surprise.\n");
+                fprintf(stderr, "                             Dyads: contempt/awe/nostalgia/disapproval/remorse/outrage/despair (blended steer).\n");
+                fprintf(stderr, "                             PRESET = STEER ryan_<emo> @ w12 (clean, every language); CLONE = COMBINE (lang .expr + steer).\n");
+                fprintf(stderr, "                             Also inline: write [emotion] tags in --text to switch emotion per sentence (one gen).\n");
+                fprintf(stderr, "                             NATIVE preset per language (JA ono_anna, KO sohee, ZH vivian, EN/Romance ryan). --instruct/-T override.\n");
                 fprintf(stderr, "  --volume <f>               Output gain (1.0=unchanged, e.g. 1.1 louder, 0.9 softer)\n");
                 fprintf(stderr, "  --rate <f>                 Speaking rate, pitch-preserving (1.0=unchanged, >1 faster, <1 slower)\n");
                 fprintf(stderr, "  --compose <spec>           Inline markup synthesis (also works inside --text):\n");

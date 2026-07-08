@@ -58,7 +58,7 @@ make blas
 - **Voice cloning** — Clone any voice from a short WAV clip. Ship it as a compact **~25 MB graft `.qvoice`** (`tests/qvoice_to_graft.py` → `--icl-only`): keeps the CustomVoice weights so emotion levers (`--instruct`, `--expr`, `--ml-steer`) all work, with full prosody (sighs/pauses). An 8 KB `--xvector-only` `.bin` is the ultra-lean alternative (identity only). See `docs/icl-graft-portability.md`.
 - **Voice management** — List, inspect, delete `.qvoice` profiles (`--list-voices`, `--delete-voice`). No model required.
 - **Style control** — `--instruct` for emotion/style on 1.7B: angry, whisper, cheerful, and more.
-- **Emotion in one flag** (🧪 **beta**; paralinguistics `[laugh]`/`[sigh]` 🧪 **alpha**) — `--emotion <sad\|joy\|anger\|fear\|disgust\|surprise>` (1.7B) auto-applies the ear-validated recipe (per-language fine-tune `.expr` + steering vector + a default English instruct + temperature), on presets **and** cloned voices, in every Qwen language. A vivid English `--instruct` and `-T` override. Pitch-preserving `--rate`/`--volume` and a `--roughness` grit knob are still available. See [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
+- **Emotion in one flag** (🧪 **beta**; paralinguistics `[laugh]`/`[sigh]` 🧪 **alpha**) — `--emotion <sad\|joy\|anger\|fear\|disgust\|surprise>` (1.7B) auto-applies the ear-validated recipe (per-language fine-tune `.expr` + steering vector + a default English instruct + temperature), on presets **and** cloned voices, in every Qwen language. **Plus 7 blended "dyads"** (`contempt`, `awe`, `nostalgia`, `disapproval`, `remorse`, `outrage`, `despair`) and **inline `[emotion]` switching** — many emotions from one prompt in a single generation. A vivid English `--instruct` and `-T` override. Pitch-preserving `--rate`/`--volume` and a `--roughness` grit knob are still available. See [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
 - **Inline markup for audiobooks** — write one text with ElevenLabs/Bark-style tags and get a multi-emotion take in one pass: `--text "I won! [excited] ...amazing! [pause:500ms] [sad] But it's over. [sigh]"`. Mid-text emotion switches, `[pause:400ms]`/`[break:1s]` pauses, and `[sigh]`/`[huff]` paralinguistic fillers — auto-detected in `--text` (no flag) or explicit via `--compose`. Spans are model-generated and concatenated seamlessly. See [docs/markup.md](docs/markup.md).
 - **VoiceDesign** — Create new voices from text descriptions.
 - **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`; JSON body takes `emotion`/`instruct`/`volume`/`rate` (same recipe as the CLI). **Inline `[mood]` markup works over the API too** — one request can switch emotion sentence-by-sentence (`"text":"[joy] Great news! [sad] But I must go."`), auto-detected and streamed span-by-span. See [docs/server.md](docs/server.md).
@@ -252,12 +252,55 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
 | Japanese | ono_anna | 😨 fear | *家に誰かいる、足音が聞こえた……怖くてどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ja_ono_anna_fear.wav) |
 | Korean | sohee | 😠 anger | *네가 어떻게 나한테 그렇게 말할 수 있어? 이건 절대 받아들일 수 없어!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ko_sohee_anger.wav) |
 
-- **Emotions:** `sad · joy · anger · fear · disgust · surprise` (synonyms like `happy`/`angry` work too).
+- **Emotions:** 6 primaries — `sad · joy · anger · fear · disgust · surprise` (synonyms like `happy`/`angry`
+  work too) — **plus 7 blended "dyads"** (below).
 - **The recipe:** a **preset voice** → pure **STEER** (the steering vector @ w12, clean in every language); a
   **cloned voice** → **COMBINE** (the language `.expr` + steer). Use the **native preset per language** (JA
   `ono_anna`, KO `sohee`, ZH `vivian`, EN/Romance `ryan`); the engine prints a hint. Full recipe →
   [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
 - **Works in every Qwen3-TTS language** (EN, IT, DE, ZH, RU, KO, JA, ES, FR, PT) — just set `-l <Language>`.
+
+#### Blended emotions (dyads) · new
+
+Emotion steering **directions add**: summing two primary vectors yields a coherent *new* emotion. Seven
+ear-validated **Plutchik dyads** ship as first-class `--emotion` values — no new capture, no fine-tune:
+
+| Dyad | = blend of | Reads as | Listen (English, ryan) |
+|---|---|---|---|
+| `contempt`    | anger + disgust    | sneering disdain | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/dyad_contempt.wav) |
+| `awe`         | fear + surprise    | hushed wonder | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/dyad_awe.wav) |
+| `nostalgia`   | joy + sad          | bittersweet fondness | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/dyad_nostalgia.wav) |
+| `disapproval` | surprise + sad     | let-down reproach | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/dyad_disapproval.wav) |
+| `remorse`     | sad + disgust      | guilty regret | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/dyad_remorse.wav) |
+| `outrage`     | anger + surprise   | indignant shock | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/dyad_outrage.wav) |
+| `despair`     | fear + sad         | hopeless dread | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/dyad_despair.wav) |
+
+```bash
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English --emotion contempt \
+    --text "Oh, sure, that's a truly brilliant idea." -o contempt.wav
+```
+
+#### Inline emotion switching — many emotions from ONE prompt · new
+
+Write `[emotion]` tags **inside `--text`** and the engine switches emotion **sentence by sentence in a single
+generation** — any primary or dyad, no flags. Clean at the seams, one output file:
+
+```bash
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English -T 1.1 --text \
+  "[contempt] Oh, sure, that's a brilliant idea. [nostalgia] We used to spend every summer by the sea. [despair] And now there's nothing left." \
+  -o switch.wav
+```
+
+**🔊 Hear the switch happen inside one prompt:**
+
+| Prompt (inline `[tags]`) | Listen |
+|---|---|
+| `[contempt]` Oh, sure, that's a brilliant idea. `[nostalgia]` We used to spend every summer by the sea. `[despair]` And now there's nothing left. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_contempt-nostalgia-despair.wav) |
+| `[sad]` I really thought this would work out. `[disgust]` But the whole thing is rotten. `[contempt]` As if they ever cared. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_sad-disgust-contempt.wav) |
+| *(Italian)* `[outrage]` Hanno annullato tutto senza dirci niente. `[remorse]` Continuo a pensare a cosa ho detto. `[awe]` Poi ho alzato lo sguardo e sono rimasto senza parole. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_it_outrage-remorse-awe.wav) |
+
+> Inline `[emotion]` uses the same steering recipe as `--emotion`, applied per sentence. `[neutral]` resets to
+> no emotion. Combine with a global `--emotion` and paralinguistic `[laugh]`/`[sigh]` tags freely.
 - **Paralinguistics → inline `[tags]`, also automatic · 🧪 Alpha.** Write `[laugh]`, `[sigh]`, `[yawn]`, `[wow]`, `[giggle]` or `[scoff]` in
   `--text` and the engine performs the event (it picks the onomatopoeia anchor + the right seed per voice for
   you) — no flags. `[wow]`/`[yawn]`/`[scoff]` compose well with the matching `--emotion`; `[giggle]` is best
