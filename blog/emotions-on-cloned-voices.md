@@ -1,7 +1,7 @@
 ---
 title: "Emotions on a cloned voice: a 25 MB graft, a steering vector, and a lot of dead ends"
 published: false
-description: "How we got sad / happy / angry / fearful speech to work on cloned voices in a pure-C Qwen3-TTS engine — a 25 MB 'graft' clone that keeps the emotion levers alive, plus a mixed steering + fine-tune recipe hard-won after many abandoned experiments."
+description: "How we got sad / happy / angry / fearful speech to work on cloned voices in a pure-C Qwen3-TTS engine — a 25 MB 'graft' clone that keeps the emotion levers alive, a steering + fine-tune recipe hard-won after many dead ends, and — because emotion is a vector — blended 'dyad' emotions plus switching emotion mid-sentence from a single prompt."
 tags: machinelearning, tts, c, audio
 ---
 
@@ -13,6 +13,7 @@ Qwen3-TTS ships 9 neutral preset speakers. No emotion control, and cloning a voi
 
 - **Small clones.** A cloned voice is now a **~25 MB `.qvoice` "graft"** — small enough to share, and, crucially, built so the emotion machinery still works on it.
 - **Emotions on *any* voice.** One flag — `--emotion <sad|joy|anger|fear|disgust|surprise>` — works on **presets and cloned voices**, in every supported language.
+- **Mixing emotions.** Because emotion is a *direction* you can add, summing two gives a new one: seven **dyads** (`contempt`, `awe`, `nostalgia`, …) fall out for free. And you can **switch emotion mid-sentence from a single prompt** with inline `[emotion]` tags.
 
 Getting there took an embarrassing number of dead ends. This post is the honest map of what failed and what finally worked.
 
@@ -85,15 +86,54 @@ Native preset per language under the hood (Japanese, Korean, Chinese, Romance, R
 
 ---
 
-## Bonus: paralinguistics without a splice
+## Mixing emotions: dyads, and switching mid-sentence
 
-Emotion is prosody. **Paralinguistics** — a laugh, a sigh — is an *event*. We ship `[laugh]` and `[sigh]` as inline tags:
+Here's the fun part. If emotion is a *direction* in activation space, then directions **add**. Take the "anger" vector and the "disgust" vector, sum them 50/50, and you get something that is neither — a coherent, recognizable **contempt**. It just works, and seven blends (Plutchik's "dyads") fall out of the six primaries we already had. The full menu:
+
+| `--emotion` | Kind | What it is |
+|---|---|---|
+| `sad` · `joy` · `anger` · `fear` · `disgust` · `surprise` | primary | the six base emotions (synonyms like `happy` / `angry` work too) |
+| `contempt` | dyad | anger + disgust → sneering disdain |
+| `awe` | dyad | fear + surprise → hushed wonder |
+| `nostalgia` | dyad | joy + sad → bittersweet fondness |
+| `disapproval` | dyad | surprise + sad → let-down reproach |
+| `remorse` | dyad | sad + disgust → guilty regret |
+| `outrage` | dyad | anger + surprise → indignant shock |
+| `despair` | dyad | fear + sad → hopeless dread |
+
+No new training, no new capture — just `dyad_mix.py a.qlsteer:0.5 b.qlsteer:0.5`, and seven new `--emotion` values appear. (One thing the ear caught: `joy`-paired blends over-drive on long English sentences, so `nostalgia` ships 40/60 sad-leaning. Vectors add — but the mix ratio still matters.)
+
+Then the demo that makes people lean in: **many emotions from one prompt.** Write `[emotion]` tags inline and the engine switches sentence by sentence, in a single generation, clean at the seams:
+
+```bash
+./qwen_tts -s ryan -l English --text \
+  "[contempt] Oh, sure, that's a brilliant idea. [nostalgia] We used to spend every summer by the sea. [despair] And now there's nothing left."
+```
+
+One file, three emotions, no splicing — the steering vector is simply swapped per sentence while the voice stays the voice. `[neutral]` resets.
+
+**One system, everywhere — which meant deleting our own earlier work.** We'd built an older, weaker per-sentence emotion path on a different (CP-level `.vec`) mechanism. It's retired. Now the CLI `--emotion` flag, the inline `[emotion]` tags, *and* the HTTP server's `emotion` field all route through the **same** steering recipe — so a dyad you find on the command line behaves identically in a server request, and a REST client can stream `[joy]…[sad]…` markup and get per-sentence emotion for free. One recipe, three surfaces.
+
+---
+
+## Paralinguistics: inline events — 🧪 work in progress
+
+Emotion is prosody; **paralinguistics** — a laugh, a sigh, a yawn — is an *event*. We ship a handful as inline tags. Each fires **in one generation, in the voice's own timbre** — no splice (a spliced laugh sounds like a *different person* laughing; the tag becomes a validated onomatopoeia *inside* the sentence instead, so it's your clone doing it):
+
+| Tag | Event |
+|---|---|
+| `[laugh]` | a real chuckle |
+| `[sigh]` | a sigh |
+| `[yawn]` | a yawn |
+| `[wow]` | a "wow!" interjection |
+| `[giggle]` | a sly giggle (best on its own — pairing it with `joy` over-drives it) |
+| `[scoff]` | a dismissive *tsk* |
 
 ```
-./qwen_tts --text "That's hilarious [laugh] I can't even."
+./qwen_tts --text "That's hilarious [laugh] I can't even. [sigh] Okay, back to work."
 ```
 
-The naive approach is to splice a separate laugh clip in — but a splice sounds like a *different person* laughing. Instead, the tag triggers the event **inline, in one generation, in the voice's own timbre**, so it's your clone laughing, not a stranger. That took its own round of onomatopoeia-by-seed hunting to make universal across voices and languages.
+**Fair warning — treat this as alpha.** It's hit-or-miss across voices and languages (laughs and sighs land best), and it's parked for now rather than under active development. But it works often enough to be fun, and it's very much worth a try: if it breaks in an interesting way on your voice or language, that's exactly the kind of bug report that makes it better. Finding a universal onomatopoeia-per-event was its own long hunt, and there's surely more to find.
 
 ---
 
@@ -103,5 +143,6 @@ The naive approach is to splice a separate laugh clip in — but a splice sounds
 - **One clean method beats five clever ones.** τ-vectors, x-vector emotion, dense per-language FT, seed palettes — all archived in favor of *steer + fine-tune, together*.
 - **On a clone, layer the levers.** Steering direction + fine-tune texture + instruct strength. Individually weak, together strong.
 - **Keep events in-timbre.** A spliced laugh is a stranger; an inline one is you.
+- **Emotion is a vector — so it composes.** Directions add (dyads) and can be swapped per sentence (inline switching). Wire every surface — CLI, inline, server — to the *one* recipe and the feature multiplies for free.
 
 It's all pure C, CPU by default, and the emotional-expressivity `.expr` packs are fetched on demand from HuggingFace. Clone your voice once, then make it *feel* something — after, admittedly, a lot of experiments that didn't.

@@ -65,11 +65,13 @@ This one trips people up, so it's worth being blunt: **batching does not make a 
 
 We wired continuous request-batching (`--serve --batch-size N`) into all three backends. On the M2 Pro, 0.6B:
 
-| Concurrent requests | Wall time | Batch speed-up |
-|---|---|---|
-| 1 | 19.5 s | — |
-| 2 | 21.9 s | **1.78×** |
-| 4 | 27.7 s | **2.81×** |
+| Concurrent requests | Wall time | Per-request RTF | Throughput speed-up |
+|---|---|---|---|
+| 1 | 19.5 s | 1.01 | — |
+| 2 | 21.9 s | 1.13 | **1.78×** |
+| 4 | 27.7 s | 1.44 | **2.81×** |
+
+So the honest per-request cost: RTF climbs from **1.01** (one request) to **1.44** (four) as the batch fills — the price of the B-wide work per step. What stays cheap is **first audio**: streaming TTFA is **314 ms** on the 0.6B and **517 ms** on the 1.7B *even under a full batch*, so it still feels responsive. You trade a lone request's **0.36** single-stream RTF for **~2.8× aggregate throughput**.
 
 4 requests served in 27.7 s instead of ~78 s serial. The 1.7B model scales identically (2.82× at B=4). CUDA does **3.35×** at B=8. And crucially, the **batch output is bit-identical to single-stream** — batching never changes what a user hears.
 
