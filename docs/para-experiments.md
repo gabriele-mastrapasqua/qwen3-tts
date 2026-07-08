@@ -138,13 +138,28 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 | **`[yawn]`** — preset | `哈啊` (CN) | **7** | ryan / vivian / other presets |
 | **`[yawn]`** — clone | `哈啊` (CN) | **42** | `--load-voice` clones |
 | **`[wow]`** | `哇` (CN) | **7** | universal — "wow!" interjection (pair with `--emotion surprise`) |
-| **`[giggle]`** | `嘿嘿` (CN) | **42** | universal — sly giggle (pair with `--emotion joy`) |
-| **`[scoff]`** | `切` (CN) | **7** | disdain/scoff · **T1.0** (per-tag; 1.1 over-drives pitch) · pair with `--emotion disgust` |
-| **`[phew]`** | `呼` preset / `唉` clone | ryan 7 · vivian 42 · clone 42 | relief exhale; clone READS 呼 → graceful `唉` sigh fallback |
+| **`[giggle]`** | `嘿嘿` (CN) | **42** | universal — sly giggle · **STANDALONE-only** (do NOT stack `--emotion joy` on long text → over-laughs) |
+| **`[scoff]`** | `切` (CN) | **42** | disdain/scoff · **T1.0** (per-tag; 1.1 over-drives pitch) · pair with `--emotion disgust` |
+| ~~`[phew]`~~ | ~~`呼`~~ | — | **PARKED 2026-07-08** — TOP on IT but metallic/literal on EN, no seed fixes it (see gate below) |
 
 `[yawn]` added 2026-07-07 (discovered + ear-validated via the E1 harness; wired w/ a preset-vs-clone
 `voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized
 trigger); cry unsolved (needs FT).
+
+### 🚦 Robustness gate — 5 new tags on VARIED natural sentences (2026-07-08, ear-decisive)
+Each 2026-07-07 tag was validated in ONE sweep carrier only. Re-tested on 3 varied natural sentences
+(c1/c2 EN + c3 IT) × with/without paired emotion, preset ryan + clone (ohenry). Trail:
+`samples/tests/2026-07-08_para-robustness-gate/`.
+| tag | verdict | why |
+|---|---|---|
+| **`[wow]`** | ✅ **SHIP** | TOP WIN all 3 carriers + noemo + clone |
+| **`[yawn]`** | ✅ **SHIP** | ALL WIN (c1/c2/c3 + noemo + clone) |
+| **`[scoff]`** | ✅ **SHIP (re-pin s7→s42)** | tsk `切` is the intended scoff; s7 stuttered "fi fi figurati" on the IT carrier (10s), s42 clean on all 3 (user: all TOP WIN) |
+| **`[giggle]`** | ⚠️ **SHIP standalone-only** | great inline / no-emotion (noemo = TOP WIN) + short IT; `+--emotion joy` OVER-DRIVES it into an over-laugh that eats the sentence — no seed tames both long EN carriers (c1 s7/s42/2024 ~10s, s123 4.5s metallic-no-laugh) |
+| **`[phew]`** | 🔴 **PARKED** | `呼` s7 truncates the sentence (early EOS, 1.8s); s42 fixes length but on EN ryan it goes metallic + over-stretched; no-emotion EN reads the word literally / laughs. Only Italian is clean → re-hunt an EN-robust relief onom later. Mirrors the `[huff]` revert. |
+
+**Cross-tag insight:** the two joy-paired tags (`[giggle]`, `[phew]`) over-drive on long EN carriers;
+disgust/surprise/sad-paired tags compose cleanly → **joy STEER is the aggressive one** for para events.
 
 ### T4 laugh variants + moan/throat generic (2026-07-07, ear verdicts) — laugh ladder needs re-tune
 - **T4 laugh (ryan EN, 哈×N) — ⚠️ named variants NOT cleanly achievable, PARKED.** Ear across a full re-hunt

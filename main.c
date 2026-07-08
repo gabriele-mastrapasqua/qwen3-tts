@@ -392,10 +392,12 @@ typedef qwen_cspan_t cspan_t;
  * is replaced by a validated ONOMATOPOEIA *inside* the sentence, so the event is produced in the active
  * voice's own timbre within ONE generation — NEVER a separate "splice" span (which mixed voices). The
  * mapping is universal across voices AND languages (ear-validated on ryan EN/IT, vivian IT, galatea clone):
- *   [laugh]→哈哈哈  [sigh]→唉/ahh  [yawn]→哈啊(preset s7/clone s42)  [wow]→哇 s7  [giggle]→嘿嘿 s42  [scoff]→切(T1.0)  [phew]→呼
+ *   [laugh]→哈哈哈  [sigh]→唉/ahh  [yawn]→哈啊(preset s7/clone s42)  [wow]→哇 s7  [giggle]→嘿嘿 s42  [scoff]→切 s42(T1.0)
  * and seed 7 makes laugh fire (哈哈哈 s7 laughs / s42 hyperventilates). SHORT form only (哈哈哈 not longer;
  * long over-laughs into a pant); no event-instruct (goes metallic). [yawn] added 2026-07-07 via the E1
- * discovery harness. See the doc for the full WIN/KO trail + the ryan-only/parked events. */
+ * discovery harness. Robustness gate 2026-07-08: [wow]/[yawn]/[scoff] SHIP (scoff re-pinned s7→s42);
+ * [giggle] SHIPS standalone-only (do NOT stack with --emotion joy — over-laughs); [phew] PARKED (only IT
+ * clean, metallic/literal on EN). See the doc for the full WIN/KO trail + the ryan-only/parked events. */
 /* para_pick / para_inline_substitute / is_para_event_tag moved to qwen_tts_compose.c
  * (shared with the server). Use qwen_compose_para_substitute / qwen_compose_is_para_event_tag. */
 

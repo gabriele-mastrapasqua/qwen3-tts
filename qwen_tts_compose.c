@@ -71,13 +71,14 @@ static void para_pick(const char *tag, int voice_class, const char **onom, int *
     } else if (!strcasecmp(tag, "giggle") || !strcasecmp(tag, "giggles")) {
         *onom = "\xe5\x98\xbf\xe5\x98\xbf"; *seed = 42;                        /* 嘿嘿 — sly giggle, universal (ear 2026-07-07) */
     } else if (!strcasecmp(tag, "scoff")) {
-        *onom = "\xe5\x88\x87"; *seed = 7; *temp = 1.0f;                       /* 切 — disdain/scoff; T1.0 (1.1 over-drives pitch); pair w/ --emotion disgust */
-    } else if (!strcasecmp(tag, "phew")) {
-        if (voice_class == 2) { *onom = "\xe5\x94\x89"; *seed = 42; }          /* clone READS 呼 → graceful fallback to sad-sigh 唉 */
-        else { *onom = "\xe5\x91\xbc"; *seed = (voice_class == 1) ? 42 : 7; }  /* 呼 — relief exhale; preset (vivian s42 / ryan s7) */
+        *onom = "\xe5\x88\x87"; *seed = 42; *temp = 1.0f;                      /* 切 — disdain tsk; s42 (s7 stuttered "fi fi figurati" on an IT carrier, robustness gate 2026-07-08); T1.0; pair w/ --emotion disgust */
     }
-    /* [huff] 嗤 reverted 2026-07-07: passed the validation-carrier sweep but on a NATURAL sentence
-     * it's metallic (ryan, "huff huff") / silent (clone) — carrier-sensitive, not robust. Parked. */
+    /* [huff] 嗤 reverted 2026-07-07: metallic (ryan) / silent (clone) on natural sentences — carrier-fragile.
+     * [phew] 呼 PARKED 2026-07-08 (robustness gate): TOP WIN on Italian but on EN ryan it reads the word
+     * literally / laughs (no-emotion) or renders then goes metallic+over-stretched (+joy) — no seed fixes EN
+     * (s7 truncates the sentence, s42 metallic). Only IT is clean → re-hunt an EN-robust relief onom later.
+     * [giggle] 嘿嘿 SHIPS but is standalone-only: great inline / no-emotion, but `--emotion joy` OVER-DRIVES it
+     * into an over-laugh (no seed tames both long EN carriers) — do NOT stack [giggle] with joy on long text. */
 }
 
 int qwen_compose_is_para_event_tag(const char *t) {
