@@ -420,6 +420,15 @@ static const emo_name_t EMOTION_NAMES[] = {
     { "fear", "fear" }, { "afraid", "fear" },
     { "disgust", "disgust" }, { "disgusted", "disgust" },
     { "surprise", "surprise" }, { "surprised", "surprise" },
+    /* Plutchik dyads — 2-primary blends, ear-validated 2026-07-08 (ryan EN+IT). The steer vector
+     * ryan_<tok>.qlsteer is a 50/50 sum of the two primaries (nostalgia 40/60 joy/sad). */
+    { "contempt", "contempt" }, { "scorn", "contempt" },
+    { "awe", "awe" }, { "wonder", "awe" },
+    { "nostalgia", "nostalgia" }, { "wistful", "nostalgia" },
+    { "disapproval", "disapproval" },
+    { "remorse", "remorse" }, { "regret", "remorse" },
+    { "outrage", "outrage" },
+    { "despair", "despair" },
     { NULL, NULL }
 };
 /* Canonical filename token for an --emotion spec, or NULL if it isn't a routed emotion. */
