@@ -384,12 +384,12 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     {
         int vivian_id = qwen_tts_speaker_id("vivian");
         int para_voice = (vivian_id >= 0 && ctx->speaker_id == vivian_id) ? 1 : 0;
-        int did = 0, para_seed = 7;
-        char *sub = qwen_compose_para_substitute(text, para_voice, &did, &para_seed);
+        int did = 0, para_seed = 7; float para_temp = 1.1f;
+        char *sub = qwen_compose_para_substitute(text, para_voice, &did, &para_seed, &para_temp);
         if (sub && did) {
             free(text); text = sub;
             if (seed < 0) ctx->seed = (uint32_t)para_seed;
-            if (strstr(body, "\"temperature\"") == NULL) ctx->temperature = 1.1f;
+            if (strstr(body, "\"temperature\"") == NULL) ctx->temperature = para_temp;
         } else {
             free(sub);
         }

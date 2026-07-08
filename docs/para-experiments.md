@@ -135,6 +135,76 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 | **`[laugh]`** | `哈哈哈` (CN, 3-char) | **7** | universal — ryan EN/IT, vivian, galatea clone |
 | **`[sigh]`** — ryan/clone | `唉` (CN) | **42** | ryan/clone |
 | **`[sigh]`** — vivian | `ahh` (Latin) | **7** | vivian only (over-does `唉`) |
+| **`[yawn]`** — preset | `哈啊` (CN) | **7** | ryan / vivian / other presets |
+| **`[yawn]`** — clone | `哈啊` (CN) | **42** | `--load-voice` clones |
+| **`[wow]`** | `哇` (CN) | **7** | universal — "wow!" interjection (pair with `--emotion surprise`) |
+| **`[giggle]`** | `嘿嘿` (CN) | **42** | universal — sly giggle · **STANDALONE-only** (do NOT stack `--emotion joy` on long text → over-laughs) |
+| **`[scoff]`** | `切` (CN) | **42** | disdain/scoff · **T1.0** (per-tag; 1.1 over-drives pitch) · pair with `--emotion disgust` |
+| ~~`[phew]`~~ | ~~`呼`~~ | — | **PARKED 2026-07-08** — TOP on IT but metallic/literal on EN, no seed fixes it (see gate below) |
+
+`[yawn]` added 2026-07-07 (discovered + ear-validated via the E1 harness; wired w/ a preset-vs-clone
+`voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized
+trigger); cry unsolved (needs FT).
+
+### 🚦 Robustness gate — 5 new tags on VARIED natural sentences (2026-07-08, ear-decisive)
+Each 2026-07-07 tag was validated in ONE sweep carrier only. Re-tested on 3 varied natural sentences
+(c1/c2 EN + c3 IT) × with/without paired emotion, preset ryan + clone (ohenry). Trail:
+`samples/tests/2026-07-08_para-robustness-gate/`.
+| tag | verdict | why |
+|---|---|---|
+| **`[wow]`** | ✅ **SHIP** | TOP WIN all 3 carriers + noemo + clone |
+| **`[yawn]`** | ✅ **SHIP** | ALL WIN (c1/c2/c3 + noemo + clone) |
+| **`[scoff]`** | ✅ **SHIP (re-pin s7→s42)** | tsk `切` is the intended scoff; s7 stuttered "fi fi figurati" on the IT carrier (10s), s42 clean on all 3 (user: all TOP WIN) |
+| **`[giggle]`** | ⚠️ **SHIP standalone-only** | great inline / no-emotion (noemo = TOP WIN) + short IT; `+--emotion joy` OVER-DRIVES it into an over-laugh that eats the sentence — no seed tames both long EN carriers (c1 s7/s42/2024 ~10s, s123 4.5s metallic-no-laugh) |
+| **`[phew]`** | 🔴 **PARKED** | `呼` s7 truncates the sentence (early EOS, 1.8s); s42 fixes length but on EN ryan it goes metallic + over-stretched; no-emotion EN reads the word literally / laughs. Only Italian is clean → re-hunt an EN-robust relief onom later. Mirrors the `[huff]` revert. |
+
+**Cross-tag insight:** the two joy-paired tags (`[giggle]`, `[phew]`) over-drive on long EN carriers;
+disgust/surprise/sad-paired tags compose cleanly → **joy STEER is the aggressive one** for para events.
+
+### T4 laugh variants + moan/throat generic (2026-07-07, ear verdicts) — laugh ladder needs re-tune
+- **T4 laugh (ryan EN, 哈×N) — ⚠️ named variants NOT cleanly achievable, PARKED.** Ear across a full re-hunt
+  (哈/哈哈/哈哈哈哈/哈哈哈哈哈 × seeds {7,42,100,256,777,2024} + T0.8): **哈哈 s7 (2.4s) too long for a "short"**
+  (model always renders a FULL laugh ~2.4s floor; single 哈 paradoxically gives 5-7s or derails; T0.8 → longer
+  not shorter); **哈哈哈哈哈 s7 (11.7s) laughs well but too long**; **哈哈哈哈 s256 (7.7s) METALLIC/fails** (CLAP
+  0.81 = false positive, precision 0.75). PATTERN: clean laughs are all **seed 7 and scale LONG with onom
+  length**; shortening (other seed / fewer chars→derail or more chars@non-7→metallic) breaks them. ⇒ no clean
+  crisp-short nor right-sized-long. Only the MEDIUM `哈哈哈` s7 (shipped `[laugh]`) is solid. Named `[laugh:short|
+  long]` would need DSP (`--rate`, but it's global) or FT → **PARK T4, keep the single shipped `[laugh]`.**
+- **[moan] generic:** ❌ **vivian `嗯` s256 = METALLIC** (starts as a moan, then laughs, then metallic mumble) —
+  not shippable. Clone 嗯/哈啊 → hum/pant. moan does NOT generalize; ryan-only at best. PARK (research later).
+- **[throat] generic:** ❌ KO — CNN14 (has "Throat clearing") P=0 on 咳/呵/嗯哼. Articulatory ceiling. PARK / FT.
+
+### Broad exploration net (2026-07-07, ryan, semi-autonomous CLAP/CNN14 screen → ear) — NEW WINS
+Wide onomatopoeia net across playful/disdain/surprise/exhale buckets; screener clustered, ear judged.
+Audio: `samples/tests/2026-07-07_para_broad_explore/WINS/`. **New candidate tags (ryan-validated, cross-voice
++ naming pending):**
+| proposed tag | onom | seed | ear verdict |
+|---|---|---|---|
+| **`[wow]`** | `哇` | 7 | ✅✅ **TOP** — perfect "wow!" (2.4s, crisp — the short interjection laugh couldn't do) |
+| **`[oh]`** | `噢` | 7 | ✅✅ **TOP** — perfect "oh!" (2.6s) |
+| **`[phew]`** (relief) | `呼` | 7 | ✅✅ **TOP** — relief sigh, distinct from sad `[sigh]` (7.0s) |
+| **`[giggle]`** (sly) | `嘿嘿` | 42 | ✅✅ **TOP** — sly/knowing chuckle (4.8s) |
+| **`[hey]`** (recognition) | `咦` | 7 | ✅ WIN — "hey, it's really you?" (2.7s), not a plain huh |
+| **`[huff]`** (tired) | `嗤` | 7 | ✅ WIN — "uff uff" 2× exertion/tiredness pant |
+| **`[scoff]`** (disdain) | `切` | 7 | ✅ WIN but **too strong** (emo raises pitch) — needs strength ↓ |
+| — | `咯咯` | 7 | 🟡 cackle but METALLIC — reduce force |
+| — | `唔` | 7 | 🟡 groan attempt, metallic/forced — reduce force |
+| — | `嘻嘻` | 7 | ❌ KO — forced "eh eh eh" pant |
+Recurring lesson: several wins are ear-good but **too forceful/metallic** (咯咯/唔/切) — the emotion push
+over-drives them; a milder emotion / no-emotion take may clean them up (a strength knob for para). The clean
+TOPs (哇/噢/呼/嘿嘿) don't need it. Next: cross-voice the TOPs → wire into para_pick (like `[yawn]`); strength-
+tune the metallic ones.
+
+### Strength-tune of the metallic wins (2026-07-07) — the lever is TEMPERATURE, not removing emotion
+Verified (non-silent) the onomatopoeia WAS in the prompt; the "no-emo" versions still under-perform because
+**the para needs the emotion to FIRE** (no-emo → the model reads the sentence flat). So the strength lever is
+a MIDDLE temperature, not dropping the emotion:
+- **`[scoff]` 切 → T1.0 + disgust = WIN** (T1.1 over-drove the pitch; no-emo did nothing; T0.9 too weak). SHIPPED
+  with a per-tag temperature (para_pick now returns temp; `[scoff]`=1.0, others=1.1).
+- **唔 (groan): DROPPED** — my carrier mismatch (swept with the gasp/surprise carrier "Wait… is that you?",
+  wrong context for a groan). The real groan trigger is `哼` s42 (T3). Don't re-chase 唔.
+- **咯咯 (cackle): DROPPED** — laughs too long/won't stop at any T. Not a clean cackle.
+
 
 Method: inline substitution, ONE `--emotion` generation @ T1.1, comma-delimited, no event-instruct, no
 steering-span. Seed pinned per-tag (laugh 7 / sigh 42) when the user gave no `--seed`. voice_class = vivian vs
@@ -230,6 +300,74 @@ Cry needs its own sweep — it's the hardest (acoustically ≈ laugh/yawn, and l
 - `呜咽` and `sob` are **READ as words** ("wuyè" / "sob") — the model doesn't perform them. `哇` = "waaah", unclear.
 - NEXT cry idea: vary the CARRIER/onomatopoeia (broken `...ah...ah...`, `singhiozzo`, sniffle `snif snif`) rather
   than seed; or accept that cry ≈ the hardest vocal event and park it. Real-cry may need FT (like the pros).
+
+---
+
+## 2026-07-07 — first AUTOMATED discovery pass (harness E1: `tools/para/para_sweep.sh` + CLAP judge)
+Method change: generated a trigger×seed×lang grid and **auto-screened with CLAP** (`para_judge.py`, τ0.20),
+so the ear only judged the shortlist (4 clips out of 24) instead of every clip. Voice: ryan, 1.7B, T1.1.
+The CLAP screener is calibrated only for laugh/sigh → for new events its probs are RELATIVE shortlisting
+signal; ear is decisive (verdicts below are the USER's ear, 2026-07-07).
+
+| tag | trigger | voice · lang · seed · emo | CLAP | EAR verdict |
+|---|---|---|---|---|
+| **`[yawn]`** (tired) | `哈啊` | ryan · EN · **s7** · (no emo) | 0.36 WIN | ✅ **TOP** — sbadiglio di stanchezza. Nit: the following speech comes out *slightly faster* (minor). Re-confirms the shipped preset seed. |
+| **`[moan]`** (NEW, pleasure) | `哈啊` | ryan · EN · **s42** · (no emo) | 0.29 WIN | ✅ **WIN** — a *pleasure/godimento* yawn (satisfied stretch), distinct from the tired `[yawn]`. Named **`[moan]`** (user-approved 2026-07-07) — pleasure/godimento vocalization, own tag. |
+| **`[throat]` / tsk** (NEW trigger) | `嗯嗯` | ryan · IT · **s42** · disgust | 0.20 (labeled groan) | ✅ **TOP** — a "tsk-tsk" throat-clear (pulirsi la voce/gola). Serendipity: swept as *groan*, landed as **throat-clear** (per the PRINCIPLE, keep it). New trigger — the shipped groan stays `哼` s42. |
+| groan | `嗯嗯` | ryan · EN · s42 · disgust | 0.24 WIN | ❌ separates the two "gr-gr" too much — not a clean groan. |
+| gasp | `啊` | ryan · EN/IT · s7/42/2024 | all DRIFT/MISS | ❌ this pass — `啊` derailed to groan/yawn/laugh (note: `啊` DID win as gasp in the T3 runs above at the per-class seed; this carrier/lang combo didn't). |
+| cry | `呜呜` | ryan · EN/IT · s7/42/2024 | P(cry)=0.00, →yawn | ❌ consistent with hunt #1: `呜呜` performs yawn/sigh-ish, never a cry. |
+
+⇒ **3 saves (user-validated):** `[yawn]`=`哈啊` s7 (tired, re-confirmed) · `[moan]`=`哈啊` s42 (NEW) ·
+`[throat]`=`嗯嗯` s42 IT (NEW, tsk throat-clear). Audio in `samples/tests/2026-07-07_{yawn,groan}_discovery/`.
+**Pending:** cross-voice (vivian/clone) seed check before wiring into `para_pick`; then confirm `[moan]`
+seed + whether `[throat]` needs its own preset/clone seed. Harness proved the discovery loop works.
+
+### Cross-voice check (2026-07-07, vivian preset + galatea clone, CLAP screen) — ⚠️ ryan-SPECIFIC, did NOT generalize
+Swept the 3 ryan wins on vivian + galatea to lock per-class seeds. They **do NOT transfer** (screener):
+| trigger | vivian | galatea clone | read |
+|---|---|---|---|
+| `哈啊` (yawn/moan) | → **laugh** (P0.22–0.54, all seeds) | → nothing (top 'hum' ~0.00) | vivian LAUGHS on `哈啊`; clone at most hums — NOT a yawn |
+| `嗯嗯` (throat/tsk) | → **hum** (P0.57–0.72) | → **hum** (P0.25–0.95) | `嗯`="mmm/hum" literal on these voices; the ryan tsk was voice-specific |
+⇒ Like `haha` (ryan-EN-only laugh) and sigh needing `ahh` for vivian, **`[yawn]`/`[moan]`/`[throat]` are so far
+ryan-only**. NOT wired into `para_pick` (would ship a broken tag on vivian/clones). Options: (a) per-voice
+trigger discovery for vivian/clone (find their yawn/throat onom, as `ahh` was found for vivian sigh); (b) ship
+ryan-gated; (c) park as ryan candidates. Audio: `samples/tests/2026-07-07_{yawn_xvoice,groan_throat_xvoice}/`.
+CLAP uncalibrated for these events → ear should confirm the vivian-laughs / clone-hums reads before finalizing.
+
+> ⚠️ **CORRECTION (2026-07-07): the yawn "KO" above is likely a CLAP artifact, not a real KO.** CLAP is
+> calibrated ONLY for laugh+sigh; a breathy YAWN is acoustically ≈ a breathy laugh, so CLAP labeling
+> vivian's `哈啊` "laugh 0.54" is probably a MISLABEL. **T3-val (2026-07-01) already ear-validated `哈啊`
+> yawn on vivian (s7/s42) AND galatea clone (s42).** ⇒ `[yawn]` `哈啊` is most likely ALREADY universal;
+> re-ear the existing `samples/tests/2026-07-07_yawn_xvoice/` clips to confirm, then wire. Lesson: do NOT
+> trust the uncalibrated screener to REJECT an event it can't score — only to shortlist. Only `[throat]`
+> (`嗯嗯`→hum on vivian/clone) genuinely needs a per-voice trigger.
+
+### `[throat]` per-voice discovery (2026-07-07, vivian+clone, triggers `嗯哼`/`咳`/`呃`) — ❌ KO, articulatory ceiling
+All 12 → hum/sigh/yawn, P≈0, and the CN triggers **derail the sentence** (garbled multilingual output:
+"¡Oh no de ti no hago!", "云束株オリー"). No clean throat-clear on vivian/clone. Throat-clear is
+**articulatory** (cough-family, which the doc already logs as decoder-ceiling KO) — ryan's `嗯嗯` tsk was a
+lucky *vocal* rendering that doesn't reproduce. ⇒ **`[throat]` stays ryan-only / PARK** (real throat-clear
+likely needs FT, same as cough/cry). Only the VOCAL family (laugh/sigh/yawn/moan/gasp/groan-哼) generalizes.
+
+### ⇒ Session net (2026-07-07): what's wireable
+- **`[yawn]` `哈啊`** — VOCAL, cross-voice OK per T3 ear (preset s7 / clone s42). Wireable into `para_pick`
+  once the ear re-confirms the existing xvoice clips. NOTE: needs a **preset-vs-clone** seed split (s7/s42),
+  which `para_pick`'s current `voice_class` (vivian-vs-rest) doesn't encode → small code add.
+- **`[moan]` `哈啊` s42** — pleasure variant, ryan-validated; ear-check other voices before universal wiring.
+- **`[throat]`** — ryan-only, articulatory ceiling → PARK.
+- **cry** — EXHAUSTED (needs FT).
+
+### Step-2 iteration (2026-07-07, ryan IT) — gasp alt-triggers KO, CRY hunt #2 KO (3rd fail)
+- **gasp `倒吸` / `嘶` (sharp-inhale candidates):** all MISS/DRIFT (→yawn/hum, P≤0.10). No new gasp win.
+  `啊` stays the gasp trigger (ear-validated in T3-val; CLAP just can't score gasp — a screener gap, not a
+  trigger failure). gasp = DONE via `啊`.
+- **CRY hunt #2 `呜呜呜` / `啊呜` / `呜哇` / `buaa` × {42,2024}:** **all P(cry)=0.00, drift to yawn/sigh** — same
+  failure as hunt #1. Transcripts show breathy "Ah... Ah..." (yawn/sigh-like), never crying; some triggers
+  read/garbled (`buaa`→"Boa"). **3rd automated failure across many triggers/seeds → CRY via inline
+  onomatopoeia is EXHAUSTED.** Cry is the decoder-ceiling event; a real cry needs FT (like the pros) — park
+  it. (Cross-cutting note: nearly every breathy TTS vocalization clusters as "yawn"/"sigh" acoustically —
+  cry's low-arousal sob just isn't in the model's inline reach.)
 
 ---
 

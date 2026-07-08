@@ -1,0 +1,11 @@
+# E1.1 para-judge — offline screening tools (CPU-first, optional MPS on Apple Silicon).
+# Heavy: pulls torch (~2-3 GB). Install into tools/para/.venv (gitignored). See README.md.
+torch>=2.1
+numpy>=1.24
+librosa>=0.10
+soundfile>=0.12
+panns-inference>=0.1.1        # CNN14 AudioSet tagger (downloads ~330MB ckpt to ~/panns_data on first run)
+openai-whisper>=20231117      # tiny/base ASR for the literal-onomatopoeia check (needs ffmpeg, already installed)
+msclap>=1.3.3                 # CLAP zero-shot text-prompt tagger (fallback for events AudioSet misses, e.g. laugh)
+# note: msclap pins numpy<2 (downgrades to 1.26). torchaudio>=2.9 needs torchcodec for load() —
+# para_judge patches torchaudio.load to use soundfile instead, so torchcodec is NOT required.

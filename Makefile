@@ -94,6 +94,7 @@ help:
 	@echo "  make test-large-quant - Run all 1.7B quantization tests (INT8 + INT4)"
 	@echo "  make emotion-demo    - Render ryan through ALL mapped emotions via --emotion (1.7B); prints the output folder"
 	@echo "  make emotion-para-demo - Emotion + inline paralinguistic [tag] ([laugh]/[sigh]/...) across langs/speakers (1.7B)"
+	@echo "  make para-demo       - Shipped inline [tag]s ([wow]/[yawn]/[scoff]/[giggle]/[laugh]/[sigh]) on natural sentences (1.7B)"
 	@echo "  make test-emotion-ft - Emotion fine-tune (.expr graft) smoke: CSP Italian on 1.7B (preset+clone, seed 42)"
 	@echo "  make test-lora-it    - Emotion×voice×temp listening matrix (L16-26 LoRA; afplay links + full cmds)"
 	@echo "  make emotion-seeds   - Seed-finder palette → docs/emotion-seeds.md (recommended seeds/lang/voice/emo; SLOW)"
@@ -491,6 +492,11 @@ emotion-demo: $(TARGET)
 # COMBINE clip). Override: EMO_PARA_DEMO_DIR=...
 emotion-para-demo: $(TARGET)
 	@bash tests/emotion_para_demo.sh
+
+# make para-demo — shipped inline paralinguistic [tag]s on natural sentences (post 2026-07-08 gate:
+# wow/yawn/scoff + laugh/sigh, scoff s42, giggle standalone; phew parked). Prints afplay links.
+para-demo: $(TARGET)
+	@bash tests/para_demo.sh
 
 # Ordered emotion TEST SUITE (tests/emo_suite.sh): per-LANGUAGE subfolders, emotion-MATCHED prompts, a steer
 # weight sweep (w6/w8/w10) + a COMBINE variant per (lang×emotion), filenames that encode voice/mode/weight,
@@ -1094,7 +1100,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
-        emotion-para-demo \
+        emotion-para-demo para-demo \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-serve-all \
         test-clone test-voice-design \
         demo-clone \

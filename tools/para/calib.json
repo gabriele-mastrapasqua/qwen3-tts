@@ -1,0 +1,12 @@
+[
+  {"file": "../../samples/tests/2026-07-01_para_validate_voices/laugh_ryanEN_CN3_s7.wav",  "tag": "laugh", "onom": "哈哈哈", "voice": "ryan",   "lang": "EN", "seed": 7,  "expected": "WIN"},
+  {"file": "../../samples/tests/2026-07-01_para_validate_voices/laugh_ryanIT_CN3_s7.wav",  "tag": "laugh", "onom": "哈哈哈", "voice": "ryan",   "lang": "IT", "seed": 7,  "expected": "WIN"},
+  {"file": "../../samples/tests/2026-07-01_para_validate_voices/laugh_vivianIT_CN3_s7.wav","tag": "laugh", "onom": "哈哈哈", "voice": "vivian", "lang": "IT", "seed": 7,  "expected": "WIN"},
+  {"file": "../../samples/tests/2026-07-01_para_validate_voices/sigh_ryanIT_CN_s42.wav",   "tag": "sigh",  "onom": "唉",     "voice": "ryan",   "lang": "IT", "seed": 42, "expected": "WIN"},
+  {"file": "../../samples/tests/2026-07-01_vivian_sigh_fix/ahh_s7_T1.1.wav",               "tag": "sigh",  "onom": "ahh",    "voice": "vivian", "lang": "IT", "seed": 7,  "expected": "WIN"},
+  {"file": "../../samples/tests/2026-07-01_vivian_sigh_fix/CN_s42_T0.9.wav",               "tag": "sigh",  "onom": "唉",     "voice": "vivian", "lang": "IT", "seed": 42, "expected": "WIN"},
+
+  {"file": "../../samples/tests/2026-07-01_para_validate_voices/laugh_ryanIT_CN3_s42.wav", "tag": "laugh", "onom": "哈哈哈", "voice": "ryan",   "lang": "IT", "seed": 42, "expected": "KO"},
+  {"file": "../../samples/tests/2026-07-01_laugh_hunt/ryanEN_hahaha_joy_s42.wav",          "tag": "laugh", "onom": "hahaha", "voice": "ryan",   "lang": "EN", "seed": 42, "expected": "KO"}
+]
+

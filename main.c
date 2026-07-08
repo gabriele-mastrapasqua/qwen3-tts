@@ -392,9 +392,12 @@ typedef qwen_cspan_t cspan_t;
  * is replaced by a validated ONOMATOPOEIA *inside* the sentence, so the event is produced in the active
  * voice's own timbre within ONE generation — NEVER a separate "splice" span (which mixed voices). The
  * mapping is universal across voices AND languages (ear-validated on ryan EN/IT, vivian IT, galatea clone):
- *   [laugh] → 哈哈哈 (CN 3-char)   [sigh] → ahh (Latin)
- * and seed 7 makes BOTH fire (哈哈哈 s7 laughs / s42 hyperventilates; ahh s7 = clean sigh). SHORT form only
- * (哈哈哈 not longer; long over-laughs into a pant); no event-instruct (goes metallic). See the doc for WIN/KO. */
+ *   [laugh]→哈哈哈  [sigh]→唉/ahh  [yawn]→哈啊(preset s7/clone s42)  [wow]→哇 s7  [giggle]→嘿嘿 s42  [scoff]→切 s42(T1.0)
+ * and seed 7 makes laugh fire (哈哈哈 s7 laughs / s42 hyperventilates). SHORT form only (哈哈哈 not longer;
+ * long over-laughs into a pant); no event-instruct (goes metallic). [yawn] added 2026-07-07 via the E1
+ * discovery harness. Robustness gate 2026-07-08: [wow]/[yawn]/[scoff] SHIP (scoff re-pinned s7→s42);
+ * [giggle] SHIPS standalone-only (do NOT stack with --emotion joy — over-laughs); [phew] PARKED (only IT
+ * clean, metallic/literal on EN). See the doc for the full WIN/KO trail + the ryan-only/parked events. */
 /* para_pick / para_inline_substitute / is_para_event_tag moved to qwen_tts_compose.c
  * (shared with the server). Use qwen_compose_para_substitute / qwen_compose_is_para_event_tag. */
 
@@ -1633,13 +1636,15 @@ int main(int argc, char **argv) {
      * Pin the para-validated seed 7 (both 哈哈哈 and ahh fire at 7) and T1.1 when the user gave no --seed/-T. */
     char *para_sub_text = NULL;
     if (text && !no_compose) {
-        int did = 0, para_seed = 7;
-        int para_voice = (!load_voice && speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0;
-        para_sub_text = qwen_compose_para_substitute(text, para_voice, &did, &para_seed);
+        int did = 0, para_seed = 7; float para_temp = 1.1f;
+        /* voice_class for para_pick: 2 = clone (--load-voice), 1 = vivian preset, 0 = ryan/other preset.
+         * (clone-vs-preset matters for [yawn]: 哈啊 clone s42 / preset s7.) */
+        int para_voice = load_voice ? 2 : ((speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0);
+        para_sub_text = qwen_compose_para_substitute(text, para_voice, &did, &para_seed, &para_temp);
         if (para_sub_text && did) {
             text = para_sub_text;
             if (seed < 0) seed = para_seed;      /* pin the validated per-tag seed (laugh 7 / sigh 42) */
-            if (!temp_set) { temperature = 1.1f; temp_set = 1; }
+            if (!temp_set) { temperature = para_temp; temp_set = 1; }   /* per-tag T (1.1 default, [scoff] 1.0) */
             if (!silent) fprintf(stderr, "Paralinguistics: inline [tag]->onomatopoeia (seed %d, T%.1f): \"%s\"\n",
                                  seed, (double)temperature, text);
         } else { free(para_sub_text); para_sub_text = NULL; }

@@ -51,23 +51,42 @@ static const cmacro_t COMPOSE_MACROS[] = {
 /* ── Inline paralinguistic EVENTS via a validated onomatopoeia (the shipped [laugh]/[sigh]) ──
  * The tag becomes an onomatopoeia INSIDE the sentence, so the event is produced in the active
  * voice's own timbre within ONE generation — never a separate "splice" span. Mapping is
- * universal across voices/languages; sigh differs per voice (唉 s42 ryan/clone, ahh s7 vivian). */
-static void para_pick(const char *tag, int voice_class, const char **onom, int *seed) {
-    *onom = NULL; *seed = 7;
+ * universal across voices/languages; sigh differs per voice (唉 s42 ryan/clone, ahh s7 vivian).
+ * [yawn] 哈啊 is vocal + cross-voice (preset s7 / clone s42). [moan]/[throat] stay ryan-only (unshipped,
+ * see docs/para-experiments.md 2026-07-07); cry is decoder-ceiling-blocked (needs FT). */
+static void para_pick(const char *tag, int voice_class, const char **onom, int *seed, float *temp) {
+    /* voice_class: 0 = ryan / other preset · 1 = vivian · 2 = clone (--load-voice).
+     * *temp = the per-tag validated temperature (default 1.1; a tag may soften it). */
+    *onom = NULL; *seed = 7; *temp = 1.1f;
     if (!strcasecmp(tag, "laugh") || !strcasecmp(tag, "laughs")) {
         *onom = "\xe5\x93\x88\xe5\x93\x88\xe5\x93\x88"; *seed = 7;              /* 哈哈哈 — all voices */
     } else if (!strcasecmp(tag, "sigh") || !strcasecmp(tag, "sighs")) {
         if (voice_class == 1) { *onom = "ahh"; *seed = 7; }                    /* vivian */
         else                  { *onom = "\xe5\x94\x89"; *seed = 42; }          /* 唉 — ryan/clone */
+    } else if (!strcasecmp(tag, "yawn") || !strcasecmp(tag, "yawns")) {
+        *onom = "\xe5\x93\x88\xe5\x95\x8a";                                    /* 哈啊 — vocal, cross-voice (ear T3/2026-07-07) */
+        *seed = (voice_class == 2) ? 42 : 7;                                   /* clone s42 · preset s7 */
+    } else if (!strcasecmp(tag, "wow")) {
+        *onom = "\xe5\x93\x87"; *seed = 7;                                     /* 哇 — "wow!" interjection, universal (ear 2026-07-07) */
+    } else if (!strcasecmp(tag, "giggle") || !strcasecmp(tag, "giggles")) {
+        *onom = "\xe5\x98\xbf\xe5\x98\xbf"; *seed = 42;                        /* 嘿嘿 — sly giggle, universal (ear 2026-07-07) */
+    } else if (!strcasecmp(tag, "scoff")) {
+        *onom = "\xe5\x88\x87"; *seed = 42; *temp = 1.0f;                      /* 切 — disdain tsk; s42 (s7 stuttered "fi fi figurati" on an IT carrier, robustness gate 2026-07-08); T1.0; pair w/ --emotion disgust */
     }
+    /* [huff] 嗤 reverted 2026-07-07: metallic (ryan) / silent (clone) on natural sentences — carrier-fragile.
+     * [phew] 呼 PARKED 2026-07-08 (robustness gate): TOP WIN on Italian but on EN ryan it reads the word
+     * literally / laughs (no-emotion) or renders then goes metallic+over-stretched (+joy) — no seed fixes EN
+     * (s7 truncates the sentence, s42 metallic). Only IT is clean → re-hunt an EN-robust relief onom later.
+     * [giggle] 嘿嘿 SHIPS but is standalone-only: great inline / no-emotion, but `--emotion joy` OVER-DRIVES it
+     * into an over-laugh (no seed tames both long EN carriers) — do NOT stack [giggle] with joy on long text. */
 }
 
 int qwen_compose_is_para_event_tag(const char *t) {
-    const char *o; int s; para_pick(t, 0, &o, &s); return o != NULL;
+    const char *o; int s; float tf; para_pick(t, 0, &o, &s, &tf); return o != NULL;
 }
 
-char *qwen_compose_para_substitute(const char *text, int voice_class, int *did, int *seed) {
-    *did = 0;
+char *qwen_compose_para_substitute(const char *text, int voice_class, int *did, int *seed, float *temp) {
+    *did = 0; *temp = 1.1f;
     if (!text) return NULL;
     size_t cap = strlen(text) + 48, n = 0;
     char *out = (char *)malloc(cap);
@@ -84,8 +103,8 @@ char *qwen_compose_para_substitute(const char *text, int voice_class, int *did, 
                     memcpy(tag, p + 1, tl); tag[tl] = 0;
                     char *t = tag; while (*t == ' ') t++;
                     char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
-                    const char *onom; int sd;
-                    para_pick(t, voice_class, &onom, &sd);
+                    const char *onom; int sd; float td;
+                    para_pick(t, voice_class, &onom, &sd, &td);
                     if (onom) {
                         /* comma BEFORE: strip trailing spaces + one comma in out, then emit ", " */
                         while (n > 0 && out[n - 1] == ' ') n--;
@@ -95,7 +114,7 @@ char *qwen_compose_para_substitute(const char *text, int voice_class, int *did, 
                         if (n > 0) { out[n++] = ','; out[n++] = ' '; }         /* not at sentence start */
                         memcpy(out + n, onom, ol); n += ol;
                         out[n++] = ','; out[n++] = ' ';                        /* comma AFTER (the pause) */
-                        if (!*did) *seed = sd;                                 /* pin the first tag's seed */
+                        if (!*did) { *seed = sd; *temp = td; }                 /* pin the first tag's seed + temp */
                         *did = 1;
                         p = c + 1;
                         while (*p == ' ') p++;                                 /* absorb following spaces */
