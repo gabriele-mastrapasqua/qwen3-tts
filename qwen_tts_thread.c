@@ -176,6 +176,13 @@ typedef struct {
 static struct {
     pthread_t *threads;
     int nworkers;
+    pthread_mutex_t submit_mtx; /* serialize the whole submit→run→wait cycle: the pool has a
+                                 * SINGLE job slot, so two threads calling qwen_parallel at once
+                                 * (e.g. batched-server scheduler + a reader/decode thread) would
+                                 * clobber job/completed/generation → a worker could miss a job and
+                                 * the submitter's cond_wait hangs (the intermittent 8.9s↔220s bug
+                                 * seen on the EPYC batched server). This makes concurrent submitters
+                                 * serialize instead — correct, since the pool runs one job at a time. */
     pthread_mutex_t mtx;
     pthread_cond_t wake;       /* workers wait for a new job */
     pthread_cond_t complete;   /* main waits for job completion */
@@ -230,6 +237,7 @@ void qwen_threadpool_stop(void) {
 void qwen_threadpool_start(int n_threads) {
     int want = n_threads > 1 ? n_threads - 1 : 0;  /* main participates */
     if (!g_inited) {
+        pthread_mutex_init(&P.submit_mtx, NULL);
         pthread_mutex_init(&P.mtx, NULL);
         pthread_cond_init(&P.wake, NULL);
         pthread_cond_init(&P.complete, NULL);
@@ -262,6 +270,9 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     job.fn = fn; job.ctx = ctx; job.nt = nt;
     atomic_init(&job.next, 0);
 
+    /* Serialize the whole submit→run→wait against the single job slot (see submit_mtx
+     * comment): two concurrent submitters would otherwise corrupt job/completed/generation. */
+    pthread_mutex_lock(&P.submit_mtx);
     pthread_mutex_lock(&P.mtx);
     P.job = &job;
     P.completed = 0;
@@ -276,6 +287,7 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
         pthread_cond_wait(&P.complete, &P.mtx);
     P.job = NULL;
     pthread_mutex_unlock(&P.mtx);
+    pthread_mutex_unlock(&P.submit_mtx);
 }
 
 /* Single global job slot → NOT safe to submit from two threads at once. */

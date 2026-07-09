@@ -573,6 +573,11 @@ ifeq ($(UNAME_M),arm64)
 	  && echo "  arm armv8.6-a +bf16 +i8mm : OK (M2/M3/M4, Graviton3+)" || echo "  arm armv8.6-a +bf16 +i8mm : FAIL"
 	@$(CC) $(ISACHK) -march=armv9-a+sme2 -DUSE_BLAS -DACCELERATE_NEW_LAPACK qwen_tts_kernels.c 2>/dev/null \
 	  && echo "  arm armv9-a +sme2        : OK (M4/M5)" || echo "  arm armv9-a +sme2        : (toolchain lacks SME2 — skipped)"
+	@# Cross-compile the x86 AVX-512-VNNI paths (incl. the C7 q4 VNNI matvec) from the ARM
+	@# Mac via clang -target, so x86 kernel breakage is caught here without a rented box.
+	@clang -target x86_64-apple-macos13 $(ISACHK) -march=x86-64-v3 -mavx512f -mavx512bw -mavx512vnni -mavx512bf16 \
+	  -DUSE_BLAS qwen_tts_kernels.c 2>/dev/null \
+	  && echo "  x86 avx512 +vnni (x-comp) : OK (Zen4/5, Ice Lake+; C7 q4-VNNI)" || echo "  x86 avx512 +vnni (x-comp) : (clang cross lacks target — skipped)"
 else
 	@$(CC) $(ISACHK) -march=x86-64-v3 -mavx512f -mavx512bw -mavx512vnni -mavx512bf16 qwen_tts_kernels.c \
 	  && echo "  x86 avx512 +vnni +bf16   : OK (Zen4/5, Ice Lake+)" || echo "  x86 avx512 +vnni +bf16   : FAIL"

@@ -1104,10 +1104,91 @@ static void int8_smm_task(size_t tid, size_t nt, void *vc) {
 }
 #endif /* __ARM_FEATURE_DOTPROD */
 
+#if defined(__AVX512VNNI__)
+/* Quantize column b of the [cols][B] activation matrix X to int8 (per-column absmax). */
+static float quantize_act_int8_col(int8_t *qb, const float *X, int cols, int B, int b) {
+    float amax = 0.0f;
+    for (int k = 0; k < cols; k++) { float a = fabsf(X[(size_t)k * B + b]); if (a > amax) amax = a; }
+    if (amax == 0.0f) { memset(qb, 0, (size_t)cols); return 0.0f; }
+    float inv = 127.0f / amax;
+    for (int k = 0; k < cols; k++) {
+        int v = (int)lrintf(X[(size_t)k * B + b] * inv);
+        qb[k] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    return amax / 127.0f;
+}
+/* ── int8 VNNI batched matmat (the x86 int8 GEMM the SDOT comment above asks for) ──
+ * Y[rows,B] = (W_int8 @ qXt^T)·scales. Weight-stationary: each 64-int8 W block is
+ * loaded ONCE and dpbusd'd against all B pre-quantized activation columns. VNNI is
+ * unsigned×signed → activations passed pre-offset as ua = qXt+128 (unsigned), corrected
+ * −128·Σw per row (ws = dpbusd(ones,w)), exactly like the single-stream int8_matvec_vnni. */
+static void int8_matmat_vnni_slice(float *Y, const int8_t *W, const float *scale,
+                                   const int8_t *qXt, const float *sx,
+                                   int r0, int r1, int cols, int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    for (int r = r0; r < r1; r++) {
+        const int8_t *w = W + (size_t)r * cols;
+        __m512i acc[16], ws = _mm512_setzero_si512();
+        for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= cols; k += 64) {
+            __m512i wv = _mm512_loadu_si512((const void *)(w + k));   /* weight block: once */
+            ws = _mm512_dpbusd_epi32(ws, ones, wv);
+            for (int b = 0; b < B; b++) {
+                __m512i ua = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qXt + (size_t)b * cols + k)), v128);
+                acc[b] = _mm512_dpbusd_epi32(acc[b], ua, wv);
+            }
+        }
+        int sw = _mm512_reduce_add_epi32(ws);
+        float s = scale[r];
+        for (int b = 0; b < B; b++) {
+            int sum = _mm512_reduce_add_epi32(acc[b]) - 128 * sw;
+            const int8_t *qb = qXt + (size_t)b * cols;
+            for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];  /* signed tail */
+            Y[(size_t)r * B + b] = (float)sum * s * sx[b];
+        }
+    }
+}
+typedef struct { float *Y; const int8_t *W; const float *scale; const int8_t *qXt; const float *sx; int rows, cols, B; } int8_vmm_ctx;
+static void int8_vmm_task(size_t tid, size_t nt, void *vc) {
+    int8_vmm_ctx *c = (int8_vmm_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx, r0, r1, c->cols, c->B);
+}
+#endif /* __AVX512VNNI__ */
+
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B) {
     if (B <= 0) return;
     if (B > 64) B = 64;
+#if defined(__AVX512VNNI__)
+    /* x86 VNNI batched int8 GEMM — default ON (QWEN_NO_VNNI=1 disables), the right
+     * int8 matmat primitive on x86 (the ARM SDOT path below stays M1 opt-in). */
+    {
+        static atomic_int no_vnni = -1;
+        int nv = atomic_load_explicit(&no_vnni, memory_order_relaxed);
+        if (nv < 0) { const char *e = getenv("QWEN_NO_VNNI"); nv = (e && e[0] == '1'); atomic_store_explicit(&no_vnni, nv, memory_order_relaxed); }
+        if (!nv && B >= 2 && B <= 16) {
+            int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
+            if (qXt) {
+                float sx[16];
+                for (int b = 0; b < B; b++)
+                    sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+                int nt = g_n_threads;
+                if (nt > 1 && rows >= 256) {
+                    int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
+                    qwen_parallel((size_t)nt, int8_vmm_task, &c);
+                } else {
+                    int8_matmat_vnni_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
+                }
+                free(qXt);
+                return;
+            }
+        }
+    }
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
     /* SDOT batched path (#3) — OPT-IN (QWEN_INT8_SDOT_MM=1), default OFF.
      * MEASURED slower on M1 than the f32-accum batched twin below: SDOT contracts
@@ -1240,10 +1321,84 @@ static void q4_mm_task(size_t tid, size_t nt, void *vc) {
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     q4_matmat_slice(c->Y, c->W, c->X, r0, r1, c->cols, c->B);
 }
+#if defined(__AVX512VNNI__)
+/* q4 VNNI batched matmat (mirrors int8_matmat_vnni_slice + the C7-v2 unsigned-nibble
+ * trick): weight-stationary — unpack each 32-nibble W block ONCE to u8 value order,
+ * dpbusd against all B pre-quantized activation columns. q4 per-block scale + per-column
+ * act scale; corr[b][bl] = −8·ΣqXt[b] over block bl (precomputed once, shared across rows). */
+static void q4_matmat_vnni_slice(float *Y, const q4_0_block_t *W, const int8_t *qXt,
+                                 const float *sx, const int *corr,
+                                 int r0, int r1, int cols, int B) {
+    int nb = cols / Q4_0_BLOCK_SIZE;
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    for (int r = r0; r < r1; r++) {
+        const q4_0_block_t *row = W + (size_t)r * nb;
+        float sum[16];
+        for (int b = 0; b < B; b++) sum[b] = 0.0f;
+        for (int bl = 0; bl < nb; bl++) {
+            __m128i raw = _mm_loadu_si128((const __m128i *)row[bl].qs);
+            __m128i lo = _mm_and_si128(raw, lomask);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
+            __m512i wv = _mm512_zextsi256_si512(_mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                                                                 _mm_unpacklo_epi8(lo, hi)));
+            float scl = row[bl].scale;
+            for (int b = 0; b < B; b++) {
+                __m512i xv = _mm512_zextsi256_si512(_mm256_loadu_si256(
+                    (const __m256i *)(qXt + (size_t)b * cols + (size_t)bl * Q4_0_BLOCK_SIZE)));
+                int dot = _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), wv, xv))
+                        + corr[(size_t)b * nb + bl];
+                sum[b] += scl * (float)dot;
+            }
+        }
+        for (int b = 0; b < B; b++) Y[(size_t)r * B + b] = sum[b] * sx[b];
+    }
+}
+typedef struct { float *Y; const q4_0_block_t *W; const int8_t *qXt; const float *sx; const int *corr; int rows, cols, B; } q4_vmm_ctx;
+static void q4_vmm_task(size_t tid, size_t nt, void *vc) {
+    q4_vmm_ctx *c = (q4_vmm_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_matmat_vnni_slice(c->Y, c->W, c->qXt, c->sx, c->corr, r0, r1, c->cols, c->B);
+}
+#endif /* __AVX512VNNI__ */
 void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                       int rows, int cols, int B) {
     if (B <= 0) return;
     if (B > 64) B = 64;
+#if defined(__AVX512VNNI__)
+    {
+        static atomic_int no_vnni_q4 = -1;
+        int nv = atomic_load_explicit(&no_vnni_q4, memory_order_relaxed);
+        if (nv < 0) { const char *e = getenv("QWEN_NO_VNNI"); nv = (e && e[0] == '1'); atomic_store_explicit(&no_vnni_q4, nv, memory_order_relaxed); }
+        if (!nv && B >= 2 && B <= 16 && cols % Q4_0_BLOCK_SIZE == 0) {
+            int nb = cols / Q4_0_BLOCK_SIZE;
+            int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
+            int *corr = (int *)malloc((size_t)B * nb * sizeof(int));
+            if (qXt && corr) {
+                float sx[16];
+                for (int b = 0; b < B; b++) {
+                    sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+                    const int8_t *qb = qXt + (size_t)b * cols;
+                    for (int bl = 0; bl < nb; bl++) {
+                        int s = 0;
+                        for (int k = 0; k < Q4_0_BLOCK_SIZE; k++) s += qb[bl * Q4_0_BLOCK_SIZE + k];
+                        corr[(size_t)b * nb + bl] = -8 * s;
+                    }
+                }
+                int nt2 = g_n_threads;
+                if (nt2 > 1 && rows >= 256) {
+                    q4_vmm_ctx c = { Y, W, qXt, sx, corr, rows, cols, B };
+                    qwen_parallel((size_t)nt2, q4_vmm_task, &c);
+                } else {
+                    q4_matmat_vnni_slice(Y, W, qXt, sx, corr, 0, rows, cols, B);
+                }
+                free(qXt); free(corr);
+                return;
+            }
+            free(qXt); free(corr);
+        }
+    }
+#endif
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         q4_mm_ctx c = { Y, W, X, rows, cols, B };
@@ -2095,11 +2250,11 @@ static void q4_0_mv_task(size_t tid, size_t nt, void *vc) {
     q4_0_matvec_inner(c->y + r0, c->x, c->W + (size_t)r0 * c->blocks_per_row,
                       c->cols, r1 - r0);
 }
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__)
 enum { Q4_QX_MAX = 8192 };
 /* Shared one-time QWEN_NO_SDOT cache (audit #10 race-free). 1 = force the legacy
- * f32-dequant q4 path (the A/B bench + quant-ladder gate); shared by qwen_matvec_q4_0
- * and the fused qwen_matvec_q4_0_qkv so single-stream stays self-consistent. */
+ * f32-dequant q4 path (the A/B bench + quant-ladder gate); shared by the ARM SDOT and
+ * x86 VNNI q4 paths and the fused QKV so single-stream stays self-consistent. */
 static int q4_sdot_disabled(void) {
     static atomic_int off = -1;
     int v = atomic_load_explicit(&off, memory_order_relaxed);
@@ -2108,8 +2263,80 @@ static int q4_sdot_disabled(void) {
 }
 #endif
 
+#if defined(__AVX512VNNI__)
+/* x86 AVX-512-VNNI q4_0 matvec (plan_v4 C7) — the x86 twin of the ARM q4_0_matvec_sdot.
+ * Quantize the shared activation to int8 once (caller), then per 32-weight block:
+ * unpack the 16 nibble-bytes to 32 signed int8 in value order (nibble−8, the SAME
+ * layout as the tested AVX2 q4 path — value order [lo0,hi0,lo1,hi1,…]), and dot against
+ * the int8 activation with _mm512_dpbusd_epi32. VNNI is unsigned×signed, so (mirroring
+ * the validated int8_matvec_vnni) make the activation unsigned via ua = qx+128 and
+ * correct: Σ w·qx = Σ w·ua − 128·Σw (Σw via dpbusd(ones, w)). q4_0 has a PER-BLOCK
+ * scale, so each block's int32 dot is scaled and summed in f32 (like the ARM twin).
+ * The 32-wide block is zero-extended into the 512-bit dpbusd (upper half → 0); packing
+ * 2 blocks per 512-bit op + 2-row fusion are the obvious throughput follow-ups.
+ * ⚠️ COMPILE-CHECKED ONLY (`make check-isa`) — NOT yet validated on real AVX-512-VNNI
+ * silicon (Zen4/SPR). See the plan_v4 C7 rental TODO before trusting it. */
+static void q4_0_matvec_vnni(float *y, const int8_t *qx, float sx,
+                             const q4_0_block_t *W, int cols, int out_dim) {
+    int nb = cols / Q4_0_BLOCK_SIZE;
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    const __m512i ones   = _mm512_set1_epi8(1);
+    /* Key opt (plan_v4 C7 v2): the q4 nibbles are ALREADY unsigned (0..15), so
+     * dpbusd(nibble_u8, qx_s8) = Σ nibble·qx DIRECTLY — no `−8` on the weight, no `+128`
+     * offset trick. Since w = scale·(nibble−8), Σ w·qx = scale·(Σ nibble·qx − 8·Σqx),
+     * and −8·Σqx depends only on the (shared) activation → precompute it ONCE per block.
+     * So the row loop is ONE dpbusd + ONE reduce per block (v1 did two of each + a
+     * broadcast +128 add). qx is shared across all out_dim rows → the precompute amortizes. */
+    int corr[Q4_QX_MAX / Q4_0_BLOCK_SIZE];
+    for (int b = 0; b < nb; b++) {
+        __m512i xv = _mm512_zextsi256_si512(_mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+        corr[b] = -8 * _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, xv));
+    }
+    for (int o = 0; o < out_dim; o++) {
+        const q4_0_block_t *row = W + (size_t)o * nb;
+        float sum = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            __m128i raw = _mm_loadu_si128((const __m128i *)row[b].qs);
+            __m128i lo = _mm_and_si128(raw, lomask);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
+            /* value order [lo0,hi0,lo1,hi1,...] as UNSIGNED nibbles 0..15 (no −8 bias) */
+            __m512i wv = _mm512_zextsi256_si512(_mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                                                                 _mm_unpacklo_epi8(lo, hi)));
+            __m512i xv = _mm512_zextsi256_si512(_mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+            int dot = _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), wv, xv)) + corr[b];
+            sum += row[b].scale * (float)dot;
+        }
+        y[o] = sum * sx;
+    }
+}
+typedef struct { float *y; const int8_t *qx; float sx; const q4_0_block_t *W; int rows, cols; } q4_0_vnni_ctx;
+static void q4_0_vnni_task(size_t tid, size_t nt, void *vc) {
+    q4_0_vnni_ctx *c = (q4_0_vnni_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_0_matvec_vnni(c->y + r0, c->qx, c->sx,
+                     c->W + (size_t)r0 * (c->cols / Q4_0_BLOCK_SIZE), c->cols, r1 - r0);
+}
+#endif
+
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
+#if defined(__AVX512VNNI__)
+    /* VNNI-native q4 path (plan_v4 C7), the x86 twin of the ARM SDOT-q4: quantize the
+     * shared activation to int8 once, then unpack nibbles→int8 + dpbusd per block. */
+    if (!q4_sdot_disabled() && cols <= Q4_QX_MAX && cols % Q4_0_BLOCK_SIZE == 0) {
+        int8_t qx_buf[Q4_QX_MAX];
+        float sx = quantize_act_int8_x86(qx_buf, x, cols);
+        int nt = g_n_threads;
+        if (nt > 1 && rows >= 256) {
+            q4_0_vnni_ctx c = { y, qx_buf, sx, W, rows, cols };
+            qwen_parallel((size_t)nt, q4_0_vnni_task, &c);
+            return;
+        }
+        q4_0_matvec_vnni(y, qx_buf, sx, W, cols, rows);
+        return;
+    }
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
     /* SDOT-native path (plan_v4 B1): quantize the shared activation to int8 once,
      * then int8×int8 dot per nibble-block. cols beyond the cap (rare; only very

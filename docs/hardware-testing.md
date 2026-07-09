@@ -257,10 +257,39 @@ to compare (chunked synthesis emits slightly more audio). For correctness across
 | _M2/M4_ | batch | | | | | native matmul twin candidate |
 | _Zen4 (AVX-512+VNNI)_ | single | | | | | VNNI int8 |
 | _Zen4_ | batch | | | | | int4+batch expected sweet spot |
-| _Zen5 Turin_ | single | | | | | |
-| _Zen5 Turin_ | batch | | | | | throughput target |
+| **Zen5 Turin** (EPYC 9555P, 4vCPU, 1.7B) | single -j4 | 2.27 | **2.03** | 2.41 | int8 1.08s / int4 1.25s / bf16 1.68s | 2026-07-09; **int8-VNNI is the x86 winner — int4 trails (nibble unpack), opposite of M1** |
+| _Zen5 Turin_ | batch (matmat, B=8) | 11.9× | **3.0×** | 1.6× | — | kernel-level batching speedup (int8/q4 now VNNI, `--matmat-bench`); e2e server-batching = WIP (§5.note) |
 | _Sapphire (AMX)_ | batch | | | | | AMX int8 GEMM (future twin) |
 | _Graviton3_ | batch | | | | | bf16+i8mm+SVE |
+
+### §5.note — EPYC 9555P Zen5 run (2026-07-09) — what DIFFERS from M1
+Real AVX-512-VNNI box (Scaleway STANDARD3-X4C-16G, `avx512_vnni`+`avx512_bf16`). Findings that
+diverge from the M1 dev box — record these so we don't assume M1 behavior carries over:
+1. **C7 q4-VNNI is CORRECT but NOT faster.** `--self-test` PASS on real VNNI (numeric correctness proven —
+   the thing M1 can't check). But single-stream int4-VNNI **RTF 2.76 vs int8 2.01 at -j1 (same 44 frames)
+   = ~37% SLOWER** — the *opposite* of M1, where int4-SDOT beats int8. Even the legacy f32-dequant q4 (2.31)
+   beats int4-VNNI. Cause: the v1 kernel is correctness-first (per-block 2× `_mm512_reduce`, 32-wide block
+   zero-extended into a 512-bit `dpbusd` = half the lane width wasted) → compute overhead eats the
+   half-the-bytes bandwidth win. The plan_v4 C7 throughput TODOs (2-blocks-per-512b full-width, drop the
+   per-block reduce, 2-row fusion) are **REQUIRED, not optional**, before int4 can win on x86.
+2. **int4 < int8 on Zen5 single-stream** (int8 is the fastest quant here), vs **int4 > int8 on M1**. Do NOT
+   port the M1 "int4 is the fast default" conclusion to x86 until C7 is optimized + re-measured.
+3. **Batched matmat twins now use VNNI (FIXED) — but the e2e `--batch-size` server has a rare intermittent
+   stall (open bug).** FIXED: `int8_matmat`/`q4_matmat` used to dequant int8→f32 (no VNNI); added
+   `int8_matmat_vnni_slice` + `q4_matmat_vnni_slice` (weight-stationary `vpdpbusd`) → **`--matmat-bench`:
+   batched int8 3.0× / q4 1.6× over B×matvec, bit-exact** (self-test L2_rel 0.00) = the real x86 server-
+   throughput kernel win. STILL OPEN: the e2e `--batch-size` server is USUALLY fine (batch-1 int8 ~9s, 14
+   consecutive good runs) but RARELY stalls to ~200-260s on a fresh request — genuinely intermittent, NOT
+   root-caused. It is NOT the pool submission race (on Linux the batched path is single-threaded: A1 helper
+   gated off, decode inline) and NOT over-generation (identical output size). Needs **ThreadSanitizer / a
+   `perf` capture of a slow run** (a proper source debug), not more black-box timing — do that on a future
+   box run. Meanwhile CLI and **plain `--serve`** (VNNI, fully reliable) are the fast paths; the kernel-level
+   batching win is proven, only the e2e throughput has this rare stall. (`submit_mtx` in the Linux pool =
+   a defensive fix for concurrent `--workers` submission, kept; it wasn't the cause of this stall.)
+4. **int4 audio trajectory diverges from M1 (benign):** `--int4 --emotion joy` over-drove into a 108-frame
+   ramble on x86 (vs a clean 36-frame render on M1, same seed/text) — greedy-argmax flips on the different
+   x86 fp path. Not a C7 bug (self-test clean); use quant-mixed (int8 CP stabilizes) or bf16 for emotion on
+   x86-int4. Plain int4/int8/quant-mixed audio = ear-clean.
 
 ---
 
