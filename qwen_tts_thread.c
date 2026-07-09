@@ -168,7 +168,19 @@ int qwen_parallel_is_reentrant(void) { return 0; }
  * worker is actually asleep. Chunk claiming stays dynamic, so outputs are
  * bit-identical to the sleeping pool. */
 
-#define QWEN_POOL_SPIN 8192   /* yield iterations (~40-80us) before sleeping */
+#define QWEN_POOL_SPIN_DEFAULT 8192 /* yield iterations (~40-80us) before sleeping */
+/* Spin budget before a worker parks on the condvar. Overridable with
+ * QWEN_POOL_SPIN: lower it when synthesis overlaps other CPU-heavy work
+ * (e.g. the streaming decoder) so idle spin does not steal those cores. */
+static int qwen_pool_spin(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN_POOL_SPIN");
+        v = e ? atoi(e) : QWEN_POOL_SPIN_DEFAULT;
+        if (v < 1) v = 1;
+    }
+    return v;
+}
 
 typedef struct {
     qwen_task_fn fn;
@@ -215,7 +227,7 @@ static void *worker_main(void *arg) {
         int spins = 0;
         while (!atomic_load_explicit(&P.stop, memory_order_relaxed) &&
                atomic_load_explicit(&P.generation, memory_order_acquire) == seen) {
-            if (++spins >= QWEN_POOL_SPIN) {
+            if (++spins >= qwen_pool_spin()) {
                 /* Sleep phase. Re-check generation under the mutex before
                  * waiting so a dispatch between our last spin check and the
                  * cond_wait cannot be missed. */
@@ -306,7 +318,7 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     /* Completion: spin briefly, then sleep. */
     int spins = 0;
     while (atomic_load_explicit(&P.completed, memory_order_acquire) != P.nworkers) {
-        if (++spins >= QWEN_POOL_SPIN) {
+        if (++spins >= qwen_pool_spin()) {
             pthread_mutex_lock(&P.mtx);
             atomic_store(&P.main_sleeping, 1);
             while (atomic_load(&P.completed) != P.nworkers)

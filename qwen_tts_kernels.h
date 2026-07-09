@@ -235,6 +235,37 @@ void qwen_snake_activation(float *data, int channels, int length,
                             const float *log_alpha, const float *log_beta);
 
 /* ========================================================================
+ * INT8 SDOT conv engine (speech decoder, QWEN_SD_INT8=1)
+ * ======================================================================== */
+
+/* 1 if the SDOT int8 conv path is compiled in (ARM dotprod). */
+int qwen_sd_int8_available(void);
+
+/* K padded up to a multiple of blk (blk must be a multiple of 16). */
+int qwen_int8_kp(int K, int blk);
+
+/* Per-row, per-blk-block absmax int8 quantization: scales is [rows][Kp/blk],
+ * rows padded to Kp with zeros. */
+void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
+                          int rows, int K, int Kp, int blk);
+
+/* Threaded int8 causal conv1d: im2col + SDOT GEMM per column panel.
+ * Wq: [out_ch, Kp] with block scales sw [out_ch][Kp/blk] (K = in_ch*kernel,
+ * im2col order ic*kernel+kk). out: channel-first [out_ch, length], bias
+ * applied. */
+void qwen_conv1d_int8(float *out, const float *in,
+                      const int8_t *Wq, const float *sw, const float *bias,
+                      int in_ch, int out_ch, int length, int kernel, int dilation,
+                      int Kp, int blk);
+
+/* Threaded int8 GEMM on pre-quantized activations: out[M,N] (ld out_ld) =
+ * sum_b sw[m][b]*sa[t][b]*dot_b(Wq[m], Xq[t]); no bias. Rows Kp-strided. */
+void qwen_gemm_int8(float *out, int out_ld,
+                    const int8_t *Wq, const float *sw,
+                    const int8_t *Xq, const float *sa,
+                    int M, int N, int Kp, int blk);
+
+/* ========================================================================
  * Argmax / Sampling
  * ======================================================================== */
 

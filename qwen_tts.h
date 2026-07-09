@@ -349,6 +349,18 @@ typedef struct {
     int frames_decoded;    /* total codec frames processed */
     int samples_produced;  /* total audio samples produced */
     int initialized;       /* 1 after first call */
+
+    /* Exact streaming conv-decoder state (replaces the windowed conv_rf
+     * re-decode): per-conv input tails (pad_left columns, zero-initialized =
+     * causal zero padding on the first chunk) and per-ConvTranspose
+     * overlap-add carries ((kernel-stride) partial output columns).
+     * Allocated lazily on first streaming decode. */
+    float *cs_cn_dw_tail[2];      /* ConvNeXt dwconv tails   [1024 × 6] */
+    float *cs_init_tail;          /* initial conv tail       [1024 × 6] */
+    float *cs_up_carry[4];        /* upsample convT carries  [out_ch × (k-s)] */
+    float *cs_res_tail[4][3];     /* res conv1 tails         [ch × 6·dil] */
+    float *cs_final_tail;         /* final conv tail         [96 × 6] */
+    int cs_alloc;                 /* 1 after tails allocated */
 } qwen_sd_stream_state_t;
 
 /* ========================================================================

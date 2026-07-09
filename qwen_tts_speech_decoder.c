@@ -31,6 +31,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <pthread.h>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -49,6 +51,30 @@
 #endif
 #define CONV_TILE_MAX_BYTES (256 * 1024 * 1024)
 #endif
+
+/* Per-stage profiling (QWEN_SD_PROFILE=1): cumulative ms per decoder stage,
+ * printed after each conv_decoder_forward call (last print = totals). */
+static double sd_prof_ms[16];
+static const char *sd_prof_names[16] = {
+    "vq+preconv", "transformer", "out_proj", "convnext",
+    "initial_conv", "up_convT", "up_res_conv", "snake", "final_conv",
+};
+static int sd_prof_enabled(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("QWEN_SD_PROFILE"); en = (e && *e && *e != '0'); }
+    return en;
+}
+static double sd_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+static void sd_prof_report(void) {
+    if (!sd_prof_enabled()) return;
+    fprintf(stderr, "[SD_PROF]");
+    for (int i = 0; i < 16 && sd_prof_names[i]; i++)
+        fprintf(stderr, " %s=%.0fms", sd_prof_names[i], sd_prof_ms[i]);
+    fprintf(stderr, "\n");
+}
 
 static const float *get_f32(void *ms, const char *name) {
     safetensors_file_t *sf = NULL;
@@ -101,15 +127,14 @@ static void causal_conv_transpose1d_naive(float *out, const float *in,
                                           int in_ch, int out_ch, int in_len, int out_len,
                                           int kernel, int stride) {
     memset(out, 0, (int64_t)out_ch * out_len * sizeof(float));
-    int full_len = (in_len - 1) * stride + kernel;
-    int trim_right = kernel - stride;
+    /* out_len selects the trim (see the BLAS variant). */
 
     for (int ic = 0; ic < in_ch; ic++) {
         for (int t = 0; t < in_len; t++) {
             float x = in[(int64_t)ic * in_len + t];
             for (int k = 0; k < kernel; k++) {
                 int out_pos = t * stride + k;
-                if (out_pos < full_len - trim_right && out_pos < out_len) {
+                if (out_pos < out_len) {
                     for (int oc = 0; oc < out_ch; oc++) {
                         out[(int64_t)oc * out_len + out_pos] +=
                             x * weight[((int64_t)ic * out_ch + oc) * kernel + k];
@@ -125,6 +150,97 @@ static void causal_conv_transpose1d_naive(float *out, const float *in,
     }
 }
 #endif /* !USE_BLAS */
+
+/* ------------------------------------------------------------------------
+ * INT8 conv path (QWEN_SD_INT8=1, ARM SDOT only): weights are quantized
+ * per-output-channel once on first use and cached; activations are quantized
+ * per-timestep-column inside the kernels. fp32 sgemm remains the default.
+ * ---------------------------------------------------------------------- */
+static int sd_int8_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_INT8");
+        en = (e && *e && *e != '0') && qwen_sd_int8_available();
+    }
+    return en;
+}
+
+/* Scale-block size along K (multiple of 16). Smaller = more accurate,
+ * slightly slower; 64 measured as the speed/quality sweet spot on N1
+ * (same RTF as 128, ~4dB better SNR). QWEN_SD_INT8_BLK overrides. */
+static int sd_int8_blk(void) {
+    static int blk = -1;
+    if (blk < 0) {
+        const char *e = getenv("QWEN_SD_INT8_BLK");
+        blk = e ? atoi(e) : 64;
+        if (blk < 16) blk = 16;
+        blk = (blk + 15) & ~15;
+    }
+    return blk;
+}
+
+/* Quantized-weight registry: keyed by (source pointer, transpose-slice k).
+ * Conv1d weights use slice -1; ConvTranspose registers one entry per kernel
+ * position (the W_k^T slice). Quantize-once, lives until process exit. */
+typedef struct {
+    const float *src;
+    int slice;
+    int8_t *q;
+    float *scales;
+    int Kp;
+} sd_wq_entry_t;
+
+#define SD_WQ_MAX 128
+static sd_wq_entry_t sd_wq[SD_WQ_MAX];
+static int sd_wq_n = 0;
+static pthread_mutex_t sd_wq_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Conv1d weight [out_ch, in_ch*kernel]: rows already in im2col order. */
+static sd_wq_entry_t *sd_wq_get_conv(const float *w, int out_ch, int K) {
+    pthread_mutex_lock(&sd_wq_mu);
+    for (int i = 0; i < sd_wq_n; i++)
+        if (sd_wq[i].src == w && sd_wq[i].slice == -1) {
+            pthread_mutex_unlock(&sd_wq_mu);
+            return &sd_wq[i];
+        }
+    if (sd_wq_n >= SD_WQ_MAX) { pthread_mutex_unlock(&sd_wq_mu); return NULL; }
+    int blk = sd_int8_blk();
+    int Kp = qwen_int8_kp(K, blk);
+    sd_wq_entry_t *e = &sd_wq[sd_wq_n];
+    e->src = w; e->slice = -1; e->Kp = Kp;
+    e->q = (int8_t *)aligned_malloc((size_t)out_ch * Kp);
+    e->scales = (float *)aligned_malloc((size_t)out_ch * (Kp / blk) * sizeof(float));
+    qwen_int8_quant_rows(e->q, e->scales, w, out_ch, K, Kp, blk);
+    sd_wq_n++;
+    pthread_mutex_unlock(&sd_wq_mu);
+    return e;
+}
+
+/* ConvTranspose slice k: rows = out_ch, K = in_ch, from [in_ch, out_ch, kernel]. */
+static sd_wq_entry_t *sd_wq_get_convt(const float *w, int k, int in_ch, int out_ch, int kernel) {
+    pthread_mutex_lock(&sd_wq_mu);
+    for (int i = 0; i < sd_wq_n; i++)
+        if (sd_wq[i].src == w && sd_wq[i].slice == k) {
+            pthread_mutex_unlock(&sd_wq_mu);
+            return &sd_wq[i];
+        }
+    if (sd_wq_n >= SD_WQ_MAX) { pthread_mutex_unlock(&sd_wq_mu); return NULL; }
+    int blk = sd_int8_blk();
+    int Kp = qwen_int8_kp(in_ch, blk);
+    float *wk = (float *)aligned_malloc((size_t)out_ch * in_ch * sizeof(float));
+    for (int oc = 0; oc < out_ch; oc++)
+        for (int ic = 0; ic < in_ch; ic++)
+            wk[(int64_t)oc * in_ch + ic] = w[((int64_t)ic * out_ch + oc) * kernel + k];
+    sd_wq_entry_t *e = &sd_wq[sd_wq_n];
+    e->src = w; e->slice = k; e->Kp = Kp;
+    e->q = (int8_t *)aligned_malloc((size_t)out_ch * Kp);
+    e->scales = (float *)aligned_malloc((size_t)out_ch * (Kp / blk) * sizeof(float));
+    qwen_int8_quant_rows(e->q, e->scales, wk, out_ch, in_ch, Kp, blk);
+    free(wk);
+    sd_wq_n++;
+    pthread_mutex_unlock(&sd_wq_mu);
+    return e;
+}
 
 #ifdef USE_BLAS
 /* Add bias to channel-first output [channels, length] */
@@ -143,6 +259,19 @@ static void causal_conv1d_blas(float *out, const float *in,
                                const float *weight, const float *bias,
                                int in_ch, int out_ch, int length,
                                int kernel, int dilation) {
+    /* int8 only for the upsample-block res convs and the initial conv —
+     * the latent-domain convs (pre-conv 512→1024, ConvNeXt) are quality-
+     * sensitive and cheap; keep them fp32. */
+    if (sd_int8_enabled() && in_ch == out_ch && in_ch <= 768) {
+        sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
+        if (e) {
+            qwen_conv1d_int8(out, in, e->q, e->scales, bias,
+                             in_ch, out_ch, length, kernel, dilation,
+                             e->Kp, sd_int8_blk());
+            return;
+        }
+    }
+
     if (kernel == 1) {
         /* k=1: weight is [out_ch, in_ch], direct matmul */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
@@ -199,8 +328,56 @@ static void causal_conv_transpose1d_blas(float *out, const float *in,
                                          int in_ch, int out_ch, int in_len, int out_len,
                                          int kernel, int stride) {
     memset(out, 0, (int64_t)out_ch * out_len * sizeof(float));
-    int full_len = (in_len - 1) * stride + kernel;
-    int trim_right = kernel - stride;
+    /* out_len selects the trim: callers pass in_len*stride for the causal
+     * trimmed result, or (in_len-1)*stride + kernel for the full (untrimmed)
+     * scatter — the streaming path keeps the tail as overlap-add carry. */
+
+    /* ConvTranspose int8 measured SLOWER than fp32 sgemm here (small K pads
+     * poorly into scale blocks, epilogue dominates) and costs quality —
+     * kept behind QWEN_SD_INT8_CONVT=1 for experiments only. */
+    static int convt_int8 = -1;
+    if (convt_int8 < 0) {
+        const char *e = getenv("QWEN_SD_INT8_CONVT");
+        convt_int8 = (e && *e && *e != '0');
+    }
+    if (sd_int8_enabled() && convt_int8 && in_ch > out_ch) {
+        /* Quantize the transposed input once (per-timestep rows), reuse for
+         * every kernel position's W_k^T GEMM. */
+        int blk = sd_int8_blk();
+        int Kp = qwen_int8_kp(in_ch, blk);
+        float *inT = (float *)aligned_malloc((int64_t)in_len * in_ch * sizeof(float));
+        for (int t = 0; t < in_len; t++)
+            for (int ic = 0; ic < in_ch; ic++)
+                inT[(int64_t)t * in_ch + ic] = in[(int64_t)ic * in_len + t];
+        int8_t *inq = (int8_t *)aligned_malloc((size_t)in_len * Kp);
+        float *sa = (float *)aligned_malloc((size_t)in_len * (Kp / blk) * sizeof(float));
+        qwen_int8_quant_rows(inq, sa, inT, in_len, in_ch, Kp, blk);
+        free(inT);
+
+        float *rk = (float *)aligned_malloc((int64_t)out_ch * in_len * sizeof(float));
+        int ok = 1;
+        for (int k = 0; k < kernel && ok; k++) {
+            sd_wq_entry_t *e = sd_wq_get_convt(weight, k, in_ch, out_ch, kernel);
+            if (!e) { ok = 0; break; }
+            qwen_gemm_int8(rk, in_len, e->q, e->scales, inq, sa, out_ch, in_len, Kp, blk);
+
+            for (int oc = 0; oc < out_ch; oc++) {
+                const float *src = rk + (int64_t)oc * in_len;
+                float *dst = out + (int64_t)oc * out_len;
+                for (int t = 0; t < in_len; t++) {
+                    int out_pos = t * stride + k;
+                    if (out_pos < out_len)
+                        dst[out_pos] += src[t];
+                }
+            }
+        }
+        free(rk); free(inq); free(sa);
+        if (ok) {
+            conv_add_bias(out, bias, out_ch, out_len);
+            return;
+        }
+        memset(out, 0, (int64_t)out_ch * out_len * sizeof(float));
+    }
 
     /* Per-kernel-position: extract weight slice, sgemm, scatter */
     float *wk = (float *)aligned_malloc((int64_t)in_ch * out_ch * sizeof(float));
@@ -226,7 +403,7 @@ static void causal_conv_transpose1d_blas(float *out, const float *in,
             float *dst = out + (int64_t)oc * out_len;
             for (int t = 0; t < in_len; t++) {
                 int out_pos = t * stride + k;
-                if (out_pos < full_len - trim_right && out_pos < out_len)
+                if (out_pos < out_len)
                     dst[out_pos] += src[t];
             }
         }
@@ -1209,6 +1386,13 @@ void qwen_sd_stream_free(qwen_sd_stream_state_t *st) {
     }
     free(st->latent_cache); st->latent_cache = NULL;
     free(st->vq_pad); st->vq_pad = NULL;
+    free(st->cs_cn_dw_tail[0]); free(st->cs_cn_dw_tail[1]);
+    free(st->cs_init_tail);
+    free(st->cs_final_tail);
+    for (int b = 0; b < 4; b++) {
+        free(st->cs_up_carry[b]);
+        for (int r = 0; r < 3; r++) free(st->cs_res_tail[b][r]);
+    }
     memset(st, 0, sizeof(*st));
 }
 
@@ -1216,10 +1400,89 @@ void qwen_sd_stream_free(qwen_sd_stream_state_t *st) {
  * on a signal in channel-first format [latent_dim, n_frames].
  * Returns audio samples. This is the same pipeline as steps 7-10 in the
  * full decode, extracted as a helper to avoid duplication. */
+/* ConvNeXt block tail: LayerNorm (per-timestep) + pw1(1024→4096)+GELU +
+ * pw2(4096→1024), then x = residual + gamma·x. `x` holds the dwconv output
+ * [ch, len] and receives the result; `residual` is the ConvTranspose output.
+ * Shared by the one-shot and exact-streaming conv decoders (every op here is
+ * per-timestep, so chunking is transparent). */
+static void convnext_mlp(qwen_sd_convnext_t *cn, float *x, const float *residual,
+                         int cur_ch, int cur_len) {
+    /* LayerNorm (per-timestep) */
+    for (int t = 0; t < cur_len; t++) {
+        float mean = 0, var = 0;
+        for (int c = 0; c < cur_ch; c++) mean += x[(int64_t)c * cur_len + t];
+        mean /= cur_ch;
+        for (int c = 0; c < cur_ch; c++) {
+            float d = x[(int64_t)c * cur_len + t] - mean;
+            var += d * d;
+        }
+        var = 1.0f / sqrtf(var / cur_ch + 1e-5f);
+        for (int c = 0; c < cur_ch; c++) {
+            float v = (x[(int64_t)c * cur_len + t] - mean) * var;
+            x[(int64_t)c * cur_len + t] = v * cn->norm_weight[c] + cn->norm_bias[c];
+        }
+    }
+
+    /* Pointwise convs: pw1 (1024→4096, GELU), pw2 (4096→1024) */
+    int pw_dim = 4096;
+    float *pw1_out = (float *)aligned_malloc((int64_t)pw_dim * cur_len * sizeof(float));
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                pw_dim, cur_len, cur_ch, 1.0f,
+                cn->pwconv1_weight, cur_ch, x, cur_len,
+                0.0f, pw1_out, cur_len);
+    if (cn->pwconv1_bias)
+        for (int i = 0; i < pw_dim; i++)
+            for (int t = 0; t < cur_len; t++)
+                pw1_out[(int64_t)i * cur_len + t] += cn->pwconv1_bias[i];
+#else
+    for (int o = 0; o < pw_dim; o++)
+        for (int t = 0; t < cur_len; t++) {
+            float sum = cn->pwconv1_bias ? cn->pwconv1_bias[o] : 0;
+            for (int i = 0; i < cur_ch; i++)
+                sum += cn->pwconv1_weight[(int64_t)o * cur_ch + i] * x[(int64_t)i * cur_len + t];
+            pw1_out[(int64_t)o * cur_len + t] = sum;
+        }
+#endif
+    /* Exact GELU */
+    for (int64_t i = 0; i < (int64_t)pw_dim * cur_len; i++)
+        pw1_out[i] = 0.5f * pw1_out[i] * (1.0f + erff(pw1_out[i] * 0.7071067811865476f));
+
+    /* pw2 */
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                cur_ch, cur_len, pw_dim, 1.0f,
+                cn->pwconv2_weight, pw_dim, pw1_out, cur_len,
+                0.0f, x, cur_len);
+    if (cn->pwconv2_bias)
+        for (int o = 0; o < cur_ch; o++)
+            for (int t = 0; t < cur_len; t++)
+                x[(int64_t)o * cur_len + t] += cn->pwconv2_bias[o];
+#else
+    for (int o = 0; o < cur_ch; o++)
+        for (int t = 0; t < cur_len; t++) {
+            float sum = cn->pwconv2_bias ? cn->pwconv2_bias[o] : 0;
+            for (int i = 0; i < pw_dim; i++)
+                sum += cn->pwconv2_weight[(int64_t)o * pw_dim + i] * pw1_out[(int64_t)i * cur_len + t];
+            x[(int64_t)o * cur_len + t] = sum;
+        }
+#endif
+    free(pw1_out);
+
+    /* Gamma + residual */
+    for (int ci = 0; ci < cur_ch; ci++) {
+        float g = cn->gamma[ci];
+        for (int t = 0; t < cur_len; t++)
+            x[(int64_t)ci * cur_len + t] = residual[(int64_t)ci * cur_len + t]
+                + x[(int64_t)ci * cur_len + t] * g;
+    }
+}
+
 static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
                                  float *signal, int cur_ch, int cur_len,
                                  float **audio_out, int *n_samples_out) {
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
+    double sd_t0 = sd_now_ms();
 
     /* ConvNeXt upsample (2 blocks, 2x each → 4x total) */
     for (int b = 0; b < 2; b++) {
@@ -1248,78 +1511,11 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
 
         float *residual = signal; signal = dw_out;
 
-        /* LayerNorm (per-timestep) */
-        for (int t = 0; t < cur_len; t++) {
-            float mean = 0, var = 0;
-            for (int c = 0; c < cur_ch; c++) mean += signal[(int64_t)c * cur_len + t];
-            mean /= cur_ch;
-            for (int c = 0; c < cur_ch; c++) {
-                float d = signal[(int64_t)c * cur_len + t] - mean;
-                var += d * d;
-            }
-            var = 1.0f / sqrtf(var / cur_ch + 1e-5f);
-            for (int c = 0; c < cur_ch; c++) {
-                float x = (signal[(int64_t)c * cur_len + t] - mean) * var;
-                signal[(int64_t)c * cur_len + t] = x * cn->norm_weight[c] + cn->norm_bias[c];
-            }
-        }
-
-        /* Pointwise convs: pw1 (1024→4096, GELU), pw2 (4096→1024) */
-        int pw_dim = 4096;
-        float *pw1_out = (float *)aligned_malloc((int64_t)pw_dim * cur_len * sizeof(float));
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    pw_dim, cur_len, cur_ch, 1.0f,
-                    cn->pwconv1_weight, cur_ch, signal, cur_len,
-                    0.0f, pw1_out, cur_len);
-        if (cn->pwconv1_bias)
-            for (int i = 0; i < pw_dim; i++)
-                for (int t = 0; t < cur_len; t++)
-                    pw1_out[(int64_t)i * cur_len + t] += cn->pwconv1_bias[i];
-#else
-        for (int o = 0; o < pw_dim; o++)
-            for (int t = 0; t < cur_len; t++) {
-                float sum = cn->pwconv1_bias ? cn->pwconv1_bias[o] : 0;
-                for (int i = 0; i < cur_ch; i++)
-                    sum += cn->pwconv1_weight[(int64_t)o * cur_ch + i] * signal[(int64_t)i * cur_len + t];
-                pw1_out[(int64_t)o * cur_len + t] = sum;
-            }
-#endif
-        /* Exact GELU */
-        for (int64_t i = 0; i < (int64_t)pw_dim * cur_len; i++)
-            pw1_out[i] = 0.5f * pw1_out[i] * (1.0f + erff(pw1_out[i] * 0.7071067811865476f));
-
-        /* pw2 */
-        memset(signal, 0, (int64_t)cur_ch * cur_len * sizeof(float));
-#ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    cur_ch, cur_len, pw_dim, 1.0f,
-                    cn->pwconv2_weight, pw_dim, pw1_out, cur_len,
-                    0.0f, signal, cur_len);
-        if (cn->pwconv2_bias)
-            for (int o = 0; o < cur_ch; o++)
-                for (int t = 0; t < cur_len; t++)
-                    signal[(int64_t)o * cur_len + t] += cn->pwconv2_bias[o];
-#else
-        for (int o = 0; o < cur_ch; o++)
-            for (int t = 0; t < cur_len; t++) {
-                float sum = cn->pwconv2_bias ? cn->pwconv2_bias[o] : 0;
-                for (int i = 0; i < pw_dim; i++)
-                    sum += cn->pwconv2_weight[(int64_t)o * pw_dim + i] * pw1_out[(int64_t)i * cur_len + t];
-                signal[(int64_t)o * cur_len + t] = sum;
-            }
-#endif
-        free(pw1_out);
-
-        /* Gamma + residual */
-        for (int ci = 0; ci < cur_ch; ci++) {
-            float g = cn->gamma[ci];
-            for (int t = 0; t < cur_len; t++)
-                signal[(int64_t)ci * cur_len + t] = residual[(int64_t)ci * cur_len + t]
-                    + signal[(int64_t)ci * cur_len + t] * g;
-        }
+        convnext_mlp(cn, signal, residual, cur_ch, cur_len);
         free(residual);
     }
+
+    sd_prof_ms[3] += sd_now_ms() - sd_t0; sd_t0 = sd_now_ms();
 
     /* Initial conv (1024→1536, k=7, pad_left=6) */
     if (!sd->initial_conv_weight) { free(signal); return -1; }
@@ -1329,6 +1525,7 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
     causal_conv1d(conv_out, signal, sd->initial_conv_weight, sd->initial_conv_bias,
                   cur_ch, new_ch, cur_len, 7, 1);
     free(signal); signal = conv_out; cur_ch = new_ch; cur_len = new_len;
+    sd_prof_ms[4] += sd_now_ms() - sd_t0;
 
     /* 4 Decoder upsample blocks */
     int up_rates[4] = {8, 5, 4, 3};
@@ -1342,14 +1539,17 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
 
         if (!ub->upsample.conv_weight) { free(signal); return -1; }
 
+        double t_blk = sd_now_ms();
         if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
             snake_activation(signal, cur_ch, cur_len, ub->upsample.snake_alpha, ub->upsample.snake_beta);
+        sd_prof_ms[7] += sd_now_ms() - t_blk; t_blk = sd_now_ms();
 
         int up_len = conv_transpose1d_out_len(cur_len, kernel, rate);
         float *up_out = (float *)aligned_calloc((int64_t)out_ch * up_len, sizeof(float));
         causal_conv_transpose1d(up_out, signal, ub->upsample.conv_weight, ub->upsample.conv_bias,
                                  cur_ch, out_ch, cur_len, up_len, kernel, rate);
         free(signal); signal = up_out; cur_ch = out_ch; cur_len = up_len;
+        sd_prof_ms[5] += sd_now_ms() - t_blk;
 
         int dilations[3] = {1, 3, 9};
         for (int r = 0; r < 3; r++) {
@@ -1357,23 +1557,28 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
             float *res = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
             memcpy(res, signal, (int64_t)cur_ch * cur_len * sizeof(float));
 
+            double t_res = sd_now_ms();
             if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
                 snake_activation(signal, cur_ch, cur_len,
                                   ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+            sd_prof_ms[7] += sd_now_ms() - t_res; t_res = sd_now_ms();
 
             float *c1_out = (float *)aligned_calloc((int64_t)cur_ch * cur_len, sizeof(float));
             causal_conv1d(c1_out, signal, ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias,
                           cur_ch, cur_ch, cur_len, 7, dil);
             memcpy(signal, c1_out, (int64_t)cur_ch * cur_len * sizeof(float));
             free(c1_out);
+            sd_prof_ms[6] += sd_now_ms() - t_res; t_res = sd_now_ms();
 
             if (ub->res_blocks[r].snake2_alpha && ub->res_blocks[r].snake2_beta)
                 snake_activation(signal, cur_ch, cur_len,
                                   ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
+            sd_prof_ms[7] += sd_now_ms() - t_res; t_res = sd_now_ms();
 
             float *c2_out = (float *)aligned_calloc((int64_t)cur_ch * cur_len, sizeof(float));
             causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias,
                           cur_ch, cur_ch, cur_len, 1, 1);
+            sd_prof_ms[6] += sd_now_ms() - t_res;
 
             for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
                 signal[i] = res[i] + c2_out[i];
@@ -1384,7 +1589,9 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
 
     /* Final Snake + Conv (96→1, k=7) */
     if (!sd->final_snake.alpha || !sd->final_conv_weight) { free(signal); return -1; }
+    sd_t0 = sd_now_ms();
     snake_activation(signal, cur_ch, cur_len, sd->final_snake.alpha, sd->final_snake.beta);
+    sd_prof_ms[7] += sd_now_ms() - sd_t0; sd_t0 = sd_now_ms();
 
     int audio_len = conv1d_out_len(cur_len, 7, 1, 6);
     float *audio = (float *)aligned_calloc(audio_len, sizeof(float));
@@ -1405,9 +1612,282 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
         if (audio[i] < -1.0f) audio[i] = -1.0f;
         if (audio[i] > 1.0f) audio[i] = 1.0f;
     }
+    sd_prof_ms[8] += sd_now_ms() - sd_t0;
+    sd_prof_report();
 
     *audio_out = audio;
     *n_samples_out = audio_len;
+    return 0;
+}
+
+/* ========================================================================
+ * Exact streaming conv decoder
+ *
+ * Identical math to conv_decoder_forward, but consumes ONLY the new latent
+ * frames, carrying per-layer causal state across calls:
+ *   - conv1d (k>1): keep the last pad_left = (k-1)·dil input columns; a
+ *     zero-initialized tail equals the causal zero padding of chunk 0.
+ *   - ConvTranspose: keep the (kernel-stride) untrimmed partial output
+ *     columns and overlap-add them into the next chunk (bias added on emit).
+ *   - snake / LayerNorm / pointwise / GELU / k=1 conv: per-timestep,
+ *     stateless.
+ * Chunked output therefore equals the one-shot decode exactly — unlike the
+ * windowed conv_rf path, which both re-decodes 20 context frames per chunk
+ * (~1.8x decoder work at 24-frame chunks) and approximates at boundaries.
+ * The windowed path is kept behind QWEN_SD_WINDOWED=1.
+ * ======================================================================== */
+
+/* Stateful causal conv1d on a chunk: prepend saved tail, convolve, emit
+ * [out_ch × len], update tail. Returns a freshly allocated output. */
+static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
+                        int kernel, int dilation,
+                        const float *w, const float *b, float *tail) {
+    int tail_cols = (kernel - 1) * dilation;
+    int ext_len = tail_cols + len;
+    float *ext = (float *)aligned_malloc((int64_t)in_ch * ext_len * sizeof(float));
+    for (int ic = 0; ic < in_ch; ic++) {
+        memcpy(ext + (int64_t)ic * ext_len, tail + (int64_t)ic * tail_cols,
+               tail_cols * sizeof(float));
+        memcpy(ext + (int64_t)ic * ext_len + tail_cols, in + (int64_t)ic * len,
+               len * sizeof(float));
+    }
+    /* New tail = last tail_cols columns of ext (start index ext_len-tail_cols = len) */
+    for (int ic = 0; ic < in_ch; ic++)
+        memcpy(tail + (int64_t)ic * tail_cols, ext + (int64_t)ic * ext_len + len,
+               tail_cols * sizeof(float));
+
+    float *full = (float *)aligned_calloc((int64_t)out_ch * ext_len, sizeof(float));
+    causal_conv1d(full, ext, w, b, in_ch, out_ch, ext_len, kernel, dilation);
+    free(ext);
+
+    /* Emit only the chunk columns (the first tail_cols outputs re-pad with
+     * zeros and are wrong — they were already emitted by earlier chunks). */
+    float *out = (float *)aligned_malloc((int64_t)out_ch * len * sizeof(float));
+    for (int oc = 0; oc < out_ch; oc++)
+        memcpy(out + (int64_t)oc * len, full + (int64_t)oc * ext_len + tail_cols,
+               len * sizeof(float));
+    free(full);
+    return out;
+}
+
+/* Stateful causal ConvTranspose1d on a chunk: run untrimmed, overlap-add the
+ * carry into the head, emit len·stride columns (+bias), save the new
+ * (kernel-stride)-column tail as carry (bias-free partial sums).
+ * carry == NULL is allowed when kernel == stride (no cross-chunk overlap). */
+static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
+                       int kernel, int stride,
+                       const float *w, const float *b, float *carry) {
+    int cs = kernel - stride;
+    int full_len = (len - 1) * stride + kernel;   /* = len·stride + cs */
+    int out_len = len * stride;
+    float *full = (float *)aligned_calloc((int64_t)out_ch * full_len, sizeof(float));
+    causal_conv_transpose1d(full, in, w, NULL, in_ch, out_ch, len, full_len,
+                            kernel, stride);
+    float *out = (float *)aligned_malloc((int64_t)out_ch * out_len * sizeof(float));
+    for (int oc = 0; oc < out_ch; oc++) {
+        float *f = full + (int64_t)oc * full_len;
+        float *o = out + (int64_t)oc * out_len;
+        if (carry) {
+            const float *cr = carry + (int64_t)oc * cs;
+            for (int i = 0; i < cs; i++) f[i] += cr[i];
+        }
+        float bb = b ? b[oc] : 0.0f;
+        for (int t = 0; t < out_len; t++) o[t] = f[t] + bb;
+        if (carry) {
+            float *cr = carry + (int64_t)oc * cs;
+            for (int i = 0; i < cs; i++) cr[i] = f[out_len + i];
+        }
+    }
+    free(full);
+    return out;
+}
+
+/* Stateful ConvNeXt depthwise conv (k=7, pad=6) with a 6-column tail. */
+static float *cs_dwconv(const float *in, int ch, int len,
+                        const float *w, const float *b, float *tail) {
+    float *out = (float *)aligned_malloc((int64_t)ch * len * sizeof(float));
+    for (int c = 0; c < ch; c++) {
+        const float *src = in + (int64_t)c * len;
+        float *tl = tail + (int64_t)c * 6;
+        float *dst = out + (int64_t)c * len;
+        float bb = b ? b[c] : 0.0f;
+        const float *wc = w + (int64_t)c * 7;
+        for (int t = 0; t < len; t++) {
+            float sum = bb;
+            for (int k = 0; k < 7; k++) {
+                int p = t - 6 + k;                 /* chunk-relative input pos */
+                sum += wc[k] * (p >= 0 ? src[p] : tl[6 + p]);
+            }
+            dst[t] = sum;
+        }
+        /* New tail = last 6 inputs of [tail | chunk] */
+        if (len >= 6) memcpy(tl, src + len - 6, 6 * sizeof(float));
+        else
+            for (int i = 0; i < 6; i++)
+                tl[i] = (i + len < 6) ? tl[i + len] : src[i + len - 6];
+    }
+    return out;
+}
+
+/* Lazily allocate (zeroed) streaming conv state. */
+static void cs_ensure_alloc(qwen_sd_stream_state_t *st) {
+    if (st->cs_alloc) return;
+    static const int up_out_ch[4] = {768, 384, 192, 96};
+    static const int up_rate[4] = {8, 5, 4, 3};
+    static const int dils[3] = {1, 3, 9};
+    st->cs_cn_dw_tail[0] = (float *)aligned_calloc(1024 * 6, sizeof(float));
+    st->cs_cn_dw_tail[1] = (float *)aligned_calloc(1024 * 6, sizeof(float));
+    st->cs_init_tail = (float *)aligned_calloc(1024 * 6, sizeof(float));
+    st->cs_final_tail = (float *)aligned_calloc(96 * 6, sizeof(float));
+    for (int b = 0; b < 4; b++) {
+        st->cs_up_carry[b] = (float *)aligned_calloc((int64_t)up_out_ch[b] * up_rate[b],
+                                                     sizeof(float));
+        for (int r = 0; r < 3; r++)
+            st->cs_res_tail[b][r] = (float *)aligned_calloc((int64_t)up_out_ch[b] * 6 * dils[r],
+                                                            sizeof(float));
+    }
+    st->cs_alloc = 1;
+}
+
+/* Streaming conv decoder: consumes `signal` [1024 × m] (takes ownership),
+ * emits exactly m·1920 samples. Mirrors conv_decoder_forward stage by
+ * stage; see the block comment above for the state discipline. */
+static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, float *signal, int m,
+                                          float **audio_out, int *n_samples_out) {
+    qwen_speech_decoder_t *sd = &ctx->speech_dec;
+    qwen_sd_stream_state_t *st = &ctx->sd_stream;
+    cs_ensure_alloc(st);
+    int cur_ch = 1024, cur_len = m;
+    double sd_t0 = sd_now_ms();
+
+    /* ConvNeXt upsample (2 blocks, 2x each) */
+    for (int b = 0; b < 2; b++) {
+        qwen_sd_convnext_t *cn = &sd->convnext[b];
+        if (!cn->conv_weight) { free(signal); return -1; }
+        /* k=2, s=2: no cross-chunk overlap, carry-free */
+        float *up = cs_convt(signal, cur_ch, cur_ch, cur_len, 2, 2,
+                             cn->conv_weight, cn->conv_bias, NULL);
+        free(signal); cur_len *= 2;
+        float *dw = cs_dwconv(up, cur_ch, cur_len, cn->dwconv_weight, cn->dwconv_bias,
+                              st->cs_cn_dw_tail[b]);
+        convnext_mlp(cn, dw, up, cur_ch, cur_len);
+        free(up);
+        signal = dw;
+    }
+    sd_prof_ms[3] += sd_now_ms() - sd_t0; sd_t0 = sd_now_ms();
+
+    /* Initial conv (1024→1536, k=7) */
+    if (!sd->initial_conv_weight) { free(signal); return -1; }
+    float *ic_out = cs_conv1d(signal, cur_ch, 1536, cur_len, 7, 1,
+                              sd->initial_conv_weight, sd->initial_conv_bias,
+                              st->cs_init_tail);
+    free(signal); signal = ic_out; cur_ch = 1536;
+    sd_prof_ms[4] += sd_now_ms() - sd_t0;
+
+    /* 4 Decoder upsample blocks */
+    int up_rates[4] = {8, 5, 4, 3};
+    int out_channels[4] = {768, 384, 192, 96};
+
+    for (int b = 0; b < 4; b++) {
+        qwen_sd_upsample_block_t *ub = &sd->upsample_blocks[b];
+        int rate = up_rates[b];
+        int kernel = rate * 2;
+        int out_ch = out_channels[b];
+
+        if (!ub->upsample.conv_weight) { free(signal); return -1; }
+
+        double t_blk = sd_now_ms();
+        if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
+            snake_activation(signal, cur_ch, cur_len, ub->upsample.snake_alpha, ub->upsample.snake_beta);
+        sd_prof_ms[7] += sd_now_ms() - t_blk; t_blk = sd_now_ms();
+
+        float *up_out = cs_convt(signal, cur_ch, out_ch, cur_len, kernel, rate,
+                                 ub->upsample.conv_weight, ub->upsample.conv_bias,
+                                 st->cs_up_carry[b]);
+        free(signal); signal = up_out; cur_ch = out_ch; cur_len *= rate;
+        sd_prof_ms[5] += sd_now_ms() - t_blk;
+
+        int dilations[3] = {1, 3, 9};
+        for (int r = 0; r < 3; r++) {
+            int dil = dilations[r];
+            float *res = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
+            memcpy(res, signal, (int64_t)cur_ch * cur_len * sizeof(float));
+
+            double t_res = sd_now_ms();
+            if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
+                snake_activation(signal, cur_ch, cur_len,
+                                  ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+            sd_prof_ms[7] += sd_now_ms() - t_res; t_res = sd_now_ms();
+
+            float *c1_out = cs_conv1d(signal, cur_ch, cur_ch, cur_len, 7, dil,
+                                      ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias,
+                                      st->cs_res_tail[b][r]);
+            free(signal); signal = c1_out;
+            sd_prof_ms[6] += sd_now_ms() - t_res; t_res = sd_now_ms();
+
+            if (ub->res_blocks[r].snake2_alpha && ub->res_blocks[r].snake2_beta)
+                snake_activation(signal, cur_ch, cur_len,
+                                  ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
+            sd_prof_ms[7] += sd_now_ms() - t_res; t_res = sd_now_ms();
+
+            /* conv2 is k=1: stateless */
+            float *c2_out = (float *)aligned_calloc((int64_t)cur_ch * cur_len, sizeof(float));
+            causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias,
+                          cur_ch, cur_ch, cur_len, 1, 1);
+            sd_prof_ms[6] += sd_now_ms() - t_res;
+
+            for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
+                signal[i] = res[i] + c2_out[i];
+            free(c2_out);
+            free(res);
+        }
+    }
+
+    /* Final Snake + Conv (96→1, k=7) with a 6-column input tail */
+    if (!sd->final_snake.alpha || !sd->final_conv_weight) { free(signal); return -1; }
+    sd_t0 = sd_now_ms();
+    snake_activation(signal, cur_ch, cur_len, sd->final_snake.alpha, sd->final_snake.beta);
+    sd_prof_ms[7] += sd_now_ms() - sd_t0; sd_t0 = sd_now_ms();
+
+    float *audio = (float *)aligned_calloc(cur_len, sizeof(float));
+    {
+        float *tl = st->cs_final_tail;   /* [96 × 6] */
+        if (sd->final_conv_bias)
+            for (int t = 0; t < cur_len; t++) audio[t] = sd->final_conv_bias[0];
+        for (int ic = 0; ic < cur_ch; ic++) {
+            const float *src = signal + (int64_t)ic * cur_len;
+            const float *wc = sd->final_conv_weight + (int64_t)ic * 7;
+            const float *tc = tl + (int64_t)ic * 6;
+            for (int t = 0; t < cur_len; t++) {
+                float sum = 0;
+                for (int k = 0; k < 7; k++) {
+                    int p = t - 6 + k;
+                    sum += wc[k] * (p >= 0 ? src[p] : tc[6 + p]);
+                }
+                audio[t] += sum;
+            }
+        }
+        /* Update tail with the last 6 (snake-activated) inputs */
+        for (int ic = 0; ic < cur_ch; ic++) {
+            float *tc = tl + (int64_t)ic * 6;
+            const float *src = signal + (int64_t)ic * cur_len;
+            if (cur_len >= 6) memcpy(tc, src + cur_len - 6, 6 * sizeof(float));
+            else
+                for (int i = 0; i < 6; i++)
+                    tc[i] = (i + cur_len < 6) ? tc[i + cur_len] : src[i + cur_len - 6];
+        }
+    }
+    free(signal);
+
+    for (int i = 0; i < cur_len; i++) {
+        if (audio[i] < -1.0f) audio[i] = -1.0f;
+        if (audio[i] > 1.0f) audio[i] = 1.0f;
+    }
+    sd_prof_ms[8] += sd_now_ms() - sd_t0;
+    sd_prof_report();
+
+    *audio_out = audio;
+    *n_samples_out = cur_len;
     return 0;
 }
 
@@ -1432,6 +1912,8 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
     int window = 72;
     float eps = c->dec_rms_norm_eps;
     int half_hd = head_dim / 2;
+
+    double sd_st = sd_now_ms();
 
     /* === Step 1: VQ dequant for new frames only === */
     /* Output: vq_out row-major [new_frames, 512] */
@@ -1545,6 +2027,8 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
     }
     free(pre_conv_out);
 #endif
+
+    sd_prof_ms[0] += sd_now_ms() - sd_st; sd_st = sd_now_ms();
 
     /* === Step 4: Pre-transformer with KV cache === */
     /* Ensure KV cache is allocated */
@@ -1764,6 +2248,7 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
     st->kv_len += new_frames;
 
     free(q); free(new_k); free(new_v); free(x_norm); free(attn_out);
+    sd_prof_ms[1] += sd_now_ms() - sd_st; sd_st = sd_now_ms();
 
     /* === Step 5: Final RMSNorm + Output proj (512→1024) on new frames === */
     if (sd->final_norm_weight) {
@@ -1802,8 +2287,36 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
 #endif
     st->latent_frames += new_frames;
     free(hidden);
+    sd_prof_ms[2] += sd_now_ms() - sd_st;
 
-    /* === Step 6: Windowed conv decoder === */
+    /* === Step 6: conv decoder on the new frames === */
+    /* Default: exact streaming conv state (no context re-decode, chunked
+     * output == one-shot decode). QWEN_SD_WINDOWED=1 restores the old
+     * windowed conv_rf approximation. */
+    static int use_windowed = -1;
+    if (use_windowed < 0) {
+        const char *e = getenv("QWEN_SD_WINDOWED");
+        use_windowed = (e && *e && *e != '0');
+    }
+    if (!use_windowed) {
+        float *sig = (float *)aligned_malloc((int64_t)latent_dim * new_frames * sizeof(float));
+        const float *lsrc = st->latent_cache + (int64_t)(st->latent_frames - new_frames) * latent_dim;
+        for (int f = 0; f < new_frames; f++)
+            for (int d = 0; d < latent_dim; d++)
+                sig[(int64_t)d * new_frames + f] = lsrc[(int64_t)f * latent_dim + d];
+
+        float *audio = NULL;
+        int ns = 0;
+        int ret = conv_decoder_forward_streaming(ctx, sig, new_frames, &audio, &ns);
+        if (ret != 0) return ret;
+
+        st->frames_decoded += new_frames;
+        st->samples_produced += ns;
+        *audio_out = audio;
+        *n_samples = ns;
+        return 0;
+    }
+
     /* Take last (RF + new_frames) from latent cache, or all if fewer */
     int conv_rf = QWEN_SD_STREAM_CONV_RF;
     int window_frames = st->latent_frames;

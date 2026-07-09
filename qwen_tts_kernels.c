@@ -18,6 +18,10 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
+#include <stdatomic.h>
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -2249,9 +2253,9 @@ void qwen_bf16_to_f32_vec(float *dst, const uint16_t *src_bf16, int n) {
  * Snake activation: x += (1/exp(beta)) * sin²(exp(alpha) * x)
  * ======================================================================== */
 
-void qwen_snake_activation(float *data, int channels, int length,
-                            const float *log_alpha, const float *log_beta) {
-    for (int c = 0; c < channels; c++) {
+static void snake_rows(float *data, int c0, int c1, int length,
+                       const float *log_alpha, const float *log_beta) {
+    for (int c = c0; c < c1; c++) {
         float a = expf(log_alpha[c]);
         float inv_b = expf(-log_beta[c]);
         float *row = data + (int64_t)c * length;
@@ -2278,18 +2282,32 @@ void qwen_snake_activation(float *data, int channels, int length,
         }
 #elif defined(__ARM_NEON)
         {
-            float32x4_t va = vdupq_n_f32(a);
-            float32x4_t vinv_b = vdupq_n_f32(inv_b);
+            /* Vectorized sin² via period-π reduction: sin²(y) = sin²(y − nπ),
+             * n = round(y/π), so u ∈ [−π/2, π/2] and an odd sin polynomial
+             * suffices — squaring makes the sign of sin(y−nπ) irrelevant. */
+            const float32x4_t va = vdupq_n_f32(a);
+            const float32x4_t vinv_b = vdupq_n_f32(inv_b);
+            const float32x4_t inv_pi = vdupq_n_f32(0.31830988618379067f);
+            const float32x4_t pi_hi = vdupq_n_f32(3.14159274101257324f);
+            const float32x4_t pi_lo = vdupq_n_f32(-8.74227765734758577e-8f);
+            const float32x4_t c3  = vdupq_n_f32(-1.6666666666e-1f);
+            const float32x4_t c5  = vdupq_n_f32( 8.3333333333e-3f);
+            const float32x4_t c7  = vdupq_n_f32(-1.9841269841e-4f);
+            const float32x4_t c9  = vdupq_n_f32( 2.7557319224e-6f);
+            const float32x4_t c11 = vdupq_n_f32(-2.5052108385e-8f);
             int t = 0;
             for (; t + 3 < length; t += 4) {
                 float32x4_t x = vld1q_f32(row + t);
-                float32x4_t ax = vmulq_f32(va, x);
-                /* Scalar sinf for each lane (no NEON intrinsic for sin) */
-                float ax_s[4];
-                vst1q_f32(ax_s, ax);
-                float s_arr[4] = { sinf(ax_s[0]), sinf(ax_s[1]),
-                                   sinf(ax_s[2]), sinf(ax_s[3]) };
-                float32x4_t s = vld1q_f32(s_arr);
+                float32x4_t y = vmulq_f32(va, x);
+                float32x4_t n = vrndaq_f32(vmulq_f32(y, inv_pi));
+                float32x4_t u = vfmsq_f32(y, n, pi_hi);
+                u = vfmsq_f32(u, n, pi_lo);
+                float32x4_t u2 = vmulq_f32(u, u);
+                float32x4_t p = vfmaq_f32(c9, c11, u2);
+                p = vfmaq_f32(c7, p, u2);
+                p = vfmaq_f32(c5, p, u2);
+                p = vfmaq_f32(c3, p, u2);
+                float32x4_t s = vfmaq_f32(u, vmulq_f32(u, u2), p);
                 float32x4_t s2 = vmulq_f32(s, s);
                 x = vfmaq_f32(x, vinv_b, s2);
                 vst1q_f32(row + t, x);
@@ -2328,6 +2346,46 @@ void qwen_snake_activation(float *data, int channels, int length,
         }
 #endif
     }
+}
+
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(_WIN32)
+/* Decoder-side worker pool, defined with the int8 conv engine below.
+ * Used here to spread snake over cores (it runs on the decoder thread,
+ * which may not touch the main qwen_parallel pool). */
+static void sd_pool_run(void (*fn)(void *), void *ctx);
+
+typedef struct {
+    float *data;
+    int channels, length;
+    const float *log_alpha, *log_beta;
+    _Atomic int next;
+    int chunk;
+} snake_job_t;
+
+static void snake_worker(void *vj) {
+    snake_job_t *j = (snake_job_t *)vj;
+    for (;;) {
+        int c0 = atomic_fetch_add(&j->next, j->chunk);
+        if (c0 >= j->channels) break;
+        int c1 = c0 + j->chunk < j->channels ? c0 + j->chunk : j->channels;
+        snake_rows(j->data, c0, c1, j->length, j->log_alpha, j->log_beta);
+    }
+}
+#endif
+
+void qwen_snake_activation(float *data, int channels, int length,
+                            const float *log_alpha, const float *log_beta) {
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(_WIN32)
+    if ((int64_t)channels * length >= 65536 && qwen_get_threads() > 1) {
+        int chunk = channels / (qwen_get_threads() * 4);
+        if (chunk < 1) chunk = 1;
+        snake_job_t job = { data, channels, length, log_alpha, log_beta, 0, chunk };
+        atomic_store(&job.next, 0);
+        sd_pool_run(snake_worker, &job);
+        return;
+    }
+#endif
+    snake_rows(data, 0, channels, length, log_alpha, log_beta);
 }
 
 /* ========================================================================
@@ -2648,3 +2706,419 @@ int qwen_kernel_selftest(void *out) {
             failures, failures == 1 ? "" : "s");
     return failures;
 }
+
+/* ========================================================================
+ * INT8 SDOT conv engine for the speech decoder (QWEN_SD_INT8=1)
+ *
+ * The decoder's conv stack (res blocks + upsample transposes + initial conv)
+ * is ~75% of decode wall time as fp32 sgemm. This path quantizes BOTH
+ * operands int8 with per-BLK-element scales (Q8_0-style; one absmax per
+ * whole im2col column is not enough — large channels crush small ones,
+ * ~17dB SNR; per-128 blocks align with channel groups and restore ~40dB+)
+ * and runs the im2col GEMM with vdotq_s32: 4x the MAC throughput of fp32
+ * FMA on Neoverse-N1, ~1.4x effective after block-scale epilogues.
+ *
+ * Layout: weights [M, Kp] quantized once (cached by caller); activations are
+ * a TRANSPOSED im2col [N, Kp] built per 128-column panel. Kp is K padded to
+ * a BLK multiple, zero-filled (zero blocks contribute 0 regardless of scale).
+ * Scales are [row][Kp/BLK]. The dot loop is a 2x4 register tile: int32
+ * accumulators per BLK, folded into fp32 accumulators with the combined
+ * weight-block x activation-block scale.
+ *
+ * Threading: work chunks are claimed atomically by a small dedicated pool —
+ * the main qwen_parallel pool is NOT reentrant and is owned by the
+ * generation thread; the decoder runs concurrently on its own thread.
+ * ======================================================================== */
+
+int qwen_sd_int8_available(void) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int qwen_int8_kp(int K, int blk) { return (K + blk - 1) / blk * blk; }
+
+/* Per-row, per-BLK-block absmax int8 quantization. dst rows are Kp-strided
+ * and zero-padded; scales is [rows][Kp/blk]. blk must be a multiple of 16. */
+void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
+                          int rows, int K, int Kp, int blk) {
+    int nblk = Kp / blk;
+    for (int r = 0; r < rows; r++) {
+        const float *s = src + (int64_t)r * K;
+        int8_t *d = dst + (int64_t)r * Kp;
+        float *sc = scales + (int64_t)r * nblk;
+        for (int b = 0; b < nblk; b++) {
+            int k0 = b * blk;
+            int kn = K - k0 < blk ? K - k0 : blk;  /* valid elems in block */
+            if (kn <= 0) { sc[b] = 1.0f; memset(d + k0, 0, blk); continue; }
+            float amax = 0.0f;
+            int i = 0;
+#ifdef __ARM_NEON
+            float32x4_t vmax = vdupq_n_f32(0.0f);
+            for (; i + 3 < kn; i += 4)
+                vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(s + k0 + i)));
+            amax = vmaxvq_f32(vmax);
+#endif
+            for (; i < kn; i++) { float a = fabsf(s[k0 + i]); if (a > amax) amax = a; }
+            float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+            float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+            sc[b] = scale;
+            i = 0;
+#ifdef __ARM_NEON
+            float32x4_t vinv = vdupq_n_f32(inv);
+            for (; i + 15 < kn; i += 16) {
+                int32x4_t q0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(s + k0 + i),      vinv));
+                int32x4_t q1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(s + k0 + i + 4),  vinv));
+                int32x4_t q2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(s + k0 + i + 8),  vinv));
+                int32x4_t q3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(s + k0 + i + 12), vinv));
+                int16x8_t p0 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+                int16x8_t p1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+                vst1q_s8(d + k0 + i, vcombine_s8(vqmovn_s16(p0), vqmovn_s16(p1)));
+            }
+#endif
+            for (; i < kn; i++) {
+                float q = s[k0 + i] * inv;
+                int v = (int)(q >= 0 ? q + 0.5f : q - 0.5f);
+                if (v > 127) v = 127;
+                if (v < -127) v = -127;
+                d[k0 + i] = (int8_t)v;
+            }
+            for (; i < blk; i++) d[k0 + i] = 0;
+        }
+    }
+}
+
+#if defined(__ARM_FEATURE_DOTPROD)
+
+/* 2 rows x 4 cols register tile with per-block fp32 accumulation.
+ * 8 int32 dot accs + 8 fp32 accs + 6 live loads = 22 registers. */
+static inline void sd_tile_2x4(float *out, int out_ld, int m, int tcol,
+                               const int8_t *Wq, const float *swb, const float *bias,
+                               const int8_t *Xq, const float *sab, int xrow,
+                               int Kp, int blk, int nblk) {
+    const int8_t *w0 = Wq + (size_t)(m + 0) * Kp, *w1 = Wq + (size_t)(m + 1) * Kp;
+    const int8_t *x0 = Xq + (size_t)(xrow + 0) * Kp, *x1 = Xq + (size_t)(xrow + 1) * Kp;
+    const int8_t *x2 = Xq + (size_t)(xrow + 2) * Kp, *x3 = Xq + (size_t)(xrow + 3) * Kp;
+    const float *sw0 = swb + (size_t)(m + 0) * nblk, *sw1 = swb + (size_t)(m + 1) * nblk;
+    const float *sa0 = sab + (size_t)(xrow + 0) * nblk, *sa1 = sab + (size_t)(xrow + 1) * nblk;
+    const float *sa2 = sab + (size_t)(xrow + 2) * nblk, *sa3 = sab + (size_t)(xrow + 3) * nblk;
+    float32x4_t f00 = vdupq_n_f32(0), f01 = f00, f02 = f00, f03 = f00;
+    float32x4_t f10 = f00, f11 = f00, f12 = f00, f13 = f00;
+    for (int b = 0; b < nblk; b++) {
+        int32x4_t a00 = vdupq_n_s32(0), a01 = a00, a02 = a00, a03 = a00;
+        int32x4_t a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+        int kend = (b + 1) * blk;
+        for (int k = b * blk; k < kend; k += 16) {
+            int8x16_t xv0 = vld1q_s8(x0 + k), xv1 = vld1q_s8(x1 + k);
+            int8x16_t xv2 = vld1q_s8(x2 + k), xv3 = vld1q_s8(x3 + k);
+            int8x16_t wv = vld1q_s8(w0 + k);
+            a00 = vdotq_s32(a00, wv, xv0); a01 = vdotq_s32(a01, wv, xv1);
+            a02 = vdotq_s32(a02, wv, xv2); a03 = vdotq_s32(a03, wv, xv3);
+            wv = vld1q_s8(w1 + k);
+            a10 = vdotq_s32(a10, wv, xv0); a11 = vdotq_s32(a11, wv, xv1);
+            a12 = vdotq_s32(a12, wv, xv2); a13 = vdotq_s32(a13, wv, xv3);
+        }
+        float s0 = sw0[b], s1 = sw1[b];
+        f00 = vfmaq_n_f32(f00, vcvtq_f32_s32(a00), s0 * sa0[b]);
+        f01 = vfmaq_n_f32(f01, vcvtq_f32_s32(a01), s0 * sa1[b]);
+        f02 = vfmaq_n_f32(f02, vcvtq_f32_s32(a02), s0 * sa2[b]);
+        f03 = vfmaq_n_f32(f03, vcvtq_f32_s32(a03), s0 * sa3[b]);
+        f10 = vfmaq_n_f32(f10, vcvtq_f32_s32(a10), s1 * sa0[b]);
+        f11 = vfmaq_n_f32(f11, vcvtq_f32_s32(a11), s1 * sa1[b]);
+        f12 = vfmaq_n_f32(f12, vcvtq_f32_s32(a12), s1 * sa2[b]);
+        f13 = vfmaq_n_f32(f13, vcvtq_f32_s32(a13), s1 * sa3[b]);
+    }
+    float b0 = bias ? bias[m + 0] : 0.0f, b1 = bias ? bias[m + 1] : 0.0f;
+    float *o0 = out + (size_t)(m + 0) * out_ld + tcol;
+    float *o1 = out + (size_t)(m + 1) * out_ld + tcol;
+    o0[0] = vaddvq_f32(f00) + b0; o0[1] = vaddvq_f32(f01) + b0;
+    o0[2] = vaddvq_f32(f02) + b0; o0[3] = vaddvq_f32(f03) + b0;
+    o1[0] = vaddvq_f32(f10) + b1; o1[1] = vaddvq_f32(f11) + b1;
+    o1[2] = vaddvq_f32(f12) + b1; o1[3] = vaddvq_f32(f13) + b1;
+}
+
+/* 1 row x up to 4 cols tail tile */
+static inline void sd_tile_1xN(float *out, int out_ld, int m, int tcol,
+                               const int8_t *Wq, const float *swb, const float *bias,
+                               const int8_t *Xq, const float *sab, int xrow, int ncols,
+                               int Kp, int blk, int nblk) {
+    const int8_t *w0 = Wq + (size_t)m * Kp;
+    const float *sw0 = swb + (size_t)m * nblk;
+    float32x4_t fc[4] = { vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0) };
+    for (int b = 0; b < nblk; b++) {
+        int32x4_t ac[4] = { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) };
+        int kend = (b + 1) * blk;
+        for (int k = b * blk; k < kend; k += 16) {
+            int8x16_t wv = vld1q_s8(w0 + k);
+            for (int c = 0; c < ncols; c++)
+                ac[c] = vdotq_s32(ac[c], wv, vld1q_s8(Xq + (size_t)(xrow + c) * Kp + k));
+        }
+        float s0 = sw0[b];
+        for (int c = 0; c < ncols; c++)
+            fc[c] = vfmaq_n_f32(fc[c], vcvtq_f32_s32(ac[c]),
+                                s0 * sab[(size_t)(xrow + c) * nblk + b]);
+    }
+    float bb = bias ? bias[m] : 0.0f;
+    for (int c = 0; c < ncols; c++)
+        out[(size_t)m * out_ld + tcol + c] = vaddvq_f32(fc[c]) + bb;
+}
+
+/* GEMM over one activation panel: out[m, tcol0 + c] for c in [0, nc).
+ * Row-blocked (32) so the 4-column activation quad stays cache-resident
+ * across row pairs. */
+static void sd_gemm_panel(float *out, int out_ld, int M,
+                          const int8_t *Wq, const float *swb, const float *bias,
+                          const int8_t *Xq, const float *sab,
+                          int tcol0, int nc, int Kp, int blk) {
+    int nblk = Kp / blk;
+    for (int rb = 0; rb < M; rb += 32) {
+        int rbe = rb + 32 < M ? rb + 32 : M;
+        int c = 0;
+        for (; c + 3 < nc; c += 4) {
+            int m = rb;
+            for (; m + 1 < rbe; m += 2)
+                sd_tile_2x4(out, out_ld, m, tcol0 + c, Wq, swb, bias, Xq, sab, c, Kp, blk, nblk);
+            for (; m < rbe; m++)
+                sd_tile_1xN(out, out_ld, m, tcol0 + c, Wq, swb, bias, Xq, sab, c, 4, Kp, blk, nblk);
+        }
+        if (c < nc)
+            for (int m = rb; m < rbe; m++)
+                sd_tile_1xN(out, out_ld, m, tcol0 + c, Wq, swb, bias, Xq, sab, c, nc - c, Kp, blk, nblk);
+    }
+}
+
+/* ---------------- dedicated worker pool (decoder thread side) ---------- */
+
+#define SD_POOL_MAX_WORKERS 8
+
+static pthread_mutex_t sdp_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  sdp_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  sdp_done_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t sdp_threads[SD_POOL_MAX_WORKERS];
+static int sdp_nworkers = 0;         /* spawned workers (excludes caller) */
+static int sdp_started = 0;
+static unsigned sdp_gen = 0;
+static int sdp_pending = 0;          /* workers still running current job */
+static void (*sdp_fn)(void *) = NULL;
+static void *sdp_ctx = NULL;
+
+static void *sdp_worker_main(void *arg) {
+    (void)arg;
+    qwen_ftz_on();
+    unsigned seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&sdp_mu);
+        while (sdp_gen == seen)
+            pthread_cond_wait(&sdp_cv, &sdp_mu);
+        seen = sdp_gen;
+        void (*fn)(void *) = sdp_fn;
+        void *ctx = sdp_ctx;
+        pthread_mutex_unlock(&sdp_mu);
+        fn(ctx);
+        pthread_mutex_lock(&sdp_mu);
+        if (--sdp_pending == 0)
+            pthread_cond_signal(&sdp_done_cv);
+        pthread_mutex_unlock(&sdp_mu);
+    }
+    return NULL;
+}
+
+/* Run fn(ctx) on caller + workers; fn must claim work via an atomic counter
+ * in ctx. One job at a time (decoder is single-threaded per synthesis). */
+static void sd_pool_run(void (*fn)(void *), void *ctx) {
+    /* Worker count (excluding the calling decoder thread). Default matches
+     * the engine thread count; QWEN_SD_THREADS overrides (total threads). */
+    static int cfg = -1;
+    if (cfg < 0) {
+        const char *e = getenv("QWEN_SD_THREADS");
+        cfg = e ? atoi(e) : 0;
+    }
+    int want = (cfg > 0 ? cfg : qwen_get_threads()) - 1;
+    if (want > SD_POOL_MAX_WORKERS) want = SD_POOL_MAX_WORKERS;
+    if (want < 0) want = 0;
+    pthread_mutex_lock(&sdp_mu);
+    if (!sdp_started) {
+        for (int i = 0; i < want; i++)
+            if (pthread_create(&sdp_threads[sdp_nworkers], NULL, sdp_worker_main, NULL) == 0)
+                sdp_nworkers++;
+        sdp_started = 1;
+    }
+    sdp_fn = fn;
+    sdp_ctx = ctx;
+    sdp_pending = sdp_nworkers;
+    sdp_gen++;
+    pthread_cond_broadcast(&sdp_cv);
+    pthread_mutex_unlock(&sdp_mu);
+
+    fn(ctx);  /* caller participates */
+
+    pthread_mutex_lock(&sdp_mu);
+    while (sdp_pending > 0)
+        pthread_cond_wait(&sdp_done_cv, &sdp_mu);
+    pthread_mutex_unlock(&sdp_mu);
+}
+
+/* ---------------- threaded int8 conv1d (im2col per panel) -------------- */
+
+#define SD_INT8_NC 128  /* activation columns per panel */
+
+typedef struct {
+    float *out;
+    const float *in;
+    const int8_t *Wq; const float *sw; const float *bias;
+    int in_ch, out_ch, length, kernel, dilation, Kp, blk;
+    _Atomic int next_panel;
+    int n_panels;
+} sd_conv_job_t;
+
+static void sd_conv1d_worker(void *vj) {
+    sd_conv_job_t *j = (sd_conv_job_t *)vj;
+    int K = j->in_ch * j->kernel;
+    int nblk = j->Kp / j->blk;
+    int pad_left = (j->kernel - 1) * j->dilation;
+    float *colf = (float *)aligned_malloc((size_t)SD_INT8_NC * K * sizeof(float));
+    int8_t *colq = (int8_t *)aligned_malloc((size_t)SD_INT8_NC * j->Kp);
+    float *sa = (float *)aligned_malloc((size_t)SD_INT8_NC * nblk * sizeof(float));
+    for (;;) {
+        int p = atomic_fetch_add(&j->next_panel, 1);
+        if (p >= j->n_panels) break;
+        int t0 = p * SD_INT8_NC;
+        int nc = j->length - t0 < SD_INT8_NC ? j->length - t0 : SD_INT8_NC;
+        /* transposed im2col: colf[c][ic*kernel+kk] = in[ic][t0+c-pad+kk*dil] */
+        for (int c = 0; c < nc; c++) {
+            float *dst = colf + (size_t)c * K;
+            int tt = t0 + c - pad_left;
+            for (int ic = 0; ic < j->in_ch; ic++) {
+                const float *src = j->in + (size_t)ic * j->length;
+                float *dk = dst + (size_t)ic * j->kernel;
+                for (int kk = 0; kk < j->kernel; kk++) {
+                    int pos = tt + kk * j->dilation;
+                    dk[kk] = (pos >= 0 && pos < j->length) ? src[pos] : 0.0f;
+                }
+            }
+        }
+        qwen_int8_quant_rows(colq, sa, colf, nc, K, j->Kp, j->blk);
+        sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->bias,
+                      colq, sa, t0, nc, j->Kp, j->blk);
+    }
+    free(colf); free(colq); free(sa);
+}
+
+void qwen_conv1d_int8(float *out, const float *in,
+                      const int8_t *Wq, const float *sw, const float *bias,
+                      int in_ch, int out_ch, int length, int kernel, int dilation,
+                      int Kp, int blk) {
+    sd_conv_job_t job = {
+        .out = out, .in = in, .Wq = Wq, .sw = sw, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+        .n_panels = (length + SD_INT8_NC - 1) / SD_INT8_NC,
+    };
+    atomic_store(&job.next_panel, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+}
+
+/* ---------------- threaded int8 GEMM on pre-quantized activations ------ */
+/* Used by ConvTranspose: activations (transposed input) are quantized once
+ * and reused across all kernel positions. Chunks are row blocks. */
+
+typedef struct {
+    float *out; int out_ld;
+    const int8_t *Wq; const float *sw;
+    const int8_t *Xq; const float *sa;
+    int M, N, Kp, blk;
+    _Atomic int next_block;
+    int n_blocks, rows_per_block;
+} sd_gemm_job_t;
+
+static void sd_gemm_worker(void *vj) {
+    sd_gemm_job_t *j = (sd_gemm_job_t *)vj;
+    int nblk = j->Kp / j->blk;
+    for (;;) {
+        int b = atomic_fetch_add(&j->next_block, 1);
+        if (b >= j->n_blocks) break;
+        int m0 = b * j->rows_per_block;
+        int m1 = m0 + j->rows_per_block < j->M ? m0 + j->rows_per_block : j->M;
+        for (int t0 = 0; t0 < j->N; t0 += SD_INT8_NC) {
+            int nc = j->N - t0 < SD_INT8_NC ? j->N - t0 : SD_INT8_NC;
+            sd_gemm_panel(j->out + (size_t)m0 * j->out_ld, j->out_ld, m1 - m0,
+                          j->Wq + (size_t)m0 * j->Kp, j->sw + (size_t)m0 * nblk, NULL,
+                          j->Xq + (size_t)t0 * j->Kp, j->sa + (size_t)t0 * nblk,
+                          t0, nc, j->Kp, j->blk);
+        }
+    }
+}
+
+void qwen_gemm_int8(float *out, int out_ld,
+                    const int8_t *Wq, const float *sw,
+                    const int8_t *Xq, const float *sa,
+                    int M, int N, int Kp, int blk) {
+    int nt = qwen_get_threads();
+    int rpb = (M + nt * 2 - 1) / (nt * 2);
+    rpb = (rpb + 1) & ~1;               /* multiple of 2 rows */
+    if (rpb < 2) rpb = 2;
+    sd_gemm_job_t job = {
+        .out = out, .out_ld = out_ld, .Wq = Wq, .sw = sw, .Xq = Xq, .sa = sa,
+        .M = M, .N = N, .Kp = Kp, .blk = blk,
+        .rows_per_block = rpb, .n_blocks = (M + rpb - 1) / rpb,
+    };
+    atomic_store(&job.next_block, 0);
+    sd_pool_run(sd_gemm_worker, &job);
+}
+
+#else /* !__ARM_FEATURE_DOTPROD: scalar reference (unused in practice) */
+
+static float sd_scalar_dot(const int8_t *w, const float *swb,
+                           const int8_t *x, const float *sab, int Kp, int blk) {
+    int nblk = Kp / blk;
+    float acc = 0.0f;
+    for (int b = 0; b < nblk; b++) {
+        int32_t ai = 0;
+        for (int k = b * blk; k < (b + 1) * blk; k++)
+            ai += (int32_t)w[k] * x[k];
+        acc += (float)ai * swb[b] * sab[b];
+    }
+    return acc;
+}
+
+void qwen_conv1d_int8(float *out, const float *in,
+                      const int8_t *Wq, const float *sw, const float *bias,
+                      int in_ch, int out_ch, int length, int kernel, int dilation,
+                      int Kp, int blk) {
+    int K = in_ch * kernel;
+    int nblk = Kp / blk;
+    int pad_left = (kernel - 1) * dilation;
+    float *colf = (float *)aligned_malloc((size_t)K * sizeof(float));
+    int8_t *colq = (int8_t *)aligned_malloc((size_t)Kp);
+    float *sa = (float *)aligned_malloc((size_t)nblk * sizeof(float));
+    for (int t = 0; t < length; t++) {
+        for (int ic = 0; ic < in_ch; ic++)
+            for (int kk = 0; kk < kernel; kk++) {
+                int pos = t - pad_left + kk * dilation;
+                colf[ic * kernel + kk] =
+                    (pos >= 0 && pos < length) ? in[(size_t)ic * length + pos] : 0.0f;
+            }
+        qwen_int8_quant_rows(colq, sa, colf, 1, K, Kp, blk);
+        for (int m = 0; m < out_ch; m++)
+            out[(size_t)m * length + t] =
+                sd_scalar_dot(Wq + (size_t)m * Kp, sw + (size_t)m * nblk, colq, sa, Kp, blk)
+                + (bias ? bias[m] : 0.0f);
+    }
+    free(colf); free(colq); free(sa);
+}
+
+void qwen_gemm_int8(float *out, int out_ld,
+                    const int8_t *Wq, const float *sw,
+                    const int8_t *Xq, const float *sa,
+                    int M, int N, int Kp, int blk) {
+    int nblk = Kp / blk;
+    for (int m = 0; m < M; m++)
+        for (int t = 0; t < N; t++)
+            out[(size_t)m * out_ld + t] =
+                sd_scalar_dot(Wq + (size_t)m * Kp, sw + (size_t)m * nblk,
+                              Xq + (size_t)t * Kp, sa + (size_t)t * nblk, Kp, blk);
+}
+
+#endif /* __ARM_FEATURE_DOTPROD */
