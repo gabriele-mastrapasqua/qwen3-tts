@@ -338,13 +338,21 @@ typedef struct {
     /* Pre-transformer KV cache: [n_layers][alloc × qkv_dim], row-major */
     float *k_cache[QWEN_SD_STREAM_MAX_LAYERS];
     float *v_cache[QWEN_SD_STREAM_MAX_LAYERS];
-    int kv_len;         /* frames in KV cache */
-    int kv_alloc;       /* allocated capacity */
+    int kv_len;         /* total frames processed (absolute, monotonic) */
+    int kv_alloc;       /* allocated PHYSICAL capacity in frames */
+    int kv_base;        /* plan_v4 D2: absolute frame stored at physical slot 0.
+                         * Attention only ever reads the last `window` (72) frames,
+                         * so the cache is compacted to O(window+chunk) instead of
+                         * growing with total stream length. physical = abs - kv_base;
+                         * RoPE is relative so the continuous abs timeline is unchanged. */
 
     /* Pre-transformer output cache (latent_out): row-major [alloc × latent_dim] */
     float *latent_cache;   /* [latent_alloc, 1024] */
-    int latent_frames;
-    int latent_alloc;
+    int latent_frames;     /* total latent frames produced (absolute, monotonic) */
+    int latent_alloc;      /* allocated PHYSICAL capacity in frames */
+    int latent_base;       /* plan_v4 D2: absolute frame at physical slot 0. The
+                            * conv decoder only reads the last conv_rf+chunk frames,
+                            * so trim like the KV cache. physical = abs - latent_base. */
 
     /* Pre-conv left padding: last 2 timesteps of VQ output, channel-first [512, 2] */
     float *vq_pad;

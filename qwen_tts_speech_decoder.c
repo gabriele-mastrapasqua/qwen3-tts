@@ -1585,15 +1585,38 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 #endif
 
     /* === Step 4: Pre-transformer with KV cache === */
-    /* Ensure KV cache is allocated */
-    int total_frames = st->kv_len + new_frames;
-    if (total_frames > st->kv_alloc) {
-        int new_alloc = total_frames + 256; /* grow with headroom */
-        for (int l = 0; l < c->dec_num_layers; l++) {
-            st->k_cache[l] = (float *)realloc(st->k_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
-            st->v_cache[l] = (float *)realloc(st->v_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
+    /* plan_v4 D2: cap the KV cache at O(window+chunk) instead of the full stream.
+     * Physical frames needed = (kv_len + new_frames) - kv_base. When that exceeds
+     * the allocation, first COMPACT: the next queries only read back to
+     * kv_len-window+1, so drop everything older and memmove the live tail (<window
+     * frames) to physical slot 0, rebasing kv_base. Only if a single chunk is
+     * larger than the cap do we then grow (rare). physical index = abs - kv_base. */
+    int need = (st->kv_len + new_frames) - st->kv_base;
+    if (need > st->kv_alloc) {
+        int keep_from = st->kv_len - (window - 1);
+        if (keep_from < 0) keep_from = 0;
+        if (keep_from > st->kv_base && st->kv_len > st->kv_base) {
+            int keep = st->kv_len - keep_from;          /* live tail, < window */
+            int shift = keep_from - st->kv_base;        /* physical frames dropped */
+            for (int l = 0; l < c->dec_num_layers; l++) {
+                if (keep > 0) {
+                    memmove(st->k_cache[l], st->k_cache[l] + (int64_t)shift * qkv_dim,
+                            (int64_t)keep * qkv_dim * sizeof(float));
+                    memmove(st->v_cache[l], st->v_cache[l] + (int64_t)shift * qkv_dim,
+                            (int64_t)keep * qkv_dim * sizeof(float));
+                }
+            }
+            st->kv_base = keep_from;
+            need = (st->kv_len + new_frames) - st->kv_base;
         }
-        st->kv_alloc = new_alloc;
+        if (need > st->kv_alloc) {                        /* chunk bigger than cap */
+            int new_alloc = need + 256;
+            for (int l = 0; l < c->dec_num_layers; l++) {
+                st->k_cache[l] = (float *)realloc(st->k_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
+                st->v_cache[l] = (float *)realloc(st->v_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
+            }
+            st->kv_alloc = new_alloc;
+        }
     }
 
     float *q = (float *)aligned_malloc((int64_t)new_frames * qkv_dim * sizeof(float));
@@ -1657,10 +1680,10 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
             }
         }
 
-        /* Append new K, V to cache for this layer */
-        memcpy(st->k_cache[layer] + (int64_t)st->kv_len * qkv_dim,
+        /* Append new K, V to cache for this layer (physical = abs - kv_base) */
+        memcpy(st->k_cache[layer] + (int64_t)(st->kv_len - st->kv_base) * qkv_dim,
                new_k, (int64_t)new_frames * qkv_dim * sizeof(float));
-        memcpy(st->v_cache[layer] + (int64_t)st->kv_len * qkv_dim,
+        memcpy(st->v_cache[layer] + (int64_t)(st->kv_len - st->kv_base) * qkv_dim,
                new_v, (int64_t)new_frames * qkv_dim * sizeof(float));
 
         /* Sliding window causal attention: Q from new frames, K/V from cache */
@@ -1682,7 +1705,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
                 float max_score = -1e30f;
                 for (int j = 0; j < n_keys; j++) {
                     int sk = sk_start + j;
-                    const float *kh = st->k_cache[layer] + (int64_t)sk * qkv_dim + h * head_dim;
+                    const float *kh = st->k_cache[layer] + (int64_t)(sk - st->kv_base) * qkv_dim + h * head_dim;
                     float dot = 0;
                     for (int d = 0; d < head_dim; d++) dot += qh[d] * kh[d];
                     scores[j] = dot * scale;
@@ -1698,7 +1721,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 
                 for (int j = 0; j < n_keys; j++) {
                     int sk = sk_start + j;
-                    const float *vh = st->v_cache[layer] + (int64_t)sk * qkv_dim + h * head_dim;
+                    const float *vh = st->v_cache[layer] + (int64_t)(sk - st->kv_base) * qkv_dim + h * head_dim;
                     float w = scores[j] * inv_sum;
                     for (int d = 0; d < head_dim; d++) oh[d] += vh[d] * w;
                 }
@@ -1808,16 +1831,32 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
         qwen_rms_norm(hidden, hidden, sd->final_norm_weight, new_frames, dec_hidden, eps);
     }
 
-    /* Grow latent cache if needed */
-    if (st->latent_frames + new_frames > st->latent_alloc) {
-        int new_alloc = st->latent_frames + new_frames + 256;
-        st->latent_cache = (float *)realloc(st->latent_cache,
-            (int64_t)new_alloc * latent_dim * sizeof(float));
-        st->latent_alloc = new_alloc;
+    /* Grow/compact latent cache (plan_v4 D2): the conv decoder (Step 6) only reads
+     * the last conv_rf+chunk frames, so cap the cache instead of keeping the whole
+     * stream — same base-offset trim as the KV cache. */
+    int lat_need = (st->latent_frames + new_frames) - st->latent_base;
+    if (lat_need > st->latent_alloc) {
+        int lkeep_from = st->latent_frames - QWEN_SD_STREAM_CONV_RF;  /* context the next chunk needs */
+        if (lkeep_from < 0) lkeep_from = 0;
+        if (lkeep_from > st->latent_base && st->latent_frames > st->latent_base) {
+            int lkeep = st->latent_frames - lkeep_from;
+            int lshift = lkeep_from - st->latent_base;
+            if (lkeep > 0)
+                memmove(st->latent_cache, st->latent_cache + (int64_t)lshift * latent_dim,
+                        (int64_t)lkeep * latent_dim * sizeof(float));
+            st->latent_base = lkeep_from;
+            lat_need = (st->latent_frames + new_frames) - st->latent_base;
+        }
+        if (lat_need > st->latent_alloc) {
+            int new_alloc = lat_need + 256;
+            st->latent_cache = (float *)realloc(st->latent_cache,
+                (int64_t)new_alloc * latent_dim * sizeof(float));
+            st->latent_alloc = new_alloc;
+        }
     }
 
     /* Output proj new frames → append to latent cache [row-major: frames × 1024] */
-    float *lat_dst = st->latent_cache + (int64_t)st->latent_frames * latent_dim;
+    float *lat_dst = st->latent_cache + (int64_t)(st->latent_frames - st->latent_base) * latent_dim;
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 new_frames, latent_dim, dec_hidden, 1.0f,
@@ -1856,7 +1895,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 
     /* Transpose window to channel-first [1024, window_frames] for conv decoder */
     float *signal = (float *)aligned_malloc((int64_t)latent_dim * window_frames * sizeof(float));
-    const float *lat_src = st->latent_cache + (int64_t)window_start * latent_dim;
+    const float *lat_src = st->latent_cache + (int64_t)(window_start - st->latent_base) * latent_dim;
     for (int f = 0; f < window_frames; f++)
         for (int d = 0; d < latent_dim; d++)
             signal[(int64_t)d * window_frames + f] = lat_src[(int64_t)f * latent_dim + d];
