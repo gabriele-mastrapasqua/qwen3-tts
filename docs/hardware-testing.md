@@ -257,8 +257,8 @@ to compare (chunked synthesis emits slightly more audio). For correctness across
 | _M2/M4_ | batch | | | | | native matmul twin candidate |
 | _Zen4 (AVX-512+VNNI)_ | single | | | | | VNNI int8 |
 | _Zen4_ | batch | | | | | int4+batch expected sweet spot |
-| **Zen5 Turin** (EPYC 9555P, 4vCPU) | single | 2.39 | **2.12** | 2.75 | int8 1.05s / int4 1.41s | 2026-07-09; **int4-VNNI (C7) LOSES to int8** — opposite of M1 |
-| _Zen5 Turin_ | batch | | | | | throughput target (batched-server stall bug found, see §5.note) |
+| **Zen5 Turin** (EPYC 9555P, 4vCPU, 1.7B) | single -j4 | 2.27 | **2.03** | 2.41 | int8 1.08s / int4 1.25s / bf16 1.68s | 2026-07-09; **int8-VNNI is the x86 winner — int4 trails (nibble unpack), opposite of M1** |
+| _Zen5 Turin_ | batch (matmat, B=8) | 11.9× | **3.0×** | 1.6× | — | kernel-level batching speedup (int8/q4 now VNNI, `--matmat-bench`); e2e server-batching = WIP (§5.note) |
 | _Sapphire (AMX)_ | batch | | | | | AMX int8 GEMM (future twin) |
 | _Graviton3_ | batch | | | | | bf16+i8mm+SVE |
 
@@ -274,17 +274,18 @@ diverge from the M1 dev box — record these so we don't assume M1 behavior carr
    per-block reduce, 2-row fusion) are **REQUIRED, not optional**, before int4 can win on x86.
 2. **int4 < int8 on Zen5 single-stream** (int8 is the fastest quant here), vs **int4 > int8 on M1**. Do NOT
    port the M1 "int4 is the fast default" conclusion to x86 until C7 is optimized + re-measured.
-3. **Batched `--batch-size` server: INTERMITTENT pathological slowdown on Linux x86 (a real threading bug).**
-   It WORKS most of the time (batch-1 int8 long = **8.9s** clean, batch-1 bf16 short = 2.8s ≈ plain-serve),
-   but the SAME config also measured **220s / 364s** on other clean-box runs → nondeterministic. Root: a
-   threading race in the batched scheduler on the **non-reentrant Linux pthread pool** (the request-batching
-   server was dev'd + validated on macOS GCD = reentrant; `qwen_parallel_is_reentrant()==false` on Linux).
-   Needs source-level debugging (tsan / the jq scheduler + pool), not black-box timing. Also, the batched
-   matmat twins (`int8_matmat`/`q4_matmat`) **dequant to f32 — no VNNI** — so even when healthy the batched
-   path is ~2× single-stream (batch1 bf16 10.9s vs plain-serve 5.2s). → server request-batching throughput
-   is **unmeasurable on x86 until this is fixed**; use CLI or **plain `--serve`** (VNNI, reliable) meanwhile.
-   (My earlier "stalls 262s on sub-batch" read was WRONG — that was box contention from leftover wedged
-   servers; the truth is the intermittent race above.)
+3. **Batched matmat twins now use VNNI (FIXED) — but the e2e `--batch-size` server has a rare intermittent
+   stall (open bug).** FIXED: `int8_matmat`/`q4_matmat` used to dequant int8→f32 (no VNNI); added
+   `int8_matmat_vnni_slice` + `q4_matmat_vnni_slice` (weight-stationary `vpdpbusd`) → **`--matmat-bench`:
+   batched int8 3.0× / q4 1.6× over B×matvec, bit-exact** (self-test L2_rel 0.00) = the real x86 server-
+   throughput kernel win. STILL OPEN: the e2e `--batch-size` server is USUALLY fine (batch-1 int8 ~9s, 14
+   consecutive good runs) but RARELY stalls to ~200-260s on a fresh request — genuinely intermittent, NOT
+   root-caused. It is NOT the pool submission race (on Linux the batched path is single-threaded: A1 helper
+   gated off, decode inline) and NOT over-generation (identical output size). Needs **ThreadSanitizer / a
+   `perf` capture of a slow run** (a proper source debug), not more black-box timing — do that on a future
+   box run. Meanwhile CLI and **plain `--serve`** (VNNI, fully reliable) are the fast paths; the kernel-level
+   batching win is proven, only the e2e throughput has this rare stall. (`submit_mtx` in the Linux pool =
+   a defensive fix for concurrent `--workers` submission, kept; it wasn't the cause of this stall.)
 4. **int4 audio trajectory diverges from M1 (benign):** `--int4 --emotion joy` over-drove into a 108-frame
    ramble on x86 (vs a clean 36-frame render on M1, same seed/text) — greedy-argmax flips on the different
    x86 fp path. Not a C7 bug (self-test clean); use quant-mixed (int8 CP stabilizes) or bf16 for emotion on
