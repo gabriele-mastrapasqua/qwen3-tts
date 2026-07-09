@@ -1321,10 +1321,84 @@ static void q4_mm_task(size_t tid, size_t nt, void *vc) {
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     q4_matmat_slice(c->Y, c->W, c->X, r0, r1, c->cols, c->B);
 }
+#if defined(__AVX512VNNI__)
+/* q4 VNNI batched matmat (mirrors int8_matmat_vnni_slice + the C7-v2 unsigned-nibble
+ * trick): weight-stationary — unpack each 32-nibble W block ONCE to u8 value order,
+ * dpbusd against all B pre-quantized activation columns. q4 per-block scale + per-column
+ * act scale; corr[b][bl] = −8·ΣqXt[b] over block bl (precomputed once, shared across rows). */
+static void q4_matmat_vnni_slice(float *Y, const q4_0_block_t *W, const int8_t *qXt,
+                                 const float *sx, const int *corr,
+                                 int r0, int r1, int cols, int B) {
+    int nb = cols / Q4_0_BLOCK_SIZE;
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    for (int r = r0; r < r1; r++) {
+        const q4_0_block_t *row = W + (size_t)r * nb;
+        float sum[16];
+        for (int b = 0; b < B; b++) sum[b] = 0.0f;
+        for (int bl = 0; bl < nb; bl++) {
+            __m128i raw = _mm_loadu_si128((const __m128i *)row[bl].qs);
+            __m128i lo = _mm_and_si128(raw, lomask);
+            __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
+            __m512i wv = _mm512_zextsi256_si512(_mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                                                                 _mm_unpacklo_epi8(lo, hi)));
+            float scl = row[bl].scale;
+            for (int b = 0; b < B; b++) {
+                __m512i xv = _mm512_zextsi256_si512(_mm256_loadu_si256(
+                    (const __m256i *)(qXt + (size_t)b * cols + (size_t)bl * Q4_0_BLOCK_SIZE)));
+                int dot = _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), wv, xv))
+                        + corr[(size_t)b * nb + bl];
+                sum[b] += scl * (float)dot;
+            }
+        }
+        for (int b = 0; b < B; b++) Y[(size_t)r * B + b] = sum[b] * sx[b];
+    }
+}
+typedef struct { float *Y; const q4_0_block_t *W; const int8_t *qXt; const float *sx; const int *corr; int rows, cols, B; } q4_vmm_ctx;
+static void q4_vmm_task(size_t tid, size_t nt, void *vc) {
+    q4_vmm_ctx *c = (q4_vmm_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_matmat_vnni_slice(c->Y, c->W, c->qXt, c->sx, c->corr, r0, r1, c->cols, c->B);
+}
+#endif /* __AVX512VNNI__ */
 void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                       int rows, int cols, int B) {
     if (B <= 0) return;
     if (B > 64) B = 64;
+#if defined(__AVX512VNNI__)
+    {
+        static atomic_int no_vnni_q4 = -1;
+        int nv = atomic_load_explicit(&no_vnni_q4, memory_order_relaxed);
+        if (nv < 0) { const char *e = getenv("QWEN_NO_VNNI"); nv = (e && e[0] == '1'); atomic_store_explicit(&no_vnni_q4, nv, memory_order_relaxed); }
+        if (!nv && B >= 2 && B <= 16 && cols % Q4_0_BLOCK_SIZE == 0) {
+            int nb = cols / Q4_0_BLOCK_SIZE;
+            int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
+            int *corr = (int *)malloc((size_t)B * nb * sizeof(int));
+            if (qXt && corr) {
+                float sx[16];
+                for (int b = 0; b < B; b++) {
+                    sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+                    const int8_t *qb = qXt + (size_t)b * cols;
+                    for (int bl = 0; bl < nb; bl++) {
+                        int s = 0;
+                        for (int k = 0; k < Q4_0_BLOCK_SIZE; k++) s += qb[bl * Q4_0_BLOCK_SIZE + k];
+                        corr[(size_t)b * nb + bl] = -8 * s;
+                    }
+                }
+                int nt2 = g_n_threads;
+                if (nt2 > 1 && rows >= 256) {
+                    q4_vmm_ctx c = { Y, W, qXt, sx, corr, rows, cols, B };
+                    qwen_parallel((size_t)nt2, q4_vmm_task, &c);
+                } else {
+                    q4_matmat_vnni_slice(Y, W, qXt, sx, corr, 0, rows, cols, B);
+                }
+                free(qXt); free(corr);
+                return;
+            }
+            free(qXt); free(corr);
+        }
+    }
+#endif
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         q4_mm_ctx c = { Y, W, X, rows, cols, B };
