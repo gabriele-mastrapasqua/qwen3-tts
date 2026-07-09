@@ -274,11 +274,17 @@ diverge from the M1 dev box — record these so we don't assume M1 behavior carr
    per-block reduce, 2-row fusion) are **REQUIRED, not optional**, before int4 can win on x86.
 2. **int4 < int8 on Zen5 single-stream** (int8 is the fastest quant here), vs **int4 > int8 on M1**. Do NOT
    port the M1 "int4 is the fast default" conclusion to x86 until C7 is optimized + re-measured.
-3. **Batched server stalls on a sub-batch request:** 1 request to a `--batch-size 4` server took **262s**
-   (waits to fill the batch / no partial-batch flush / long admission) — and pegged the 4 vCPUs enough to
-   make sshd unresponsive. A `--batch-size N` server must flush partial batches on an admission timeout;
-   file as an engine bug. (Throughput row above still TBD — needs `serve_batch_bench.sh` with N==batch-size
-   concurrent so the batch fills; the ad-hoc 1-req test is invalid.)
+3. **Batched `--batch-size` server: INTERMITTENT pathological slowdown on Linux x86 (a real threading bug).**
+   It WORKS most of the time (batch-1 int8 long = **8.9s** clean, batch-1 bf16 short = 2.8s ≈ plain-serve),
+   but the SAME config also measured **220s / 364s** on other clean-box runs → nondeterministic. Root: a
+   threading race in the batched scheduler on the **non-reentrant Linux pthread pool** (the request-batching
+   server was dev'd + validated on macOS GCD = reentrant; `qwen_parallel_is_reentrant()==false` on Linux).
+   Needs source-level debugging (tsan / the jq scheduler + pool), not black-box timing. Also, the batched
+   matmat twins (`int8_matmat`/`q4_matmat`) **dequant to f32 — no VNNI** — so even when healthy the batched
+   path is ~2× single-stream (batch1 bf16 10.9s vs plain-serve 5.2s). → server request-batching throughput
+   is **unmeasurable on x86 until this is fixed**; use CLI or **plain `--serve`** (VNNI, reliable) meanwhile.
+   (My earlier "stalls 262s on sub-batch" read was WRONG — that was box contention from leftover wedged
+   servers; the truth is the intermittent race above.)
 4. **int4 audio trajectory diverges from M1 (benign):** `--int4 --emotion joy` over-drove into a 108-frame
    ramble on x86 (vs a clean 36-frame render on M1, same seed/text) — greedy-argmax flips on the different
    x86 fp path. Not a C7 bug (self-test clean); use quant-mixed (int8 CP stabilizes) or bf16 for emotion on
