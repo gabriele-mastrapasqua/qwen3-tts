@@ -589,10 +589,15 @@ test-compose: $(TARGET)
 		--text "Che bella notizia! [pause:400ms] [sad] Devo andare... [sigh] [neutral] Ciao." \
 		-o $(TEST_DIR)/mk_inline.wav 2>$(TEST_DIR)/mk_inline.log
 	@grep -qi "Inline markup detected" $(TEST_DIR)/mk_inline.log || { echo "FAIL: inline markup not auto-detected in --text"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
-	@grep -qi "composed 4 spans" $(TEST_DIR)/mk_inline.log || { echo "FAIL: expected 4 spans (neutral/sad/sigh/neutral)"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
+	@# 3 spans: neutral / sad / neutral. [sigh] is an INLINE para tag -> folded as an
+	@# onomatopoeia into the adjacent (sad) span's text (one generation, voice-native
+	@# timbre), NOT a separate span. The old split/steering-span "splice" that made it a
+	@# 4th span was rejected & deleted (CLAUDE.md para protocol) — so 3 is correct here.
+	@grep -qi "composed 3 spans" $(TEST_DIR)/mk_inline.log || { echo "FAIL: expected 3 spans (neutral/sad+[sigh]/neutral)"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
+	@grep -qi "inline \[tag\]->onomatopoeia" $(TEST_DIR)/mk_inline.log || { echo "FAIL: [sigh] not folded inline as onomatopoeia"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
 	@grep -qi "pause 0.40s" $(TEST_DIR)/mk_inline.log || { echo "FAIL: [pause:400ms] not parsed"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
 	@test -s $(TEST_DIR)/mk_inline.wav || { echo "FAIL: no audio"; exit 1; }
-	@echo "  PASS: inline [tag] markup in --text (4 spans, pause, [sigh] macro)"
+	@echo "  PASS: inline [tag] markup in --text (3 spans, pause, [sigh] folded inline)"
 	@# Plain text (no tags) must NOT trigger compose
 	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian \
 		--text "Frase normale senza tag." -o $(TEST_DIR)/mk_plain.wav 2>$(TEST_DIR)/mk_plain.log
