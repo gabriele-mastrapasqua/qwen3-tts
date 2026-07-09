@@ -2125,9 +2125,18 @@ static void q4_0_matvec_vnni(float *y, const int8_t *qx, float sx,
                              const q4_0_block_t *W, int cols, int out_dim) {
     int nb = cols / Q4_0_BLOCK_SIZE;
     const __m128i lomask = _mm_set1_epi8(0x0F);
-    const __m128i bias8  = _mm_set1_epi8(8);
-    const __m256i off128 = _mm256_set1_epi8((char)128);
     const __m512i ones   = _mm512_set1_epi8(1);
+    /* Key opt (plan_v4 C7 v2): the q4 nibbles are ALREADY unsigned (0..15), so
+     * dpbusd(nibble_u8, qx_s8) = Σ nibble·qx DIRECTLY — no `−8` on the weight, no `+128`
+     * offset trick. Since w = scale·(nibble−8), Σ w·qx = scale·(Σ nibble·qx − 8·Σqx),
+     * and −8·Σqx depends only on the (shared) activation → precompute it ONCE per block.
+     * So the row loop is ONE dpbusd + ONE reduce per block (v1 did two of each + a
+     * broadcast +128 add). qx is shared across all out_dim rows → the precompute amortizes. */
+    int corr[Q4_QX_MAX / Q4_0_BLOCK_SIZE];
+    for (int b = 0; b < nb; b++) {
+        __m512i xv = _mm512_zextsi256_si512(_mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+        corr[b] = -8 * _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, xv));
+    }
     for (int o = 0; o < out_dim; o++) {
         const q4_0_block_t *row = W + (size_t)o * nb;
         float sum = 0.0f;
@@ -2135,13 +2144,11 @@ static void q4_0_matvec_vnni(float *y, const int8_t *qx, float sx,
             __m128i raw = _mm_loadu_si128((const __m128i *)row[b].qs);
             __m128i lo = _mm_and_si128(raw, lomask);
             __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
-            __m128i il0 = _mm_sub_epi8(_mm_unpacklo_epi8(lo, hi), bias8);  /* w0..w15 (value order) */
-            __m128i il1 = _mm_sub_epi8(_mm_unpackhi_epi8(lo, hi), bias8);  /* w16..w31 */
-            __m512i wv = _mm512_zextsi256_si512(_mm256_set_m128i(il1, il0));
-            __m256i x256 = _mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE));
-            __m512i ua = _mm512_zextsi256_si512(_mm256_add_epi8(x256, off128));
-            int dot = _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ua, wv))
-                    - 128 * _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, wv));
+            /* value order [lo0,hi0,lo1,hi1,...] as UNSIGNED nibbles 0..15 (no −8 bias) */
+            __m512i wv = _mm512_zextsi256_si512(_mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                                                                 _mm_unpacklo_epi8(lo, hi)));
+            __m512i xv = _mm512_zextsi256_si512(_mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+            int dot = _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), wv, xv)) + corr[b];
             sum += row[b].scale * (float)dot;
         }
         y[o] = sum * sx;
