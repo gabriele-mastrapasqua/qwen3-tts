@@ -318,9 +318,7 @@ static void write_tensor_impl(FILE *vf, FILE *cv_sf, const char *cv_hdr_json, si
     (*count)++;
 }
 
-/* Load a 'QSTV' steering .vec and accumulate scale*data into *acc (alloc'd if NULL).
- * Validates magic + that dim == expect_dim. Returns 0 on success, -1 on error. */
-/* load_steer_vec_accum + resolve_emotion_path + qwen_apply_emotion moved to
+/* qwen_tts_apply_emotion (the --emotion qlsteer STEER router) lives in
  * qwen_tts_emotion.c so the CLI and the HTTP server apply the SAME recipe. */
 
 /* Load a multi-layer Talker steer (.qlsteer: 'QLST' magic + int32 L + int32 D + L*D float32)
@@ -944,14 +942,12 @@ int main(int argc, char **argv) {
     int run_gpu_batch_bench = 0; int gpu_batch_B = 4; /* --gpu-batch-bench N: batched Talker correctness + throughput */
     const char *gpu_backend_str = NULL; /* --backend cpu|metal|cuda (v1: selects the --gpu-selftest target) */
     float cp_roughness = 0.0f;        /* --roughness: q2-down blend on the CP (texture knob) */
-    const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
-    float cp_steer_weight = 1.0f;     /* --steer-weight: injection scale for the control vector */
     const char *emotion_spec = NULL;  /* --emotion: mood name or preset(s), e.g. "joy", "happy:0.5,proud:0.5" */
     const char *speaker_name = NULL;  /* -s preset name kept verbatim (id discards it) for the emotion router */
     float audio_volume = 1.0f;        /* --volume: linear PCM gain on the output */
     float audio_rate = 1.0f;          /* --rate: pitch-preserving tempo (>1 faster) */
     /* "_set" = flag was explicitly passed -> overrides any --emotion manifest recipe value */
-    int steer_weight_set = 0, roughness_set = 0, volume_set = 0, rate_set = 0;
+    int roughness_set = 0, volume_set = 0, rate_set = 0;
     const char *compose_spec = NULL;  /* --compose: multi-span "[mood] text | [mood] text | [pause=0.5]" */
     float compose_pause = 0.12f;      /* --compose-pause: default gap (s) between spoken spans */
     int no_compose = 0;               /* --no-compose: pass [tags] LITERALLY to the model (don't auto-route
@@ -1055,8 +1051,6 @@ int main(int argc, char **argv) {
         {"gpu-selftest-talker", no_argument, 0, 1072},
         {"gpu-batch-bench", required_argument, 0, 1074},
         {"roughness",     required_argument, 0, 1028},
-        {"steer-vector",  required_argument, 0, 1029},
-        {"steer-weight",  required_argument, 0, 1030},
         {"emotion",       required_argument, 0, 1031},
         {"volume",        required_argument, 0, 1032},
         {"rate",          required_argument, 0, 1033},
@@ -1133,8 +1127,6 @@ int main(int argc, char **argv) {
             case 1072: run_gpu_selftest_talker = 1; break;
             case 1074: run_gpu_batch_bench = 1; gpu_batch_B = atoi(optarg); break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
-            case 1029: steer_vector_path = optarg; break;
-            case 1030: cp_steer_weight = (float)atof(optarg); steer_weight_set = 1; break;
             case 1031: emotion_spec = optarg; break;
             case 1032: audio_volume = (float)atof(optarg); volume_set = 1; break;
             case 1033: audio_rate = (float)atof(optarg); rate_set = 1; break;
@@ -1212,8 +1204,6 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "                             Tags: [happy|sad|excited|annoyed|...] emotion, [sigh|huff|ugh|groan|hmm]\n");
                 fprintf(stderr, "                             paralinguistic, [pause:400ms]/[pause:1s] pause. One WAV, spans joined.\n");
                 fprintf(stderr, "  --compose-pause <s>        Default gap between adjacent spoken spans (default 0.12s)\n");
-                fprintf(stderr, "  --steer-vector <file>      Custom emotion/prosody control vector (.vec from QWEN_STEER_CAPTURE)\n");
-                fprintf(stderr, "  --steer-weight <f>         Global injection scale for --emotion/--steer-vector (default 1.0)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 fprintf(stderr, "  --caps                     Print compiled SIMD/threading capabilities and exit\n");
@@ -1715,8 +1705,8 @@ int main(int argc, char **argv) {
     int emotion_routed = emotion_spec && !compose_spec &&
                          ctx->config.hidden_size >= 2048 && emotion_tok(emotion_spec) != NULL;
     if (!compose_spec && !emotion_routed &&
-        qwen_tts_apply_emotion(ctx, emotion_spec, steer_vector_path, language,
-                           cp_steer_weight, steer_weight_set, cp_roughness, roughness_set,
+        qwen_tts_apply_emotion(ctx, emotion_spec, language,
+                           cp_roughness, roughness_set,
                            audio_volume, volume_set, audio_rate, rate_set,
                            &audio_volume, &audio_rate, silent) != 0) {
         qwen_tts_unload(ctx);

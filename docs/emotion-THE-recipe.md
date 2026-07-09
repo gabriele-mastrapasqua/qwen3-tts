@@ -15,7 +15,8 @@
 ## How a user invokes it
 **One flag.** `--emotion <sad|joy|anger|fear|disgust|surprise>` (1.7B CustomVoice only). The engine auto-applies
 the table below (expr + steer + a default English instruct + temperature). A vivid **English** `--instruct` and an
-explicit `-T` always override. On the 0.6B model `--emotion` falls back to the legacy `.vec` path.
+explicit `-T` always override. Emotion is a **1.7B** feature: on the 0.6B model `--emotion` is a no-op
+(parked-neutral) — the legacy `.vec` control-vector path was retired 2026-07-09.
 
 ```bash
 ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian --emotion sad --text "…" -o out.wav

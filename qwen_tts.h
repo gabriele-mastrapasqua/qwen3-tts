@@ -423,7 +423,7 @@ typedef struct qwen_tts_ctx {
     int cached_ref_n_frames;     /* Number of reference codec frames */
     /* Override weight buffers (WDELTA/WOVR/--expr) that REPLACED mmap pointers — tracked so unload
      * frees them (leaks-audit #3). A worker clone shares this list via the shallow `*w=*base` copy;
-     * only the base's unload frees it (qwen_tts_free_clone leaves it, like cp_steer_vec). */
+     * only the base's unload frees it (qwen_tts_free_clone leaves it). */
     void **owned_overrides;
     int    n_owned_overrides;
     int    cap_owned_overrides;
@@ -576,9 +576,6 @@ typedef struct qwen_tts_ctx {
     float  cp_roughness;     /* 0..1: blend q2-down into the high-prec down output
                               *        (texture "roughness" knob; 0 = off). */
     int    cp_rough_built;   /* lazy-build guard for the per-layer down_q2_rough copies. */
-    float *cp_steer_vec;     /* [cp_hidden] emotion/prosody control vector, or NULL. */
-    int    cp_steer_dim;     /* length of cp_steer_vec (must equal cp_hidden_size). */
-    float  cp_steer_weight;  /* injection scale: cp_x += weight*steer at the Talker→CP point. */
 
     /* Multi-layer Talker steering (emotion identity lives at late layers, not the
      * single cp_x point). ml_steer is [num_layers+1][hidden]: after Talker layer L

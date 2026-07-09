@@ -13,13 +13,14 @@
 #define QWEN_TTS_EMOTION_H
 
 /* Apply emotion to a context (shared by the CLI and the HTTP server). A named emotion
- * (primary or dyad) routes to the new qlsteer STEER on 1.7B; --roughness/--steer-vector are
- * generic knobs. Returns the effective volume/rate via out params. 0 on success, -1 on error.
- * The legacy .vec mood palette was retired 2026-07-08. */
+ * (primary or dyad) routes to the qlsteer STEER on 1.7B; --roughness is the only other
+ * (generic, non-emotion) knob. Returns the effective volume/rate via out params. 0 on
+ * success, -1 on error. The legacy .vec mood palette + --steer-vector were retired
+ * (2026-07-08 palette, 2026-07-09 the raw control-vector path). */
 typedef struct qwen_tts_ctx qwen_tts_ctx_t;
 int qwen_tts_apply_emotion(qwen_tts_ctx_t *ctx,
-        const char *emotion_spec, const char *steer_vector_path, const char *language,
-        float sw, int sw_set, float ro, int ro_set,
+        const char *emotion_spec, const char *language,
+        float ro, int ro_set,
         float vo, int vo_set, float ra, int ra_set,
         float *out_volume, float *out_rate, int silent);
 

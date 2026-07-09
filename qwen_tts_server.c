@@ -303,9 +303,7 @@ static void reset_request_state(qwen_tts_ctx_t *ctx) {
     ctx->instruct = NULL;
 
     /* Clear any emotion steering from a prior request (must not leak between requests).
-     * qwen_tts_apply_emotion also clears it, but a request with NO emotion needs this.
-     * The new emotion path is the Talker ml_steer (qlsteer) — clear it too. */
-    if (ctx->cp_steer_vec) { free(ctx->cp_steer_vec); ctx->cp_steer_vec = NULL; ctx->cp_steer_dim = 0; }
+     * The emotion path is the Talker ml_steer (qlsteer) — cleared just below. */
     ctx->cp_roughness = 0.0f;
     if (ctx->ml_steer) { free(ctx->ml_steer); ctx->ml_steer = NULL; ctx->ml_steer_layers = 0; }
 
@@ -409,8 +407,8 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     float req_rate = (float)json_extract_number(body, "rate", 1.0);
     char *emotion = json_extract_string(body, "emotion");
     if (emotion && emotion[0]) {
-        qwen_tts_apply_emotion(ctx, emotion, NULL, language,
-                               1.0f, 0, 0.0f, 0, req_vol, vol_present, req_rate, rate_present,
+        qwen_tts_apply_emotion(ctx, emotion, language,
+                               0.0f, 0, req_vol, vol_present, req_rate, rate_present,
                                &eff_vol, &eff_rate, 0);
     } else {
         eff_vol  = vol_present  ? req_vol  : 1.0f;

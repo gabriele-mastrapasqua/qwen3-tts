@@ -710,15 +710,14 @@ void qwen_track_override(qwen_tts_ctx_t *ctx, void *ptr) {
 void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     if (!ctx) return;
     /* Leaks-audit #3: free the WDELTA/WOVR/--expr override buffers that replaced mmap pointers.
-     * A worker clone shares this list (shallow copy) and must be freed BEFORE its base (same
-     * contract as cp_steer_vec), so only the base reaches here with the list populated. */
+     * A worker clone shares this list (shallow copy) and must be freed BEFORE its base, so only
+     * the base reaches here with the list populated. */
     for (int i = 0; i < ctx->n_owned_overrides; i++) free(ctx->owned_overrides[i]);
     free(ctx->owned_overrides);
     /* Free malloc'd fused weights (gate_up are the only malloc'd weight copies) */
     for (int i = 0; i < ctx->config.num_layers; i++) free(ctx->layers[i].gate_up_fused_bf16);
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].gate_up_fused_bf16);
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].down_q2_rough);
-    free(ctx->cp_steer_vec);
     /* Free pre-converted F32 codec embeddings */
     /* codec_embedding_f32 removed — vectorized bf16→f32 conversion used instead */
     /* Free malloc'd codebooks (EMA-reconstructed, not from safetensors) */

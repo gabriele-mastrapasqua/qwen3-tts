@@ -98,43 +98,16 @@ int qwen_emotion_steer_install(qwen_tts_ctx_t *ctx, const char *tok, float weigh
 
 /* ── Emotion application (shared by CLI + server) — new steer on 1.7B, else knobs ── */
 
-/* Load a .vec steer file (QSTV magic + int32 dim + dim*float32), accumulate scaled.
- * Only used now by the raw --steer-vector power-user path. */
-static int load_steer_vec_accum(const char *path, float scale, float **acc, int expect_dim) {
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "Error: cannot open steer vector '%s'\n", path); return -1; }
-    uint32_t magic = 0; int32_t dim = 0;
-    if (fread(&magic, 4, 1, f) != 1 || fread(&dim, 4, 1, f) != 1 ||
-        magic != 0x56545351u /* 'QSTV' */ || dim != expect_dim) {
-        fprintf(stderr, "Error: '%s' is not a valid steer vector for this model "
-                        "(dim=%d, expected %d)\n", path, dim, expect_dim);
-        fclose(f); return -1;
-    }
-    float *tmp = (float *)malloc((size_t)dim * sizeof(float));
-    if (!tmp || fread(tmp, sizeof(float), dim, f) != (size_t)dim) {
-        fprintf(stderr, "Error: failed to read steer vector '%s'\n", path);
-        free(tmp); fclose(f); return -1;
-    }
-    fclose(f);
-    if (!*acc) *acc = (float *)calloc(dim, sizeof(float));
-    if (*acc) for (int i = 0; i < dim; i++) (*acc)[i] += scale * tmp[i];
-    free(tmp);
-    return *acc ? 0 : -1;
-}
-
-/* Resolve an emotion preset name to its .vec path (first hit wins), language-aware. */
+/* --emotion routes to the qlsteer STEER above; --roughness is the only other knob. The
+ * legacy --steer-vector / .vec (QSTV) control-vector path was retired 2026-07-09. */
 int qwen_tts_apply_emotion(qwen_tts_ctx_t *ctx,
-        const char *emotion_spec, const char *steer_vector_path, const char *language,
-        float sw, int sw_set, float ro, int ro_set,
+        const char *emotion_spec, const char *language,
+        float ro, int ro_set,
         float vo, int vo_set, float ra, int ra_set,
         float *out_volume, float *out_rate, int silent) {
-    (void)language; (void)sw_set;
-    int cp_h = ctx->config.cp_hidden_size;
+    (void)language;
     float eff_roughness = ro; (void)ro_set;
 
-    /* Clear any prior steer (both CP-legacy and the Talker ml_steer) so emotion never leaks across
-     * calls/requests. */
-    if (ctx->cp_steer_vec) { free(ctx->cp_steer_vec); ctx->cp_steer_vec = NULL; ctx->cp_steer_dim = 0; }
     ctx->cp_roughness = 0.0f;
 
     /* ── The ONLY emotion path: the new qlsteer STEER (primaries + Plutchik dyads), 1.7B. ──
@@ -150,19 +123,11 @@ int qwen_tts_apply_emotion(qwen_tts_ctx_t *ctx,
         return 0;
     }
 
-    /* ── Generic knobs (NOT emotions): --roughness texture + raw --steer-vector control vector. ── */
+    /* ── Generic knob (NOT an emotion): --roughness texture. ── */
     if (eff_roughness > 0.0f) {
         if (eff_roughness > 1.0f) eff_roughness = 1.0f;
         ctx->cp_roughness = eff_roughness;
         if (!silent) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", eff_roughness);
-    }
-    if (steer_vector_path) {
-        float *steer_acc = NULL;
-        if (load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) { free(steer_acc); return -1; }
-        if (steer_acc) {
-            ctx->cp_steer_vec = steer_acc; ctx->cp_steer_dim = cp_h; ctx->cp_steer_weight = sw;
-            if (!silent) fprintf(stderr, "Steering: custom vector (dim=%d, weight=%.2f)\n", cp_h, sw);
-        }
     }
     if (out_volume) *out_volume = vo_set ? vo : 1.0f;
     if (out_rate)   *out_rate   = ra_set ? ra : 1.0f;

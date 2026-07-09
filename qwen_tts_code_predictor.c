@@ -93,49 +93,12 @@ static float  ql_ffn_eps    = 1e-4f;
 static long   ql_ffn_total  = 0;
 static long   ql_ffn_zero   = 0;
 
-/* ---- Steering-vector capture (QWEN_STEER_CAPTURE=path): accumulate the mean
- * cp_x at the Talker→CP injection point and write it as a .vec on exit. The
- * emotion control vector is mean(angry) − mean(neutral) from two such runs
- * (see tests/steer_make.py). Format: 'QSTV' magic + int32 dim + dim×float32. */
-#define STEER_VEC_MAGIC 0x56545351u  /* 'QSTV' little-endian */
-static const char *steer_cap_path   = NULL;   /* set once in ql_init, read-only after */
-/* Accumulators are per-thread: steer_capture_accum() does a cross-frame `+=` from the
- * generation thread; making them __thread avoids a data race if multiple worker threads
- * ever run with capture on (capture is a single-stream debug tool — atexit flushes the
- * main/generation thread's copy, which is the one that accumulates in CLI capture). */
-static __thread double *steer_cap_acc    = NULL;
-static __thread long    steer_cap_frames = 0;
-static __thread int     steer_cap_dim    = 0;
-
-static void steer_capture_accum(const float *cp_x, int n) {
-    if (!steer_cap_path) return;
-    if (!steer_cap_acc) { steer_cap_acc = (double *)calloc(n, sizeof(double)); steer_cap_dim = n; }
-    if (!steer_cap_acc || steer_cap_dim != n) return;
-    for (int i = 0; i < n; i++) steer_cap_acc[i] += cp_x[i];
-    steer_cap_frames++;
-}
-
 static void ql_report_atexit(void) {
     if (ql_codes_fp) { fclose(ql_codes_fp); ql_codes_fp = NULL; }
     if (ql_ffn_on && ql_ffn_total > 0)
         fprintf(stderr, "  [QWEN_FFN_SPARSITY] post-SwiGLU |x|<%.0e: %ld/%ld = %.2f%% (sparsity headroom)\n",
                 (double)ql_ffn_eps, ql_ffn_zero, ql_ffn_total,
                 100.0 * (double)ql_ffn_zero / (double)ql_ffn_total);
-    if (steer_cap_path && steer_cap_frames > 0 && steer_cap_acc) {
-        FILE *f = fopen(steer_cap_path, "wb");
-        if (f) {
-            uint32_t magic = STEER_VEC_MAGIC; int32_t dim = steer_cap_dim;
-            fwrite(&magic, 4, 1, f); fwrite(&dim, 4, 1, f);
-            for (int i = 0; i < steer_cap_dim; i++) {
-                float v = (float)(steer_cap_acc[i] / (double)steer_cap_frames);
-                fwrite(&v, 4, 1, f);
-            }
-            fclose(f);
-            fprintf(stderr, "  [QWEN_STEER_CAPTURE] wrote mean cp_x (dim=%d, %ld frames) -> %s\n",
-                    steer_cap_dim, steer_cap_frames, steer_cap_path);
-        }
-        free(steer_cap_acc); steer_cap_acc = NULL;
-    }
 }
 
 static void ql_init(void) {
@@ -149,9 +112,7 @@ static void ql_init(void) {
         double e = atof(s);
         if (e > 0) ql_ffn_eps = (float)e;
     }
-    const char *sc = getenv("QWEN_STEER_CAPTURE");
-    if (sc && *sc) steer_cap_path = sc;
-    if (ql_codes_fp || ql_ffn_on || steer_cap_path) atexit(ql_report_atexit);
+    if (ql_codes_fp || ql_ffn_on) atexit(ql_report_atexit);
 }
 
 /* ========================================================================
@@ -817,14 +778,13 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     /* Device-frame CP: whole 16-pass RVQ loop + argmax + embed on GPU, 1 sync/frame (the M1 win).
      * Falls back to the CPU/per-pass loop for steer/roughness/teacher-forcing. */
     { extern void *g_metal_cp_frame_state; extern void qwen_metal_cp_frame(void *, const float *, int, int *);
-      if (g_metal_cp_frame_state && !(ctx->cp_steer_vec && ctx->cp_steer_weight != 0.0f)
-          && ctx->cp_roughness <= 0.0f && !ctx->tf_ref_codes) {
+      if (g_metal_cp_frame_state && ctx->cp_roughness <= 0.0f && !ctx->tf_ref_codes) {
         qwen_metal_cp_frame(g_metal_cp_frame_state, talker_hidden, code0, out_codes);
         return 0;
       } }
 #endif
 
-    ql_init();  /* one-time env probe (QWEN_DUMP_CODES / QWEN_FFN_SPARSITY / QWEN_STEER_CAPTURE) */
+    ql_init();  /* one-time env probe (QWEN_DUMP_CODES / QWEN_FFN_SPARSITY) */
 
     if (ctx->cp_roughness > 0.0f && !ctx->cp_rough_built) cp_build_roughness(ctx);
 
@@ -839,17 +799,6 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     CPB_RESET();
     /* Step 0: process talker hidden state (project if needed) */
     cp_mtp_project(ctx, cp_x, talker_hidden);
-
-    /* Capture the clean (pre-steer) cp_x for control-vector building. */
-    steer_capture_accum(cp_x, cp_h);
-
-    /* Emotion/prosody steering: inject the control vector at the single Talker→CP
-     * point. It enters the CP KV cache at pos 0, so all 15 codebook predictions
-     * attend to the steered hidden → one injection point, global per-frame effect. */
-    if (ctx->cp_steer_vec && ctx->cp_steer_weight != 0.0f && ctx->cp_steer_dim == cp_h) {
-        float w = ctx->cp_steer_weight;
-        for (int i = 0; i < cp_h; i++) cp_x[i] += w * ctx->cp_steer_vec[i];
-    }
 
     CPB_MARK(CPB_EMBED);
     cp_transformer_step(ctx, cp_x, x_norm, 0);
@@ -1039,14 +988,9 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
     float emb_buf[4096], normed[2048];
 
-    /* step 0: project talker hidden (+ optional steering) */
-    for (int b = 0; b < B; b++) {
+    /* step 0: project talker hidden */
+    for (int b = 0; b < B; b++)
         cp_mtp_project(ctx, cx + (size_t)b * ch, talker_hidden + (size_t)b * h);
-        if (ctx->cp_steer_vec && ctx->cp_steer_weight != 0.0f && ctx->cp_steer_dim == ch) {
-            float w = ctx->cp_steer_weight; float *xb = cx + (size_t)b * ch;
-            for (int i = 0; i < ch; i++) xb[i] += w * ctx->cp_steer_vec[i];
-        }
-    }
     batch_cp_transformer_step(ctx, bb, cx, cxn, 0);
 
     /* step 1: embed code0 via the Talker codec embedding */
