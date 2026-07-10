@@ -207,12 +207,12 @@ Build con **gcc 15.2 reale** (su Mac `gcc` è clang: il fix `-MMD -MP` è quindi
 **Il chunk 150 che non guadagna nulla è la conferma del meccanismo**, non un'anomalia: a chunk 150 il
 re-decode `conv_rf=20` pesa 13%; a chunk 10 (default file mode) pesa **3×**. Teoria e misura coincidono.
 
-### ⚠️ Regressione REALE trovata solo qui: TTFA streaming **+8%** (920 → 994 ms)
-Su M1 era dentro il rumore. Su N1 i tre range sono **disgiunti** (920/964/968 vs 994/1006/1007) → segnale.
-Causa probabile: il path esatto fa `cs_ensure_alloc` + una `aligned_malloc` di `ext`/`full` **per ogni conv,
-per ogni chunk**, e il primo chunk è di soli 2 frame → overhead relativamente grande.
-→ **TODO: pre-allocare gli scratch per-stream una volta sola** invece che per chunk. Non bloccante
-(74 ms su ~950), ma va chiuso prima di dichiarare il lavoro finito.
+### TTFA streaming: regressione trovata qui, e poi **chiusa** (vedi §5.7)
+Con il solo conv esatto, N1 mostrava TTFA 920 → 994 ms (su M1 cadeva nel rumore). Causa: il path esatto
+anteponeva le code **anche al primo chunk**, quando sono ancora tutte zero — e un prepend di zeri è
+identico allo zero-pad causale che `causal_conv1d` già applica. Lavoro puro, buttato.
+Fix `cs_warm` (`2142bc9`). **A/B appaiato `main` vs HEAD ×5: nessuna regressione residua** (TTFA mediana
+948 vs 962 ms, a favore di HEAD). ⚠️ Il +8% qui sotto è pre-fix e proveniva da run non appaiati.
 
 ### Confronto col claim della PR
 | | loro (dichiarato) | noi (misurato, stessa µarch) |
@@ -403,16 +403,17 @@ M1 ha dotprod, quindi la conv int8 gira anche qui: la qualità si valida in loca
 
 > `joy` ha rumore assoluto 10 dB più alto di `sad` **ma lo stesso SNR**: il rumore di quantizzazione
 > **segue il livello del segnale**, e joy è semplicemente più energico. Non è una fragilità dell'emozione.
-> ⚠️ Costo: **TTFA +5%** in streaming (975 → 1020 ms), che si somma al +8% del conv esatto.
+> ⚠️ Costo TTFA: misurato **prima** del fix `cs_warm`. Dopo (§5.7), l'A/B appaiato `main` vs HEAD non
+> mostra regressione. Il costo della conv int8 sul TTFA va rimisurato appaiato — non è ancora fatto.
 
 Gate su M1: default OFF **bit-identico** al HEAD precedente · `--self-test` PASS · `make test-golden` PASS ·
 leaks invariati (137 / 420096 B, come `main`). Audio: `samples/tests/2026-07-10_pr17-int8-conv/audio_our_port/`.
 
 ## 5.5 Debito aperto (nostro, creato oggi)
 
-- **TTFA in streaming: +8% (conv esatto) +5% (conv int8).** Su M1 cadeva nel rumore; su N1 i range sono
-  disgiunti. Causa: il path esatto alloca gli scratch per-conv **a ogni chunk**, e il primo chunk è di 2 frame.
-  → pre-allocare gli scratch per-stream una volta sola.
+- ~~TTFA in streaming~~ **CHIUSO** (§5.7): `cs_warm` (`2142bc9`); A/B appaiato `main` vs HEAD senza regressione.
+  Resta l'inefficienza (una `aligned_malloc` per conv per chunk) ma **senza costo osservabile** → bassa priorità.
+- **Costo TTFA della conv int8** da rimisurare in coppie adiacenti (finora solo run non appaiati).
 - **`OPENBLAS_NUM_THREADS` non è tarato**: default = ncpu ⇒ oversubscription col nostro pool. Ottimo
   dipendente dal modo (file 2, stream 3). Serve una manopola per fase, non una costante.
 - **snake threading** e **spin-pool fixato** (publish seq_cst + fence, sopra `submit_mtx`): ~8% residuo.
@@ -457,15 +458,25 @@ generazione è finita, quindi senza nulla dietro cui nascondersi — esplode, e 
 3. ⚠️ **Da documentare per gli utenti del parametro:** sotto i ~7 frame la curva punisce (chunk 2 → RTF 2.11
    su N1, contro 1.51 a chunk 24). Il parametro invita a scendere; il costo non è ovvio.
 
-## 5.7 Il fix del TTFA (`2142bc9`) — misurato, parziale
+## 5.7 Il fix del TTFA (`2142bc9`) — **la regressione è chiusa**
 
-A/B appaiato su N1 (stesso testo, coppie adiacenti ×3):
+A/B appaiato del fix (N1, coppie adiacenti ×3):
 - **chunk=2:** pre-fix 970/980/1008 → post-fix 949/943/955. Range **disgiunti**: −30 ms reali (−3%).
-- **chunk=24:** pre 982/991/945 → post 970/936/959. **Sovrapposti**: dentro il rumore.
+- **chunk=24:** pre 982/991/945 → post 970/936/959. Sovrapposti (il primo chunk è 2 frame in entrambi).
 
-**Recupera ~30 ms dei ~74 ms persi.** Il resto è nelle allocazioni per-chunk (`cs_ensure_alloc` + una
-`aligned_malloc` per ogni conv, per ogni chunk) → resta il debito di §5.5. Non è "risolto": è **ridotto da
-+8% a ~+3%**.
+E soprattutto, **`main` vs HEAD appaiati ×5** (stream chunk 24), che è il confronto che conta:
+
+| | TTFA mediana | TTFA min | RTF |
+|---|---|---|---|
+| `main` | 962 ms | 944 ms | 1.98 |
+| **HEAD** | **948 ms** | **921 ms** | **1.52** |
+
+**Nessuna regressione residua**: HEAD è uguale o meglio di `main` sul TTFA, con −23% di RTF.
+
+> ⚠️ **Correzione.** Il "+8% di TTFA" riportato in §4 e §5.4 veniva da run presi in momenti diversi
+> (`main` misurato in una sessione, HEAD in un'altra). Misurato in **coppie adiacenti**, dopo `cs_warm`,
+> non esiste. È la stessa lezione della mediana contaminata dal load: **su questa macchina solo l'A/B
+> appaiato è affidabile.** Il debito delle allocazioni per-chunk (§5.5) resta, ma non ha un costo osservabile.
 
 ## 5.8 `OPENBLAS_NUM_THREADS`: nessuno lo impostava, e l'ottimo è un compromesso RTF↔TTFA
 
