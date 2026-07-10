@@ -511,6 +511,51 @@ non è più sul percorso critico, mentre il decoder è identico nei due casi.
 → La regola "int4 batte int8 su ARM" ([[project_quant_ladder_findings]]) resta vera **per il Talker isolato**,
 non end-to-end. Ottimizzare una parte riordina la classifica di tutte le altre.
 
+## 5.10 Snake threading + leva BLAS per fase (`8ea26fc`) — le due leve del profilo
+
+Nessuna delle due è un kernel: vengono dal `perf` (§5.1), che metteva il 21% nello scheduler e la snake
+sotto l'1%. A/B **appaiato** su N1 (0.6B `--int4 -j4`, coppie adiacenti):
+
+| config | PREV | NOW | Δ RTF |
+|---|---|---|---|
+| stream chunk 24 | 1.53 | **1.46** | −5% |
+| file mode | 1.62 | **1.49** | **−8%** |
+| stream + conv int8 | 1.29 | 1.28 | ~0 |
+| file TTFA | 1944 ms | **1871 ms** | migliora |
+
+Su M1 (decoder non è il collo): decoder 2440 → 2318 ms (−5%), **RTF invariato** — il guadagno resta nascosto
+dietro la generazione, come sempre.
+
+**Cosa insegnano questi numeri:**
+- **File mode guadagna più dello stream (−8%)**: lì il prefill è una fetta maggiore del wall, e la leva BLAS
+  gli tiene tutti i thread. Il decoder scende (8503 → 7885 ms) grazie alla snake threaded.
+- **Con la conv int8 il guadagno sparisce**: la conv int8 ha già dimezzato il decoder, quindi la snake non è
+  più il collo. Ennesima conferma: **ottimizzare una parte sposta il collo, e le due ottimizzazioni non si
+  sommano** — si sovrappongono sullo stesso collo.
+- **Il TTFA non regredisce** (anzi migliora in file): la leva è a **due valori** — prefill largo, generazione
+  stretta — proprio per non pagare il time-to-first-audio, che un `OPENBLAS_NUM_THREADS=2` piatto avrebbe
+  peggiorato del 30% (§5.8).
+
+**Implementazione:** il dispatcher `sd_pool_run` è uscito dalla guardia `__ARM_FEATURE_DOTPROD` (la conv int8
+ce l'aveva confinato) perché la snake lo usa su ogni ISA; il suo path GCD non usa più un globale. Snake
+seriale sotto `QWEN_SNAKE_MIN_WORK` (le snake dei primi stadi ConvNeXt sono piccole). La leva BLAS: prefill
+tiene `-j`, la generazione scende a `-j−1` quando parte il thread del decoder, risale al join. **Non** una
+partizione rigida `nostri+BLAS=core`: `OB=1` dà RTF 2.14, la lieve oversubscription vince.
+
+Gate: one-shot bit-identico, chunked==one-shot (mel_corr 1.00000), `--self-test` + `make test-golden` PASS.
+
+## 5.11 Riepilogo — il branch finale contro `main`, su due architetture
+
+| | M1 (RTF) | N1 (RTF) |
+|---|---|---|
+| 0.6B file int4 — `main` → HEAD | 0.65 → **0.52** | 2.70 → **1.49** |
+| 0.6B stream int4 — `main` → HEAD | 0.67 → **0.56** | 1.98 → **1.46** |
+| 0.6B stream int4 **+ conv int8** | — | → **1.28** |
+| 1.7B file int4 — `main` → HEAD | 1.13 → **0.87** | — |
+
+TTFA senza regressione (A/B appaiato, §5.7). 18 commit. Aperto: spin-pool fixato (~3%), ramo `__AVX2__`
+della snake su x86, AVX-512 per attention/rms_norm su x86.
+
 ## 6. Da dire all'autore (dopo §4 e §5)
 
 - Credito pieno: l'analisi è di qualità, i risultati negativi documentati, il conv esatto è il pezzo
