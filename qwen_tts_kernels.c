@@ -2184,10 +2184,15 @@ static void q4_0_matvec_sdot(float *y, const int8_t *qx, float sx,
     const uint8x16_t mask = vdupq_n_u8(0x0F);
     const int8x16_t bias = vdupq_n_s8(8);
     int o = 0;
+    /* Per-block accumulation stays in a float32x4 lane vector: the cross-lane
+     * vaddvq_s32 + scalar FMA that used to sit in the inner loop serialized on a
+     * high-latency reduce every 32 weights. Deferring it (cvt + vfmaq_n_f32, one
+     * vaddvq_f32 per row) is algebraically the same sum of scale*lane. Idea from
+     * PR #17 (TrinityTF); kept on our interleaved q4_0 layout. */
     for (; o + 1 < out_dim; o += 2) {
         const q4_0_block_t *r0 = W + (size_t)o * nb;
         const q4_0_block_t *r1 = W + (size_t)(o + 1) * nb;
-        float sum0 = 0.0f, sum1 = 0.0f;
+        float32x4_t fa0 = vdupq_n_f32(0.0f), fa1 = vdupq_n_f32(0.0f);
         for (int b = 0; b < nb; b++) {
             const int8_t *xb = qx + b * Q4_0_BLOCK_SIZE;
             int8x16_t x0 = vld1q_s8(xb);
@@ -2198,21 +2203,21 @@ static void q4_0_matvec_sdot(float *y, const int8_t *qx, float sx,
             int8x16_t w0a = vsubq_s8(vreinterpretq_s8_u8(z0.val[0]), bias);
             int8x16_t w0b = vsubq_s8(vreinterpretq_s8_u8(z0.val[1]), bias);
             int32x4_t acc0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w0a, x0), w0b, x1);
-            sum0 += r0[b].scale * (float)vaddvq_s32(acc0);
+            fa0 = vfmaq_n_f32(fa0, vcvtq_f32_s32(acc0), r0[b].scale);
             /* row 1 */
             uint8x16_t raw1 = vld1q_u8(r1[b].qs);
             uint8x16x2_t z1 = vzipq_u8(vandq_u8(raw1, mask), vshrq_n_u8(raw1, 4));
             int8x16_t w1a = vsubq_s8(vreinterpretq_s8_u8(z1.val[0]), bias);
             int8x16_t w1b = vsubq_s8(vreinterpretq_s8_u8(z1.val[1]), bias);
             int32x4_t acc1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w1a, x0), w1b, x1);
-            sum1 += r1[b].scale * (float)vaddvq_s32(acc1);
+            fa1 = vfmaq_n_f32(fa1, vcvtq_f32_s32(acc1), r1[b].scale);
         }
-        y[o]     = sum0 * sx;
-        y[o + 1] = sum1 * sx;
+        y[o]     = vaddvq_f32(fa0) * sx;
+        y[o + 1] = vaddvq_f32(fa1) * sx;
     }
     if (o < out_dim) {
         const q4_0_block_t *r0 = W + (size_t)o * nb;
-        float sum0 = 0.0f;
+        float32x4_t fa0 = vdupq_n_f32(0.0f);
         for (int b = 0; b < nb; b++) {
             const int8_t *xb = qx + b * Q4_0_BLOCK_SIZE;
             int8x16_t x0 = vld1q_s8(xb);
@@ -2222,9 +2227,9 @@ static void q4_0_matvec_sdot(float *y, const int8_t *qx, float sx,
             int8x16_t w0a = vsubq_s8(vreinterpretq_s8_u8(z0.val[0]), bias);
             int8x16_t w0b = vsubq_s8(vreinterpretq_s8_u8(z0.val[1]), bias);
             int32x4_t acc0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w0a, x0), w0b, x1);
-            sum0 += r0[b].scale * (float)vaddvq_s32(acc0);
+            fa0 = vfmaq_n_f32(fa0, vcvtq_f32_s32(acc0), r0[b].scale);
         }
-        y[o] = sum0 * sx;
+        y[o] = vaddvq_f32(fa0) * sx;
     }
 }
 
