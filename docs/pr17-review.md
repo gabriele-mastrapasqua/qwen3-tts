@@ -364,6 +364,59 @@ Compilati entrambi sulla N1, stesso testo/seed/flag (0.6B, `--int4 -j4`, min di 
 **Divario residuo noi↔lui:** ourHEAD+OB=3 **1.46** vs hisPR **1.39** ≈ 5%, attribuibile a spin-pool (~3%)
 + il suo packing deinterleaved. Nulla che giustifichi il rischio dei 13 siti CUDA/Metal (§1.3).
 
+## 5.4 Il port della conv int8 nel NOSTRO albero — validato su N1 (commit `68bddbf`)
+
+Portato dopo l'ok all'ascolto. Tre scostamenti deliberati dal suo codice:
+- **Threading:** lui crea *sempre* un pool privato (il pool POSIX non è rientrante ed è posseduto dal thread
+  di generazione; col nostro `submit_mtx` un secondo submitter lo bloccherebbe). Vero su Linux, **inutile su
+  macOS** (GCD rientrante) → usiamo `qwen_parallel` se `qwen_parallel_is_reentrant()`, il suo pool altrimenti.
+- **ConvTranspose int8 NON portata:** lui stesso l'ha misurata più lenta dell'sgemm fp32 e la spedisce spenta.
+- **Stesso scoping** (`in_ch == out_ch && in_ch <= 768`): le conv nel dominio latente restano fp32.
+
+`QWEN_SD_INT8=1`, **mai default**: scambia qualità con velocità, la scelta resta di chi usa il motore.
+
+### Il percorso completo su N1 (0.6B, `--int4 -j4`, stream chunk 24, min di 3)
+
+| build | RTF | decoder | TTFA |
+|---|---|---|---|
+| la sua base `a4f6337` | 3.45 | 15295 ms | 1137 ms |
+| **il nostro `main`** | 1.96 | 11821 ms | 920 ms |
+| + accumulo float32x4 + conv esatto (`e6208f2`,`fff169e`) | 1.51 | 7545 ms | 975 ms |
+| + snake poly (`5f6e654`) | ~1.48 | 7479 ms | — |
+| **+ conv int8** (`68bddbf`, `QWEN_SD_INT8=1`) | **1.29** | 5159 ms | 1020 ms |
+| il suo albero + conv int8 (riferimento) | 1.19 | — | — |
+
+File mode `--int4`: **1.65 → 1.39** con la conv int8 (decoder 8577 → 6528 ms).
+
+**Divario residuo noi↔lui ≈ 8%.** Attribuibile a: spin-pool (~3%, misurato isolando `QWEN_POOL_SPIN=0`),
+il suo **snake threading** (lui distribuisce le righe della snake sul pool del decoder — non portato),
+e il packing deinterleaved. Nessuno dei tre giustifica, oggi, il rischio dei 13 siti CUDA/Metal.
+
+### Qualità: `--emotion` VERO + voice clone (M1, nostro albero)
+M1 ha dotprod, quindi la conv int8 gira anche qui: la qualità si valida in locale, senza la box.
+
+| caso | SNR full | rumore RMS | rumore di picco |
+|---|---|---|---|
+| `--emotion sad` (1.7B, THE recipe) | 37.4 dB | −65.7 dBFS | −43.0 dBFS |
+| `--emotion joy` | 37.3 dB | **−55.1 dBFS** | −34.5 dBFS |
+| voice clone (`--ref-audio`, 0.6B-base) | 43.3 dB | −67.6 dBFS | −47.3 dBFS |
+
+> `joy` ha rumore assoluto 10 dB più alto di `sad` **ma lo stesso SNR**: il rumore di quantizzazione
+> **segue il livello del segnale**, e joy è semplicemente più energico. Non è una fragilità dell'emozione.
+> ⚠️ Costo: **TTFA +5%** in streaming (975 → 1020 ms), che si somma al +8% del conv esatto.
+
+Gate su M1: default OFF **bit-identico** al HEAD precedente · `--self-test` PASS · `make test-golden` PASS ·
+leaks invariati (137 / 420096 B, come `main`). Audio: `samples/tests/2026-07-10_pr17-int8-conv/audio_our_port/`.
+
+## 5.5 Debito aperto (nostro, creato oggi)
+
+- **TTFA in streaming: +8% (conv esatto) +5% (conv int8).** Su M1 cadeva nel rumore; su N1 i range sono
+  disgiunti. Causa: il path esatto alloca gli scratch per-conv **a ogni chunk**, e il primo chunk è di 2 frame.
+  → pre-allocare gli scratch per-stream una volta sola.
+- **`OPENBLAS_NUM_THREADS` non è tarato**: default = ncpu ⇒ oversubscription col nostro pool. Ottimo
+  dipendente dal modo (file 2, stream 3). Serve una manopola per fase, non una costante.
+- **snake threading** e **spin-pool fixato** (publish seq_cst + fence, sopra `submit_mtx`): ~8% residuo.
+
 ## 6. Da dire all'autore (dopo §4 e §5)
 
 - Credito pieno: l'analisi è di qualità, i risultati negativi documentati, il conv esatto è il pezzo
