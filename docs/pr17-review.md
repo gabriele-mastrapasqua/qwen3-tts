@@ -330,6 +330,40 @@ dispatch prende `int8_matvec_vnni` / `q4_0_matvec_vnni` (verificato). Buchi veri
 | ARM-Linux | spin-pool | **dopo** il fix; e dopo aver tarato OpenBLAS |
 | ARM-Linux | conv int8 del decoder | opt-in, solo dopo ascolto su emotion/clone |
 
+## 5.3 Il SUO albero contro il NOSTRO, sulla stessa box (N1) — chi arriva dove
+
+Compilati entrambi sulla N1, stesso testo/seed/flag (0.6B, `--int4 -j4`, min di 3).
+
+| build | stream chunk 24 | file chunk 150 | decoder (stream) |
+|---|---|---|---|
+| `a4f6337` — **la SUA base** | **3.45** | 2.85 | 15295 ms |
+| il **nostro `main`** (stessa data della sua PR) | **1.96** | 1.44 | 11821 ms |
+| **il suo albero completo** (4 commit) | **1.41** | 1.31 | 7735 ms |
+| il suo albero **+ `QWEN_SD_INT8=1`** | **1.15** | **1.11** | 5112 ms |
+| **il nostro HEAD** (branch review) | 1.49 | 1.44 | 7476 ms |
+| il nostro HEAD **+ `OPENBLAS_NUM_THREADS=3`** | **1.46** | — | 7366 ms |
+
+### Tre cose che questo tavolo dice, e che nessuna delle due parti sapeva
+
+1. **Il claim `2.21 → 1.34` è vero ma non trasferibile.** La sua base `a4f6337` fa **3.45** dove il nostro
+   `main` fa **1.96**: tra la sua base e il nostro main c'è **B1 (SDOT-q4)**, che lui ha **re-inventato**
+   dentro la PR. Buona parte del suo Δ è un guadagno che il nostro albero aveva già preso per altra strada.
+   Il suo contributo **netto sopra il nostro main** è molto più piccolo del Δ che dichiara.
+
+2. **Il pezzo grosso non è quello che pensava nessuno dei due.** Non lo spin-pool, non la snake, non il
+   packing: è la **conv int8 del decoder**. `1.41 → 1.15` in stream (**−18%**), `1.31 → 1.11` in file,
+   decoder 7735 → 5112 ms. È **l'unica cosa che avevo messo da parte per la qualità** (26 dB worst-segment).
+   → La decisione è **d'orecchio, non di benchmark**: audio in `samples/tests/2026-07-10_pr17-int8-conv/`.
+
+3. **Lo spin-pool vale poco, isolato.** Sul suo stesso binario, `QWEN_POOL_SPIN=0` vs default:
+   **1.43 → 1.39** (~3%). La sua *diagnosi* (~7300 futex/frame) era giusta e preziosa — il profilo la
+   conferma col 21% nello scheduler — ma la sua *cura* cattura solo una fetta. La fetta più grossa la
+   prende `OPENBLAS_NUM_THREADS` (che lui non tocca): il nostro HEAD passa da 1.53-1.58 a **1.46** con OB=3.
+   ⚠️ E solo in certi modi: in stream OB=2 **peggiora** (TTFA 943 → 1300). Manopola per fase, non costante.
+
+**Divario residuo noi↔lui:** ourHEAD+OB=3 **1.46** vs hisPR **1.39** ≈ 5%, attribuibile a spin-pool (~3%)
++ il suo packing deinterleaved. Nulla che giustifichi il rischio dei 13 siti CUDA/Metal (§1.3).
+
 ## 6. Da dire all'autore (dopo §4 e §5)
 
 - Credito pieno: l'analisi è di qualità, i risultati negativi documentati, il conv esatto è il pezzo
