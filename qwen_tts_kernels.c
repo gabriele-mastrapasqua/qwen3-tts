@@ -3026,8 +3026,56 @@ void qwen_bf16_to_f32_vec(float *dst, const uint16_t *src_bf16, int n) {
  * Snake activation: x += (1/exp(beta)) * sin²(exp(alpha) * x)
  * ======================================================================== */
 
+#if defined(__ARM_NEON) && !(defined(__APPLE__) && defined(USE_BLAS))
+/* sin²(y), vectorized — the only form the snake needs.
+ *
+ * Reduce y by π (not 2π): u = y − n·π ∈ [−π/2, π/2], with n = round(y/π). That leaves
+ * sin(u) = ±sin(y), and **squaring discards the sign**, so no quadrant bookkeeping.
+ * π is split Cody-Waite (hi+lo) because n·π_float alone loses the low bits.
+ * Odd Taylor series to u¹¹: the truncated term is u¹³/13! ≈ 1.2e-8 at |u|=π/2, well under
+ * a float ULP. Idea from PR #17 (TrinityTF); the |y| guard below is ours.
+ *
+ * Above QWEN_SIN_POLY_MAX the 2-term reduction stops being exact enough (n grows, and the
+ * π_lo residual is amplified), so the caller falls back to libm there. Snake's α·x stays
+ * far below it in practice — this just refuses to be silently wrong if it ever doesn't. */
+#define QWEN_SIN_POLY_MAX 8192.0f
+static inline float32x4_t qwen_vsin2q_f32(float32x4_t y) {
+    const float32x4_t inv_pi = vdupq_n_f32(0.31830988618379067f);
+    const float32x4_t pi_hi  = vdupq_n_f32(3.14159274101257324f);   /* float(π)      */
+    const float32x4_t pi_lo  = vdupq_n_f32(-8.74227800708368e-8f);  /* π − float(π)  */
+    float32x4_t n = vrndaq_f32(vmulq_f32(y, inv_pi));               /* round-to-nearest, ties away */
+    float32x4_t u = vfmsq_f32(y, n, pi_hi);
+    u = vfmaq_f32(u, n, pi_lo);
+    float32x4_t u2 = vmulq_f32(u, u);
+    /* Horner on u²: s = u·(1 − u²/6 + u⁴/120 − u⁶/5040 + u⁸/362880 − u¹⁰/39916800) */
+    float32x4_t p = vdupq_n_f32(-1.0f / 39916800.0f);
+    p = vfmaq_f32(vdupq_n_f32( 1.0f / 362880.0f), p, u2);
+    p = vfmaq_f32(vdupq_n_f32(-1.0f / 5040.0f),   p, u2);
+    p = vfmaq_f32(vdupq_n_f32( 1.0f / 120.0f),    p, u2);
+    p = vfmaq_f32(vdupq_n_f32(-1.0f / 6.0f),      p, u2);
+    p = vfmaq_f32(vdupq_n_f32( 1.0f),             p, u2);
+    float32x4_t s = vmulq_f32(u, p);
+    return vmulq_f32(s, s);
+}
+/* QWEN_NO_SIN_POLY=1 restores the per-lane libm sinf — the A/B switch for this kernel
+ * (same shape as QWEN_NO_SDOT). Cached once; read outside the hot loop. */
+static int qwen_sin_poly_off(void) {
+    static atomic_int off = -1;
+    int v = atomic_load_explicit(&off, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_SIN_POLY");
+        v = (e && e[0] == '1');
+        atomic_store_explicit(&off, v, memory_order_relaxed);
+    }
+    return v;
+}
+#endif
+
 void qwen_snake_activation(float *data, int channels, int length,
                             const float *log_alpha, const float *log_beta) {
+#if defined(__ARM_NEON) && !(defined(__APPLE__) && defined(USE_BLAS))
+    const int sin_poly = !qwen_sin_poly_off();
+#endif
     for (int c = 0; c < channels; c++) {
         float a = expf(log_alpha[c]);
         float inv_b = expf(-log_beta[c]);
@@ -3061,13 +3109,18 @@ void qwen_snake_activation(float *data, int channels, int length,
             for (; t + 3 < length; t += 4) {
                 float32x4_t x = vld1q_f32(row + t);
                 float32x4_t ax = vmulq_f32(va, x);
-                /* Scalar sinf for each lane (no NEON intrinsic for sin) */
-                float ax_s[4];
-                vst1q_f32(ax_s, ax);
-                float s_arr[4] = { sinf(ax_s[0]), sinf(ax_s[1]),
-                                   sinf(ax_s[2]), sinf(ax_s[3]) };
-                float32x4_t s = vld1q_f32(s_arr);
-                float32x4_t s2 = vmulq_f32(s, s);
+                float32x4_t s2;
+                if (sin_poly && vmaxvq_f32(vabsq_f32(ax)) <= QWEN_SIN_POLY_MAX) {
+                    s2 = qwen_vsin2q_f32(ax);
+                } else {
+                    /* Range reduction would lose too many bits here: fall back to libm. */
+                    float ax_s[4];
+                    vst1q_f32(ax_s, ax);
+                    float s_arr[4] = { sinf(ax_s[0]), sinf(ax_s[1]),
+                                       sinf(ax_s[2]), sinf(ax_s[3]) };
+                    float32x4_t s = vld1q_f32(s_arr);
+                    s2 = vmulq_f32(s, s);
+                }
                 x = vfmaq_f32(x, vinv_b, s2);
                 vst1q_f32(row + t, x);
             }
