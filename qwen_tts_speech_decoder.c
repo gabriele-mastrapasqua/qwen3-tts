@@ -23,6 +23,7 @@
  *   decoder.decoder.6.conv.{weight,bias}                - final conv
  */
 
+#include <pthread.h>
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_safetensors.h"
@@ -151,6 +152,73 @@ static void causal_conv_transpose1d_naive(float *out, const float *in,
 }
 #endif /* !USE_BLAS */
 
+
+/* ========================================================================
+ * INT8 conv path for the decoder (PR #17 sub-change B, ported)
+ *
+ * OPT-IN ONLY (QWEN_SD_INT8=1) and only on ARM dotprod: it trades audio
+ * quality for speed. Measured on Neoverse-N1 (0.6B --int4 -j4): stream RTF
+ * 1.41 -> 1.15, decoder 7735 -> 5112 ms. Added noise floor ~-65 dBFS RMS.
+ * The ConvTranspose int8 variant is NOT ported: the author measured it slower
+ * than fp32 sgemm (small K pads poorly into blocks) and ships it disabled.
+ * ======================================================================== */
+static int sd_int8_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_INT8");
+        en = (e && *e && *e != '0') && qwen_sd_int8_available();
+    }
+    return en;
+}
+
+/* Scale-block size along K (multiple of 16). Smaller = more accurate, slightly
+ * slower; the author measured 64 as the sweet spot on N1 (same RTF as 128,
+ * ~4 dB better SNR). QWEN_SD_INT8_BLK overrides. */
+static int sd_int8_blk(void) {
+    static int blk = -1;
+    if (blk < 0) {
+        const char *e = getenv("QWEN_SD_INT8_BLK");
+        blk = e ? atoi(e) : 64;
+        if (blk < 16) blk = 16;
+        blk = (blk + 15) & ~15;
+    }
+    return blk;
+}
+
+/* Quantized-weight registry keyed by source pointer. Quantize-once; the entries
+ * live until process exit (bounded at SD_WQ_MAX, and only populated when the
+ * env flag is on). Weights are read-only and shared across streaming slots. */
+typedef struct {
+    const float *src;
+    int8_t *q;
+    float *scales;
+    int Kp;
+} sd_wq_entry_t;
+
+#define SD_WQ_MAX 128
+static sd_wq_entry_t sd_wq[SD_WQ_MAX];
+static int sd_wq_n = 0;
+static pthread_mutex_t sd_wq_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Conv1d weight [out_ch, in_ch*kernel]: rows are already in im2col order. */
+static sd_wq_entry_t *sd_wq_get_conv(const float *w, int out_ch, int K) {
+    pthread_mutex_lock(&sd_wq_mu);
+    for (int i = 0; i < sd_wq_n; i++)
+        if (sd_wq[i].src == w) { pthread_mutex_unlock(&sd_wq_mu); return &sd_wq[i]; }
+    if (sd_wq_n >= SD_WQ_MAX) { pthread_mutex_unlock(&sd_wq_mu); return NULL; }
+    int blk = sd_int8_blk();
+    int Kp = qwen_int8_kp(K, blk);
+    sd_wq_entry_t *e = &sd_wq[sd_wq_n];
+    e->q = (int8_t *)aligned_malloc((size_t)out_ch * Kp);
+    e->scales = (float *)aligned_malloc((size_t)out_ch * (Kp / blk) * sizeof(float));
+    if (!e->q || !e->scales) { free(e->q); free(e->scales); pthread_mutex_unlock(&sd_wq_mu); return NULL; }
+    e->src = w; e->Kp = Kp;
+    qwen_int8_quant_rows(e->q, e->scales, w, out_ch, K, Kp, blk);
+    sd_wq_n++;
+    pthread_mutex_unlock(&sd_wq_mu);
+    return e;
+}
+
 #ifdef USE_BLAS
 /* Add bias to channel-first output [channels, length] */
 static void conv_add_bias(float *out, const float *bias, int channels, int length) {
@@ -168,6 +236,19 @@ static void causal_conv1d_blas(float *out, const float *in,
                                const float *weight, const float *bias,
                                int in_ch, int out_ch, int length,
                                int kernel, int dilation) {
+    /* int8 only for the upsample-block res convs: the latent-domain convs
+     * (pre-conv 512->1024, ConvNeXt) are quality-sensitive and cheap, so they
+     * stay fp32. Same scoping as the author's. */
+    if (sd_int8_enabled() && in_ch == out_ch && in_ch <= 768) {
+        sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
+        if (e) {
+            qwen_conv1d_int8(out, in, e->q, e->scales, bias,
+                             in_ch, out_ch, length, kernel, dilation,
+                             e->Kp, sd_int8_blk());
+            return;
+        }
+    }
+
     if (kernel == 1) {
         /* k=1: weight is [out_ch, in_ch], direct matmul */
         SD_GEMM(CblasNoTrans, CblasNoTrans,
