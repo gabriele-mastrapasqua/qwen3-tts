@@ -224,8 +224,43 @@ Il nostro **prima** è già migliore del loro (`main` ha D2 e altro che la loro 
 **dopo** è più lento del loro **esattamente dei pezzi che non abbiamo portato**: snake poly + conv int8
 + spin-pool. Il conto torna, e dice quanto valgono quei pezzi su questa box: **~0.14 RTF sullo stream**.
 
-⏳ Restano da misurare qui: snake poly (ramo `__ARM_NEON`), spin-pool **dopo** il fix (`submit_mtx` +
-fence seq_cst), `QWEN_SD_INT8=1` **con ascolto** su emotion/clone, e un `perf record` per ordinare il resto.
+### 4.1 snake poly (commit `5f6e654`) — misurata su N1: **corretta, ma il guadagno è modesto**
+
+Correttezza (stesso binario, `QWEN_NO_SIN_POLY=1` come A/B): **SNR 101.3 dB**, max **1 LSB**, 0.04% dei
+campioni diversi. Il kernel è giusto.
+
+Velocità (0.6B, `--int4 -j4`, coppie adiacenti ×3, min):
+
+| config | libm `sinf` | poly NEON | Δ decoder |
+|---|---|---|---|
+| file `--int4` | RTF 1.58, dec 8367 ms | RTF 1.57, dec 8163 ms | **−4%** |
+| stream chunk 24 | RTF 1.52, dec 7856 ms | RTF 1.51, dec 7479 ms | **−3%** |
+
+**Non è il 3.5× che la PR dichiara per il polinomio** (1209 → 341 ms). Motivo: da noi la snake non è
+mai stata il collo di bottiglia — vedi il profilo qui sotto. Il commit resta (è corretto, gratis, e
+toglie 200-380 ms), ma **non è il pezzo che vale**.
+
+### 4.2 `perf record` — dove va DAVVERO il tempo su N1 (0.6B, `--int4 -j4`)
+
+| simbolo | % |
+|---|---|
+| `sgemm_kernel_NEOVERSEN1` (OpenBLAS: conv del decoder) | **30.9%** |
+| `q4_0_matvec_sdot` (Talker + CP) | **28.8%** |
+| `__schedule` + `el0_svc` + `__sched_yield` + `do_sched_yield` (**kernel: scheduling/futex/yield**) | **~21%** |
+| `conv_decoder_forward_streaming` | 2.7% |
+| `causal_conv1d_blas` | 1.7% |
+| snake | **non compare** (< 1.5%) |
+
+**Il ~21% nello scheduler è il vero mostro, e nessuno l'aveva visto.** `__sched_yield` è OpenBLAS che
+fa spin nelle sue barriere; `__schedule` è il futex del nostro pool. Cioè: **il nostro pool a 4 thread e
+OpenBLAS a 4 thread si contendono 4 core** (oversubscription da parallelismo annidato).
+
+→ Questo **valida l'idea** del commit spin-pool della PR (che avevamo rifiutato per il lost-wakeup e per
+`submit_mtx`): il costo che attaccava è reale e grosso. Ma la prima mossa non è nemmeno lo spin-pool:
+è capire quanti thread deve avere OpenBLAS quando il nostro pool ne ha già 4. ⏳ (misura in corso)
+
+⏳ Restano: spin-pool **dopo** il fix (`submit_mtx` + fence seq_cst), `QWEN_SD_INT8=1` **con ascolto** su
+emotion/clone, e il ramo `__AVX2__` della snake (stesso problema, box x86).
 
 ## 5. ⏳ Il lavoro derivato che la PR ha rivelato (e che la PR NON copre)
 
