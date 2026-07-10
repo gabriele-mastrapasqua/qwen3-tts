@@ -261,7 +261,8 @@ to compare (chunked synthesis emits slightly more audio). For correctness across
 | _M2/M4_ | batch | | | | | native matmul twin candidate |
 | _Zen4 (AVX-512+VNNI)_ | single | | | | | VNNI int8 |
 | _Zen4_ | batch | | | | | int4+batch expected sweet spot |
-| **Zen5 Turin** (EPYC 9555P, 4vCPU, 1.7B) | single -j4 | 2.27 | **2.03** | 2.41 | int8 1.08s / int4 1.25s / bf16 1.68s | 2026-07-09; **int8-VNNI is the x86 winner — int4 trails (nibble unpack), opposite of M1** |
+| **Zen5 Turin** (EPYC 9555P, 4vCPU, 1.7B) | single -j4 | 2.27 | **2.03** | 2.41 | int8 1.08s / int4 1.25s / bf16 1.68s | 2026-07-09 (v2 q4-VNNI); int8 won, int4 trailed |
+| **Zen5 Turin** (EPYC 9555P, 0.6B, ms/frame) | q4-VNNI **v3** vs v2 vs int8 | — | Tlk 25.3 / CP 69.6 | **Tlk 22.9 / CP 63.5** | — | 2026-07-10 **q4-VNNI v3 throughput-packing: int4 now BEATS int8** (−9% vs v2, faster than int8); reverses the v2 finding. `SIMD=avx512vnni`, `QWEN_Q4_VNNI_V3=0`→v2. Compare ms/frame not RTF (int4/int8 fork trajectory: 95 vs 147 frames) |
 | _Zen5 Turin_ | batch (matmat, B=8) | 11.9× | **3.0×** | 1.6× | — | kernel-level batching speedup (int8/q4 now VNNI, `--matmat-bench`); e2e server-batching = WIP (§5.note) |
 | _Sapphire (AMX)_ | batch | | | | | AMX int8 GEMM (future twin) |
 | _Graviton3_ | batch | | | | | bf16+i8mm+SVE |

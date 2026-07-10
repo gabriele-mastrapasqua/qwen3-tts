@@ -605,7 +605,19 @@ v2, per l'A/B on-box senza rebuild.
   default PASS (`matmat_q4_0` L2_rel ~1e-7); v2 (`QWEN_Q4_VNNI_V3=0`) PASS. La verifica scalare-emulata da
   M1 reggeva. ⚠️ Nota: `make blas` di default compila **AVX2 portabile** — serve `SIMD=avx512vnni` per
   esercitare v2/v3, altrimenti si testa il fallback AVX2.
-- **Velocità: in misura** (RTF A/B v3 vs v2 vs int8, `-j1` e `-j4`, in corso sull'EPYC).
+- **Velocità: v3 VINCE, e ribalta il verdetto (2026-07-10, EPYC 9555P Zen5, -j1, ms/frame).**
+
+  | q4 kernel | Talker ms/f | Code Predictor ms/f |
+  |---|---|---|
+  | int4 **v3** | **22.9** | **63.5** |
+  | int4 v2 | 25.1 | 70.0 |
+  | int8 VNNI | 25.3 | 69.6 |
+
+  v3 è −9% vs v2 su Talker E CP, e **int4-v3 BATTE int8** (22.9 vs 25.3; 63.5 vs 69.6). Sulla STESSA box
+  dove la v2 era il 37% più lenta di int8 ([[project_x86_epyc_vnni_validation]]), il throughput-packing
+  (2 blocchi/512b + 4-row unroll) chiude il gap e lo supera. **Il TODO "int4 non è ancora un win x86" è
+  risolto.** ⚠️ Metrica: **ms/frame**, non RTF — int4 e int8 forkano la traiettoria greedy (95 vs 147
+  frame sullo stesso testo), quindi RTF=wall/durata non è comparabile fra quant; il ms/frame sì.
 
 → **Piano box x86:** `make check-isa` (già verde) → sulla box `make bench-matrix` + `--self-test` +
 A/B v3/v2/int8 + snake AVX2 on/off, **tutte le mod insieme**. Poi si decide se int4 batte int8 su x86 (oggi no).
