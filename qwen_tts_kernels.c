@@ -2340,13 +2340,121 @@ static void q4_0_matvec_vnni(float *y, const int8_t *qx, float sx,
         y[o] = sum * sx;
     }
 }
+/* v3 (throughput-packing): the two follow-ups the v2 comment names.
+ *
+ * v2 wasted half the datapath (a 32-int8 block zero-extended into a 512-bit
+ * dpbusd) and put a cross-lane _mm512_reduce_add_epi32 on the critical path
+ * every block. On EPYC 9555P that made int4-VNNI ~37% SLOWER than int8
+ * (project_x86_epyc_vnni_validation). v3:
+ *   - packs 2 blocks per 512-bit dpbusd (64 int8 = full width): the low 256-bit
+ *     half is block b, the high half is block b+1, and the activation load is a
+ *     single _mm512_loadu of qx[b*32 .. b*32+63];
+ *   - unrolls 4 output rows with independent dpbusd accumulator chains, so the
+ *     per-block reduces from different rows overlap and hide dpbusd's ~4-5c
+ *     latency instead of serializing.
+ * Per-block q4 scale still forces a scalar dot per block (like the ARM SDOT
+ * twin), but the two block-dots come out of ONE dpbusd as the two 256-bit-half
+ * sums, and the FMA into the float accumulator carries the scale.
+ *
+ * QWEN_Q4_VNNI_V3=0 falls back to v2, so the box can A/B without a rebuild.
+ * ⚠️ COMPILE-CHECKED ONLY here (cross-compile + Rosetta numeric spot-check);
+ * the SPEED claim is a hypothesis until measured on real Zen4/SPR silicon. */
+static inline int q4_hsum256(__m256i v) {           /* Σ of 8 int32 lanes */
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i s  = _mm_add_epi32(lo, hi);
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm_cvtsi128_si32(s);
+}
+/* Unpack one q4_0 block (16 nibble bytes) to 32 unsigned int8 in value order,
+ * placed in the given 256-bit half. Nibbles stay 0..15; the −8 bias is folded
+ * into `corr` by the caller, exactly as in v2. */
+static inline __m256i q4_unpack_block_u8(const uint8_t *qs) {
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    __m128i raw = _mm_loadu_si128((const __m128i *)qs);
+    __m128i lo = _mm_and_si128(raw, lomask);
+    __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
+    return _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+}
+static void q4_0_matvec_vnni_v3(float *y, const int8_t *qx, float sx,
+                                const q4_0_block_t *W, int cols, int out_dim) {
+    int nb = cols / Q4_0_BLOCK_SIZE;
+    const __m512i ones = _mm512_set1_epi8(1);
+    /* Per-block −8·Σqx correction, shared across all rows (like v2). */
+    int corr[Q4_QX_MAX / Q4_0_BLOCK_SIZE];
+    for (int b = 0; b < nb; b++) {
+        __m512i xv = _mm512_zextsi256_si512(
+            _mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+        corr[b] = -8 * _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, xv));
+    }
+
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {          /* 4 independent rows */
+        const q4_0_block_t *r0 = W + (size_t)o * nb, *r1 = r0 + nb, *r2 = r1 + nb, *r3 = r2 + nb;
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+        int b = 0;
+        for (; b + 1 < nb; b += 2) {           /* 2 blocks / 512-bit op */
+            __m512i xv = _mm512_loadu_si512((const void *)(qx + (size_t)b * Q4_0_BLOCK_SIZE));
+            __m512i w0 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r0[b].qs)), q4_unpack_block_u8(r0[b + 1].qs), 1);
+            __m512i w1 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r1[b].qs)), q4_unpack_block_u8(r1[b + 1].qs), 1);
+            __m512i w2 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r2[b].qs)), q4_unpack_block_u8(r2[b + 1].qs), 1);
+            __m512i w3 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r3[b].qs)), q4_unpack_block_u8(r3[b + 1].qs), 1);
+            __m512i d0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0, xv);
+            __m512i d1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1, xv);
+            __m512i d2 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w2, xv);
+            __m512i d3 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w3, xv);
+            /* low 256 = block b, high 256 = block b+1; reduce each half. */
+            s0 += r0[b].scale * (q4_hsum256(_mm512_castsi512_si256(d0)) + corr[b])
+                + r0[b + 1].scale * (q4_hsum256(_mm512_extracti64x4_epi64(d0, 1)) + corr[b + 1]);
+            s1 += r1[b].scale * (q4_hsum256(_mm512_castsi512_si256(d1)) + corr[b])
+                + r1[b + 1].scale * (q4_hsum256(_mm512_extracti64x4_epi64(d1, 1)) + corr[b + 1]);
+            s2 += r2[b].scale * (q4_hsum256(_mm512_castsi512_si256(d2)) + corr[b])
+                + r2[b + 1].scale * (q4_hsum256(_mm512_extracti64x4_epi64(d2, 1)) + corr[b + 1]);
+            s3 += r3[b].scale * (q4_hsum256(_mm512_castsi512_si256(d3)) + corr[b])
+                + r3[b + 1].scale * (q4_hsum256(_mm512_extracti64x4_epi64(d3, 1)) + corr[b + 1]);
+        }
+        for (; b < nb; b++) {                  /* odd tail block */
+            __m512i xv = _mm512_zextsi256_si512(
+                _mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+            __m512i xw0 = _mm512_zextsi256_si512(q4_unpack_block_u8(r0[b].qs));
+            __m512i xw1 = _mm512_zextsi256_si512(q4_unpack_block_u8(r1[b].qs));
+            __m512i xw2 = _mm512_zextsi256_si512(q4_unpack_block_u8(r2[b].qs));
+            __m512i xw3 = _mm512_zextsi256_si512(q4_unpack_block_u8(r3[b].qs));
+            s0 += r0[b].scale * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw0, xv)) + corr[b]);
+            s1 += r1[b].scale * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw1, xv)) + corr[b]);
+            s2 += r2[b].scale * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw2, xv)) + corr[b]);
+            s3 += r3[b].scale * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw3, xv)) + corr[b]);
+        }
+        y[o] = s0 * sx; y[o + 1] = s1 * sx; y[o + 2] = s2 * sx; y[o + 3] = s3 * sx;
+    }
+    /* remaining rows via v2 (correct, just not 4-unrolled) */
+    if (o < out_dim)
+        q4_0_matvec_vnni(y + o, qx, sx, W + (size_t)o * nb, cols, out_dim - o);
+}
+
+static int q4_vnni_v3_on(void) {
+    static atomic_int v = -1;
+    int r = atomic_load_explicit(&v, memory_order_relaxed);
+    if (r < 0) { const char *e = getenv("QWEN_Q4_VNNI_V3"); r = !(e && e[0] == '0'); /* default ON */
+                 atomic_store_explicit(&v, r, memory_order_relaxed); }
+    return r;
+}
+
 typedef struct { float *y; const int8_t *qx; float sx; const q4_0_block_t *W; int rows, cols; } q4_0_vnni_ctx;
 static void q4_0_vnni_task(size_t tid, size_t nt, void *vc) {
     q4_0_vnni_ctx *c = (q4_0_vnni_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
-    q4_0_matvec_vnni(c->y + r0, c->qx, c->sx,
-                     c->W + (size_t)r0 * (c->cols / Q4_0_BLOCK_SIZE), c->cols, r1 - r0);
+    const q4_0_block_t *W = c->W + (size_t)r0 * (c->cols / Q4_0_BLOCK_SIZE);
+    if (q4_vnni_v3_on())
+        q4_0_matvec_vnni_v3(c->y + r0, c->qx, c->sx, W, c->cols, r1 - r0);
+    else
+        q4_0_matvec_vnni(c->y + r0, c->qx, c->sx, W, c->cols, r1 - r0);
 }
 #endif
 
@@ -2364,7 +2472,8 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
             qwen_parallel((size_t)nt, q4_0_vnni_task, &c);
             return;
         }
-        q4_0_matvec_vnni(y, qx_buf, sx, W, cols, rows);
+        if (q4_vnni_v3_on()) q4_0_matvec_vnni_v3(y, qx_buf, sx, W, cols, rows);
+        else                 q4_0_matvec_vnni(y, qx_buf, sx, W, cols, rows);
         return;
     }
 #endif
