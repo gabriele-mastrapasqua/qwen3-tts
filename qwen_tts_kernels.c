@@ -56,10 +56,34 @@ void qwen_ftz_on(void) {
 
 /* Threading */
 static int g_n_threads = 1;
+/* OpenBLAS spawns one thread per core by default and knows nothing about our
+ * pool, so `-j4` on a 64-core box meant 4 threads of ours + 64 of theirs, on 64
+ * cores. `perf` on a 4-core Neoverse-N1 put ~21% of wall time in __schedule /
+ * el0_svc / sched_yield: the two pools fighting. Bind BLAS to the budget `-j`
+ * actually asks for.
+ *
+ * Weak symbol: resolved when linked against OpenBLAS, NULL with Accelerate
+ * (which manages its own threads) or a reference BLAS, where this is a no-op.
+ * OPENBLAS_NUM_THREADS in the environment still wins -- OpenBLAS reads it at
+ * init, and a user tuning by hand should not be second-guessed. */
+#if defined(__GNUC__) && !defined(__APPLE__)
+extern void openblas_set_num_threads(int) __attribute__((weak));
+#endif
+
+static void qwen_blas_set_threads(int n) {
+#if defined(__GNUC__) && !defined(__APPLE__)
+    if (getenv("OPENBLAS_NUM_THREADS")) return;   /* explicit user choice wins */
+    if (openblas_set_num_threads) openblas_set_num_threads(n > 0 ? n : 1);
+#else
+    (void)n;
+#endif
+}
+
 void qwen_set_threads(int n) {
     g_n_threads = n > 0 ? n : 1;
     qwen_ftz_on();
     qwen_threadpool_start(g_n_threads);  /* (re)size the off-Mac worker pool */
+    qwen_blas_set_threads(g_n_threads);
 }
 int qwen_get_threads(void) { return g_n_threads; }
 
