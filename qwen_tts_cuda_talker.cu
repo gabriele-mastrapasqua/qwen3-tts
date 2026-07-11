@@ -310,6 +310,10 @@ static inline void mv(int prec, const void *W, const float *scale, const float *
 
 extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c=&ctx->config;
+    /* dp4a scratch MUST be allocated here, before any CUDA-graph capture: cudaMalloc
+     * inside a capturing stream fails (A100 box finding 2026-07-11 — the lazy alloc
+     * in mv() always failed AND perturbed the capture). qdp_enabled() is idempotent. */
+    (void)qdp_enabled();
     cuda_talker_t *s=(cuda_talker_t*)calloc(1,sizeof(*s));
     s->hidden=c->hidden_size; s->n_heads=c->num_heads; s->n_kv=c->num_kv_heads;
     s->head_dim=c->head_dim; s->inter=c->intermediate_size; s->n_layers=c->num_layers;
