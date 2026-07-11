@@ -764,6 +764,136 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
  * - After each step: apply final norm, compute logits via lm_head, sample
  * ======================================================================== */
 
+/* ── CP 2-token prefill (perf item 3, 2026-07-11) ────────────────────────────
+ * Frame positions 0 (projected talker hidden) and 1 (code0 embed) are BOTH known
+ * before the RVQ loop starts — the only legal intra-frame batching the sequential
+ * argmax feedback permits. Run them as ONE B=2 matmat pass per projection so each
+ * 5-layer weight matrix is read from DRAM once instead of twice (−1 of 16 full
+ * weight sweeps ≈ −6% CP traffic). QUANTIZED-CP ONLY (uniform int8 or q4 across
+ * all 5 layers): the bf16 path keeps the sequential steps so the bf16 golden
+ * trajectory (the quality anchor) is untouched. matmat fp-order differs from
+ * matvec → the quantized trajectories fork (same class of intentional fork as
+ * the int8-SDOT argmax). Per-pos attention/rope/norm use the exact kernels the
+ * sequential path uses. Kill-switch: QWEN_CP_PREFILL2=0. */
+static int cp_prefill2_mode(qwen_tts_ctx_t *ctx) {   /* 0=off, 1=int8, 2=q4 (weights+env only) */
+    static __thread int cached = -2;                 /* -2 = unprobed */
+    if (cached != -2) return cached;
+    /* OPT-IN (QWEN_CP_PREFILL2=1). Measured on M1 2026-07-11: perf NEUTRAL (B=2 int8
+     * matmat ≈ 2× SDOT matvec — SDOT-seq is already near-optimal there), so the M1
+     * default keeps the sequential path (no trajectory change). The win case is
+     * x86/VNNI + bandwidth-starved boxes, where matmat_int8 rides the VNNI GEMM —
+     * measure there before flipping the default. Curiosity worth an ear-test: with
+     * pf2 ON the teacher-forced gold-agreement IMPROVES (int8 78.2 -> 82.2% — the
+     * f32-act B=2 matmat is MORE precise than int8-act matvec on pos 0/1). */
+    const char *e = getenv("QWEN_CP_PREFILL2");
+    if (!(e && e[0] == '1')) return cached = 0;
+    int all8 = 1, all4 = 1;
+    for (int l = 0; l < ctx->config.cp_num_layers; l++) {
+        qwen_cp_layer_t *L = &ctx->cp_layers[l];
+        if (L->gate_up_fused_q2 || L->down_q2) { all8 = 0; all4 = 0; break; }
+        if (!(L->wq_int8 && L->wk_int8 && L->wv_int8 && L->wo_int8 &&
+              L->gate_up_fused_int8 && L->down_int8)) all8 = 0;
+        if (!(L->wq_q4 && L->wk_q4 && L->wv_q4 && L->wo_q4 &&
+              L->gate_up_fused_q4 && L->down_q4)) all4 = 0;
+    }
+    return cached = all8 ? 1 : (all4 ? 2 : 0);
+}
+
+static inline void cp_ilv2(float *X2, const float *a, const float *b, int n) {
+    for (int i = 0; i < n; i++) { X2[2 * i] = a[i]; X2[2 * i + 1] = b[i]; }
+}
+static inline void cp_dcol2(float *dst, const float *Y2, int n, int p) {
+    for (int i = 0; i < n; i++) dst[i] = Y2[2 * i + p];
+}
+
+static void cp_prefill2(qwen_tts_ctx_t *ctx, int mode, float *x0, float *x1) {
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h  = c->cp_hidden_size;
+    int qd    = c->cp_num_heads * c->cp_head_dim;
+    int kvd   = c->cp_num_kv_heads * c->cp_head_dim;
+    int inter = c->cp_intermediate_size;
+    float eps = c->rms_norm_eps;
+    float attn_scale = 1.0f / sqrtf((float)c->cp_head_dim);
+
+    /* grow-once per-thread scratch (~190 KB): all the B=2 interleaved views */
+    static __thread float *S = NULL; static __thread size_t S_cap = 0;
+    size_t need = (size_t)(2*cp_h /*X2*/ + 2*qd /*Q2*/ + 2*kvd /*K2*/ + 2*kvd /*V2*/
+                 + qd /*attn0*/ + 2*qd /*A2*/ + 2*cp_h /*P2*/ + 4*inter /*G2*/
+                 + 2*inter /*g0*/ + 2*inter /*GI2*/ + 2*cp_h /*D2*/ + 2*cp_h /*xn0+xn1*/);
+    if (need > S_cap) {
+        float *ns = (float *)realloc(S, need * sizeof(float));
+        if (!ns) return;                       /* OOM: caller keeps prior KV; unreachable in practice */
+        S = ns; S_cap = need;
+    }
+    float *X2 = S,            *Q2 = X2 + 2*cp_h, *K2 = Q2 + 2*qd,  *V2 = K2 + 2*kvd;
+    float *attn0 = V2 + 2*kvd, *A2 = attn0 + qd, *P2 = A2 + 2*qd,  *G2 = P2 + 2*cp_h;
+    float *g0 = G2 + 4*inter,  *GI2 = g0 + 2*inter, *D2 = GI2 + 2*inter;
+    float *xn0 = D2 + 2*cp_h,  *xn1 = xn0 + cp_h;
+
+#define CP_MM2(Y, W8, S8, W4, ROWS, COLS) do {                                   \
+        if (mode == 1) qwen_matmat_int8((Y), (W8), (S8), X2loc, (ROWS), (COLS), 2); \
+        else           qwen_matmat_q4_0((Y), (W4), X2loc, (ROWS), (COLS), 2);       \
+    } while (0)
+
+    float *xs[2] = { x0, x1 };
+    for (int layer = 0; layer < c->cp_num_layers; layer++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[layer];
+
+        qwen_rms_norm(xn0, x0, l->input_norm, 1, cp_h, eps);
+        qwen_rms_norm(xn1, x1, l->input_norm, 1, cp_h, eps);
+        cp_ilv2(X2, xn0, xn1, cp_h);
+        { const float *X2loc = X2;
+          CP_MM2(Q2, l->wq_int8, l->wq_scale, l->wq_q4, qd,  cp_h);
+          CP_MM2(K2, l->wk_int8, l->wk_scale, l->wk_q4, kvd, cp_h);
+          CP_MM2(V2, l->wv_int8, l->wv_scale, l->wv_q4, kvd, cp_h); }
+
+        for (int p = 0; p < 2; p++) {
+            float *q = ctx->cp_dec_q, *k = ctx->cp_dec_k, *v = ctx->cp_dec_v;
+            cp_dcol2(q, Q2, qd, p); cp_dcol2(k, K2, kvd, p); cp_dcol2(v, V2, kvd, p);
+            qwen_rms_norm_per_head(q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
+            qwen_rms_norm_per_head(k, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
+            apply_rope_neox(q, c->cp_num_heads, c->cp_head_dim, ctx->cp_rope_cos, ctx->cp_rope_sin, p);
+            apply_rope_neox(k, c->cp_num_kv_heads, c->cp_head_dim, ctx->cp_rope_cos, ctx->cp_rope_sin, p);
+            int64_t kv_off = (int64_t)layer * ctx->cp_kv_max * kvd + (int64_t)p * kvd;
+            f32_to_bf16_vec(ctx->cp_kv_k + kv_off, k, kvd);
+            f32_to_bf16_vec(ctx->cp_kv_v + kv_off, v, kvd);
+            uint16_t *layer_k = ctx->cp_kv_k + (int64_t)layer * ctx->cp_kv_max * kvd;
+            uint16_t *layer_v = ctx->cp_kv_v + (int64_t)layer * ctx->cp_kv_max * kvd;
+            qwen_causal_attention_bf16kv(p == 0 ? attn0 : ctx->cp_dec_attn_out, q,
+                                         layer_k, layer_v, 1, p + 1,
+                                         c->cp_num_heads, c->cp_num_kv_heads,
+                                         c->cp_head_dim, attn_scale, p);
+        }
+
+        cp_ilv2(A2, attn0, ctx->cp_dec_attn_out, qd);
+        { const float *X2loc = A2;
+          CP_MM2(P2, l->wo_int8, l->wo_scale, l->wo_q4, cp_h, qd); }
+        for (int p = 0; p < 2; p++) {
+            float *x = xs[p];
+            for (int i = 0; i < cp_h; i++) x[i] += P2[2 * i + p];
+        }
+
+        qwen_rms_norm(xn0, x0, l->post_attn_norm, 1, cp_h, eps);
+        qwen_rms_norm(xn1, x1, l->post_attn_norm, 1, cp_h, eps);
+        cp_ilv2(X2, xn0, xn1, cp_h);
+        { const float *X2loc = X2;
+          CP_MM2(G2, l->gate_up_fused_int8, l->gate_up_fused_scale, l->gate_up_fused_q4,
+                 2 * inter, cp_h); }
+        cp_dcol2(g0, G2, 2 * inter, 0);
+        cp_dcol2(ctx->cp_dec_gate, G2, 2 * inter, 1);
+        qwen_swiglu_inplace(g0, ctx->swiglu_tmp, inter);
+        qwen_swiglu_inplace(ctx->cp_dec_gate, ctx->swiglu_tmp, inter);
+        cp_ilv2(GI2, g0, ctx->cp_dec_gate, inter);
+        { const float *X2loc = GI2;
+          CP_MM2(D2, l->down_int8, l->down_scale, l->down_q4, cp_h, inter); }
+        for (int p = 0; p < 2; p++) {
+            float *x = xs[p];
+            for (int i = 0; i < cp_h; i++) x[i] += D2[2 * i + p];
+        }
+    }
+#undef CP_MM2
+}
+
 /* Apply small_to_mtp_projection: projects from emb_dim to cp_hidden.
  * If no projection needed (0.6B), just copies the first cp_h elements.
  * src has dim=emb_dim, dst has dim=cp_h. */
@@ -819,23 +949,37 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     /* Step 0: process talker hidden state (project if needed) */
     cp_mtp_project(ctx, cp_x, talker_hidden);
 
-    CPB_MARK(CPB_EMBED);
-    cp_transformer_step(ctx, cp_x, x_norm, 0);
-
-    /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's).
-     * Vectorized bf16→f32 conversion, then project to cp_hidden. */
+    /* Step-1 input (code0 embed via TALKER's codec embedding, NOT CP's) is known
+     * NOW too — compute it up front so positions 0+1 can prefill together. */
+    static __thread float *x1in = NULL;
+    if (!x1in) { x1in = (float *)malloc((size_t)cp_h * sizeof(float)); if (!x1in) return -1; }
     {
         int h = c->hidden_size;
         if (ctx->codec_embedding_bf16 && code0 >= 0 && code0 < c->codec_vocab_size) {
             float emb_buf[4096];
             qwen_bf16_to_f32_vec(emb_buf, ctx->codec_embedding_bf16 + (int64_t)code0 * h, h);
-            cp_mtp_project(ctx, cp_x, emb_buf);
+            cp_mtp_project(ctx, x1in, emb_buf);
         } else {
-            memset(cp_x, 0, cp_h * sizeof(float));
+            memset(x1in, 0, cp_h * sizeof(float));
         }
     }
     CPB_MARK(CPB_EMBED);
-    cp_transformer_step(ctx, cp_x, x_norm, 1);
+
+    /* Fused 2-token prefill (quantized CP only; see cp_prefill2). Roughness blends
+     * per-step → sequential path. CP_MICROBENCH keeps the per-step marks meaningful. */
+    int pf2 = 0;
+#ifndef CP_MICROBENCH
+    if (ctx->cp_roughness <= 0.0f) pf2 = cp_prefill2_mode(ctx);
+#endif
+    if (pf2) {
+        cp_prefill2(ctx, pf2, cp_x, x1in);
+        memcpy(cp_x, x1in, (size_t)cp_h * sizeof(float));   /* continue on pos-1's stream */
+    } else {
+        cp_transformer_step(ctx, cp_x, x_norm, 0);
+        memcpy(cp_x, x1in, (size_t)cp_h * sizeof(float));
+        CPB_MARK(CPB_EMBED);
+        cp_transformer_step(ctx, cp_x, x_norm, 1);
+    }
 
     /* Predict codebook 1: fused argmax+matvec (greedy — avoids writing 2048 logits) */
     qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
