@@ -77,6 +77,62 @@ __global__ void k_matvec_q4_0(const q4blk *W, const float *x, float *y, int rows
     if (lane == 0) y[row] = s;
 }
 
+/* ── dp4a q4×q8 twin (rental-prep 2026-07-11, OPT-IN QWEN_CUDA_DP4A=1) ─────────
+ * The gpu-accel-status "⏳ dp4a q4→q8_1" item: quantize the activation once per
+ * matvec into per-32-block int8 (DEINTERLEAVED even/odd to match q4_0's within-
+ * byte packing) + per-block scale/sum, then integer __dp4a dots with the -8
+ * offset corrected via the block sum. NOTE qs sits at byte offset 2 of the
+ * 18-byte block → words are built from BYTE loads (no misaligned uint32 reads).
+ * ⚠ COMPILE-UNTESTED here (no nvcc on the M1 dev box) — default-off so the
+ * proven f32-act kernel above stays the path; first build/validate on the
+ * rented NVIDIA box (--gpu-selftest), then A/B with the env flag. */
+__global__ void k_quant_act_q4dp(const float *x, int nb, signed char *qe, signed char *qo,
+                                 float *sxb, int *sumb) {
+    int b = blockIdx.x*blockDim.x + threadIdx.x; if (b >= nb) return;
+    const float *xb = x + (size_t)b*32;
+    float amax = 0.f;
+    for (int i = 0; i < 32; i++) { float a = fabsf(xb[i]); if (a > amax) amax = a; }
+    float sc  = amax > 0.f ? amax/127.f : 0.f;
+    float inv = amax > 0.f ? 127.f/amax : 0.f;
+    int sum = 0;
+    for (int i = 0; i < 16; i++) {
+        int e = (int)lrintf(xb[2*i]   * inv);
+        int o = (int)lrintf(xb[2*i+1] * inv);
+        e = max(-128, min(127, e)); o = max(-128, min(127, o));
+        qe[(size_t)b*16 + i] = (signed char)e;
+        qo[(size_t)b*16 + i] = (signed char)o;
+        sum += e + o;
+    }
+    sxb[b] = sc; sumb[b] = sum;
+}
+__global__ void k_matvec_q4_0_dp4a(const q4blk *W, const signed char *qe, const signed char *qo,
+                                   const float *sxb, const int *sumb,
+                                   float *y, int rows, int cols) {
+    int row = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    int nb = cols >> 5;
+    const q4blk *wr = W + (size_t)row * nb;
+    float s = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        const unsigned char *qs = wr[b].qs;
+        const int *ie = (const int *)(qe + (size_t)b*16);
+        const int *io = (const int *)(qo + (size_t)b*16);
+        int t = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            unsigned int w = (unsigned int)qs[4*j] | ((unsigned int)qs[4*j+1] << 8)
+                           | ((unsigned int)qs[4*j+2] << 16) | ((unsigned int)qs[4*j+3] << 24);
+            t = __dp4a((int)(w & 0x0F0F0F0Fu),        ie[j], t);   /* even weights (lo nibbles) */
+            t = __dp4a((int)((w >> 4) & 0x0F0F0F0Fu), io[j], t);   /* odd weights (hi nibbles) */
+        }
+        s += __half2float(wr[b].scale) * sxb[b] * (float)(t - 8*sumb[b]);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (lane == 0) y[row] = s;
+}
+
 /* Same, int8 weight (1 byte) × f32 activation, per-row scale. Warp-per-row. */
 __global__ void k_matvec_int8(const int8_t *W, const float *scale, const float *x, float *y, int rows, int cols) {
     int row = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
@@ -206,14 +262,42 @@ static float *up_f32(const float *w, size_t n) {
     float *d=NULL; CK(cudaMalloc(&d,n*sizeof(float)));
     CK(cudaMemcpy(d,w,n*sizeof(float),cudaMemcpyHostToDevice)); return d;
 }
-static void *up_q4(const void *w, size_t nblocks) {   /* q4_0 blocks (20 bytes each), raw */
+static void *up_q4(const void *w, size_t nblocks) {   /* q4_0 blocks (18 bytes each: fp16 scale), raw */
     void *d=NULL; size_t bytes=nblocks*sizeof(q4blk);
     CK(cudaMalloc(&d,bytes)); CK(cudaMemcpy(d,w,bytes,cudaMemcpyHostToDevice)); return d;
+}
+/* dp4a activation scratch (opt-in path; lazily allocated once, sized to the max col dim). */
+enum { QDP_MAX_COLS = 16384 };
+static signed char *g_qdp_qe = NULL, *g_qdp_qo = NULL;
+static float *g_qdp_sx = NULL; static int *g_qdp_sum = NULL;
+static int qdp_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("QWEN_CUDA_DP4A");
+        on = (e && e[0]=='1');
+        if (on) {
+            if (cudaMalloc(&g_qdp_qe,  QDP_MAX_COLS/2) != cudaSuccess ||
+                cudaMalloc(&g_qdp_qo,  QDP_MAX_COLS/2) != cudaSuccess ||
+                cudaMalloc(&g_qdp_sx,  (QDP_MAX_COLS/32)*sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&g_qdp_sum, (QDP_MAX_COLS/32)*sizeof(int))   != cudaSuccess) {
+                fprintf(stderr, "[cuda] dp4a scratch alloc failed — falling back to f32-act q4 kernel\n");
+                on = 0;
+            } else {
+                fprintf(stderr, "[cuda] q4_0 matvec: dp4a q4xq8 path ENABLED (QWEN_CUDA_DP4A=1, experimental)\n");
+            }
+        }
+    }
+    return on;
 }
 /* dispatch by precision (0=bf16, 1=int8, 2=q4_0). Warp-per-row: one warp per output row. */
 static inline void mv(int prec, const void *W, const float *scale, const float *dX, float *dY, int rows, int cols) {
     int grid = CEIL(rows*32, TPB);
-    if (prec==2)      k_matvec_q4_0<<<grid,TPB>>>((const q4blk*)W, dX, dY, rows, cols);
+    if (prec==2 && cols <= QDP_MAX_COLS && qdp_enabled()) {
+        int nb = cols >> 5;
+        k_quant_act_q4dp<<<CEIL(nb,128),128>>>(dX, nb, g_qdp_qe, g_qdp_qo, g_qdp_sx, g_qdp_sum);
+        k_matvec_q4_0_dp4a<<<grid,TPB>>>((const q4blk*)W, g_qdp_qe, g_qdp_qo, g_qdp_sx, g_qdp_sum, dY, rows, cols);
+    }
+    else if (prec==2) k_matvec_q4_0<<<grid,TPB>>>((const q4blk*)W, dX, dY, rows, cols);
     else if (prec==1) k_matvec_int8<<<grid,TPB>>>((const int8_t*)W, scale, dX, dY, rows, cols);
     else              k_matvec_bf16<<<grid,TPB>>>((const __nv_bfloat16*)W, dX, dY, rows, cols);
 }

@@ -1567,7 +1567,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
          * oversubscription wins, because our pool has serial stretches in which
          * the cores must be free to go to the decoder. */
         int nt = qwen_get_threads();
-        qwen_blas_set_threads(nt > 1 ? nt - 1 : 1);
+        /* rental-prep (pr17 §5.5): the per-mode OPENBLAS optimum on N1 differs (file=2,
+         * stream=3 at 4 vCPU) — QWEN_BLAS_GEN_THREADS overrides the generation-phase
+         * default so the box can sweep it without rebuilds. No-op on Accelerate. */
+        int gen_blas = nt > 1 ? nt - 1 : 1;
+        { const char *e = getenv("QWEN_BLAS_GEN_THREADS");
+          if (e && atoi(e) > 0) gen_blas = atoi(e); }
+        qwen_blas_set_threads(gen_blas);
     }
 
     for (int frame = 0; frame < max_frames; frame++) {
