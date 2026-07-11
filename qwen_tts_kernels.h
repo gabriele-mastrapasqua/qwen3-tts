@@ -154,12 +154,60 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 void qwen_quantize_bf16_to_int8(const uint16_t *src_bf16, int rows, int cols,
                                  int8_t *dst_int8, float *dst_scale);
 
-/* Q4_0 block: 32 weights packed into 18 bytes (16 nibble-pairs + fp32 scale) */
+/* fp16 (IEEE binary16) <-> f32 for the q4_0 block scale. Storage-only: all math
+ * stays f32 — one convert per 32-weight block on kernels that are bandwidth-bound,
+ * so the cost is noise while the block shrinks 20 -> 18 bytes (-10% q4 traffic;
+ * perf item 2, 2026-07-11 — same layout as llama.cpp q4_0). aarch64 uses the
+ * native __fp16; elsewhere a portable bit-exact fallback (handles subnormals). */
+static inline float qwen_f16_to_f32(uint16_t h) {
+#if defined(__aarch64__)
+    __fp16 v; memcpy(&v, &h, sizeof(v)); return (float)v;
+#else
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t em   = h & 0x7FFF;
+    uint32_t bits;
+    if (em >= 0x7C00)      bits = sign | 0x7F800000u | ((em & 0x03FF) << 13); /* inf/NaN */
+    else if (em >= 0x0400) bits = sign | ((em + ((127u - 15u) << 10)) << 13); /* normal */
+    else if (em == 0)      bits = sign;                                        /* +-0 */
+    else {                                                                     /* subnormal */
+        int shift = 0; uint32_t m = em;
+        while (!(m & 0x0400)) { m <<= 1; shift++; }
+        bits = sign | ((uint32_t)(127 - 15 - shift) << 23) | ((m & 0x03FF) << 13);
+    }
+    float f; memcpy(&f, &bits, sizeof(f)); return f;
+#endif
+}
+static inline uint16_t qwen_f32_to_f16(float f) {
+#if defined(__aarch64__)
+    __fp16 v = (__fp16)f; uint16_t h; memcpy(&h, &v, sizeof(h)); return h;
+#else
+    uint32_t bits; memcpy(&bits, &f, sizeof(bits));
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t  e    = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t m    = bits & 0x007FFFFF;
+    if (e >= 0x1F) return (uint16_t)(sign | 0x7C00);       /* overflow -> inf */
+    if (e <= 0) {                                          /* subnormal / zero */
+        if (e < -10) return (uint16_t)sign;
+        m |= 0x00800000;
+        uint32_t shift = (uint32_t)(14 - e);
+        uint16_t sub = (uint16_t)(m >> shift);
+        if ((m >> (shift - 1)) & 1) sub++;                 /* round-to-nearest */
+        return (uint16_t)(sign | sub);
+    }
+    uint16_t out = (uint16_t)(sign | ((uint32_t)e << 10) | (m >> 13));
+    if (m & 0x1000) out++;                                 /* round-to-nearest (carry into exp is fine) */
+    return out;
+#endif
+}
+
+/* Q4_0 block: 32 weights packed into 18 bytes (16 nibble-pairs + fp16 scale).
+ * The fp16 scale (was f32, 20 B/block) cuts q4 weight traffic 10% — the block is
+ * pure bandwidth on the 16x-reread CP. Read with qwen_f16_to_f32(). */
 #define Q4_0_BLOCK_SIZE 32
 typedef struct {
-    float scale;           /* per-block scale factor */
+    uint16_t scale_f16;    /* per-block scale factor, IEEE fp16 bits */
     uint8_t qs[16];        /* 32 nibbles: low 4 bits = even idx, high 4 bits = odd idx */
-} q4_0_block_t;            /* 20 bytes per 32 weights */
+} q4_0_block_t;            /* 18 bytes per 32 weights */
 
 /* Quantize bf16 weight matrix to Q4_0 blocks.
  * cols must be a multiple of 32. Returns number of blocks per row = cols/32.

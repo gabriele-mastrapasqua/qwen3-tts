@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>   /* __half q4blk scale (matches q4_0_block_t fp16 layout) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -54,9 +55,9 @@ __global__ void k_matvec_bf16(const __nv_bfloat16 *W, const float *x, float *y, 
     if (lane == 0) y[row] = s;
 }
 
-/* q4_0 block: 32 weights = fp32 scale + 16 bytes (low nibble=even idx, high=odd), val=(nib-8)*scale.
- * MUST match qwen_tts_kernels.h q4_0_block_t exactly. */
-typedef struct { float scale; unsigned char qs[16]; } q4blk;
+/* q4_0 block: 32 weights = fp16 scale + 16 bytes (low nibble=even idx, high=odd), val=(nib-8)*scale.
+ * MUST match qwen_tts_kernels.h q4_0_block_t exactly (fp16 scale, 18 B/block since perf item 2). */
+typedef struct { __half scale; unsigned char qs[16]; } q4blk;
 /* warp-per-row q4_0 matvec: int4 weight (0.5 byte) × f32 activation. Half the bytes of int8. */
 __global__ void k_matvec_q4_0(const q4blk *W, const float *x, float *y, int rows, int cols) {
     int row = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
@@ -69,7 +70,7 @@ __global__ void k_matvec_q4_0(const q4blk *W, const float *x, float *y, int rows
         const q4blk *b = wr + (c>>5); int ic = c & 31;
         unsigned char byte = b->qs[ic>>1];
         int nib = (ic&1) ? (byte>>4) : (byte&0x0F);
-        s += (float)(nib-8) * b->scale * x[c];
+        s += (float)(nib-8) * __half2float(b->scale) * x[c];
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
@@ -380,7 +381,7 @@ __global__ void k_matmat_q4_0(const q4blk *W,const float *X,float *Y,int rows,in
     for(int b=0;b<QB_MAX;++b) s[b]=0.f;
     for(int c=lane;c<cols;c+=32){ const q4blk *bk=wr+(c>>5); int ic=c&31;
         unsigned char byte=bk->qs[ic>>1]; int nib=(ic&1)?(byte>>4):(byte&0x0F);
-        float w=(float)(nib-8)*bk->scale;
+        float w=(float)(nib-8)*__half2float(bk->scale);
         for(int b=0;b<B;++b) s[b]+=w*X[(size_t)b*cols+c]; }
     for(int b=0;b<B;++b){ float v=s[b];
         #pragma unroll

@@ -454,7 +454,9 @@ test-emotion: $(TARGET)
 # --icl-only clone graft. 2 short renders (seed 42 = stable; some seeds glitch). Asserts the
 # pack loads (N tensors applied) + non-empty audio. The .expr packs are local-only (large),
 # so SKIP cleanly when absent instead of failing a fresh checkout. Pack override: EXPR_FT=...
-EXPR_FT ?= presets/expr/italian_csp.expr
+# The shipped WIN pack (was italian_csp.expr — stale name, the test silently SKIPped;
+# caught 2026-07-11 auditing a "too fast" test-all).
+EXPR_FT ?= presets/expr/italian_csp_topk6.expr
 EMO_FT_INSTR = Speak with warm, bright happiness, smiling through the words.
 EMO_FT_TEXT  = Che bella notizia, sono davvero felicissimo oggi!
 test-emotion-ft: $(TARGET)

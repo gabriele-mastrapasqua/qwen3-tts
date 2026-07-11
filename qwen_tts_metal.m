@@ -28,7 +28,9 @@ static const char *QWEN_METAL_SRC =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "inline float bf16_to_f32(ushort b) { return as_type<float>(uint(b) << 16); }\n"
-"struct q4blk { float scale; uchar qs[16]; };\n"
+/* MUST match qwen_tts_kernels.h q4_0_block_t exactly (fp16 scale, 18 B/block since
+ * perf item 2). MSL `half` is IEEE binary16; reads auto-convert to float in exprs. */
+"struct q4blk { half scale; uchar qs[16]; };\n"
 "\n"
 /* simdgroup matvec: one output row per simdgroup; 32 lanes stride the cols with
  * coalesced weight reads, then simd_sum reduces (the ggml-metal mmv pattern). */
