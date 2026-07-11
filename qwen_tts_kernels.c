@@ -1990,47 +1990,26 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
     qwen_matvec_int8(v, Wv, sv, x, kv_dim, in_dim);
 }
 
+/* Argmax over an INT8 matvec (CP lm_head with --int8 / quant-mixed; runs 15×/frame).
+ * Reuses the optimized (multi-threaded, SDOT/VNNI) int8 matvec into a per-thread
+ * scratch, then argmaxes — mirrors qwen_argmax_matvec_q4_0 below. The old body was
+ * the only hot int8 kernel still doing single-threaded widen-to-f32 FMA (audit
+ * 2026-07-11, perf item 4). __thread keeps the scratch race-free under concurrent
+ * server synthesis (mirrors sampling.c's buffers). */
 int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
                             int in_dim, int out_dim) {
-    qwen_ftz_on();
-    int best = 0;
-    float best_val = -1e30f;
-    for (int o = 0; o < out_dim; o++) {
-        const int8_t *row = W + (size_t)o * in_dim;
-        float sum = 0.0f;
-#ifdef __ARM_NEON
-        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
-        int k = 0;
-        for (; k + 7 < in_dim; k += 8) {
-            int8x8_t r = vld1_s8(row + k);
-            int16x8_t r16 = vmovl_s8(r);
-            a0 = vfmaq_f32(a0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(r16))),
-                           vld1q_f32(x + k));
-            a1 = vfmaq_f32(a1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(r16))),
-                           vld1q_f32(x + k + 4));
-        }
-        sum = vaddvq_f32(vaddq_f32(a0, a1));
-        for (; k < in_dim; k++) sum += (float)row[k] * x[k];
-#elif defined(__AVX2__)
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(),
-               a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-        int k = 0;
-        for (; k + 32 <= in_dim; k += 32) {
-            a0 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k),      _mm256_loadu_ps(x + k),      a0);
-            a1 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k + 8),  _mm256_loadu_ps(x + k + 8),  a1);
-            a2 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k + 16), _mm256_loadu_ps(x + k + 16), a2);
-            a3 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k + 24), _mm256_loadu_ps(x + k + 24), a3);
-        }
-        for (; k + 8 <= in_dim; k += 8)
-            a0 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k), _mm256_loadu_ps(x + k), a0);
-        sum = qwen_hsum256_ps(_mm256_add_ps(_mm256_add_ps(a0, a2), _mm256_add_ps(a1, a3)));
-        for (; k < in_dim; k++) sum += (float)row[k] * x[k];
-#else
-        for (int k = 0; k < in_dim; k++) sum += (float)row[k] * x[k];
-#endif
-        sum *= scale[o];
-        if (sum > best_val) { best_val = sum; best = o; }
+    static __thread float *y = NULL;
+    static __thread int y_cap = 0;
+    if (out_dim > y_cap) {
+        float *ny = (float *)realloc(y, (size_t)out_dim * sizeof(float));
+        if (!ny) return 0;
+        y = ny; y_cap = out_dim;
     }
+    qwen_matvec_int8(y, W, scale, x, out_dim, in_dim);
+    int best = 0;
+    float best_val = y[0];
+    for (int o = 1; o < out_dim; o++)
+        if (y[o] > best_val) { best_val = y[o]; best = o; }
     return best;
 }
 

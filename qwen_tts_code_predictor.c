@@ -461,6 +461,17 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
             ctx->cp_mtp_proj_bias = NULL;
         }
         ctx->cp_emb_dim = talker_h;  /* CP embeddings have talker_hidden dim */
+        /* perf item 5 (2026-07-11): when the CP is quantized, this projection was the
+         * one weight left permanently bf16 — [cp_h × talker_h] ≈ 4 MB re-read 16×/frame
+         * (~64 MB/frame of unquantized traffic on 1.7B). Build an int8 twin (int8 even
+         * under --int4: the projection feeds the whole CP residual stream, int8 is the
+         * near-lossless pick). The bf16 pointer stays valid (mmap) for the GPU paths. */
+        if ((ctx->use_int8 || ctx->use_int4) && ctx->cp_mtp_proj_bf16) {
+            cp_qz(&ctx->cp_mtp_proj_int8, &ctx->cp_mtp_proj_scale,
+                  ctx->cp_mtp_proj_bf16, cp_h, talker_h);
+            if (!ctx->silent)
+                fprintf(stderr, "  MTP projection quantized to INT8 (%d x %d)\n", cp_h, talker_h);
+        }
         if (!ctx->silent)
             fprintf(stderr, "  MTP projection: %d -> %d\n", talker_h, cp_h);
     } else {
@@ -759,9 +770,14 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
 static void cp_mtp_project(qwen_tts_ctx_t *ctx, float *dst, const float *src) {
     int cp_h = ctx->config.cp_hidden_size;
     if (ctx->cp_mtp_proj_bf16) {
-        /* Linear: dst = W @ src + bias, W is [cp_h, emb_dim] in bf16 */
+        /* Linear: dst = W @ src + bias, W is [cp_h, emb_dim]. Prefer the int8 twin
+         * when the CP is quantized (perf item 5: ¼ the bytes of the 16×-reread bf16). */
         int emb_dim = ctx->cp_emb_dim;
-        matvec_bf16(dst, ctx->cp_mtp_proj_bf16, src, cp_h, emb_dim);
+        if (ctx->cp_mtp_proj_int8)
+            qwen_matvec_int8(dst, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale,
+                             src, cp_h, emb_dim);
+        else
+            matvec_bf16(dst, ctx->cp_mtp_proj_bf16, src, cp_h, emb_dim);
         if (ctx->cp_mtp_proj_bias) {
             for (int i = 0; i < cp_h; i++) dst[i] += ctx->cp_mtp_proj_bias[i];
         }

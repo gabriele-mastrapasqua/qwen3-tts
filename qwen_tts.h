@@ -489,6 +489,9 @@ typedef struct qwen_tts_ctx {
     int cp_emb_dim;                   /* embedding dim: talker_hidden for 1.7B, cp_hidden for 0.6B */
     uint16_t *cp_mtp_proj_bf16;       /* [cp_hidden, talker_hidden] or NULL if same size */
     float *cp_mtp_proj_bias;          /* [cp_hidden] or NULL */
+    int8_t *cp_mtp_proj_int8;         /* int8 twin (built when CP is quantized): the bf16 4MB was
+                                       * re-read 16×/frame on an otherwise fully-quantized CP */
+    float *cp_mtp_proj_scale;         /* [cp_hidden] per-row scales for the int8 twin */
     
     /* Speech decoder */
     qwen_speech_decoder_t speech_dec;
