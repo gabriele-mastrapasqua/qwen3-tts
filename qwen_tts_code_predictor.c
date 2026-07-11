@@ -778,15 +778,17 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
 static int cp_prefill2_mode(qwen_tts_ctx_t *ctx) {   /* 0=off, 1=int8, 2=q4 (weights+env only) */
     static __thread int cached = -2;                 /* -2 = unprobed */
     if (cached != -2) return cached;
-    /* OPT-IN (QWEN_CP_PREFILL2=1). Measured on M1 2026-07-11: perf NEUTRAL (B=2 int8
-     * matmat ≈ 2× SDOT matvec — SDOT-seq is already near-optimal there), so the M1
-     * default keeps the sequential path (no trajectory change). The win case is
-     * x86/VNNI + bandwidth-starved boxes, where matmat_int8 rides the VNNI GEMM —
-     * measure there before flipping the default. Curiosity worth an ear-test: with
-     * pf2 ON the teacher-forced gold-agreement IMPROVES (int8 78.2 -> 82.2% — the
-     * f32-act B=2 matmat is MORE precise than int8-act matvec on pos 0/1). */
+    /* DEFAULT: ON under AVX-512/VNNI (EPYC Turin measured 2026-07-11: CP −6-8% ms/f,
+     * RTF −3% — the B=2 matmat rides the VNNI GEMM; QWEN_CP_PREFILL2=0 opts out).
+     * OFF elsewhere (M1 measured NEUTRAL — SDOT-seq is already near-optimal;
+     * QWEN_CP_PREFILL2=1 opts in). Bonus with pf2 ON: teacher-forced gold-agreement
+     * IMPROVES (int8 78.2 -> 82.2% — f32-act matmat is MORE precise on pos 0/1). */
     const char *e = getenv("QWEN_CP_PREFILL2");
+#if defined(__AVX512VNNI__)
+    if (e && e[0] == '0') return cached = 0;
+#else
     if (!(e && e[0] == '1')) return cached = 0;
+#endif
     int all8 = 1, all4 = 1;
     for (int l = 0; l < ctx->config.cp_num_layers; l++) {
         qwen_cp_layer_t *L = &ctx->cp_layers[l];

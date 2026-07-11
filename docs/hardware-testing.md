@@ -294,8 +294,9 @@ comparable.
 - **1.7B config note: pure `--int8` (1.22) beats `--quant-mixed` (1.30) on x86** — the int4 Talker is
   SLOWER than int8 on VNNI (43.2 vs 35.5 ms/f). quant-mixed is an Apple-silicon (M1) config;
   **on x86 use `--int8`**.
-- **`QWEN_CP_PREFILL2=1` is a measured x86 WIN**: CP 49.6/50.7 → **46.8/46.6 ms/f (−6-8%)**, RTF −3%
-  (the B=2 matmat rides the VNNI GEMM; on M1 the same lever is neutral — SDOT-seq is already optimal).
+- **CP 2-token prefill is a measured x86 WIN**: CP 49.6/50.7 → **46.8/46.6 ms/f (−6-8%)**, RTF −3%
+  (the B=2 matmat rides the VNNI GEMM) — **now DEFAULT-ON under AVX-512/VNNI builds**
+  (`QWEN_CP_PREFILL2=0` opts out; on M1/non-VNNI it stays off — measured neutral there).
 - **`QWEN_BLAS_GEN_THREADS` sweep (4 vCPU)**: optimum = **1** (RTF 0.95 vs 0.99 at the nt−1 default of
   3; =4 catastrophic 1.46, oversubscription). Per-box knob — sweep it on every new box (N1 file-mode
   optimum was 2).
@@ -326,7 +327,8 @@ Build: plain `make blas` (Linux ARM uses `-march=native` → i8mm/bf16 auto-enab
 | matmat-bench (B=8) | **per-box heterogeneity vs Graviton**: q4-SMMLA **1.50-1.84× WIN** · int8-SMMLA 0.61-0.91× (loses — M4's SDOT matvec + bandwidth too strong) · BFMMLA 0.72-0.91× (loses — transpose overhead doesn't pay on bandwidth-rich cores) → per-platform gating is a real question for the merge |
 | CPU single-stream | 0.6B int8 **0.44** · **int4 0.32** ⚡ · 1.7B quant-mixed **0.57** — the M4 CPU alone nearly matches the A100 GPU numbers |
 | **Metal** | 0.6B int8 0.38 · **int4 0.28 — new all-device record** (M2 Pro was 0.39) · 1.7B int4 **0.41** (M2 Pro: 0.50). **int4 > int8 on M4 Metal even with the SCALAR q4 shader** — the M4 GPU reversed the M2-era ordering by itself |
-| q4-vec shader verdict | `QWEN_METAL_Q4_VEC=1` = **NEUTRAL on M4** (0.28 vs 0.28) and a regression on M1 → the vectorized twin is NOT the win anywhere tested; keep opt-in or drop at merge |
+| q4-vec shader verdict | `QWEN_METAL_Q4_VEC=1` = **NEUTRAL on M4** (0.28 vs 0.28) and a regression on M1 → stays **opt-in** (re-evaluate on M4 Pro / M5) |
+| merge defaults applied | int8-SMMLA + BFMMLA **default OFF on Apple** (`QWEN_APPLE_MMLA=1` re-enables, for M4 Pro/M5 re-eval); q4-SMMLA stays ON everywhere (wins on both Apple and Graviton) |
 
 **⭐ Full RTF+TTFA — Neoverse-N1 (Ampere Altra Max, 4 vCPU, `-j4`, 2026-07-10, post-PR#17, min of 3):**
 

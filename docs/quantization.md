@@ -62,7 +62,7 @@ reducing memory usage and (for INT8) improving speed.
 | **x86 AVX-512/VNNI** (Zen4+, Ice Lake+) | **`--int8`** — for 1.7B too | EPYC Turin: int8 0.96 vs int4 1.05; **1.7B pure int8 1.22 beats quant-mixed 1.30** (quant-mixed is an Apple-silicon config). Build with `make blas SIMD=avx512vnni` |
 | **x86 AVX2-only** (Zen3, small L3) | `--int4` multi-threaded | memory-starved: fewer weight bytes wins (Ryzen 6800H 3.9→2.02) |
 | **ARM server** (Graviton3+, i8mm) | `--int8` single-stream; int8/int4 batched | 0.6B int8 **0.66**, 1.7B int8 **0.95** (sub-RT); batched matmats ride SMMLA (int8 2.1×, int4 1.6×) |
-| **NVIDIA CUDA** | `--quant-mixed` (+ `QWEN_CUDA_DP4A=1`) | A100: 0.50 with dp4a (Talker −33% ms/f) — see [cuda-performance.md](cuda-performance.md) |
+| **NVIDIA CUDA** | `--quant-mixed` (dp4a on by default) | A100: 0.50 (Talker −33% ms/f vs the f32-act kernel) — see [cuda-performance.md](cuda-performance.md) |
 
 ## Testing
 

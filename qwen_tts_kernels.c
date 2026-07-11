@@ -147,12 +147,20 @@ void qwen_caps_report(void *out) {
     fprintf(f, "  rms/bf16-conv:    scalar\n");
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+# if defined(__APPLE__)
+    fprintf(f, "  arm bf16 matmul:  BFMMLA compiled, default OFF on Apple (M4-measured loss on bandwidth-rich cores; QWEN_APPLE_MMLA=1 re-enables)\n");
+# else
     fprintf(f, "  arm bf16 matmul:  BFMMLA ACTIVE (native bf16 GEMM batched matmat; QWEN_NO_BFMMLA=1 disables)\n");
+# endif
 #elif defined(__ARM_FEATURE_BF16)
     fprintf(f, "  arm bf16 matmul:  bfdot available (BFMMLA twin needs +bf16 vector arithmetic)\n");
 #endif
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+# if defined(__APPLE__)
+    fprintf(f, "  arm i8mm:         q4-SMMLA ACTIVE; int8-SMMLA default OFF on Apple (M4-measured loss; QWEN_APPLE_MMLA=1 re-enables)\n");
+# else
     fprintf(f, "  arm i8mm:         SMMLA ACTIVE (native int8 GEMM batched matmat; QWEN_NO_SMMLA=1 disables)\n");
+# endif
 #endif
 #if defined(__APPLE__) && defined(__BLOCKS__) && !defined(QWEN_FORCE_PTHREAD)
     fprintf(f, "  matvec threads:   GCD dispatch_apply (%d threads)\n", qwen_get_threads());
@@ -1079,7 +1087,16 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
     {
         static atomic_int no_bfmmla = -1;
         int nb = atomic_load_explicit(&no_bfmmla, memory_order_relaxed);
-        if (nb < 0) { const char *e = getenv("QWEN_NO_BFMMLA"); nb = (e && e[0] == '1'); atomic_store_explicit(&no_bfmmla, nb, memory_order_relaxed); }
+        if (nb < 0) {
+            const char *e = getenv("QWEN_NO_BFMMLA"); nb = (e && e[0] == '1');
+#if defined(__APPLE__)
+            /* M4-measured: BFMMLA batch loses on Apple (0.72-0.91× — the transpose+truncate
+             * overhead doesn't pay on bandwidth-rich cores) vs 1.5× win on Graviton3 →
+             * default OFF on Apple; QWEN_APPLE_MMLA=1 re-enables (M4 Pro / M5 re-eval). */
+            if (!nb) { const char *a = getenv("QWEN_APPLE_MMLA"); nb = !(a && a[0] == '1'); }
+#endif
+            atomic_store_explicit(&no_bfmmla, nb, memory_order_relaxed);
+        }
         if (!nb && B >= 2) {
             uint16_t *Xb = (uint16_t *)malloc((size_t)B * cols * sizeof(uint16_t));
             if (Xb) {
@@ -1386,7 +1403,17 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
     {
         static atomic_int no_smmla = -1;
         int ns = atomic_load_explicit(&no_smmla, memory_order_relaxed);
-        if (ns < 0) { const char *e = getenv("QWEN_NO_SMMLA"); ns = (e && e[0] == '1'); atomic_store_explicit(&no_smmla, ns, memory_order_relaxed); }
+        if (ns < 0) {
+            const char *e = getenv("QWEN_NO_SMMLA"); ns = (e && e[0] == '1');
+#if defined(__APPLE__)
+            /* Per-platform gate (M4-measured 2026-07-11): int8-SMMLA batch LOSES to B×
+             * SDOT matvecs on Apple's bandwidth-rich cores (0.61-0.91×) while winning
+             * 2.1× on Graviton3 → default OFF on Apple. QWEN_APPLE_MMLA=1 re-enables
+             * (re-evaluate on M4 Pro / M5). The q4-SMMLA twin stays ON (wins on both). */
+            if (!ns) { const char *a = getenv("QWEN_APPLE_MMLA"); ns = !(a && a[0] == '1'); }
+#endif
+            atomic_store_explicit(&no_smmla, ns, memory_order_relaxed);
+        }
         if (!ns && B >= 2 && B <= 16) {
             int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
             if (qXt) {

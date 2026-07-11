@@ -63,9 +63,9 @@ Full recipe (`QWEN_CUDA_FUSED_TALKER=1 QWEN_CUDA_CONVDEC=1`), seed-pinned, greed
 | 1.7B `--quant-mixed` | 0.55 |
 | 1.7B `--quant-mixed` + `QWEN_CUDA_DP4A=1` | **0.50** |
 
-- **`QWEN_CUDA_DP4A=1` (int4 weights × int8-quantized activations, integer `__dp4a` dots)** is a
-  measured win on real NVIDIA: **1.7B Talker 8.4 → 5.6 ms/f (−33%)**, 0.6B Talker −19% / CP −16%,
-  ear-validated. Opt-in for now; the plain q4 kernel (f32 activations) stays the default.
+- **dp4a (int4 weights × int8-quantized activations, integer `__dp4a` dots)** is a measured win on
+  real NVIDIA: **1.7B Talker 8.4 → 5.6 ms/f (−33%)**, 0.6B Talker −19% / CP −16%, ear-validated —
+  **now the DEFAULT for int4/quant-mixed** (`QWEN_CUDA_DP4A=0` reverts to the f32-act kernel).
 - Without `QWEN_CUDA_CONVDEC=1` the speech decoder runs on the host CPU — on a weak cloud host
   that alone was the difference between RTF 0.94 and 0.39. **Always set both env vars.**
 - **Batch throughput (B=8, 1.7B quant-mixed):** 8 concurrent requests = 30 s wall for 63.5 s of
@@ -121,9 +121,10 @@ Flags / env:
 - `QWEN_CUDA_FUSED_TALKER=1` — GPU-resident fused Talker + Code Predictor.
 - `QWEN_CUDA_CONVDEC=1` — GPU-resident ConvNet speech decoder.
 - `QWEN_CUDA_BATCH=1` — GPU-batched fused steps for the server (`--batch-size N`, N ≤ 8).
-- `QWEN_CUDA_DP4A=1` — int4 matvec via integer `__dp4a` (activation quantized to int8 per
-  32-block, even/odd-deinterleaved to match q4_0 packing). Measured −33% Talker ms/f on A100
-  (1.7B); trajectory forks vs the f32-act kernel (act-quant numerics, benign — ear-validated).
+- dp4a int4 matvec (integer `__dp4a`, activation quantized to int8 per 32-block, even/odd-
+  deinterleaved to match q4_0 packing): **ON by default** since the A100 validation (−33% Talker
+  ms/f on 1.7B, ear-validated). `QWEN_CUDA_DP4A=0` reverts to the f32-activation kernel
+  (trajectory forks between the two — act-quant numerics, benign).
 
 ## Notes
 

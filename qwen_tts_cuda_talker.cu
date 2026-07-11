@@ -273,8 +273,10 @@ static float *g_qdp_sx = NULL; static int *g_qdp_sum = NULL;
 static int qdp_enabled(void) {
     static int on = -1;
     if (on < 0) {
+        /* DEFAULT ON since the A100 validation (2026-07-11: Talker −33% ms/f on 1.7B
+         * quant-mixed, RTF 0.55→0.50, ear-validated). QWEN_CUDA_DP4A=0 opts out. */
         const char *e = getenv("QWEN_CUDA_DP4A");
-        on = (e && e[0]=='1');
+        on = !(e && e[0]=='0');
         if (on) {
             if (cudaMalloc(&g_qdp_qe,  QDP_MAX_COLS/2) != cudaSuccess ||
                 cudaMalloc(&g_qdp_qo,  QDP_MAX_COLS/2) != cudaSuccess ||
@@ -283,7 +285,7 @@ static int qdp_enabled(void) {
                 fprintf(stderr, "[cuda] dp4a scratch alloc failed — falling back to f32-act q4 kernel\n");
                 on = 0;
             } else {
-                fprintf(stderr, "[cuda] q4_0 matvec: dp4a q4xq8 path ENABLED (QWEN_CUDA_DP4A=1, experimental)\n");
+                fprintf(stderr, "[cuda] q4_0 matvec: dp4a q4xq8 path ENABLED (default; QWEN_CUDA_DP4A=0 disables)\n");
             }
         }
     }
