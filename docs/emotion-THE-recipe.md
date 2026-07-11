@@ -79,6 +79,14 @@ saves/restores the global steer per span). Also works in the HTTP server. The ol
   "[contempt] Oh, sure, that's a brilliant idea. [nostalgia] We used to spend every summer by the sea. [despair] And now there's nothing left." -o switch.wav
 ```
 
+**🔊 Hear the switch happen inside one prompt** (showcase clips, moved here from the README):
+
+| Prompt (inline `[tags]`) | Listen |
+|---|---|
+| `[contempt]` Oh, sure, that's a brilliant idea. `[nostalgia]` We used to spend every summer by the sea. `[despair]` And now there's nothing left. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_contempt-nostalgia-despair.wav) |
+| `[sad]` I really thought this would work out. `[disgust]` But the whole thing is rotten. `[contempt]` As if they ever cared. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_sad-disgust-contempt.wav) |
+| *(Italian)* `[outrage]` Hanno annullato tutto senza dirci niente. `[remorse]` Continuo a pensare a cosa ho detto. `[awe]` Poi ho alzato lo sguardo e sono rimasto senza parole. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_it_outrage-remorse-awe.wav) |
+
 ## Assets
 - expr packs (`presets/expr/`): `italian_csp_topk6`, `german_csp_k6`, `french_csp_k6` (shipped on HF, fetch with
   `bash download_assets.sh`). Native `{german,french,spanish}_r32` re-exportable from the GPU box checkpoints
@@ -105,6 +113,17 @@ the steering vector; `[huff]`/`[ugh]`/`[hmm]`/`[mmm]`/`[phew]`/… are soft onom
 > Clearest on `[laugh]`/`[sigh]` with `ryan`/`vivian`. Known rough edge: on a CLONE the laugh span (a separate
 > cold-prefill span) can sound slightly detached/off-timbre (the seam, not audio-splice). Provenance of the
 > per-voice weights + the "anchor + vector" rule: memory `project_paralinguistic_steering_vector` (ear 2026-06-25/28).
+
+**🔊 Emotion + paralinguistics showcase** (a `[tag]` inside an emotional sentence; moved here from the README):
+
+| Language | Voice | Emotion + tag | Text | Listen |
+|----------|-------|---------------|------|--------|
+| Italian | ryan (preset) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_joy_laugh.wav) |
+| Italian | ryan (preset) | 😢 sad + `[sigh]` | *Ho perso tutto quello che avevo, `[sigh]` e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_sad_sigh.wav) |
+| English | ryan (preset) | 😄 joy + `[laugh]` | *I can't believe it, `[laugh]` this is the best news of my whole life!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_en_joy_laugh.wav) |
+| French | vivian | 😢 sad + `[sigh]` | *J'ai tout perdu, `[sigh]` et maintenant je ne sais plus quoi faire.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/fr_vivian_sad_sigh.wav) |
+| Spanish | vivian | 😄 joy + `[laugh]` | *No me lo puedo creer, `[laugh]` ¡es la mejor noticia de mi vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/es_vivian_joy_laugh.wav) |
+| Italian | galatea (cloned voice) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/galatea_it_joy_laugh.wav) |
 
 ## Instruct control (strength & speed) — the `--instruct` lever
 `--instruct` (1.7B, COMBINE/clone path only — preset pure-STEER needs none) is a secondary flavour on top of the

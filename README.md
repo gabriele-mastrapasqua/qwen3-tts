@@ -12,7 +12,7 @@ The engine runs the complete TTS pipeline: BPE tokenization, a 28-layer causal t
 
 ## Audio Samples
 
-All samples generated with the 0.6B model (RTF ~1.3–1.7, Apple M1):
+All samples generated with the 0.6B model — sub-realtime on a 2020 Apple M1 CPU (**RTF 0.52 `--int4` / 0.69 `--int8`**, no GPU; see [Performance](#performance)):
 
 | Language | Speaker | Sample | Text |
 |----------|---------|--------|------|
@@ -63,7 +63,7 @@ make blas
 - **VoiceDesign** — Create new voices from text descriptions.
 - **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`; JSON body takes `emotion`/`instruct`/`volume`/`rate` (same recipe as the CLI). **Inline `[mood]` markup works over the API too** — one request can switch emotion sentence-by-sentence (`"text":"[joy] Great news! [sad] But I must go."`), auto-detected and streamed span-by-span. See [docs/server.md](docs/server.md).
 - **Streaming** — Real-time audio via `--stream` (WAV) or `--stdout` (raw PCM).
-- **INT8 quantization** — `--int8` quantizes Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B goes sub-realtime on Apple Silicon (RTF < 1.0, CLI/stream/server)**, **1.7B 2.66→1.79 (−33%)**, near-bf16 quality, works with preset speakers and custom `.qvoice` voices. (INT4 is the lever on memory-starved x86; on cache-rich chips like M1, INT8 wins.)
+- **INT8 / INT4 quantization** — `--int8` / `--int4` quantize Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86), near-bf16 quality, and work with presets **and** custom `.qvoice` voices. On cache-rich Apple Silicon **both go sub-realtime** (0.6B best **0.52 int4 / 0.69 int8**; 1.7B best **~1.53** quant-mixed); on memory-starved x86, int8+VNNI wins the wall clock. See [Performance](#performance).
 - **Configurable sampling** — Temperature, top-k, top-p, and repetition penalty.
 - **24 kHz WAV output** — 16-bit PCM, mono.
 
@@ -282,8 +282,9 @@ ear-validated **Plutchik dyads** ship as first-class `--emotion` values — no n
 
 #### Inline emotion switching — many emotions from ONE prompt · new
 
-Write `[emotion]` tags **inside `--text`** and the engine switches emotion **sentence by sentence in a single
-generation** — any primary or dyad, no flags. Clean at the seams, one output file:
+Write `[emotion]` tags **inside `--text`** — any primary or dyad — and the engine switches emotion **sentence by
+sentence in a single generation**, clean at the seams, one output file. `[neutral]` resets; composes with a global
+`--emotion` and with `[laugh]`/`[sigh]` tags.
 
 ```bash
 ./qwen_tts -d qwen3-tts-1.7b -s ryan -l English -T 1.1 --text \
@@ -291,16 +292,8 @@ generation** — any primary or dyad, no flags. Clean at the seams, one output f
   -o switch.wav
 ```
 
-**🔊 Hear the switch happen inside one prompt:**
+> 🔊 Switch-inside-one-prompt audio examples (EN + IT) → **[docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md)**.
 
-| Prompt (inline `[tags]`) | Listen |
-|---|---|
-| `[contempt]` Oh, sure, that's a brilliant idea. `[nostalgia]` We used to spend every summer by the sea. `[despair]` And now there's nothing left. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_contempt-nostalgia-despair.wav) |
-| `[sad]` I really thought this would work out. `[disgust]` But the whole thing is rotten. `[contempt]` As if they ever cared. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_sad-disgust-contempt.wav) |
-| *(Italian)* `[outrage]` Hanno annullato tutto senza dirci niente. `[remorse]` Continuo a pensare a cosa ho detto. `[awe]` Poi ho alzato lo sguardo e sono rimasto senza parole. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_it_outrage-remorse-awe.wav) |
-
-> Inline `[emotion]` uses the same steering recipe as `--emotion`, applied per sentence. `[neutral]` resets to
-> no emotion. Combine with a global `--emotion` and paralinguistic `[laugh]`/`[sigh]` tags freely.
 - **Paralinguistics → inline `[tags]`, also automatic · 🧪 Alpha.** Write `[laugh]`, `[sigh]`, `[yawn]`, `[wow]`, `[giggle]` or `[scoff]` in
   `--text` and the engine performs the event (it picks the onomatopoeia anchor + the right seed per voice for
   you) — no flags. `[wow]`/`[yawn]`/`[scoff]` compose well with the matching `--emotion`; `[giggle]` is best
@@ -311,66 +304,24 @@ generation** — any primary or dyad, no flags. Clean at the seams, one output f
       --text "Che giornata... [sigh] non ce la faccio più. [laugh]" -o para.wav
   ```
 
-#### Emotion + paralinguistics together (experimental 🧪)
+#### Emotion + paralinguistics, and tuning the `--instruct` (experimental 🧪)
 
-You can put a paralinguistic `[tag]` **inside an emotional sentence** and get both at once — e.g. `--emotion joy`
-+ `[laugh]`. When a `[tag]` is present the engine switches the emotion to its **COMBINE** stack (the `.expr`
-language-correction keeps the event from drifting the accent) and rides the laugh/sigh steering vector at the
-per-voice weight (ryan w6, others w8). The pure-emotion path (no tag) is unchanged. This is **still a bit
-unstable** across some languages/voices (work in progress) — the clearest results are `[laugh]`/`[sigh]` on
-`ryan`/`vivian`. Reproduce with `make emotion-para-demo`.
+You can put a paralinguistic `[tag]` **inside an emotional sentence** (e.g. `--emotion joy` + `[laugh]`) and get both
+at once — the engine switches to the **COMBINE** stack so the `.expr` language-correction keeps the event on-accent.
+Still a bit unstable across some languages/voices; clearest on `[laugh]`/`[sigh]` with `ryan`/`vivian`. Reproduce with
+`make emotion-para-demo`.
 
-| Language | Voice | Emotion + tag | Text | Listen |
-|----------|-------|---------------|------|--------|
-| Italian | ryan (preset) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_joy_laugh.wav) |
-| Italian | ryan (preset) | 😢 sad + `[sigh]` | *Ho perso tutto quello che avevo, `[sigh]` e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_sad_sigh.wav) |
-| English | ryan (preset) | 😄 joy + `[laugh]` | *I can't believe it, `[laugh]` this is the best news of my whole life!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_en_joy_laugh.wav) |
-| French | vivian | 😢 sad + `[sigh]` | *J'ai tout perdu, `[sigh]` et maintenant je ne sais plus quoi faire.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/fr_vivian_sad_sigh.wav) |
-| Spanish | vivian | 😄 joy + `[laugh]` | *No me lo puedo creer, `[laugh]` ¡es la mejor noticia de mi vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/es_vivian_joy_laugh.wav) |
-| Italian | galatea (cloned voice) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/galatea_it_joy_laugh.wav) |
+`--instruct` is an **optional** vivid English (or Chinese) line on top of the recipe (matters for cloned voices;
+preset pure-emotion needs none): a stronger, more vivid instruct pushes emotion harder, and plain English
+`"speak faster/slower"` shifts pacing (~±15 %). **Don't** use a slot template (`Tempo:+40%` comes out *slower* —
+Qwen doesn't parse it); plain prose wins.
 
-#### Tuning the `--instruct` (strength & speed)
+> 🔊 Emotion+`[tag]` audio examples, the per-emotion `strong`/`very-strong` instruct library, and the manual
+> override flags (`--expr` / `--ml-steer` — you normally never touch them) → **[docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md)**
+> · [docs/emotion-instruct-control.md](docs/emotion-instruct-control.md).
 
-`--instruct` is an **optional** vivid English (or Chinese) line that rides on top of the emotion recipe (1.7B; it
-matters for **cloned voices** and preset+instruct — preset pure-emotion needs none). Two things it controls well:
-
-- **Strength** — a stronger, more vivid instruct pushes emotion harder. Escalate the wording when you want more
-  (e.g. anger gets raspier and angrier); back off if it starts to sound noisy. Write it as **plain prose**, not a
-  parameter list.
-- **Speed** — say it in words: `"… and speak a little faster"` / `"speak slowly"` shifts pacing (~±15 %);
-  `"in a higher voice"` lifts the pitch a touch.
-
-```bash
-# mild vs strong wording — same recipe, more push
-./qwen_tts -d qwen3-tts-1.7b -s ryan -l English -T 1.1 --emotion anger \
-    --instruct "Speak in an absolutely furious, explosive, screaming rage, voice cracking with violent anger." \
-    --text "How dare you talk to me like that? I will not accept this!" -o anger.wav
-```
-
-> **Don't** use a slot/parameter template (`VoiceStyle: … Tempo: +15% Pitch: higher`). Qwen3-TTS does **not** parse
-> the slots — `Tempo:+40%` even comes out *slower*. Plain vivid prose wins. Full findings + a ready per-emotion
-> `strong`/`very-strong` instruct library → [docs/emotion-instruct-control.md](docs/emotion-instruct-control.md).
-
-**Assets:** `bash download_assets.sh` (introduced in the setup callout above) fetches the `.expr` packs;
-`--verify` re-checks integrity. Full set ≈ 1.4 GB; Italian-only emotion needs just `italian_csp_topk6.expr` (203 MB).
-
-<details>
-<summary><b>Under the hood</b> — what each file is, and the manual override flags (advanced)</summary>
-
-You normally never touch these — `--emotion` and `[tags]` load the right ones. But if you want to tune by hand:
-
-| File | Where | What it is | Manual flag |
-|------|-------|------------|-------------|
-| `.expr` | `presets/expr/` (HF) | **Per-language emotion fine-tune** — a weight-delta on the Talker's emotion layers; fixes/renders the language *and* gives the base emotion. | `--expr <file> --expr-weight <m>` |
-| `.qlsteer` | `presets/steer/emotion/` (git) | **Emotion steering vector** — an inference-time activation direction (per voice × emotion). Changes no weights; carries the emotion, transfers cross-voice/language. | `--ml-steer <file> --ml-range 21-25 --ml-weight <w>` |
-| `.qlsteer` | `presets/steer/paraling/` (git) | **Paralinguistic vector** — `laugh_vs_cry`, `sigh_vs_laugh`. Speaker/language-agnostic. | (auto via `[laugh]`/`[sigh]`) |
-| `.qamp` | `presets/steer/paraling/` (git) | **Raw activation fingerprint** — the source a `.qlsteer` is built from (reproducibility). | (build input) |
-
-A manual `--expr` / `--ml-steer` always **overrides** the `--emotion` auto-router. Validated recipe (2026-06-29):
-**preset → pure STEER `ryan_<emo>` @ `w12`** (clean, every language; w10 also good); **clone → COMBINE** (language
-`.expr` + steer). Use the native preset per language (JA `ono_anna`, KO `sohee`, ZH `vivian`, EN/Romance `ryan`).
-**Train your own `.expr` for any language** with [`training/expressivity-lora/`](training/expressivity-lora/).
-</details>
+**Assets:** `bash download_assets.sh` fetches the `.expr` packs; `--verify` re-checks integrity. Full set ≈ 1.4 GB;
+Italian-only emotion needs just `italian_csp_topk6.expr` (203 MB).
 
 **Deeper docs:** [docs/expressivity-assets.md](docs/expressivity-assets.md) (asset catalog + recipes) ·
 [docs/csp-ft-emotion.md](docs/csp-ft-emotion.md) (how the `.expr` packs were trained, cross-language transfer) ·
@@ -439,10 +390,19 @@ Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --
 
 ## Performance
 
-> ### ⚡ The sweet spot: `--int8` is **faster than real-time (RTF < 1.0) on Apple Silicon** — CLI, streaming **and** server
-> ~2× faster than bf16 with **no perceptible quality loss** (validated by ear, including cloned `.qvoice` voices).
+> ### ⚡ Faster than real-time on Apple Silicon — both `--int8` and `--int4` go sub-1.0 RTF
+> On a 2020 M1 (CPU, no GPU) the 0.6B model runs **~2× faster than real time** — CLI, streaming **and** server — with **no perceptible quality loss** by ear (cloned `.qvoice` voices included).
 
-**Apple M1** (8-core, 16 GB, 4 threads), 0.6B model — full-precision **bf16** vs **`--int8`**, across every delivery mode:
+**Apple M1** (8-core, 16 GB, 4 threads), 0.6B — best RTF per precision. int4 is the fastest lever on Apple's
+cache-rich SLC; int8 is the safest quality/speed pick — **both beat real time**:
+
+| Precision | Best 0.6B RTF | vs real-time |
+|---|---|---|
+| bf16 | 1.3–1.8 | slower |
+| **`--int8`** | **0.69** ⚡ | ~1.4× faster |
+| **`--int4`** | **0.52** ⚡ | ~1.9× faster |
+
+**Every delivery mode stays sub-realtime** — bf16 vs `--int8` across CLI / streaming / server / cloned voice:
 
 | Mode | bf16 RTF | **`--int8` RTF** | First audio (TTFA) |
 |---|---|---|---|
@@ -453,14 +413,10 @@ Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --
 | **HTTP server** (`--serve`, warm) | ~1.3 | **0.88** ⚡ | — |
 | **Custom voice** `.qvoice` (streamed) | 1.34 | **0.93** ⚡ | 0.47 s |
 
-Yes — this project ships a **streaming mode** (`--stream`, ~0.5 s to first audio) and an
-**OpenAI-compatible HTTP server** (`--serve`, with `--workers N` request concurrency). With `--int8`,
-**every delivery path runs faster than real time on a 2020 M1** — cloned custom voices included.
-
-RTF = processing_time / audio_duration; **< 1.0 = faster than real-time**. `--int8` quantizes the
-Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B drops from ~1.5 (bf16) to
-~0.8–0.9**, **1.7B 2.66 → 1.79 (−33%)**, no perceptible quality loss, and it works with `.qvoice`
-voices ([details](docs/quantization.md)). 1.7B: bf16 ~2.0–4.1, `--int8` ~1.8–2.4 on longer text.
+RTF = processing_time / audio_duration; **< 1.0 = faster than real-time**. Quantization reads fewer weight bytes
+per frame (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B ~1.5 (bf16) → 0.69 (int8) → 0.52 (int4)**; **1.7B
+~2.0 (bf16) → 1.79 (int8) → ~1.53 (quant-mixed: int4 Talker + int8 CP, the fastest 1.7B config on M1)** — no
+perceptible quality loss, works with `.qvoice` voices ([details](docs/quantization.md)).
 
 ### 📊 Benchmark *your* CPU
 
