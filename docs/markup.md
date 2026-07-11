@@ -6,19 +6,23 @@ paralinguistic fillers (sighs, huffs). The tag style follows the modern AI-TTS c
 (ElevenLabs / Bark): **English tags in square brackets**, placed inline, switchable mid-text.
 
 ```bash
-./qwen_tts -d qwen3-tts-0.6b -s ryan -l English \
-  --text "I couldn't believe it. [excited] We actually won! [pause:500ms] [sad] But it meant leaving everyone behind. [sigh]" \
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English \
+  --text "I couldn't believe it. [joy] We actually won! [pause:500ms] [sad] But it meant leaving everyone behind. [sigh]" \
   -o out.wav
 ```
 
 You don't need a special flag: if `--text` contains recognized tags it is rendered as
 expressive markup automatically. (`--compose "..."` does the same explicitly.)
 
+> **Mid-text `[emotion]` tags need the 1.7B model.** On 0.6B they are silently ignored (emotion is a
+> 1.7B feature). Pauses and paralinguistic fillers below work on both models.
+
 ## Tags
 
 | tag | effect |
 |---|---|
-| `[happy] [sad] [excited] [eager] [proud] [calm] [dramatic] [news] [annoyed] [stern] [angry] [joy] [gloomy]` | switch the emotion for the text that follows (full recipe: steering + roughness + volume + rate) |
+| **primaries** `[sad] [joy] [anger] [fear] [disgust] [surprise]` (synonyms: `[happy] [angry] [rage] [afraid] [disgusted] [surprised] [sadness]`) | switch the emotion for the text that follows (steering vector @ the ear-validated weight; 1.7B only) |
+| **dyads** `[contempt] [awe] [nostalgia] [disapproval] [remorse] [outrage] [despair]` | blended Plutchik emotions (two steering directions summed; 1.7B only) |
 | `[neutral]` (`[none]`, `[normal]`) | back to plain, unmodified delivery |
 | `[sigh]` `[sighs]` | sigh of relief (`Hah…`) |
 | `[ahh]` `[relief]` | pleasure/relief exhale (`Haaa…`) |
@@ -85,17 +89,17 @@ true non-verbal breaths (the model has no real `<breath>` token — see the dead
 ## Examples
 
 ```bash
-# Audiobook beat: setup (neutral) -> reveal (excited) -> turn (sad + sigh)
-./qwen_tts -d qwen3-tts-0.6b -s ryan -l English \
-  --text "The letter sat on the table for days. [pause:400ms] [excited] When she finally opened it, she gasped. [pause:600ms] [sad] It was the goodbye she'd feared. [sigh]" \
+# Audiobook beat: setup (neutral) -> reveal (joy) -> turn (sad + sigh)
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English \
+  --text "The letter sat on the table for days. [pause:400ms] [joy] When she finally opened it, she gasped. [pause:600ms] [sad] It was the goodbye she'd feared. [sigh]" \
   -o scene.wav
 
 # Italian, explicit --compose form (| is an optional hard span break)
-./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian \
-  --compose "[annoyed] Te l'avevo detto! [pause:300ms] | [neutral] Va bene, ricominciamo. [sigh]" \
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian \
+  --compose "[anger] Te l'avevo detto! [pause:300ms] | [neutral] Va bene, ricominciamo. [sigh]" \
   -o dialogo.wav
 
 # Tired character: huff, beat, resigned line
-./qwen_tts -d qwen3-tts-0.6b -s ryan -l English \
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l English \
   --text "[huff] [pause:300ms] [sad] Fine. I'll do it myself." -o tired.wav
 ```
