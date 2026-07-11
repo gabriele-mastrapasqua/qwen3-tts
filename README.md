@@ -527,7 +527,7 @@ concurrent users in roughly the time of one by reading each weight once for all 
 | **CUDA** (A100, cloud) | **aggregate RTF 0.47 at B=8** | 8 concurrent users, all served faster than real-time (1.7B; ~2.1× throughput) |
 | **Apple Metal** (M2 Pro) | **~2.8× at B=4** | 0.6B 2.81× · 1.7B 2.82× (consistent); batch output bit-identical to single-stream |
 | **CPU x86** | ~N on bandwidth-bound servers | ~1× on cache-rich M1 (single-stream is already fast) |
-| **CPU ARM** (Graviton3+, i8mm) | **int8 batch matmat 2.1×** (native SMMLA GEMM) | e2e batched server −19% wall @ B=4 vs the pre-SMMLA twin; bf16 1.5× (BFMMLA) |
+| **CPU ARM** (Graviton3+, i8mm) | **int8 batch matmat 2.1×, int4 1.6×** (native SMMLA GEMM) | e2e batched server −19% wall @ B=4 vs the pre-SMMLA twin; bf16 1.5× (BFMMLA) |
 
 ## Documentation
 

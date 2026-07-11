@@ -308,7 +308,7 @@ i8mm/bf16; the MMLA twins' first silicon:**
 | `--self-test` | **SMMLA int8 matmat L2 = 0.00e+00 (bit-identical to B× SDOT matvec)**; BFMMLA 3.4e-03 (expected bf16-act signature) — both PASS first run |
 | matmat-bench int8 (B=8) | old twin **0.32-0.38×** (batching LOST vs seq) → **SMMLA 2.03-2.10×** (batch 0.90→0.16 ms — ~6× better) |
 | matmat-bench bf16 (B=8) | old 1.01-1.20× → **BFMMLA 1.38-1.58×** |
-| matmat-bench int4 (B=8) | ⚠️ **0.29× — q4 batch decode is scalar, a big LOSS**; avoid int4 in batched serving on ARM (TODO: q4 MMLA twin or force_matvec fallback) |
+| matmat-bench int4 (B=8) | 0.29× with the old scalar batch → **1.55-1.63× with the q4-SMMLA twin** (same-session follow-up; self-test L2 ~7e-8). On M1-class (no i8mm) the batch now falls back to B× SDOT matvecs: 0.43-0.65× → 0.95-1.13× (loss gone) |
 | single-stream RTF | 0.6B int8 **0.66** (beats EPYC Turin 0.96!) · int4 0.73 · bf16 1.11 · **1.7B int8 0.95 — sub-realtime 1.7B on an ARM server CPU** |
 | batched server B=4 (e2e A/B) | 4 concurrent: **17 s with MMLA vs 21 s without = −19% wall** (aggregate RTF 0.84) |
 | `QWEN_BLAS_GEN_THREADS` | optimum = 3 (= the nt−1 default) on 8 vCPU — opposite of the 4-vCPU EPYC; the knob is genuinely per-box |
