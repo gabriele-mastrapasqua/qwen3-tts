@@ -30,45 +30,39 @@ reducing memory usage and (for INT8) improving speed.
 - Halves Talker RAM usage on 1.7B (2.8 GB → 1.4 GB)
 - Works with all features: server, streaming, custom voices (`.qvoice` re-quantized after override), instruct
 
-## INT4 (Experimental)
+## INT4 (Q4_0 — the fastest lever on Apple Silicon)
 
 ```bash
-./qwen_tts -d qwen3-tts-1.7b --text "Hello world" --int4 -o hello.wav
+./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --int4 -o hello.wav
 ```
 
-- Q4_0 format (4-bit with per-block scale factors)
-- Smallest memory footprint (0.7 GB Talker RAM)
-- Slightly **slower** than BF16 due to nibble unpacking overhead
-- Audio quality may degrade on some inputs
+- Q4_0 format: 32 weights per block, **fp16 per-block scale → 18 bytes/block** (llama.cpp layout;
+  was 20 B with an f32 scale — the fp16 scale cut int4 weight traffic another 10% with negligible
+  quality drift, teacher-forced ladder −0.8pp).
+- On ARM the kernel is **SDOT-native** (int8-quantized activations, no per-nibble unpack tax);
+  on AVX-512 x86 it's the VNNI v3 throughput kernel; batched ARM rides a **q4-SMMLA GEMM** (i8mm).
+- Smallest memory footprint (¼ of bf16) — also the pick when RAM is tight.
+- Quality: a touch more aggressive than int8 (per-block-32 scales are coarse for the CP's late
+  residuals) — int8 stays the quality reference; int4 is ear-validated fine on 0.6B.
 
-## Comparison
+## Comparison (Apple M1 8-core, 16 GB, `-j4`, 2026-07 state)
 
-**1.7B, Italian, seed=42, Apple M1 16 GB, 4 threads** (these rows predate SDOT — with SDOT the
-INT8 Talker is ~46 ms/f, see the validated figures in the box above):
+| Config | 0.6B best RTF | 1.7B best RTF | Talker RAM (1.7B) |
+|--------|--------------|---------------|-------------------|
+| BF16 (default) | 1.3–1.8 | ~2.0 | 2.8 GB (mmap) |
+| **INT8** | **0.69** | 1.79 | 1.4 GB |
+| **INT4** | **0.51** ⚡ | 1.58 | 0.7 GB |
+| quant-mixed (int4 Talker + int8 CP) | — | **~1.53** | ~1.0 GB |
 
-| Config | Talker ms/f | Total time | RTF | Talker RAM |
-|--------|-------------|------------|-----|------------|
-| BF16 (default) | ~80 ms/f | ~13s | ~4.3 | 2.8 GB (mmap) |
-| **INT8 (recommended)** | **~67 ms/f** | **~11s** | **~3.6** | **1.4 GB** |
-| INT4 (experimental) | ~83 ms/f | ~14s | ~4.5 | 0.7 GB |
+## Recommendation — per platform (all measured on real silicon, 2026-07-11)
 
-## Recommendation
-
-On Apple Silicon, use `--int8` for **both** models — Talker −23% (1.7B) and CP −29% (both) with
-SDOT, and **0.6B goes sub-realtime (RTF < 1.0) in CLI/stream/server**. On x86 the int8 matvec now has
-AVX2 + AVX-512/VNNI (validated on Ryzen 6800H and EPYC 9555P/Zen5) — `--int8` is the right default
-there too; on a memory-starved CPU with a small L3, `--int4` can edge ahead multi-threaded
-(see [x86 optimization](x86-optimization.md)).
-
-INT4 is the lever on **memory-starved x86** (small L3 → fewer weight bytes wins, e.g. Ryzen 6800H
-3.9→2.02). On **cache-rich / bandwidth-rich chips (Apple M1)** INT4 is *slower* than INT8 (nibble
-unpacking dominates) — there INT8 is the quality/speed floor. Per-block-32 int4 scales are also a
-touch coarse for the CP's fine residuals (slight timbre shift), so INT8 stays the quality reference.
-For maximum speed, use the 0.6B model (RTF ~1.3–1.7 vs 3.6 for 1.7B INT8).
-
-On systems with 16+ GB free RAM, expected performance is better than shown above
-(our test machine had high system memory pressure from other applications).
-Projected RTF with free RAM: **0.6B ~1.3, 1.7B BF16 ~3.0, 1.7B INT8 ~2.5**.
+| Platform | Pick | Why (measured) |
+|---|---|---|
+| **Apple Silicon (M1+)** | `--int4` for speed, `--int8` for max quality | int4-SDOT is the fastest lever (0.6B **0.51**); 1.7B best = `--quant-mixed` (~1.53) |
+| **x86 AVX-512/VNNI** (Zen4+, Ice Lake+) | **`--int8`** — for 1.7B too | EPYC Turin: int8 0.96 vs int4 1.05; **1.7B pure int8 1.22 beats quant-mixed 1.30** (quant-mixed is an Apple-silicon config). Build with `make blas SIMD=avx512vnni` |
+| **x86 AVX2-only** (Zen3, small L3) | `--int4` multi-threaded | memory-starved: fewer weight bytes wins (Ryzen 6800H 3.9→2.02) |
+| **ARM server** (Graviton3+, i8mm) | `--int8` single-stream; int8/int4 batched | 0.6B int8 **0.66**, 1.7B int8 **0.95** (sub-RT); batched matmats ride SMMLA (int8 2.1×, int4 1.6×) |
+| **NVIDIA CUDA** | `--quant-mixed` (+ `QWEN_CUDA_DP4A=1`) | A100: 0.50 with dp4a (Talker −33% ms/f) — see [cuda-performance.md](cuda-performance.md) |
 
 ## Testing
 

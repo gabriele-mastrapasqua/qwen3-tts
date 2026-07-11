@@ -102,13 +102,21 @@ the rigorous correctness gate. The default matmul path forks the greedy trajecto
 > Server-test hygiene (see CLAUDE.md): always `timeout` curls and kill the server **by name**
 > (`pkill -9 -f "qwen_tts.*--serve"`); `wait` only on curl PIDs — never on the never-exiting server.
 
-## Performance
+## Performance — measured on rented silicon (2026-07-11)
 
 The throughput win (read each weight once, reuse across B) shows up on **bandwidth-bound** boxes.
 On M1 (bf16, the dev box) it is **correctness-validated** and the aggregate RTF for a small batch
-already dips ~0.95; the real **N× throughput** lever lands on **x86 EPYC / Sapphire (AVX-512/VNNI)** —
-to be measured on rented hardware (see `docs/hardware-testing.md`). int8/int4 inherit from the batched
-matmat twins (batching pays most at low precision — it amortizes the unpack).
+already dips ~0.95. Measured on real hardware:
+
+| Backend / box | Batch result |
+|---|---|
+| **CUDA A100** (1.7B quant-mixed, B=8) | 8 concurrent users in 30 s for 63.5 s of audio → **aggregate RTF 0.47, ~2.1× throughput** (per-request 1.27 — the known latency/throughput trade) |
+| **ARM Graviton3** (i8mm, 0.6B int8, B=4) | 4 concurrent, aggregate RTF 0.84; the **SMMLA GEMM twins cut wall −19%** vs the pre-MMLA batch (int8 batch matmat 0.34×→**2.1×**, bf16 →1.5×, int4 →1.6×) |
+| **ARM Graviton3** (0.6B **int4**, B=4) | aggregate RTF **0.94** — int4 batched serving is viable on ARM now (the old scalar q4 batch was a 3.4× loss) |
+| **x86 EPYC Turin** (B=4) | stall-free (8-9 s/req; the historical 262 s scheduler bug is fixed + re-validated); inactive slots are compacted (skip per-slot vector work) |
+
+int8/int4 inherit from the batched matmat twins (batching pays most at low precision — it amortizes
+the unpack); per-box details in `docs/hardware-testing.md`.
 
 ## Status / next
 

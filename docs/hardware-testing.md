@@ -311,6 +311,7 @@ i8mm/bf16; the MMLA twins' first silicon:**
 | matmat-bench int4 (B=8) | 0.29× with the old scalar batch → **1.55-1.63× with the q4-SMMLA twin** (same-session follow-up; self-test L2 ~7e-8). On M1-class (no i8mm) the batch now falls back to B× SDOT matvecs: 0.43-0.65× → 0.95-1.13× (loss gone) |
 | single-stream RTF | 0.6B int8 **0.66** (beats EPYC Turin 0.96!) · int4 0.73 · bf16 1.11 · **1.7B int8 0.95 — sub-realtime 1.7B on an ARM server CPU** |
 | batched server B=4 (e2e A/B) | 4 concurrent: **17 s with MMLA vs 21 s without = −19% wall** (aggregate RTF 0.84) |
+| batched server B=4 **int4** (e2e) | aggregate RTF **0.94** with the q4-SMMLA twin — int4 batched serving viable on ARM |
 | `QWEN_BLAS_GEN_THREADS` | optimum = 3 (= the nt−1 default) on 8 vCPU — opposite of the 4-vCPU EPYC; the knob is genuinely per-box |
 
 Build: plain `make blas` (Linux ARM uses `-march=native` → i8mm/bf16 auto-enabled; `--caps` must say
