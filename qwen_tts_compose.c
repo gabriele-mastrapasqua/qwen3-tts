@@ -171,9 +171,9 @@ int qwen_compose_parse(const char *input, qwen_cspan_t **out, int *out_n) {
             _s.steer_weight = -1.0f; _s.rate = 0; _s.volume = 0;                  \
             snprintf(_s.mood, sizeof(_s.mood), "%s", cur_mood);                   \
             _s.text = (char *)malloc((size_t)(_b - _a) + 1);                      \
-            if (!_s.text) { free(seg); free(arr); return -1; }                    \
+            if (!_s.text) { free(seg); qwen_compose_free_spans(arr, n); return -1; } \
             memcpy(_s.text, seg + _a, (size_t)(_b - _a)); _s.text[_b - _a] = 0;   \
-            if (cspan_push(&arr, &n, &cap, _s) != 0) { free(_s.text); free(seg); free(arr); return -1; } \
+            if (cspan_push(&arr, &n, &cap, _s) != 0) { free(_s.text); free(seg); qwen_compose_free_spans(arr, n); return -1; } \
         }                                                                        \
         seglen = 0;                                                              \
     } while (0)
@@ -196,12 +196,12 @@ int qwen_compose_parse(const char *input, qwen_cspan_t **out, int *out_n) {
                         const char *num = col ? col + 1 : (eq ? eq + 1 : t + 5);
                         MK_FLUSH();
                         qwen_cspan_t s; memset(&s, 0, sizeof(s)); s.is_pause = 1; s.pause_s = parse_duration_s(num);
-                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); free(arr); return -1; }
+                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); qwen_compose_free_spans(arr, n); return -1; }
                         handled = 1;
                     } else if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') {
                         MK_FLUSH();
                         qwen_cspan_t s; memset(&s, 0, sizeof(s)); s.is_pause = 1; s.pause_s = parse_duration_s(t);
-                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); free(arr); return -1; }
+                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); qwen_compose_free_spans(arr, n); return -1; }
                         handled = 1;
                     } else {
                         /* [laugh]/[sigh] are handled INLINE upstream (qwen_compose_para_substitute) before
@@ -216,7 +216,7 @@ int qwen_compose_parse(const char *input, qwen_cspan_t **out, int *out_n) {
                                 s.volume = COMPOSE_MACROS[m].volume;
                                 s.mood[0] = 0;  /* macros are no-steer prosody; mood unused */
                                 s.text = strdup(COMPOSE_MACROS[m].text);
-                                if (!s.text || cspan_push(&arr, &n, &cap, s) != 0) { free(s.text); free(seg); free(arr); return -1; }
+                                if (!s.text || cspan_push(&arr, &n, &cap, s) != 0) { free(s.text); free(seg); qwen_compose_free_spans(arr, n); return -1; }
                                 handled = 1;
                             }
                         }

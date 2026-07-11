@@ -191,7 +191,7 @@ static struct {
     _Atomic int completed;     /* workers that finished the current job; main spins on it */
     int sleeping;              /* workers parked on `wake` — guarded by mtx */
     int main_sleeping;         /* main parked on `complete` — guarded by mtx */
-    int stop;
+    _Atomic int stop;          /* read in the worker spin loop outside the mutex → atomic */
 } P;
 static int g_inited = 0;
 

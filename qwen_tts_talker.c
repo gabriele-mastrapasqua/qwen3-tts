@@ -489,6 +489,11 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
  * and the sequential prefill delegate to it (it builds its OWN device KV from pos 0). Disabled
  * automatically when emotion steering is active (the fused step doesn't apply ml_steer yet). */
 void *g_cuda_talker_state = NULL;
+/* audit MED-2: the fused single-stream states above/below hold ONE device KV, so they belong to
+ * exactly ONE ctx (the one they were init'd with). Guard every delegation with an owner check:
+ * a clone ctx (server --workers N, batched single-worker clone) must fall through to the CPU
+ * path instead of clobbering the owner's device KV mid-request (cross-request audio corruption). */
+void *g_gpu_fused_owner = NULL;   /* the qwen_tts_ctx_t* the fused states were created for */
 /* GPU-resident BATCHED Talker step (throughput path). When set, qwen_batch_talker_step_ragged
  * delegates to it (maintains its OWN device KV [B][kv_max][kvd]; seeded per slot on admit via
  * qwen_cuda_talker_batch_upload_slot). Created by qwen_tts_serve_continuous when QWEN_CUDA_BATCH=1. */
@@ -515,14 +520,16 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
     float eps = c->rms_norm_eps;
 
 #ifdef QWEN_HAVE_CUDA
-    if (g_cuda_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
+    if (g_cuda_talker_state && ctx == g_gpu_fused_owner &&
+        !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
         qwen_cuda_talker_step(g_cuda_talker_state, embed, hidden_out, pos);
         ctx->kv_len = pos + 1;
         return 0;
     }
 #endif
 #ifdef QWEN_HAVE_METAL
-    if (g_metal_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
+    if (g_metal_talker_state && ctx == g_gpu_fused_owner &&
+        !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
         qwen_metal_talker_step(g_metal_talker_state, embed, hidden_out, pos);
         ctx->kv_len = pos + 1;
         return 0;

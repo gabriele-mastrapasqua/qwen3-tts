@@ -30,6 +30,7 @@ qvoices/
 .claude/
 server_stderr.log
 qwen_tts_cpbench
+qwen_tts_decoder_tool
 voices/
 *.qvoice
 
@@ -67,3 +68,6 @@ samples/tests/
 
 # Metal/CPU bench outputs (bench_m2.sh)
 bench_out/
+
+# Compiler-generated dependency files (Makefile -MMD -MP)
+*.d

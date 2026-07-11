@@ -1556,11 +1556,12 @@ int main(int argc, char **argv) {
              * GPU-resident (weights+KV on device, one sync/step) instead of the per-op matvec
              * hook. Decode-only; prefill stays CPU-batched + KV uploaded. Off = per-op path. */
             if (bk == QWEN_BACKEND_CUDA && getenv("QWEN_CUDA_FUSED_TALKER")) {
-                extern void *g_cuda_talker_state, *g_cuda_cp_state;
+                extern void *g_cuda_talker_state, *g_cuda_cp_state, *g_gpu_fused_owner;
                 extern void *qwen_cuda_talker_init(qwen_tts_ctx_t *);
                 extern void *qwen_cuda_cp_init(qwen_tts_ctx_t *);
                 g_cuda_talker_state = qwen_cuda_talker_init(ctx);
                 g_cuda_cp_state = qwen_cuda_cp_init(ctx);
+                g_gpu_fused_owner = ctx;   /* audit MED-2: fused states delegate only for this ctx */
                 if (g_cuda_talker_state && g_cuda_cp_state)
                     fprintf(stderr, "GPU fused Talker+CP steps ENABLED (resident, 1 sync/step each)\n");
             }
@@ -1582,7 +1583,9 @@ int main(int argc, char **argv) {
              * (weights+KV in MTLBuffers, one command buffer/step) instead of the per-op hook. */
             if (bk == QWEN_BACKEND_METAL && getenv("QWEN_METAL_FUSED_TALKER")) {
                 extern void *g_metal_talker_state, *g_metal_cp_state, *g_metal_cp_frame_state;
+                extern void *g_gpu_fused_owner;
                 g_metal_talker_state = qwen_metal_talker_init(gpu_backend->impl, ctx);
+                g_gpu_fused_owner = ctx;   /* audit MED-2: fused states delegate only for this ctx */
                 /* CP: device-frame (1 sync/frame — the M1 win) by default; QWEN_METAL_CP_PERPASS = old path. */
                 if (getenv("QWEN_METAL_CP_PERPASS"))
                     g_metal_cp_state = qwen_metal_cp_init(gpu_backend->impl, ctx);

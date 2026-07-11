@@ -1398,17 +1398,19 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     /* Fused GPU Talker: the CPU batched prefill populated the host bf16 KV; upload it to the
      * device cache once so the fused decode steps (which read the device KV) see the prompt. */
     {
-        extern void *g_cuda_talker_state;
+        extern void *g_cuda_talker_state, *g_gpu_fused_owner;
         extern void qwen_cuda_talker_upload_kv(void *, qwen_tts_ctx_t *, int);
-        if (g_cuda_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f))
+        if (g_cuda_talker_state && ctx == g_gpu_fused_owner &&
+            !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f))
             qwen_cuda_talker_upload_kv(g_cuda_talker_state, ctx, ctx->kv_len);
     }
 #endif
 #ifdef QWEN_HAVE_METAL
     {
-        extern void *g_metal_talker_state;
+        extern void *g_metal_talker_state, *g_gpu_fused_owner;
         extern void qwen_metal_talker_upload_kv(void *, qwen_tts_ctx_t *, int);
-        if (g_metal_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f))
+        if (g_metal_talker_state && ctx == g_gpu_fused_owner &&
+            !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f))
             qwen_metal_talker_upload_kv(g_metal_talker_state, ctx, ctx->kv_len);
     }
 #endif

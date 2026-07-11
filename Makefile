@@ -107,6 +107,7 @@ help:
 	@echo "  make bench           - RTF benchmark (short+long, normal+stream)"
 	@echo "  make bench-full      - Full benchmark (+ server, qvoice, instruct, INT8)"
 	@echo "  make cp-microbench   - Build qwen_tts_cpbench (per-op Code Predictor breakdown)"
+	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
 	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
@@ -195,6 +196,12 @@ cp-microbench:
 	@echo ""
 	@echo "Built ./qwen_tts_cpbench  (run a normal generation; CP breakdown prints in the summary)"
 
+# Standalone speech-decoder tool: decode a QWEN_DUMP_CODES text dump (16 ints/line)
+# through the decoder alone (fixed input, no sampling) — A/B the decoder across changes.
+test-decoder-tool: $(filter-out main.o,$(OBJS)) test_decoder_standalone.o
+	$(CC) $(CFLAGS) -o qwen_tts_decoder_tool $^ $(LDLIBS)
+	@echo "Built ./qwen_tts_decoder_tool  (usage: ./qwen_tts_decoder_tool codes.txt [model_dir] [out.wav])"
+
 # Compile C sources. -MMD -MP emits a .d per object listing every header it
 # actually included, so a header edit rebuilds exactly what depends on it. The
 # hand-written list below used to do this and drifted: qwen_tts_compose.o,
@@ -220,6 +227,7 @@ qwen_tts_speech_encoder.o: qwen_tts_speech_encoder.c
 clean:
 	rm -f $(OBJS) $(OBJS:.o=.d) $(TARGET) qwen_tts_backend.o qwen_tts_cuda.o qwen_tts_metal.o qwen_tts_cuda_kernels.o
 	rm -f qwen_tts_backend.d qwen_tts_cuda.d qwen_tts_metal.d vendor/lz4.d
+	rm -f test_decoder_standalone.o test_decoder_standalone.d qwen_tts_decoder_tool
 
 # Debug build
 debug: CFLAGS = $(CFLAGS_BASE) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined

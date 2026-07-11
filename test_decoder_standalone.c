@@ -3,98 +3,98 @@
 #include <string.h>
 #include <stdint.h>
 
-/* Simple program to decode test codes using the C speech decoder */
+#include "qwen_tts.h"
 
-extern int qwen_decode_codes(const char *model_dir, const int *codes, int n_frames,
-                              int n_codebooks, float **audio_out, int *n_samples);
+/* Standalone speech-decoder test tool: decode a dumped codes file through the C
+ * speech decoder alone — no Talker/CP — and write a WAV. Useful to A/B the decoder
+ * against Python or across kernel changes with a FIXED code input (no sampling noise).
+ *
+ * Input = the QWEN_DUMP_CODES text format the engine emits: one line per frame,
+ * 16 whitespace-separated ints ("code0 c1 ... c15"). Produce one with e.g.:
+ *   QWEN_DUMP_CODES=codes.txt ./qwen_tts -d qwen3-tts-0.6b --text "..." -o /dev/null
+ * Build + run: `make test-decoder-tool` then
+ *   ./qwen_tts_decoder_tool codes.txt [model_dir] [out.wav]                       */
+
+extern int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
+                                      float **audio_out, int *n_samples);
+
+#define QDT_NCB 16   /* codebooks per frame */
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <codes.bin> [model_dir]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <codes.txt> [model_dir] [out.wav]\n", argv[0]);
+        fprintf(stderr, "  codes.txt = QWEN_DUMP_CODES output (16 ints per line, one frame per line)\n");
         return 1;
     }
-    
+
     const char *codes_file = argv[1];
     const char *model_dir = (argc > 2) ? argv[2] : "qwen3-tts-0.6b";
-    
-    /* Read codes */
-    FILE *f = fopen(codes_file, "rb");
+    const char *output = (argc > 3) ? argv[3] : "decoder_test.wav";
+
+    /* Read codes (text: one frame per line, 16 ints) */
+    FILE *f = fopen(codes_file, "r");
     if (!f) {
         fprintf(stderr, "Cannot open %s\n", codes_file);
         return 1;
     }
-    
-    int n_frames, n_codebooks;
-    fread(&n_frames, sizeof(int), 1, f);
-    fread(&n_codebooks, sizeof(int), 1, f);
-    
-    int *codes = malloc(n_frames * n_codebooks * sizeof(int));
-    fread(codes, sizeof(int), n_frames * n_codebooks, f);
+    int cap = 256, n_frames = 0;
+    int *codes = malloc((size_t)cap * QDT_NCB * sizeof(int));
+    if (!codes) { fprintf(stderr, "OOM\n"); fclose(f); return 1; }
+    for (;;) {
+        if (n_frames >= cap) {
+            cap *= 2;
+            int *t = realloc(codes, (size_t)cap * QDT_NCB * sizeof(int));
+            if (!t) { fprintf(stderr, "OOM\n"); free(codes); fclose(f); return 1; }
+            codes = t;
+        }
+        int *row = codes + (size_t)n_frames * QDT_NCB, got = 0;
+        while (got < QDT_NCB && fscanf(f, "%d", &row[got]) == 1) got++;
+        if (got == 0) break;                     /* clean EOF */
+        if (got < QDT_NCB) {
+            fprintf(stderr, "Truncated frame %d in %s (%d/%d codes)\n",
+                    n_frames, codes_file, got, QDT_NCB);
+            free(codes); fclose(f);
+            return 1;
+        }
+        n_frames++;
+    }
     fclose(f);
-    
-    printf("Loaded %d frames x %d codebooks from %s\n", n_frames, n_codebooks, codes_file);
-    
+    if (n_frames == 0) {
+        fprintf(stderr, "No frames in %s\n", codes_file);
+        free(codes);
+        return 1;
+    }
+    printf("Loaded %d frames x %d codebooks from %s\n", n_frames, QDT_NCB, codes_file);
+
+    /* Load model (decoder weights ride along with the full ctx) */
+    printf("Loading model from %s...\n", model_dir);
+    qwen_tts_ctx_t *ctx = qwen_tts_load(model_dir);
+    if (!ctx) {
+        fprintf(stderr, "Model load failed (%s)\n", model_dir);
+        free(codes);
+        return 1;
+    }
+
     /* Decode */
-    float *audio;
-    int n_samples;
-    
-    printf("Decoding with model from %s...\n", model_dir);
-    int ret = qwen_decode_codes(model_dir, codes, n_frames, n_codebooks, &audio, &n_samples);
-    
-    if (ret != 0) {
+    float *audio = NULL;
+    int n_samples = 0;
+    if (qwen_speech_decoder_decode(ctx, codes, n_frames, &audio, &n_samples) != 0) {
         fprintf(stderr, "Decoding failed!\n");
+        qwen_tts_unload(ctx);
         free(codes);
         return 1;
     }
-    
-    /* Write WAV */
-    const char *output = "/tmp/c_decoder_test.wav";
-    FILE *wav = fopen(output, "wb");
-    if (!wav) {
+
+    /* Write WAV via the engine's writer (24 kHz, 16-bit PCM mono) */
+    if (qwen_tts_write_wav(output, audio, n_samples, 24000) != 0) {
         fprintf(stderr, "Cannot write %s\n", output);
-        free(audio);
-        free(codes);
+        free(audio); qwen_tts_unload(ctx); free(codes);
         return 1;
     }
-    
-    /* Simple WAV header for 24kHz, 16-bit mono */
-    int sr = 24000;
-    int bits = 16;
-    int channels = 1;
-    int data_size = n_samples * channels * (bits/8);
-    int file_size = 36 + data_size;
-    
-    fwrite("RIFF", 1, 4, wav);
-    fwrite(&file_size, 4, 1, wav);
-    fwrite("WAVE", 1, 4, wav);
-    fwrite("fmt ", 1, 4, wav);
-    int fmt_size = 16;
-    fwrite(&fmt_size, 4, 1, wav);
-    short audio_fmt = 1;
-    fwrite(&audio_fmt, 2, 1, wav);
-    fwrite(&channels, 2, 1, wav);
-    fwrite(&sr, 4, 1, wav);
-    int byte_rate = sr * channels * (bits/8);
-    fwrite(&byte_rate, 4, 1, wav);
-    short block_align = channels * (bits/8);
-    fwrite(&block_align, 2, 1, wav);
-    fwrite(&bits, 2, 1, wav);
-    fwrite("data", 1, 4, wav);
-    fwrite(&data_size, 4, 1, wav);
-    
-    /* Write samples (clamp and convert to 16-bit) */
-    for (int i = 0; i < n_samples; i++) {
-        float s = audio[i];
-        if (s < -1.0f) s = -1.0f;
-        if (s > 1.0f) s = 1.0f;
-        int16_t sample = (int16_t)(s * 32767.0f);
-        fwrite(&sample, 2, 1, wav);
-    }
-    
-    fclose(wav);
-    printf("Wrote %s (%d samples, %.2fs)\n", output, n_samples, (float)n_samples/sr);
-    
+    printf("Wrote %s (%d samples, %.2fs)\n", output, n_samples, (float)n_samples / 24000.0f);
+
     free(audio);
+    qwen_tts_unload(ctx);
     free(codes);
     return 0;
 }

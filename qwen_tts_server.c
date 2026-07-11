@@ -719,11 +719,19 @@ static void *worker_main(void *arg) {
 
 /* ── Main server loop ────────────────────────────────────────────────── */
 
-static volatile int server_running = 1;
+static volatile sig_atomic_t server_running = 1;   /* audit: written from a signal handler */
 
 static void sigint_handler(int sig) {
     (void)sig;
     server_running = 0;
+}
+
+/* audit MED-3: a client that connects and never sends data must not hold a reader
+ * (or, in single-worker mode, the whole server) forever — bound the socket reads.
+ * 30s is generous for any legit request; streaming WRITES are unaffected (send side). */
+static void set_client_timeout(int fd) {
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 static int setup_listen_socket(int port) {
@@ -975,7 +983,7 @@ static void *reader_main(void *arg) {
 
 typedef struct {
     job_queue_t *jq;     /* batch jobs */
-    int *running;        /* &server_running */
+    volatile sig_atomic_t *running;   /* &server_running */
     int admitted, done;  /* counters for the [BATCH] log */
 } sink_ctx_t;
 
@@ -1042,12 +1050,26 @@ static int sink_running(void *ud) {
 typedef struct { qwen_tts_ctx_t *ctx; job_queue_t *jq; int max_batch; } sched_arg_t;
 static void *scheduler_main(void *arg) {
     sched_arg_t *sa = (sched_arg_t *)arg;
-    sink_ctx_t sc = { .jq = sa->jq, .running = (int *)&server_running, .admitted = 0, .done = 0 };
+    sink_ctx_t sc = { .jq = sa->jq, .running = &server_running, .admitted = 0, .done = 0 };
     qwen_batch_sink_t sink = {
         .ud = &sc, .next_job = sink_next_job, .on_done = sink_on_done,
         .on_chunk = sink_on_chunk, .running = sink_running,
     };
-    qwen_tts_serve_continuous(sa->ctx, sa->max_batch, &sink);
+    int rc = qwen_tts_serve_continuous(sa->ctx, sa->max_batch, &sink);
+    /* audit MED-1: if the batch driver died (alloc failure / no bf16 weights) while the
+     * server is still up, readers keep queueing JOB_BATCH into an unbounded queue nobody
+     * pops → every batch client hangs forever, silently. Become a 503-drain instead
+     * (mirrors the single-worker reject path) until shutdown. */
+    if (rc != 0 && server_running) {
+        fprintf(stderr, "[BATCH] FATAL: continuous scheduler failed (rc=%d) — "
+                        "draining batch jobs with 503 until shutdown\n", rc);
+        for (;;) {
+            batch_job_t *j = jq_pop(sa->jq);
+            if (!j) break;   /* shutdown + drained */
+            send_error(j->fd, 503, "batch scheduler unavailable (startup failure)");
+            close(j->fd); job_free(j);
+        }
+    }
     return NULL;
 }
 
@@ -1126,6 +1148,7 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
         struct sockaddr_in client_addr; socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
+        set_client_timeout(client_fd);
         cq_push(&cq, client_fd);
     }
 
@@ -1163,6 +1186,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
                 perror("accept");
                 continue;
             }
+            set_client_timeout(client_fd);
             handle_connection(ctx, client_fd, client_addr);
         }
         close(server_fd);
@@ -1216,6 +1240,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
             perror("accept");
             continue;
         }
+        set_client_timeout(client_fd);
         cq_push(&q, client_fd);
     }
 

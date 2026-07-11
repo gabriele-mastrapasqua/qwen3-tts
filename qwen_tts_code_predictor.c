@@ -722,14 +722,15 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
 
+    extern void *g_gpu_fused_owner;   /* audit MED-2: delegate only for the owning ctx */
 #ifdef QWEN_HAVE_CUDA
-    if (g_cuda_cp_state && ctx->cp_roughness <= 0.0f) {
+    if (g_cuda_cp_state && ctx == g_gpu_fused_owner && ctx->cp_roughness <= 0.0f) {
         qwen_cuda_cp_step(g_cuda_cp_state, x, pos);   /* x updated in place (residual stream) */
         return;
     }
 #endif
 #ifdef QWEN_HAVE_METAL
-    if (g_metal_cp_state && ctx->cp_roughness <= 0.0f) {
+    if (g_metal_cp_state && ctx == g_gpu_fused_owner && ctx->cp_roughness <= 0.0f) {
         extern void qwen_metal_cp_step(void *, float *, int);
         qwen_metal_cp_step(g_metal_cp_state, x, pos);
         return;
@@ -777,8 +778,10 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 #ifdef QWEN_HAVE_METAL
     /* Device-frame CP: whole 16-pass RVQ loop + argmax + embed on GPU, 1 sync/frame (the M1 win).
      * Falls back to the CPU/per-pass loop for steer/roughness/teacher-forcing. */
-    { extern void *g_metal_cp_frame_state; extern void qwen_metal_cp_frame(void *, const float *, int, int *);
-      if (g_metal_cp_frame_state && ctx->cp_roughness <= 0.0f && !ctx->tf_ref_codes) {
+    { extern void *g_metal_cp_frame_state, *g_gpu_fused_owner;
+      extern void qwen_metal_cp_frame(void *, const float *, int, int *);
+      if (g_metal_cp_frame_state && ctx == g_gpu_fused_owner &&
+          ctx->cp_roughness <= 0.0f && !ctx->tf_ref_codes) {
         qwen_metal_cp_frame(g_metal_cp_frame_state, talker_hidden, code0, out_codes);
         return 0;
       } }
