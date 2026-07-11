@@ -108,6 +108,30 @@ static const char *QWEN_METAL_SRC =
 "    acc = simd_sum(acc); if (tiisg == 0) y[row] = acc;\n"
 "}\n"
 "\n"
+/* Vectorized q4_0 twin (opt-in QWEN_METAL_Q4_VEC=1): float4 dot over coalesced x,
+ * scale factored out per block — the direct analog of the CPU SDOT int4 kernel.
+ * MEASURED SLOWER on M1 (bandwidth/dispatch-bound → adding ALU hurts); kept for
+ * M2+/real-NVIDIA-class compute-bound GPUs where it may flip int4 ahead of int8.
+ * See plan_v4 E4.speedup. Default OFF; the scalar matvec_q4_0 above is the M1 default. */
+"kernel void matvec_q4_0_vec(device const q4blk *W [[buffer(0)]],\n"
+"    device const float *x [[buffer(1)]], device float *y [[buffer(2)]],\n"
+"    constant uint &cols [[buffer(3)]], constant uint &rows [[buffer(4)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]], uint tiisg [[thread_index_in_simdgroup]],\n"
+"    uint sgitg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {\n"
+"    uint row = tgpig.x*nsg + sgitg; if (row >= rows) return;\n"
+"    uint bpr = cols / 32; device const q4blk *wr = W + (ulong)row * bpr; float acc = 0.0f;\n"
+"    for (uint b = tiisg; b < bpr; b += 32) {\n"
+"        device const uchar *qs = wr[b].qs;\n"
+"        device const float4 *x4 = (device const float4 *)(x + b*32);\n"
+"        float sub = 0.0f;\n"
+"        for (uint j = 0; j < 8; ++j) { uchar b0 = qs[2*j], b1 = qs[2*j+1];\n"
+"            float4 wf = float4(float(int(b0 & 0x0f) - 8), float(int(b0 >> 4) - 8),\n"
+"                               float(int(b1 & 0x0f) - 8), float(int(b1 >> 4) - 8));\n"
+"            sub += dot(wf, x4[j]); }\n"
+"        acc += sub * wr[b].scale; }\n"
+"    acc = simd_sum(acc); if (tiisg == 0) y[row] = acc;\n"
+"}\n"
+"\n"
 "kernel void rms_norm(device const float *x [[buffer(0)]],\n"
 "    device const float *w [[buffer(1)]], device float *y [[buffer(2)]],\n"
 "    constant uint &dim [[buffer(3)]], constant float &eps [[buffer(4)]],\n"
@@ -550,7 +574,16 @@ void *qwen_metal_init(void) {
         c->pso_matvec_bf16 = make_pso(dev, lib, "matvec_bf16");
         c->pso_matmat_bf16 = make_pso(dev, lib, "matmat_bf16");
         c->pso_matvec_int8 = make_pso(dev, lib, "matvec_int8");
-        c->pso_matvec_q4_0 = make_pso(dev, lib, "matvec_q4_0");
+        /* q4_0 matvec: default = scalar (fastest on M1, bandwidth-bound). Opt-in the
+         * vectorized twin with QWEN_METAL_Q4_VEC=1 for M2+/compute-bound GPUs (untested there;
+         * measured a regression on M1 — see plan_v4 E4.speedup). Swapping the pso here covers
+         * both the standalone matvec and the fused Talker/CP enc_mv path. */
+        const char *q4vec = getenv("QWEN_METAL_Q4_VEC");
+        int use_q4vec = (q4vec && q4vec[0] == '1');
+        c->pso_matvec_q4_0 = make_pso(dev, lib, use_q4vec ? "matvec_q4_0_vec" : "matvec_q4_0");
+        if (use_q4vec)
+            fprintf(stderr, "[metal] q4_0 matvec: VECTORIZED twin (QWEN_METAL_Q4_VEC=1) — "
+                            "experimental, for M2+/compute-bound GPUs (slower on M1)\n");
         c->pso_rms    = make_pso(dev, lib, "rms_norm");
         c->pso_swiglu = make_pso(dev, lib, "swiglu");
         c->pso_silu   = make_pso(dev, lib, "silu");
