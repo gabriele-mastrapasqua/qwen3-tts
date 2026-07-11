@@ -1059,7 +1059,7 @@ static int cp_lm_argmax(qwen_tts_ctx_t *ctx, const float *normed, int g, int ch,
 }
 
 static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
-                           float *x, float *x_norm, int pos, int layer, const int *active) {
+                           float *x, float *x_norm, int pos, int layer, const uint8_t *active) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h, cqd = bb->cp_q_dim, ckvd = bb->cp_kv_dim, cint = bb->cp_inter;
     float eps = c->rms_norm_eps, ascale = 1.0f / sqrtf((float)c->cp_head_dim);
@@ -1120,7 +1120,7 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 }
 
 static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
-                                      float *x, float *x_norm, int pos, const int *active) {
+                                      float *x, float *x_norm, int pos, const uint8_t *active) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h; float eps = c->rms_norm_eps;
 #ifdef QWEN_HAVE_CUDA
@@ -1150,7 +1150,7 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 
 int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                           const float *talker_hidden, const int *code0, int *out_codes,
-                          const int *active) {
+                          const uint8_t *active) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h, h = c->hidden_size, emb_dim = ctx->cp_emb_dim;
     /* Sanity: the mmapped bf16 weights must exist (they always do after a successful load —

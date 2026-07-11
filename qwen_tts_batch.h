@@ -62,7 +62,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
  * x86 follow-up, see plan_v4). */
 int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                           const float *talker_hidden, const int *code0, int *out_codes,
-                          const int *active);
+                          const uint8_t *active);
 
 /* Allocate batched buffers + B KV caches from ctx config. kv_max = max frames per
  * chunk. Returns NULL on OOM or if the model isn't bf16 (v1 limitation). */
