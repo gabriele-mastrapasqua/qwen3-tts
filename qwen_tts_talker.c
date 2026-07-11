@@ -1344,7 +1344,7 @@ int qwen_batch_self_test(qwen_tts_ctx_t *ctx) {
         int cp_unsupported = 0, diff_mv = 0, diff_mm = 0;
         for (int mode = 0; mode < 2; mode++) {
             bb->force_matvec = (mode == 0);
-            if (qwen_batch_cp_predict(ctx, bb, th, c0, bat) == -2) { cp_unsupported = 1; break; }
+            if (qwen_batch_cp_predict(ctx, bb, th, c0, bat, NULL) == -2) { cp_unsupported = 1; break; }
             int diff = 0;
             for (int i = 0; i < B * 15; i++) if (bat[i] != ref[i]) diff++;
             if (mode == 0) diff_mv = diff; else diff_mm = diff;
@@ -1411,7 +1411,7 @@ int qwen_batch_bench(qwen_tts_ctx_t *ctx) {
     for (int s = 0; s < K; s++) {
         for (int b = 0; b < B; b++) memcpy(embB + (size_t)b * h, emb + (size_t)s * h, h * sizeof(float));
         qwen_batch_talker_step(ctx, bb, embB, hid);
-        qwen_batch_cp_predict(ctx, bb, hid, c0, codes);
+        qwen_batch_cp_predict(ctx, bb, hid, c0, codes, NULL);
     }
     NOW(t1); double t_batch = MS(t0, t1);
 

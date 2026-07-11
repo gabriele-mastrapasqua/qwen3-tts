@@ -1964,7 +1964,7 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
             if (n_active == 0) break;
 
             /* 2. batched Code Predictor (lockstep; inactive use code0=0, ignored) */
-            qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes);
+            qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes, NULL);
 
             /* 3. per-chunk: record frame + build next-step embedding */
             for (int b = 0; b < B; b++) {
@@ -2147,7 +2147,7 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
             if (n_active == 0) break;
 
             /* 2. batched Code Predictor */
-            qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes);
+            qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes, NULL);
 
             /* 3. per-slot: record frame + build next-step embedding */
             for (int b = 0; b < B; b++) {
@@ -2580,7 +2580,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         if (n_active == 0) continue;
 
         /* ---- batched CP over all slots (inactive use code0=0) ---- */
-        qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes);
+        qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes, active);
 
         /* ---- record frame + build next embedding ---- */
         for (int b = 0; b < B; b++) {

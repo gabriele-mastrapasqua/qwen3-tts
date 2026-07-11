@@ -54,9 +54,15 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 
 /* One batched Code Predictor: for B frames, talker_hidden[B*hidden] + code0[B] ->
  * out_codes[B*15]. Reuses the CP layer math, batching the matvecs. Returns 0 ok,
- * -2 if non-bf16. (kv reset internally; B sequences in lockstep.) */
+ * -2 if non-bf16. (kv reset internally; B sequences in lockstep.)
+ * `active` (may be NULL = all active): slot compaction (rental-prep, audit MED-5) —
+ * inactive slots skip ALL per-slot vector work (mtp projection, lm_head argmax,
+ * rope/attn/norm/swiglu); their out_codes are zeroed. The batched matmats still run
+ * full-B width (near-free on bandwidth-bound ARM; the B_eff-gather deep cut is the
+ * x86 follow-up, see plan_v4). */
 int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
-                          const float *talker_hidden, const int *code0, int *out_codes);
+                          const float *talker_hidden, const int *code0, int *out_codes,
+                          const int *active);
 
 /* Allocate batched buffers + B KV caches from ctx config. kv_max = max frames per
  * chunk. Returns NULL on OOM or if the model isn't bf16 (v1 limitation). */

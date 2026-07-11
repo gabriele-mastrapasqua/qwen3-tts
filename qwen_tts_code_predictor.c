@@ -1059,18 +1059,20 @@ static int cp_lm_argmax(qwen_tts_ctx_t *ctx, const float *normed, int g, int ch,
 }
 
 static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
-                           float *x, float *x_norm, int pos, int layer) {
+                           float *x, float *x_norm, int pos, int layer, const int *active) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h, cqd = bb->cp_q_dim, ckvd = bb->cp_kv_dim, cint = bb->cp_inter;
     float eps = c->rms_norm_eps, ascale = 1.0f / sqrtf((float)c->cp_head_dim);
     int fm = bb->force_matvec;
     qwen_cp_layer_t *l = &ctx->cp_layers[layer];
+#define CP_SKIP(b) (active && !active[b])   /* slot compaction: inactive skip per-slot vector work */
 
     /* x_norm = RMSNorm(x) already on entry. QKV (batched, precision-aware) */
     qwen_batch_proj_q(bb->cp_q, l->wq_bf16, l->wq_int8, l->wq_scale, l->wq_q4, x_norm, cqd,  ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
     qwen_batch_proj_q(bb->cp_k, l->wk_bf16, l->wk_int8, l->wk_scale, l->wk_q4, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
     qwen_batch_proj_q(bb->cp_v, l->wv_bf16, l->wv_int8, l->wv_scale, l->wv_q4, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++) {
+        if (CP_SKIP(b)) continue;
         qwen_rms_norm_per_head(bb->cp_q + (size_t)b * cqd,  l->q_norm, 1, c->cp_num_heads,    c->cp_head_dim, eps);
         qwen_rms_norm_per_head(bb->cp_k + (size_t)b * ckvd, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
         apply_rope_neox(bb->cp_q + (size_t)b * cqd,  c->cp_num_heads,    c->cp_head_dim, ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
@@ -1085,32 +1087,40 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     }
     /* O projection (batched, precision-aware) + residual + post-attn norm */
     qwen_batch_proj_q(bb->cp_proj, l->wo_bf16, l->wo_int8, l->wo_scale, l->wo_q4, bb->cp_attn, ch, cqd, cqd, B, fm, bb->cp_Xt, bb->cp_Yt);
-    for (int b = 0; b < B; b++)
+    for (int b = 0; b < B; b++) {
+        if (CP_SKIP(b)) continue;
         qwen_rms_norm_residual(x_norm + (size_t)b * ch, x + (size_t)b * ch,
                                bb->cp_proj + (size_t)b * ch, l->post_attn_norm, ch, eps);
+    }
     /* gate+up (batched, precision-aware) + SwiGLU per frame */
     qwen_batch_proj_q(bb->cp_gate, l->gate_up_fused_bf16, l->gate_up_fused_int8, l->gate_up_fused_scale,
                       l->gate_up_fused_q4, x_norm, 2 * cint, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
-    for (int b = 0; b < B; b++)
+    for (int b = 0; b < B; b++) {
+        if (CP_SKIP(b)) continue;
         qwen_swiglu_inplace(bb->cp_gate + (size_t)b * 2 * cint, bb->cp_swiglu_tmp, cint);
+    }
     /* down (batched, precision-aware) */
     qwen_batch_proj_q(bb->cp_proj, l->down_bf16, l->down_int8, l->down_scale, l->down_q4,
                       bb->cp_gate, ch, cint, 2 * cint, B, fm, bb->cp_Xt, bb->cp_Yt);
     /* residual (+ next layer input norm, or plain add on last layer) */
     if (layer + 1 < c->cp_num_layers) {
-        for (int b = 0; b < B; b++)
+        for (int b = 0; b < B; b++) {
+            if (CP_SKIP(b)) continue;
             qwen_rms_norm_residual(x_norm + (size_t)b * ch, x + (size_t)b * ch,
                                    bb->cp_proj + (size_t)b * ch, ctx->cp_layers[layer + 1].input_norm, ch, eps);
+        }
     } else {
         for (int b = 0; b < B; b++) {
+            if (CP_SKIP(b)) continue;
             float *xb = x + (size_t)b * ch, *pb = bb->cp_proj + (size_t)b * ch;
             for (int i = 0; i < ch; i++) xb[i] += pb[i];
         }
     }
+#undef CP_SKIP
 }
 
 static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
-                                      float *x, float *x_norm, int pos) {
+                                      float *x, float *x_norm, int pos, const int *active) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h; float eps = c->rms_norm_eps;
 #ifdef QWEN_HAVE_CUDA
@@ -1130,14 +1140,17 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         return;
     }
 #endif
-    for (int b = 0; b < B; b++)
+    for (int b = 0; b < B; b++) {
+        if (active && !active[b]) continue;
         qwen_rms_norm(x_norm + (size_t)b * ch, x + (size_t)b * ch, ctx->cp_layers[0].input_norm, 1, ch, eps);
+    }
     for (int layer = 0; layer < c->cp_num_layers; layer++)
-        batch_cp_layer(ctx, bb, x, x_norm, pos, layer);
+        batch_cp_layer(ctx, bb, x, x_norm, pos, layer, active);
 }
 
 int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
-                          const float *talker_hidden, const int *code0, int *out_codes) {
+                          const float *talker_hidden, const int *code0, int *out_codes,
+                          const int *active) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h, h = c->hidden_size, emb_dim = ctx->cp_emb_dim;
     /* Sanity: the mmapped bf16 weights must exist (they always do after a successful load —
@@ -1148,23 +1161,29 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
     float emb_buf[4096], normed[2048];
 
+#define CPB_SKIP(b) (active && !active[b])   /* slot compaction (MED-5): see qwen_tts_batch.h */
+
     /* step 0: project talker hidden */
-    for (int b = 0; b < B; b++)
+    for (int b = 0; b < B; b++) {
+        if (CPB_SKIP(b)) { memset(cx + (size_t)b * ch, 0, ch * sizeof(float)); continue; }
         cp_mtp_project(ctx, cx + (size_t)b * ch, talker_hidden + (size_t)b * h);
-    batch_cp_transformer_step(ctx, bb, cx, cxn, 0);
+    }
+    batch_cp_transformer_step(ctx, bb, cx, cxn, 0, active);
 
     /* step 1: embed code0 via the Talker codec embedding */
     for (int b = 0; b < B; b++) {
+        if (CPB_SKIP(b)) continue;   /* cx slot already zeroed at step 0 */
         int code0_b = code0[b];
         if (ctx->codec_embedding_bf16 && code0_b >= 0 && code0_b < c->codec_vocab_size) {
             qwen_bf16_to_f32_vec(emb_buf, ctx->codec_embedding_bf16 + (int64_t)code0_b * h, h);
             cp_mtp_project(ctx, cx + (size_t)b * ch, emb_buf);
         } else memset(cx + (size_t)b * ch, 0, ch * sizeof(float));
     }
-    batch_cp_transformer_step(ctx, bb, cx, cxn, 1);
+    batch_cp_transformer_step(ctx, bb, cx, cxn, 1, active);
 
     /* codebook 0 per frame (greedy argmax) */
     for (int b = 0; b < B; b++) {
+        if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + 0] = 0; continue; }
         qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
         out_codes[(size_t)b * 15 + 0] = cp_lm_argmax(ctx, normed, 0, ch, c->codebook_size);
     }
@@ -1173,17 +1192,20 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     for (int g = 1; g < 15; g++) {
         int pos = g + 1;
         for (int b = 0; b < B; b++) {
+            if (CPB_SKIP(b)) continue;
             int prev = out_codes[(size_t)b * 15 + (g - 1)];
             if (ctx->cp_codec_emb_bf16[g - 1] && prev >= 0 && prev < c->codebook_size) {
                 qwen_bf16_to_f32_vec(emb_buf, ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev * emb_dim, emb_dim);
                 cp_mtp_project(ctx, cx + (size_t)b * ch, emb_buf);
             } else memset(cx + (size_t)b * ch, 0, ch * sizeof(float));
         }
-        batch_cp_transformer_step(ctx, bb, cx, cxn, pos);
+        batch_cp_transformer_step(ctx, bb, cx, cxn, pos, active);
         for (int b = 0; b < B; b++) {
+            if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + g] = 0; continue; }
             qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
             out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, normed, g, ch, c->codebook_size);
         }
     }
     return 0;
+#undef CPB_SKIP
 }
