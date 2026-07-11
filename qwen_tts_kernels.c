@@ -992,11 +992,112 @@ static void bf16_mm_task(size_t tid, size_t nt, void *vc) {
  * NULL = CPU default. This is where the GPU's matrix-unit (MMA) win lands. */
 void (*g_qwen_matmat_bf16_hook)(float *, const uint16_t *, const float *, int, int, int) = NULL;
 
+/* ── ARM MMLA batched matmat twins (rental-prep, 2026-07-11) ──────────────────
+ * BFMMLA (bf16) + SMMLA (i8mm): the native 2x2-tile matrix-multiply units on
+ * M2+/M3/M4, Neoverse V1/V2, Graviton3+. Compile-time guarded — on the M1 these
+ * guards are false and the scalar/NEON twins below stay the path; `make
+ * check-isa` (-march=armv8.6-a+bf16+i8mm) keeps them compiling from the M1.
+ * These are exactly the "AVAILABLE but UNUSED (PLAN 21.3b)" paths in --caps.
+ * Numerics: BFMMLA computes bf16×bf16→f32 with the ACTIVATION truncated to bf16
+ * (same truncation as the KV cache) → vs the f32-activation twin expect ~1e-3
+ * L2 (self-test threshold relaxed to 1e-2 under this guard). SMMLA reuses the
+ * per-column int8 activation quant → integer-exact per column vs SDOT.
+ * A/B kill-switches on the box: QWEN_NO_BFMMLA=1 / QWEN_NO_SMMLA=1. */
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+static inline float qbf16_to_f32(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16; float f; memcpy(&f, &u, 4); return f;
+}
+static void bf16_matmat_bfmmla_slice(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                     int r0, int r1, int cols, int B) {
+    /* Xb: [B][cols] bf16 bits (pre-transposed + truncated). 2-row × 2-col tiles, k step 4. */
+    int r = r0;
+    for (; r + 1 < r1; r += 2) {
+        const bfloat16_t *w0 = (const bfloat16_t *)(W + (size_t)r * cols);
+        const bfloat16_t *w1 = (const bfloat16_t *)(W + (size_t)(r + 1) * cols);
+        int j = 0;
+        for (; j + 1 < B; j += 2) {
+            const bfloat16_t *x0 = (const bfloat16_t *)(Xb + (size_t)j * cols);
+            const bfloat16_t *x1 = (const bfloat16_t *)(Xb + (size_t)(j + 1) * cols);
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 3 < cols; k += 4) {
+                bfloat16x8_t a = vcombine_bf16(vld1_bf16(w0 + k), vld1_bf16(w1 + k));
+                bfloat16x8_t b = vcombine_bf16(vld1_bf16(x0 + k), vld1_bf16(x1 + k));
+                acc = vbfmmlaq_f32(acc, a, b);   /* lanes: [r·c, r·c1, r1·c, r1·c1] */
+            }
+            float t[4]; vst1q_f32(t, acc);
+            for (; k < cols; k++) {              /* k tail (cols%4!=0 — not hit by model dims) */
+                float wv0 = qbf16_to_f32(W[(size_t)r * cols + k]);
+                float wv1 = qbf16_to_f32(W[(size_t)(r + 1) * cols + k]);
+                float xv0 = qbf16_to_f32(Xb[(size_t)j * cols + k]);
+                float xv1 = qbf16_to_f32(Xb[(size_t)(j + 1) * cols + k]);
+                t[0] += wv0 * xv0; t[1] += wv0 * xv1; t[2] += wv1 * xv0; t[3] += wv1 * xv1;
+            }
+            Y[(size_t)r * B + j]           = t[0];
+            Y[(size_t)r * B + j + 1]       = t[1];
+            Y[(size_t)(r + 1) * B + j]     = t[2];
+            Y[(size_t)(r + 1) * B + j + 1] = t[3];
+        }
+        for (; j < B; j++) {                     /* odd-B col tail */
+            float s0 = 0.0f, s1 = 0.0f;
+            for (int k = 0; k < cols; k++) {
+                float xv = qbf16_to_f32(Xb[(size_t)j * cols + k]);
+                s0 += qbf16_to_f32(W[(size_t)r * cols + k]) * xv;
+                s1 += qbf16_to_f32(W[(size_t)(r + 1) * cols + k]) * xv;
+            }
+            Y[(size_t)r * B + j] = s0; Y[(size_t)(r + 1) * B + j] = s1;
+        }
+    }
+    for (; r < r1; r++) {                        /* odd-rows tail */
+        for (int j = 0; j < B; j++) {
+            float s = 0.0f;
+            for (int k = 0; k < cols; k++)
+                s += qbf16_to_f32(W[(size_t)r * cols + k]) * qbf16_to_f32(Xb[(size_t)j * cols + k]);
+            Y[(size_t)r * B + j] = s;
+        }
+    }
+}
+typedef struct { float *Y; const uint16_t *W; const uint16_t *Xb; int rows, cols, B; } bfmmla_ctx;
+static void bfmmla_task(size_t tid, size_t nt, void *vc) {
+    bfmmla_ctx *c = (bfmmla_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt), r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    r0 &= ~1; if (tid + 1 < nt) r1 &= ~1;        /* keep 2-row tiles within one slice */
+    bf16_matmat_bfmmla_slice(c->Y, c->W, c->Xb, r0, r1, c->cols, c->B);
+}
+#endif /* __ARM_FEATURE_BF16_VECTOR_ARITHMETIC */
+
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
     if (g_qwen_matmat_bf16_hook) { g_qwen_matmat_bf16_hook(Y, W, X, rows, cols, B); return; }
     if (B <= 0) return;
     if (B > 64) B = 64;  /* contract: B<=64 */
     int nt = g_n_threads;
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    /* Native bf16 GEMM (BFMMLA). Transpose+truncate X once ([cols][B] f32 →
+     * [B][cols] bf16 bits) then 2x2 MMLA tiles. QWEN_NO_BFMMLA=1 opts out. */
+    {
+        static atomic_int no_bfmmla = -1;
+        int nb = atomic_load_explicit(&no_bfmmla, memory_order_relaxed);
+        if (nb < 0) { const char *e = getenv("QWEN_NO_BFMMLA"); nb = (e && e[0] == '1'); atomic_store_explicit(&no_bfmmla, nb, memory_order_relaxed); }
+        if (!nb && B >= 2) {
+            uint16_t *Xb = (uint16_t *)malloc((size_t)B * cols * sizeof(uint16_t));
+            if (Xb) {
+                for (int b = 0; b < B; b++)
+                    for (int k = 0; k < cols; k++) {
+                        uint32_t u; memcpy(&u, &X[(size_t)k * B + b], 4);
+                        Xb[(size_t)b * cols + k] = (uint16_t)(u >> 16);   /* truncate, like the KV */
+                    }
+                if (nt > 1 && rows >= 256) {
+                    bfmmla_ctx c = { Y, W, Xb, rows, cols, B };
+                    qwen_parallel((size_t)nt, bfmmla_task, &c);
+                } else {
+                    bf16_matmat_bfmmla_slice(Y, W, Xb, 0, rows, cols, B);
+                }
+                free(Xb);
+                return;
+            }
+        }
+    }
+#endif
     if (nt > 1 && rows >= 256) {
         bf16_mm_ctx c = { Y, W, X, rows, cols, B };
         qwen_parallel((size_t)nt, bf16_mm_task, &c);
@@ -1130,8 +1231,9 @@ static void int8_smm_task(size_t tid, size_t nt, void *vc) {
 }
 #endif /* __ARM_FEATURE_DOTPROD */
 
-#if defined(__AVX512VNNI__)
-/* Quantize column b of the [cols][B] activation matrix X to int8 (per-column absmax). */
+/* Quantize column b of the [cols][B] activation matrix X to int8 (per-column absmax).
+ * Plain C — shared by the x86 VNNI matmat AND the ARM i8mm SMMLA matmat (rental-prep),
+ * so it lives OUTSIDE the ISA guards (it was VNNI-guarded; check-isa caught the ARM use). */
 static float quantize_act_int8_col(int8_t *qb, const float *X, int cols, int B, int b) {
     float amax = 0.0f;
     for (int k = 0; k < cols; k++) { float a = fabsf(X[(size_t)k * B + b]); if (a > amax) amax = a; }
@@ -1143,6 +1245,7 @@ static float quantize_act_int8_col(int8_t *qb, const float *X, int cols, int B, 
     }
     return amax / 127.0f;
 }
+#if defined(__AVX512VNNI__)
 /* ── int8 VNNI batched matmat (the x86 int8 GEMM the SDOT comment above asks for) ──
  * Y[rows,B] = (W_int8 @ qXt^T)·scales. Weight-stationary: each 64-int8 W block is
  * loaded ONCE and dpbusd'd against all B pre-quantized activation columns. VNNI is
@@ -1185,6 +1288,64 @@ static void int8_vmm_task(size_t tid, size_t nt, void *vc) {
 }
 #endif /* __AVX512VNNI__ */
 
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+/* i8mm SMMLA int8 GEMM slice (see the dispatch note in qwen_matmat_int8). */
+static void int8_matmat_smmla_slice(float *Y, const int8_t *W, const float *scale,
+                                    const int8_t *qXt, const float *sx,
+                                    int r0, int r1, int cols, int B) {
+    int r = r0;
+    for (; r + 1 < r1; r += 2) {
+        const int8_t *w0 = W + (size_t)r * cols, *w1 = W + (size_t)(r + 1) * cols;
+        int j = 0;
+        for (; j + 1 < B; j += 2) {
+            const int8_t *x0 = qXt + (size_t)j * cols, *x1 = qXt + (size_t)(j + 1) * cols;
+            int32x4_t acc = vdupq_n_s32(0);
+            int k = 0;
+            for (; k + 7 < cols; k += 8) {
+                int8x16_t a = vcombine_s8(vld1_s8(w0 + k), vld1_s8(w1 + k));
+                int8x16_t b = vcombine_s8(vld1_s8(x0 + k), vld1_s8(x1 + k));
+                acc = vmmlaq_s32(acc, a, b);   /* lanes: [r·c, r·c1, r1·c, r1·c1] */
+            }
+            int32_t t[4]; vst1q_s32(t, acc);
+            for (; k < cols; k++) {
+                t[0] += w0[k] * x0[k]; t[1] += w0[k] * x1[k];
+                t[2] += w1[k] * x0[k]; t[3] += w1[k] * x1[k];
+            }
+            Y[(size_t)r * B + j]           = (float)t[0] * scale[r]     * sx[j];
+            Y[(size_t)r * B + j + 1]       = (float)t[1] * scale[r]     * sx[j + 1];
+            Y[(size_t)(r + 1) * B + j]     = (float)t[2] * scale[r + 1] * sx[j];
+            Y[(size_t)(r + 1) * B + j + 1] = (float)t[3] * scale[r + 1] * sx[j + 1];
+        }
+        for (; j < B; j++) {
+            const int8_t *xj = qXt + (size_t)j * cols;
+            int64_t s0 = 0, s1 = 0;
+            for (int k = 0; k < cols; k++) { s0 += w0[k] * xj[k]; s1 += w1[k] * xj[k]; }
+            Y[(size_t)r * B + j]       = (float)s0 * scale[r]     * sx[j];
+            Y[(size_t)(r + 1) * B + j] = (float)s1 * scale[r + 1] * sx[j];
+        }
+    }
+    for (; r < r1; r++) {
+        const int8_t *w = W + (size_t)r * cols;
+        for (int j = 0; j < B; j++) {
+            const int8_t *xj = qXt + (size_t)j * cols;
+            int64_t s = 0;
+            for (int k = 0; k < cols; k++) s += w[k] * xj[k];
+            Y[(size_t)r * B + j] = (float)s * scale[r] * sx[j];
+        }
+    }
+}
+typedef struct {
+    float *Y; const int8_t *W; const float *scale; const int8_t *qXt; const float *sx;
+    int rows, cols, B;
+} int8_smmla_ctx;
+static void int8_smmla_task(size_t tid, size_t nt, void *vc) {
+    int8_smmla_ctx *c = (int8_smmla_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt), r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    r0 &= ~1; if (tid + 1 < nt) r1 &= ~1;   /* keep 2-row tiles within one slice */
+    int8_matmat_smmla_slice(c->Y, c->W, c->scale, c->qXt, c->sx, r0, r1, c->cols, c->B);
+}
+#endif /* __ARM_FEATURE_MATMUL_INT8 */
+
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B) {
     if (B <= 0) return;
@@ -1208,6 +1369,34 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                     qwen_parallel((size_t)nt, int8_vmm_task, &c);
                 } else {
                     int8_matmat_vnni_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
+                }
+                free(qXt);
+                return;
+            }
+        }
+    }
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    /* i8mm SMMLA batched path — the TRUE int8 GEMM primitive the SDOT note below
+     * asks for (M2+/Neoverse-V1+/Graviton3+; compile-guarded, absent on M1).
+     * 2x2 tiles: vmmlaq_s32 does 2 rows × 2 cols × 8-deep per instruction.
+     * Reuses the per-column activation quant. QWEN_NO_SMMLA=1 opts out. */
+    {
+        static atomic_int no_smmla = -1;
+        int ns = atomic_load_explicit(&no_smmla, memory_order_relaxed);
+        if (ns < 0) { const char *e = getenv("QWEN_NO_SMMLA"); ns = (e && e[0] == '1'); atomic_store_explicit(&no_smmla, ns, memory_order_relaxed); }
+        if (!ns && B >= 2 && B <= 16) {
+            int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
+            if (qXt) {
+                float sx[16];
+                for (int b = 0; b < B; b++)
+                    sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+                int nt2 = g_n_threads;
+                if (nt2 > 1 && rows >= 256) {
+                    int8_smmla_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
+                    qwen_parallel((size_t)nt2, int8_smmla_task, &c);
+                } else {
+                    int8_matmat_smmla_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
                 free(qXt);
                 return;
@@ -4045,9 +4234,17 @@ int qwen_kernel_selftest(void *out) {
                     }
                 }
                 double l2rel = l2d > 0 ? sqrt(l2n / l2d) : 0.0;
+                /* BFMMLA builds truncate the ACTIVATION to bf16 (native bf16 GEMM) →
+                 * ~1e-3 L2 vs the f32-activation matvec is the expected correct value,
+                 * not a defect (same class as the int8 act-quant tolerance). */
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+                const double mmthr = 1e-2;
+#else
+                const double mmthr = 1e-4;
+#endif
                 fprintf(f, "  [%4dx%4d] matmat(B=%d) vs B*matvec: L2_rel=%.2e  %s\n",
-                        rows, cols, B, l2rel, l2rel < 1e-4 ? "PASS" : "FAIL");
-                if (!(l2rel < 1e-4)) failures++;
+                        rows, cols, B, l2rel, l2rel < mmthr ? "PASS" : "FAIL");
+                if (!(l2rel < mmthr)) failures++;
             }
             free(Xb); free(Yb); free(xb); free(yc);
         }
