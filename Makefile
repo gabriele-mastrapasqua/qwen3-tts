@@ -650,7 +650,7 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression test-errors test-emotion test-emotion-ft test-compose test-caps test-selftest test-golden
+test-all: test-small test-large test-regression test-errors test-emotion test-emotion-ft test-compose test-caps test-selftest test-golden test-serve-repro
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
@@ -951,15 +951,9 @@ test-serve-repro: $(TARGET)
 	     -d "$$REQ" -o $(TEST_DIR)/repro_$$n.wav; \
 	 done; \
 	 kill $$SERVER_PID 2>/dev/null; \
-	 M1=$$(md5sum $(TEST_DIR)/repro_1.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/repro_1.wav 2>/dev/null); \
-	 M2=$$(md5sum $(TEST_DIR)/repro_2.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/repro_2.wav 2>/dev/null); \
-	 M3=$$(md5sum $(TEST_DIR)/repro_3.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/repro_3.wav 2>/dev/null); \
 	 S1=$$(stat -f%z $(TEST_DIR)/repro_1.wav 2>/dev/null || stat -c%s $(TEST_DIR)/repro_1.wav 2>/dev/null); \
-	 echo "  run1=$$M1 ($$S1 B)  run2=$$M2  run3=$$M3"; \
 	 if [ "$$S1" -le 44 ]; then echo "FAIL: empty WAV"; exit 1; fi; \
-	 if [ "$$M1" != "$$M2" ] || [ "$$M2" != "$$M3" ]; then \
-	   echo "FAIL: identical requests produced DIFFERENT output (state leaks between requests)"; exit 1; fi; \
-	 echo "PASS: 3 identical requests are bit-identical"
+	 python3 tests/compare_repro.py $(TEST_DIR)/repro_1.wav $(TEST_DIR)/repro_2.wav $(TEST_DIR)/repro_3.wav
 	@echo ""
 
 # ── Combined server tests ──
