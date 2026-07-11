@@ -46,6 +46,32 @@ kernel efficiency and clocks):
 
 The 0.6B model is proportionally faster (smaller Talker).
 
+> ⚠️ **The scaling has a floor — measured on an A100 (2026-07-11).** A cloud **A100-SXM4-40GB**
+> (HBM2, ~1.5 TB/s — 5–6× the reference card) measured **0.50–0.55**, not the ~0.1 the table
+> would extrapolate: past the point where weights stream fast enough, single-stream decode
+> becomes **kernel-launch-latency-bound** (hundreds of small dependent launches per frame,
+> costlier on virtualized cloud GPUs). Big-bandwidth cards pay off in **batch throughput**,
+> not single-stream latency — same lesson as Apple-silicon Metal.
+
+## Measured: datacenter A100 (Verda cloud, A100-SXM4-40GB, 2026-07-11)
+
+Full recipe (`QWEN_CUDA_FUSED_TALKER=1 QWEN_CUDA_CONVDEC=1`), seed-pinned, greedy:
+
+| Config | RTF |
+|--------|-----|
+| 0.6B bf16 / int4 | **0.39** |
+| 1.7B `--quant-mixed` | 0.55 |
+| 1.7B `--quant-mixed` + `QWEN_CUDA_DP4A=1` | **0.50** |
+
+- **`QWEN_CUDA_DP4A=1` (int4 weights × int8-quantized activations, integer `__dp4a` dots)** is a
+  measured win on real NVIDIA: **1.7B Talker 8.4 → 5.6 ms/f (−33%)**, 0.6B Talker −19% / CP −16%,
+  ear-validated. Opt-in for now; the plain q4 kernel (f32 activations) stays the default.
+- Without `QWEN_CUDA_CONVDEC=1` the speech decoder runs on the host CPU — on a weak cloud host
+  that alone was the difference between RTF 0.94 and 0.39. **Always set both env vars.**
+- **Batch throughput (B=8, 1.7B quant-mixed):** 8 concurrent requests = 30 s wall for 63.5 s of
+  audio → **aggregate RTF 0.47, ~2.1× throughput**; per-request RTF in batch mode 1.27 (the known
+  latency/throughput trade).
+
 ## Throughput — server batching (`--serve --batch-size N`)
 
 With concurrent requests, the per-request matvecs become a **matmat** (each weight row read once
@@ -95,6 +121,9 @@ Flags / env:
 - `QWEN_CUDA_FUSED_TALKER=1` — GPU-resident fused Talker + Code Predictor.
 - `QWEN_CUDA_CONVDEC=1` — GPU-resident ConvNet speech decoder.
 - `QWEN_CUDA_BATCH=1` — GPU-batched fused steps for the server (`--batch-size N`, N ≤ 8).
+- `QWEN_CUDA_DP4A=1` — int4 matvec via integer `__dp4a` (activation quantized to int8 per
+  32-block, even/odd-deinterleaved to match q4_0 packing). Measured −33% Talker ms/f on A100
+  (1.7B); trajectory forks vs the f32-act kernel (act-quant numerics, benign — ear-validated).
 
 ## Notes
 

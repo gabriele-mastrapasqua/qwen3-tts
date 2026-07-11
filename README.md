@@ -453,8 +453,10 @@ re-reads its weights 16×/frame): SIMD width and thread count matter less than f
 (`--int8`/`--int4`) and a cache that fits the working set (Apple's SLC, an X3D chip's V-cache). On
 cache-rich Apple Silicon **int4 is the fastest lever**; on x86 **int8+VNNI wins the wall clock** (int4 and
 int8 fork the greedy trajectory, so compare kernel ms/frame, not wall RTF — there the q4-VNNI v3
-throughput kernel now edges int8). Many-core servers are best for **throughput** (concurrent requests), not
-single-stream latency. Check yours: `./qwen_tts --caps`.
+throughput kernel now edges int8). This holds for 1.7B too: on x86 pure `--int8` beats `--quant-mixed`
+(quant-mixed is the Apple-silicon config). Many-core servers are best for **throughput** (concurrent
+requests), not single-stream latency. Check yours: `./qwen_tts --caps` (on x86, build with
+`make blas SIMD=avx512vnni` to enable the VNNI kernels — the default build is portable AVX2).
 
 **Concurrent serving — request batching (`--serve --batch-size N`).** For *N users at once*, the server
 can step their requests **together** through the model (vLLM-style): weights are read from memory **once**
@@ -498,15 +500,20 @@ upload — e.g. ~3.6 s cold vs 469 ms warm on M1-0.6B). Metal beats the native M
 (bandwidth-rich → int4's nibble-unpack doesn't pay). Resident decode is bit-identical to the CPU path.
 *(Multi-user concurrency → the batching table below.)*
 
-**NVIDIA CUDA** — `make cuda` (resident fused + cuBLAS pointwise convs + CUDA graphs), 1.7B, on a mainstream
-**~270 GB/s GPU (RTX 4060-class)**. **Single-stream latency** (one request):
+**NVIDIA CUDA** — `make cuda` (resident fused + cuBLAS pointwise convs + CUDA graphs). One multi-arch
+binary (Ampere/Ada/Blackwell). **Single-stream latency** (one request), measured:
 
-| Config | RTF (single stream) |
-|---|---|
-| Resident fused (`--quant-mixed`: int4 Talker + int8 CP) | **0.44** |
+| GPU | Config | RTF (single stream) |
+|---|---|---|
+| RTX 4060-class (~270 GB/s) | 1.7B `--quant-mixed` | **0.44** |
+| **A100-SXM4-40GB** (cloud) | 0.6B (bf16 or int4) | **0.39** |
+| **A100-SXM4-40GB** (cloud) | 1.7B `--quant-mixed` + `QWEN_CUDA_DP4A=1` | **0.50** |
 
-Decode is bandwidth-bound, so RTF scales with memory bandwidth: RTX 3060 ~0.33 · 4070 ~0.24 · 4090 ~0.12
-(estimates; 4060-class is measured).
+`QWEN_CUDA_DP4A=1` (new, opt-in) runs int4 weights against int8-quantized activations with integer
+`__dp4a` dots: **1.7B Talker −33% ms/f on the A100**, ear-validated. Note the honest scaling limit:
+decode is bandwidth-bound only up to a point — past it, single-stream becomes **launch-latency-bound**
+(the A100's 5–6× bandwidth did not translate to 5× RTF), so big cards pay off in **batching**, not
+single-stream. Details → [docs/cuda-performance.md](docs/cuda-performance.md).
 
 **Throughput — server request-batching** (`--serve --batch-size N`, continuous batching + per-request
 streaming). Batching is a **throughput / parallelism** lever, *not* a per-request speedup — it serves N
@@ -516,6 +523,7 @@ concurrent users in roughly the time of one by reading each weight once for all 
 | Backend | Batch speedup | Notes |
 |---|---|---|
 | **CUDA** (RTX 4060-class) | **~3.35× at B=8** | per-step (Talker 4.1× · CP 2.7×), ~3× end-to-end; output bit-identical solo-vs-batch |
+| **CUDA** (A100, cloud) | **aggregate RTF 0.47 at B=8** | 8 concurrent users, all served faster than real-time (1.7B; ~2.1× throughput) |
 | **Apple Metal** (M2 Pro) | **~2.8× at B=4** | 0.6B 2.81× · 1.7B 2.82× (consistent); batch output bit-identical to single-stream |
 | **CPU** | ~N on bandwidth-bound x86 servers | ~1× on cache-rich M1 (single-stream is already fast) |
 

@@ -283,6 +283,23 @@ Headline: **int8 is the x86 wall-clock winner** (0.6B sub-RT 0.95). q4-VNNI v3 m
 per-frame than int8 (row above), but int4/int8 fork the greedy trajectory so wall RTF isn't cross-quant
 comparable.
 
+**⭐ Re-validation round (2026-07-11, same instance type, `perf/rental-prep` branch):**
+- ⚠️ **Build gotcha (bit us again):** `make blas` on x86 defaults to PORTABLE AVX2 — VNNI needs
+  **`make blas SIMD=avx512vnni`**. `--caps` says which one you got ("int8 dot: VNNI" vs "widen->FMA");
+  READ IT before trusting any number.
+- **Batched-server stall fix VALIDATED**: B=4 server, sequential single requests = **8–9 s each**
+  (the historical intermittent bug was 262 s; `submit_mtx` + inactive-slot compaction now on).
+- **fp16 q4 scale (18 B/block)**: `--self-test` PASS on real VNNI; `matmat_q4 vs matvec_q4 L2 = 0`
+  (bit-identical). int8 0.96 vs int4 1.05 wall — x86 story unchanged, int8 stays the pick.
+- **1.7B config note: pure `--int8` (1.22) beats `--quant-mixed` (1.30) on x86** — the int4 Talker is
+  SLOWER than int8 on VNNI (43.2 vs 35.5 ms/f). quant-mixed is an Apple-silicon (M1) config;
+  **on x86 use `--int8`**.
+- **`QWEN_CP_PREFILL2=1` is a measured x86 WIN**: CP 49.6/50.7 → **46.8/46.6 ms/f (−6-8%)**, RTF −3%
+  (the B=2 matmat rides the VNNI GEMM; on M1 the same lever is neutral — SDOT-seq is already optimal).
+- **`QWEN_BLAS_GEN_THREADS` sweep (4 vCPU)**: optimum = **1** (RTF 0.95 vs 0.99 at the nt−1 default of
+  3; =4 catastrophic 1.46, oversubscription). Per-box knob — sweep it on every new box (N1 file-mode
+  optimum was 2).
+
 **⭐ Full RTF+TTFA — Neoverse-N1 (Ampere Altra Max, 4 vCPU, `-j4`, 2026-07-10, post-PR#17, min of 3):**
 
 | model | config | RTF | TTFA |
