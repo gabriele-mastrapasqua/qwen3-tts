@@ -1041,8 +1041,10 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
  * OPT-IN BATCHED Code Predictor (feat/batching) — see qwen_tts_batch.h.
  * ADDITIVE: qwen_cp_predict above is untouched. B frames in lockstep through
  * the 16-step CP; reuses the per-vector kernels looped over B and batches the
- * matvecs via qwen_batch_proj. v1: bf16 weights, no roughness in the batched
- * path (steering IS supported). Mirrors cp_layer_body / cp_transformer_step.
+ * matvecs via qwen_batch_proj_q (PRECISION-AWARE: q4 > int8 > bf16, matching
+ * the single-stream dispatch — the old "v1: bf16 only" note was stale). No
+ * roughness in the batched path (steering IS supported). Mirrors
+ * cp_layer_body / cp_transformer_step.
  * ======================================================================== */
 
 /* Precision-aware CP lm_head argmax (B2): mirror the single-stream dispatch
@@ -1138,16 +1140,11 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                           const float *talker_hidden, const int *code0, int *out_codes) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h, h = c->hidden_size, emb_dim = ctx->cp_emb_dim;
-    /* CPU path needs bf16 transformer weights; the GPU batched path runs the transformer on the
-     * device (int8/q4) and only uses the precision-aware argmax + (always-bf16) embeddings/proj. */
-    int cp_gpu = 0;
-#ifdef QWEN_HAVE_CUDA
-    { extern void *g_cuda_cp_batch_state; cp_gpu = (g_cuda_cp_batch_state != NULL); }
-#endif
-#ifdef QWEN_HAVE_METAL
-    if (g_metal_cp_batch_state) cp_gpu = 1;
-#endif
-    if (!cp_gpu && (!ctx->cp_layers[0].wq_bf16 || !ctx->cp_lm_head_bf16[0])) return -2;  /* v1 CPU: bf16 only */
+    /* Sanity: the mmapped bf16 weights must exist (they always do after a successful load —
+     * quantized runs keep the bf16 pointers as the embedding/GPU source). audit 2026-07-11:
+     * the old "v1 CPU: bf16 only" framing was stale — batch_cp_layer dispatches q4>int8>bf16
+     * via qwen_batch_proj_q, so the CPU batched CP has been quantization-aware for a while. */
+    if (!ctx->cp_layers[0].wq_bf16 || !ctx->cp_lm_head_bf16[0]) return -2;
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
     float emb_buf[4096], normed[2048];
 
