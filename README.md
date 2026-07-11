@@ -444,6 +444,7 @@ The full cross-hardware workflow (which boxes have which SIMD, where to rent, wh
 |---|---|---|---|---|
 | **Apple M1** 8-core | NEON + SDOT int8/int4, GCD 4-thread | 16 GB | **0.52 int4 / 0.69 int8** | `--int4 -j4` |
 | **Neoverse-N1** (Ampere Altra Max, Scaleway) | NEON + SDOT, pthread 4-thread | 16 GB / 4 vCPU | **1.28** stream int4 + conv-int8 (**1.49** default) | `--int4 --stream` |
+| **Graviton3** (Neoverse-V1, AWS c7g.2xlarge) | NEON + SDOT + **i8mm SMMLA + BFMMLA**, pthread 4-thread | 16 GB / 8 vCPU | **0.66** (1.7B int8: **0.95**, sub-RT!) | `--int8 -j4` |
 | **Ryzen 7 6800H** (Zen3+, 16 MB L3, bare metal) | AVX2 + FMA, pthread 4-thread | 32 GB | **2.02** | `--int4 -j4` |
 | **EPYC 9555P** (Zen5, AVX-512+VNNI, Scaleway VM) | AVX-512-VNNI, pthread 4-thread | 16 GB / 4 vCPU | **0.95** | `--int8 -j4` |
 
@@ -525,7 +526,8 @@ concurrent users in roughly the time of one by reading each weight once for all 
 | **CUDA** (RTX 4060-class) | **~3.35× at B=8** | per-step (Talker 4.1× · CP 2.7×), ~3× end-to-end; output bit-identical solo-vs-batch |
 | **CUDA** (A100, cloud) | **aggregate RTF 0.47 at B=8** | 8 concurrent users, all served faster than real-time (1.7B; ~2.1× throughput) |
 | **Apple Metal** (M2 Pro) | **~2.8× at B=4** | 0.6B 2.81× · 1.7B 2.82× (consistent); batch output bit-identical to single-stream |
-| **CPU** | ~N on bandwidth-bound x86 servers | ~1× on cache-rich M1 (single-stream is already fast) |
+| **CPU x86** | ~N on bandwidth-bound servers | ~1× on cache-rich M1 (single-stream is already fast) |
+| **CPU ARM** (Graviton3+, i8mm) | **int8 batch matmat 2.1×** (native SMMLA GEMM) | e2e batched server −19% wall @ B=4 vs the pre-SMMLA twin; bf16 1.5× (BFMMLA) |
 
 ## Documentation
 

@@ -300,6 +300,22 @@ comparable.
   3; =4 catastrophic 1.46, oversubscription). Per-box knob — sweep it on every new box (N1 file-mode
   optimum was 2).
 
+**⭐ Graviton3 (AWS c7g.2xlarge, Neoverse-V1, 8 vCPU, `-j4`, 2026-07-11) — first server-ARM with
+i8mm/bf16; the MMLA twins' first silicon:**
+
+| what | result |
+|---|---|
+| `--self-test` | **SMMLA int8 matmat L2 = 0.00e+00 (bit-identical to B× SDOT matvec)**; BFMMLA 3.4e-03 (expected bf16-act signature) — both PASS first run |
+| matmat-bench int8 (B=8) | old twin **0.32-0.38×** (batching LOST vs seq) → **SMMLA 2.03-2.10×** (batch 0.90→0.16 ms — ~6× better) |
+| matmat-bench bf16 (B=8) | old 1.01-1.20× → **BFMMLA 1.38-1.58×** |
+| matmat-bench int4 (B=8) | ⚠️ **0.29× — q4 batch decode is scalar, a big LOSS**; avoid int4 in batched serving on ARM (TODO: q4 MMLA twin or force_matvec fallback) |
+| single-stream RTF | 0.6B int8 **0.66** (beats EPYC Turin 0.96!) · int4 0.73 · bf16 1.11 · **1.7B int8 0.95 — sub-realtime 1.7B on an ARM server CPU** |
+| batched server B=4 (e2e A/B) | 4 concurrent: **17 s with MMLA vs 21 s without = −19% wall** (aggregate RTF 0.84) |
+| `QWEN_BLAS_GEN_THREADS` | optimum = 3 (= the nt−1 default) on 8 vCPU — opposite of the 4-vCPU EPYC; the knob is genuinely per-box |
+
+Build: plain `make blas` (Linux ARM uses `-march=native` → i8mm/bf16 auto-enabled; `--caps` must say
+"SMMLA ACTIVE"/"BFMMLA ACTIVE"). Kill-switches for A/B: `QWEN_NO_SMMLA=1` / `QWEN_NO_BFMMLA=1`.
+
 **⭐ Full RTF+TTFA — Neoverse-N1 (Ampere Altra Max, 4 vCPU, `-j4`, 2026-07-10, post-PR#17, min of 3):**
 
 | model | config | RTF | TTFA |
