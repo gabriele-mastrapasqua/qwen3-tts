@@ -1578,6 +1578,104 @@ static void q4_vmm_task(size_t tid, size_t nt, void *vc) {
     q4_matmat_vnni_slice(c->Y, c->W, c->qXt, c->sx, c->corr, r0, r1, c->cols, c->B);
 }
 #endif /* __AVX512VNNI__ */
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+/* q4×q8 SMMLA GEMM slice: nibbles decoded to VALUE order via the same vzip the
+ * SDOT matvec uses (kept as raw 0..15, the −8 offset folded in via the per-block
+ * activation sums corr), then 2×2 vmmlaq_s32 tiles, per-block fp16 weight scale
+ * applied at block granularity, per-column activation scale at the end. */
+static void q4_matmat_smmla_slice(float *Y, const q4_0_block_t *W,
+                                  const int8_t *qXt, const float *sx, const int *corr,
+                                  int r0, int r1, int cols, int B) {
+    int nb = cols / Q4_0_BLOCK_SIZE;
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    int r = r0;
+    for (; r + 1 < r1; r += 2) {
+        const q4_0_block_t *w0 = W + (size_t)r * nb, *w1 = W + (size_t)(r + 1) * nb;
+        int j = 0;
+        for (; j + 1 < B; j += 2) {
+            const int8_t *x0 = qXt + (size_t)j * cols, *x1 = qXt + (size_t)(j + 1) * cols;
+            const int *c0 = corr + (size_t)j * nb,     *c1 = corr + (size_t)(j + 1) * nb;
+            float f00 = 0, f01 = 0, f10 = 0, f11 = 0;
+            for (int bl = 0; bl < nb; bl++) {
+                uint8x16_t raw0 = vld1q_u8(w0[bl].qs), raw1 = vld1q_u8(w1[bl].qs);
+                uint8x16x2_t z0 = vzipq_u8(vandq_u8(raw0, mask), vshrq_n_u8(raw0, 4));
+                uint8x16x2_t z1 = vzipq_u8(vandq_u8(raw1, mask), vshrq_n_u8(raw1, 4));
+                int8x16_t a0lo = vreinterpretq_s8_u8(z0.val[0]);  /* r   w0..15  */
+                int8x16_t a0hi = vreinterpretq_s8_u8(z0.val[1]);  /* r   w16..31 */
+                int8x16_t a1lo = vreinterpretq_s8_u8(z1.val[0]);  /* r+1 w0..15  */
+                int8x16_t a1hi = vreinterpretq_s8_u8(z1.val[1]);  /* r+1 w16..31 */
+                const int8_t *xb0 = x0 + (size_t)bl * 32, *xb1 = x1 + (size_t)bl * 32;
+                int32x4_t acc = vdupq_n_s32(0);
+                acc = vmmlaq_s32(acc, vcombine_s8(vget_low_s8(a0lo),  vget_low_s8(a1lo)),
+                                       vcombine_s8(vld1_s8(xb0),      vld1_s8(xb1)));
+                acc = vmmlaq_s32(acc, vcombine_s8(vget_high_s8(a0lo), vget_high_s8(a1lo)),
+                                       vcombine_s8(vld1_s8(xb0 + 8),  vld1_s8(xb1 + 8)));
+                acc = vmmlaq_s32(acc, vcombine_s8(vget_low_s8(a0hi),  vget_low_s8(a1hi)),
+                                       vcombine_s8(vld1_s8(xb0 + 16), vld1_s8(xb1 + 16)));
+                acc = vmmlaq_s32(acc, vcombine_s8(vget_high_s8(a0hi), vget_high_s8(a1hi)),
+                                       vcombine_s8(vld1_s8(xb0 + 24), vld1_s8(xb1 + 24)));
+                int32_t t[4]; vst1q_s32(t, acc);
+                float s0 = qwen_f16_to_f32(w0[bl].scale_f16);
+                float s1 = qwen_f16_to_f32(w1[bl].scale_f16);
+                f00 += s0 * (float)(t[0] - 8 * c0[bl]);
+                f01 += s0 * (float)(t[1] - 8 * c1[bl]);
+                f10 += s1 * (float)(t[2] - 8 * c0[bl]);
+                f11 += s1 * (float)(t[3] - 8 * c1[bl]);
+            }
+            Y[(size_t)r * B + j]           = f00 * sx[j];
+            Y[(size_t)r * B + j + 1]       = f01 * sx[j + 1];
+            Y[(size_t)(r + 1) * B + j]     = f10 * sx[j];
+            Y[(size_t)(r + 1) * B + j + 1] = f11 * sx[j + 1];
+        }
+        for (; j < B; j++) {                       /* odd-B col tail (scalar int dots) */
+            const int8_t *xj = qXt + (size_t)j * cols;
+            const int *cj = corr + (size_t)j * nb;
+            float fa = 0, fb = 0;
+            for (int bl = 0; bl < nb; bl++) {
+                int64_t ta = 0, tb = 0;
+                const uint8_t *qa = w0[bl].qs, *qb = w1[bl].qs;
+                const int8_t *xb = xj + (size_t)bl * 32;
+                for (int i = 0; i < 16; i++) {
+                    ta += (qa[i] & 0x0F) * xb[2*i] + (qa[i] >> 4) * xb[2*i + 1];
+                    tb += (qb[i] & 0x0F) * xb[2*i] + (qb[i] >> 4) * xb[2*i + 1];
+                }
+                fa += qwen_f16_to_f32(w0[bl].scale_f16) * (float)(ta - 8 * cj[bl]);
+                fb += qwen_f16_to_f32(w1[bl].scale_f16) * (float)(tb - 8 * cj[bl]);
+            }
+            Y[(size_t)r * B + j]       = fa * sx[j];
+            Y[(size_t)(r + 1) * B + j] = fb * sx[j];
+        }
+    }
+    for (; r < r1; r++) {                          /* odd-rows tail */
+        const q4_0_block_t *wr = W + (size_t)r * nb;
+        for (int j = 0; j < B; j++) {
+            const int8_t *xj = qXt + (size_t)j * cols;
+            const int *cj = corr + (size_t)j * nb;
+            float f = 0;
+            for (int bl = 0; bl < nb; bl++) {
+                int64_t t = 0;
+                const uint8_t *q = wr[bl].qs;
+                const int8_t *xb = xj + (size_t)bl * 32;
+                for (int i = 0; i < 16; i++)
+                    t += (q[i] & 0x0F) * xb[2*i] + (q[i] >> 4) * xb[2*i + 1];
+                f += qwen_f16_to_f32(wr[bl].scale_f16) * (float)(t - 8 * cj[bl]);
+            }
+            Y[(size_t)r * B + j] = f * sx[j];
+        }
+    }
+}
+typedef struct {
+    float *Y; const q4_0_block_t *W; const int8_t *qXt; const float *sx; const int *corr;
+    int rows, cols, B;
+} q4_smmla_ctx;
+static void q4_smmla_task(size_t tid, size_t nt, void *vc) {
+    q4_smmla_ctx *c = (q4_smmla_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt), r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    r0 &= ~1; if (tid + 1 < nt) r1 &= ~1;
+    q4_matmat_smmla_slice(c->Y, c->W, c->qXt, c->sx, c->corr, r0, r1, c->cols, c->B);
+}
+#endif /* __ARM_FEATURE_MATMUL_INT8 */
+
 void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                       int rows, int cols, int B) {
     if (B <= 0) return;
@@ -1614,6 +1712,63 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
             }
             free(qXt); free(corr);
         }
+    }
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    /* q4 SMMLA twin (rental-prep follow-up, Graviton3 2026-07-11): the scalar batch
+     * below was a big LOSS on ARM (0.29× vs B×matvec on Neoverse-V1, 0.43-0.65× on
+     * M1) — decode nibbles in value order (same vzip as the SDOT matvec) and feed
+     * 2×2 vmmlaq_s32 tiles against the per-column int8-quantized activations, with
+     * the −8 offset corrected via per-block activation sums. QWEN_NO_SMMLA=1 opts out. */
+    {
+        static atomic_int no_smmla_q4 = -1;
+        int ns = atomic_load_explicit(&no_smmla_q4, memory_order_relaxed);
+        if (ns < 0) { const char *e = getenv("QWEN_NO_SMMLA"); ns = (e && e[0] == '1'); atomic_store_explicit(&no_smmla_q4, ns, memory_order_relaxed); }
+        if (!ns && B >= 2 && B <= 16 && cols % Q4_0_BLOCK_SIZE == 0) {
+            int nb = cols / Q4_0_BLOCK_SIZE;
+            int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
+            int *corr = (int *)malloc((size_t)B * nb * sizeof(int));
+            if (qXt && corr) {
+                float sx[16];
+                for (int b = 0; b < B; b++) {
+                    sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+                    const int8_t *qb = qXt + (size_t)b * cols;
+                    for (int bl = 0; bl < nb; bl++) {
+                        int s = 0;
+                        for (int k = 0; k < Q4_0_BLOCK_SIZE; k++) s += qb[bl * Q4_0_BLOCK_SIZE + k];
+                        corr[(size_t)b * nb + bl] = s;
+                    }
+                }
+                int nt2 = g_n_threads;
+                if (nt2 > 1 && rows >= 256) {
+                    q4_smmla_ctx c = { Y, W, qXt, sx, corr, rows, cols, B };
+                    qwen_parallel((size_t)nt2, q4_smmla_task, &c);
+                } else {
+                    q4_matmat_smmla_slice(Y, W, qXt, sx, corr, 0, rows, cols, B);
+                }
+                free(qXt); free(corr);
+                return;
+            }
+            free(qXt); free(corr);
+        }
+    }
+#elif defined(__ARM_FEATURE_DOTPROD)
+    /* Floor fallback (M1-class ARM, no i8mm): the scalar fixed-B batch LOSES to B
+     * sequential SDOT matvecs (measured 0.43-0.65× on M1) — so just do the matvecs.
+     * Column gather/scatter is noise next to the weight sweep. */
+    if (cols % Q4_0_BLOCK_SIZE == 0) {
+        float *xcol = (float *)malloc((size_t)cols * sizeof(float));
+        float *ycol = (float *)malloc((size_t)rows * sizeof(float));
+        if (xcol && ycol) {
+            for (int b = 0; b < B; b++) {
+                for (int k = 0; k < cols; k++) xcol[k] = X[(size_t)k * B + b];
+                qwen_matvec_q4_0(ycol, W, xcol, rows, cols);
+                for (int r = 0; r < rows; r++) Y[(size_t)r * B + b] = ycol[r];
+            }
+            free(xcol); free(ycol);
+            return;
+        }
+        free(xcol); free(ycol);
     }
 #endif
     int nt = g_n_threads;
