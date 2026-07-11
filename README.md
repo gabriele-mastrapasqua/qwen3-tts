@@ -50,7 +50,7 @@ make blas
 
 - **Pure C, minimal dependencies** — Only requires a C compiler and BLAS. No Python runtime needed.
 - **Runs on macOS, Linux and Windows/WSL2 (ARM/x86)** — the hot matvec/attention kernels have **NEON+SDOT (ARM), AVX2 and AVX-512/VNNI (x86)** twins with a scalar fallback + runtime ISA guard, and decode threading runs on a **cross-OS pool** (GCD on macOS, pthread elsewhere). Validated on Apple M1, Ryzen 7 6800H, and EPYC 9555P (Zen5). Single-stream RTF is memory/cache-bound, so the chip's cache matters most (see [Performance](#performance)); measure yours with `bash tests/x86_bench.sh`.
-- **Optional GPU backends (opt-in)** — **Apple Metal** (`make metal`) and **NVIDIA CUDA** (`make cuda`) run the whole fused pipeline resident on the GPU (~0.36 RTF for 0.6B on an M2 Pro; ~0.44 for 1.7B on a mainstream NVIDIA GPU), plus server request-batching for throughput. CPU stays the default. → [Performance § GPU backends](#performance) · [docs/hardware-testing.md](docs/hardware-testing.md) (Metal) · [docs/cuda-performance.md](docs/cuda-performance.md) (CUDA).
+- **Optional GPU backends (opt-in)** — **Apple Metal** (`make metal`) and **NVIDIA CUDA** (`make cuda`) run the whole fused pipeline resident on the GPU (**0.28 RTF** for 0.6B on an M4; ~0.44 for 1.7B on a mainstream NVIDIA GPU), plus server request-batching for throughput. CPU stays the default. → [Performance § GPU backends](#performance) · [docs/hardware-testing.md](docs/hardware-testing.md) (Metal) · [docs/cuda-performance.md](docs/cuda-performance.md) (CUDA).
 - **Both model sizes** — Automatically detects 0.6B or 1.7B from weight files.
 - **9 preset voices** — `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
 - **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
@@ -445,6 +445,7 @@ The full cross-hardware workflow (which boxes have which SIMD, where to rent, wh
 | **Apple M1** 8-core | NEON + SDOT int8/int4, GCD 4-thread | 16 GB | **0.52 int4 / 0.69 int8** | `--int4 -j4` |
 | **Neoverse-N1** (Ampere Altra Max, Scaleway) | NEON + SDOT, pthread 4-thread | 16 GB / 4 vCPU | **1.28** stream int4 + conv-int8 (**1.49** default) | `--int4 --stream` |
 | **Graviton3** (Neoverse-V1, AWS c7g.2xlarge) | NEON + SDOT + **i8mm SMMLA + BFMMLA**, pthread 4-thread | 16 GB / 8 vCPU | **0.66** (1.7B int8: **0.95**, sub-RT!) | `--int8 -j4` |
+| **Apple M4** (Mac mini, Scaleway) | NEON + SDOT + i8mm + bf16 + SME | 16 GB / 10-core | **0.32** (1.7B qm: **0.57**!) | `--int4 -j4` |
 | **Ryzen 7 6800H** (Zen3+, 16 MB L3, bare metal) | AVX2 + FMA, pthread 4-thread | 32 GB | **2.02** | `--int4 -j4` |
 | **EPYC 9555P** (Zen5, AVX-512+VNNI, Scaleway VM) | AVX-512-VNNI, pthread 4-thread | 16 GB / 4 vCPU | **0.95** | `--int8 -j4` |
 
@@ -493,7 +494,8 @@ Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDI
 | Device | 0.6B RTF | 1.7B RTF | Streaming TTFA (single client) |
 |---|---|---|---|
 | **Apple M1** 8-core (dev box) | ~0.60 (int4) | — | **469 ms** (0.6B) |
-| **Apple M2 Pro** 16-core GPU | **0.36–0.39** | **0.48–0.53** | **314 ms** / 517 ms |
+| **Apple M2 Pro** 16-core GPU | 0.36–0.39 | 0.48–0.53 | **314 ms** / 517 ms |
+| **Apple M4** 10-core GPU | **0.28** (int4) | **0.41** (int4) | — |
 
 RTF = processing_time ÷ audio_duration (**< 1.0 = faster than real time**); TTFA = time to first audio for a
 single `--stream` client, **warm server** (the first request after startup pays a one-time weight→GPU-buffer

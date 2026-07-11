@@ -317,6 +317,17 @@ i8mm/bf16; the MMLA twins' first silicon:**
 Build: plain `make blas` (Linux ARM uses `-march=native` → i8mm/bf16 auto-enabled; `--caps` must say
 "SMMLA ACTIVE"/"BFMMLA ACTIVE"). Kill-switches for A/B: `QWEN_NO_SMMLA=1` / `QWEN_NO_BFMMLA=1`.
 
+**⭐ Apple M4 (Scaleway M4-S Mac mini, 10-core, 16 GB, `-j4`, 2026-07-11) — first M4 + SME silicon:**
+
+| what | result |
+|---|---|
+| `--caps` | i8mm + bf16 + **SME/SME2 detected at runtime** (first SME silicon; no SME kernels yet) — MMLA twins ACTIVE |
+| `--self-test` | ALL PASS (SMMLA int8 L2=0, q4-SMMLA 7.6e-08, BFMMLA 3.4e-03 — same signatures as Graviton3) |
+| matmat-bench (B=8) | **per-box heterogeneity vs Graviton**: q4-SMMLA **1.50-1.84× WIN** · int8-SMMLA 0.61-0.91× (loses — M4's SDOT matvec + bandwidth too strong) · BFMMLA 0.72-0.91× (loses — transpose overhead doesn't pay on bandwidth-rich cores) → per-platform gating is a real question for the merge |
+| CPU single-stream | 0.6B int8 **0.44** · **int4 0.32** ⚡ · 1.7B quant-mixed **0.57** — the M4 CPU alone nearly matches the A100 GPU numbers |
+| **Metal** | 0.6B int8 0.38 · **int4 0.28 — new all-device record** (M2 Pro was 0.39) · 1.7B int4 **0.41** (M2 Pro: 0.50). **int4 > int8 on M4 Metal even with the SCALAR q4 shader** — the M4 GPU reversed the M2-era ordering by itself |
+| q4-vec shader verdict | `QWEN_METAL_Q4_VEC=1` = **NEUTRAL on M4** (0.28 vs 0.28) and a regression on M1 → the vectorized twin is NOT the win anywhere tested; keep opt-in or drop at merge |
+
 **⭐ Full RTF+TTFA — Neoverse-N1 (Ampere Altra Max, 4 vCPU, `-j4`, 2026-07-10, post-PR#17, min of 3):**
 
 | model | config | RTF | TTFA |

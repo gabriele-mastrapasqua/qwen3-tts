@@ -58,7 +58,7 @@ reducing memory usage and (for INT8) improving speed.
 
 | Platform | Pick | Why (measured) |
 |---|---|---|
-| **Apple Silicon (M1+)** | `--int4` for speed, `--int8` for max quality | int4-SDOT is the fastest lever (0.6B **0.51**); 1.7B best = `--quant-mixed` (~1.53) |
+| **Apple Silicon (M1+)** | `--int4` for speed, `--int8` for max quality | int4-SDOT is the fastest lever (0.6B: M1 **0.51**, **M4 0.32**); 1.7B best = `--quant-mixed` (M1 ~1.53, **M4 0.57**) |
 | **x86 AVX-512/VNNI** (Zen4+, Ice Lake+) | **`--int8`** — for 1.7B too | EPYC Turin: int8 0.96 vs int4 1.05; **1.7B pure int8 1.22 beats quant-mixed 1.30** (quant-mixed is an Apple-silicon config). Build with `make blas SIMD=avx512vnni` |
 | **x86 AVX2-only** (Zen3, small L3) | `--int4` multi-threaded | memory-starved: fewer weight bytes wins (Ryzen 6800H 3.9→2.02) |
 | **ARM server** (Graviton3+, i8mm) | `--int8` single-stream; int8/int4 batched | 0.6B int8 **0.66**, 1.7B int8 **0.95** (sub-RT); batched matmats ride SMMLA (int8 2.1×, int4 1.6×) |
