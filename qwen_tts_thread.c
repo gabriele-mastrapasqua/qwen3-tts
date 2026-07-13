@@ -70,10 +70,11 @@ static void run_chunks(qwen_job_t *job) {
 }
 
 static DWORD WINAPI worker_main(LPVOID arg) {
-    (void)arg;
     qwen_ftz_on();
     EnterCriticalSection(&P.mtx);
-    unsigned long seen = P.generation;
+    /* Initial `seen` = generation at create time (passed by the creator), not a read
+     * done at first schedule: a submit racing thread startup would be missed → hang. */
+    unsigned long seen = (unsigned long)(ULONG_PTR)arg;
     for (;;) {
         while (!P.stop && P.generation == seen)
             SleepConditionVariableCS(&P.wake, &P.mtx, INFINITE);
@@ -121,8 +122,10 @@ void qwen_threadpool_start(int n_threads) {
     P.threads = (HANDLE *)malloc(sizeof(HANDLE) * (size_t)want);
     if (!P.threads) { P.nworkers = 0; return; }  /* audit #9: fall back to serial */
     int created = 0;
+    unsigned long gen0 = P.generation;  /* workers' initial `seen` (see worker_main) */
     for (int i = 0; i < want; i++) {
-        P.threads[i] = CreateThread(NULL, 0, worker_main, NULL, 0, NULL);
+        P.threads[i] = CreateThread(NULL, 0, worker_main,
+                                    (LPVOID)(ULONG_PTR)gen0, 0, NULL);
         if (!P.threads[i]) break;
         created++;
     }
@@ -164,6 +167,7 @@ int qwen_parallel_is_reentrant(void) { return 0; }
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 typedef struct {
@@ -239,9 +243,13 @@ static void run_chunks(qwen_job_t *job) {
  * atomic generation and never decides to sleep. Same structure guards the
  * completion side with `main_sleeping`/`completed`. */
 static void *worker_main(void *arg) {
-    (void)arg;
     qwen_ftz_on();             /* per-thread FTZ (int8 denormals) — set once */
-    unsigned long seen = atomic_load_explicit(&P.generation, memory_order_acquire);
+    /* Initial `seen` comes from the creator (generation at create time), NOT from a
+     * load done when the OS first schedules this thread: a submit racing the thread
+     * startup would otherwise be absorbed into `seen` and the job missed → deadlock
+     * (submitter waits completed==nworkers forever; hit by --self-test/--matmat-bench,
+     * which dispatch immediately after threadpool_start). */
+    unsigned long seen = (unsigned long)(uintptr_t)arg;
     for (;;) {
         /* Spin on the atomic generation before paying the futex. */
         int budget = qwen_pool_spin();
@@ -316,8 +324,12 @@ void qwen_threadpool_start(int n_threads) {
     /* audit #9: cap nworkers to threads actually created; qwen_parallel runs
      * serially when nworkers==0 and correctly with a partial pool otherwise. */
     int created = 0;
+    /* Hand each worker the CURRENT generation as its initial `seen`: any bump after
+     * this point (first possible submit is after start() returns) is then observable. */
+    unsigned long gen0 = atomic_load_explicit(&P.generation, memory_order_acquire);
     for (int i = 0; i < want; i++) {
-        if (pthread_create(&P.threads[i], NULL, worker_main, NULL) != 0) break;
+        if (pthread_create(&P.threads[i], NULL, worker_main,
+                           (void *)(uintptr_t)gen0) != 0) break;
         created++;
     }
     P.nworkers = created;
