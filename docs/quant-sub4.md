@@ -221,6 +221,17 @@ naive lever reproduces the historical 83.92/46.34 exactly), `--self-test` PASS,
 Every `--int4` / quant-mixed config on every ISA gets the words-accuracy jump for free.
 Ear A/B: `samples/tests/2026-07-14_quant-sub4-ladder/ear_int4_{OLD_naive,NEW_lsq}.wav`.
 
+**RTF + duration (free-running A/B, same text/seed, M1 -j4):** per-frame cost is
+unchanged BY CONSTRUCTION (same kernels, same bytes — only the scale VALUES differ;
+`--self-test` q4 twins bit-exact). What DOES change is the trajectory, and in the right
+direction: on 1.7B `--int4` the old quantizer stretched the utterance to **20.9s vs the
+bf16 gold's 12.2s (+71%)**; the LSQ quantizer lands at **14.9s (+22%)** → duration
+fidelity recovered ≈ ⅔ of the int4 stretch pathology, which also means LESS total
+compute per sentence. 0.6B: 12.1s vs 11.9s, RTF 0.55/0.50 (noise). GPU inherits with no
+further changes: Metal calls `qwen_quantize_bf16_to_q4_0` itself; the CUDA q4 struct
+mirrors `q4_0_block_t` byte-for-byte (single-producer / read-only consumers). Ear trio
+for 1.7B: `ear_1.7b_{bf16_ref,int4_OLD_naive,int4_NEW_lsq}.wav`.
+
 ## 5. Verdict (E7.5) — **NO GO for sub-4-bit kernels** (2026-07-14)
 
 - **E7.2 gate: FAILED.** Best modern format on the full CP: q3_k **27.9%** vs gate ≥60%
