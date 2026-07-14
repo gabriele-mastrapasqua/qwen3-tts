@@ -177,6 +177,50 @@ how far DOWN the heads can go, and what the realistic mix buys:
   bytes, below the 15-20% E7.3 gate**, while costing 7.5 agreement points vs pure int4
   (46.3 → 38.8). The tensor that would pay (the transformer) is exactly the one that can't.
 
+## 4c. Follow-up round: BETTER 4-bit ("the legitimate heir") — measured 2026-07-14
+
+Since sub-4 failed on the quality cliff, the same harness was pointed at the open cheap
+question from §5: **better formats at the SAME 4.5 bpw**, plus the "pure int4+int4"
+question (Talker int4 quality is what blocks it — int4 flips words). Three candidates,
+all 4.5 bpw: `q4_0s` (identical Q4_0 layout, weighted scale search instead of absmax
+RTN → **ships as a loader change, zero new kernels**), `iq4_nl` (non-linear 16-value
+LUT), `q4_k` (superblock, asymmetric, two-level scales). Talker measured via
+`QWEN_DUMP_CODE0` under TF (code0 = words; bf16 control 100%, fake q4_0 83.2% ≈ C int4
+83.9% → method valid on the Talker too). Results (`ladder_q4_results.txt`,
+`talker_code0_results.txt`):
+
+| Format (4.5 bpw) | Talker code0 (words) | CP c1-15 | CP late c11-15 |
+|---|---|---|---|
+| int4 C today (absmax RTN) | 83.9% | 46.3% | 26-36% |
+| **q4_0s** (search, same layout) | **90.2%** | 48.8% | 27-40% |
+| q4_k | 84.6% | 52.9% | 34-44% |
+| **iq4_nl** | 85.3% | **55.2%** | **36-52%** |
+| int8 (reference) | ~96.9% (June) | 79.4% | 69-83% |
+
+**The two components want different medicine** (mechanistically consistent):
+- **Talker**: one wide-margin argmax per frame → what matters is SCALE accuracy.
+  q4_0s alone cuts wrong-word frames by 42% (24 → 14 of 143). The fancy grids barely
+  move it.
+- **CP**: error compounds over 15 intra-frame steps → what matters is GRID accuracy.
+  iq4_nl recovers +8.8 pts overall and +10-16 on the late codebooks (closes ~27% of the
+  int4→int8 gap at identical bytes).
+- Search breadth is nearly irrelevant on real weights: 1 candidate (signed absmax → -8)
+  + closed-form weighted LSQ rescale ≈ full 19-candidate sweep (rel-RMSE 8.93 vs 8.87;
+  naive 10.18) → the C port of q4_0s costs ~one extra multiply-accumulate pair per
+  weight at load time. Fake-quant variant `q4_0s1` validates it end-to-end.
+- iq4_nl kernel cost if ever wanted for the CP: kvalues fit int8 → NEON decode =
+  nibble-unpack + `vqtbl1q` table lookup + SDOT (llama.cpp does exactly this; x86 =
+  `vpshufb`). A real E7-style candidate — but gate it on ear need, not on this table.
+
+**✅ q4_0s1 PORTED TO C (same day)** — `qwen_quantize_bf16_to_q4_0` in
+`qwen_tts_kernels.c` now does signed-max→-8 + weighted-LSQ rescale (w=v²) in the same
+single load pass; `QWEN_Q4_NAIVE=1` restores the old absmax RTN for A/B. Validation on
+the binary: Talker code0 **90.91%** / CP **48.81%** (fake-quant predicted 92.31/48.86;
+naive lever reproduces the historical 83.92/46.34 exactly), `--self-test` PASS,
+`make test-golden` ALL PASS (bf16/int8 paths byte-identical, no int4 golden in the set).
+Every `--int4` / quant-mixed config on every ISA gets the words-accuracy jump for free.
+Ear A/B: `samples/tests/2026-07-14_quant-sub4-ladder/ear_int4_{OLD_naive,NEW_lsq}.wav`.
+
 ## 5. Verdict (E7.5) — **NO GO for sub-4-bit kernels** (2026-07-14)
 
 - **E7.2 gate: FAILED.** Best modern format on the full CP: q3_k **27.9%** vs gate ≥60%
