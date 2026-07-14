@@ -44,6 +44,13 @@ reducing memory usage and (for INT8) improving speed.
 - Smallest memory footprint (¼ of bf16) — also the pick when RAM is tight.
 - Quality: a touch more aggressive than int8 (per-block-32 scales are coarse for the CP's late
   residuals) — int8 stays the quality reference; int4 is ear-validated fine on 0.6B.
+- **v0.16.0 — weighted-LSQ scales**: the load-time quantizer now picks each block scale by
+  closed-form weighted least-squares (signed-max→-8 + LSQ rescale, w=v²) instead of naive
+  absmax RTN. Same layout, same kernels, same bytes, same speed — measurably better weights:
+  Talker word accuracy (teacher-forced code0) **83.9% → 90.9%**, and the 1.7B int4 duration
+  stretch vs bf16 gold drops from **+71% to +22%** on the A/B sentence. Applies to every
+  `--int4`/`--quant-mixed` config on every ISA (Metal/CUDA included — single quantizer).
+  `QWEN_Q4_NAIVE=1` restores the old quantizer for A/B. Full study: `docs/quant-sub4.md`.
 
 ## Comparison (Apple M1 8-core, 16 GB, `-j4`, 2026-07 state)
 
