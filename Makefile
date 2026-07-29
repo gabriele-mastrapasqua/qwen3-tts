@@ -123,7 +123,21 @@ blas: $(TARGET)
 # See plan_v4 §E4 / docs/gpu-accel-analysis.md. Metal is dev-testable on M1;
 # CUDA is cuBLAS-first (no nvcc for v1) and RTF-measured on the DGX/5090.
 GPU_OBJS = qwen_tts_backend.o qwen_tts_cuda.o
-CUDA_HOME ?= /usr/local/cuda
+
+# CUDA toolkit location — AUTO-DETECTED, because distros disagree: the NVIDIA
+# .run/.deb installers use /usr/local/cuda, Arch Linux's `cuda` package uses
+# /opt/cuda, and module/conda environments use neither. Order: an nvcc already on
+# PATH wins (covers modules/conda/custom prefixes), then the two common locations.
+# Override explicitly when needed: `make cuda CUDA_HOME=/path/to/cuda`.
+CUDA_HOME ?= $(shell \
+	if command -v nvcc >/dev/null 2>&1; then dirname "$$(dirname "$$(command -v nvcc)")"; \
+	elif [ -x /usr/local/cuda/bin/nvcc ]; then echo /usr/local/cuda; \
+	elif [ -x /opt/cuda/bin/nvcc ]; then echo /opt/cuda; \
+	else echo /usr/local/cuda; fi)
+# lib64 on x86_64 distro packages; lib on aarch64/Tegra and some prefixes.
+CUDA_LIBDIR ?= $(shell \
+	if [ -d "$(CUDA_HOME)/lib64" ]; then echo "$(CUDA_HOME)/lib64"; \
+	else echo "$(CUDA_HOME)/lib"; fi)
 
 .PHONY: metal cuda metal_build cuda_build
 
@@ -157,12 +171,20 @@ NVCC_ARCH ?= -gencode arch=compute_80,code=sm_80 \
              -gencode arch=compute_120,code=sm_120 \
              -gencode arch=compute_120,code=compute_120
 cuda:
+	@if [ ! -x "$(NVCC)" ]; then \
+		echo "ERROR: nvcc not found at $(NVCC) (CUDA_HOME=$(CUDA_HOME))."; \
+		echo "Install the CUDA toolkit, or point CUDA_HOME at it explicitly:"; \
+		echo "  make cuda CUDA_HOME=/opt/cuda        # Arch Linux (cuda package)"; \
+		echo "  make cuda CUDA_HOME=/usr/local/cuda  # NVIDIA .run/.deb installer"; \
+		exit 1; \
+	fi
+	@echo "CUDA toolkit: $(CUDA_HOME) (libs: $(CUDA_LIBDIR))"
 	$(MAKE) clean
 	$(MAKE) cuda_build
 cuda_build: EXTRA_CFLAGS += -DQWEN_HAVE_CUDA -I$(CUDA_HOME)/include
 cuda_build: $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o $(LDLIBS) \
-		-L$(CUDA_HOME)/lib64 -lcublas -lcudart -lstdc++
+		-L$(CUDA_LIBDIR) -lcublas -lcudart -lstdc++
 	@# -lstdc++: the nvcc-compiled .cu object pulls in C++ ABI (__cxa_guard*/libstdc++);
 	@#          the final link is driven by gcc, which doesn't add it automatically.
 	@echo ""

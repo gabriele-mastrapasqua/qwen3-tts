@@ -504,7 +504,9 @@ upload — e.g. ~3.6 s cold vs 469 ms warm on M1-0.6B). Metal beats the native M
 *(Multi-user concurrency → the batching table below.)*
 
 **NVIDIA CUDA** — `make cuda` (resident fused + cuBLAS pointwise convs + CUDA graphs). One multi-arch
-binary (Ampere/Ada/Blackwell). **Single-stream latency** (one request), measured:
+binary (Ampere/Ada/Blackwell). The CUDA toolkit is auto-detected (`nvcc` on `PATH`, else `/usr/local/cuda`,
+else `/opt/cuda` — Arch Linux); point at a different prefix with `make cuda CUDA_HOME=/path/to/cuda`.
+**Single-stream latency** (one request), measured:
 
 | GPU | Config | RTF (single stream) |
 |---|---|---|

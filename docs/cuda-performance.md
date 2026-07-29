@@ -99,6 +99,14 @@ Build (pick your arch, or use the default multi-arch):
 make cuda                    # multi-arch (sm_80/86/89/120 + PTX)
 ```
 
+The CUDA toolkit prefix is auto-detected: `nvcc` on `PATH` (covers conda / environment-modules /
+custom prefixes) → `/usr/local/cuda` (NVIDIA `.run`/`.deb` installers) → `/opt/cuda` (Arch Linux's
+`cuda` package). If yours lives elsewhere, pass it explicitly:
+
+```bash
+make cuda CUDA_HOME=/path/to/cuda
+```
+
 Single stream (lowest latency):
 
 ```bash

@@ -1,7 +1,9 @@
 # GPU acceleration status — CPU / Metal / CUDA, per accelerated code point
 
 Branch `feat/gpu-backends`. `make blas` (CPU-only) is the default and stays byte-identical;
-Metal/CUDA are opt-in (`make metal` / `make cuda`, `--backend metal|cuda`). All numbers measured on
+Metal/CUDA are opt-in (`make metal` / `make cuda`, `--backend metal|cuda`). `make cuda` auto-detects the
+CUDA toolkit (`nvcc` on `PATH` → `/usr/local/cuda` → `/opt/cuda`, the Arch Linux location); override with
+`make cuda CUDA_HOME=/path/to/cuda`. All numbers measured on
 the **Apple M1 base** (8-core GPU, ~68 GB/s shared CPU+GPU). Correctness = `--gpu-selftest` per-op vs the
 CPU kernels (bf16-exact within fp-order).
 
