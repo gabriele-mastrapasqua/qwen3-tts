@@ -503,11 +503,13 @@ void *g_cuda_talker_batch_state = NULL;
 void *g_metal_talker_state = NULL;
 void *g_metal_talker_batch_state = NULL;   /* batched fused Talker step (server throughput) */
 extern void qwen_metal_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+extern void qwen_metal_talker_get_dec_x(void *state, float *out);
 extern void qwen_metal_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
 #endif
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
 extern void qwen_cuda_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+extern void qwen_cuda_talker_get_dec_x(void *state, float *out);
 #endif
 
 int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
@@ -519,18 +521,29 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
     int pos = ctx->kv_len;
     float eps = c->rms_norm_eps;
 
+    /* Fused-vs-CPU dispatch is per-REQUEST (ml_steer_weight), not per-frame (w_eff):
+     * mixing fused steps (device KV only) and CPU steered steps (host KV only) inside one
+     * request leaves each cache missing the other side's rows — a pulse schedule
+     * (--ml-frames N) would read garbage after the pulse. A steered request runs fully on
+     * the CPU path (the fused step doesn't apply ml_steer yet); qwen_tts_generate forces a
+     * full prefill for it so the host KV is coherent (issue #19 part 2). */
 #ifdef QWEN_HAVE_CUDA
     if (g_cuda_talker_state && ctx == g_gpu_fused_owner &&
-        !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
+        !(ctx->ml_steer && ctx->ml_steer_weight != 0.0f)) {
         qwen_cuda_talker_step(g_cuda_talker_state, embed, hidden_out, pos);
+        /* The fused step skips the host state; refresh ctx->dec_x from the device residual
+         * so the prefill→decode handoff (last_hidden = rms_norm(dec_x, talker_norm)) stays
+         * correct across server delta-reuse requests and streaming chunk seeds (issue #19). */
+        qwen_cuda_talker_get_dec_x(g_cuda_talker_state, ctx->dec_x);
         ctx->kv_len = pos + 1;
         return 0;
     }
 #endif
 #ifdef QWEN_HAVE_METAL
     if (g_metal_talker_state && ctx == g_gpu_fused_owner &&
-        !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
+        !(ctx->ml_steer && ctx->ml_steer_weight != 0.0f)) {
         qwen_metal_talker_step(g_metal_talker_state, embed, hidden_out, pos);
+        qwen_metal_talker_get_dec_x(g_metal_talker_state, ctx->dec_x);
         ctx->kv_len = pos + 1;
         return 0;
     }

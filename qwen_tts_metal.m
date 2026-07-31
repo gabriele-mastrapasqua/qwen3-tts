@@ -1704,6 +1704,17 @@ void qwen_metal_talker_step(void *st, const float *embed, float *hidden_out, int
     }
 }
 
+/* Last stepped token's pre-final-norm residual (xb, stable after waitUntilCompleted).
+ * qwen_talker_step uses it to refresh ctx->dec_x, which the fused step otherwise never
+ * touches (the delta-reuse server path would seed the first frame from a stale dec_x —
+ * issue #19). Shared buffer → plain memcpy from .contents. */
+void qwen_metal_talker_get_dec_x(void *st, float *out) {
+    qwen_metal_talker_t *s = st; if (!s || !out) return;
+    @autoreleasepool {
+        memcpy(out, ((__bridge id<MTLBuffer>)s->xb).contents, (size_t)s->H*sizeof(float));
+    }
+}
+
 /* Seed the device KV from the CPU batched prefill (ctx->kv_cache_{k,v} bf16), so the fused
  * decode steps attend to the prompt. Mirrors qwen_cuda_talker_upload_kv. bf16->f32 = bits<<16
  * (= the bf16-truncated f32 kv_store also writes). Shared buffers → write .contents directly. */
