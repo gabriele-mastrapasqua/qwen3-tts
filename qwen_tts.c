@@ -1352,6 +1352,27 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * the sequential path and correctly repopulate dec_x at the last position. */
     if (delta_start >= prefill_len) delta_start = 0;
 
+#if defined(QWEN_HAVE_CUDA) || defined(QWEN_HAVE_METAL)
+    /* Issue #19 (part 2): fused GPU Talker + emotion steering. Steered steps run on the
+     * CPU path and read the HOST KV, but a fused delta-prefill writes the device KV only,
+     * so host rows [delta_start, prefill_len) may be stale from an earlier request. A
+     * steered decode would then attend to the previous request's text. Force a full fresh
+     * prefill (host + device KV both repopulated) whenever this request will steer. */
+    {
+        extern void *g_gpu_fused_owner;
+        int fused_owner = 0;
+#ifdef QWEN_HAVE_CUDA
+        { extern void *g_cuda_talker_state;
+          if (g_cuda_talker_state && ctx == g_gpu_fused_owner) fused_owner = 1; }
+#endif
+#ifdef QWEN_HAVE_METAL
+        { extern void *g_metal_talker_state;
+          if (g_metal_talker_state && ctx == g_gpu_fused_owner) fused_owner = 1; }
+#endif
+        if (fused_owner && ctx->ml_steer && ctx->ml_steer_weight != 0.0f) delta_start = 0;
+    }
+#endif
+
     /* Reset KV cache to the reusable prefix length */
     ctx->kv_len = delta_start;
 
@@ -1395,12 +1416,18 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         }
     }
 #ifdef QWEN_HAVE_CUDA
-    /* Fused GPU Talker: the CPU batched prefill populated the host bf16 KV; upload it to the
-     * device cache once so the fused decode steps (which read the device KV) see the prompt. */
+    /* Fused GPU Talker KV sync (issue #19). The device KV is the source of truth in fused mode:
+     *  - delta_start == 0 (full CPU batched prefill): host kv_cache_k/v is freshly populated
+     *    by qwen_talker_prefill → mirror it to the device once.
+     *  - delta_start > 0 (server delta-reuse): the new tokens were stepped through the fused
+     *    GPU step, which writes the device KV DIRECTLY and skips the host KV. The matching
+     *    prefix [0, delta_start) is still valid on the device from the previous request, so
+     *    the device KV is ALREADY correct — uploading here would clobber it with the stale
+     *    host KV (the previous request's text) and make the model replay the old prompt. */
     {
         extern void *g_cuda_talker_state, *g_gpu_fused_owner;
         extern void qwen_cuda_talker_upload_kv(void *, qwen_tts_ctx_t *, int);
-        if (g_cuda_talker_state && ctx == g_gpu_fused_owner &&
+        if (g_cuda_talker_state && ctx == g_gpu_fused_owner && delta_start == 0 &&
             !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f))
             qwen_cuda_talker_upload_kv(g_cuda_talker_state, ctx, ctx->kv_len);
     }
@@ -1409,7 +1436,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     {
         extern void *g_metal_talker_state, *g_gpu_fused_owner;
         extern void qwen_metal_talker_upload_kv(void *, qwen_tts_ctx_t *, int);
-        if (g_metal_talker_state && ctx == g_gpu_fused_owner &&
+        if (g_metal_talker_state && ctx == g_gpu_fused_owner && delta_start == 0 &&
             !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f))
             qwen_metal_talker_upload_kv(g_metal_talker_state, ctx, ctx->kv_len);
     }
