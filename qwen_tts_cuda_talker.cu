@@ -411,6 +411,16 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
     CK(cudaMemcpy(hidden_out,s->xn,H*sizeof(float),cudaMemcpyDeviceToHost));
 }
 
+/* Last stepped token's pre-final-norm residual (s->x, stable after the step's sync).
+ * qwen_talker_step uses it to refresh ctx->dec_x, which the fused step otherwise never
+ * touches: the generation loop seeds last_hidden = rms_norm(dec_x, talker_norm) after
+ * prefill, and a stale dec_x from the previous request corrupts the first frame in the
+ * server delta-reuse path (issue #19). */
+extern "C" void qwen_cuda_talker_get_dec_x(void *state, float *out) {
+    cuda_talker_t *s=(cuda_talker_t*)state;
+    if (s && out) CK(cudaMemcpy(out, s->x, (size_t)s->hidden*sizeof(float), cudaMemcpyDeviceToHost));
+}
+
 extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int prefill_len) {
     cuda_talker_t *s=(cuda_talker_t*)state; if(!s||prefill_len<=0) return;
     int kvd=s->kv_dim, L=s->n_layers, kvm=s->kv_max;
