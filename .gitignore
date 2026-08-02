@@ -17,11 +17,12 @@ tools/para/.venv/
 !tools/para/*.py
 # tools/quant (E7): fake-quant harness for offline quant-format quality gates
 !tools/quant/*.py
-qwen3-tts-0.6b/
-qwen3-tts-1.7b/
-qwen3-tts-0.6b-base/
-qwen3-tts-1.7b-base/
-qwen3-tts-voice-design/
+# NB: no trailing slash — these may be symlinks to the NAS copy, not real dirs
+qwen3-tts-0.6b
+qwen3-tts-1.7b
+qwen3-tts-0.6b-base
+qwen3-tts-1.7b-base
+qwen3-tts-voice-design
 __pycache__/
 .DS_Store
 TODO.md
@@ -44,7 +45,7 @@ ab_*.sh
 scripts/
 
 # expressivity artifacts (host on GH release/HF, do not commit big binaries)
-qwen3-tts-1.7b-expr/
+qwen3-tts-1.7b-expr
 # The big .expr weight-deltas are hosted on HF (gabrione/qwen3-tts-italian-expr) and fetched
 # on demand by download_assets.sh (sha256-verified against presets/expr/MANIFEST.md, which IS
 # tracked). HF is the durable backup now, so we no longer track any .expr in git — this also
