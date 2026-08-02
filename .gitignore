@@ -1,0 +1,32 @@
+# build products
+*.o
+*.a
+build/
+
+# local planning and scratch — the repo documents itself in README.md and docs/
+PLAN.md
+TODO.md
+NOTES.md
+scratch/
+*.log
+
+# editors and OS junk
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+compile_commands.json
+.cache/
+
+# NOT ignored on purpose:
+#   amalgam/       generated, but committed so the drop-in build needs no Python
+#   src/*.inc      generated, but committed for the same reason
+#   tests/fixtures committed so the oracle test runs without the gguf package
+
+# internal migration playbooks — local work, not part of the library
+docs/migration/
+
+# make -MMD dependency files + build tree
+src/*.d
+build/

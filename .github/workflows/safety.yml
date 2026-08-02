@@ -1,0 +1,69 @@
+name: Memory Safety
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # make test-asan builds the whole suite with both sanitizers and runs it,
+      # so the parsers are exercised rather than only compiled.
+      - name: Build and run the suite under ASan and UBSan
+        run: make test-asan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  fuzz-sanitized:
+    name: Fuzz under sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The interesting rounds are the mutated files that still parse: they walk
+      # the accept path with values no valid writer would produce.
+      - name: Mutation fuzz with the sanitizers on
+        run: make fuzz CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  leaks:
+    name: Leaks (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # ASan tends to hang on macOS, so `leaks` is the memory gate here — it is
+      # also what found a handle leak ASan had not reported.
+      - name: Run the suite under leaks
+        run: make test-leaks
+
+  warnings:
+    name: No warnings, three compilers
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            cc: gcc
+          - runner: ubuntu-latest
+            cc: clang
+          - runner: macos-latest
+            cc: clang
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # -Werror is not the default build: a consumer should never be stopped by
+      # a warning from a new compiler. It is a gate here instead.
+      - name: Build with -Werror
+        run: make lib CC=${{ matrix.cc }} CFLAGS="-O2 -Werror"
