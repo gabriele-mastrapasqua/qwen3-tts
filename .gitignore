@@ -74,3 +74,4 @@ bench_out/
 
 # Compiler-generated dependency files (Makefile -MMD -MP)
 *.d
+tests/test_ingot_parity
