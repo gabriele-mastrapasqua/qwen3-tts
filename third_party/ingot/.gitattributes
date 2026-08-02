@@ -1,0 +1,11 @@
+# GitHub guesses the language from the extension, and .inc defaults to Pawn.
+# These are C tables, and they are generated: the second line keeps them out of
+# the language stats and collapses them in diffs, where 2,000 lines of codebook
+# constants are noise.
+*.inc linguist-language=C
+src/iq_tables.inc linguist-generated=true
+
+# Generated from src/ by tools/amalgamate.py, committed so the drop-in build
+# needs no Python. Same reasoning: not hand-written, not worth diffing.
+amalgam/ingot.c linguist-generated=true
+amalgam/ingot.h linguist-generated=true

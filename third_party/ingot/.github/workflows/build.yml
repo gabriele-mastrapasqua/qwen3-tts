@@ -1,0 +1,74 @@
+name: Build & Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Portable by default: no -march=native anywhere, so what CI builds is
+          # what a consumer gets. The SIMD paths are opted into per row.
+          - runner: ubuntu-latest
+            name: linux-x86_64 (scalar)
+            cflags: '-O2'
+          - runner: ubuntu-latest
+            name: linux-x86_64 (avx2+fma)
+            cflags: '-O2 -mavx2 -mfma'
+          - runner: ubuntu-24.04-arm
+            name: linux-aarch64 (neon)
+            cflags: '-O2'
+          - runner: ubuntu-24.04-arm
+            name: linux-aarch64 (neon+dotprod+i8mm)
+            cflags: '-O2 -march=armv8.6-a+dotprod+i8mm'
+          - runner: macos-latest
+            name: macos-arm64 (neon)
+            cflags: '-O2'
+
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the library
+        run: make lib CFLAGS="${{ matrix.cflags }}"
+
+      - name: Run the test suite
+        run: make test CFLAGS="${{ matrix.cflags }}"
+
+      # The container half must build and pass with every kernel compiled out:
+      # a consumer that only reads files should not have to link the SIMD.
+      - name: Container-only build
+        run: make core-only CFLAGS="${{ matrix.cflags }}"
+
+      # The two-file drop-in is generated from src/, so it can drift. Building
+      # the whole suite against it is what proves it did not.
+      - name: Amalgam matches the library
+        run: make amalgam-test CFLAGS="${{ matrix.cflags }}"
+
+      - name: Tools and example
+        run: |
+          make tools examples CFLAGS="${{ matrix.cflags }}"
+          ./build/ingot-dump --help || true
+
+      # Every SIMD path has a scalar twin that must agree with it. The library
+      # picks the level at runtime, so the same binary can be made to walk the
+      # slow path and be compared against itself.
+      - name: Scalar fallback agrees with the SIMD path
+        run: INGOT_CAPS=scalar make test CFLAGS="${{ matrix.cflags }}"
+
+  fuzz:
+    name: Mutation fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Write a valid file, flip bytes, open it
+        run: make fuzz
