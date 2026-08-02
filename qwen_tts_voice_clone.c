@@ -10,7 +10,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_voice_clone.h"
-#include "qwen_tts_safetensors.h"
+#include "ingot/safetensors.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -651,15 +651,19 @@ static void se_res2net_block_forward(
 
 
 /* Helper: load f32 tensor from safetensors by name */
-static float *load_f32_tensor(multi_safetensors_t *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
-    if (!t || !sf) return NULL;
-    return safetensors_get_f32(sf, t);
+static float *load_f32_tensor(ingot_st *ms, const char *name) {
+    const ingot_st_tensor *t = ingot_st_find(ms, name);
+    if (!t) return NULL;
+    float *out = malloc((size_t)t->nelem * sizeof(float));
+    if (!out || ingot_st_to_f32(ms, t, out) != 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
 }
 
 int qwen_speaker_encoder_load(qwen_speaker_encoder_t *enc, void *safetensors) {
-    multi_safetensors_t *st = (multi_safetensors_t *)safetensors;
+    ingot_st *st = (ingot_st *)safetensors;
     int saved_enc_dim = enc->enc_dim;  /* may be pre-set from config */
     memset(enc, 0, sizeof(*enc));
     enc->enc_dim = saved_enc_dim > 0 ? saved_enc_dim : 1024;

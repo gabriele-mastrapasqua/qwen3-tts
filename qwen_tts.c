@@ -6,7 +6,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_voice_clone.h"
 #include "qwen_tts_kernels.h"
-#include "qwen_tts_safetensors.h"
+#include "ingot/safetensors.h"
 #include "qwen_tts_tokenizer.h"
 #include "qwen_tts_audio.h"
 #include "qwen_tts_batch.h"
@@ -629,28 +629,33 @@ qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8
         }
     }
 
-    /* Load safetensors using qwen-asr loader (mmap-based, working) */
-    ctx->safetensors = multi_safetensors_open(ctx->model_dir);
-    if (!ctx->safetensors) {
-        fprintf(stderr, "Error: Failed to load model from %s\n", ctx->model_dir);
+    /* Load safetensors through ingot (mmap, index.json-aware, no caps) */
+    char st_err[256] = "";
+    ingot_st *st_main = NULL;
+    if (ingot_st_open_dir(&st_main, ctx->model_dir, st_err, sizeof st_err) != 0) {
+        fprintf(stderr, "Error: Failed to load model from %s: %s\n",
+                ctx->model_dir, st_err);
         free(ctx); return NULL;
     }
+    ctx->safetensors = st_main;
     /* Speech tokenizer is in a separate subdirectory */
     char speech_dir[4096];
     snprintf(speech_dir, sizeof(speech_dir), "%s/speech_tokenizer", ctx->model_dir);
-    ctx->speech_safetensors = multi_safetensors_open(speech_dir);
-    if (!ctx->speech_safetensors) {
-        fprintf(stderr, "Error: Failed to load speech tokenizer from %s\n", speech_dir);
-        multi_safetensors_close(ctx->safetensors);
+    ingot_st *st_speech = NULL;
+    if (ingot_st_open_dir(&st_speech, speech_dir, st_err, sizeof st_err) != 0) {
+        fprintf(stderr, "Error: Failed to load speech tokenizer from %s: %s\n",
+                speech_dir, st_err);
+        ingot_st_close(ctx->safetensors);
         free(ctx); return NULL;
     }
+    ctx->speech_safetensors = st_speech;
 
     if (!ctx->silent) fprintf(stderr, "Threads: %d\n", qwen_get_threads());
 
     double t0 = time_ms();
     if (qwen_talker_load(ctx) != 0 || qwen_cp_load(ctx) != 0 || qwen_speech_decoder_load(ctx) != 0) {
-        multi_safetensors_close(ctx->safetensors);
-        multi_safetensors_close(ctx->speech_safetensors);
+        ingot_st_close(ctx->safetensors);
+        ingot_st_close(ctx->speech_safetensors);
         free(ctx); return NULL;
     }
 
@@ -725,8 +730,8 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->speech_dec.pre_layers);
     free(ctx->speech_dec.rope_cos); free(ctx->speech_dec.rope_sin);
     /* Close safetensors (all get_bf16/get_f32 pointers point into this data) */
-    multi_safetensors_close(ctx->safetensors);
-    multi_safetensors_close(ctx->speech_safetensors);
+    ingot_st_close(ctx->safetensors);
+    ingot_st_close(ctx->speech_safetensors);
     free(ctx->instruct);
     free(ctx->speaker_embedding);
     free(ctx->ref_audio_path);

@@ -9,7 +9,7 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
-#include "qwen_tts_safetensors.h"
+#include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
 
 #include <stdio.h>
@@ -103,17 +103,22 @@ static inline uint16_t f32_to_bf16(float val) {
 }
 
 static uint16_t *get_bf16(void *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
-    if (!t || !sf) return NULL;
-    return safetensors_get_bf16_direct(sf, t);
+    const ingot_st_tensor *t = ingot_st_find((ingot_st *)ms, name);
+    if (!t || t->dtype != INGOT_DT_BF16) return NULL;
+    return (uint16_t *)(uintptr_t)ingot_st_data((ingot_st *)ms, t);
 }
 
+/* Same signature and same ownership as the old safetensors_get_f32: the
+ * caller frees. ingot converts into a buffer that is ours from the start. */
 static float *get_f32(void *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
-    if (!t || !sf) return NULL;
-    return safetensors_get_f32(sf, t);
+    const ingot_st_tensor *t = ingot_st_find((ingot_st *)ms, name);
+    if (!t) return NULL;
+    float *out = malloc((size_t)t->nelem * sizeof(float));
+    if (!out || ingot_st_to_f32((ingot_st *)ms, t, out) != 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
 }
 
 /* Convert f32 vector to bf16 (NEON-vectorized) */

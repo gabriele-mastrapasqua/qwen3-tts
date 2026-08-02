@@ -46,7 +46,7 @@ else
     LDLIBS += -lopenblas
 endif
 
-CFLAGS = $(CFLAGS_BASE) $(EXTRA_CFLAGS)
+CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include $(EXTRA_CFLAGS)
 
 # Source files
 SRCS = main.c \
@@ -64,7 +64,6 @@ SRCS = main.c \
        qwen_tts_compose.c \
        qwen_tts_sampling.c \
        qwen_tts_tokenizer.c \
-       qwen_tts_safetensors.c \
        qwen_tts_server.c \
        qwen_tts_voice_clone.c \
        qwen_tts_speech_encoder.c \
@@ -133,8 +132,8 @@ help:
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
 # Build
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+$(TARGET): $(OBJS) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(INGOT_LIB) $(LDLIBS)
 
 blas: $(TARGET)
 
