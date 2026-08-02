@@ -27,3 +27,21 @@ Non eseguibile qui (symlink al NAS non montato — /Volumes/shared):
   assente, NON un bug: il vecchio reader fallirebbe uguale.
 → da rifare a casa col NAS montato, poi cancellare qwen_tts_safetensors.c/h
   e merge.
+
+## TODO — next steps (da fare A CASA, per chiudere in sicurezza)
+
+1. Montare il NAS (/Volumes/shared), poi:
+   - `make test-clone` (estrazione x-vector col base) e `make test-voice-design`;
+   - `make e2e` completo, stavolta fino in fondo.
+2. `compare_c_vs_python.py` — l'oracolo Python indipendente sui pesi (unico
+   check della scheda non ancora girato; serve il venv).
+3. Solo a 1-2 verdi: cancellare `qwen_tts_safetensors.c/h` + il gate
+   `tests/test_ingot_parity.c`, togliere il target dal Makefile, merge del
+   branch `feat/migration-ingotlib` in main, push.
+4. Extra collegati (stessa sessione, vale la pena):
+   - `make update-ingot` in mynah-tts e mynah-asr + loro suite: si prendono
+     le conversioni BF16→F32 SIMD e i dequant vettorizzati della fase 7;
+   - push dei branch `feat/migration-ingotlib` di keyra e qwen-tts come
+     backup remoto (senza merge);
+   - VPS x86: checklist in keyra/PLAN.md §91 (runtime fase 7 di ingot +
+     parity keyra).
