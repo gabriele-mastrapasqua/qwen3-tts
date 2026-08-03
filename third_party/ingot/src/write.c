@@ -5,6 +5,8 @@
  * caller, not to a loader.
  *
  * SPDX-License-Identifier: MIT */
+#define _POSIX_C_SOURCE 200809L   /* ftello/off_t under -std=c11 on glibc */
+#include <sys/types.h>
 #include "ingot/write.h"
 #include "ingot/gguf.h"   /* the INGOT_KV_* tags */
 #include "internal.h"
@@ -62,6 +64,7 @@ typedef struct {
 struct ingot_gguf_writer {
     wbuf      kv;             /* the serialized KV block, built as we go */
     uint64_t  nkv;
+    int       alignment_kv;   /* general.alignment already appended (save() ran) */
     wtensor  *tensors;
     size_t    ntensor, cap;
     int       failed;
@@ -245,7 +248,7 @@ int ingot_gguf_add_f32(ingot_gguf_writer *w, const char *name, int type,
 
 static int pad_file(FILE *f, uint64_t alignment) {
     static const unsigned char zero[GGUF_ALIGNMENT] = {0};
-    const long pos = ftell(f);
+    const off_t pos = ftello(f);   /* ftell's long truncates past 2 GiB on LP32 */
     if (pos < 0) return -1;
     const size_t rem = (size_t)((uint64_t)pos % alignment);
     if (rem == 0) return 0;
@@ -265,10 +268,15 @@ int ingot_gguf_writer_save(ingot_gguf_writer *w, const char *path,
         return -1;
     }
     /* The alignment is written as a KV so a reader does not have to assume the
-     * default; we always use 32, which is the default, so old readers agree. */
-    if (ingot_gguf_kv_u32(w, "general.alignment", GGUF_ALIGNMENT) != 0 || w->failed) {
-        ingot_err(err, errsz, "out of memory");
-        return -1;
+     * default; we always use 32, which is the default, so old readers agree.
+     * save() may legitimately run twice (retry after ENOSPC, two paths): the
+     * KV must be appended exactly once or the header count lies. */
+    if (!w->alignment_kv) {
+        if (ingot_gguf_kv_u32(w, "general.alignment", GGUF_ALIGNMENT) != 0 || w->failed) {
+            ingot_err(err, errsz, "out of memory");
+            return -1;
+        }
+        w->alignment_kv = 1;
     }
 
     /* The tensor table needs each payload's offset, which depends on the table
