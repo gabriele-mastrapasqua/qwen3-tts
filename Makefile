@@ -265,7 +265,7 @@ clean:
 	rm -f test_decoder_standalone.o test_decoder_standalone.d qwen_tts_decoder_tool
 
 # Debug build
-debug: CFLAGS = $(CFLAGS_BASE) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
+debug: CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
 debug: LDLIBS += -fsanitize=address -fsanitize=undefined
 debug: clean $(TARGET)
 

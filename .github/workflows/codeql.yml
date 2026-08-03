@@ -53,8 +53,9 @@ jobs:
             --extra-arg='-DUSE_BLAS' \
             --extra-arg='-DUSE_OPENBLAS' \
             --extra-arg='-I/usr/include/openblas' \
+            --extra-arg='-Ithird_party/ingot/include' \
             main.c qwen_tts.c qwen_tts_talker.c qwen_tts_code_predictor.c \
             qwen_tts_speech_decoder.c qwen_tts_kernels.c qwen_tts_audio.c \
-            qwen_tts_sampling.c qwen_tts_tokenizer.c qwen_tts_safetensors.c \
+            qwen_tts_sampling.c qwen_tts_tokenizer.c \
             qwen_tts_server.c qwen_tts_voice_clone.c qwen_tts_speech_encoder.c \
-            -- -I/usr/include/openblas
+            -- -I/usr/include/openblas -Ithird_party/ingot/include
