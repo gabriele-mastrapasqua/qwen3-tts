@@ -1,0 +1,52 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+
+      - name: Build
+        run: make lib tools
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy
+
+      # src/iq_tables.inc is generated data, not hand-written code, and the
+      # amalgam is src/ concatenated — analysing either would only report the
+      # same findings twice.
+      - name: Run clang-tidy over the sources
+        run: |
+          clang-tidy \
+            -checks='clang-analyzer-core.*,clang-analyzer-unix.*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-deadcode.DeadStores,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-narrowing-conversions,-bugprone-implicit-widening-of-multiplication-result,-bugprone-suspicious-realloc-usage,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-misplaced-widening-cast,-bugprone-branch-clone' \
+            -warnings-as-errors='' \
+            src/*.c tools/ingot_dump.c \
+            -- -std=c11 -Iinclude

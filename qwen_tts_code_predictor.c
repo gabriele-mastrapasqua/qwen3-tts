@@ -8,7 +8,7 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
-#include "qwen_tts_safetensors.h"
+#include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
 
 #include <stdio.h>
@@ -158,15 +158,20 @@ static void f32_to_bf16_vec(uint16_t *dst, const float *src, int64_t n) {
 }
 
 static uint16_t *get_bf16(void *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
-    return (t && sf) ? (uint16_t *)safetensors_get_bf16_direct(sf, t) : NULL;
+    const ingot_st_tensor *t = ingot_st_find((ingot_st *)ms, name);
+    if (!t || t->dtype != INGOT_DT_BF16) return NULL;
+    return (uint16_t *)(uintptr_t)ingot_st_data((ingot_st *)ms, t);
 }
 
 static float *get_f32(void *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
-    return (t && sf) ? (float *)safetensors_get_f32(sf, t) : NULL;
+    const ingot_st_tensor *t = ingot_st_find((ingot_st *)ms, name);
+    if (!t) return NULL;
+    float *out = malloc((size_t)t->nelem * sizeof(float));
+    if (!out || ingot_st_to_f32((ingot_st *)ms, t, out) != 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
 }
 
 /* Use centralized NEON+multi-threaded matvec from qwen_tts_kernels.c */

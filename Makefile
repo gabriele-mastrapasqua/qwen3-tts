@@ -46,7 +46,7 @@ else
     LDLIBS += -lopenblas
 endif
 
-CFLAGS = $(CFLAGS_BASE) $(EXTRA_CFLAGS)
+CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include $(EXTRA_CFLAGS)
 
 # Source files
 SRCS = main.c \
@@ -64,7 +64,6 @@ SRCS = main.c \
        qwen_tts_compose.c \
        qwen_tts_sampling.c \
        qwen_tts_tokenizer.c \
-       qwen_tts_safetensors.c \
        qwen_tts_server.c \
        qwen_tts_voice_clone.c \
        qwen_tts_speech_encoder.c \
@@ -72,6 +71,27 @@ SRCS = main.c \
 
 OBJS = $(SRCS:.c=.o)
 TARGET = qwen_tts
+
+# ── ingot: the GGUF/safetensors library, vendored as a git subtree. Built by
+# its own Makefile so this one never learns how it is compiled. ──────────────
+INGOT_DIR := third_party/ingot
+INGOT_LIB := $(INGOT_DIR)/libingot.a
+$(INGOT_LIB):
+	$(MAKE) -C $(INGOT_DIR) lib
+
+# Refresh the vendored subtree from upstream (clean working tree required).
+update-ingot:
+	git subtree pull --prefix $(INGOT_DIR) https://github.com/mynah-org/ingot.git main --squash
+	@$(MAKE) -C $(INGOT_DIR) clean
+
+# The A/B gate of the ingot migration: both readers in one binary, run on the
+# REAL checkpoints in this repo (QWEN_PARITY_DIR overrides the default).
+# Lives only on feat/migration-ingotlib; deleted when the branch merges.
+.PHONY: update-ingot test-ingot-parity
+test-ingot-parity: $(INGOT_LIB)
+	$(CC) $(CFLAGS) -I$(INGOT_DIR)/include tests/test_ingot_parity.c \
+	  qwen_tts_safetensors.c $(INGOT_LIB) -lm -lpthread -o tests/test_ingot_parity
+	./tests/test_ingot_parity
 MODEL_DIR = qwen3-tts-0.6b
 
 # Default: show help
@@ -112,8 +132,8 @@ help:
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
 # Build
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+$(TARGET): $(OBJS) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(INGOT_LIB) $(LDLIBS)
 
 blas: $(TARGET)
 
@@ -146,8 +166,8 @@ metal:
 	$(MAKE) clean
 	$(MAKE) metal_build
 metal_build: EXTRA_CFLAGS += -DQWEN_HAVE_METAL
-metal_build: $(OBJS) $(GPU_OBJS) qwen_tts_metal.o
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_metal.o $(LDLIBS) \
+metal_build: $(OBJS) $(GPU_OBJS) qwen_tts_metal.o $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_metal.o $(INGOT_LIB) $(LDLIBS) \
 		-framework Metal -framework Foundation
 	@echo ""
 	@echo "Built ./$(TARGET) with Metal backend. Try: ./$(TARGET) --gpu-selftest --backend metal"
@@ -182,8 +202,8 @@ cuda:
 	$(MAKE) clean
 	$(MAKE) cuda_build
 cuda_build: EXTRA_CFLAGS += -DQWEN_HAVE_CUDA -I$(CUDA_HOME)/include
-cuda_build: $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o $(LDLIBS) \
+cuda_build: $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o $(INGOT_LIB) $(LDLIBS) \
 		-L$(CUDA_LIBDIR) -lcublas -lcudart -lstdc++
 	@# -lstdc++: the nvcc-compiled .cu object pulls in C++ ABI (__cxa_guard*/libstdc++);
 	@#          the final link is driven by gcc, which doesn't add it automatically.

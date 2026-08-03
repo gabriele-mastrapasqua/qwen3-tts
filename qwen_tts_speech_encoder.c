@@ -24,7 +24,7 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
-#include "qwen_tts_safetensors.h"
+#include "ingot/safetensors.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,9 +44,8 @@
  * ======================================================================== */
 
 static const float *enc_get_f32(void *ms, const char *name) {
-    safetensors_file_t *sf = NULL;
-    const safetensor_t *t = multi_safetensors_find((multi_safetensors_t *)ms, name, &sf);
-    return (t && sf) ? (const float *)safetensors_data(sf, t) : NULL;
+    const ingot_st_tensor *t = ingot_st_find((ingot_st *)ms, name);
+    return t ? (const float *)ingot_st_data((ingot_st *)ms, t) : NULL;
 }
 
 /* ========================================================================
