@@ -72,3 +72,23 @@ jobs:
       - uses: actions/checkout@v5
       - name: Write a valid file, flip bytes, open it
         run: make fuzz
+
+  # The AVX-512/VNNI kernels do not run on any hosted runner, so before this
+  # job they were compiled at best and executed never. Intel SDE emulates a
+  # Sapphire Rapids CPU faithfully enough to run the whole suite on them.
+  avx512-emulated:
+    name: linux-x86_64 (avx512+vnni, Intel SDE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Intel SDE
+        uses: petarpetrovt/setup-sde@v5.0
+
+      - name: Build with AVX-512+VNNI and run the suite under SDE
+        run: |
+          make test CFLAGS="-O2 -march=x86-64-v4 -mavx512vnni" RUN="$SDE_PATH/sde64 -spr --"
+
+      - name: Scalar fallback agrees under SDE too
+        run: |
+          INGOT_CAPS=scalar make test CFLAGS="-O2 -march=x86-64-v4 -mavx512vnni" RUN="$SDE_PATH/sde64 -spr --"

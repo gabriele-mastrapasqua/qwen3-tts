@@ -336,7 +336,9 @@ void ingot_bf16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
     }
 #elif defined(INGOT_DTYPE_NEON)
     for (; i + 8 <= nelem; i += 8) {
-        const uint16x8_t h = vld1q_u16((const uint16_t *)(const void *)(p + 2 * i));
+        /* byte load: these converters accept any source alignment, and
+         * vld1q_u16 would promise the compiler 2-byte alignment it may not have */
+        const uint16x8_t h = vreinterpretq_u16_u8(vld1q_u8(p + 2 * i));
         vst1q_f32(dst + i,     vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16)));
         vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16)));
     }
@@ -357,7 +359,8 @@ void ingot_f16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
             _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 2 * i))));
 #elif defined(INGOT_DTYPE_NEON) && defined(__aarch64__)
     for (; i + 4 <= nelem; i += 4) {
-        const float16x4_t h = vld1_f16((const float16_t *)(const void *)(p + 2 * i));
+        /* byte load: any source alignment (see the BF16 twin above) */
+        const float16x4_t h = vreinterpret_f16_u8(vld1_u8(p + 2 * i));
         vst1q_f32(dst + i, vcvt_f32_f16(h));
     }
 #endif
@@ -410,7 +413,9 @@ void ingot_f32_block_to_bf16(const float *src, size_t nelem, unsigned char *dst)
             vcgtq_u32(vandq_u32(bits, manm), vdupq_n_u32(0)));
         const uint16x4_t nanh = vorr_u16(vshrn_n_u32(bits, 16), vdup_n_u16(0x0040));
         h = vbsl_u16(vmovn_u32(isnan), nanh, h);
-        vst1_u16((uint16_t *)(void *)(dst + 2 * i), h);
+        /* byte store: dst may sit at any alignment; vst1_u16 would be UB there
+         * (UBSan on GB10 caught exactly this on an odd destination) */
+        vst1_u8(dst + 2 * i, vreinterpret_u8_u16(h));
     }
 #endif
     for (; i < nelem; i++) {

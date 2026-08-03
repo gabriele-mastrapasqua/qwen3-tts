@@ -10,21 +10,46 @@ on:
 jobs:
   sanitizers:
     name: ASan + UBSan
-    runs-on: ubuntu-latest
+    # Every ISA level the library ships, sanitized where it can execute: the
+    # x86 rows cover scalar and AVX2, the ARM rows NEON and dotprod+i8mm. An
+    # unaligned NEON store once survived this job because the sanitizers only
+    # ran on x86, where that code does not even compile — and it takes GCC's
+    # arm_neon.h for -fsanitize=alignment to see through the intrinsic at all.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            name: x86_64 scalar
+            simd: ''
+          - runner: ubuntu-latest
+            name: x86_64 avx2+fma
+            simd: '-mavx2 -mfma'
+          - runner: ubuntu-24.04-arm
+            name: aarch64 neon
+            simd: ''
+          - runner: ubuntu-24.04-arm
+            name: aarch64 neon+dotprod+i8mm
+            simd: '-march=armv8.6-a+dotprod+i8mm'
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
 
       # make test-asan builds the whole suite with both sanitizers and runs it,
       # so the parsers are exercised rather than only compiled.
-      - name: Build and run the suite under ASan and UBSan
-        run: make test-asan
+      - name: Build and run the suite under ASan and UBSan (${{ matrix.name }})
+        run: make test-asan SIMD="${{ matrix.simd }}"
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
 
   fuzz-sanitized:
     name: Fuzz under sanitizers
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
 
