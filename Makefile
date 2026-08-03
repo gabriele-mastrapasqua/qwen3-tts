@@ -84,14 +84,7 @@ update-ingot:
 	git subtree pull --prefix $(INGOT_DIR) https://github.com/mynah-org/ingot.git main --squash
 	@$(MAKE) -C $(INGOT_DIR) clean
 
-# The A/B gate of the ingot migration: both readers in one binary, run on the
-# REAL checkpoints in this repo (QWEN_PARITY_DIR overrides the default).
-# Lives only on feat/migration-ingotlib; deleted when the branch merges.
-.PHONY: update-ingot test-ingot-parity
-test-ingot-parity: $(INGOT_LIB)
-	$(CC) $(CFLAGS) -I$(INGOT_DIR)/include tests/test_ingot_parity.c \
-	  qwen_tts_safetensors.c $(INGOT_LIB) -lm -lpthread -o tests/test_ingot_parity
-	./tests/test_ingot_parity
+.PHONY: update-ingot
 MODEL_DIR = qwen3-tts-0.6b
 
 # Default: show help
