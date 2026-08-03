@@ -130,8 +130,9 @@ float    ingot_f8_e4m3_to_f32(uint8_t value);
 float    ingot_f8_e5m2_to_f32(uint8_t value);
 
 /* Bulk conversion of a whole buffer — all the safetensors side ever needs,
- * since it has no block types. Returns -1 when the dtype has no f32
- * representation (BOOL, U64 above 2^53, …see the implementation notes). */
+ * since it has no block types. Returns -1 only for INGOT_DT_UNKNOWN; every
+ * other dtype converts, rounding where f32 cannot represent the value
+ * exactly (BOOL becomes 0.0/1.0, U64/I64 above 2^24..2^53 lose low bits). */
 int ingot_dtype_to_f32(ingot_dtype dtype, const void *src, size_t nelem, float *dst);
 
 /* ═══ include/ingot/gguf.h ═══ */

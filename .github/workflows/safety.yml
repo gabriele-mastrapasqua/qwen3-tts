@@ -33,7 +33,7 @@ jobs:
             simd: '-march=armv8.6-a+dotprod+i8mm'
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # make test-asan builds the whole suite with both sanitizers and runs it,
       # so the parsers are exercised rather than only compiled.
@@ -51,7 +51,7 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The interesting rounds are the mutated files that still parse: they walk
       # the accept path with values no valid writer would produce.
@@ -65,7 +65,7 @@ jobs:
     name: Leaks (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # ASan tends to hang on macOS, so `leaks` is the memory gate here — it is
       # also what found a handle leak ASan had not reported.
@@ -86,7 +86,7 @@ jobs:
             cc: clang
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # -Werror is not the default build: a consumer should never be stopped by
       # a warning from a new compiler. It is a gate here instead.

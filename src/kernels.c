@@ -946,10 +946,20 @@ static size_t qk_token_tile(size_t cols) {
                 parsed <= INGOT_QK_TOKEN_TILE_MAX) override = (long)parsed;
         }
     }
-    if (override > 0) return (size_t)override;
-    size_t tile = INGOT_QK_TILE_BYTES / (cols * sizeof(float));
-    if (tile > INGOT_QK_TOKEN_TILE) tile = INGOT_QK_TOKEN_TILE;
-    if (tile < INGOT_QK_TOKEN_TILE_MIN) tile = INGOT_QK_TOKEN_TILE_MIN;
+    size_t tile;
+    if (override > 0) {
+        tile = (size_t)override;
+    } else {
+        tile = INGOT_QK_TILE_BYTES / (cols * sizeof(float));
+        if (tile > INGOT_QK_TOKEN_TILE) tile = INGOT_QK_TOKEN_TILE;
+        if (tile < INGOT_QK_TOKEN_TILE_MIN) tile = INGOT_QK_TOKEN_TILE_MIN;
+    }
+    /* The SMMLA worker indexes interleaved token PAIRS as
+     * (token_begin + t) / 2, which is only right when every tile starts on
+     * an even token. The derived tile can be odd (cols=11008 gives 95), and
+     * so can the env override: round down to even, floor 2. */
+    tile &= ~(size_t)1;
+    if (tile < 2) tile = 2;
     return tile;
 }
 
@@ -2438,13 +2448,15 @@ static void dense_rows(size_t begin, size_t end, void *user) {
                 for (; c + 8 <= cols; c += 8) {
                     float32x4_t wlo, whi;
                     if (f16) {
-                        const float16x8_t h = vld1q_f16(
-                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        /* byte load: wrow follows the file layout and owes
+                         * no 2-byte alignment (same fix as the dtype.c lanes) */
+                        const float16x8_t h = vreinterpretq_f16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vcvt_f32_f16(vget_low_f16(h));
                         whi = vcvt_f32_f16(vget_high_f16(h));
                     } else {
-                        const uint16x8_t h = vld1q_u16(
-                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        const uint16x8_t h = vreinterpretq_u16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
                         whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
                     }
@@ -2476,13 +2488,15 @@ static void dense_rows(size_t begin, size_t end, void *user) {
                 for (; c + 8 <= cols; c += 8) {
                     float32x4_t wlo, whi;
                     if (f16) {
-                        const float16x8_t h = vld1q_f16(
-                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        /* byte load: wrow follows the file layout and owes
+                         * no 2-byte alignment (same fix as the dtype.c lanes) */
+                        const float16x8_t h = vreinterpretq_f16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vcvt_f32_f16(vget_low_f16(h));
                         whi = vcvt_f32_f16(vget_high_f16(h));
                     } else {
-                        const uint16x8_t h = vld1q_u16(
-                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        const uint16x8_t h = vreinterpretq_u16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
                         whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
                     }

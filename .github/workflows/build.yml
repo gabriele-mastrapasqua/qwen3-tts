@@ -36,7 +36,7 @@ jobs:
     name: ${{ matrix.name }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Build the library
         run: make lib CFLAGS="${{ matrix.cflags }}"
@@ -69,7 +69,7 @@ jobs:
     name: Mutation fuzz
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Write a valid file, flip bytes, open it
         run: make fuzz
 
@@ -80,7 +80,7 @@ jobs:
     name: linux-x86_64 (avx512+vnni, Intel SDE)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Intel SDE
         uses: petarpetrovt/setup-sde@v5.0

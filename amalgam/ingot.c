@@ -15,6 +15,7 @@
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE 1
 #endif
+#define _POSIX_C_SOURCE 200809L   /* ftello/off_t under -std=c11 on glibc */
 
 #include "ingot.h"
 
@@ -500,7 +501,9 @@ void ingot_bf16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
     }
 #elif defined(INGOT_DTYPE_NEON)
     for (; i + 8 <= nelem; i += 8) {
-        const uint16x8_t h = vld1q_u16((const uint16_t *)(const void *)(p + 2 * i));
+        /* byte load: these converters accept any source alignment, and
+         * vld1q_u16 would promise the compiler 2-byte alignment it may not have */
+        const uint16x8_t h = vreinterpretq_u16_u8(vld1q_u8(p + 2 * i));
         vst1q_f32(dst + i,     vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16)));
         vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16)));
     }
@@ -521,7 +524,8 @@ void ingot_f16_block_to_f32(const unsigned char *p, size_t nelem, float *dst) {
             _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 2 * i))));
 #elif defined(INGOT_DTYPE_NEON) && defined(__aarch64__)
     for (; i + 4 <= nelem; i += 4) {
-        const float16x4_t h = vld1_f16((const float16_t *)(const void *)(p + 2 * i));
+        /* byte load: any source alignment (see the BF16 twin above) */
+        const float16x4_t h = vreinterpret_f16_u8(vld1_u8(p + 2 * i));
         vst1q_f32(dst + i, vcvt_f32_f16(h));
     }
 #endif
@@ -574,7 +578,9 @@ void ingot_f32_block_to_bf16(const float *src, size_t nelem, unsigned char *dst)
             vcgtq_u32(vandq_u32(bits, manm), vdupq_n_u32(0)));
         const uint16x4_t nanh = vorr_u16(vshrn_n_u32(bits, 16), vdup_n_u16(0x0040));
         h = vbsl_u16(vmovn_u32(isnan), nanh, h);
-        vst1_u16((uint16_t *)(void *)(dst + 2 * i), h);
+        /* byte store: dst may sit at any alignment; vst1_u16 would be UB there
+         * (UBSan on GB10 caught exactly this on an odd destination) */
+        vst1_u8(dst + 2 * i, vreinterpret_u8_u16(h));
     }
 #endif
     for (; i < nelem; i++) {
@@ -702,6 +708,7 @@ struct ingot_kv {
     uint64_t             payload_bytes;
     char                *strval;        /* NUL-terminated copy, scalar strings */
     uint64_t            *str_off;       /* per-element offsets, string arrays  */
+    uint64_t            *str_len;       /* parse-time-validated lengths        */
 };
 
 struct ingot_gguf {
@@ -773,10 +780,27 @@ static uint64_t align_up(uint64_t value, uint64_t alignment, int *ok) {
 }
 
 /* ── metadata ───────────────────────────────────────────────────────────── */
+/* A hostile float KV (NaN, inf, 1e30) must not hit the out-of-range
+ * float->integer conversion, which is UB and ISA-dependent: saturate,
+ * NaN goes to 0. */
+static int64_t f64_to_i64_sat(double v) {
+    if (v != v) return 0;
+    if (v >= 9223372036854775807.0) return INT64_MAX;
+    if (v <= -9223372036854775808.0) return INT64_MIN;
+    return (int64_t)v;
+}
+
+static uint64_t f64_to_u64_sat(double v) {
+    if (v != v || v <= 0.0) return 0;
+    if (v >= 18446744073709551615.0) return UINT64_MAX;
+    return (uint64_t)v;
+}
+
 static void kv_free_one(ingot_kv *kv) {
     free(kv->key);
     free(kv->strval);
     free(kv->str_off);
+    free(kv->str_len);
 }
 
 static int parse_kv(ingot_gguf *g, cursor *c, uint64_t count,
@@ -834,7 +858,8 @@ static int parse_kv(ingot_gguf *g, cursor *c, uint64_t count,
                  * O(1) instead of O(n) per lookup. */
                 if (n != 0) {
                     kv->str_off = (uint64_t *)calloc((size_t)n, sizeof(*kv->str_off));
-                    if (kv->str_off == NULL) {
+                    kv->str_len = (uint64_t *)calloc((size_t)n, sizeof(*kv->str_len));
+                    if (kv->str_off == NULL || kv->str_len == NULL) {
                         ingot_err(err, errsz, "out of memory");
                         return -1;
                     }
@@ -848,6 +873,7 @@ static int parse_kv(ingot_gguf *g, cursor *c, uint64_t count,
                                   "GGUF string array '%s' truncated at %" PRIu64, kv->key, k);
                         return -1;
                     }
+                    kv->str_len[k] = len;
                 }
                 kv->payload = c->base;    /* offsets are absolute in the mapping */
             } else {
@@ -913,6 +939,14 @@ static int shard_map(shard_t *s, const char *path, char *err, size_t errsz) {
         return -1;
     }
     s->size = (uint64_t)st.st_size;
+    /* On a 32-bit size_t the cast below would map size mod 2^32 bytes while
+     * every bounds check trusts the full u64: refuse instead. The /2 also
+     * keeps nelem*sizeof(float) products from wrapping downstream. */
+    if (s->size > SIZE_MAX / 2) {
+        ingot_err(err, errsz, "'%s' is too large for this address space", path);
+        gguf_shard_close(s);
+        return -1;
+    }
     s->path = ingot_strdup(path);
     s->map = (unsigned char *)mmap(NULL, (size_t)s->size, PROT_READ, MAP_PRIVATE, s->fd, 0);
     if (s->path == NULL || s->map == MAP_FAILED) {
@@ -1328,14 +1362,14 @@ static int kv_read_scalar(int type, const unsigned char *p,
         const uint32_t bits = ingot_ld_u32(p);
         float v;
         memcpy(&v, &bits, sizeof(v));
-        *f = (double)v; *i = (int64_t)v; *u = (uint64_t)(v < 0 ? 0 : v);
+        *f = (double)v; *i = f64_to_i64_sat((double)v); *u = f64_to_u64_sat((double)v);
         return 0;
     }
     case INGOT_KV_FLOAT64: {
         const uint64_t bits = ingot_ld_u64(p);
         double v;
         memcpy(&v, &bits, sizeof(v));
-        *f = v; *i = (int64_t)v; *u = (uint64_t)(v < 0 ? 0 : v);
+        *f = v; *i = f64_to_i64_sat(v); *u = f64_to_u64_sat(v);
         return 0;
     }
     default: return -1;
@@ -1374,9 +1408,12 @@ int ingot_kv_bool(const ingot_kv *kv, int *out) {
 int ingot_kv_arr_str(const ingot_kv *kv, uint64_t index, const char **out, size_t *len) {
     if (kv == NULL || out == NULL || len == NULL || kv->type != INGOT_KV_ARRAY ||
         kv->arr_type != INGOT_KV_STRING || index >= kv->arr_len ||
-        kv->str_off == NULL) return -1;
+        kv->str_off == NULL || kv->str_len == NULL) return -1;
+    /* The length was bounds-checked at parse time; re-reading it from the
+     * mapping would trust bytes the file may have changed since (MAP_PRIVATE
+     * does not snapshot unfaulted pages). */
     const unsigned char *p = kv->payload + kv->str_off[index];
-    *len = (size_t)ingot_ld_u64(p);
+    *len = (size_t)kv->str_len[index];
     *out = (const char *)(p + 8);
     return 0;
 }
@@ -1858,6 +1895,12 @@ static int shard_open(ingot_st *st, uint32_t index, const char *path,
         return -1;
     }
     s->size = (uint64_t)sb.st_size;
+    /* refuse files a 32-bit size_t cannot map in full (see gguf.c) */
+    if (s->size > SIZE_MAX / 2) {
+        ingot_err(err, errsz, "'%s' is too large for this address space", path);
+        st_shard_close(s, 0);
+        return -1;
+    }
     s->path = ingot_strdup(path);
     s->map = (unsigned char *)mmap(NULL, (size_t)s->size, PROT_READ, MAP_PRIVATE, s->fd, 0);
     if (s->path == NULL || s->map == MAP_FAILED) {
@@ -2409,6 +2452,7 @@ ingot_st *ingot_wfile_st(const ingot_wfile *w) {
  * caller, not to a loader.
  *
  * SPDX-License-Identifier: MIT */
+#include <sys/types.h>
 
 #ifndef INGOT_NO_KERNELS
 #endif
@@ -2462,6 +2506,7 @@ typedef struct {
 struct ingot_gguf_writer {
     wbuf      kv;             /* the serialized KV block, built as we go */
     uint64_t  nkv;
+    int       alignment_kv;   /* general.alignment already appended (save() ran) */
     wtensor  *tensors;
     size_t    ntensor, cap;
     int       failed;
@@ -2645,7 +2690,7 @@ int ingot_gguf_add_f32(ingot_gguf_writer *w, const char *name, int type,
 
 static int pad_file(FILE *f, uint64_t alignment) {
     static const unsigned char zero[GGUF_ALIGNMENT] = {0};
-    const long pos = ftell(f);
+    const off_t pos = ftello(f);   /* ftell's long truncates past 2 GiB on LP32 */
     if (pos < 0) return -1;
     const size_t rem = (size_t)((uint64_t)pos % alignment);
     if (rem == 0) return 0;
@@ -2665,10 +2710,15 @@ int ingot_gguf_writer_save(ingot_gguf_writer *w, const char *path,
         return -1;
     }
     /* The alignment is written as a KV so a reader does not have to assume the
-     * default; we always use 32, which is the default, so old readers agree. */
-    if (ingot_gguf_kv_u32(w, "general.alignment", GGUF_ALIGNMENT) != 0 || w->failed) {
-        ingot_err(err, errsz, "out of memory");
-        return -1;
+     * default; we always use 32, which is the default, so old readers agree.
+     * save() may legitimately run twice (retry after ENOSPC, two paths): the
+     * KV must be appended exactly once or the header count lies. */
+    if (!w->alignment_kv) {
+        if (ingot_gguf_kv_u32(w, "general.alignment", GGUF_ALIGNMENT) != 0 || w->failed) {
+            ingot_err(err, errsz, "out of memory");
+            return -1;
+        }
+        w->alignment_kv = 1;
     }
 
     /* The tensor table needs each payload's offset, which depends on the table
@@ -7437,10 +7487,20 @@ static size_t qk_token_tile(size_t cols) {
                 parsed <= INGOT_QK_TOKEN_TILE_MAX) override = (long)parsed;
         }
     }
-    if (override > 0) return (size_t)override;
-    size_t tile = INGOT_QK_TILE_BYTES / (cols * sizeof(float));
-    if (tile > INGOT_QK_TOKEN_TILE) tile = INGOT_QK_TOKEN_TILE;
-    if (tile < INGOT_QK_TOKEN_TILE_MIN) tile = INGOT_QK_TOKEN_TILE_MIN;
+    size_t tile;
+    if (override > 0) {
+        tile = (size_t)override;
+    } else {
+        tile = INGOT_QK_TILE_BYTES / (cols * sizeof(float));
+        if (tile > INGOT_QK_TOKEN_TILE) tile = INGOT_QK_TOKEN_TILE;
+        if (tile < INGOT_QK_TOKEN_TILE_MIN) tile = INGOT_QK_TOKEN_TILE_MIN;
+    }
+    /* The SMMLA worker indexes interleaved token PAIRS as
+     * (token_begin + t) / 2, which is only right when every tile starts on
+     * an even token. The derived tile can be odd (cols=11008 gives 95), and
+     * so can the env override: round down to even, floor 2. */
+    tile &= ~(size_t)1;
+    if (tile < 2) tile = 2;
     return tile;
 }
 
@@ -8929,13 +8989,15 @@ static void dense_rows(size_t begin, size_t end, void *user) {
                 for (; c + 8 <= cols; c += 8) {
                     float32x4_t wlo, whi;
                     if (f16) {
-                        const float16x8_t h = vld1q_f16(
-                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        /* byte load: wrow follows the file layout and owes
+                         * no 2-byte alignment (same fix as the dtype.c lanes) */
+                        const float16x8_t h = vreinterpretq_f16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vcvt_f32_f16(vget_low_f16(h));
                         whi = vcvt_f32_f16(vget_high_f16(h));
                     } else {
-                        const uint16x8_t h = vld1q_u16(
-                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        const uint16x8_t h = vreinterpretq_u16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
                         whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
                     }
@@ -8967,13 +9029,15 @@ static void dense_rows(size_t begin, size_t end, void *user) {
                 for (; c + 8 <= cols; c += 8) {
                     float32x4_t wlo, whi;
                     if (f16) {
-                        const float16x8_t h = vld1q_f16(
-                            (const float16_t *)(const void *)(wrow + 2 * c));
+                        /* byte load: wrow follows the file layout and owes
+                         * no 2-byte alignment (same fix as the dtype.c lanes) */
+                        const float16x8_t h = vreinterpretq_f16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vcvt_f32_f16(vget_low_f16(h));
                         whi = vcvt_f32_f16(vget_high_f16(h));
                     } else {
-                        const uint16x8_t h = vld1q_u16(
-                            (const uint16_t *)(const void *)(wrow + 2 * c));
+                        const uint16x8_t h = vreinterpretq_u16_u8(
+                            vld1q_u8(wrow + 2 * c));
                         wlo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h), 16));
                         whi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h), 16));
                     }

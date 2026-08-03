@@ -43,6 +43,7 @@ struct ingot_kv {
     uint64_t             payload_bytes;
     char                *strval;        /* NUL-terminated copy, scalar strings */
     uint64_t            *str_off;       /* per-element offsets, string arrays  */
+    uint64_t            *str_len;       /* parse-time-validated lengths        */
 };
 
 struct ingot_gguf {
@@ -114,10 +115,27 @@ static uint64_t align_up(uint64_t value, uint64_t alignment, int *ok) {
 }
 
 /* ── metadata ───────────────────────────────────────────────────────────── */
+/* A hostile float KV (NaN, inf, 1e30) must not hit the out-of-range
+ * float->integer conversion, which is UB and ISA-dependent: saturate,
+ * NaN goes to 0. */
+static int64_t f64_to_i64_sat(double v) {
+    if (v != v) return 0;
+    if (v >= 9223372036854775807.0) return INT64_MAX;
+    if (v <= -9223372036854775808.0) return INT64_MIN;
+    return (int64_t)v;
+}
+
+static uint64_t f64_to_u64_sat(double v) {
+    if (v != v || v <= 0.0) return 0;
+    if (v >= 18446744073709551615.0) return UINT64_MAX;
+    return (uint64_t)v;
+}
+
 static void kv_free_one(ingot_kv *kv) {
     free(kv->key);
     free(kv->strval);
     free(kv->str_off);
+    free(kv->str_len);
 }
 
 static int parse_kv(ingot_gguf *g, cursor *c, uint64_t count,
@@ -175,7 +193,8 @@ static int parse_kv(ingot_gguf *g, cursor *c, uint64_t count,
                  * O(1) instead of O(n) per lookup. */
                 if (n != 0) {
                     kv->str_off = (uint64_t *)calloc((size_t)n, sizeof(*kv->str_off));
-                    if (kv->str_off == NULL) {
+                    kv->str_len = (uint64_t *)calloc((size_t)n, sizeof(*kv->str_len));
+                    if (kv->str_off == NULL || kv->str_len == NULL) {
                         ingot_err(err, errsz, "out of memory");
                         return -1;
                     }
@@ -189,6 +208,7 @@ static int parse_kv(ingot_gguf *g, cursor *c, uint64_t count,
                                   "GGUF string array '%s' truncated at %" PRIu64, kv->key, k);
                         return -1;
                     }
+                    kv->str_len[k] = len;
                 }
                 kv->payload = c->base;    /* offsets are absolute in the mapping */
             } else {
@@ -254,6 +274,14 @@ static int shard_map(shard_t *s, const char *path, char *err, size_t errsz) {
         return -1;
     }
     s->size = (uint64_t)st.st_size;
+    /* On a 32-bit size_t the cast below would map size mod 2^32 bytes while
+     * every bounds check trusts the full u64: refuse instead. The /2 also
+     * keeps nelem*sizeof(float) products from wrapping downstream. */
+    if (s->size > SIZE_MAX / 2) {
+        ingot_err(err, errsz, "'%s' is too large for this address space", path);
+        gguf_shard_close(s);
+        return -1;
+    }
     s->path = ingot_strdup(path);
     s->map = (unsigned char *)mmap(NULL, (size_t)s->size, PROT_READ, MAP_PRIVATE, s->fd, 0);
     if (s->path == NULL || s->map == MAP_FAILED) {
@@ -669,14 +697,14 @@ static int kv_read_scalar(int type, const unsigned char *p,
         const uint32_t bits = ingot_ld_u32(p);
         float v;
         memcpy(&v, &bits, sizeof(v));
-        *f = (double)v; *i = (int64_t)v; *u = (uint64_t)(v < 0 ? 0 : v);
+        *f = (double)v; *i = f64_to_i64_sat((double)v); *u = f64_to_u64_sat((double)v);
         return 0;
     }
     case INGOT_KV_FLOAT64: {
         const uint64_t bits = ingot_ld_u64(p);
         double v;
         memcpy(&v, &bits, sizeof(v));
-        *f = v; *i = (int64_t)v; *u = (uint64_t)(v < 0 ? 0 : v);
+        *f = v; *i = f64_to_i64_sat(v); *u = f64_to_u64_sat(v);
         return 0;
     }
     default: return -1;
@@ -715,9 +743,12 @@ int ingot_kv_bool(const ingot_kv *kv, int *out) {
 int ingot_kv_arr_str(const ingot_kv *kv, uint64_t index, const char **out, size_t *len) {
     if (kv == NULL || out == NULL || len == NULL || kv->type != INGOT_KV_ARRAY ||
         kv->arr_type != INGOT_KV_STRING || index >= kv->arr_len ||
-        kv->str_off == NULL) return -1;
+        kv->str_off == NULL || kv->str_len == NULL) return -1;
+    /* The length was bounds-checked at parse time; re-reading it from the
+     * mapping would trust bytes the file may have changed since (MAP_PRIVATE
+     * does not snapshot unfaulted pages). */
     const unsigned char *p = kv->payload + kv->str_off[index];
-    *len = (size_t)ingot_ld_u64(p);
+    *len = (size_t)kv->str_len[index];
     *out = (const char *)(p + 8);
     return 0;
 }

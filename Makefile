@@ -101,7 +101,7 @@ test: $(TESTS)
 ## fuzz: mutation-fuzz both readers (ROUNDS=n to change the count)
 ROUNDS ?= 6000
 fuzz: build/fuzz_mutate
-	./build/fuzz_mutate $(ROUNDS)
+	$(RUN) ./build/fuzz_mutate $(ROUNDS)
 
 ## fuzz-leaks: the same under the memory checker
 fuzz-leaks: build/fuzz_mutate
@@ -186,7 +186,7 @@ AMALGAM_SHIM = build/shim/ingot
 amalgam-test: amalgam
 	@mkdir -p $(AMALGAM_SHIM) build/amalgam
 	@for h in dtype gguf safetensors quant wfile write; do 		printf '#include <ingot.h>\n' > $(AMALGAM_SHIM)/$$h.h; 	done
-	@fail=0; for t in tests/test_*.c; do 		name=$$(basename $$t .c); 		$(CC) $(WARN) $(CFLAGS) -Ibuild/shim -Iamalgam $$t amalgam/ingot.c 			$(LDLIBS) -o build/amalgam/$$name || fail=1; 		echo "== amalgam/$$name"; ./build/amalgam/$$name > /dev/null || fail=1; 	done; 	if [ $$fail -eq 0 ]; then echo "AMALGAM MATCHES THE LIBRARY"; 	else echo "AMALGAM BUILD FAILED"; exit 1; fi
+	@fail=0; for t in tests/test_*.c; do 		name=$$(basename $$t .c); 		$(CC) $(WARN) $(CFLAGS) -Ibuild/shim -Iamalgam $$t amalgam/ingot.c 			$(LDLIBS) -o build/amalgam/$$name || fail=1; 		echo "== amalgam/$$name"; $(RUN) ./build/amalgam/$$name > /dev/null || fail=1; 	done; 	if [ $$fail -eq 0 ]; then echo "AMALGAM MATCHES THE LIBRARY"; 	else echo "AMALGAM BUILD FAILED"; exit 1; fi
 	@$(CXX) -std=c++17 -Wall -Wextra -Iamalgam -fsyntax-only -x c++ amalgam/ingot.h \
 		&& echo "the header also parses as C++"
 

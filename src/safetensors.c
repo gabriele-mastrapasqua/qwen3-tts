@@ -436,6 +436,12 @@ static int shard_open(ingot_st *st, uint32_t index, const char *path,
         return -1;
     }
     s->size = (uint64_t)sb.st_size;
+    /* refuse files a 32-bit size_t cannot map in full (see gguf.c) */
+    if (s->size > SIZE_MAX / 2) {
+        ingot_err(err, errsz, "'%s' is too large for this address space", path);
+        st_shard_close(s, 0);
+        return -1;
+    }
     s->path = ingot_strdup(path);
     s->map = (unsigned char *)mmap(NULL, (size_t)s->size, PROT_READ, MAP_PRIVATE, s->fd, 0);
     if (s->path == NULL || s->map == MAP_FAILED) {
