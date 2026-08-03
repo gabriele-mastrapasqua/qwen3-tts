@@ -86,9 +86,11 @@ build/minimal: examples/minimal.c $(LIB) | build
 	$(CC) $(WARN) $(CFLAGS) $(INCLUDE) $< $(LIB) $(LDLIBS) -o $@
 
 ## test: build and run the whole suite
+# RUN= an optional launcher for the test binaries (an emulator, mostly:
+# `make test RUN="sde64 -spr --"` exercises AVX-512/VNNI paths on any x86).
 test: $(TESTS)
 	@fail=0; for t in $(TESTS); do \
-		echo "== $$t"; ./$$t || fail=1; \
+		echo "== $$t"; $(RUN) ./$$t || fail=1; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
 
@@ -130,9 +132,23 @@ test-leaks: $(TESTS)
 .PHONY: test-leaks
 
 ## test-asan: the suite under ASan+UBSan (Linux; on macOS prefer test-leaks)
+# SIMD= extra ISA flags so the sanitizers see the vector paths too
+# (`make test-asan SIMD="-mavx2 -mfma"`); without it only the baseline ISA
+# of the host is compiled, which is how an unaligned NEON store once hid.
 test-asan:
 	$(MAKE) clean
-	$(MAKE) test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+	$(MAKE) test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer $(SIMD)"
+
+## test-x86-rosetta: on an Apple Silicon Mac, build the suite as x86_64 with
+## AVX2+FMA and run it under Rosetta (macOS 15+ translates AVX2). The cheapest
+## way to execute the AVX2 lanes without an x86 machine. AVX-512/VNNI are NOT
+## translated — those run in CI under Intel SDE instead.
+test-x86-rosetta:
+	$(MAKE) clean
+	$(MAKE) test CC="$(CC) -arch x86_64" CFLAGS="-O2 -mavx2 -mfma"
+	$(MAKE) clean
+
+.PHONY: test-x86-rosetta
 
 # ── regenerating what is generated ─────────────────────────────────────────
 # Both need llama.cpp's `gguf` package. The outputs are committed, so a plain
