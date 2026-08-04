@@ -27,7 +27,42 @@ SIMD each one has**, **how to check the extension actually fires**, and **what t
 | `make check-isa` | compile-check the newer-ISA kernel paths (BFMMLA/SMMLA/SME ; VNNI/BF16/AMX) on the dev box, before the hardware exists |
 
 Scripts (copy onto any rented box): `tests/bench_matrix.sh <model> [--full]`,
-`tests/serve_batch_bench.sh <model> [port] [batch_N] [clients_M] [threads]`.
+`tests/serve_batch_bench.sh <model> [port] [batch_N] [clients_M] [threads]`,
+`tests/avx512_parity_bench.sh <model>` (the perf/avx512-parity branch battery, below).
+
+### avx512-parity battery (branch `perf/avx512-parity`, authored 2026-08-04 on M1 — HW-UNVALIDATED)
+
+Target box: Scaleway **STANDARD3-X4C-16G** (EPYC 9555P Zen5: `avx512_vnni` + `avx512_bf16`).
+New build flavor: **`make blas SIMD=avx512bf16`** (= avx512vnni + `-mavx512bf16`; check
+`--caps` runtime line for `avx512bf16` first — Ice Lake has VNNI but NOT BF16).
+What the branch adds + its runtime kill-switches (all default ON, A/B without rebuild):
+
+| lever | switch (disables) |
+|---|---|
+| C4: bf16 matvec via `VDPBF16PS` (activation rounded to bf16, BFMMLA-class numerics) | `QWEN_NO_BF16DOT=1` |
+| C7 v4: q4-VNNI deferred-reduce (no cross-lane op in the block loop) | **default OFF su Zen5** (v3 vince 1-2%, 3× A/B 2026-08-04); `QWEN_Q4_VNNI_V4=1` riabilita (`QWEN_Q4_VNNI_V3=0` → v2) |
+| fused-QKV q4 VNNI twin (was f32-dequant on x86) | `QWEN_NO_VNNI_QKV=1` |
+| attention dots/accum + rms_norm + bf16 bulk conv at 512-bit | compile-time only → A/B vs a main-branch binary |
+
+One command: `bash tests/avx512_parity_bench.sh qwen3-tts-0.6b` (add `MAIN_BIN=` for the
+branch-vs-main compile-time A/B).
+
+**✅ MEASURED on the EPYC 9555P (2026-08-04, 0.6B, temp0 seed42)** — self-test 5/5 PASS
+on-silicon; **dpbf16 −21% -j1** (RTF 1.19 vs 1.51; bf16 now TIES int8 single-thread) and
+−3% -j4; **int4 now BEATS int8 -j1** (v3 1.05-1.07 vs int8 1.21 — the old "+21% behind"
+verdict is REVERSED by v3-default + the QKV twin ~5%); v4 measured 1-2% SLOWER than v3 on
+Zen5 (3× A/B) → **default flipped to v3**, `QWEN_Q4_VNNI_V4=1` re-tests elsewhere; branch
+vs main: bf16 −17% / int4 −8% (-j1). `QWEN_PREFILL_MATMAT` A/B ≈ neutral → BLAS stays
+default (audit leftover CLOSED — on 1.7B BLAS wins clearly: 1.43 vs 1.52).
+**1.7B (same battery)**: dpbf16 **−19% -j1** (1.92 vs 2.38), branch vs main bf16 −17% /
+int4 −6% (-j1), int4 −4.5% (-j4). BUT **int8 stays the 1.7B single-stream king on x86**
+(int8 1.74 vs int4 1.84 -j1; 1.16 vs 1.28 -j4; qm 1.21) — the int4>int8 flip is
+**0.6B-only**; gap narrowed from +21% to ~+6% (-j1). QKV-twin share ≈0 on 1.7B.
+mel-corr BETWEEN kernel variants is NOT a valid gate:
+greedy trajectory forks at ~frame 8 from fp-level logit shifts (first 7 frames
+bit-identical — benign known class); quality gate = self-test + ear on the -j1 wavs
+(`samples/tests/2026-08-04_avx512-parity-epyc/`). Follow-up found: batched q4 matmat is
+now 0.80× vs the faster seq matvec → port the VNNI-matvec tricks to `q4_matmat_vnni_slice`.
 
 ### The 2-command rented-box workflow
 
@@ -300,6 +335,32 @@ comparable.
 - **`QWEN_BLAS_GEN_THREADS` sweep (4 vCPU)**: optimum = **1** (RTF 0.95 vs 0.99 at the nt−1 default of
   3; =4 catastrophic 1.46, oversubscription). Per-box knob — sweep it on every new box (N1 file-mode
   optimum was 2).
+
+**⭐ avx512-parity round — EPYC 9555P Zen5, 4 vCPU, `SIMD=avx512bf16` (2026-08-04, branch
+`perf/avx512-parity` @ 74bc18d, temp0 seed42 ryan EN, file mode):**
+
+| model | config | -j1 | -j4 | note |
+|---|---|---|---|---|
+| 0.6B | bf16 **dpbf16 ON** (C4) | **1.19** | 1.07 | ties int8 single-thread |
+| 0.6B | bf16 dpbf16 OFF (widen+FMA) | 1.51 | 1.10 | → **C4 = −21% -j1**, −3% -j4 |
+| 0.6B | **int4 v3 (default)** | **1.05–1.07** | 0.95 | ⭐ **int4 BEATS int8 -j1 on x86** (first time) |
+| 0.6B | int4 v4 (opt-in) | 1.07–1.09 | 0.95 | v4 LOSES to v3 by 1-2% on Zen5 (3× A/B) → default v3 |
+| 0.6B | int4 v2 | 1.35 | — | v3 = −20% vs v2 |
+| 0.6B | int4, QKV-VNNI twin OFF | 1.14 | — | the fused-QKV twin is worth ~5% |
+| 0.6B | int8 | 1.21 | 0.95 | -j4 = int4 parity (bandwidth-bound) |
+| 1.7B | bf16 dpbf16 ON / OFF | **1.92** / 2.38 | 1.43 / 1.45 | **C4 = −19% -j1** on 1.7B too |
+| 1.7B | **int8** | **1.74** | **1.16** | **int8 stays the 1.7B x86 king** (qm 1.21) |
+| 1.7B | int4 (v3 default) | 1.84 | 1.28 | gap vs int8 narrowed +21% → ~+6% (-j1); QKV share ≈0 |
+| — | branch vs main (same SIMD) | 0.6B bf16 1.43→1.19, int4 1.18→1.09 · 1.7B bf16 2.30→1.91, int4 1.90→1.79 | 1.7B bf16 1.48→1.43, int4 1.34→1.28 | attention/rms/conv 512-bit |
+
+Self-test 5/5 PASS on-silicon (both models). `QWEN_PREFILL_MATMAT` A/B: neutral on 0.6B,
+BLAS clearly better on 1.7B (1.43 vs 1.52) → BLAS stays default, audit leftover CLOSED.
+mel-corr between kernel variants is NOT a gate (greedy fork at ~frame 8, first 7 frames
+bit-identical — benign); quality gate = self-test + ear
+(`samples/tests/2026-08-04_avx512-parity-epyc/`). Follow-up: batched q4 matmat now 0.80-0.90×
+vs the faster seq matvec → port the VNNI-matvec tricks into `q4_matmat_vnni_slice`.
+Recommended x86 defaults after this round: **0.6B → `--int4`** (new fastest), **1.7B → `--int8`**;
+bf16 mode always benefits from dpbf16 (default ON under `SIMD=avx512bf16`).
 
 **⭐ Graviton3 (AWS c7g.2xlarge, Neoverse-V1, 8 vCPU, `-j4`, 2026-07-11) — first server-ARM with
 i8mm/bf16; the MMLA twins' first silicon:**

@@ -49,7 +49,7 @@ make blas
 ## Features
 
 - **Pure C, minimal dependencies** — Only requires a C compiler and BLAS. No Python runtime needed.
-- **Runs on macOS, Linux and Windows/WSL2 (ARM/x86)** — the hot matvec/attention kernels have **NEON+SDOT (ARM), AVX2 and AVX-512/VNNI (x86)** twins with a scalar fallback + runtime ISA guard, and decode threading runs on a **cross-OS pool** (GCD on macOS, pthread elsewhere). Validated on Apple M1, Ryzen 7 6800H, and EPYC 9555P (Zen5). Single-stream RTF is memory/cache-bound, so the chip's cache matters most (see [Performance](#performance)); measure yours with `bash tests/x86_bench.sh`.
+- **Runs on macOS, Linux and Windows/WSL2 (ARM/x86)** — the hot matvec/attention kernels have **NEON+SDOT (ARM), AVX2 and AVX-512/VNNI/BF16 (x86)** twins with a scalar fallback + runtime ISA guard, and decode threading runs on a **cross-OS pool** (GCD on macOS, pthread elsewhere). Validated on Apple M1, Ryzen 7 6800H, and EPYC 9555P (Zen5). Single-stream RTF is memory/cache-bound, so the chip's cache matters most (see [Performance](#performance)); measure yours with `bash tests/x86_bench.sh`.
 - **Optional GPU backends (opt-in)** — **Apple Metal** (`make metal`) and **NVIDIA CUDA** (`make cuda`) run the whole fused pipeline resident on the GPU (**0.28 RTF** for 0.6B on an M4; ~0.44 for 1.7B on a mainstream NVIDIA GPU), plus server request-batching for throughput. CPU stays the default. → [Performance § GPU backends](#performance) · [docs/hardware-testing.md](docs/hardware-testing.md) (Metal) · [docs/cuda-performance.md](docs/cuda-performance.md) (CUDA).
 - **Both model sizes** — Automatically detects 0.6B or 1.7B from weight files.
 - **9 preset voices** — `ryan`, `vivian`, `serena`, `aiden`, `eric`, `dylan`, `uncle_fu`, `ono_anna`, `sohee`.
@@ -447,18 +447,19 @@ The full cross-hardware workflow (which boxes have which SIMD, where to rent, wh
 | **Graviton3** (Neoverse-V1, AWS c7g.2xlarge) | NEON + SDOT + **i8mm SMMLA + BFMMLA**, pthread 4-thread | 16 GB / 8 vCPU | **0.66** (1.7B int8: **0.95**, sub-RT!) | `--int8 -j4` |
 | **Apple M4** (Mac mini, Scaleway) | NEON + SDOT + i8mm + bf16 + SME | 16 GB / 10-core | **0.32** (1.7B qm: **0.57**!) | `--int4 -j4` |
 | **Ryzen 7 6800H** (Zen3+, 16 MB L3, bare metal) | AVX2 + FMA, pthread 4-thread | 32 GB | **2.02** | `--int4 -j4` |
-| **EPYC 9555P** (Zen5, AVX-512+VNNI, Scaleway VM) | AVX-512-VNNI, pthread 4-thread | 16 GB / 4 vCPU | **0.95** | `--int8 -j4` |
+| **EPYC 9555P** (Zen5, AVX-512+VNNI+BF16, Scaleway VM) | AVX-512 attention + VNNI + VDPBF16PS, pthread 4-thread | 16 GB / 4 vCPU | **0.95** (int4 = int8; -j1: int4 **1.05** beats int8 1.21) | `--int4 -j4`, `SIMD=avx512bf16` |
 
-Numbers refreshed 2026-07-10 after the PR#17 decoder work (exact streaming conv + threaded snake + BLAS
-phase-lever + optional int8 decoder conv). Single-stream RTF is **memory/cache-bound** (the Code Predictor
-re-reads its weights 16×/frame): SIMD width and thread count matter less than fewer weight bytes
-(`--int8`/`--int4`) and a cache that fits the working set (Apple's SLC, an X3D chip's V-cache). On
-cache-rich Apple Silicon **int4 is the fastest lever**; on x86 **int8+VNNI wins the wall clock** (int4 and
-int8 fork the greedy trajectory, so compare kernel ms/frame, not wall RTF — there the q4-VNNI v3
-throughput kernel now edges int8). This holds for 1.7B too: on x86 pure `--int8` beats `--quant-mixed`
-(quant-mixed is the Apple-silicon config). Many-core servers are best for **throughput** (concurrent
-requests), not single-stream latency. Check yours: `./qwen_tts --caps` (on x86, build with
-`make blas SIMD=avx512vnni` to enable the VNNI kernels — the default build is portable AVX2).
+Numbers refreshed 2026-08-04 after the AVX-512 parity round (16-wide attention/rms/conversions,
+native-bf16 `VDPBF16PS` matvec, q4-VNNI v3-default + fused-QKV VNNI twin — bf16 mode −21% single-thread
+on Zen5, and **int4 now beats int8 single-thread on x86 0.6B** for the first time). Single-stream RTF is
+**memory/cache-bound** (the Code Predictor re-reads its weights 16×/frame): SIMD width and thread count
+matter less than fewer weight bytes (`--int8`/`--int4`) and a cache that fits the working set (Apple's
+SLC, an X3D chip's V-cache). On cache-rich Apple Silicon **int4 is the fastest lever**; on x86 it now
+depends on the model: **0.6B → `--int4`**, **1.7B → `--int8`** (still the 1.7B wall-clock king; pure
+`--int8` beats `--quant-mixed`, which is the Apple-silicon config). Many-core servers are best for
+**throughput** (concurrent requests), not single-stream latency. Check yours: `./qwen_tts --caps` (on
+x86, build with `make blas SIMD=avx512bf16` on Zen4/5 / Cooper Lake+, or `SIMD=avx512vnni` if the CPU
+lacks `avx512bf16` — the default build is portable AVX2).
 
 **Concurrent serving — request batching (`--serve --batch-size N`).** For *N users at once*, the server
 can step their requests **together** through the model (vLLM-style): weights are read from memory **once**

@@ -125,6 +125,8 @@ void qwen_caps_report(void *out) {
      * AVX2 are full 2-row, multi-accumulator, prefetching kernels (PLAN 21.3). */
 #ifdef __ARM_NEON
     fprintf(f, "  matvec + attn:    NEON (2-row fused)\n");
+#elif defined(__AVX512F__)
+    fprintf(f, "  matvec + attn:    AVX-512 (2-row fused, FMA, 16-wide attention)\n");
 #elif defined(__AVX2__)
     fprintf(f, "  matvec + attn:    AVX2 (2-row fused, FMA)\n");
 #else
@@ -139,7 +141,14 @@ void qwen_caps_report(void *out) {
 #else
     fprintf(f, "  int8 dot:         dequant->FMA (no SDOT/VNNI)\n");
 #endif
-#if defined(__AVX2__)
+#if defined(__AVX512BF16__)
+    fprintf(f, "  bf16 dot:         VDPBF16PS _mm512_dpbf16_ps (native; QWEN_NO_BF16DOT=1 disables)\n");
+#elif defined(__x86_64__)
+    fprintf(f, "  bf16 dot:         widen->FMA (no AVX-512-BF16)\n");
+#endif
+#if defined(__AVX512F__)
+    fprintf(f, "  rms/bf16-conv:    AVX-512\n");
+#elif defined(__AVX2__)
     fprintf(f, "  rms/bf16-conv:    AVX2\n");
 #elif defined(__ARM_NEON)
     fprintf(f, "  rms/bf16-conv:    NEON\n");
@@ -313,6 +322,30 @@ void qwen_rms_norm(float *out, const float *x, const float *weight,
             vst1q_f32(os + i + 4, vmulq_f32(vmulq_f32(v1, vinv), w1));
         }
         for (; i < dim; i++) os[i] = xs[i] * inv_rms * weight[i];
+#elif defined(__AVX512F__)
+        __m512 vsum0 = _mm512_setzero_ps(), vsum1 = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 31 < dim; i += 32) {
+            __m512 v0 = _mm512_loadu_ps(xs + i);
+            __m512 v1 = _mm512_loadu_ps(xs + i + 16);
+            vsum0 = _mm512_fmadd_ps(v0, v0, vsum0);
+            vsum1 = _mm512_fmadd_ps(v1, v1, vsum1);
+        }
+        float sum = _mm512_reduce_add_ps(_mm512_add_ps(vsum0, vsum1));
+        for (; i < dim; i++) sum += xs[i] * xs[i];
+
+        float inv_rms = 1.0f / sqrtf(sum / dim + eps);
+        __m512 vinv = _mm512_set1_ps(inv_rms);
+        i = 0;
+        for (; i + 31 < dim; i += 32) {
+            __m512 v0 = _mm512_loadu_ps(xs + i);
+            __m512 v1 = _mm512_loadu_ps(xs + i + 16);
+            __m512 w0 = _mm512_loadu_ps(weight + i);
+            __m512 w1 = _mm512_loadu_ps(weight + i + 16);
+            _mm512_storeu_ps(os + i,      _mm512_mul_ps(_mm512_mul_ps(v0, vinv), w0));
+            _mm512_storeu_ps(os + i + 16, _mm512_mul_ps(_mm512_mul_ps(v1, vinv), w1));
+        }
+        for (; i < dim; i++) os[i] = xs[i] * inv_rms * weight[i];
 #elif defined(__AVX2__)
         __m256 vsum0 = _mm256_setzero_ps(), vsum1 = _mm256_setzero_ps();
         int i = 0;
@@ -382,6 +415,32 @@ void qwen_rms_norm_residual(float *out, float *x, const float *residual,
         float32x4_t w1 = vld1q_f32(weight + i + 4);
         vst1q_f32(out + i,     vmulq_f32(vmulq_f32(v0, vinv), w0));
         vst1q_f32(out + i + 4, vmulq_f32(vmulq_f32(v1, vinv), w1));
+    }
+    for (; i < dim; i++) out[i] = x[i] * inv_rms * weight[i];
+#elif defined(__AVX512F__)
+    __m512 vsum0 = _mm512_setzero_ps(), vsum1 = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 31 < dim; i += 32) {
+        __m512 x0 = _mm512_add_ps(_mm512_loadu_ps(x + i),      _mm512_loadu_ps(residual + i));
+        __m512 x1 = _mm512_add_ps(_mm512_loadu_ps(x + i + 16), _mm512_loadu_ps(residual + i + 16));
+        _mm512_storeu_ps(x + i, x0);
+        _mm512_storeu_ps(x + i + 16, x1);
+        vsum0 = _mm512_fmadd_ps(x0, x0, vsum0);
+        vsum1 = _mm512_fmadd_ps(x1, x1, vsum1);
+    }
+    float sum = _mm512_reduce_add_ps(_mm512_add_ps(vsum0, vsum1));
+    for (; i < dim; i++) { x[i] += residual[i]; sum += x[i] * x[i]; }
+
+    float inv_rms = 1.0f / sqrtf(sum / dim + eps);
+    __m512 vinv = _mm512_set1_ps(inv_rms);
+    i = 0;
+    for (; i + 31 < dim; i += 32) {
+        __m512 v0 = _mm512_loadu_ps(x + i);
+        __m512 v1 = _mm512_loadu_ps(x + i + 16);
+        __m512 w0 = _mm512_loadu_ps(weight + i);
+        __m512 w1 = _mm512_loadu_ps(weight + i + 16);
+        _mm512_storeu_ps(out + i,      _mm512_mul_ps(_mm512_mul_ps(v0, vinv), w0));
+        _mm512_storeu_ps(out + i + 16, _mm512_mul_ps(_mm512_mul_ps(v1, vinv), w1));
     }
     for (; i < dim; i++) out[i] = x[i] * inv_rms * weight[i];
 #elif defined(__AVX2__)
@@ -455,6 +514,30 @@ void qwen_rms_norm_per_head(float *x, const float *weight,
                 float32x4_t w1 = vld1q_f32(weight + i + 4);
                 vst1q_f32(hs + i,     vmulq_f32(vmulq_f32(v0, vinv), w0));
                 vst1q_f32(hs + i + 4, vmulq_f32(vmulq_f32(v1, vinv), w1));
+            }
+            for (; i < head_dim; i++) hs[i] *= inv_rms * weight[i];
+#elif defined(__AVX512F__)
+            __m512 vsum0 = _mm512_setzero_ps(), vsum1 = _mm512_setzero_ps();
+            int i = 0;
+            for (; i + 31 < head_dim; i += 32) {
+                __m512 v0 = _mm512_loadu_ps(hs + i);
+                __m512 v1 = _mm512_loadu_ps(hs + i + 16);
+                vsum0 = _mm512_fmadd_ps(v0, v0, vsum0);
+                vsum1 = _mm512_fmadd_ps(v1, v1, vsum1);
+            }
+            float sum = _mm512_reduce_add_ps(_mm512_add_ps(vsum0, vsum1));
+            for (; i < head_dim; i++) sum += hs[i] * hs[i];
+
+            float inv_rms = 1.0f / sqrtf(sum / head_dim + eps);
+            __m512 vinv = _mm512_set1_ps(inv_rms);
+            i = 0;
+            for (; i + 31 < head_dim; i += 32) {
+                __m512 v0 = _mm512_loadu_ps(hs + i);
+                __m512 v1 = _mm512_loadu_ps(hs + i + 16);
+                __m512 w0 = _mm512_loadu_ps(weight + i);
+                __m512 w1 = _mm512_loadu_ps(weight + i + 16);
+                _mm512_storeu_ps(hs + i,      _mm512_mul_ps(_mm512_mul_ps(v0, vinv), w0));
+                _mm512_storeu_ps(hs + i + 16, _mm512_mul_ps(_mm512_mul_ps(v1, vinv), w1));
             }
             for (; i < head_dim; i++) hs[i] *= inv_rms * weight[i];
 #elif defined(__AVX2__)
@@ -533,8 +616,26 @@ static inline __m512 qwen_loadu_bf16_16(const uint16_t *p) {
 }
 #endif
 /* f32 dot product, AVX2/FMA with scalar tail (attention score).
- * 4 accumulators (32 elem/iter) so the FMA reduction isn't latency-bound. */
+ * 4 accumulators (32 elem/iter) so the FMA reduction isn't latency-bound.
+ * The `_avx2` names are historical: under __AVX512F__ each helper carries a
+ * 16-wide body (head_dim=128 → whole rows per iter), call sites unchanged. */
 static inline float qwen_dot_f32_avx2(const float *a, const float *b, int n) {
+#if defined(__AVX512F__)
+    __m512 c0 = _mm512_setzero_ps(), c1 = _mm512_setzero_ps(),
+           c2 = _mm512_setzero_ps(), c3 = _mm512_setzero_ps();
+    int d = 0;
+    for (; d + 64 <= n; d += 64) {
+        c0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d),      _mm512_loadu_ps(b + d),      c0);
+        c1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d + 16), _mm512_loadu_ps(b + d + 16), c1);
+        c2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d + 32), _mm512_loadu_ps(b + d + 32), c2);
+        c3 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d + 48), _mm512_loadu_ps(b + d + 48), c3);
+    }
+    for (; d + 16 <= n; d += 16)
+        c0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + d), _mm512_loadu_ps(b + d), c0);
+    float s = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(c0, c2), _mm512_add_ps(c1, c3)));
+    for (; d < n; d++) s += a[d] * b[d];
+    return s;
+#else
     __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps(),
            c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
     int d = 0;
@@ -549,9 +650,26 @@ static inline float qwen_dot_f32_avx2(const float *a, const float *b, int n) {
     float s = qwen_hsum256_ps(_mm256_add_ps(_mm256_add_ps(c0, c2), _mm256_add_ps(c1, c3)));
     for (; d < n; d++) s += a[d] * b[d];
     return s;
+#endif
 }
 /* q·(bf16 k) dot product, AVX2/FMA with scalar tail (bf16-KV attention score). */
 static inline float qwen_dot_f32_bf16_avx2(const float *q, const uint16_t *k, int n) {
+#if defined(__AVX512F__)
+    __m512 c0 = _mm512_setzero_ps(), c1 = _mm512_setzero_ps(),
+           c2 = _mm512_setzero_ps(), c3 = _mm512_setzero_ps();
+    int d = 0;
+    for (; d + 64 <= n; d += 64) {
+        c0 = _mm512_fmadd_ps(_mm512_loadu_ps(q + d),      qwen_loadu_bf16_16(k + d),      c0);
+        c1 = _mm512_fmadd_ps(_mm512_loadu_ps(q + d + 16), qwen_loadu_bf16_16(k + d + 16), c1);
+        c2 = _mm512_fmadd_ps(_mm512_loadu_ps(q + d + 32), qwen_loadu_bf16_16(k + d + 32), c2);
+        c3 = _mm512_fmadd_ps(_mm512_loadu_ps(q + d + 48), qwen_loadu_bf16_16(k + d + 48), c3);
+    }
+    for (; d + 16 <= n; d += 16)
+        c0 = _mm512_fmadd_ps(_mm512_loadu_ps(q + d), qwen_loadu_bf16_16(k + d), c0);
+    float s = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(c0, c2), _mm512_add_ps(c1, c3)));
+    for (; d < n; d++) s += q[d] * bf16_to_f32(k[d]);
+    return s;
+#else
     __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps(),
            c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
     int d = 0;
@@ -566,46 +684,176 @@ static inline float qwen_dot_f32_bf16_avx2(const float *q, const uint16_t *k, in
     float s = qwen_hsum256_ps(_mm256_add_ps(_mm256_add_ps(c0, c2), _mm256_add_ps(c1, c3)));
     for (; d < n; d++) s += q[d] * bf16_to_f32(k[d]);
     return s;
+#endif
 }
-/* Attention online-softmax accumulators (AVX2). */
+/* Attention online-softmax accumulators (AVX2 names, 16-wide under __AVX512F__). */
 static inline void qwen_acc_corr_avx2(float *o, const float *v, float c, int n) {
-    __m256 vc = _mm256_set1_ps(c); int d = 0;
+    int d = 0;
+#if defined(__AVX512F__)
+    __m512 zc = _mm512_set1_ps(c);
+    for (; d + 16 <= n; d += 16)
+        _mm512_storeu_ps(o + d, _mm512_fmadd_ps(_mm512_loadu_ps(o + d), zc, _mm512_loadu_ps(v + d)));
+#else
+    __m256 vc = _mm256_set1_ps(c);
     for (; d + 8 <= n; d += 8)
         _mm256_storeu_ps(o + d, _mm256_fmadd_ps(_mm256_loadu_ps(o + d), vc, _mm256_loadu_ps(v + d)));
+#endif
     for (; d < n; d++) o[d] = o[d] * c + v[d];
 }
 static inline void qwen_acc_wt_avx2(float *o, const float *v, float w, int n) {
-    __m256 vw = _mm256_set1_ps(w); int d = 0;
+    int d = 0;
+#if defined(__AVX512F__)
+    __m512 zw = _mm512_set1_ps(w);
+    for (; d + 16 <= n; d += 16)
+        _mm512_storeu_ps(o + d, _mm512_fmadd_ps(_mm512_loadu_ps(v + d), zw, _mm512_loadu_ps(o + d)));
+#else
+    __m256 vw = _mm256_set1_ps(w);
     for (; d + 8 <= n; d += 8)
         _mm256_storeu_ps(o + d, _mm256_fmadd_ps(_mm256_loadu_ps(v + d), vw, _mm256_loadu_ps(o + d)));
+#endif
     for (; d < n; d++) o[d] += v[d] * w;
 }
 static inline void qwen_scale_avx2(float *o, float s, int n) {
-    __m256 vs = _mm256_set1_ps(s); int d = 0;
+    int d = 0;
+#if defined(__AVX512F__)
+    __m512 zs = _mm512_set1_ps(s);
+    for (; d + 16 <= n; d += 16)
+        _mm512_storeu_ps(o + d, _mm512_mul_ps(_mm512_loadu_ps(o + d), zs));
+#else
+    __m256 vs = _mm256_set1_ps(s);
     for (; d + 8 <= n; d += 8)
         _mm256_storeu_ps(o + d, _mm256_mul_ps(_mm256_loadu_ps(o + d), vs));
+#endif
     for (; d < n; d++) o[d] *= s;
 }
 static inline void qwen_acc_corr_bf16_avx2(float *o, const uint16_t *v, float c, int n) {
-    __m256 vc = _mm256_set1_ps(c); int d = 0;
+    int d = 0;
+#if defined(__AVX512F__)
+    __m512 zc = _mm512_set1_ps(c);
+    for (; d + 16 <= n; d += 16)
+        _mm512_storeu_ps(o + d, _mm512_fmadd_ps(_mm512_loadu_ps(o + d), zc, qwen_loadu_bf16_16(v + d)));
+#else
+    __m256 vc = _mm256_set1_ps(c);
     for (; d + 8 <= n; d += 8)
         _mm256_storeu_ps(o + d, _mm256_fmadd_ps(_mm256_loadu_ps(o + d), vc, qwen_loadu_bf16_8(v + d)));
+#endif
     for (; d < n; d++) o[d] = o[d] * c + bf16_to_f32(v[d]);
 }
 static inline void qwen_acc_wt_bf16_avx2(float *o, const uint16_t *v, float w, int n) {
-    __m256 vw = _mm256_set1_ps(w); int d = 0;
+    int d = 0;
+#if defined(__AVX512F__)
+    __m512 zw = _mm512_set1_ps(w);
+    for (; d + 16 <= n; d += 16)
+        _mm512_storeu_ps(o + d, _mm512_fmadd_ps(qwen_loadu_bf16_16(v + d), zw, _mm512_loadu_ps(o + d)));
+#else
+    __m256 vw = _mm256_set1_ps(w);
     for (; d + 8 <= n; d += 8)
         _mm256_storeu_ps(o + d, _mm256_fmadd_ps(qwen_loadu_bf16_8(v + d), vw, _mm256_loadu_ps(o + d)));
+#endif
     for (; d < n; d++) o[d] += bf16_to_f32(v[d]) * w;
 }
 #endif
 
+
+#if defined(__AVX512BF16__)
+/* ── C4 (plan_v4): bf16 matvec via VDPBF16PS (_mm512_dpbf16_ps) ──
+ * Fuses the bf16→f32 widen INTO the FMA: 32 bf16 pairs per instruction (2× the
+ * width of the shift+FMA __AVX512F__ path below) and no shift/convert uops on
+ * the weight stream. The ACTIVATION is rounded to bf16 once per call (same
+ * numeric class as the ARM BFMMLA batched path: ~1e-3 L2 vs the f32-activation
+ * reference — activation-rounding, not a defect; weights are bf16 anyway).
+ * Runtime kill-switch: QWEN_NO_BF16DOT=1 falls back to the widen+FMA path so
+ * the box can A/B speed AND mel-corr without a rebuild.
+ * ⚠️ COMPILE-CHECKED ONLY on M1 (make check-isa) — validate on real
+ * avx512_bf16 silicon (Zen4/5, Cooper Lake+) before trusting. */
+enum { QWEN_BF16DOT_XMAX = 8192 };
+static int qwen_bf16dot_disabled(void) {
+    static atomic_int off = -1;
+    int v = atomic_load_explicit(&off, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("QWEN_NO_BF16DOT"); v = (e && e[0] == '1'); atomic_store_explicit(&off, v, memory_order_relaxed); }
+    return v;
+}
+/* gcc/clang lack _mm512_castsi512_pbh-style casts across versions → union punning. */
+static inline __m512bh qwen_loadu_pbh(const uint16_t *p) {
+    union { __m512i i; __m512bh bh; } u;
+    u.i = _mm512_loadu_si512((const void *)p);
+    return u.bh;
+}
+/* Round a f32 row to bf16 (RNE, matches _mm512_cvtneps_pbh) with scalar tail. */
+static void qwen_f32_to_bf16_row(uint16_t *dst, const float *src, int n) {
+    int k = 0;
+    for (; k + 16 <= n; k += 16) {
+        union { __m256bh bh; __m256i i; } u;
+        u.bh = _mm512_cvtneps_pbh(_mm512_loadu_ps(src + k));
+        _mm256_storeu_si256((__m256i *)(dst + k), u.i);
+    }
+    for (; k < n; k++) {
+        uint32_t bits; memcpy(&bits, &src[k], 4);
+        uint32_t lsb = (bits >> 16) & 1;
+        dst[k] = (uint16_t)((bits + 0x7FFFu + lsb) >> 16);
+    }
+}
+static void bf16_matvec_dpbf16(float *y, const uint16_t *xb, const float *x,
+                               const uint16_t *W, int in_dim, int out_dim) {
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const uint16_t *w0 = W + (size_t)o * in_dim;
+        const uint16_t *w1 = W + (size_t)(o + 1) * in_dim;
+        if (o + 5 < out_dim) {
+            __builtin_prefetch(W + (size_t)(o + 4) * in_dim, 0, 0);
+            __builtin_prefetch(W + (size_t)(o + 5) * in_dim, 0, 0);
+        }
+        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+        __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {          /* 64 bf16 = 2 dpbf16/row */
+            __m512bh x0 = qwen_loadu_pbh(xb + k);
+            __m512bh x1 = qwen_loadu_pbh(xb + k + 32);
+            a0 = _mm512_dpbf16_ps(a0, qwen_loadu_pbh(w0 + k),      x0);
+            a1 = _mm512_dpbf16_ps(a1, qwen_loadu_pbh(w0 + k + 32), x1);
+            b0 = _mm512_dpbf16_ps(b0, qwen_loadu_pbh(w1 + k),      x0);
+            b1 = _mm512_dpbf16_ps(b1, qwen_loadu_pbh(w1 + k + 32), x1);
+        }
+        for (; k + 32 <= in_dim; k += 32) {
+            __m512bh xv = qwen_loadu_pbh(xb + k);
+            a0 = _mm512_dpbf16_ps(a0, qwen_loadu_pbh(w0 + k), xv);
+            b0 = _mm512_dpbf16_ps(b0, qwen_loadu_pbh(w1 + k), xv);
+        }
+        float s0 = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+        float s1 = _mm512_reduce_add_ps(_mm512_add_ps(b0, b1));
+        for (; k < in_dim; k++) { s0 += bf16_to_f32(w0[k]) * x[k]; s1 += bf16_to_f32(w1[k]) * x[k]; }
+        y[o] = s0;
+        y[o + 1] = s1;
+    }
+    if (o < out_dim) {
+        const uint16_t *w_row = W + (size_t)o * in_dim;
+        __m512 acc = _mm512_setzero_ps();
+        int k = 0;
+        for (; k + 32 <= in_dim; k += 32)
+            acc = _mm512_dpbf16_ps(acc, qwen_loadu_pbh(w_row + k), qwen_loadu_pbh(xb + k));
+        float sum = _mm512_reduce_add_ps(acc);
+        for (; k < in_dim; k++) sum += bf16_to_f32(w_row[k]) * x[k];
+        y[o] = sum;
+    }
+}
+#endif /* __AVX512BF16__ */
 
 /* Fused bf16 matvec: processes 2 output rows at a time to amortize x vector loads.
  * On NEON: 32 elements/iter, 8 accumulators per row pair (from qwen-asr). */
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
                                int in_dim, int out_dim) {
     int o = 0;
+#if defined(__AVX512BF16__)
+    /* C4: native bf16 dot when available (QWEN_NO_BF16DOT=1 opts out). The
+     * activation is rounded to bf16 once per call; threads each convert their
+     * own copy (in_dim ≤ 3072 in practice → negligible vs the row work). */
+    if (!qwen_bf16dot_disabled() && in_dim <= QWEN_BF16DOT_XMAX) {
+        uint16_t xb[QWEN_BF16DOT_XMAX];
+        qwen_f32_to_bf16_row(xb, x, in_dim);
+        bf16_matvec_dpbf16(y, xb, x, W, in_dim, out_dim);
+        return;
+    }
+#endif
 #if defined(__AVX512F__)
     /* AVX-512: 2 rows, 4 __m512 accumulators/row (8 chains), 64 f32/iter, + prefetch.
      * Genuinely 16-wide on the hot path; helps where the working set fits in cache
@@ -2827,16 +3075,120 @@ static int q4_vnni_v3_on(void) {
     return r;
 }
 
+/* v4 (deferred reduce, plan_v4 C7 round 3): v3 killed the half-width waste but
+ * kept TWO cross-lane q4_hsum256 per dpbusd on the critical path — on the EPYC
+ * that left int4-VNNI ~21% behind int8 (whose inner loop has NO cross-lane op).
+ * v4 removes ALL cross-lane reduces from the block loop:
+ *   - the dpbusd result (16 int32 partial sums; low 256-bit half = block b,
+ *     high half = block b+1) is cvtepi32_ps'd and FMA'd into a per-row f32
+ *     ACCUMULATOR VECTOR against a per-half scale vector [s_b ×8 | s_b+1 ×8];
+ *   - the −8·Σqx correction (already scale-weighted) accumulates in a scalar;
+ *   - ONE _mm512_reduce_add_ps per ROW at the end (v3: 2 per block per row).
+ * Inner loop per row = dpbusd + cvt + fmadd (+ scale-vec build), all in-lane.
+ * QWEN_Q4_VNNI_V4=0 falls back to v3 (and QWEN_Q4_VNNI_V3=0 to v2) so the box
+ * can ladder-A/B without a rebuild. ⚠️ COMPILE-CHECKED ONLY on M1 (check-isa +
+ * Rosetta has no AVX-512): numerics + the speed claim need the VNNI box. */
+static void q4_0_matvec_vnni_v4(float *y, const int8_t *qx, float sx,
+                                const q4_0_block_t *W, int cols, int out_dim) {
+    int nb = cols / Q4_0_BLOCK_SIZE;
+    const __m512i ones = _mm512_set1_epi8(1);
+    int corr[Q4_QX_MAX / Q4_0_BLOCK_SIZE];
+    for (int b = 0; b < nb; b++) {
+        __m512i xv = _mm512_zextsi256_si512(
+            _mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+        corr[b] = -8 * _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, xv));
+    }
+
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {          /* 4 independent rows */
+        const q4_0_block_t *r0 = W + (size_t)o * nb, *r1 = r0 + nb, *r2 = r1 + nb, *r3 = r2 + nb;
+        __m512 f0 = _mm512_setzero_ps(), f1 = _mm512_setzero_ps(),
+               f2 = _mm512_setzero_ps(), f3 = _mm512_setzero_ps();
+        float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+        int b = 0;
+        for (; b + 1 < nb; b += 2) {           /* 2 blocks / 512-bit op */
+            __m512i xv = _mm512_loadu_si512((const void *)(qx + (size_t)b * Q4_0_BLOCK_SIZE));
+            __m512i w0 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r0[b].qs)), q4_unpack_block_u8(r0[b + 1].qs), 1);
+            __m512i w1 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r1[b].qs)), q4_unpack_block_u8(r1[b + 1].qs), 1);
+            __m512i w2 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r2[b].qs)), q4_unpack_block_u8(r2[b + 1].qs), 1);
+            __m512i w3 = _mm512_inserti64x4(
+                _mm512_castsi256_si512(q4_unpack_block_u8(r3[b].qs)), q4_unpack_block_u8(r3[b + 1].qs), 1);
+            __m512i d0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w0, xv);
+            __m512i d1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w1, xv);
+            __m512i d2 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w2, xv);
+            __m512i d3 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w3, xv);
+            float s0a = qwen_f16_to_f32(r0[b].scale_f16), s0b = qwen_f16_to_f32(r0[b + 1].scale_f16);
+            float s1a = qwen_f16_to_f32(r1[b].scale_f16), s1b = qwen_f16_to_f32(r1[b + 1].scale_f16);
+            float s2a = qwen_f16_to_f32(r2[b].scale_f16), s2b = qwen_f16_to_f32(r2[b + 1].scale_f16);
+            float s3a = qwen_f16_to_f32(r3[b].scale_f16), s3b = qwen_f16_to_f32(r3[b + 1].scale_f16);
+            __m512 sv0 = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(s0a)), _mm256_set1_ps(s0b), 1);
+            __m512 sv1 = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(s1a)), _mm256_set1_ps(s1b), 1);
+            __m512 sv2 = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(s2a)), _mm256_set1_ps(s2b), 1);
+            __m512 sv3 = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(s3a)), _mm256_set1_ps(s3b), 1);
+            f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d0), sv0, f0);
+            f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d1), sv1, f1);
+            f2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d2), sv2, f2);
+            f3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d3), sv3, f3);
+            c0 += s0a * corr[b] + s0b * corr[b + 1];
+            c1 += s1a * corr[b] + s1b * corr[b + 1];
+            c2 += s2a * corr[b] + s2b * corr[b + 1];
+            c3 += s3a * corr[b] + s3b * corr[b + 1];
+        }
+        for (; b < nb; b++) {                  /* odd tail block (rare: nb odd) */
+            __m512i xv = _mm512_zextsi256_si512(
+                _mm256_loadu_si256((const __m256i *)(qx + (size_t)b * Q4_0_BLOCK_SIZE)));
+            __m512i xw0 = _mm512_zextsi256_si512(q4_unpack_block_u8(r0[b].qs));
+            __m512i xw1 = _mm512_zextsi256_si512(q4_unpack_block_u8(r1[b].qs));
+            __m512i xw2 = _mm512_zextsi256_si512(q4_unpack_block_u8(r2[b].qs));
+            __m512i xw3 = _mm512_zextsi256_si512(q4_unpack_block_u8(r3[b].qs));
+            c0 += qwen_f16_to_f32(r0[b].scale_f16) * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw0, xv)) + corr[b]);
+            c1 += qwen_f16_to_f32(r1[b].scale_f16) * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw1, xv)) + corr[b]);
+            c2 += qwen_f16_to_f32(r2[b].scale_f16) * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw2, xv)) + corr[b]);
+            c3 += qwen_f16_to_f32(r3[b].scale_f16) * (_mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), xw3, xv)) + corr[b]);
+        }
+        y[o]     = (_mm512_reduce_add_ps(f0) + c0) * sx;
+        y[o + 1] = (_mm512_reduce_add_ps(f1) + c1) * sx;
+        y[o + 2] = (_mm512_reduce_add_ps(f2) + c2) * sx;
+        y[o + 3] = (_mm512_reduce_add_ps(f3) + c3) * sx;
+    }
+    /* remaining rows via v3 (correct, just not 4-unrolled) */
+    if (o < out_dim)
+        q4_0_matvec_vnni_v3(y + o, qx, sx, W + (size_t)o * nb, cols, out_dim - o);
+}
+
+static int q4_vnni_v4_on(void) {
+    /* Default OFF (= v3): measured on EPYC 9555P Zen5 2026-08-04, 3×-repeated
+     * -j1 temp0 A/B — v3 1.05-1.06 vs v4 1.07-1.08 RTF. Zen5's cross-lane
+     * reduce is cheap enough that v4's cvt+scale-vec build costs more than the
+     * hsums it removes. QWEN_Q4_VNNI_V4=1 re-enables (re-test on Sapphire
+     * Rapids / Ice Lake, where reduce latency may tip the other way). */
+    static atomic_int v = -1;
+    int r = atomic_load_explicit(&v, memory_order_relaxed);
+    if (r < 0) { const char *e = getenv("QWEN_Q4_VNNI_V4"); r = (e && e[0] == '1'); /* default OFF */
+                 atomic_store_explicit(&v, r, memory_order_relaxed); }
+    return r;
+}
+
+/* Version ladder for the q4-VNNI matvec: v4 (default) → v3 (QWEN_Q4_VNNI_V4=0)
+ * → v2 (also QWEN_Q4_VNNI_V3=0). One entry point so the matvec, the threaded
+ * task and the fused QKV all pick the same kernel. */
+static inline void q4_vnni_rows(float *y, const int8_t *qx, float sx,
+                                const q4_0_block_t *W, int cols, int rows) {
+    if (q4_vnni_v4_on())      q4_0_matvec_vnni_v4(y, qx, sx, W, cols, rows);
+    else if (q4_vnni_v3_on()) q4_0_matvec_vnni_v3(y, qx, sx, W, cols, rows);
+    else                      q4_0_matvec_vnni(y, qx, sx, W, cols, rows);
+}
+
 typedef struct { float *y; const int8_t *qx; float sx; const q4_0_block_t *W; int rows, cols; } q4_0_vnni_ctx;
 static void q4_0_vnni_task(size_t tid, size_t nt, void *vc) {
     q4_0_vnni_ctx *c = (q4_0_vnni_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     const q4_0_block_t *W = c->W + (size_t)r0 * (c->cols / Q4_0_BLOCK_SIZE);
-    if (q4_vnni_v3_on())
-        q4_0_matvec_vnni_v3(c->y + r0, c->qx, c->sx, W, c->cols, r1 - r0);
-    else
-        q4_0_matvec_vnni(c->y + r0, c->qx, c->sx, W, c->cols, r1 - r0);
+    q4_vnni_rows(c->y + r0, c->qx, c->sx, W, c->cols, r1 - r0);
 }
 #endif
 
@@ -2854,8 +3206,7 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
             qwen_parallel((size_t)nt, q4_0_vnni_task, &c);
             return;
         }
-        if (q4_vnni_v3_on()) q4_0_matvec_vnni_v3(y, qx_buf, sx, W, cols, rows);
-        else                 q4_0_matvec_vnni(y, qx_buf, sx, W, cols, rows);
+        q4_vnni_rows(y, qx_buf, sx, W, cols, rows);
         return;
     }
 #endif
@@ -2957,10 +3308,67 @@ static void q4_0_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
     }
 }
 #endif
+#if defined(__AVX512VNNI__)
+/* VNNI fused-QKV (the x86 twin of the SDOT one above — closes the last f32-dequant
+ * hole in the single-stream int4 Talker path, plan_v4 C7 "fused-QKV VNNI twin"):
+ * quantize the shared activation to int8 ONCE, then VNNI for Q/K/V, partitioning
+ * the concatenated [Q|K|V] row space like the f32/SDOT twins. */
+typedef struct {
+    float *q, *k, *v;
+    const q4_0_block_t *Wq, *Wk, *Wv;
+    const int8_t *qx; float sx;
+    int in_dim, q_dim, kv_dim;
+} q4_0_qkv_vnni_ctx;
+static void q4_0_qkv_vnni_task(size_t tid, size_t nt, void *vc) {
+    q4_0_qkv_vnni_ctx *c = (q4_0_qkv_vnni_ctx *)vc;
+    int total = c->q_dim + 2 * c->kv_dim;
+    int nb = c->in_dim / Q4_0_BLOCK_SIZE;
+    int r0 = (int)(tid * (size_t)total / nt);
+    int r1 = (int)((tid + 1) * (size_t)total / nt);
+    for (int r = r0; r < r1; ) {
+        if (r < c->q_dim) {
+            int end = r1 < c->q_dim ? r1 : c->q_dim;
+            q4_vnni_rows(c->q + r, c->qx, c->sx, c->Wq + (size_t)r * nb, c->in_dim, end - r);
+            r = end;
+        } else if (r < c->q_dim + c->kv_dim) {
+            int local = r - c->q_dim;
+            int end = r1 < c->q_dim + c->kv_dim ? r1 : c->q_dim + c->kv_dim;
+            q4_vnni_rows(c->k + local, c->qx, c->sx, c->Wk + (size_t)local * nb, c->in_dim, (end - c->q_dim) - local);
+            r = end;
+        } else {
+            int local = r - c->q_dim - c->kv_dim;
+            int local_end = r1 - c->q_dim - c->kv_dim;
+            q4_vnni_rows(c->v + local, c->qx, c->sx, c->Wv + (size_t)local * nb, c->in_dim, local_end - local);
+            r = r1;
+        }
+    }
+}
+#endif
 void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
+#if defined(__AVX512VNNI__)
+    /* QWEN_NO_VNNI_QKV=1 isolates THIS lever in the box A/B (falls back to the
+     * f32-dequant QKV below while the standalone q4 matvec stays VNNI). */
+    static atomic_int qkv_off = -1;
+    int qkv_o = atomic_load_explicit(&qkv_off, memory_order_relaxed);
+    if (qkv_o < 0) { const char *e = getenv("QWEN_NO_VNNI_QKV"); qkv_o = (e && e[0] == '1'); atomic_store_explicit(&qkv_off, qkv_o, memory_order_relaxed); }
+    if (!qkv_o && !q4_sdot_disabled() && in_dim <= Q4_QX_MAX && in_dim % Q4_0_BLOCK_SIZE == 0) {
+        int8_t qx_buf[Q4_QX_MAX];
+        float sx = quantize_act_int8_x86(qx_buf, x, in_dim);
+        int nt = g_n_threads;
+        if (nt > 1) {
+            q4_0_qkv_vnni_ctx c = { q, k, v, Wq, Wk, Wv, qx_buf, sx, in_dim, q_dim, kv_dim };
+            qwen_parallel((size_t)nt, q4_0_qkv_vnni_task, &c);
+            return;
+        }
+        q4_vnni_rows(q, qx_buf, sx, Wq, in_dim, q_dim);
+        q4_vnni_rows(k, qx_buf, sx, Wk, in_dim, kv_dim);
+        q4_vnni_rows(v, qx_buf, sx, Wv, in_dim, kv_dim);
+        return;
+    }
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
     if (!q4_sdot_disabled() && in_dim <= Q4_QX_MAX && in_dim % Q4_0_BLOCK_SIZE == 0) {
         int8_t qx_buf[Q4_QX_MAX];
@@ -4414,10 +4822,23 @@ int qwen_kernel_selftest(void *out) {
         }
         qwen_matvec_bf16(y, wb, x, rows, cols);
         double max_rel_bf16 = 0.0;
-        for (int r = 0; r < rows; r++) {
-            double denom = fabs(ref[r]) + 1e-3;
-            double rel = fabs((double)y[r] - ref[r]) / denom;
-            if (rel > max_rel_bf16) max_rel_bf16 = rel;
+        {
+            double l2n_bf = 0.0, l2d_bf = 0.0;
+            for (int r = 0; r < rows; r++) {
+                double denom = fabs(ref[r]) + 1e-3;
+                double rel = fabs((double)y[r] - ref[r]) / denom;
+                if (rel > max_rel_bf16) max_rel_bf16 = rel;
+                double d = (double)y[r] - ref[r];
+                l2n_bf += d * d; l2d_bf += (double)ref[r] * ref[r];
+            }
+#if defined(__AVX512BF16__)
+            /* VDPBF16PS rounds the ACTIVATION to bf16 → constant-ish absolute
+             * error per row; per-row max-rel explodes on near-zero rows and
+             * means nothing (same reasoning as int8 below). Gate on global L2. */
+            max_rel_bf16 = sqrt(l2n_bf / (l2d_bf + 1e-12));
+#else
+            (void)l2n_bf; (void)l2d_bf;
+#endif
         }
 
         /* ---- batched matmat: Y[rows,B] must equal B independent matvecs ----
@@ -4446,8 +4867,10 @@ int qwen_kernel_selftest(void *out) {
                 double l2rel = l2d > 0 ? sqrt(l2n / l2d) : 0.0;
                 /* BFMMLA builds truncate the ACTIVATION to bf16 (native bf16 GEMM) →
                  * ~1e-3 L2 vs the f32-activation matvec is the expected correct value,
-                 * not a defect (same class as the int8 act-quant tolerance). */
-#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+                 * not a defect (same class as the int8 act-quant tolerance). Same story
+                 * under __AVX512BF16__: the dispatched MATVEC is now bf16-activation
+                 * (VDPBF16PS) while the matmat keeps f32 activation. */
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) || defined(__AVX512BF16__)
                 const double mmthr = 1e-2;
 #else
                 const double mmthr = 1e-4;
@@ -4491,11 +4914,16 @@ int qwen_kernel_selftest(void *out) {
                         (amax_got >= 0 && amax_got < rows &&
                          (amax_val - ref[amax_got]) < 0.02 * (fabs(amax_val) + 1e-3));
 
-        int bf16_ok = max_rel_bf16 < 1e-2;   /* bf16: only fp accumulation-order drift */
+        int bf16_ok = max_rel_bf16 < 1e-2;   /* bf16: fp-order drift (or act-rounding L2 under VDPBF16PS) */
         int i8_ok   = rel_l2_i8    < 3e-2;   /* int8: activation-quant noise (~0.7% expected) */
         if (!bf16_ok || !i8_ok || !argmax_ok) failures++;
-        fprintf(f, "  [%4dx%-4d] bf16 max_rel=%.2e %s | int8 rel_L2=%.2e %s | argmax %s (ref=%d got=%d)\n",
-                rows, cols, max_rel_bf16, bf16_ok ? "OK" : "FAIL",
+#if defined(__AVX512BF16__)
+        const char *bf16_metric = "rel_L2";
+#else
+        const char *bf16_metric = "max_rel";
+#endif
+        fprintf(f, "  [%4dx%-4d] bf16 %s=%.2e %s | int8 rel_L2=%.2e %s | argmax %s (ref=%d got=%d)\n",
+                rows, cols, bf16_metric, max_rel_bf16, bf16_ok ? "OK" : "FAIL",
                 rel_l2_i8, i8_ok ? "OK" : "FAIL",
                 argmax_ok ? "OK" : "FAIL", amax_ref, amax_got);
 
@@ -4546,6 +4974,40 @@ int qwen_kernel_selftest(void *out) {
             float *yc = malloc((size_t)rows * sizeof(float));
             if (wq && Xb && Yb && xb && yc) {
                 qwen_quantize_bf16_to_q4_0(wb, rows, cols, wq);
+
+                /* ---- q4_0 matvec vs exact dequant reference (plan_v4 C7 gate) ----
+                 * Reference: dequantized-W · x with the activation kept f32. The
+                 * dispatched matvec (SDOT/VNNI v2/v3/v4) quantizes the activation
+                 * to int8 → same global-L2 tolerance class as int8 above. This is
+                 * the case that catches a broken VNNI offset/scale on real silicon
+                 * (per-row max-rel is meaningless near ref≈0, see int8 comment). */
+                {
+                    for (int r = 0; r < rows; r++) {
+                        const q4_0_block_t *row = wq + (size_t)r * nb;
+                        float s = 0.0f;
+                        for (int b = 0; b < nb; b++) {
+                            float bs = qwen_f16_to_f32(row[b].scale_f16);
+                            const float *xk = x + b * Q4_0_BLOCK_SIZE;
+                            for (int i = 0; i < 16; i++) {
+                                s += bs * (float)((int)(row[b].qs[i] & 0x0F) - 8) * xk[2 * i];
+                                s += bs * (float)((int)(row[b].qs[i] >> 4)   - 8) * xk[2 * i + 1];
+                            }
+                        }
+                        ref[r] = s;
+                    }
+                    qwen_matvec_q4_0(y, wq, x, rows, cols);
+                    double l2n = 0.0, l2d = 0.0;
+                    for (int r = 0; r < rows; r++) {
+                        double d = (double)y[r] - ref[r];
+                        l2n += d * d; l2d += (double)ref[r] * ref[r];
+                    }
+                    double l2rel = sqrt(l2n / (l2d + 1e-12));
+                    int ok = l2rel < 3e-2;
+                    fprintf(f, "  [%4dx%4d] matvec_q4_0 vs dequant ref: rel_L2=%.2e  %s\n",
+                            rows, cols, l2rel, ok ? "PASS" : "FAIL");
+                    if (!ok) failures++;
+                }
+
                 for (int k = 0; k < cols; k++)
                     for (int b = 0; b < B; b++) Xb[(size_t)k * B + b] = x[k] * (1.0f + 0.05f * b);
                 qwen_matmat_q4_0(Yb, wq, Xb, rows, cols, B);
