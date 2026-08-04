@@ -97,13 +97,29 @@ Two takeaways:
   doesn't happen** — threading scales (as on M1 and the 6800H). A VM slice of a many-core server is
   the worst case for single-stream latency.
 
+### 2026-08-04 update — the AVX-512 parity round (Zen5, `SIMD=avx512bf16`)
+
+The remaining AVX2-only hot paths got true AVX-512 twins, plus two new levers
+(all runtime-switchable; full RTF matrix in `docs/hardware-testing.md` §5):
+
+- **16-wide attention, rms_norm and bf16↔f32 conversions** (were AVX2 even on AVX-512 builds):
+  branch-vs-main alone is **bf16 −17% / int4 −8%** at `-j1`.
+- **Native bf16 dot (`VDPBF16PS`)** for the bf16 matvec: **−21% at `-j1`** (0.6B RTF 1.19 vs 1.51;
+  −19% on 1.7B) — bf16 mode now *ties int8* single-thread. `QWEN_NO_BF16DOT=1` opts out.
+- **q4-VNNI v3 as default + a fused-QKV VNNI twin** (QKV was still f32-dequant): 0.6B int4 `-j1`
+  **1.05 vs int8 1.21** — **the first time int4 beats int8 on x86**. On 1.7B int8 remains the
+  wall-clock king (1.74 vs 1.84); the old +21% int4 gap shrank to ~+6%.
+- Recommended configs after this round: **0.6B → `--int4 -j4`**, **1.7B → `--int8 -j4`**; build
+  with **`make blas SIMD=avx512bf16`** on Zen4/5 / Cooper Lake+ (falls back to `SIMD=avx512vnni`
+  on VNNI-only chips like Ice Lake).
+
 ### Cross-device summary (0.6B, single-stream, best config)
 
 | Device | SIMD + threads | Best RTF | Lever |
 |---|---|---|---|
 | Apple M1 | NEON + SDOT, 4-thread | **sub-1.0 (int8)** | big SLC fits the working set |
 | Ryzen 7 6800H | AVX2, 4-thread, bare metal | 2.02 | `--int4` (small L3) |
-| EPYC 9555P (Zen5, VM) | AVX-512-VNNI | 1.64 | int8; VM limits threading |
+| EPYC 9555P (Zen5, VM) | AVX-512 + VNNI + BF16, 4-thread | **0.95 (int4/int8)** | 2026-08-04 parity round; int4 wins `-j1` (1.05) |
 
 ---
 
