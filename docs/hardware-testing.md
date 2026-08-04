@@ -336,6 +336,32 @@ comparable.
   3; =4 catastrophic 1.46, oversubscription). Per-box knob — sweep it on every new box (N1 file-mode
   optimum was 2).
 
+**⭐ avx512-parity round — EPYC 9555P Zen5, 4 vCPU, `SIMD=avx512bf16` (2026-08-04, branch
+`perf/avx512-parity` @ 74bc18d, temp0 seed42 ryan EN, file mode):**
+
+| model | config | -j1 | -j4 | note |
+|---|---|---|---|---|
+| 0.6B | bf16 **dpbf16 ON** (C4) | **1.19** | 1.07 | ties int8 single-thread |
+| 0.6B | bf16 dpbf16 OFF (widen+FMA) | 1.51 | 1.10 | → **C4 = −21% -j1**, −3% -j4 |
+| 0.6B | **int4 v3 (default)** | **1.05–1.07** | 0.95 | ⭐ **int4 BEATS int8 -j1 on x86** (first time) |
+| 0.6B | int4 v4 (opt-in) | 1.07–1.09 | 0.95 | v4 LOSES to v3 by 1-2% on Zen5 (3× A/B) → default v3 |
+| 0.6B | int4 v2 | 1.35 | — | v3 = −20% vs v2 |
+| 0.6B | int4, QKV-VNNI twin OFF | 1.14 | — | the fused-QKV twin is worth ~5% |
+| 0.6B | int8 | 1.21 | 0.95 | -j4 = int4 parity (bandwidth-bound) |
+| 1.7B | bf16 dpbf16 ON / OFF | **1.92** / 2.38 | 1.43 / 1.45 | **C4 = −19% -j1** on 1.7B too |
+| 1.7B | **int8** | **1.74** | **1.16** | **int8 stays the 1.7B x86 king** (qm 1.21) |
+| 1.7B | int4 (v3 default) | 1.84 | 1.28 | gap vs int8 narrowed +21% → ~+6% (-j1); QKV share ≈0 |
+| — | branch vs main (same SIMD) | 0.6B bf16 1.43→1.19, int4 1.18→1.09 · 1.7B bf16 2.30→1.91, int4 1.90→1.79 | 1.7B bf16 1.48→1.43, int4 1.34→1.28 | attention/rms/conv 512-bit |
+
+Self-test 5/5 PASS on-silicon (both models). `QWEN_PREFILL_MATMAT` A/B: neutral on 0.6B,
+BLAS clearly better on 1.7B (1.43 vs 1.52) → BLAS stays default, audit leftover CLOSED.
+mel-corr between kernel variants is NOT a gate (greedy fork at ~frame 8, first 7 frames
+bit-identical — benign); quality gate = self-test + ear
+(`samples/tests/2026-08-04_avx512-parity-epyc/`). Follow-up: batched q4 matmat now 0.80-0.90×
+vs the faster seq matvec → port the VNNI-matvec tricks into `q4_matmat_vnni_slice`.
+Recommended x86 defaults after this round: **0.6B → `--int4`** (new fastest), **1.7B → `--int8`**;
+bf16 mode always benefits from dpbf16 (default ON under `SIMD=avx512bf16`).
+
 **⭐ Graviton3 (AWS c7g.2xlarge, Neoverse-V1, 8 vCPU, `-j4`, 2026-07-11) — first server-ARM with
 i8mm/bf16; the MMLA twins' first silicon:**
 
