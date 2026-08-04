@@ -3160,9 +3160,14 @@ static void q4_0_matvec_vnni_v4(float *y, const int8_t *qx, float sx,
 }
 
 static int q4_vnni_v4_on(void) {
+    /* Default OFF (= v3): measured on EPYC 9555P Zen5 2026-08-04, 3×-repeated
+     * -j1 temp0 A/B — v3 1.05-1.06 vs v4 1.07-1.08 RTF. Zen5's cross-lane
+     * reduce is cheap enough that v4's cvt+scale-vec build costs more than the
+     * hsums it removes. QWEN_Q4_VNNI_V4=1 re-enables (re-test on Sapphire
+     * Rapids / Ice Lake, where reduce latency may tip the other way). */
     static atomic_int v = -1;
     int r = atomic_load_explicit(&v, memory_order_relaxed);
-    if (r < 0) { const char *e = getenv("QWEN_Q4_VNNI_V4"); r = !(e && e[0] == '0'); /* default ON */
+    if (r < 0) { const char *e = getenv("QWEN_Q4_VNNI_V4"); r = (e && e[0] == '1'); /* default OFF */
                  atomic_store_explicit(&v, r, memory_order_relaxed); }
     return r;
 }

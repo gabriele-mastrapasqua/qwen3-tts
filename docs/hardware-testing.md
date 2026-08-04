@@ -40,15 +40,24 @@ What the branch adds + its runtime kill-switches (all default ON, A/B without re
 | lever | switch (disables) |
 |---|---|
 | C4: bf16 matvec via `VDPBF16PS` (activation rounded to bf16, BFMMLA-class numerics) | `QWEN_NO_BF16DOT=1` |
-| C7 v4: q4-VNNI deferred-reduce (no cross-lane op in the block loop) | `QWEN_Q4_VNNI_V4=0` → v3 (`QWEN_Q4_VNNI_V3=0` → v2) |
+| C7 v4: q4-VNNI deferred-reduce (no cross-lane op in the block loop) | **default OFF su Zen5** (v3 vince 1-2%, 3× A/B 2026-08-04); `QWEN_Q4_VNNI_V4=1` riabilita (`QWEN_Q4_VNNI_V3=0` → v2) |
 | fused-QKV q4 VNNI twin (was f32-dequant on x86) | `QWEN_NO_VNNI_QKV=1` |
 | attention dots/accum + rms_norm + bf16 bulk conv at 512-bit | compile-time only → A/B vs a main-branch binary |
 
 One command: `bash tests/avx512_parity_bench.sh qwen3-tts-0.6b` (add `MAIN_BIN=` for the
-branch-vs-main compile-time A/B). Also re-run the audit leftover it includes:
-`QWEN_PREFILL_MATMAT=0/1` on Linux BLAS. Verdicts to bring home: does dpbf16 beat
-widen+FMA (+ mel-corr ≥0.99)? does v4 close the int4-vs-int8 single-stream gap
-(v3 left +21%)? per-lever shares; then pick defaults per-ISA like the MMLA merge did.
+branch-vs-main compile-time A/B).
+
+**✅ MEASURED on the EPYC 9555P (2026-08-04, 0.6B, temp0 seed42)** — self-test 5/5 PASS
+on-silicon; **dpbf16 −21% -j1** (RTF 1.19 vs 1.51; bf16 now TIES int8 single-thread) and
+−3% -j4; **int4 now BEATS int8 -j1** (v3 1.05-1.07 vs int8 1.21 — the old "+21% behind"
+verdict is REVERSED by v3-default + the QKV twin ~5%); v4 measured 1-2% SLOWER than v3 on
+Zen5 (3× A/B) → **default flipped to v3**, `QWEN_Q4_VNNI_V4=1` re-tests elsewhere; branch
+vs main: bf16 −17% / int4 −8% (-j1). `QWEN_PREFILL_MATMAT` A/B ≈ neutral → BLAS stays
+default (audit leftover CLOSED). mel-corr BETWEEN kernel variants is NOT a valid gate:
+greedy trajectory forks at ~frame 8 from fp-level logit shifts (first 7 frames
+bit-identical — benign known class); quality gate = self-test + ear on the -j1 wavs
+(`samples/tests/2026-08-04_avx512-parity-epyc/`). Follow-up found: batched q4 matmat is
+now 0.80× vs the faster seq matvec → port the VNNI-matvec tricks to `q4_matmat_vnni_slice`.
 
 ### The 2-command rented-box workflow
 
