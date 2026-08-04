@@ -49,7 +49,7 @@ BIN=./qwen_tts_avx512bf16
 run() { # $1=label $2=outwav then env/cmd+flags
     local label="$1" wav="$2"; shift 2
     local out rtf
-    out=$("$@" -d "$MODEL" --text "$TXT" --seed 42 -s ryan -l English -o "$wav" 2>&1)
+    out=$("$@" -d "$MODEL" --text "$TXT" --seed 42 --temperature 0 -s ryan -l English -o "$wav" 2>&1)
     rtf=$(printf '%s\n' "$out" | grep -oE 'RTF [0-9.]+' | head -1 | awk '{print $2}')
     printf "  %-42s RTF %-7s\n" "$label" "${rtf:-ERR}"
 }
@@ -78,11 +78,11 @@ for cfg in \
 done
 echo
 echo "[2] C4 bf16: VDPBF16PS vs widen+FMA (speed + mel-corr gate):"
-run "bf16 dpbf16 ON  -j4" "$OUT/bf16_on.wav"  $BIN -j4
-run "bf16 dpbf16 OFF -j4" "$OUT/bf16_off.wav" env QWEN_NO_BF16DOT=1 $BIN -j4
-run "bf16 dpbf16 ON  -j1" "$OUT/x.wav"        $BIN -j1
-run "bf16 dpbf16 OFF -j1" "$OUT/x.wav"        env QWEN_NO_BF16DOT=1 $BIN -j1
-melcmp "dpbf16 ON vs OFF" "$OUT/bf16_off.wav" "$OUT/bf16_on.wav"
+run "bf16 dpbf16 ON  -j4" "$OUT/x.wav"        $BIN -j4
+run "bf16 dpbf16 OFF -j4" "$OUT/x.wav"        env QWEN_NO_BF16DOT=1 $BIN -j4
+run "bf16 dpbf16 ON  -j1" "$OUT/bf16_on.wav"  $BIN -j1
+run "bf16 dpbf16 OFF -j1" "$OUT/bf16_off.wav" env QWEN_NO_BF16DOT=1 $BIN -j1
+melcmp "dpbf16 ON vs OFF (-j1 temp0)" "$OUT/bf16_off.wav" "$OUT/bf16_on.wav"
 echo
 echo "[3] C7 int4 ladder (v4 default; the number to beat is int8):"
 run "int8 (reference)      -j1" "$OUT/i8.wav" $BIN --int8 -j1
@@ -106,12 +106,16 @@ if [ -n "${MAIN_BIN:-}" ] && [ -x "$MAIN_BIN" ]; then
   echo
   echo "[6] branch vs main (same SIMD=avx512bf16 — isolates the compile-time wins:"
   echo "    attention AVX-512 + rms_norm + bulk conv; plus everything above):"
-  run "main   bf16 -j4" "$OUT/main_bf16.wav" "$MAIN_BIN" -j4
-  run "branch bf16 -j4" "$OUT/br_bf16.wav"   $BIN -j4
-  run "main   int4 -j4" "$OUT/main_i4.wav"   "$MAIN_BIN" --int4 -j4
-  run "branch int4 -j4" "$OUT/br_i4.wav"     $BIN --int4 -j4
-  melcmp "bf16 branch vs main" "$OUT/main_bf16.wav" "$OUT/br_bf16.wav"
-  melcmp "int4 branch vs main" "$OUT/main_i4.wav"   "$OUT/br_i4.wav"
+  run "main   bf16 -j4" "$OUT/x.wav"         "$MAIN_BIN" -j4
+  run "branch bf16 -j4" "$OUT/x.wav"         $BIN -j4
+  run "main   int4 -j4" "$OUT/x.wav"         "$MAIN_BIN" --int4 -j4
+  run "branch int4 -j4" "$OUT/x.wav"         $BIN --int4 -j4
+  run "main   bf16 -j1" "$OUT/main_bf16.wav" "$MAIN_BIN" -j1
+  run "branch bf16 -j1" "$OUT/br_bf16.wav"   $BIN -j1
+  run "main   int4 -j1" "$OUT/main_i4.wav"   "$MAIN_BIN" --int4 -j1
+  run "branch int4 -j1" "$OUT/br_i4.wav"     $BIN --int4 -j1
+  melcmp "bf16 branch vs main (-j1 temp0)" "$OUT/main_bf16.wav" "$OUT/br_bf16.wav"
+  melcmp "int4 branch vs main (-j1 temp0)" "$OUT/main_i4.wav"   "$OUT/br_i4.wav"
 fi
 echo "================================================================"
 echo "Verdicts to fill: [2] dpbf16 faster? mel-corr>=0.99? [3] does v4 close the"
