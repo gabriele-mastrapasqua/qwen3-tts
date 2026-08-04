@@ -84,16 +84,16 @@ run "bf16 dpbf16 ON  -j1" "$OUT/bf16_on.wav"  $BIN -j1
 run "bf16 dpbf16 OFF -j1" "$OUT/bf16_off.wav" env QWEN_NO_BF16DOT=1 $BIN -j1
 melcmp "dpbf16 ON vs OFF (-j1 temp0)" "$OUT/bf16_off.wav" "$OUT/bf16_on.wav"
 echo
-echo "[3] C7 int4 ladder (v4 default; the number to beat is int8):"
+echo "[3] C7 int4 ladder (default = v3, Zen5-measured 2026-08-04; beat int8):"
 run "int8 (reference)      -j1" "$OUT/i8.wav" $BIN --int8 -j1
-run "int4 v4               -j1" "$OUT/v4.wav" $BIN --int4 -j1
-run "int4 v3               -j1" "$OUT/x.wav"  env QWEN_Q4_VNNI_V4=0 $BIN --int4 -j1
+run "int4 default(v3)      -j1" "$OUT/v4.wav" $BIN --int4 -j1
+run "int4 v4 (opt-in)      -j1" "$OUT/x.wav"  env QWEN_Q4_VNNI_V4=1 $BIN --int4 -j1
 run "int4 v2               -j1" "$OUT/x.wav"  env QWEN_Q4_VNNI_V4=0 QWEN_Q4_VNNI_V3=0 $BIN --int4 -j1
 run "int4 v4 QKV-vnni OFF  -j1" "$OUT/x.wav"  env QWEN_NO_VNNI_QKV=1 $BIN --int4 -j1
 run "int8                  -j4" "$OUT/x.wav"  $BIN --int8 -j4
-run "int4 v4               -j4" "$OUT/x.wav"  $BIN --int4 -j4
-run "int4 v3               -j4" "$OUT/x.wav"  env QWEN_Q4_VNNI_V4=0 $BIN --int4 -j4
-melcmp "int4 v4 vs v3-era engine" "$OUT/i8.wav" "$OUT/v4.wav"
+run "int4 default(v3)      -j4" "$OUT/x.wav"  $BIN --int4 -j4
+run "int4 v4 (opt-in)      -j4" "$OUT/x.wav"  env QWEN_Q4_VNNI_V4=1 $BIN --int4 -j4
+melcmp "int4 default vs int8 (sanity)" "$OUT/i8.wav" "$OUT/v4.wav"
 echo "  (int4-vs-int8 mel-corr is a sanity ear-proxy, not a bit gate — different quant)"
 echo
 echo "[4] prefill A/B (audit leftover, Linux BLAS vs threaded matmat):"

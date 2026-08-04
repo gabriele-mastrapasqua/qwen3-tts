@@ -53,7 +53,12 @@ on-silicon; **dpbf16 −21% -j1** (RTF 1.19 vs 1.51; bf16 now TIES int8 single-t
 verdict is REVERSED by v3-default + the QKV twin ~5%); v4 measured 1-2% SLOWER than v3 on
 Zen5 (3× A/B) → **default flipped to v3**, `QWEN_Q4_VNNI_V4=1` re-tests elsewhere; branch
 vs main: bf16 −17% / int4 −8% (-j1). `QWEN_PREFILL_MATMAT` A/B ≈ neutral → BLAS stays
-default (audit leftover CLOSED). mel-corr BETWEEN kernel variants is NOT a valid gate:
+default (audit leftover CLOSED — on 1.7B BLAS wins clearly: 1.43 vs 1.52).
+**1.7B (same battery)**: dpbf16 **−19% -j1** (1.92 vs 2.38), branch vs main bf16 −17% /
+int4 −6% (-j1), int4 −4.5% (-j4). BUT **int8 stays the 1.7B single-stream king on x86**
+(int8 1.74 vs int4 1.84 -j1; 1.16 vs 1.28 -j4; qm 1.21) — the int4>int8 flip is
+**0.6B-only**; gap narrowed from +21% to ~+6% (-j1). QKV-twin share ≈0 on 1.7B.
+mel-corr BETWEEN kernel variants is NOT a valid gate:
 greedy trajectory forks at ~frame 8 from fp-level logit shifts (first 7 frames
 bit-identical — benign known class); quality gate = self-test + ear on the -j1 wavs
 (`samples/tests/2026-08-04_avx512-parity-epyc/`). Follow-up found: batched q4 matmat is
