@@ -27,7 +27,28 @@ SIMD each one has**, **how to check the extension actually fires**, and **what t
 | `make check-isa` | compile-check the newer-ISA kernel paths (BFMMLA/SMMLA/SME ; VNNI/BF16/AMX) on the dev box, before the hardware exists |
 
 Scripts (copy onto any rented box): `tests/bench_matrix.sh <model> [--full]`,
-`tests/serve_batch_bench.sh <model> [port] [batch_N] [clients_M] [threads]`.
+`tests/serve_batch_bench.sh <model> [port] [batch_N] [clients_M] [threads]`,
+`tests/avx512_parity_bench.sh <model>` (the perf/avx512-parity branch battery, below).
+
+### avx512-parity battery (branch `perf/avx512-parity`, authored 2026-08-04 on M1 — HW-UNVALIDATED)
+
+Target box: Scaleway **STANDARD3-X4C-16G** (EPYC 9555P Zen5: `avx512_vnni` + `avx512_bf16`).
+New build flavor: **`make blas SIMD=avx512bf16`** (= avx512vnni + `-mavx512bf16`; check
+`--caps` runtime line for `avx512bf16` first — Ice Lake has VNNI but NOT BF16).
+What the branch adds + its runtime kill-switches (all default ON, A/B without rebuild):
+
+| lever | switch (disables) |
+|---|---|
+| C4: bf16 matvec via `VDPBF16PS` (activation rounded to bf16, BFMMLA-class numerics) | `QWEN_NO_BF16DOT=1` |
+| C7 v4: q4-VNNI deferred-reduce (no cross-lane op in the block loop) | `QWEN_Q4_VNNI_V4=0` → v3 (`QWEN_Q4_VNNI_V3=0` → v2) |
+| fused-QKV q4 VNNI twin (was f32-dequant on x86) | `QWEN_NO_VNNI_QKV=1` |
+| attention dots/accum + rms_norm + bf16 bulk conv at 512-bit | compile-time only → A/B vs a main-branch binary |
+
+One command: `bash tests/avx512_parity_bench.sh qwen3-tts-0.6b` (add `MAIN_BIN=` for the
+branch-vs-main compile-time A/B). Also re-run the audit leftover it includes:
+`QWEN_PREFILL_MATMAT=0/1` on Linux BLAS. Verdicts to bring home: does dpbf16 beat
+widen+FMA (+ mel-corr ≥0.99)? does v4 close the int4-vs-int8 single-stream gap
+(v3 left +21%)? per-lever shares; then pick defaults per-ISA like the MMLA merge did.
 
 ### The 2-command rented-box workflow
 

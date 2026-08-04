@@ -134,6 +134,15 @@ static void f32_to_bf16_vec(uint16_t *dst, const float *src, int64_t n) {
         vst1q_u16(dst + i, vcombine_u16(lo, hi));
     }
     for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
+#elif defined(__AVX512F__)
+    int64_t i = 0;
+    for (; i + 15 < n; i += 16) {
+        /* Truncate 16 f32 to their top 16 bits (bf16, same semantics as the
+         * AVX2/NEON paths), narrow 16×u32 -> 16×u16 with vpmovdw. */
+        __m512i u = _mm512_srli_epi32(_mm512_castps_si512(_mm512_loadu_ps(src + i)), 16);
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm512_cvtepi32_epi16(u));
+    }
+    for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
 #elif defined(__AVX2__)
     int64_t i = 0;
     for (; i + 7 < n; i += 8) {
@@ -159,6 +168,14 @@ static void bf16_to_f32_matrix(float *dst, const uint16_t *src, int64_t n) {
         uint32x4_t hi = vshll_n_u16(vget_high_u16(v), 16);
         vst1q_f32(dst + i,     vreinterpretq_f32_u32(lo));
         vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(hi));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+#elif defined(__AVX512F__)
+    int64_t i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m512i w = _mm512_slli_epi32(_mm512_cvtepu16_epi32(v), 16);
+        _mm512_storeu_ps(dst + i, _mm512_castsi512_ps(w));
     }
     for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
 #elif defined(__AVX2__)

@@ -19,6 +19,11 @@ ifeq ($(UNAME_S),Darwin)
 else ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
     ifeq ($(SIMD),scalar)
         ARCH_FLAGS =
+    else ifeq ($(SIMD),avx512bf16)
+        # AVX-512 + VNNI + BF16 (native int8 dot + native bf16 dot VDPBF16PS).
+        # Zen4/Zen5 (EPYC 9xx4/9xx5, Ryzen 7xxx+), Cooper Lake, Sapphire Rapids.
+        # Check `--caps` runtime line for avx512bf16 BEFORE using this build.
+        ARCH_FLAGS = -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx512bf16 -mavx2 -mfma
     else ifeq ($(SIMD),avx512vnni)
         # AVX-512 + VNNI (native int8 dot). Cascade Lake+/Ice Lake/Zen4+ (e.g. Ryzen 9950X3D).
         ARCH_FLAGS = -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx2 -mfma
@@ -618,6 +623,11 @@ ifeq ($(UNAME_M),arm64)
 	@clang -target x86_64-apple-macos13 $(ISACHK) -march=x86-64-v3 -mavx512f -mavx512bw -mavx512vnni -mavx512bf16 \
 	  -DUSE_BLAS qwen_tts_kernels.c 2>/dev/null \
 	  && echo "  x86 avx512 +vnni (x-comp) : OK (Zen4/5, Ice Lake+; C7 q4-VNNI)" || echo "  x86 avx512 +vnni (x-comp) : (clang cross lacks target — skipped)"
+	@# talker.c carries the AVX-512 bf16<->f32 bulk-conversion paths (avx512-parity) —
+	@# compile-check it for x86 too (needs the ingot include).
+	@clang -target x86_64-apple-macos13 $(ISACHK) -Ithird_party/ingot/include -march=x86-64-v3 \
+	  -mavx512f -mavx512bw -mavx512vnni -mavx512bf16 -DUSE_BLAS qwen_tts_talker.c 2>/dev/null \
+	  && echo "  x86 avx512 talker (x-comp): OK (bf16 conv paths)" || echo "  x86 avx512 talker (x-comp): (clang cross lacks target — skipped)"
 else
 	@$(CC) $(ISACHK) -march=x86-64-v3 -mavx512f -mavx512bw -mavx512vnni -mavx512bf16 qwen_tts_kernels.c \
 	  && echo "  x86 avx512 +vnni +bf16   : OK (Zen4/5, Ice Lake+)" || echo "  x86 avx512 +vnni +bf16   : FAIL"
