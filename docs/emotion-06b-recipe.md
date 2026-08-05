@@ -19,7 +19,38 @@ direction failed.
 But the 0.6B **clones voices very well**. So the emotion enters through the channel that already
 works: you clone from *emotional* audio, and you get an emotional voice.
 
-## The recipe
+## The fast path — a cloned voice emotes with no setup at all
+
+The emotional offset in ECAPA speaker space is largely **speaker-independent**. Measured on two
+different speakers (a preset and a clone), per emotion:
+
+| emotion | cos(d_speakerA, d_speakerB) | ‖d‖ / ‖x‖ |
+|---|---|---|
+| sad | +0.68 | 0.23 |
+| anger | +0.66 | 0.26 |
+| fear | +0.58 | 0.24 |
+| surprise | +0.59 | 0.25 |
+| disgust | +0.54 | 0.24 |
+| joy | +0.48 | 0.18 |
+
+Random 1024-dim vectors would sit near 0, so roughly half of the emotional shift is a shared
+direction rather than a property of the person. Six averaged unit directions ship as
+`presets/emovoice/dir_<tok>.bin` (4 KB each). At runtime the engine adds one to whatever x-vector is
+loaded and restores the original norm — pure arithmetic, no extra model, no generation:
+
+```bash
+./qwen_tts -d qwen3-tts-0.6b --load-voice myvoice.qvoice --icl-only --int8 \
+    -l Italian --emotion anger --text "[sigh] ..." -o out.wav
+```
+
+Dose with `--emotion-strength` (default **0.25**; 0.35 pushes harder). Ear-validated 2026-08-05, on a
+cloned voice using a direction derived from a *different* speaker.
+
+**Resolution order**: dedicated per-voice asset (below) → generic direction → explicit error. The
+dedicated asset always wins when present; it is stronger and more faithful, because it is rendered
+from that voice actually performing the emotion rather than displaced toward it.
+
+## The high-quality path — a dedicated asset per (voice × emotion)
 
 ### Runtime — small model only, one flag, nothing else
 

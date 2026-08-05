@@ -338,8 +338,23 @@ emotion subspace disjoint from language and timbre, so there is nothing to steer
 But it **clones voices very well**. So on the small model the emotion is not an inference-time lever,
 it is a **property of the voice**: you clone from emotional audio and get an emotional voice.
 
-**`ryan` works out of the box** — its six assets ship in this repo (24 KB total), so `--emotion` on the
-0.6B needs no setup at all:
+**A cloned voice gets all six emotions for free.** Clone a voice the usual way and `--emotion` just
+works on it — no asset to build, no 1.7B, no Base model:
+
+```bash
+./qwen_tts -d qwen3-tts-0.6b --load-voice myvoice.qvoice --icl-only --int8 \
+    -l Italian --emotion anger --text "[sigh] ..." -o out.wav
+# → Emotion 'ang' on 0.6B: generic direction @ 0.25 (no per-voice asset needed)
+```
+
+This works because the emotional offset in ECAPA speaker space turns out to be largely
+**speaker-independent** — between two different speakers' deltas the cosine sits at 0.48-0.68 (random
+1024-dim vectors would be ~0). Six averaged unit directions ship in this repo (4 KB each, 24 KB total)
+and the engine adds one to whatever x-vector you loaded, preserving its norm. It costs nothing at
+runtime. Dose it with `--emotion-strength` (default 0.25; 0.35 pushes harder).
+
+**`ryan` works out of the box** too — its six dedicated assets ship here (24 KB), so `--emotion` on a
+preset needs no setup either:
 
 ```bash
 # emotion on the SMALL model — nothing to install, the 1.7B is not in the path
@@ -351,8 +366,9 @@ it is a **property of the voice**: you clone from emotional audio and get an emo
     --text "[sigh] Non è possibile che succeda sempre la stessa cosa." -o sad_sigh.wav
 ```
 
-For **any other voice** — another preset, or your own clone — it is **one command**, not a manual
-hunt. It generates all six donors, extracts all six assets, and caches them; you never map anything
+**Optional upgrade — a dedicated asset per (voice × emotion).** The generic direction is instant and
+needs nothing; a *dedicated* asset, rendered from ~25 s of that voice actually performing the emotion,
+is stronger and more faithful. One command builds all six and caches them — you never map anything
 by hand:
 
 ```bash
@@ -361,10 +377,13 @@ make emovoice VOICE=galatea LOAD=voices/galatea_graft.qvoice    # your own clone
 make emovoice VOICE=ryan TTS_LANG=English                       # another language
 ```
 
-It needs the 1.7B and the 0.6B Base model present (the first generates the emotional donor audio,
-the second extracts the 4 KB voice). Both are one-time, offline. After that the small model is
-self-sufficient. If an asset is missing, the engine says exactly which one and prints the two
-commands to build it — it never silently falls back to neutral.
+This route needs the 1.7B and the 0.6B Base model present (the first renders the emotional donor
+audio, the second extracts the 4 KB voice), one-time and offline. **It is an upgrade, not a
+prerequisite** — without it a cloned voice still emotes via the generic direction. When a dedicated
+asset exists the engine prefers it automatically.
+
+**Resolution order** for `--emotion` on the 0.6B: dedicated asset → generic direction on the loaded
+x-vector → an explicit error naming the missing piece. It never silently falls back to neutral.
 
 🎧 **`make emo-06b-demo`** renders the whole stack (6 emotions + 5 `[tag]`s + both together + a clone)
 and prints the RTF of each.
