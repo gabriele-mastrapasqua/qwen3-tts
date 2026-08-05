@@ -26,9 +26,16 @@ OUT="${OUT:-presets/emovoice}"
 SEED="${SEED:-42}"
 DONORS="${DONORS:-samples/tests/emovoice_donors/$VOICE}"
 
-# ~25 s of carrier text: enough for a stable ECAPA embedding.
+# ~25 s of carrier text: enough for a stable ECAPA embedding. Use a language the voice speaks
+# natively — the donor's delivery is what we are capturing, so a voice fighting the language is
+# a worse donor (see the native-preset-per-language rule in docs/emotion-THE-recipe.md).
 TEXT="Ma ti rendi conto di quello che è successo? Te l'avevo detto mille volte, mille volte, e alla fine è andata proprio così. Adesso non venirmi a dire che non lo sapevi, perché lo sapevi benissimo. È sempre la stessa storia, ogni volta la stessa identica storia, e io continuo a ripetere le cose a vuoto."
-[ "$LANG_" = "English" ] && TEXT="Do you realise what just happened? I told you a thousand times, a thousand times, and in the end it went exactly like that. Now do not tell me you did not know, because you knew perfectly well. It is always the same story, every single time the same story, and I keep repeating myself for nothing."
+case "$LANG_" in
+  English)  TEXT="Do you realise what just happened? I told you a thousand times, a thousand times, and in the end it went exactly like that. Now do not tell me you did not know, because you knew perfectly well. It is always the same story, every single time the same story, and I keep repeating myself for nothing." ;;
+  Chinese)  TEXT="你知道刚才发生了什么吗？我跟你说过一千遍，一千遍了，结果还是这样。现在别跟我说你不知道，因为你心里清楚得很。永远都是同样的事情，每一次都是同样的事情，而我一直在重复，毫无意义。" ;;
+  Japanese) TEXT="今何が起きたか分かっていますか。何千回も言いましたよね、何千回も。それなのに結局こうなってしまいました。知らなかったなんて言わないでください、よく分かっていたはずです。いつも同じことの繰り返しで、私はずっと同じことを言い続けています。" ;;
+  Korean)   TEXT="방금 무슨 일이 있었는지 알고 있나요. 제가 천 번은 말했잖아요, 천 번이나요. 그런데 결국 이렇게 되어 버렸네요. 몰랐다고는 하지 마세요, 아주 잘 알고 있었잖아요. 항상 똑같은 일의 반복이고, 저는 계속 같은 말만 하고 있습니다." ;;
+esac
 
 if [ ! -d "$BASE" ]; then
   echo "Error: need the 0.6B Base model at '$BASE' (it carries the ECAPA speaker encoder)."

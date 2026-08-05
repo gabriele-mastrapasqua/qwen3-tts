@@ -141,8 +141,10 @@ voice**: clone + emotion + paralinguistics together at **RTF ≈ 0.78**.
 
 ## Validated by ear (2026-08-05)
 
-- **presets: all 6 emotions work** on `ryan` via this recipe — the recipe is not clone-only, a preset
-  simply becomes a voice asset too
+- **presets: all 9 ship with all 6 emotions**, each built from a donor in the language that voice
+  speaks natively (ZH `vivian`/`uncle_fu`, JA `ono_anna`, KO `sohee`, EN the rest, IT `ryan`).
+  Ear-checked across languages including Korean, Japanese and English — a preset simply becomes a
+  voice asset too, the recipe is not clone-only
 - **all 6 also verified through the shipped `--emotion` flag under `--int8`** (sad/joy/anger, then
   fear/disgust/surprise) ⇒ the sub-1.0 configuration is the *validated* one, not a speed-only mode
 - **cloned voice (galatea): works**, with the anger caveat above
