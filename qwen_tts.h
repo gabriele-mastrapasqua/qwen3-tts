@@ -435,6 +435,16 @@ typedef struct qwen_tts_ctx {
     char *ref_audio_path;        /* Path to reference audio file */
     char *ref_text;              /* Reference text for ICL mode */
 
+    /* --emo-ref: EMOTION BY EXAMPLE (works on CustomVoice too, unlike voice clone).
+     * The reference contributes ONLY its codec tokens (the ICL prosody anchor) — the speaker
+     * identity keeps coming from wherever it already came from (preset -s, or a loaded clone).
+     * Rationale: the speech tokenizer is bit-identical across 0.6B/1.7B, so a codec sequence is
+     * the one exact channel between models — an emotional reference rendered by the 1.7B (or any
+     * emotional audio at all) transfers its STYLE to the 0.6B, which has no steerable emotion
+     * subspace of its own. See plan_06b_emo.md §E1. */
+    char *emo_ref_path;          /* Path to the emotional reference audio (style donor) */
+    char *emo_ref_text;          /* Its transcript — required by the ICL prompt format */
+
     /* Cached ICL data (for .qvoice save/load) */
     int *cached_ref_codes;       /* [cached_ref_n_frames × 16] codec tokens from speech encoder */
     int cached_ref_n_frames;     /* Number of reference codec frames */

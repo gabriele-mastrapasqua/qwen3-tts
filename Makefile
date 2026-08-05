@@ -544,6 +544,23 @@ emotion-demo: $(TARGET)
 emotion-para-demo: $(TARGET)
 	@bash tests/emotion_para_demo.sh
 
+# ── The SMALL model (0.6B) expressivity stack — emotion + para + clone, sub-realtime ──────────
+# On the 0.6B `--emotion` used to be a no-op: the model has no steerable emotion subspace. Since
+# 2026-08-05 the emotion rides on the VOICE instead (docs/emotion-06b-recipe.md) — you build one
+# 4 KB voice asset per emotion, once, and the small model gets the full expressive stack at RTF<1.
+#
+# make emovoice VOICE=ryan                                     # build the 6 assets for a preset
+# make emovoice VOICE=galatea LOAD=voices/galatea_graft.qvoice  # ... for a cloned voice
+# make emovoice VOICE=ryan GRAFT=voices/galatea_06b_graft.qvoice # ... + 16.8MB grafts (best for anger)
+#   (language: TTS_LANG=English — NOT LANG, which is the shell's own locale variable)
+emovoice: $(TARGET)
+	@bash tests/emovoice_build.sh
+
+# make emo-06b-demo — the showcase: 6 emotions + 5 [tag]s + both together + a clone, all on the
+# 0.6B under --int8, with the RTF printed for each. Needs `make emovoice VOICE=<v>` first.
+emo-06b-demo: $(TARGET)
+	@bash tests/emo_06b_demo.sh
+
 # make para-demo — shipped inline paralinguistic [tag]s on natural sentences (post 2026-07-08 gate:
 # wow/yawn/scoff + laugh/sigh, scoff s42, giggle standalone; phew parked). Prints afplay links.
 para-demo: $(TARGET)
@@ -1159,7 +1176,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
         emotion-para-demo para-demo \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-serve-all \
         test-clone test-voice-design \

@@ -41,8 +41,10 @@ int qwen_compose_is_para_event_tag(const char *tag);
 /* Replace every [laugh]/[sigh] in `text` with its validated onomatopoeia, comma-delimited,
  * so the event renders in the active voice's own timbre within ONE generation. Returns a new
  * string (caller frees); sets *did=1 if any tag matched and *seed to the FIRST tag's validated
- * seed. voice_class: 0 = ryan/clone/default, 1 = vivian. */
-char *qwen_compose_para_substitute(const char *text, int voice_class, int *did, int *seed, float *temp);
+ * seed. voice_class: 0 = ryan/clone/default, 1 = vivian, 2 = clone.
+ * small_model: 1 = 0.6B (its own seed table — the 1.7B seeds do not transfer). */
+char *qwen_compose_para_substitute(const char *text, int voice_class, int small_model,
+                                   int *did, int *seed, float *temp);
 
 /* ── Parse + render ───────────────────────────────────────────────────── */
 /* Parse inline markup into a span list. Free with qwen_compose_free_spans. */

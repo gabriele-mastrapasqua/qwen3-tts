@@ -59,6 +59,7 @@ make blas
 - **Voice management** — List, inspect, delete `.qvoice` profiles (`--list-voices`, `--delete-voice`). No model required.
 - **Style control** — `--instruct` for emotion/style on 1.7B: angry, whisper, cheerful, and more.
 - **Emotion in one flag** (🧪 **beta**; paralinguistics `[laugh]`/`[sigh]` 🧪 **alpha**) — `--emotion <sad\|joy\|anger\|fear\|disgust\|surprise>` (1.7B) auto-applies the ear-validated recipe (per-language fine-tune `.expr` + steering vector + a default English instruct + temperature), on presets **and** cloned voices, in every Qwen language. **Plus 7 blended "dyads"** (`contempt`, `awe`, `nostalgia`, `disapproval`, `remorse`, `outrage`, `despair`) and **inline `[emotion]` switching** — many emotions from one prompt in a single generation. A vivid English `--instruct` and `-T` override. Pitch-preserving `--rate`/`--volume` and a `--roughness` grit knob are still available. See [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
+- **The small 0.6B is expressive too — and stays sub-realtime** 🆕 — for a long time `--emotion` did nothing on the 0.6B: unlike the 1.7B it has no steerable emotion subspace. It does, however, clone voices very well — so on the small model **the emotion rides on the voice**. Build a **4 KB voice asset** per emotion once (`make emovoice VOICE=ryan`) and the small model gets the whole expressive stack — **6 emotions + inline `[tag]` paralinguistics + voice cloning, together, at RTF ≈ 0.8** under `--int8` on an M1. Try it with **`make emo-06b-demo`**. See [docs/emotion-06b-recipe.md](docs/emotion-06b-recipe.md).
 - **Inline markup for audiobooks** — write one text with ElevenLabs/Bark-style tags and get a multi-emotion take in one pass: `--text "I won! [joy] ...amazing! [pause:500ms] [sad] But it's over. [sigh]"`. Mid-text emotion switches, `[pause:400ms]`/`[break:1s]` pauses, and `[sigh]`/`[huff]` paralinguistic fillers — auto-detected in `--text` (no flag) or explicit via `--compose`. Spans are model-generated and concatenated seamlessly. See [docs/markup.md](docs/markup.md).
 - **VoiceDesign** — Create new voices from text descriptions.
 - **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`; JSON body takes `emotion`/`instruct`/`volume`/`rate` (same recipe as the CLI). **Inline `[mood]` markup works over the API too** — one request can switch emotion sentence-by-sentence (`"text":"[joy] Great news! [sad] But I must go."`), auto-detected and streamed span-by-span. See [docs/server.md](docs/server.md).
@@ -328,6 +329,48 @@ Italian-only emotion needs just `italian_csp_topk6.expr` (203 MB).
 [docs/expressivity-lora.md](docs/expressivity-lora.md) (which layers, the `.expr` format, train your own) ·
 [docs/paralinguistics-tags.md](docs/paralinguistics-tags.md) (laugh/sigh tags + vectors).
 
+### Emotion & expressivity on the **small 0.6B** · 🆕
+
+The 0.6B used to be the fast *neutral* voice: `--emotion` was a no-op there, and steering or
+fine-tuning it never worked. The reason is structural — at half the width the small model has no
+emotion subspace disjoint from language and timbre, so there is nothing to steer.
+
+But it **clones voices very well**. So on the small model the emotion is not an inference-time lever,
+it is a **property of the voice**: you clone from emotional audio and get an emotional voice.
+
+```bash
+# 1. build the six emotional voice assets for a voice — ONCE, ~3 min, 4 KB each
+make emovoice VOICE=ryan
+#    (a cloned voice: make emovoice VOICE=galatea LOAD=voices/galatea_graft.qvoice)
+
+# 2. use them on the SMALL model — the 1.7B is no longer in the path
+./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian --int8 --emotion anger \
+    --text "Non è possibile che succeda sempre la stessa cosa." -o anger.wav
+
+# 3. everything composes — emotion + inline paralinguistics, one generation
+./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian --int8 --emotion sad \
+    --text "[sigh] Non è possibile che succeda sempre la stessa cosa." -o sad_sigh.wav
+```
+
+🎧 **`make emo-06b-demo`** renders the whole stack (6 emotions + 5 `[tag]`s + both together + a clone)
+and prints the RTF of each.
+
+**Speed** — M1, `-j4`, quiet machine. The full expressive stack costs ~0.09 RTF over the bare model:
+
+| on the 0.6B | bf16 | **int8** | int4 |
+|---|---|---|---|
+| emotional voice (4 KB) | 1.16 | **0.73** | **0.56** |
+| emotional voice (16.8 MB graft) | 1.14 | **0.72** | — |
+| **emotional voice + `[tag]`** | 1.18 | **0.78** | — |
+| bare 0.6B (reference) | 1.17 | 0.69 | — |
+
+**Notes.** Works on presets *and* cloned voices. Prefer the 16.8 MB graft for **anger** — with a bare
+4 KB x-vector the high-arousal delivery compresses and can swallow a short word; the graft's prosody
+scaffolding holds it together, at the same speed. The `[tag]` seeds differ from the 1.7B's (the engine
+picks the right table per model automatically).
+
+→ Full recipe, limits and what was tried and rejected: [docs/emotion-06b-recipe.md](docs/emotion-06b-recipe.md)
+
 ### HTTP Server
 
 ```bash
@@ -544,6 +587,7 @@ concurrent users in roughly the time of one by reading each weight once for all 
 | [Server request-batching](docs/server-batching.md) | vLLM-style `--batch-size N`: serve N concurrent users together, continuous batching, per-request streaming |
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
 | [Emotion — THE recipe](docs/emotion-THE-recipe.md) | The one-and-only `--emotion` recipe: preset → STEER @ w12, clone → COMBINE; native preset per language. Single source of truth |
+| [Emotion on the small 0.6B](docs/emotion-06b-recipe.md) | 🆕 The small model has no steerable emotion subspace — so the emotion rides on the **voice** (4 KB asset per emotion, `make emovoice`). Emotion + paralinguistics + cloning at RTF ≈ 0.8 |
 | [Expressivity packs `.expr`](docs/expressivity-lora.md) | Per-language emotion LoRA: which layers, why it's ~16–63 MB, file format, `--expr`/`--expr-weight`, per-voice rank. Train your own: [`training/expressivity-lora/`](training/expressivity-lora/) |
 | [Inline markup](docs/markup.md) | Audiobook/podcast tags in `--text`: `[sad]`/`[joy]` mid-text emotion switches, `[sigh]`/`[huff]` fillers, `[pause:400ms]` |
 | [Quantization](docs/quantization.md) | INT8/INT4, comparison table, recommendations |
