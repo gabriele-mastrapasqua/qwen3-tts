@@ -965,6 +965,8 @@ int main(int argc, char **argv) {
     int voice_design = 0;
     const char *ref_audio = NULL;
     const char *ref_text_str = NULL;
+    const char *emo_ref = NULL;        /* --emo-ref: emotional style donor (codec anchor only) */
+    const char *emo_ref_text = NULL;   /* --emo-ref-text: its transcript */
     int xvector_only = 0;
     const char *save_voice = NULL;
     const char *load_voice = NULL;
@@ -1015,6 +1017,8 @@ int main(int argc, char **argv) {
         {"voice-design",  no_argument,       0, 1007},
         {"ref-audio",     required_argument, 0, 1008},
         {"ref-text",      required_argument, 0, 1009},
+        {"emo-ref",       required_argument, 0, 1600},
+        {"emo-ref-text",  required_argument, 0, 1601},
         {"xvector-only",  no_argument,       0, 1010},
         {"save-voice",    required_argument, 0, 1011},
         {"load-voice",    required_argument, 0, 1012},
@@ -1095,6 +1099,8 @@ int main(int argc, char **argv) {
             case 1007: voice_design = 1; break;
             case 1008: ref_audio = optarg; break;
             case 1009: ref_text_str = optarg; break;
+            case 1600: emo_ref = optarg; break;
+            case 1601: emo_ref_text = optarg; break;
             case 1010: xvector_only = 1; break;
             case 1011: save_voice = optarg; break;
             case 1012: load_voice = optarg; break;
@@ -1185,6 +1191,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 30, 0=all)\n");
                 fprintf(stderr, "  --voice-strength <a>       .qvoice WDELTA scale (1=full voice; <1=more emotion, less fidelity)\n");
                 fprintf(stderr, "  --icl-frames <N>           Cap ICL ref frames (dilute prosody anchor; more emotion; 0=all)\n");
+                fprintf(stderr, "  --emo-ref <path>           EMOTION BY EXAMPLE: copy the STYLE of an emotional reference WAV (24kHz mono),\n");
+                fprintf(stderr, "                             keeping the current voice (preset or clone). Works on 0.6B, where --emotion is a no-op.\n");
+                fprintf(stderr, "  --emo-ref-text <text>      Transcript of --emo-ref (required: the ICL prompt pairs text with codec frames)\n");
                 fprintf(stderr, "  --graft                    Ignore lite .qvoice ref_codes; clone via x-vector (emotive; use with --instruct)\n");
                 fprintf(stderr, "  --expr <file>              Apply a <lang>.expr expressivity weight delta on top (composable with any voice; 1.7B)\n");
                 fprintf(stderr, "  --expr-weight <m>          Dose a .expr (factored LoRA AND dense): 1=as trained, 0.6=subtler, 1.5=stronger\n");
@@ -1623,7 +1632,9 @@ int main(int argc, char **argv) {
         /* voice_class for para_pick: 2 = clone (--load-voice), 1 = vivian preset, 0 = ryan/other preset.
          * (clone-vs-preset matters for [yawn]: 哈啊 clone s42 / preset s7.) */
         int para_voice = load_voice ? 2 : ((speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0);
-        para_sub_text = qwen_compose_para_substitute(text, para_voice, &did, &para_seed, &para_temp);
+        int para_small = ctx->config.hidden_size < 2048;   /* 0.6B has its own seed table */
+        para_sub_text = qwen_compose_para_substitute(text, para_voice, para_small,
+                                                     &did, &para_seed, &para_temp);
         if (para_sub_text && did) {
             text = para_sub_text;
             if (seed < 0) seed = para_seed;      /* pin the validated per-tag seed (laugh 7 / sigh 42) */
@@ -1725,6 +1736,81 @@ int main(int argc, char **argv) {
         }
         ctx->voice_design = 1;
     }
+    /* ── --emotion on the 0.6B: the emotion rides on the VOICE ──────────────────────────────
+     * The small model has no steerable emotion subspace (steer/expr/COMBINE all fail — see
+     * docs/emotion-06b-recipe.md), but it clones very well. So --emotion here resolves an
+     * emotional voice asset built once from emotional audio of that same voice, and loads it
+     * through the normal clone path. Presets and clones both work. */
+    static char emo06b_path[1024];
+    if (emotion_spec && ctx->config.hidden_size < 2048 && !compose_spec) {
+        const char *tok = emotion_tok(emotion_spec);
+        if (!tok) {
+            fprintf(stderr, "Error: '%s' is not a known emotion\n", emotion_spec);
+            qwen_tts_unload(ctx); return 1;
+        }
+        char keybuf[128];
+        const char *key = emotion_voice_key(load_voice != NULL, load_voice, speaker_name,
+                                            keybuf, sizeof(keybuf));
+        if (!key) key = "ryan";                      /* default preset */
+        /* Search: next to an explicitly loaded voice first, then the shipped palette. */
+        char dirbuf[512] = "";
+        if (load_voice) {
+            const char *sl = strrchr(load_voice, '/');
+            if (sl && (size_t)(sl - load_voice) < sizeof(dirbuf))
+                snprintf(dirbuf, sizeof(dirbuf), "%.*s", (int)(sl - load_voice), load_voice);
+        }
+        const char *found = NULL; int found_is_bin = 0;
+        const char *dirs[2] = { dirbuf[0] ? dirbuf : NULL, "presets/emovoice" };
+        const char *exts[2] = { ".qvoice", ".bin" };   /* graft first: it holds anger together */
+        for (int d = 0; d < 2 && !found; d++) {
+            if (!dirs[d]) continue;
+            for (int e = 0; e < 2 && !found; e++) {
+                snprintf(emo06b_path, sizeof(emo06b_path), "%s/%s_%s%s", dirs[d], key, tok, exts[e]);
+                FILE *t = fopen(emo06b_path, "rb");
+                if (t) { fclose(t); found = emo06b_path; found_is_bin = (e == 1); }
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "Error: no '%s' voice asset for '%s' on the 0.6B.\n", tok, key);
+            fprintf(stderr, "  On the small model the emotion rides on the VOICE (docs/emotion-06b-recipe.md).\n");
+            fprintf(stderr, "  Build it once (~25s of that voice, emotional, then extract):\n");
+            fprintf(stderr, "    ./qwen_tts -d qwen3-tts-1.7b -s %s -l <LANG> --emotion %s \\\n", key, emotion_spec);
+            fprintf(stderr, "        --text \"<~25 s of text>\" -o donor.wav\n");
+            fprintf(stderr, "    ./qwen_tts -d qwen3-tts-0.6b-base --ref-audio donor.wav \\\n");
+            fprintf(stderr, "        --save-voice presets/emovoice/%s_%s.bin\n", key, tok);
+            qwen_tts_unload(ctx); return 1;
+        }
+        if (!silent)
+            fprintf(stderr, "Emotion '%s' on 0.6B: voice asset %s\n", tok, found);
+        load_voice = found;
+        if (found_is_bin) xvector_only = 1; else icl_only = 1;
+        emotion_spec = NULL;   /* consumed — do not fall through to the 1.7B steer router */
+    }
+
+    /* --emo-ref: EMOTION BY EXAMPLE. Independent of voice cloning — it only contributes the
+     * reference's codec frames as the ICL prosody anchor, so it composes with a preset speaker
+     * (-s ryan) on CustomVoice AND with a loaded clone. This is the emotion lever for the 0.6B,
+     * where --emotion is a no-op (no steerable emotion subspace); it works because the speech
+     * tokenizer is bit-identical across model sizes, so codec frames mean the same thing
+     * everywhere. See plan_06b_emo.md §E1. */
+    if (emo_ref) {
+        if (!emo_ref_text) {
+            fprintf(stderr, "Error: --emo-ref requires --emo-ref-text (the reference's transcript)\n");
+            fprintf(stderr, "  The ICL prompt pairs the reference TEXT with its codec frames.\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        if (qwen_speech_encoder_load(ctx) != 0) {
+            fprintf(stderr, "Error: --emo-ref needs the speech encoder (speech_tokenizer/) and it failed to load\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        ctx->emo_ref_path = strdup(emo_ref);
+        ctx->emo_ref_text = strdup(emo_ref_text);
+        if (!silent)
+            fprintf(stderr, "Emotion by example: style from %s (voice identity unchanged)\n", emo_ref);
+    }
+
     /* Voice cloning setup */
     if (ref_audio || load_voice) {
         if (!ctx->is_base_model && ref_audio) {

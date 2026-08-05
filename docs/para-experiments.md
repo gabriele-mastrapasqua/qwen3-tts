@@ -371,6 +371,115 @@ likely needs FT, same as cough/cry). Only the VOCAL family (laugh/sigh/yawn/moan
 
 ---
 
+## 2026-08-05 — first sweep on the **0.6B**, and the seed rule flips
+
+Setup: `-d qwen3-tts-0.6b`, galatea clone (neutral 4 KB x-vector), Italian, T1.1, onomatopoeia passed
+**literally** via `--no-compose` — deliberately bypassing `para_pick`, whose constants are 1.7B-tuned.
+Files: `samples/tests/2026-08-05_06b_rtf_seeds/seeds/<tag>_s<seed>.wav`.
+
+| tag | onom | s7 | s42 | s2024 | s123 | verdict |
+|---|---|---|---|---|---|---|
+| sigh | `唉` | 🟡 short "eh!" | ✅ **TOP** | 🟡 "awhhh" | ✅ **TOP** | event ALWAYS fires; seed picks the flavour |
+| laugh | `哈哈哈` | ❌ | ❌ **yawns** ("auuhhh") | ✅ **TOP** (real laugh) | ❌ | **s2024** — and s42 must be AVOIDED, it hits the yawn attractor |
+| yawn | `哈啊` | — | ✅ **good yawn** | 🟡 close: good sigh-in, then one "ah" too many | — | **s42** is the pick |
+| wow | `哇` | — | — | 🟡 decent | 🟡 weak | best available = s2024; worth a re-hunt |
+
+⇒ **0.6B `para_pick` branch to wire**: `[laugh]`→`哈哈哈` **s2024** · `[sigh]`→`唉` s42 (or s123) ·
+`[yawn]`→`哈啊` **s42** · `[wow]`→`哇` s2024. Note laugh and yawn want *different* seeds precisely
+because they share the s42 attractor (see the collision section above).
+
+### ⭐⭐ Seeds COLLIDE across tags — the onomatopoeia proposes, the seed disposes (2026-08-05)
+User's ear: **`laugh` @ s42 produces a yawn** ("auuhhh"), and `yawn` @ s42 is a correct yawn. Question
+raised: *do some seeds activate the same para event regardless of the trigger?*
+
+Measured on the 16-clip sweep (acoustic distance, `para_variants.py`):
+
+| pair type | mean distance |
+|---|---|
+| same onomatopoeia, different seed | 4.32 |
+| **same seed**, different onomatopoeia | 4.36 |
+| nothing in common | 4.45 |
+
+So **globally neither dominates** — the averages are flat. But the *closest pairs* tell the real story:
+
+| distance | pair | |
+|---|---|---|
+| 1.39 | `wow_s123` ~ `yawn_s7` | different seed AND tag |
+| 2.09 | **`laugh_s42` ~ `yawn_s42`** | **same seed** — exactly what the ear heard |
+| 2.31 | **`wow_s42` ~ `yawn_s42`** | **same seed** |
+
+⇒ **Specific (onomatopoeia × seed) cells collide onto the same gesture; seed 42 is one such attractor
+(laugh/wow/yawn all land on "yawn" there).** Consistent with the decoder-ceiling picture: the vocal
+family is a *small set of attractors* (laugh / sigh / yawn / groan), and the (onom, seed) pair selects
+which one you land in — not always the one you asked for.
+
+**Practical consequences:**
+1. there is no "pick any seed" shortcut — the map must stay per-cell, which is why this table exists
+2. the collisions are **actionable**: s42 → yawn attractor ⇒ `[yawn]` should USE s42 (ear-confirmed
+   good) and `[laugh]` must AVOID it (ear: it yawns). Collision data tells you which seeds to exclude.
+3. it explains why hand-mapping is so laborious: you are sampling a small attractor set with an
+   imprecise handle, so you must check the result rather than trust the trigger.
+
+### ⭐ The seed rule is DIFFERENT on the 0.6B — and it is a feature, not a defect
+On the 1.7B the per-tag seed is **WIN/KO**: wrong seed, no event (hence the pinned seeds in
+`para_pick`). On the 0.6B, `[sigh]` fires on **every** seed — the seed only selects *which* sigh
+("eh!" / "ehhh" / "awhhh" / another). User note: the same seed→variant behaviour is visible on the
+**1.7B too**, and is precisely what made hand-mapping the tags so laborious.
+
+⇒ Reframing: **seed × onomatopoeia is a variant GENERATOR**, not a lottery to be pinned. The
+interesting product move is to *expose or randomise* the variant (so repeated `[sigh]`s differ)
+rather than freeze one. The blocker was never the idea, it was the cost of ear-mapping the variants
+— which is what `tools/para/para_judge.py` (CNN14 + whisper screener) exists to cut down.
+
+⚠️ Note that `laugh` wants **s2024** on the 0.6B vs **s7** on the 1.7B → confirms
+`feedback_06b_constants_not_transferable`: the METHOD transfers, the CONSTANTS do not. A 0.6B branch
+in `para_pick` is needed before shipping tags on the small model.
+
+## 2026-08-05 — automating the variant hunt: what failed, what works
+
+The seed→variant behaviour above makes hand-mapping expensive, so we re-tested the automatic screener.
+
+### ❌ `para_judge.py` (CNN14 **and** CLAP) does NOT work on this material
+On the 0.6B sweep, every clip the ear calls a TOP event comes back negative on **both** backends:
+
+| clip (ear verdict) | CNN14 | CLAP |
+|---|---|---|
+| `sigh_s42` ✅ TOP | `MISS` P=0.12 | `MISS` P=0.00 |
+| `laugh_s2024` ✅ TOP (real laugh) | `DRIFT`→sigh | `MISS` P=0.09 |
+| all 16 clips | 0 `WIN_CAND` | 0 `WIN_CAND` |
+
+Cropping to the first 1.2 s (hypothesis: the 0.4 s event is diluted in a 5 s clip) does **not** help —
+probabilities stay 0.00-0.03. Root cause is structural: CNN14/CLAP are trained on isolated, salient
+AudioSet-style events, not on a short in-voice event embedded in speech. Do not re-tune `--tau`.
+
+### ❌ "falling F0 predicts a performed event" — post-hoc pattern, FAILED held-out
+On the 0.6B sweep the ear-best clip had the most negative `f0_slope` in 3/3 discriminated tags. Tested
+on a fresh 1.7B set with July's known ground truth (`laugh 哈哈哈 s7` WIN, `sigh 唉 s42` WIN): it picks
+`laugh_s123` (truth: s7) and ranks `sigh_s42` **last**. Retracted — it was fitted on the same 16 clips.
+
+### ✅ `para_variants.py` — cluster the variants instead of classifying them
+No pretrained tagger, no labels: describes the event region (F0 contour, RMS envelope, spectral
+centroid, voiced fraction, duration) and groups the seeds. Validated on both sets:
+
+| set | groups found | known/ear WIN among the representatives? |
+|---|---|---|
+| 0.6B laugh | `{s123,s42}` vs `{s2024,s7}` | ✅ s2024 is a representative (and max-distance from all) |
+| 0.6B sigh | `{s123,s2024,s42}` vs `{s7}` | ✅ isolates s7 = the short "eh!" the ear also called distinct |
+| 1.7B laugh (held-out) | `{s2024,s42}` vs `{s123,s7}` | ✅ s7 in the second group — and the split matches voiced-fraction: the {s2024,s42} pair is *reading* 哈哈哈 (voiced 0.44-0.47), {s123,s7} is performing it (0.00-0.17) |
+| 1.7B sigh (held-out) | `{s2024,s42}` vs `{s123,s7}` | ✅ s42 is the representative of its group |
+
+**What it does**: turns N seeds into ~2-4 representatives to audition, without losing the winner.
+**What it does NOT do**: tell you which one is good. The ear still picks — it just picks from 3 clips
+instead of 20.
+
+🟡 **Open lead (do not trust yet)**: `voiced_fraction` separates performed from read for **laugh/yawn**
+on BOTH models (WIN = lowest voiced), but not for `sigh` — physically consistent, a sigh *is* voiced.
+This is again a post-hoc read; it needs its own held-out test before being wired into a gate.
+
+📌 **Process lesson**: July's `calib.json` clips were deleted with their sample folders, so there was
+no labelled set to test a judge against — the whole calibration had to be regenerated. **Keep
+ear-labelled clips**; they are the only way to measure an automatic judge.
+
 ## Status legend
 ✅ WIN (promote to the `[tag]` map) · 🟡 interesting/partial (keep, needs a pick) · ❌ KO (do not re-run) · ↪ produced a different event.
 

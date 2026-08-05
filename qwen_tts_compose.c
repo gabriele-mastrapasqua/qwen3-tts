@@ -54,10 +54,35 @@ static const cmacro_t COMPOSE_MACROS[] = {
  * universal across voices/languages; sigh differs per voice (唉 s42 ryan/clone, ahh s7 vivian).
  * [yawn] 哈啊 is vocal + cross-voice (preset s7 / clone s42). [moan]/[throat] stay ryan-only (unshipped,
  * see docs/para-experiments.md 2026-07-07); cry is decoder-ceiling-blocked (needs FT). */
-static void para_pick(const char *tag, int voice_class, const char **onom, int *seed, float *temp) {
+static void para_pick(const char *tag, int voice_class, int small_model,
+                      const char **onom, int *seed, float *temp) {
     /* voice_class: 0 = ryan / other preset · 1 = vivian · 2 = clone (--load-voice).
+     * small_model: 1 = 0.6B. The seeds below were tuned on the 1.7B and DO NOT transfer — on the
+     * 0.6B the (onomatopoeia × seed) cells land on different attractors of the vocal family, so the
+     * small model gets its own branch (ear-validated 2026-08-05, docs/para-experiments.md).
      * *temp = the per-tag validated temperature (default 1.1; a tag may soften it). */
     *onom = NULL; *seed = 7; *temp = 1.1f;
+
+    if (small_model) {
+        /* 0.6B branch. Key finding: seed 42 is a "yawn" attractor on this model — 哈哈哈, 哇 and 哈啊
+         * all land on a yawn there. So [yawn] USES s42 and [laugh] must AVOID it. */
+        if (!strcasecmp(tag, "laugh") || !strcasecmp(tag, "laughs")) {
+            *onom = "\xe5\x93\x88\xe5\x93\x88\xe5\x93\x88"; *seed = 2024;   /* 哈哈哈 — s42 yawns, s7/s123 KO */
+        } else if (!strcasecmp(tag, "sigh") || !strcasecmp(tag, "sighs")) {
+            if (voice_class == 1) { *onom = "ahh"; *seed = 7; }                     /* vivian: untested on 0.6B */
+            else                  { *onom = "\xe5\x94\x89"; *seed = 42; }        /* 唉 — fires on EVERY seed here */
+        } else if (!strcasecmp(tag, "yawn") || !strcasecmp(tag, "yawns")) {
+            *onom = "\xe5\x93\x88\xe5\x95\x8a"; *seed = 42;                    /* 哈啊 @ s42 = the yawn attractor */
+        } else if (!strcasecmp(tag, "wow")) {
+            *onom = "\xe5\x93\x87"; *seed = 2024;                                 /* 哇 — best available, worth a re-hunt */
+        } else if (!strcasecmp(tag, "giggle") || !strcasecmp(tag, "giggles")) {
+            *onom = "\xe5\x98\xbf\xe5\x98\xbf"; *seed = 42;                    /* untested on 0.6B: 1.7B value */
+        } else if (!strcasecmp(tag, "scoff")) {
+            *onom = "\xe5\x88\x87"; *seed = 42; *temp = 1.0f;                     /* untested on 0.6B: 1.7B value */
+        }
+        return;
+    }
+
     if (!strcasecmp(tag, "laugh") || !strcasecmp(tag, "laughs")) {
         *onom = "\xe5\x93\x88\xe5\x93\x88\xe5\x93\x88"; *seed = 7;              /* 哈哈哈 — all voices */
     } else if (!strcasecmp(tag, "sigh") || !strcasecmp(tag, "sighs")) {
@@ -82,10 +107,11 @@ static void para_pick(const char *tag, int voice_class, const char **onom, int *
 }
 
 int qwen_compose_is_para_event_tag(const char *t) {
-    const char *o; int s; float tf; para_pick(t, 0, &o, &s, &tf); return o != NULL;
+    const char *o; int s; float tf; para_pick(t, 0, 0, &o, &s, &tf); return o != NULL;
 }
 
-char *qwen_compose_para_substitute(const char *text, int voice_class, int *did, int *seed, float *temp) {
+char *qwen_compose_para_substitute(const char *text, int voice_class, int small_model,
+                                   int *did, int *seed, float *temp) {
     *did = 0; *temp = 1.1f;
     if (!text) return NULL;
     size_t cap = strlen(text) + 48, n = 0;
@@ -104,7 +130,7 @@ char *qwen_compose_para_substitute(const char *text, int voice_class, int *did, 
                     char *t = tag; while (*t == ' ') t++;
                     char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
                     const char *onom; int sd; float td;
-                    para_pick(t, voice_class, &onom, &sd, &td);
+                    para_pick(t, voice_class, small_model, &onom, &sd, &td);
                     if (onom) {
                         /* comma BEFORE: strip trailing spaces + one comma in out, then emit ", " */
                         while (n > 0 && out[n - 1] == ' ') n--;

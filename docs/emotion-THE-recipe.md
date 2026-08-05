@@ -15,8 +15,14 @@
 ## How a user invokes it
 **One flag.** `--emotion <sad|joy|anger|fear|disgust|surprise>` (1.7B CustomVoice only). The engine auto-applies
 the table below (expr + steer + a default English instruct + temperature). A vivid **English** `--instruct` and an
-explicit `-T` always override. Emotion is a **1.7B** feature: on the 0.6B model `--emotion` is a no-op
-(parked-neutral) — the legacy `.vec` control-vector path was retired 2026-07-09.
+explicit `-T` always override. `--emotion` is a **1.7B** flag: on the 0.6B it is a no-op (gated on
+`hidden_size >= 2048`) — the legacy `.vec` control-vector path was retired 2026-07-09.
+
+> 🔹 **The 0.6B is NOT emotion-less — it just works differently.** On the small model emotion is not an
+> inference-time lever but a **property of the voice**: you clone from emotional audio and get an emotional
+> voice (4 KB asset, works for presets and clones, composes with `[tag]` paralinguistics, RTF ≈ 0.78 under
+> `--int8`). That recipe lives in **[`emotion-06b-recipe.md`](emotion-06b-recipe.md)** — do not apply the
+> steer/expr/COMBINE recipe below to the 0.6B, it silently does nothing.
 
 ```bash
 ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian --emotion sad --text "…" -o out.wav

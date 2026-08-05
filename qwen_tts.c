@@ -736,6 +736,8 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->speaker_embedding);
     free(ctx->ref_audio_path);
     free(ctx->ref_text);
+    free(ctx->emo_ref_path);
+    free(ctx->emo_ref_text);
     /* Free runtime buffers */
     free(ctx->kv_cache_k); free(ctx->kv_cache_v); free(ctx->cp_kv_k); free(ctx->cp_kv_v);
     free(ctx->dec_x); free(ctx->dec_x_norm); free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
@@ -980,11 +982,15 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     int ref_text_token_len = 0;
     if (tok) {
         text_tokens = qwen_tokenizer_encode_para(tok, text, &text_token_len);
-        /* ICL mode: also tokenize reference text */
-        if (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text) {
-            ref_text_tokens = qwen_tokenizer_encode(tok, ctx->ref_text, &ref_text_token_len);
+        /* ICL mode: also tokenize reference text. --emo-ref brings its own transcript and takes
+         * precedence — its codec anchor is what carries the emotion (and it does NOT require
+         * voice_clone, so it works on CustomVoice with a preset speaker). */
+        const char *icl_text = (ctx->emo_ref_path && ctx->emo_ref_text) ? ctx->emo_ref_text
+                             : ((ctx->voice_clone && !ctx->xvector_only) ? ctx->ref_text : NULL);
+        if (icl_text) {
+            ref_text_tokens = qwen_tokenizer_encode(tok, icl_text, &ref_text_token_len);
             if (!ctx->silent && ref_text_tokens)
-                fprintf(stderr, "Ref text: \"%s\" (%d tokens)\n", ctx->ref_text, ref_text_token_len);
+                fprintf(stderr, "Ref text: \"%s\" (%d tokens)\n", icl_text, ref_text_token_len);
         }
         /* tok is cached in ctx->cached_tokenizer — do not free */
     }
@@ -1072,8 +1078,39 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "ICL: --graft -> ignoring %d ref frames, cloning via x-vector (emotive)\n",
                 ctx->cached_ref_n_frames);
 
+    /* --emo-ref (EMOTION BY EXAMPLE): encode the emotional reference and use ONLY its codec
+     * tokens as the ICL anchor. Checked FIRST so it wins over any clone-supplied ref_codes.
+     * Crucially this does NOT set/need voice_clone: the speaker slot below stays whatever it
+     * already was (preset -s on CustomVoice, or a loaded clone's x-vector), so identity and
+     * emotion come from two independent places. That is the whole point on the 0.6B, which has
+     * no steerable emotion subspace but shares the codec vocabulary with the 1.7B. */
+    if (ctx->emo_ref_path && ctx->emo_ref_text && ref_text_tokens && ref_text_token_len > 0) {
+        float *emo_samples = NULL;
+        int emo_n_samples = 0, emo_sr = 0;
+        if (qwen_read_wav(ctx->emo_ref_path, &emo_samples, &emo_n_samples, &emo_sr) != 0) {
+            fprintf(stderr, "Error: failed to read emotion reference %s\n", ctx->emo_ref_path);
+        } else {
+            if (emo_sr != QWEN_TTS_SAMPLE_RATE && !ctx->silent)
+                fprintf(stderr, "Warning: emo-ref sample rate %d, expected %d\n",
+                        emo_sr, QWEN_TTS_SAMPLE_RATE);
+            /* Same trailing-fade trim as the clone paths: a fade-out tail poisons the anchor. */
+            qwen_trim_trailing_silence(emo_samples, &emo_n_samples, emo_sr, ctx->silent);
+            if (qwen_speech_encoder_encode(ctx, emo_samples, emo_n_samples,
+                                           &ref_codes, &ref_n_frames) != 0) {
+                fprintf(stderr, "Error: speech encoder failed on emotion reference\n");
+                ref_codes = NULL; ref_n_frames = 0;
+            } else {
+                icl_mode = 1;
+                ref_codes_owned = 1;
+                if (!ctx->silent)
+                    fprintf(stderr, "Emotion-by-example: %d ref frames from %s (identity unchanged)\n",
+                            ref_n_frames, ctx->emo_ref_path);
+            }
+            free(emo_samples);
+        }
+    }
     /* Check for cached ref_codes from .qvoice file (skipped in --graft mode) */
-    if (ctx->voice_clone && !ctx->graft_mode && ctx->cached_ref_codes && ctx->cached_ref_n_frames > 0
+    else if (ctx->voice_clone && !ctx->graft_mode && ctx->cached_ref_codes && ctx->cached_ref_n_frames > 0
         && ctx->ref_text && ref_text_tokens && ref_text_token_len > 0) {
         ref_codes = ctx->cached_ref_codes;
         ref_n_frames = ctx->cached_ref_n_frames;
