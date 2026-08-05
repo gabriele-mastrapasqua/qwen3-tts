@@ -384,7 +384,7 @@ Files: `samples/tests/2026-08-05_06b_rtf_seeds/seeds/<tag>_s<seed>.wav`.
 | yawn | `哈啊` | — | ✅ **good yawn** | 🟡 close: good sigh-in, then one "ah" too many | — | **s42** is the pick |
 | wow | `哇` | — | — | 🟡 decent | 🟡 weak | best available = s2024; worth a re-hunt |
 
-⇒ **0.6B `para_pick` branch to wire**: `[laugh]`→`哈哈哈` **s2024** · `[sigh]`→`唉` s42 (or s123) ·
+⇒ **0.6B `para_pick` branch — WIRED (v0.19.0)**: `[laugh]`→`哈哈哈` **s2024** · `[sigh]`→`唉` s42 (or s123) ·
 `[yawn]`→`哈啊` **s42** · `[wow]`→`哇` s2024. Note laugh and yawn want *different* seeds precisely
 because they share the s42 attractor (see the collision section above).
 

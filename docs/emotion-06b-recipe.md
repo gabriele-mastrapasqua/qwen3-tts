@@ -116,8 +116,12 @@ level, so it has no dependency on hidden size. `[sigh] [laugh] [wow] [yawn] [sco
 > WIN/KO and had to be pinned (`docs/para-experiments.md`). On the 0.6B `[sigh]` is **robust across
 > seeds** — every seed produces a sigh, the seed only changes *which* sigh:
 > `s7` = short "eh!" · `s42` = "ehhh" · `s2024` = "awhhh" · `s123` = another variant.
-> So on the small model the seed is a **variety knob**, not a risk to tune. (Verified for `[sigh]`;
-> `[laugh]/[yawn]/[wow]` sweeps are in `samples/tests/2026-08-05_06b_rtf_seeds/seeds/`, ear-pending.)
+> So on the small model the seed is a **variety knob**, not a risk to tune — for `[sigh]`.
+>
+> It is *not* uniform across tags: `[laugh]` fires only at **s2024** here (the 1.7B wants s7), and
+> **seed 42 is a "yawn" attractor** on this model — the laugh, wow and yawn onomatopoeia all land on
+> a yawn there. So `[yawn]` uses s42 and `[laugh]` avoids it. The engine picks the right table per
+> model automatically; sweeps live in `samples/tests/2026-08-05_06b_rtf_seeds/seeds/`.
 
 **General rule for this model**: the constants in `para_pick` (onomatopoeia × seed × temperature) and
 all per-voice weights were tuned on the **1.7B**. The *method* transfers to the 0.6B; the *constants*
@@ -152,9 +156,13 @@ voice**: clone + emotion + paralinguistics together at **RTF ≈ 0.78**.
 
 ## What is NOT yet validated
 
-- languages other than Italian
-- per-emotion identity drift: anger moves the x-vector ~0.93 cosine from neutral *for the same
+- **paralinguistics beyond four tags**: `[wow]` is weak on the 0.6B (s2024 is the least bad) and
+  `[giggle]`/`[scoff]` still carry the 1.7B constants, untested here. `[sigh]`, `[laugh]` and
+  `[yawn]` are ear-validated. The tag sweep also only covers one voice, one language and four seeds
+- **per-emotion identity drift**: anger moves the x-vector ~0.93 cosine from neutral *for the same
   speaker*, so each emotion pulls identity somewhere — worth watching across a full matrix
+- **the generic directions are averaged over only two speakers**; more voices would make them more
+  robust, but changing them requires re-validating by ear
 - weakest cells by objective movement: `surprise` and `sad` on the galatea clone
 
 ## Why the obvious alternatives were rejected
