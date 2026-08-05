@@ -338,19 +338,33 @@ emotion subspace disjoint from language and timbre, so there is nothing to steer
 But it **clones voices very well**. So on the small model the emotion is not an inference-time lever,
 it is a **property of the voice**: you clone from emotional audio and get an emotional voice.
 
-```bash
-# 1. build the six emotional voice assets for a voice — ONCE, ~3 min, 4 KB each
-make emovoice VOICE=ryan
-#    (a cloned voice: make emovoice VOICE=galatea LOAD=voices/galatea_graft.qvoice)
+**`ryan` works out of the box** — its six assets ship in this repo (24 KB total), so `--emotion` on the
+0.6B needs no setup at all:
 
-# 2. use them on the SMALL model — the 1.7B is no longer in the path
+```bash
+# emotion on the SMALL model — nothing to install, the 1.7B is not in the path
 ./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian --int8 --emotion anger \
     --text "Non è possibile che succeda sempre la stessa cosa." -o anger.wav
 
-# 3. everything composes — emotion + inline paralinguistics, one generation
+# everything composes — emotion + inline paralinguistics, one generation
 ./qwen_tts -d qwen3-tts-0.6b -s ryan -l Italian --int8 --emotion sad \
     --text "[sigh] Non è possibile che succeda sempre la stessa cosa." -o sad_sigh.wav
 ```
+
+For **any other voice** — another preset, or your own clone — it is **one command**, not a manual
+hunt. It generates all six donors, extracts all six assets, and caches them; you never map anything
+by hand:
+
+```bash
+make emovoice VOICE=vivian                                      # another preset
+make emovoice VOICE=galatea LOAD=voices/galatea_graft.qvoice    # your own cloned voice
+make emovoice VOICE=ryan TTS_LANG=English                       # another language
+```
+
+It needs the 1.7B and the 0.6B Base model present (the first generates the emotional donor audio,
+the second extracts the 4 KB voice). Both are one-time, offline. After that the small model is
+self-sufficient. If an asset is missing, the engine says exactly which one and prints the two
+commands to build it — it never silently falls back to neutral.
 
 🎧 **`make emo-06b-demo`** renders the whole stack (6 emotions + 5 `[tag]`s + both together + a clone)
 and prints the RTF of each.
@@ -455,6 +469,17 @@ cache-rich SLC; int8 is the safest quality/speed pick — **both beat real time*
 | **Streaming** (long) | ~1.3 | **0.81** ⚡ | **0.50 s** |
 | **HTTP server** (`--serve`, warm) | ~1.3 | **0.88** ⚡ | — |
 | **Custom voice** `.qvoice` (streamed) | 1.34 | **0.93** ⚡ | 0.47 s |
+
+**Expressive *and* sub-realtime** — the 0.6B's full expressive stack (emotional voice + inline `[tag]`
+paralinguistics + cloning, see [Emotion on the small 0.6B](#emotion--expressivity-on-the-small-06b--)) costs
+only **~0.09 RTF** over the bare model:
+
+| 0.6B, everything on | bf16 | **`--int8`** | `--int4` |
+|---|---|---|---|
+| emotional voice (4 KB asset) | 1.16 | **0.73** ⚡ | **0.56** ⚡ |
+| emotional voice (16.8 MB graft) | 1.14 | **0.72** ⚡ | — |
+| **emotional voice + `[tag]`** | 1.18 | **0.78** ⚡ | — |
+| bare 0.6B (reference) | 1.17 | 0.69 | — |
 
 RTF = processing_time / audio_duration; **< 1.0 = faster than real-time**. Quantization reads fewer weight bytes
 per frame (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B ~1.5 (bf16) → 0.69 (int8) → 0.52 (int4)**; **1.7B
