@@ -44,6 +44,18 @@ $(LIB): $(OBJ)
 	$(CC) $(WARN) $(CFLAGS) $(INCLUDE) -MMD -MP -c $< -o $@
 -include $(SRC:.c=.d)
 
+# Changing CFLAGS must invalidate the objects: `make test-asan` followed by a
+# plain `make` otherwise links the surviving sanitized .o files and dies with
+# undefined __asan references — or worse, a plain .o survives into a sanitized
+# run and that file silently goes unsanitized. The stamp name encodes the
+# flags; a different set removes the old stamp and forces the rebuild.
+FLAGS_ID  := $(firstword $(shell printf '%s' '$(WARN) $(CFLAGS)' | cksum))
+FLAGSTAMP := build/.flags-$(FLAGS_ID)
+$(FLAGSTAMP): | build
+	@rm -f build/.flags-*
+	@touch $@
+$(OBJ): $(FLAGSTAMP)
+
 # A build with the container readers alone, to prove the split is real: a
 # consumer that only wants to open files must not have to link the SIMD.
 ## core-only: build the readers without the quantization half

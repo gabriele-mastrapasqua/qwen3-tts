@@ -119,6 +119,14 @@ make test           # full suite, no model files and no Python needed
 make help           # every target, one line each
 ```
 
+The Makefile adds no `-march` flags of its own: kernels compile for the
+compiler's default target — on aarch64 that already includes NEON, but on
+x86-64 the default is baseline SSE2, which leaves every AVX lane dark. To
+build and test the AVX2/AVX-512 paths, name the target explicitly, e.g.
+`make test CFLAGS="-O2 -march=x86-64-v4 -mavx512vnni"`, and use
+`INGOT_CAPS=scalar|avx2|vnni` (with `neon`/`dotprod` as ARM aliases) to pin
+the runtime dispatch below what the CPU offers.
+
 `make core-only` builds the readers without the quantization half and proves
 the split on every commit. `amalgam/` is generated from `src/` by
 `make amalgam`, and `make amalgam-test` runs the entire suite against the
@@ -212,6 +220,14 @@ that still parse are the valuable ones, since they exercise the accept path
 with values no writer produces). `make test-asan` is the sanitizer gate on
 Linux, `make test-leaks` the one on macOS.
 
+The SIMD matrix is validated on real silicon at both ends, not only under
+emulation in CI: Apple M-series (NEON, SDOT/SMMLA) and AMD Zen 5 (AVX2,
+AVX-512 VNNI) — full suite, sanitizers, fuzz and `check-real` at every
+`INGOT_CAPS` level. An alignment-invariance test places the same quantized
+bytes at data offsets +0/32/64/96 and requires byte-identical
+matvec/matmat/dequant output from every lane, closing off the class of bug
+where results depend on where a tensor happens to land in the file.
+
 ## Portability and limits
 
 - Both formats are little-endian by definition and parsing is
@@ -220,6 +236,11 @@ Linux, `make test-leaks` the one on macOS.
 - `Q1_0` opens and its bytes are accounted, but it has no decoder: llama.cpp's
   reference package has none either, so there is nothing to verify against.
   Details in [docs/QUANTS.md](docs/QUANTS.md).
+- gcc 15.2 miscompiles the *combined* `-fsanitize=address,undefined` build
+  when AVX-512 codegen is enabled: a spurious SEGV in the quantizer at `-O1`
+  and above, with each sanitizer alone green and `-O0` green (reduced to a
+  20-line repro, toolchain bug — not an ingot defect). When sanitizing with
+  an AVX-512 `-march` under gcc 15, run ASan and UBSan as separate builds.
 
 ## License
 

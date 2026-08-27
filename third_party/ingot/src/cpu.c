@@ -198,6 +198,46 @@ static void init_caps(void) {
         const int level = level_from_name(env);
         if (level != INGOT_LEVEL_UNKNOWN) cap_level_cap = level;
     }
+
+    /* INGOT_CAPS_ASSUME goes the other way: trust the BUILD instead of CPUID.
+     *
+     * It exists because CPUID is not always telling the truth. Rosetta 2
+     * executes AVX2 but does not advertise it in leaf 7, so on an Apple
+     * Silicon machine — which for many of us is the only place x86 code can be
+     * run at all — every AVX2 kernel in this library silently falls back to
+     * scalar. They are then neither tested nor measured, and an untested
+     * kernel is the one that is wrong.
+     *
+     * This can only switch on what the compiler was already told to emit, so
+     * it cannot conjure an instruction the binary does not contain. It CAN
+     * fault on a machine that genuinely lacks the feature, which is why it is
+     * opt-in, off by default, and a testing tool rather than a tuning knob.
+     *
+     * AVX-512 is deliberately not forceable: it additionally needs the OS to
+     * have enabled ZMM state, and that is not something a build flag knows. */
+    const char *assume = getenv("INGOT_CAPS_ASSUME");
+    if (assume != NULL) {
+        const int level = level_from_name(assume);
+        if (level >= 1) {
+#if defined(INGOT_COMPILED_NEON)
+            cached.neon = 1;
+#endif
+#if defined(INGOT_COMPILED_AVX2)
+            cached.avx2 = 1;
+#endif
+#if defined(INGOT_COMPILED_F16C)
+            cached.f16c = 1;
+#endif
+        }
+        if (level >= 2) {
+#if defined(INGOT_COMPILED_DOTPROD)
+            cached.dotprod = 1;
+#endif
+#if defined(INGOT_COMPILED_I8MM)
+            cached.i8mm = 1;
+#endif
+        }
+    }
 }
 
 ingot_cpu_caps ingot_cpu(void) {

@@ -65,6 +65,25 @@ jobs:
       - name: Scalar fallback agrees with the SIMD path
         run: INGOT_CAPS=scalar make test CFLAGS="${{ matrix.cflags }}"
 
+  # amalgam-test proves the generated pair BUILDS and PASSES; it cannot prove it
+  # is CURRENT. A stale amalgam is perfectly self-consistent — same API, same
+  # results, just missing whatever landed in src/ since — so it goes on passing
+  # while consumers of the two-file drop-in silently run the old code. That is
+  # exactly what happened to the Q6_K/Q4_0/Q4_K kernels: three commits of SIMD
+  # work, green CI, and an amalgam with no trace of any of it.
+  amalgam-fresh:
+    name: Amalgam is regenerated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Regenerate and diff against what is committed
+        run: |
+          make amalgam
+          git diff --exit-code amalgam/ || {
+            echo "::error::amalgam/ is stale — run 'make amalgam' and commit the result"
+            exit 1
+          }
+
   fuzz:
     name: Mutation fuzz
     runs-on: ubuntu-latest
