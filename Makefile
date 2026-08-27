@@ -14,11 +14,67 @@ CC = gcc
 #                   SIMD=avx512  -> add AVX-512 (validate with Intel SDE / real HW)
 #   - Linux ARM:  -march=native (NEON; M1-class and up)
 SIMD ?= auto
+
+# ── SIMD=auto: scegli il profilo PIU' ALTO che questa macchina e questo compilatore
+# reggono, invece di ricadere in silenzio sull'AVX2 portabile.
+#
+# PERCHE' ESISTE (successo il 2026-08-20, ed e' costata mezz'ora di caccia al colpevole
+# sbagliato): su una Emerald Rapids un `make blas` liscio compilava il default portabile,
+# quindi niente AMX, niente VNNI, niente AVX-512-BF16 — tutti gli speedup spenti. Non
+# fallisce, non avverte, passa il self-test: l'unico sintomo e' "~1.5x piu' lento", che si
+# scambia per la macchina, per il vicino rumoroso o per il proprio ultimo commit. Un
+# default che perde silenziosamente il 40% e' un default sbagliato.
+#
+# DUE CONDIZIONI, entrambe necessarie: la CPU dichiara l'estensione in /proc/cpuinfo E il
+# compilatore accetta il flag. Un gcc vecchio su una Sapphire non sa cosa sia -mamx-int8,
+# e senza la seconda prova la build fallirebbe invece di scendere di un gradino.
+#
+# ⚠️ IL BINARIO RESTA LEGATO ALL'HOST. E' il motivo per cui il default era portabile: con
+# -mavx512f il compilatore emette AVX-512 anche fuori dai nostri kernel, e quel binario va
+# in SIGILL su una CPU piu' vecchia. I percorsi AMX/VNNI nostri sono anche gated a runtime,
+# il codice auto-vettorizzato no. Per un binario da distribuire:  make blas SIMD=portable
+ifeq ($(SIMD),auto)
+    ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
+        ifeq ($(UNAME_S),Linux)
+            # ⚠️ niente `case` qui dentro: $(shell ...) di Make conta le parentesi, e il
+            # `*)` di un ramo case chiude $( in anticipo e tronca il comando. Solo grep.
+            SIMD := $(shell \
+                F=$$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null); \
+                cc_ok() { $(CC) $$1 -E -x c /dev/null >/dev/null 2>&1; }; \
+                has() { echo "$$F" | grep -qw "$$1"; }; \
+                if has amx_int8 && has avx512_bf16 && cc_ok "-mamx-int8 -mamx-bf16 -mamx-tile"; then echo amx; \
+                elif has avx512_bf16 && cc_ok -mavx512bf16; then echo avx512bf16; \
+                elif has avx512_vnni && cc_ok -mavx512vnni; then echo avx512vnni; \
+                elif has avx512f && cc_ok -mavx512f; then echo avx512; \
+                elif has avx2; then echo portable; \
+                else echo scalar; fi)
+            $(info [simd] auto -> $(SIMD)   (make blas SIMD=portable per un binario non legato a questo host))
+        else
+            SIMD := portable
+        endif
+    else
+        # macOS e Linux ARM restano su -march=native: l'etichetta serve solo perche' il
+        # binario sappia dire di che build e' fatto (finisce in --caps).
+        SIMD := native
+    endif
+endif
 ifeq ($(UNAME_S),Darwin)
     ARCH_FLAGS = -march=native
 else ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
     ifeq ($(SIMD),scalar)
         ARCH_FLAGS =
+    else ifeq ($(SIMD),amx)
+        # AMX (Sapphire Rapids = GCP c3, Emerald Rapids = GCP c4) + everything below it.
+        # AMX is the only true MATRIX-MATRIX integer unit on x86: a 16x64 int8 tile takes
+        # B=16 concurrent requests in one operand, which is the lever for server batching
+        # (PLAN 0.nonies S2) rather than another few percent of SIMD width.
+        # The AMX code is #ifdef'd AND runtime-gated (CPUID + the XTILEDATA permission,
+        # which is requested once and read back), so this binary still runs on a CPU
+        # without AMX — it just never enters the tile path. Check `--caps` says
+        # "AMX ACTIVE" on the box: if it says permission DENIED the kernel is < 5.16 and
+        # every number after that is a VNNI number.
+        ARCH_FLAGS = -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512bf16 \
+                     -mamx-tile -mamx-int8 -mamx-bf16 -mavx2 -mfma
     else ifeq ($(SIMD),avx512bf16)
         # AVX-512 + VNNI + BF16 (native int8 dot + native bf16 dot VDPBF16PS).
         # Zen4/Zen5 (EPYC 9xx4/9xx5, Ryzen 7xxx+), Cooper Lake, Sapphire Rapids.
@@ -39,7 +95,21 @@ else
     ARCH_FLAGS = -march=native
 endif
 
-CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -ffast-math
+# ── PROVENIENZA INCISA NEL BINARIO ────────────────────────────────────────────
+# Un report deve dire QUALE binario ha prodotto i numeri, non quale checkout c'era
+# nella cartella quando lo hai letto. Su un box affittato le due cose divergono
+# continuamente: si copiano sorgenti a mano, si ricompila, si dimentica. Il 2026-08-20
+# ci sono volute mezz'ora e un braccio di controllo per scoprire che il binario in prova
+# era compilato senza AMX — e la domanda "che versione sta girando?" non aveva risposta.
+# `-dirty` compare se l'albero ha modifiche non committate: un numero preso da un albero
+# sporco non e' riproducibile e deve dirlo da solo.
+# Si puo' SCAVALCARE dalla riga di comando, ed e' il modo giusto di costruire su un box
+# sincronizzato con scp: li' il checkout git e' quello vecchio della macchina e i sorgenti
+# arrivano da fuori, quindi lo sha locale descriverebbe il codice sbagliato. Da usare:
+#     make blas GIT_REV=$(git -C <repo locale> rev-parse --short HEAD)
+GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
+CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -ffast-math \
+              -DQWEN_GIT_REV=\"$(GIT_REV)\" -DQWEN_SIMD_PROFILE=\"$(SIMD)\"
 LDLIBS = -lm -lpthread
 
 # LZ4 (embedded in vendor/ — no external dependency needed)
@@ -54,11 +124,70 @@ else
     LDLIBS += -lopenblas
 endif
 
-CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include $(EXTRA_CFLAGS)
+CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include $(KAI_INC) $(EXTRA_CFLAGS)
 
 # Source files
+# KleidiAI (Apache-2.0, vendored subset - third_party/kleidiai/NOTICE.md). Only built
+# on aarch64: the micro-kernels are Arm intrinsics. On any other host the engine-side
+# glue compiles to stubs, so nothing else has to know.
+# Gate on what the COMPILER can actually emit, not on `uname -m`: an M1 is aarch64 but
+# has no i8mm, and the micro-kernel refuses to compile there (`#error i8mm extension
+# required`). So probe for __ARM_FEATURE_MATMUL_INT8 under the real ARCH_FLAGS. On a
+# box without it the engine-side glue compiles to stubs and nothing else changes.
+KAI_HAS_I8MM := $(shell $(CC) $(ARCH_FLAGS) -dM -E -x c /dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8)
+ifeq ($(KAI_HAS_I8MM),1)
+KAI_DIR  = third_party/kleidiai
+KAI_SRCS = $(KAI_DIR)/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4c32pscalef16_qsu4c32s16s0.c \
+           $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32p_f32.c \
+           $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod.c \
+           $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm.c
+# The two matmul micro-kernels keep their inner loop in hand-written assembly; the .c
+# half is only the C entry point, so BOTH must be built or the link fails with an
+# undefined `kai_kernel_...`.
+KAI_ASM  = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod_asm.S \
+           $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm_asm.S
+
+# ── The INT8 slice: qai8dxp (LHS, quantized+packed per call) x qsi8cxp (RHS, one
+# scale per output channel = OUR int8 weight format, byte for byte). Four candidates
+# because the census has to answer "which tile", not only "Kleidi or not":
+# two GEMV (dotprod, kr=4 and kr=8) and two GEMM (dotprod 16x4, i8mm 16x4).
+KAI_I8_DIR = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp
+KAI_SRCS += $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.c \
+            $(KAI_DIR)/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c \
+            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4x4_1x4_neon_dotprod.c \
+            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod.c \
+            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod.c \
+            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm.c
+# Only two of the four ship an assembly half; the other two are pure intrinsics.
+# Listing a .S that does not exist is a make error, listing one too few is a link
+# error - so this list is per-kernel, not per-directory.
+KAI_ASM  += $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4x4_1x4_neon_dotprod_asm.S \
+            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm_asm.S
+
+# ── The BF16 slice: only where the compiler can emit BFMMLA. Separate probe from
+# i8mm on purpose - Neoverse V1/V2 have both, but the two features are independent
+# and a box with one and not the other must still build.
+# grep -c would count __ARM_FEATURE_BF16_SCALAR_ARITHMETIC and
+# __ARM_FEATURE_BF16_VECTOR_ARITHMETIC too, return 3, and silently fail the
+# ifeq - which is exactly how the first Axion build linked without the bf16
+# kernels. Match the bare macro.
+KAI_HAS_BF16 := $(shell $(CC) $(ARCH_FLAGS) -dM -E -x c /dev/null 2>/dev/null | grep -qE '^#define __ARM_FEATURE_BF16 ' && echo 1 || echo 0)
+ifeq ($(KAI_HAS_BF16),1)
+KAI_BF_DIR = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_bf16p_bf16p
+KAI_SRCS += $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_bf16p1x4_f32_neon.c \
+            $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_bf16p8x4_f32_neon.c \
+            $(KAI_DIR)/kai/ukernels/matmul/pack/kai_rhs_quant_pack_kxn_bf16p12x4biasf32_f32_neon.c \
+            $(KAI_BF_DIR)/kai_matmul_clamp_f32_bf16p1x4_bf16p12x4b_1x36_neon_dot.c \
+            $(KAI_BF_DIR)/kai_matmul_clamp_f32_bf16p8x4_bf16p12x4b_8x12_neon_mmla.c
+endif
+KAI_AOBJ = $(KAI_ASM:.S=.o)
+KAI_INC  = -I$(KAI_DIR)
+endif
+
 SRCS = main.c \
+       qwen_tts_kleidi.c qwen_tts_q8repack.c qwen_tts_q4export.c $(KAI_SRCS) \
        qwen_tts.c \
+       qwen_tts_gguf.c \
        qwen_tts_talker.c \
        qwen_tts_code_predictor.c \
        qwen_tts_speech_decoder.c \
@@ -77,7 +206,12 @@ SRCS = main.c \
        qwen_tts_speech_encoder.c \
        vendor/lz4.c
 
-OBJS = $(SRCS:.c=.o)
+OBJS = $(SRCS:.c=.o) $(KAI_AOBJ)
+
+# KleidiAI's assembly halves. Plain aarch64 asm, assembled with the same flags so the
+# .S sees the same -march (the i8mm one needs it).
+%_asm.o: %_asm.S
+	$(CC) $(CFLAGS) -c -o $@ $<
 TARGET = qwen_tts
 
 # ── ingot: the GGUF/safetensors library, vendored as a git subtree. Built by
@@ -90,9 +224,19 @@ $(INGOT_LIB):
 # Refresh the vendored subtree from upstream (clean working tree required).
 update-ingot:
 	git subtree pull --prefix $(INGOT_DIR) https://github.com/mynah-org/ingot.git main --squash
+
+# The vendored library has its own clean.
+clean-ingot:
 	@$(MAKE) -C $(INGOT_DIR) clean
 
-.PHONY: update-ingot
+.PHONY: update-ingot clean-ingot
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+$(TARGET): $(OBJS) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(INGOT_LIB) $(LDLIBS)
+
+blas: $(TARGET)
+
 MODEL_DIR = qwen3-tts-0.6b
 
 # Default: show help
@@ -118,7 +262,7 @@ help:
 	@echo "  make para-demo       - Shipped inline [tag]s ([wow]/[yawn]/[scoff]/[giggle]/[laugh]/[sigh]) on natural sentences (1.7B)"
 	@echo "  make test-emotion-ft - Emotion fine-tune (.expr graft) smoke: CSP Italian on 1.7B (preset+clone, seed 42)"
 	@echo "  make test-lora-it    - Emotion×voice×temp listening matrix (L16-26 LoRA; afplay links + full cmds)"
-	@echo "  make emotion-seeds   - Seed-finder palette → docs/emotion-seeds.md (recommended seeds/lang/voice/emo; SLOW)"
+	@echo "  make emotion-seeds   - Seed-finder palette → the design notes (recommended seeds/lang/voice/emo; SLOW)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
@@ -128,15 +272,42 @@ help:
 	@echo "  make bench           - RTF benchmark (short+long, normal+stream)"
 	@echo "  make bench-full      - Full benchmark (+ server, qvoice, instruct, INT8)"
 	@echo "  make cp-microbench   - Build qwen_tts_cpbench (per-op Code Predictor breakdown)"
+	@echo ""
+	@echo "Box appena affittato (in QUESTO ordine — vedi docs/hardware-testing.md):"
+	@echo "  make server-hw-check       - LA VERITA' SUL SILICIO: hardware + banda di memoria"
+	@echo "  make server-batch-microbench - la curva B=1->2->4 e BatchEfficiency (~4 min, solo OSS)"
+	@echo "  make mini-bench-06b|-17b   - 1/2/4 richieste parallele su un modello OSS"
+	@echo "  make kernel-tune           - misura le soglie del dispatcher invece di indovinarle"
+	@echo "  make tune-archive BOX=<nome> - idem, e archivia il JSON the design notes per il confronto cross-ISA"
+	@echo "                               (tools/box_info.sh + tests/membw.c) + --caps + --self-test"
+	@echo "                               + --matmat-bench. Nessun modello richiesto. JSON in HW_JSON=."
+	@echo "                               (alias storico: make box-report)"
+	@echo "  make membw                 - solo la banda: Copy/Triad con sweep di thread + ginocchio"
+	@echo "  make bench-matrix[-full]   - poi la matrice RTF (richiede un modello scaricato)"
+	@echo "  make check-matmat-parity   - i gemelli batched fanno l'aritmetica che dichiarano? (ISA nativa)"
+	@echo "  make check-matmat-parity-x86 - idem sui kernel AVX2 x86, eseguiti sotto Rosetta 2 dal Mac ARM"
+	@echo "  make check-isa             - compile-check dei percorsi ISA che questa macchina non ha"
 	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
+	@echo ""
+	@echo "  Variabili: SPK (def. $(AX_SPK)) · TEXT · SEED ($(AX_SEED)) · Q ($(AX_Q))"
 	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
-# Build
-$(TARGET): $(OBJS) $(INGOT_LIB)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(INGOT_LIB) $(LDLIBS)
 
-blas: $(TARGET)
+# ── benchmark workflow (the design notes ────────────────────────
+
+debug: CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include $(KAI_INC) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
+debug: LDLIBS += -fsanitize=address -fsanitize=undefined
+debug: clean $(TARGET)
+
+# Info
+info:
+	@echo "Platform: $(UNAME_S)"
+	@echo "CC:       $(CC)"
+	@echo "CFLAGS:   $(CFLAGS)"
+	@echo "LDLIBS:   $(LDLIBS)"
+	@echo "SRCS:     $(SRCS)"
+	@echo "TARGET:   $(TARGET)"
 
 # ── Experimental GPU backends (opt-in; `make blas` is NEVER affected) ──────────
 # These add the backend seam (qwen_tts_backend) + one GPU TU and rebuild a fresh
@@ -271,20 +442,53 @@ clean:
 	rm -f $(OBJS) $(OBJS:.o=.d) $(TARGET) qwen_tts_backend.o qwen_tts_cuda.o qwen_tts_metal.o qwen_tts_cuda_kernels.o
 	rm -f qwen_tts_backend.d qwen_tts_cuda.d qwen_tts_metal.d vendor/lz4.d
 	rm -f test_decoder_standalone.o test_decoder_standalone.d qwen_tts_decoder_tool
+	rm -f tests/decode_quantum_bench.o tests/decode_quantum_bench.d qwen_tts_decode_quantum
 
 # Debug build
-debug: CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
-debug: LDLIBS += -fsanitize=address -fsanitize=undefined
-debug: clean $(TARGET)
+# ⚠️ $(KAI_INC) IS REQUIRED HERE. Without it the KleidiAI sources cannot find
+# kai/kai_common.h and `make debug` fails on every box that HAS i8mm - i.e. exactly the
+# hardware we deploy on. It never showed up on the M1 dev machine because there
+# KAI_HAS_I8MM is 0, so KAI_SRCS is empty and the include is not needed. Found 2026-08-25
+# on the Axion box: the sanitizer build, the one gate that would catch a use-after-free in
+# the cancellation path, had never been buildable on ARM+KleidiAI.
 
-# Info
-info:
-	@echo "Platform: $(UNAME_S)"
-	@echo "CC:       $(CC)"
-	@echo "CFLAGS:   $(CFLAGS)"
-	@echo "LDLIBS:   $(LDLIBS)"
-	@echo "SRCS:     $(SRCS)"
-	@echo "TARGET:   $(TARGET)"
+bench-server: $(TARGET)
+	@bash tests/serve_batch_bench.sh $(MODEL_SMALL)
+
+check-isa:
+	@echo "=== Compile-check newer-ISA paths (syntax only, not run) ==="
+
+# Emotion + PARALINGUISTIC demo: like emotion-demo, but each clip embeds an inline para [tag]
+# ([laugh]/[sigh]/[huff]/[ugh]) in a real emotional sentence, across languages/speakers/emotions.
+# Same one-flag --emotion router as emotion-demo (preset→STEER, clone→COMBINE), which now composes
+# with the inline [tag] (engine fix 2026-06-30: the routed emotion steer is preserved on the spoken
+# spans). Logic in tests/emotion_para_demo.sh. Needs 1.7B (+ .expr packs only for the galatea
+# COMBINE clip). Override: EMO_PARA_DEMO_DIR=...
+emotion-para-demo: $(TARGET)
+	@bash tests/emotion_para_demo.sh
+
+# Real-kernel batched matmat throughput: qwen_matmat_{bf16,int8,q4_0} vs B*matvec,
+# per precision, at the current thread count (override with QWEN_BATCH_B / -j via THREADS).
+matmat-bench: $(TARGET)
+	@echo "=== Batched matmat twins vs B*matvec (real kernels, 4 threads) ==="
+	@./$(TARGET) --matmat-bench
+	@echo "=== (single thread = compute-bound reference) ==="
+	@./$(TARGET) --matmat-bench -j 1
+
+# ── Kernel numeric self-test (matvec correctness vs f32 reference) ──
+# Cross-ISA correctness gate for the SIMD matvecs (bf16/int8/argmax) that does NOT depend
+# on a full-pipeline golden, so it's immune to the greedy-decode trajectory fork that makes
+# end-to-end audio mel-corr a FALSE ALARM cross-ISA (the test-golden cross-ISA caveat).
+# Runs the dispatched path AND the scalar/widen fallback (QWEN_NO_SDOT/QWEN_NO_VNNI). On the
+# AVX-512 VPS this is THE proof the VNNI int8 dot + __m512 bf16 matvec are correct.
+# Needs no model — fast, run anywhere.
+test-selftest: $(TARGET)
+	@echo "=== Kernel self-test (dispatched path) ==="
+	@./$(TARGET) --self-test || { echo "FAIL: kernel self-test (dispatched)"; exit 1; }
+	@echo "=== Kernel self-test (scalar/widen fallback: QWEN_NO_SDOT=1 QWEN_NO_VNNI=1) ==="
+	@QWEN_NO_SDOT=1 QWEN_NO_VNNI=1 ./$(TARGET) --self-test || { echo "FAIL: kernel self-test (fallback)"; exit 1; }
+	@echo "PASS: kernel self-test (both paths numerically correct)"
+	@echo ""
 
 # ── Test targets ──────────────────────────────────────────────────────────────
 # Models must be downloaded first via ./download_model.sh
@@ -535,14 +739,6 @@ test-emotion-ft: $(TARGET)
 emotion-demo: $(TARGET)
 	@bash tests/emotion_demo.sh
 
-# Emotion + PARALINGUISTIC demo: like emotion-demo, but each clip embeds an inline para [tag]
-# ([laugh]/[sigh]/[huff]/[ugh]) in a real emotional sentence, across languages/speakers/emotions.
-# Same one-flag --emotion router as emotion-demo (preset→STEER, clone→COMBINE), which now composes
-# with the inline [tag] (engine fix 2026-06-30: the routed emotion steer is preserved on the spoken
-# spans). Logic in tests/emotion_para_demo.sh. Needs 1.7B (+ .expr packs only for the galatea
-# COMBINE clip). Override: EMO_PARA_DEMO_DIR=...
-emotion-para-demo: $(TARGET)
-	@bash tests/emotion_para_demo.sh
 
 # ── The SMALL model (0.6B) expressivity stack — emotion + para + clone, sub-realtime ──────────
 # On the 0.6B `--emotion` used to be a no-op: the model has no steerable emotion subspace. Since
@@ -584,12 +780,24 @@ EXPR ?= presets/expr/italian_l1626_r64.expr
 test-lora-it: $(TARGET)
 	@bash tests/lora_matrix.sh Italian $(EXPR)
 
-# Emotion seed-finder → recommended-seeds palette doc (docs/emotion-seeds.md). For each
+# Emotion seed-finder → recommended-seeds palette doc (the design notes. For each
 # (language × voice × emotion) renders N seeds with --seed-audition --audition-keep, records the
 # auto-pick (glitch+dur) + every take, and writes a usage doc with afplay links + full commands.
 # Opt-in + SLOW (full IT+ES+clone matrix on 1.7B). Override scope via env: LANGS/VOICES_IT/EMOS_IT/N.
 emotion-seeds: $(TARGET)
-	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),docs/emotion-seeds.md) $(if $(N),$(N),5)
+	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),the design notes $(if $(N),$(N),5)
+
+# Il cablaggio del batching sotto le due TRANSIZIONI che test-batch non esercita:
+# N->1 (una richiesta resta sola) e 1->N (una viene ammessa accanto a una in corso).
+# Entrambi i bug del 2026-08-20 vivevano li' e passavano test-batch senza un graffio.
+# Aritmetica fissata (QWEN_BATCH_NOMATMUL=1) + greedy + seed fisso -> si pretende
+# l'identita' bit a bit, quindi niente soglie da tarare.
+test-batch-invariance: $(TARGET)
+	@echo "=== 1/2 cablaggio: percorsi pinnati, identita' bit a bit dovuta ==="
+	@MODEL=$(MODEL_SMALL) EP=/v1/tts PIN_ENV="env QWEN_BATCH_NO_SOLO=1 QWEN_BATCH_NOMATMUL=1" CRITERION=byte \
+	  bash tests/serve_batch_invariance.sh
+	@echo "=== 2/2 percorsi veri: si pretende la stessa DURATA, non gli stessi byte ==="
+	@MODEL=$(MODEL_SMALL) CRITERION=frames bash tests/serve_batch_invariance.sh
 
 test-batch: $(TARGET)
 	@echo "=== Batched Talker step correctness (opt-in path vs single-stream) ==="
@@ -603,58 +811,178 @@ batching-bench:
 	$(CC) $(CFLAGS_BASE) -o /tmp/batching_bench tests/batching_bench.c -lm
 	@/tmp/batching_bench
 
-# Real-kernel batched matmat throughput: qwen_matmat_{bf16,int8,q4_0} vs B*matvec,
-# per precision, at the current thread count (override with QWEN_BATCH_B / -j via THREADS).
-matmat-bench: $(TARGET)
-	@echo "=== Batched matmat twins vs B*matvec (real kernels, 4 threads) ==="
-	@./$(TARGET) --matmat-bench
-	@echo "=== (single thread = compute-bound reference) ==="
-	@./$(TARGET) --matmat-bench -j 1
+# ── LA VERITA' SUL SILICIO — si esegue PER PRIMA su un box appena affittato ──
+# box-report = inventario hardware (tools/box_info.sh) + --caps + --self-test
+# (nativo e fallback) + --matmat-bench (a pieni thread e a -j1).
+#
+# PERCHE' PRIMA DI TUTTO, e non "quando c'e' tempo". Un numero di server preso su
+# una macchina di cui non sai (a) quanti core VERI ha, (b) se il governor scala la
+# frequenza, (c) se sei su due nodi NUMA, (d) se il binario sta davvero eseguendo
+# la primitiva che credi, non e' una misura: e' un aneddoto. Ed e' gia' successo —
+# il q6 AVX-512 e' compilato da giugno e non l'abbiamo MAI visto girare: finche'
+# --caps non lo dichiara attivo SU QUEL BOX, quel percorso non esiste.
+#
+# Se --self-test e' rosso, o --caps non nomina la primitiva attesa, FERMATI: la
+# matrice che seguirebbe misura un fallback, e la si scoprirebbe dopo aver pagato.
+#
+# LA BANDA DI MEMORIA fa parte del report, e non e' un contorno: il Code Predictor
+# rilegge i suoi pesi 16 VOLTE PER FRAME, quindi il carico e' memory-bound. Il numero
+# che decide il batching non e' "quanti GFLOP" ma A QUANTI THREAD LA BANDA SATURA:
+# se satura a 2, dare 8 thread a UNA richiesta e' sprecato e conviene dare 2 thread a
+# QUATTRO richieste. tests/membw.c misura quel ginocchio (Copy+Triad, sweep di thread,
+# array >= 4x L3 per non misurare la cache), e su piu' nodi NUMA aggiunge le celle
+# local-vs-cross. Accanto resta la banda TEORICA, sempre etichettata come STIMA.
+#
+# Non richiede il modello scaricato: gira su un box vergine, prima di download_model.sh.
+#
+# HW_JSON=<path> cambia dove finisce l'artefatto JSON (default /tmp/tts/box_info.json).
+# Quel JSON e' la fonte da INCORPORARE nel report del microbench di batching: chiavi
+# stabili, autoesplicativo. Non riscrivere quella logica altrove — leggila da qui.
+HW_JSON ?= /tmp/tts/box_info.json
+MEMBW_BIN ?= /tmp/qwen_membw
+
+$(MEMBW_BIN): tests/membw.c
+	@$(CC) -Wall -Wextra -O2 -o $@ tests/membw.c -lpthread -lm
+
+
+
+# ── Le due corse corte e mirate: 1/2/4 paralleli, quant di default, solo OSS ──
+# Servono a rispondere subito a "2-4 richieste parallele sono decenti su questa
+# macchina?" con la tabella per livello (TTFA p50/p95, RTF p50/p95, Q, BEff, RSS)
+# e il verdetto contro le soglie dichiarate PRIMA (PLAN 0.nonies).
+#
+# Il 0.6B risponde in fretta ed e' il primo da lanciare; il 1.7B e' la taglia del
+# prodotto (stessa architettura di un finetune reale, quindi gli stessi colli
+# di bottiglia) ed e' quello il cui numero conta.
+# I TRE QUANT, ognuno sul PROPRIO server pulito (lo script riavvia il server per
+# braccio: page cache, allocatore e pool ripartono da zero, altrimenti il secondo
+# quant erediterebbe lo stato del primo e il confronto non varrebbe).
+#
+#   --int8                     il gold: e' la qualita' di riferimento
+#   --int4                     il piu' piccolo: meta' dei byte dell'int8
+#   --quant-mixed-int6=q4n14   la mappa mista del 17/08: 14 layer int8 + 14 q4_0,
+#                              -21,9% di traffico pesi contro l'all-int8, e sulla
+#                              language identity aveva tenuto il pari con l'int8 gold
+#
+# La domanda a cui rispondono INSIEME: la mappa mista rende davvero, o e' solo un
+# int4 con un nome piu' lungo? Serve vederli sulla stessa macchina, stessi livelli,
+# stessi testi — e con il controllo che il quant chiesto sia DAVVERO quello caricato
+# (lo script lo legge dal log del server e lo dichiara: un flag che non si applica
+# non fallisce, degrada in silenzio).
+MINI_ARMS ?= --int8 --int4 --quant-mixed-int6=q4n14
+
+
+
+# ── Decoder batchato fra slot: parita' contro il percorso per-slot ────────────
+# Stessi codici, stesso calendario ragged dei chunk (compresi i giri a 0 frame),
+# decodificati in ENTRAMBI i modi e confrontati campione per campione.
+# QWEN_PARITY_PAT=2 toglie i chunk da 1 frame, che isola l'ordine di riduzione
+# GEMV-contro-GEMM di Accelerate da questo motore: con M=1 la BLAS prende un kernel
+# diverso e l'ultimo bit si muove: e' una proprieta' della libreria, non del batching,
+# e il percorso per-slot ce l'ha gia'.
+tests/decoder_batch_parity.o: tests/decoder_batch_parity.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+# $(INGOT_LIB) e' esplicito: il caricatore safetensors e' vendorizzato in una libreria
+# a parte, non negli OBJS, e senza di lei il link muore su _ingot_st_open_dir.
+test-decoder-batch-parity: $(filter-out main.o,$(OBJS)) tests/decoder_batch_parity.o $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o qwen_tts_batch_parity $^ $(LDLIBS)
+	@echo "--- calendario ragged CON chunk da 1 frame (percorso GEMV della BLAS in gioco) ---"
+	@./qwen_tts_batch_parity $(MODEL_SMALL) 4 6
+	@echo "--- stesso calendario, senza chunk da 1 frame (atteso: bit-identico) ---"
+	@QWEN_PARITY_PAT=2 ./qwen_tts_batch_parity $(MODEL_SMALL) 4 6
+
+# ── Costo di UNA decode call, contro (group x chunk) ────────────────────────
+# Il trace di serving registra la durata della chiamata e quanti SLOT c'erano
+# dentro, ma NON quanti frame: quindi la curva costo-per-frame non e' derivabile
+# dagli artifact, e ogni domanda su "spezzare il quantum" dipende proprio da
+# quella. Questo la misura sullo stesso entry point che usa il driver.
+tests/decode_quantum_bench.o: tests/decode_quantum_bench.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+test-decode-quantum: $(filter-out main.o,$(OBJS)) tests/decode_quantum_bench.o $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o qwen_tts_decode_quantum $^ $(LDLIBS)
+	@echo "Built ./qwen_tts_decode_quantum  (usage: ./qwen_tts_decode_quantum <model_dir> [threads] [reps])"
+
+# ── Censimento kernel per shape: NOSTRI kernel vs KleidiAI, sulle shape VERE ──
+# Due sole slice verticali, nessun catalogo: INT8 per-row (i nostri stessi pesi,
+# stessa scala per riga) contro qsi8cxp, e il prefill BF16 contro bf16p. Il pack
+# dell'RHS e' in colonna separata perche' al load si paga una volta; il pack
+# dell'LHS e' dentro ns/call perche' in inferenza si paga a ogni chiamata.
+kernel-census: $(filter-out main.o,$(OBJS)) tests/kernel_census_bench.o $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o qwen_kernel_census $^ $(LDLIBS)
+	@./qwen_kernel_census --model $(or $(CMODEL),1.7b) $(CENSUS_ARGS)
+
+
+# Le soglie misurate su QUESTA macchina, archiviate nel DB dei box (the design notes con lo
+# stesso nome del suo box_info, cosi' che un confronto cross-arch possa mettere x86 e
+# ARM nella stessa tabella. Le soglie NON si ereditano fra architetture, e nemmeno fra
+# due binari con micro-kernel diversi: un tune vale per il binario che l'ha prodotto.
+#   make tune-archive BOX=2026-08-21_gcp-c4a-standard-16_axion MODEL=qwen3-tts-1.7b-base
+BOX ?= $(shell date +%Y-%m-%d)_$(shell uname -m)-$(shell hostname | tr -cd 'a-zA-Z0-9-')
+
+
+server-hw-check: $(TARGET) $(MEMBW_BIN)
+	@MEMBW_BIN=$(MEMBW_BIN) HW_JSON=$(HW_JSON) bash tests/bench_matrix.sh --silicon-only
+
+# Alias storico: i doc e gli script che dicevano `box-report` continuano a funzionare.
+box-report: server-hw-check
+
+# La banda da sola, senza il resto del report (utile per un A/B rapido su un box).
+membw: $(MEMBW_BIN)
+	@$(MEMBW_BIN)
 
 # Full per-box SIMD-check + RTF matrix (docs/hardware-testing.md). Copy onto any
-# rented ARM/x86 box. `make bench-matrix` = caps+self-test+matmat-bench+single/batch
-# RTF; `make bench-matrix-full` adds streaming + server. Quiet machine only.
+# rented ARM/x86 box. `make bench-matrix` = box-info+caps+self-test+matmat-bench+
+# single/batch RTF; `make bench-matrix-full` adds streaming + server. Quiet machine only.
 bench-matrix: $(TARGET)
 	@bash tests/bench_matrix.sh $(MODEL_SMALL)
 bench-matrix-full: $(TARGET)
 	@bash tests/bench_matrix.sh $(MODEL_SMALL) --full
 
-# Server request-batching THROUGHPUT (the x86/ARM lever from this session): M
-# concurrent clients vs single-stream, per precision (bf16/int8/int4). Speedup ~N
-# on a bandwidth-bound box, ~1 on bandwidth-rich M1. Quiet machine only.
-bench-server: $(TARGET)
-	@bash tests/serve_batch_bench.sh $(MODEL_SMALL)
 
-# Compile-check the newer-ISA kernel paths that are #ifdef'd OUT on M1 (so their
-# syntax is verified NOW, before any M2+/AVX-512 hardware). Forces the -march so the
-# guarded BFMMLA/SMMLA/VNNI/BF16 paths actually compile; does NOT run (the host may
-# not execute them). The workflow guard for "develop on M1, deploy elsewhere".
-# See docs/hardware-testing.md §7. Syntax-only -> fast, no objects.
-ISACHK = -Wall -Wextra -O3 -Ivendor -ffast-math -fsyntax-only
-check-isa:
-	@echo "=== Compile-check newer-ISA paths (syntax only, not run) ==="
-ifeq ($(UNAME_M),arm64)
-	@$(CC) $(ISACHK) -march=armv8.6-a+bf16+i8mm -DUSE_BLAS -DACCELERATE_NEW_LAPACK qwen_tts_kernels.c \
-	  && echo "  arm armv8.6-a +bf16 +i8mm : OK (M2/M3/M4, Graviton3+)" || echo "  arm armv8.6-a +bf16 +i8mm : FAIL"
-	@$(CC) $(ISACHK) -march=armv9-a+sme2 -DUSE_BLAS -DACCELERATE_NEW_LAPACK qwen_tts_kernels.c 2>/dev/null \
-	  && echo "  arm armv9-a +sme2        : OK (M4/M5)" || echo "  arm armv9-a +sme2        : (toolchain lacks SME2 — skipped)"
-	@# Cross-compile the x86 AVX-512-VNNI paths (incl. the C7 q4 VNNI matvec) from the ARM
-	@# Mac via clang -target, so x86 kernel breakage is caught here without a rented box.
-	@clang -target x86_64-apple-macos13 $(ISACHK) -march=x86-64-v3 -mavx512f -mavx512bw -mavx512dq -mavx512vnni -mavx512bf16 \
-	  -DUSE_BLAS qwen_tts_kernels.c 2>/dev/null \
-	  && echo "  x86 avx512 +vnni (x-comp) : OK (Zen4/5, Ice Lake+; C7 q4-VNNI)" || echo "  x86 avx512 +vnni (x-comp) : (clang cross lacks target — skipped)"
-	@# talker.c carries the AVX-512 bf16<->f32 bulk-conversion paths (avx512-parity) —
-	@# compile-check it for x86 too (needs the ingot include).
-	@clang -target x86_64-apple-macos13 $(ISACHK) -Ithird_party/ingot/include -march=x86-64-v3 \
-	  -mavx512f -mavx512bw -mavx512dq -mavx512vnni -mavx512bf16 -DUSE_BLAS qwen_tts_talker.c 2>/dev/null \
-	  && echo "  x86 avx512 talker (x-comp): OK (bf16 conv paths)" || echo "  x86 avx512 talker (x-comp): (clang cross lacks target — skipped)"
+
+# ── PARITA' DEI GEMELLI BATCHED — check-isa dice che COMPILA, questo che e' GIUSTO ──
+# check-isa e' solo -fsyntax-only: garantisce che il percorso VNNI/SMMLA/AVX2 esista,
+# non che faccia l'aritmetica che dichiara. tests/matmat_parity.c confronta i gemelli
+# batched (int8, q4_0) contro un riferimento INTERO in C semplice che quantizza le
+# attivazioni esattamente come il motore. Dove il dispatcher ha un GEMM intero vero,
+# l'errore atteso e' ZERO — l'aritmetica intera non ha ordine di somma da discutere,
+# quindi un rel != 0 e' un bug, non "rumore in virgola mobile".
+PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c
+PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I.
+check-matmat-parity:
+	@echo "=== matmat parity — ISA nativa ==="
+ifeq ($(UNAME_S),Darwin)
+	@clang $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -march=native \
+	  $(PARITY_SRC) -framework Accelerate -lm -o /tmp/matmat_parity
 else
-	@$(CC) $(ISACHK) -march=x86-64-v3 -mavx512f -mavx512bw -mavx512dq -mavx512vnni -mavx512bf16 qwen_tts_kernels.c \
-	  && echo "  x86 avx512 +vnni +bf16   : OK (Zen4/5, Ice Lake+)" || echo "  x86 avx512 +vnni +bf16   : FAIL"
-	@$(CC) $(ISACHK) -march=sapphirerapids qwen_tts_kernels.c 2>/dev/null \
-	  && echo "  x86 sapphirerapids (AMX) : OK" || echo "  x86 sapphirerapids (AMX) : (toolchain lacks AMX — skipped)"
+	@$(CC) $(PARITY_CF) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas $(ARCH_FLAGS) \
+	  $(PARITY_SRC) -lopenblas -lm -lpthread -o /tmp/matmat_parity
 endif
-	@echo "  (scalar/NEON #else paths stay the always-correct fallback + --self-test oracle)"
+	@/tmp/matmat_parity
+
+# ⭐ ESEGUE DAVVERO I KERNEL x86 AVX2 DAL MAC ARM. Rosetta 2 supporta AVX2 (verificato
+# su questa macchina il 2026-08-18), quindi il binario cross-compilato per x86-64-v3
+# non si limita a compilare: gira, e i suoi numeri valgono. E' il modo di validare il
+# kernel della classe di VPS piu' affittata (AVX2 senza VNNI) senza affittare nulla.
+#
+# ⚠️ DUE COSE DA SAPERE, o si legge male l'output:
+#   1. Rosetta NON emula AVX-512. VNNI e AMX restano da validare SUL METALLO: qui
+#      passano solo i percorsi AVX2. Un PASS qui non dice niente su c3d/c3.
+#   2. Sotto Rosetta `--caps` riporta "runtime cpu: sse2" e stampa
+#      "WARNING: built with AVX2 but this CPU lacks it -> will SIGILL". E' un FALSO
+#      ALLARME dell'emulazione (CPUID non espone AVX2 mentre le istruzioni girano),
+#      non un difetto del binario: il test infatti passa. Non "aggiustare" nulla.
+check-matmat-parity-x86:
+ifeq ($(UNAME_S)-$(UNAME_M),Darwin-arm64)
+	@echo "=== matmat parity — x86-64-v3 (AVX2) sotto Rosetta 2 ==="
+	@clang -target x86_64-apple-macos13 $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK \
+	  -march=x86-64-v3 $(PARITY_SRC) -framework Accelerate -lm -o /tmp/matmat_parity_x86
+	@/tmp/matmat_parity_x86
+else
+	@echo "check-matmat-parity-x86: solo su Mac ARM (serve Rosetta 2). Su x86 usa check-matmat-parity."
+endif
 
 test-compose: $(TARGET)
 	@echo "=== Inline markup / --compose smoke test ==="
@@ -746,20 +1074,6 @@ test-caps: $(TARGET)
 	@echo "PASS: --caps report consistent with build arch"
 	@echo ""
 
-# ── Kernel numeric self-test (matvec correctness vs f32 reference) ──
-# Cross-ISA correctness gate for the SIMD matvecs (bf16/int8/argmax) that does NOT depend
-# on a full-pipeline golden, so it's immune to the greedy-decode trajectory fork that makes
-# end-to-end audio mel-corr a FALSE ALARM cross-ISA (the test-golden cross-ISA caveat).
-# Runs the dispatched path AND the scalar/widen fallback (QWEN_NO_SDOT/QWEN_NO_VNNI). On the
-# AVX-512 VPS this is THE proof the VNNI int8 dot + __m512 bf16 matvec are correct.
-# Needs no model — fast, run anywhere.
-test-selftest: $(TARGET)
-	@echo "=== Kernel self-test (dispatched path) ==="
-	@./$(TARGET) --self-test || { echo "FAIL: kernel self-test (dispatched)"; exit 1; }
-	@echo "=== Kernel self-test (scalar/widen fallback: QWEN_NO_SDOT=1 QWEN_NO_VNNI=1) ==="
-	@QWEN_NO_SDOT=1 QWEN_NO_VNNI=1 ./$(TARGET) --self-test || { echo "FAIL: kernel self-test (fallback)"; exit 1; }
-	@echo "PASS: kernel self-test (both paths numerically correct)"
-	@echo ""
 
 # ── Golden-reference correctness (mel-correlation + duration) ──
 # Regenerates output deterministically (-j1 --temperature 0 --seed 42) and compares to the
@@ -1038,7 +1352,18 @@ test-serve-continuous: $(TARGET)
 test-serve-stream-batch: $(TARGET)
 	@bash tests/serve_stream_batch.sh $(MODEL_SMALL)
 
-test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch
+## make server-soak — S16.5: il soak lungo. Trenta minuti di carico costante e le
+## quattro derive che una corsa da tre minuti non puo' vedere: RSS (pendenza sulla
+## seconda meta', non valore assoluto), thread/descrittori, latenza per finestra da
+## 5 minuti, e una SONDA audio identica ogni 10 minuti — perche' la degenerazione di
+## un decoder la sente l'orecchio, non una soglia. Solo modelli OSS.
+##   make server-soak                      # 30 min, 0.6B int8, c=2
+##   make server-soak MINUTES=60 LEVEL=4 MODEL=qwen3-tts-1.7b
+MINUTES ?= 30
+LEVEL ?= 2
+
+
+test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy
 	@echo "=== All server tests passed ==="
 
 # ── RTF Benchmarks ──
@@ -1176,9 +1501,12 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
+.PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
+	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
+	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
         emotion-para-demo para-demo \
-        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-serve-all \
+        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all \
         test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \

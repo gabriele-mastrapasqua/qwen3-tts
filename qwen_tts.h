@@ -52,6 +52,30 @@
 #define QWEN_TTS_CODEC_THINK_BOS     2156
 #define QWEN_TTS_CODEC_THINK_EOS     2157
 
+/* ── EOS strategies ─────────────────────────────────────────────────────────
+ * There is no single upstream behaviour to conform to. Measured 2026-08-14 on
+ * some downstream stacks: upstream Qwen has no EOS assist; their PyTorch path
+ * adds EosBoostLogitsProcessor (their own patch, commit 54447c3, described as
+ * an "inference safety net" — and a no-op under greedy, since lifting EOS to
+ * the top-k boundary can never make it the argmax); their PRODUCTION runtime
+ * (nano-vllm) has none at all. So this is a switch, not a constant.
+ * Full analysis: see the design notes. */
+typedef enum {
+    QWEN_EOS_OFF  = 0,  /* no assist — matches nano-vllm, i.e. their production */
+    QWEN_EOS_V1   = 1,  /* historic: ramp from start_mult * (tokens * fpt)      */
+    QWEN_EOS_V2   = 2,  /* affine: ramp from start_mult * (K + tokens * fpt)    */
+    QWEN_EOS_TOPK = 3,  /* lift EOS to the k-th logit, like their PyTorch path  */
+} qwen_eos_strategy_t;
+
+const char *qwen_tts_eos_strategy_name(int strategy);
+int         qwen_tts_eos_strategy_parse(const char *name); /* -1 if unknown */
+
+/* Reload the name->slot table from ANOTHER model (dir or config.json).
+ * For GRAFTS: a grafted model carries the finetune's weights but the parent's
+ * config, so `-s <name>` cannot resolve. Point this at the source finetune and
+ * names work again. Returns the number of speakers, or -1. */
+int qwen_tts_load_speaker_map(qwen_tts_ctx_t *ctx, const char *path);
+
 /* Language IDs (codec vocab) */
 #define QWEN_TTS_LANG_CHINESE        2055
 #define QWEN_TTS_LANG_ENGLISH        2050
@@ -166,6 +190,30 @@ typedef struct {
     q4_0_block_t *wo_q4;              /* [hidden, q_dim/32 blocks] */
     q4_0_block_t *gate_up_fused_q4;   /* [2*inter, hidden/32 blocks] */
     q4_0_block_t *down_q4;            /* [hidden, inter/32 blocks] */
+
+    /* Q6_0 weights — the CHEAP half of the per-layer mixed map
+     * (--quant-mixed-int6). A layer is EITHER in the int8 set or in the q6 set,
+     * never both: the map decides which pointer group gets allocated, and the
+     * forward dispatch (q6 -> q4 -> int8 -> bf16) selects on its own.
+     * WHICH layers stay at int8 is MEASURED, not deduced — from the sensitivity
+     * profile (PLAN T2.next), because the accent-delta prior predicted the wrong
+     * layers three times running. */
+    q6_0_block_t *wq_q6;              /* [q_dim, hidden/32 blocks] */
+    q6_0_block_t *wk_q6;              /* [kv_dim, hidden/32 blocks] */
+    q6_0_block_t *wv_q6;              /* [kv_dim, hidden/32 blocks] */
+    q6_0_block_t *wo_q6;              /* [hidden, q_dim/32 blocks] */
+    q6_0_block_t *gate_up_fused_q6;   /* [2*inter, hidden/32 blocks] */
+    q6_0_block_t *down_q6;            /* [hidden, inter/32 blocks] */
+
+    /* PREFILL weights, kept separate from the ones above since 2026-08-22.
+     * On ARM the prefill takes the BFMMLA matmat path and reads bf16 directly, so when
+     * a quantized GGUF replaced the bf16 pointers the PROMPT - speaker token, language,
+     * text - was built at 4 bits and every later frame inherited a corrupted
+     * conditioning: measured 0.0 % language identity against 99.7 % with the originals.
+     * These always alias the ORIGINAL checkpoint weights. Decode may be quantized;
+     * prefill is where the conditioning is decided and stays at full precision. */
+    const uint16_t *wq_bf16_pref, *wk_bf16_pref, *wv_bf16_pref, *wo_bf16_pref;
+    const uint16_t *gate_up_fused_bf16_pref, *down_bf16_pref;
 } qwen_talker_layer_t;
 
 /* ========================================================================
@@ -381,6 +429,40 @@ typedef struct {
     int initialized;       /* 1 after first call */
 } qwen_sd_stream_state_t;
 
+/* ------------------------------------------------------------------------
+ * Cross-slot BATCHED streaming decode (feature-flagged: QWEN_DECODER_BATCH=1)
+ *
+ * WHY. The Talker and the Code Predictor read each weight ONCE for all the slots
+ * the scheduler is stepping; the speech decoder does not. Called once per slot it
+ * re-reads the whole conv/pre-transformer weight set N times for N slots, which is
+ * why QWEN_SERVE_PROFILE=1 attributes 58.5% of the streaming scheduler loop (and
+ * 29.8% of the WAV one) to it at c=4. This is the exact shape of vllm-omni#3163:
+ * a per-request for-loop de-batching what the scheduler had already batched.
+ *
+ * WHAT IS BATCHED AND WHAT IS NOT. The MATH is batched, the STATE is not. Each item
+ * keeps its own qwen_sd_stream_state_t (conv tails, ConvTranspose carries, KV cache,
+ * vq_pad); the frames of all items are concatenated along the time axis so that every
+ * GEMM/conv runs once, with the batch as the leading (N) dimension of the flattened
+ * time axis. Mixing state across items would splice two voices together.
+ *
+ * RAGGED IS THE NORM. With the ramped chunking the items arrive with DIFFERENT
+ * nframes, so the concatenation is ragged (per-item offsets), never padded: the
+ * worst-case wasted work is zero frames. See the strategy comment on the
+ * implementation in qwen_tts_speech_decoder.c.
+ *
+ * Each item's `audio` is malloc'd by the callee and must be freed by the caller;
+ * `rc` is 0 on success for that item. The return value is 0 if every item succeeded.
+ * n_items == 1 delegates to the per-slot function, so the single-slot path is
+ * bit-identical by construction. ---------------------------------------------- */
+typedef struct {
+    qwen_sd_stream_state_t *st;   /* in: per-slot state, caller-owned  */
+    const int *codes;             /* in: 16 codes per frame            */
+    int nframes;                  /* in: frames in this item (may be 0)*/
+    float *audio;                 /* out: malloc'd PCM, caller frees   */
+    int n_samples;                /* out                               */
+    int rc;                       /* out: 0 = ok                       */
+} qwen_sd_batch_item_t;
+
 /* ========================================================================
  * Audio Callback (for streaming)
  * ======================================================================== */
@@ -417,9 +499,38 @@ typedef struct qwen_tts_ctx {
     int cp_top_k;
     int greedy_warmup;  /* initial frames sampled greedily (temp=0) for cross-model stability */
 
+    /* EOS strategy — see qwen_eos_strategy_t above and the design notes. */
+    int   eos_strategy;          /* qwen_eos_strategy_t                              */
+    int   eos_suppress_frames;   /* leading frames where EOS is forbidden        (2) */
+    float eos_frames_per_token;  /* assumed frames per BPE token               (3.0) */
+    float eos_start_multiple;    /* ramp starts at this multiple of expected   (2.0) */
+    int   eos_overhead_frames;   /* V2 only: fixed overhead K, in frames        (18) */
+    float eos_ramp_per_frame;    /* additive slope past the threshold          (0.5) */
+    float eos_ramp_cap;          /* max additive boost                        (10.0) */
+    int   eos_topk;              /* TOPK only: rank to lift EOS to              (50) */
+
     /* Speaker and language */
     int speaker_id;
     int language_id;
+
+    /* Speaker table read from this model's config.json (talker_config.spk_id).
+     * Upstream CustomVoice ships preset voices the engine hardcodes; a Base-derived
+     * finetune instead declares its own speakers here — one entry for a single-speaker
+     * model, N for a pool, on slots that need not be contiguous. Empty for Base and
+     * VoiceDesign. */
+    char **spk_names;
+    int   *spk_slots;
+    /* Where every weight family actually came from. Recorded by whoever loads it, so a
+     * benchmark documents its own configuration instead of being deduced from the
+     * command line - a kernel firing proves the FORMAT, never the PROVENANCE. */
+    struct {
+        char talker_linear[224];   int talker_n, talker_eligible;
+        char cp_linear[224];       int cp_n, cp_eligible;
+        char cp_heads[224];        int cp_heads_n;
+        char extras[224];          int extras_n;
+    } src;
+
+    int    spk_count;
 
     /* Instruct text (style/emotion control, 1.7B only; required for VoiceDesign) */
     char *instruct;
@@ -482,9 +593,16 @@ typedef struct qwen_tts_ctx {
     uint16_t *text_proj_fc1_bf16;   /* [text_hidden, text_hidden] */
     float *text_proj_fc1_bias;
     uint16_t *text_proj_fc2_bf16;   /* [hidden, text_hidden] */
+    q4_0_block_t *text_proj_fc1_q4; /* [text_hidden, text_hidden/32] */
+    q4_0_block_t *text_proj_fc2_q4; /* [hidden, text_hidden/32] */
     float *text_proj_fc2_bias;
     uint16_t *codec_embedding_bf16; /* [codec_vocab, hidden] */
     uint16_t *codec_head_bf16;      /* [codec_vocab, hidden] */
+    /* Q4_0 twins for the three matrices outside the per-layer blocks. They exist only
+     * when a GGUF supplies them (--gguf-rest); NULL means "use the bf16 above", which
+     * is what every non-GGUF run does. Dispatch is the same rule as the layers: q4 if
+     * present, else int8, else bf16. */
+    q4_0_block_t *codec_head_q4;    /* [codec_vocab, hidden/32] */
     float *talker_norm;             /* [hidden] */
     qwen_talker_layer_t layers[QWEN_TTS_MAX_TALKER_LAYERS];
     
@@ -502,6 +620,7 @@ typedef struct qwen_tts_ctx {
     int8_t *cp_mtp_proj_int8;         /* int8 twin (built when CP is quantized): the bf16 4MB was
                                        * re-read 16×/frame on an otherwise fully-quantized CP */
     float *cp_mtp_proj_scale;         /* [cp_hidden] per-row scales for the int8 twin */
+    q4_0_block_t *cp_mtp_proj_q4;     /* [cp_hidden, emb_dim/32] - from --gguf-rest */
     
     /* Speech decoder */
     qwen_speech_decoder_t speech_dec;
@@ -511,6 +630,12 @@ typedef struct qwen_tts_ctx {
     qwen_speaker_encoder_t speaker_enc;
     
     /* KV cache (Talker) — stored as bf16 to halve memory and improve cache utilization */
+    /* Prefix-cache key for this request, set by the prompt builder. pfx_len is the
+     * number of leading positions that do NOT depend on the text (instruct + role +
+     * codec prefix); 0 disables. See qwen_talker_prefix_key(). */
+    int      pfx_len, pfx_spk, pfx_lang, pfx_think;
+    uint64_t pfx_ihash;
+
     uint16_t *kv_cache_k;
     uint16_t *kv_cache_v;
     int kv_max;
@@ -668,6 +793,19 @@ extern "C" {
 qwen_tts_ctx_t *qwen_tts_load(const char *model_dir);
 qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8, int use_int4);
 
+/* Pack every weight KleidiAI will be asked for, once, at load. No-op where the ISA
+ * or the flags say no. See qwen_tts_talker.c for why the scope is decode-int8 plus
+ * PREFILL-bf16 and not simply "every bf16 pointer". */
+void qwen_kleidi_prepack(qwen_tts_ctx_t *ctx);
+
+/* Pre-fork serving: pack once in the parent, fork W workers pinned to disjoint core
+ * sets, each binding the same port with SO_REUSEPORT. The packed weights are never
+ * written after the fork, so copy-on-write keeps ONE physical copy for all workers.
+ * See qwen_tts_server.c for why RSS is the wrong thing to measure here and Pss is
+ * the right one. */
+int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
+                           int threads_per, int max_batch);
+
 /* Unload model and free resources */
 void qwen_tts_unload(qwen_tts_ctx_t *ctx);
 
@@ -691,8 +829,20 @@ void qwen_tts_set_language(qwen_tts_ctx_t *ctx, const char *language);
 /* Get language ID from name */
 int qwen_tts_language_id(const char *name);
 
-/* Get speaker ID from name */
+/* Get speaker ID from name (built-in CustomVoice presets only) */
 int qwen_tts_speaker_id(const char *name);
+
+/* Resolve a speaker name against THIS model's own table, then the built-in presets.
+ *
+ * Checkpoints finetuned from Base — every such finetune — carry their speakers in
+ * config.json `talker_config.spk_id`, and none of them are upstream presets. Returns
+ * -1 when the name is unknown, which callers MUST treat as an error: falling back to
+ * the default slot renders an identity that does not exist in those weights (the slot
+ * holds untrained initialisation noise), and does so without any audible warning. */
+int qwen_tts_resolve_speaker(const qwen_tts_ctx_t *ctx, const char *name);
+
+/* Print every speaker this model exposes (name -> slot) to stderr. */
+void qwen_tts_list_speakers(const qwen_tts_ctx_t *ctx);
 
 /* Set audio callback for streaming (called with each decoded chunk) */
 void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata);
@@ -765,7 +915,32 @@ typedef struct {
     void (*on_chunk)(void *ud, void *tag, float *samples, int n_samples);
     /* Return non-zero while the server should keep running. */
     int (*running)(void *ud);
+    /* OPTIONAL. Return non-zero when this request's client is gone and generation for it
+     * must stop. NULL (the default) reproduces the historical behaviour exactly: the
+     * driver generates every request to its natural end regardless of the client.
+     *
+     * ⚠️ CANCELLED IS NOT A SUCCESSFUL EOS. The driver releases the slot through the
+     * SHARED release path and deliberately skips the delivery work an EOS does - no tail
+     * flush, no decode of the remainder, no chunk written to a socket already known to be
+     * dead. on_done() is still called (samples=NULL,n=0) so the host can close its
+     * response and free the tag; the host is responsible for recording the request as
+     * CANCELLED rather than COMPLETED.
+     *
+     * MUST read state owned by the JOB behind `tag`, never a raw fd: an fd can be closed
+     * and recycled by another connection while this slot still exists. */
+    int (*cancelled)(void *ud, void *tag);
 } qwen_batch_sink_t;
+
+/* ── STEP 3A · admission-opportunity probe (diagnostic, no scheduling change) ──
+ * The driver admits from the ready queue at ONE point per loop iteration. This publishes,
+ * for anyone in the same process, WHEN the last such opportunity happened and how long the
+ * previous iteration took, so a request can be told which opportunity it waited for instead
+ * of that being assumed. Written only while QWEN_TTFA_TRACE is on; two relaxed atomic
+ * stores per iteration. It changes no decision the scheduler makes.
+ *   seq          monotonically increasing opportunity number
+ *   ts_ms        CLOCK_MONOTONIC instant of that opportunity (domain S)
+ *   last_iter_ms duration of the iteration that ENDED at that opportunity */
+void qwen_admit_probe_read(unsigned long long *seq, double *ts_ms, double *last_iter_ms);
 
 /* Run the continuous-batching loop until running()==0 and the queue drains.
  * Returns 0 on clean exit, -2 if the model can't use the bf16 batched path. */
