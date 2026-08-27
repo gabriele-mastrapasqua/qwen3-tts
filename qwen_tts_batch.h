@@ -13,7 +13,25 @@
 #include "qwen_tts.h"
 
 typedef struct {
-    int B;                                  /* batch width (chunks in flight) */
+    int B;                                  /* batch width ALLOCATED (max chunks in flight) */
+    /* Width the projections actually run at this step: (highest active slot + 1).
+     * Columns above it belong to inactive slots and their output is discarded, so
+     * computing them is work thrown away — on EVERY ISA. Only the SIZE of the loss is
+     * machine-dependent (bandwidth/compute ratio), not its existence: the "near-free on
+     * bandwidth-bound ARM" claim below holds only where the kernel is fully
+     * bandwidth-bound, which is a property of the box and not of the instruction set.
+     * Set per step by the batched Talker/CP; always <= B, == B when the last slot is
+     * busy. Idle slots BELOW it still cost — closing those holes needs slot compaction
+     * (PLAN T5.piano #2b). Measured on M1; to be re-measured on x86-64 (AVX2-only and
+     * AVX-512/VNNI) and arm64 Linux. */
+    int B_eff;
+    /* act_idx[0..B_eff) = the slot index of each column the GEMMs actually compute.
+     * With this map the batched path follows the ACTIVE slots instead of the allocated
+     * width, so idle slots cost nothing even when they sit in the MIDDLE of the batch —
+     * which the high-water mark alone could not fix, since both orchestrators seed every
+     * slot up front and drain them in arbitrary order. No KV is moved and the
+     * orchestrator is untouched: the packing lives entirely in gather/scatter. */
+    int act_idx[64];
     int h, q_dim, kv_dim, inter, num_layers, kv_max;
     int kv_len;                             /* shared lockstep position */
     /* B-wide activation buffers (each sequence contiguous: [B][dim]) */
@@ -35,18 +53,34 @@ typedef struct {
 /* Batched projection dst[B][rows] = W @ src[B][cols] (src row b at b*srcstride).
  * Shared by the batched Talker and Code Predictor. force_matvec=1 -> B matvecs
  * (bit-matches single-stream); else one batched matmat. Xt/Yt = scratch. */
+/* `idx` (may be NULL = identity) maps each computed column to its slot: pass the
+ * active-slot map to make the GEMM width follow the load instead of the allocation. */
 void qwen_batch_proj(float *dst, const uint16_t *W, const float *src,
-                     int rows, int cols, int srcstride, int B, int force_matvec,
-                     float *Xt, float *Yt);
+                     int rows, int cols, int srcstride, int B, const int *idx,
+                     int force_matvec, float *Xt, float *Yt);
 
 /* Precision-aware batched projection (B2): dispatches q4 (Wq) > int8 (Wi+Wscale) >
  * bf16 (Wb) by which weight set is non-NULL, using the batched matmat twins (weights
  * read once across B). Uses bb's own scratch/width. Shared by batched Talker + CP. */
+/* One QKV: one LHS pack and one barrier when the fused int8 path applies, otherwise
+ * exactly the three qwen_batch_proj_q calls it replaces. QWEN_KAI_QKV_FUSED=0 forces
+ * the latter. */
+void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
+                         const uint16_t *Wqb, const int8_t *Wqi, const float *Wqs,
+                         const q4_0_block_t *Wqq,
+                         const uint16_t *Wkb, const int8_t *Wki, const float *Wks,
+                         const q4_0_block_t *Wkq,
+                         const uint16_t *Wvb, const int8_t *Wvi, const float *Wvs,
+                         const q4_0_block_t *Wvq,
+                         const float *src, int q_rows, int kv_rows, int cols,
+                         int srcstride, int B, const int *idx, int force_matvec,
+                         float *Xt, float *Yt);
+
 void qwen_batch_proj_q(float *dst,
                        const uint16_t *Wb, const int8_t *Wi, const float *Wscale,
                        const q4_0_block_t *Wq,
                        const float *src, int rows, int cols, int srcstride,
-                       int B, int force_matvec, float *Xt, float *Yt);
+                       int B, const int *idx, int force_matvec, float *Xt, float *Yt);
 
 /* Single-stream Code Predictor (defined in qwen_tts_code_predictor.c) — declared here
  * so the batched self-test can use it as the reference. */
@@ -63,6 +97,34 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                           const float *talker_hidden, const int *code0, int *out_codes,
                           const uint8_t *active);
+
+/* 1 if QWEN_BATCH_NO_SOLO=1: the B_eff==1 shortcut is off and every step stays on the
+ * batched path. Shared by the Talker and CP solo fallbacks, so one switch keeps them
+ * consistent — one on and one off would be a configuration nobody has tested. */
+int qwen_batch_solo_disabled(void);
+
+/* 1 if QWEN_BATCH_NO_BEFF=1: projections stay pinned to the allocated B (the "before"
+ * of T5.piano #2), so the win can be A/B'd on any box without a rebuild. */
+int qwen_batch_beff_disabled(void);
+
+/* Write bb->act_idx / bb->B_eff so they describe THIS step's active slots.
+ *
+ * INVARIANT, and it exists because breaking it cost a day (2026-08-20): after any step —
+ * batched or the B_eff==1 shortcut — act_idx/B_eff must describe that step. The frame
+ * loop reads them straight afterwards for the codec head (qwen_tts.c), and both solo
+ * shortcuts used to return BEFORE the packing block, leaving whatever the last batched
+ * step had left. When the surviving slot was not in that stale set, its logits column was
+ * never computed and the sampler read the PREVIOUS frame's values — for another request.
+ * Generation derailed from there: noise, speech and beeps mixed, and double the duration.
+ *
+ * It only fired on the transition from several active slots to one, which a server
+ * reaches constantly (open-loop arrivals put three requests in flight even at a nominal
+ * concurrency of 1), and never in a sequential test — without overlap the batched path
+ * never runs and act_idx stays the identity. Hence one function, called on every exit
+ * path, instead of the same nine lines copied into four places.
+ *
+ * `active` NULL (bench, self-test: no mask) means full width. */
+void qwen_batch_pack_active(qwen_batch_t *bb, const uint8_t *active);
 
 /* Allocate batched buffers + B KV caches from ctx config. kv_max = max frames per
  * chunk. Returns NULL on OOM or if the model isn't bf16 (v1 limitation). */

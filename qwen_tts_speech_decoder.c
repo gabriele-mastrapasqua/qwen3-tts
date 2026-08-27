@@ -24,6 +24,7 @@
  */
 
 #include <pthread.h>
+#include <unistd.h>   /* getpid() for the QWEN_SD_PHASE line: glibc does not pull it in transitively the way macOS does */
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
 #include "ingot/safetensors.h"
@@ -165,10 +166,71 @@ static int sd_int8_enabled(void) {
     static int en = -1;
     if (en < 0) {
         const char *e = getenv("QWEN_SD_INT8");
+#if defined(__AVX512VNNI__)
+        /* x86: DEFAULT ON since 2026-08-19, after the ear passed it.
+         * The listening pack (samples/tests/2026-08-19_sd-int8-x86/) compared fp32,
+         * int8 blk=64 and int8 blk=256 on three cells; the verdict on the worst cell
+         * by SNR - vivian, 36.5 dB - was "no audible noise". It buys RTF 1.19-1.23 ->
+         * 1.10-1.14 on the 0.6B. QWEN_SD_INT8=0 goes back to fp32 sgemm.
+         * ARM stays opt-in: there the block that is fast (64) is a different point on
+         * the same curve, and it has its own ear history. */
+        en = qwen_sd_int8_available() && !(e && *e == '0');
+#else
         en = (e && *e && *e != '0') && qwen_sd_int8_available();
+#endif
     }
     return en;
 }
+
+
+/* ── SD PHASE ATTRIBUTION (QWEN_SD_PHASE=1) ───────────────────────────────────
+ * Measurement only, and OFF by default: when the env is unset every macro below
+ * compiles to a branch on one cached int and nothing else runs, so the production
+ * path is untouched.
+ *
+ * The point of the design is that it can FAIL. Each phase is timed with its own
+ * start/stop, and the WHOLE call is timed separately, so `total - sum(phases)` is
+ * printed as `unacc` rather than being absorbed into the last phase. A phase
+ * scheme that does not reconcile says so in its own output.
+ *
+ * The two decode entry points have the same six steps and are instrumented the
+ * same way; the line records which one ran, because they are different code:
+ * `qwen_speech_decoder_decode_streaming_batch` hands any single-item call to the
+ * per-slot function, so group=1 and group>=2 are not the same implementation.
+ *
+ * Single-threaded by construction: the driver calls decode inline from the loop,
+ * one thread per worker process, so the file-scope accumulators for the step-6
+ * sub-split are not shared. */
+static int sd_phase_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_PHASE"); v = (e && *e && *e != '0'); }
+    return v;
+}
+static double sd_ph_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+/* step-6 sub-split, filled by conv_decoder_forward_streaming[_batch] */
+static double sd_p6a, sd_p6b, sd_p6c;
+
+
+/* One line per decode call. `unacc` is total minus the six phases: it is the part
+ * the phase scheme does NOT explain, and it is printed rather than hidden. */
+#define SD_PHASE_EMIT(path_, group_, frames_) do {                                   \
+    if (_ph) {                                                                       \
+        _ph_p[5] += sd_ph_now() - _ph_mark;                                          \
+        double _tot = sd_ph_now() - _ph_call0;                                       \
+        double _sum = _ph_p[0]+_ph_p[1]+_ph_p[2]+_ph_p[3]+_ph_p[4]+_ph_p[5];         \
+        fprintf(stderr, "[SDPHASE] v=1 pid=%d path=%s group=%d frames=%d "           \
+                "clock=CLOCK_MONOTONIC domain=S vq=%.3f preconv=%.3f inproj=%.3f "   \
+                "pretf=%.3f outproj=%.3f conv=%.3f conv_cnext=%.3f conv_init=%.3f "  \
+                "conv_up=%.3f sum=%.3f total=%.3f unacc=%.3f\n",                     \
+                (int)getpid(), (path_), (group_), (frames_),                         \
+                _ph_p[0], _ph_p[1], _ph_p[2], _ph_p[3], _ph_p[4], _ph_p[5],          \
+                sd_p6a, sd_p6b, sd_p6c, _sum, _tot, _tot - _sum);                    \
+    }                                                                                \
+} while (0)
 
 /* Scale-block size along K (multiple of 16). Smaller = more accurate, slightly
  * slower; the author measured 64 as the sweet spot on N1 (same RTF as 128,
@@ -177,7 +239,22 @@ static int sd_int8_blk(void) {
     static int blk = -1;
     if (blk < 0) {
         const char *e = getenv("QWEN_SD_INT8_BLK");
+#if defined(__AVX512VNNI__)
+        /* x86 wants a BIGGER block than ARM, and the reason is the instruction mix, not
+         * the numerics. Per scale block each tile pays a fixed f32 epilogue (convert +
+         * FMA per accumulator). On NEON a 64-element block is 32 SDOTs against 16 f32
+         * ops — 2:1. On a 512-bit VNNI lane the same block is EIGHT dpbusd against the
+         * same 16 f32 ops — 1:2, and the epilogue dominates. Measured on the c3 (0.6B,
+         * -j4, same utterance), decoder ms / RTF:
+         *     blk=64  6923 / 1.22   blk=128 6305 / 1.15
+         *     blk=256 5797 / 1.10   blk=512 5826 / 1.10      (fp32 sgemm: 5897 / 1.19)
+         * 256 is the knee. ⚠️ Coarser blocks mean coarser scales: this trades SNR for
+         * speed on top of the trade int8 already makes, which is why the whole path
+         * stays opt-in and must pass the ear before it is ever a default. */
+        blk = e ? atoi(e) : 256;
+#else
         blk = e ? atoi(e) : 64;
+#endif
         if (blk < 16) blk = 16;
         blk = (blk + 15) & ~15;
     }
@@ -191,6 +268,9 @@ typedef struct {
     const float *src;
     int8_t *q;
     float *scales;
+    int32_t *wsum;      /* [out_ch][Kp/blk] sums of the quantized bytes — the x86 VNNI
+                         * correction, precomputed here because it is a property of the
+                         * weights and must never enter the inner loop. */
     int Kp;
 } sd_wq_entry_t;
 
@@ -208,11 +288,25 @@ static sd_wq_entry_t *sd_wq_get_conv(const float *w, int out_ch, int K) {
     int blk = sd_int8_blk();
     int Kp = qwen_int8_kp(K, blk);
     sd_wq_entry_t *e = &sd_wq[sd_wq_n];
+    int nblk = Kp / blk;
     e->q = (int8_t *)aligned_malloc((size_t)out_ch * Kp);
-    e->scales = (float *)aligned_malloc((size_t)out_ch * (Kp / blk) * sizeof(float));
-    if (!e->q || !e->scales) { free(e->q); free(e->scales); pthread_mutex_unlock(&sd_wq_mu); return NULL; }
+    e->scales = (float *)aligned_malloc((size_t)out_ch * nblk * sizeof(float));
+    e->wsum = (int32_t *)aligned_malloc((size_t)out_ch * nblk * sizeof(int32_t));
+    if (!e->q || !e->scales || !e->wsum) {
+        free(e->q); free(e->scales); free(e->wsum);
+        pthread_mutex_unlock(&sd_wq_mu); return NULL;
+    }
     e->src = w; e->Kp = Kp;
     qwen_int8_quant_rows(e->q, e->scales, w, out_ch, K, Kp, blk);
+    for (int r = 0; r < out_ch; r++) {
+        const int8_t *row = e->q + (size_t)r * Kp;
+        int32_t *ws = e->wsum + (size_t)r * nblk;
+        for (int b = 0; b < nblk; b++) {
+            int32_t acc = 0;
+            for (int k = b * blk; k < (b + 1) * blk; k++) acc += (int32_t)row[k];
+            ws[b] = acc;
+        }
+    }
     sd_wq_n++;
     pthread_mutex_unlock(&sd_wq_mu);
     return e;
@@ -241,7 +335,7 @@ static void causal_conv1d_blas(float *out, const float *in,
     if (sd_int8_enabled() && in_ch == out_ch && in_ch <= 768) {
         sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
         if (e) {
-            qwen_conv1d_int8(out, in, e->q, e->scales, bias,
+            qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
                              in_ch, out_ch, length, kernel, dilation,
                              e->Kp, sd_int8_blk());
             return;
@@ -578,6 +672,7 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
 
 int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
                                 float **audio_out, int *n_samples) {
+    qwen_mm_component(QWEN_COMP_DECODER);   /* MAC audit: attribute this step's kernels */
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
     qwen_tts_config_t *c = &ctx->config;
 
@@ -1410,7 +1505,6 @@ static void convnext_mlp(qwen_sd_convnext_t *cn, float *signal, const float *res
                 + signal[(int64_t)ci * cur_len + t] * g;
     }
 }
-
 static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
                                  float *signal, int cur_ch, int cur_len,
                                  float **audio_out, int *n_samples_out) {
@@ -1696,6 +1790,46 @@ static float *cs_dwconv(const float *in, int ch, int len,
     return out;
 }
 
+/* Final conv (96 -> 1, k=7) with the per-slot 6-column input tail, written as a
+ * STRIDED view so that the per-slot and the batched decoder call the very same
+ * function on the very same instruction stream.
+ *
+ * WHY IT IS A SHARED FUNCTION RATHER THAN COPY-PASTE. Duplicating this loop in the
+ * batched path made it disagree with the per-slot one in the last bits — identical
+ * source, different codegen (an out-parameter the compiler cannot prove non-aliasing
+ * for is contracted into FMAs in one context and not in the other). That is ~1 ULP
+ * here, but it is the last stage before the samples, so it lands straight in the
+ * audio. One function, one answer. `stride`/`off` select this item's columns of the
+ * flattened batched buffer (per-slot passes stride = len, off = 0). */
+static void cs_final_conv(float *audio, const float *signal, int64_t stride, int64_t off,
+                          int cur_ch, int len, const float *w, const float *bias,
+                          float *tail) {
+    if (bias)
+        for (int t = 0; t < len; t++) audio[t] = bias[0];
+    for (int ic = 0; ic < cur_ch; ic++) {
+        const float *src = signal + (int64_t)ic * stride + off;
+        const float *wc  = w + (int64_t)ic * 7;
+        const float *tc  = tail + (int64_t)ic * 6;
+        for (int t = 0; t < len; t++) {
+            float sum = 0;
+            for (int k = 0; k < 7; k++) {
+                int p = t - 6 + k;
+                sum += wc[k] * (p >= 0 ? src[p] : tc[6 + p]);
+            }
+            audio[t] += sum;
+        }
+    }
+    /* New tail = the last 6 (snake-activated) inputs of this item. */
+    for (int ic = 0; ic < cur_ch; ic++) {
+        float *tc = tail + (int64_t)ic * 6;
+        const float *src = signal + (int64_t)ic * stride + off;
+        if (len >= 6) memcpy(tc, src + len - 6, 6 * sizeof(float));
+        else
+            for (int i = 0; i < 6; i++)
+                tc[i] = (i + len < 6) ? tc[i + len] : src[i + len - 6];
+    }
+}
+
 /* Lazily allocate (zeroed) per-slot streaming conv state. */
 static int cs_ensure_alloc(qwen_sd_stream_state_t *st) {
     if (st->cs_alloc) return 0;
@@ -1722,6 +1856,7 @@ static int cs_ensure_alloc(qwen_sd_stream_state_t *st) {
     return 0;
 }
 
+
 /* Streaming conv decoder: consumes `signal` [1024 x m] (takes ownership),
  * emits exactly m*1920 samples. Mirrors conv_decoder_forward stage by stage. */
 static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
@@ -1730,6 +1865,8 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
     if (cs_ensure_alloc(st) != 0) { free(signal); return -1; }
     int cur_ch = 1024, cur_len = m;
+    const int _ph = sd_phase_on();
+    double _m = _ph ? sd_ph_now() : 0.0;
 
     /* ConvNeXt upsample (2 blocks, 2x each). k=2,s=2 → no overlap, carry-free. */
     for (int b = 0; b < 2; b++) {
@@ -1748,6 +1885,8 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         signal = dw;
     }
 
+    if (_ph) { double _t = sd_ph_now(); sd_p6a += _t - _m; _m = _t; }
+
     /* Initial conv (1024→1536, k=7) */
     if (!sd->initial_conv_weight) { free(signal); return -1; }
     float *ic_out = cs_conv1d(signal, cur_ch, 1536, cur_len, 7, 1,
@@ -1756,6 +1895,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
     free(signal);
     if (!ic_out) return -1;
     signal = ic_out; cur_ch = 1536;
+    if (_ph) { double _t = sd_ph_now(); sd_p6b += _t - _m; _m = _t; }
 
     /* 4 Decoder upsample blocks */
     int up_rates[4] = {8, 5, 4, 3};
@@ -1819,33 +1959,8 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
 
     float *audio = (float *)aligned_calloc(cur_len, sizeof(float));
     if (!audio) { free(signal); return -1; }
-    {
-        float *tl = st->cs_final_tail;   /* [96 x 6] */
-        if (sd->final_conv_bias)
-            for (int t = 0; t < cur_len; t++) audio[t] = sd->final_conv_bias[0];
-        for (int ic = 0; ic < cur_ch; ic++) {
-            const float *src = signal + (int64_t)ic * cur_len;
-            const float *wc  = sd->final_conv_weight + (int64_t)ic * 7;
-            const float *tc  = tl + (int64_t)ic * 6;
-            for (int t = 0; t < cur_len; t++) {
-                float sum = 0;
-                for (int k = 0; k < 7; k++) {
-                    int p = t - 6 + k;
-                    sum += wc[k] * (p >= 0 ? src[p] : tc[6 + p]);
-                }
-                audio[t] += sum;
-            }
-        }
-        /* Update the tail with the last 6 (snake-activated) inputs */
-        for (int ic = 0; ic < cur_ch; ic++) {
-            float *tc = tl + (int64_t)ic * 6;
-            const float *src = signal + (int64_t)ic * cur_len;
-            if (cur_len >= 6) memcpy(tc, src + cur_len - 6, 6 * sizeof(float));
-            else
-                for (int i = 0; i < 6; i++)
-                    tc[i] = (i + cur_len < 6) ? tc[i + cur_len] : src[i + cur_len - 6];
-        }
-    }
+    cs_final_conv(audio, signal, cur_len, 0, cur_ch, cur_len,
+                  sd->final_conv_weight, sd->final_conv_bias, st->cs_final_tail);
     free(signal);
 
     for (int i = 0; i < cur_len; i++) {
@@ -1855,6 +1970,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
 
     st->cs_warm = 1;   /* tails now hold real context; later chunks must prepend them */
 
+    if (_ph) sd_p6c += sd_ph_now() - _m;
     *audio_out = audio;
     *n_samples_out = cur_len;
     return 0;
@@ -1881,6 +1997,11 @@ static int sd_exact_stream_enabled(void) {
 int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                                           const int *new_codes, int new_frames,
                                           float **audio_out, int *n_samples) {
+    qwen_mm_component(QWEN_COMP_DECODER);   /* MAC audit: the streaming paths too, or their work lands in "other" */
+    const int  _ph    = sd_phase_on();
+    const double _ph_call0 = _ph ? sd_ph_now() : 0.0;
+    double _ph_p[6] = {0,0,0,0,0,0}, _ph_mark = 0.0;
+    if (_ph) { sd_p6a = sd_p6b = sd_p6c = 0.0; }
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
     qwen_tts_config_t *c = &ctx->config;
 
@@ -1896,6 +2017,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     float eps = c->dec_rms_norm_eps;
     int half_hd = head_dim / 2;
 
+    if (_ph) _ph_mark = sd_ph_now();
     /* === Step 1: VQ dequant for new frames only === */
     /* Output: vq_out row-major [new_frames, 512] */
     float *vq_out = (float *)aligned_calloc((int64_t)new_frames * vq_hidden, sizeof(float));
@@ -1933,6 +2055,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     }
     free(cb_sum);
 
+    if (_ph) { double _t = sd_ph_now(); _ph_p[0] += _t - _ph_mark; _ph_mark = _t; }
     /* === Step 2: Pre-conv on new frames with padding from previous chunk === */
     /* VQ output is row-major [new_frames, 512]. Transpose to channel-first [512, new_frames]
      * for conv1d, prepending 2 frames of padding. */
@@ -1977,6 +2100,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     /* Take only the last new_frames from pre_conv output */
     /* The first pad_frames outputs may have been computed with actual previous context */
 
+    if (_ph) { double _t = sd_ph_now(); _ph_p[1] += _t - _ph_mark; _ph_mark = _t; }
     /* === Step 3: Input proj on new frames (1024→512, row-major) === */
     float *hidden = (float *)aligned_malloc((int64_t)new_frames * dec_hidden * sizeof(float));
 #ifdef USE_BLAS
@@ -2009,6 +2133,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     free(pre_conv_out);
 #endif
 
+    if (_ph) { double _t = sd_ph_now(); _ph_p[2] += _t - _ph_mark; _ph_mark = _t; }
     /* === Step 4: Pre-transformer with KV cache === */
     /* plan_v4 D2: cap the KV cache at O(window+chunk) instead of the full stream.
      * Physical frames needed = (kv_len + new_frames) - kv_base. When that exceeds
@@ -2251,6 +2376,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 
     free(q); free(new_k); free(new_v); free(x_norm); free(attn_out);
 
+    if (_ph) { double _t = sd_ph_now(); _ph_p[3] += _t - _ph_mark; _ph_mark = _t; }
     /* === Step 5: Final RMSNorm + Output proj (512→1024) on new frames === */
     if (sd->final_norm_weight) {
         qwen_rms_norm(hidden, hidden, sd->final_norm_weight, new_frames, dec_hidden, eps);
@@ -2305,6 +2431,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     st->latent_frames += new_frames;
     free(hidden);
 
+    if (_ph) { double _t = sd_ph_now(); _ph_p[4] += _t - _ph_mark; _ph_mark = _t; }
     /* === Step 6: conv decoder === */
     /* Exact path: feed ONLY the new frames; the per-conv tails/carries in `st`
      * hold everything the causal stack needs from the past. Emits exactly
@@ -2331,6 +2458,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
         st->samples_produced += new_samples;
         *audio_out = new_audio;
         *n_samples = new_samples;
+        SD_PHASE_EMIT("per-slot", 1, new_frames);
         return 0;
     }
 
@@ -2382,6 +2510,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 
     *audio_out = new_audio;
     *n_samples = new_samples;
+    SD_PHASE_EMIT("per-slot-windowed", 1, new_frames);
     return 0;
 }
 
@@ -2389,6 +2518,903 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
                                           const int *new_codes, int new_frames,
                                           float **audio_out, int *n_samples) {
+    qwen_mm_component(QWEN_COMP_DECODER);   /* MAC audit: the streaming paths too, or their work lands in "other" */
     return qwen_speech_decoder_decode_streaming_st(ctx, &ctx->sd_stream,
                                                    new_codes, new_frames, audio_out, n_samples);
 }
+
+/* ==========================================================================
+ * CROSS-SLOT BATCHED STREAMING DECODE   (server flag: QWEN_DECODER_BATCH=1)
+ *
+ * THE PROBLEM THIS SOLVES. The batched Talker and Code Predictor read each weight
+ * ONCE for every slot the scheduler steps. The speech decoder did not: it was called
+ * once per slot, in sequence, so it re-read the entire decoder weight set (pre-
+ * transformer + ConvNeXt + 4 upsample blocks, hundreds of MB in fp32) N times for N
+ * slots. That is why QWEN_SERVE_PROFILE=1 puts it at 58.5% of the streaming scheduler
+ * loop and 29.8% of the WAV one at c=4 - more than the Code Predictor, more than the
+ * Talker. It is the same defect vllm-omni#3163 found in Code2Wav: a per-request
+ * for-loop de-batching what the scheduler had already batched.
+ *
+ * WHAT IS BATCHED. The math. Every GEMM and every convolution runs ONCE over the
+ * concatenation of all the items' frames, so each weight is read once per batch
+ * instead of once per slot. The batch is the leading (N) dimension of the flattened
+ * time axis of the channel-first buffers: buf[c * total + off[b] + t].
+ *
+ * WHAT IS NOT BATCHED, AND MUST NOT BE. The state. Every item keeps its own
+ * qwen_sd_stream_state_t - conv input tails, ConvTranspose overlap-add carries,
+ * vq_pad, the pre-transformer KV cache, the absolute RoPE positions. Those are read
+ * and written per item, inside the batched stages. Sharing any of them would splice
+ * two speakers together, which is exactly the failure dec_busy[] exists to prevent
+ * one level up.
+ *
+ * ---------------------------------------------------------------------------
+ * RAGGED STRATEGY: CONCATENATE, NEVER PAD.  Worst-case wasted work: ZERO frames.
+ *
+ * With the ramped chunking (QWEN_STREAM_DECODE_CHUNK, ramp 1 -> 2 -> 4 -> 8) slots
+ * reach their decode trigger at different times and with different frame counts, so
+ * a batch in which every slot has the same nframes is the exception, not the rule.
+ * Two strategies were on the table:
+ *
+ *   (a) group only items with IDENTICAL nframes. Rejected, and not on taste: in
+ *       steady state every slot uses the same chunk size (8) but fires on a
+ *       different iteration, because its phase is set by when the request arrived.
+ *       Slots at independent phase co-fire in the same iteration with probability
+ *       ~(1/8) per extra slot, so the batch would almost always be B=1 - the change
+ *       would measure as "no effect" and we would conclude the wrong thing.
+ *
+ *   (b) pad every item up to max(nframes) and throw the tail away. Not merely
+ *       wasteful - IMPOSSIBLE here: the padding frames do not exist yet (their codes
+ *       have not been generated), and feeding invented codes would advance the conv
+ *       tails, carries and KV cache of a *stateful* decoder with garbage. There is no
+ *       cheap rollback.
+ *
+ * So: ragged concatenation. Item b owns columns [off[b], off[b]+len[b]) of a single
+ * flattened buffer; the im2col of every conv is built per item, from that item's own
+ * columns and its own tail, and then ONE GEMM covers all of them. No padded frame is
+ * ever computed, so the wasted work is exactly zero frames in the worst case. What
+ * the strategy costs instead is bookkeeping (per-item offsets at every stage) and the
+ * per-item tail/carry handling - which is the same work the per-slot path already did,
+ * not extra work.
+ *
+ * The phase problem of (a) is then solved in the CALLER, not here (qwen_tts.c: once
+ * any slot fires, the others with frames pending join the same batch), which is why
+ * this function has to accept ragged input in the first place.
+ * ---------------------------------------------------------------------------
+ *
+ * WHAT WOULD FALSIFY THIS, AND WHAT WAS MEASURED. The audio must not move:
+ * tests/decoder_batch_parity.c decodes the same codes both ways and reports the max
+ * abs sample difference, and `make test-serve-stream-batch` must stay at corr=1.00000
+ * with an exact sample count. Both hold. Most streams come out at exactly 0.
+ *
+ * The residue that is left is NOT the batching, and it is worth writing down because
+ * the obvious reading ("fp noise, whatever") is wrong twice over:
+ *   - Accelerate routes an sgemm with M==1 through a GEMV kernel whose K-reduction
+ *     order differs from the M>1 kernel (M=1 vs M=5, N=512, K=1024 -> 2.9e-05;
+ *     M=2..16 -> exactly 0). That fires on the ramp's ONE-frame first chunk.
+ *   - and N is not neutral either at every shape: M=768, K=5376 gives exactly 0 for
+ *     N=256/262/274/320/608, but 2.4e-04 for N=310 - which is exactly the width the
+ *     per-slot conv1d asks for (256 columns + a 54-column dilation-9 tail).
+ * Both are properties of the BLAS that the PER-SLOT path already has: change its chunk
+ * size and its own last bits move too. End to end that is 8.1e-06 with 1-frame chunks
+ * and 3.1e-07 without, against a 16-bit LSB of 3.05e-05.
+ *
+ * TWO DEFECTS THIS FOUND THAT WERE NOT ARITHMETIC AT ALL, and the rule that came out
+ * of them: the depthwise conv and the final conv were first written as strided copies
+ * of the per-slot loops. Identical source, different codegen - through an
+ * out-parameter the compiler cannot prove non-aliasing and does not contract the
+ * k-loop into FMAs, while in the per-slot version the output buffer is malloc'd
+ * locally and it does. One ULP, amplified 480x by the upsampling stack into ~1e-05 on
+ * the audio. Hence cs_dwconv() and cs_final_conv() are now called by BOTH paths.
+ * **When two paths must agree to the last bit, share the function - do not copy the
+ * loop.** (Cost of that decision, stated: cs_dwconv is now called from two sites, so
+ * the compiler no longer inlines it into the per-slot decoder, and the per-slot path's
+ * own last bits shifted by ~1 ULP relative to the previous build. The gate that
+ * matters - corr and sample count against a single-stream reference - is unchanged.)
+ *
+ * NOT BATCHED (falls back to the per-slot loop, by design):
+ *   - n_items == 1                  -> bit-identical by construction
+ *   - QWEN_SD_WINDOWED=1            -> the legacy approximate path
+ *   - QWEN_SD_INT8=1                -> the int8 conv kernel is per-call, not ragged
+ *   - a CUDA-resident conv decoder  -> owns the conv stack
+ *   - builds without USE_BLAS       -> the ragged helpers are sgemm-based
+ * ========================================================================== */
+
+#ifdef USE_BLAS
+
+/* Ragged time axis over `n` items: item b owns [off[b], off[b]+len[b]). */
+typedef struct {
+    int      n;
+    int     *len;
+    int64_t *off;
+    int64_t  total;
+} sd_rag_t;
+
+static int rag_alloc(sd_rag_t *r, int n) {
+    r->n = n; r->total = 0;
+    r->len = (int *)calloc((size_t)n, sizeof(int));
+    r->off = (int64_t *)calloc((size_t)n, sizeof(int64_t));
+    return (r->len && r->off) ? 0 : -1;
+}
+static void rag_recompute(sd_rag_t *r) {
+    int64_t o = 0;
+    for (int i = 0; i < r->n; i++) { r->off[i] = o; o += r->len[i]; }
+    r->total = o;
+}
+static void rag_free(sd_rag_t *r) { free(r->len); free(r->off); r->len = NULL; r->off = NULL; }
+
+/* cs_save_tail for one item inside a flattened [in_ch x total] buffer (row stride is
+ * `total`, not `len`). Same semantics otherwise: new tail = last tail_cols columns of
+ * [old tail | this item's chunk]. */
+static void rag_save_tail(float *tail, const float *in, int in_ch,
+                          int64_t total, int64_t off, int len, int tail_cols) {
+    if (len >= tail_cols) {
+        for (int ic = 0; ic < in_ch; ic++)
+            memcpy(tail + (int64_t)ic * tail_cols,
+                   in + (int64_t)ic * total + off + (len - tail_cols),
+                   (size_t)tail_cols * sizeof(float));
+    } else {
+        int keep = tail_cols - len;   /* columns of the old tail that survive */
+        for (int ic = 0; ic < in_ch; ic++) {
+            float *t = tail + (int64_t)ic * tail_cols;
+            memmove(t, t + len, (size_t)keep * sizeof(float));
+            memcpy(t + keep, in + (int64_t)ic * total + off, (size_t)len * sizeof(float));
+        }
+    }
+}
+
+/* Ragged batched causal conv1d. Semantically identical to running cs_conv1d() once
+ * per item: for output column j of item b the input window is
+ *     X[p] = (p >= 0) ? in[ic][off_b + p] : tail_b[ic][tail_cols + p],
+ * i.e. the item's own frames backed by its own saved tail (all zeros before the first
+ * chunk - the same values causal zero padding produces, which is why the `warm`
+ * shortcut of cs_conv1d is unnecessary here and no work is wasted by dropping it).
+ * ONE im2col matrix and ONE sgemm cover every item: that is where the per-slot weight
+ * re-reads go away. Tails are updated AFTER the GEMM (they are read during it). */
+static int rag_conv1d(float *out, const float *in, int in_ch, int out_ch,
+                      const sd_rag_t *r, int kernel, int dilation,
+                      const float *w, const float *bias, float * const *tails) {
+    int64_t total = r->total;
+    if (kernel == 1) {
+        /* k=1 has no time coupling at all, so the flattened axis IS the batch. */
+        SD_GEMM(CblasNoTrans, CblasNoTrans, out_ch, (int)total, in_ch,
+                1.0f, w, in_ch, in, (int)total, 0.0f, out, (int)total);
+        conv_add_bias(out, bias, out_ch, (int)total);
+        return 0;
+    }
+
+    int tail_cols = (kernel - 1) * dilation;
+    int64_t col_rows = (int64_t)in_ch * kernel;
+
+    /* Same im2col memory cap as the per-slot path; tiles are cut on the FLATTENED
+     * axis, and a tile still spans several items, so it costs one weight read for
+     * all of them. */
+    int64_t max_tile = CONV_TILE_MAX_BYTES / (col_rows * (int64_t)sizeof(float));
+    if (max_tile < 1) max_tile = 1;
+    if (max_tile > total) max_tile = total;
+    float *col = (float *)aligned_malloc(col_rows * max_tile * sizeof(float));
+    if (!col) return -1;
+
+    for (int64_t ts = 0; ts < total; ts += max_tile) {
+        int64_t tile = (ts + max_tile > total) ? (total - ts) : max_tile;
+        memset(col, 0, col_rows * tile * sizeof(float));
+        for (int b = 0; b < r->n; b++) {
+            int64_t lo = r->off[b] > ts ? r->off[b] : ts;
+            int64_t hi = (r->off[b] + r->len[b]) < (ts + tile) ? (r->off[b] + r->len[b]) : (ts + tile);
+            if (lo >= hi) continue;
+            const float *tl_base = tails ? tails[b] : NULL;
+            for (int ic = 0; ic < in_ch; ic++) {
+                const float *src = in + (int64_t)ic * total + r->off[b];
+                const float *tl  = tl_base ? tl_base + (int64_t)ic * tail_cols : NULL;
+                for (int k = 0; k < kernel; k++) {
+                    float *cr = col + ((int64_t)ic * kernel + k) * tile;
+                    int64_t shift = (int64_t)tail_cols - (int64_t)k * dilation;   /* p = j - shift */
+                    for (int64_t gc = lo; gc < hi; gc++) {
+                        int64_t p = (gc - r->off[b]) - shift;
+                        cr[gc - ts] = (p >= 0) ? src[p] : (tl ? tl[tail_cols + p] : 0.0f);
+                    }
+                }
+            }
+        }
+        SD_GEMM(CblasNoTrans, CblasNoTrans, out_ch, (int)tile, (int)col_rows,
+                1.0f, w, (int)col_rows, col, (int)tile, 0.0f, out + ts, (int)total);
+    }
+    free(col);
+    conv_add_bias(out, bias, out_ch, (int)total);
+
+    if (tails)
+        for (int b = 0; b < r->n; b++)
+            rag_save_tail(tails[b], in, in_ch, total, r->off[b], r->len[b], tail_cols);
+    return 0;
+}
+
+/* Ragged batched causal ConvTranspose1d. Mirrors cs_convt() exactly, item by item:
+ * run untrimmed (len*stride + (kernel-stride) columns), overlap-add the item's carry
+ * into the head, emit len*stride columns with bias, save the new carry. The only
+ * thing that changes is that the per-kernel-position sgemm covers ALL items at once.
+ * Writes `rout` (len[b] = in len[b]*stride) and returns a fresh [out_ch x rout.total]. */
+static float *rag_convt(const float *in, int in_ch, int out_ch,
+                        const sd_rag_t *rin, int kernel, int stride,
+                        const float *w, const float *bias, float * const *carries,
+                        sd_rag_t *rout) {
+    int cs = kernel - stride;
+    sd_rag_t rfull;
+    if (rag_alloc(&rfull, rin->n) != 0) { rag_free(&rfull); return NULL; }
+    for (int b = 0; b < rin->n; b++) {
+        rout->len[b]  = rin->len[b] * stride;
+        rfull.len[b]  = rin->len[b] * stride + cs;
+    }
+    rag_recompute(rout);
+    rag_recompute(&rfull);
+
+    float *full = (float *)aligned_calloc((int64_t)out_ch * rfull.total, sizeof(float));
+    float *wk   = (float *)aligned_malloc((int64_t)in_ch * out_ch * sizeof(float));
+    float *rk   = (float *)aligned_malloc((int64_t)out_ch * rin->total * sizeof(float));
+    float *out  = (float *)aligned_malloc((int64_t)out_ch * rout->total * sizeof(float));
+    if (!full || !wk || !rk || !out) {
+        free(full); free(wk); free(rk); free(out); rag_free(&rfull); return NULL;
+    }
+
+    for (int k = 0; k < kernel; k++) {
+        for (int ic = 0; ic < in_ch; ic++)
+            for (int oc = 0; oc < out_ch; oc++)
+                wk[(int64_t)ic * out_ch + oc] = w[((int64_t)ic * out_ch + oc) * kernel + k];
+
+        SD_GEMM(CblasTrans, CblasNoTrans, out_ch, (int)rin->total, in_ch,
+                1.0f, wk, out_ch, in, (int)rin->total, 0.0f, rk, (int)rin->total);
+
+        for (int b = 0; b < rin->n; b++) {
+            int ilen = rin->len[b], flen = rfull.len[b];
+            for (int oc = 0; oc < out_ch; oc++) {
+                const float *src = rk + (int64_t)oc * rin->total + rin->off[b];
+                float *dst = full + (int64_t)oc * rfull.total + rfull.off[b];
+                for (int t = 0; t < ilen; t++) {
+                    int pos = t * stride + k;
+                    if (pos < flen) dst[pos] += src[t];
+                }
+            }
+        }
+    }
+
+    for (int b = 0; b < rin->n; b++) {
+        int olen = rout->len[b];
+        for (int oc = 0; oc < out_ch; oc++) {
+            float *f = full + (int64_t)oc * rfull.total + rfull.off[b];
+            float *o = out  + (int64_t)oc * rout->total + rout->off[b];
+            if (carries && cs > 0) {
+                float *cr = carries[b] + (int64_t)oc * cs;
+                for (int i = 0; i < cs; i++) f[i] += cr[i];
+            }
+            float bb = bias ? bias[oc] : 0.0f;
+            for (int t = 0; t < olen; t++) o[t] = f[t] + bb;
+            if (carries && cs > 0) {
+                float *cr = carries[b] + (int64_t)oc * cs;
+                for (int i = 0; i < cs; i++) cr[i] = f[olen + i];
+            }
+        }
+    }
+    free(full); free(wk); free(rk);
+    rag_free(&rfull);
+    return out;
+}
+
+/* Ragged depthwise conv (ConvNeXt, k=7, pad_left=6): 7 weights per channel, so there
+ * is nothing to amortise across items - kept per item, on the shared flat buffer. */
+static int rag_dwconv(float *out, const float *in, int ch, const sd_rag_t *r,
+                      const float *w, const float *b, float * const *tails) {
+    /* NOT a batched kernel, and deliberately so: this calls cs_dwconv() — the SAME
+     * function the per-slot path calls — on a contiguous copy of each item's columns.
+     *
+     * WHY THE COPY, since the loop body is trivially portable to a strided view: it
+     * was measured. A hand-inlined strided twin of the loop diverged from cs_dwconv in
+     * the last bits (the very first ConvNeXt block already showed sum -100.3078361 vs
+     * -100.3078340). Same source, different codegen: in cs_dwconv the output buffer is
+     * malloc'd inside the function, so the compiler knows it cannot alias the input and
+     * contracts the k-loop into FMAs; through an out-parameter it cannot prove that and
+     * emits mul+add. One ULP there is amplified by the 480x upsampling stack into ~1e-5
+     * on the audio. Calling the identical function removes the whole question.
+     *
+     * The copy is affordable precisely because there is nothing to batch here: 7 weights
+     * per channel, so the win would have been zero anyway, and at this stage the buffer
+     * is 1024 x (2..4 * nframes) floats. */
+    int64_t total = r->total;
+    for (int i = 0; i < r->n; i++) {
+        int len = r->len[i];
+        if (len <= 0) continue;
+        int64_t off = r->off[i];
+        float *tmp = (float *)aligned_malloc((int64_t)ch * len * sizeof(float));
+        if (!tmp) return -1;
+        for (int c = 0; c < ch; c++)
+            memcpy(tmp + (int64_t)c * len, in + (int64_t)c * total + off,
+                   (size_t)len * sizeof(float));
+        float *o = cs_dwconv(tmp, ch, len, w, b, tails[i]);
+        free(tmp);
+        if (!o) return -1;
+        for (int c = 0; c < ch; c++)
+            memcpy(out + (int64_t)c * total + off, o + (int64_t)c * len,
+                   (size_t)len * sizeof(float));
+        free(o);
+    }
+    return 0;
+}
+
+/* Batched conv decoder: consumes `signal` [1024 x rg->total] (takes ownership), emits
+ * item b's 1920*nframes[b] samples into audio_out[b]. Stage for stage the same graph
+ * as conv_decoder_forward_streaming(), with the ragged batch as the flattened time
+ * axis and the per-item tails/carries applied inside each stage. */
+static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
+                                                qwen_sd_stream_state_t **sts, int nb,
+                                                float *signal, sd_rag_t *rg,
+                                                float **audio_out, int *nsamp_out) {
+    qwen_speech_decoder_t *sd = &ctx->speech_dec;
+    int rc = -1;
+    int cur_ch = 1024;
+    sd_rag_t rnext;
+    float **tails = (float **)calloc((size_t)nb, sizeof(float *));
+    if (rag_alloc(&rnext, nb) != 0 || !tails) { rag_free(&rnext); free(tails); free(signal); return -1; }
+    for (int b = 0; b < nb; b++) if (cs_ensure_alloc(sts[b]) != 0) goto done;
+
+    const int _ph = sd_phase_on();
+    double _m = _ph ? sd_ph_now() : 0.0;
+
+    /* ConvNeXt upsample (2 blocks, 2x each). k=2,s=2 -> no overlap, carry-free. */
+    for (int blk = 0; blk < 2; blk++) {
+        qwen_sd_convnext_t *cn = &sd->convnext[blk];
+        if (!cn->conv_weight) goto done;
+        float *up = rag_convt(signal, cur_ch, cur_ch, rg, 2, 2,
+                              cn->conv_weight, cn->conv_bias, NULL, &rnext);
+        free(signal); signal = NULL;
+        if (!up) goto done;
+        for (int b = 0; b < nb; b++) rg->len[b] = rnext.len[b];
+        rag_recompute(rg);
+
+        float *dw = (float *)aligned_malloc((int64_t)cur_ch * rg->total * sizeof(float));
+        if (!dw) { free(up); goto done; }
+        for (int b = 0; b < nb; b++) tails[b] = sts[b]->cs_cn_dw_tail[blk];
+        if (rag_dwconv(dw, up, cur_ch, rg, cn->dwconv_weight, cn->dwconv_bias, tails) != 0) {
+            free(up); free(dw); signal = NULL; goto done;
+        }
+        /* convnext_mlp is strictly per-timestep, so the flattened axis is safe. */
+        convnext_mlp(cn, dw, up, cur_ch, (int)rg->total);
+        free(up);
+        signal = dw;
+    }
+
+    if (_ph) { double _t = sd_ph_now(); sd_p6a += _t - _m; _m = _t; }
+
+    /* Initial conv (1024->1536, k=7) */
+    if (!sd->initial_conv_weight) goto done;
+    {
+        float *ic_out = (float *)aligned_malloc((int64_t)1536 * rg->total * sizeof(float));
+        if (!ic_out) goto done;
+        for (int b = 0; b < nb; b++) tails[b] = sts[b]->cs_init_tail;
+        int crc = rag_conv1d(ic_out, signal, cur_ch, 1536, rg, 7, 1,
+                             sd->initial_conv_weight, sd->initial_conv_bias, tails);
+        free(signal); signal = ic_out; cur_ch = 1536;
+        if (crc != 0) goto done;
+    }
+
+    if (_ph) { double _t = sd_ph_now(); sd_p6b += _t - _m; _m = _t; }
+
+    /* 4 decoder upsample blocks */
+    {
+        static const int up_rates[4]    = {8, 5, 4, 3};
+        static const int out_channels[4] = {768, 384, 192, 96};
+        static const int dilations[3]   = {1, 3, 9};
+        for (int blk = 0; blk < 4; blk++) {
+            qwen_sd_upsample_block_t *ub = &sd->upsample_blocks[blk];
+            int rate = up_rates[blk], kernel = rate * 2, out_ch = out_channels[blk];
+            if (!ub->upsample.conv_weight) goto done;
+
+            if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
+                snake_activation(signal, cur_ch, (int)rg->total,
+                                 ub->upsample.snake_alpha, ub->upsample.snake_beta);
+
+            for (int b = 0; b < nb; b++) tails[b] = sts[b]->cs_up_carry[blk];
+            float *up_out = rag_convt(signal, cur_ch, out_ch, rg, kernel, rate,
+                                      ub->upsample.conv_weight, ub->upsample.conv_bias,
+                                      tails, &rnext);
+            free(signal); signal = NULL;
+            if (!up_out) goto done;
+            for (int b = 0; b < nb; b++) rg->len[b] = rnext.len[b];
+            rag_recompute(rg);
+            signal = up_out; cur_ch = out_ch;
+
+            for (int r = 0; r < 3; r++) {
+                int dil = dilations[r];
+                int64_t nel = (int64_t)cur_ch * rg->total;
+                float *res = (float *)aligned_malloc(nel * sizeof(float));
+                if (!res) goto done;
+                memcpy(res, signal, nel * sizeof(float));
+
+                if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
+                    snake_activation(signal, cur_ch, (int)rg->total,
+                                     ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+
+                float *c1_out = (float *)aligned_malloc(nel * sizeof(float));
+                if (!c1_out) { free(res); goto done; }
+                for (int b = 0; b < nb; b++) tails[b] = sts[b]->cs_res_tail[blk][r];
+                int crc = rag_conv1d(c1_out, signal, cur_ch, cur_ch, rg, 7, dil,
+                                     ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias, tails);
+                free(signal); signal = c1_out;
+                if (crc != 0) { free(res); goto done; }
+
+                if (ub->res_blocks[r].snake2_alpha && ub->res_blocks[r].snake2_beta)
+                    snake_activation(signal, cur_ch, (int)rg->total,
+                                     ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
+
+                float *c2_out = (float *)aligned_calloc(nel, sizeof(float));
+                if (!c2_out) { free(res); goto done; }
+                rag_conv1d(c2_out, signal, cur_ch, cur_ch, rg, 1, 1,
+                           ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias, NULL);
+
+                for (int64_t i = 0; i < nel; i++) signal[i] = res[i] + c2_out[i];
+                free(c2_out); free(res);
+            }
+        }
+    }
+
+    /* Final snake + conv (96->1, k=7), per item into its own audio buffer. */
+    if (!sd->final_snake.alpha || !sd->final_conv_weight) goto done;
+    snake_activation(signal, cur_ch, (int)rg->total, sd->final_snake.alpha, sd->final_snake.beta);
+    for (int b = 0; b < nb; b++) {
+        int len = rg->len[b];
+        int64_t off = rg->off[b];
+        float *audio = (float *)aligned_calloc(len > 0 ? len : 1, sizeof(float));
+        if (!audio) goto done;
+        cs_final_conv(audio, signal, rg->total, off, cur_ch, len,
+                      sd->final_conv_weight, sd->final_conv_bias, sts[b]->cs_final_tail);
+        for (int i = 0; i < len; i++) {
+            if (audio[i] < -1.0f) audio[i] = -1.0f;
+            if (audio[i] >  1.0f) audio[i] =  1.0f;
+        }
+        audio_out[b] = audio;
+        nsamp_out[b] = len;
+        sts[b]->cs_warm = 1;   /* tails now hold real context */
+    }
+    if (_ph) sd_p6c += sd_ph_now() - _m;
+    rc = 0;
+
+done:
+    free(signal);
+    rag_free(&rnext);
+    free(tails);
+    return rc;
+}
+
+#endif /* USE_BLAS (ragged batched helpers) */
+
+/* Per-slot fallback used by every "not batched" case listed at the top. */
+static int sd_batch_fallback(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, int n) {
+    int rc = 0;
+    for (int i = 0; i < n; i++) {
+        if (it[i].nframes <= 0) continue;
+        it[i].rc = qwen_speech_decoder_decode_streaming_st(ctx, it[i].st, it[i].codes,
+                                                          it[i].nframes,
+                                                          &it[i].audio, &it[i].n_samples);
+        if (it[i].rc != 0) rc = it[i].rc;
+    }
+    return rc;
+}
+
+#ifdef USE_BLAS
+/* The batched twin of qwen_speech_decoder_decode_streaming_st(). Stage numbering and
+ * comments follow that function one-to-one; only the shapes change (a ragged batch of
+ * frames instead of one item's frames) and the state accesses become per item. */
+int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
+                                               qwen_sd_batch_item_t *it, int n_items) {
+    qwen_mm_component(QWEN_COMP_DECODER);   /* MAC audit: the streaming paths too, or their work lands in "other" */
+    const int  _ph    = sd_phase_on();
+    const double _ph_call0 = _ph ? sd_ph_now() : 0.0;
+    double _ph_p[6] = {0,0,0,0,0,0}, _ph_mark = 0.0;
+    for (int i = 0; i < n_items; i++) { it[i].audio = NULL; it[i].n_samples = 0; it[i].rc = 0; }
+
+    /* Compact away empty items; batching one item buys nothing and the per-slot path
+     * is the reference, so hand it straight over (this also keeps c=1 bit-identical). */
+    int *idx = (int *)calloc((size_t)(n_items > 0 ? n_items : 1), sizeof(int));
+    if (!idx) return -1;
+    int nb = 0;
+    for (int i = 0; i < n_items; i++) if (it[i].nframes > 0) idx[nb++] = i;
+    if (nb == 0) { free(idx); return 0; }
+    if (nb == 1 || !sd_exact_stream_enabled() || sd_int8_enabled()) {
+        /* Handed to the per-slot function, which is a DIFFERENT implementation and emits
+         * its own [SDPHASE] line. Emitting here too would count the same call twice. */
+        free(idx);
+        return sd_batch_fallback(ctx, it, n_items);
+    }
+
+    qwen_speech_decoder_t *sd = &ctx->speech_dec;
+    qwen_tts_config_t *c = &ctx->config;
+
+    int cb_dim = QWEN_TTS_CODEBOOK_DIM;
+    int vq_hidden = 512;
+    int latent_dim = 1024;
+    int dec_hidden = 512;
+    int dec_inter = 1024;
+    int n_heads = 16;
+    int head_dim = c->dec_head_dim;
+    int qkv_dim = n_heads * head_dim;
+    int window = 72;
+    float eps = c->dec_rms_norm_eps;
+    int half_hd = head_dim / 2;
+
+    int rc = -1;
+    sd_rag_t fr;                       /* frame-level ragged descriptor */
+    float **tails = NULL, **auds = NULL;
+    int *ans = NULL;
+    qwen_sd_stream_state_t **sts = NULL;
+    float *vq_out = NULL, *cb_sum = NULL, *vq_cf = NULL, *pre_conv_out = NULL;
+    float *pre_conv_rm = NULL, *hidden = NULL, *q = NULL, *new_k = NULL, *new_v = NULL;
+    float *x_norm = NULL, *attn_out = NULL, *lat_tmp = NULL, *signal = NULL;
+
+    int64_t TF = 0;
+    if (rag_alloc(&fr, nb) != 0) { rag_free(&fr); free(idx); return -1; }
+    sts   = (qwen_sd_stream_state_t **)calloc((size_t)nb, sizeof(*sts));
+    tails = (float **)calloc((size_t)nb, sizeof(float *));
+    auds  = (float **)calloc((size_t)nb, sizeof(float *));
+    ans   = (int *)calloc((size_t)nb, sizeof(int));
+    if (!sts || !tails || !auds || !ans) goto done;
+    for (int b = 0; b < nb; b++) { fr.len[b] = it[idx[b]].nframes; sts[b] = it[idx[b]].st; }
+    rag_recompute(&fr);
+    TF = fr.total;
+
+    if (_ph) { sd_p6a = sd_p6b = sd_p6c = 0.0; _ph_mark = sd_ph_now(); }
+    /* === Step 1: VQ dequant, per frame (kept scalar and per item: the RVQ projections
+     * are 2 x 512x256 MACs per frame, nothing to amortise, and reordering them would
+     * move the sums). === */
+    vq_out = (float *)aligned_calloc(TF * vq_hidden, sizeof(float));
+    cb_sum = (float *)aligned_malloc(cb_dim * sizeof(float));
+    if (!vq_out || !cb_sum) goto done;
+    for (int b = 0; b < nb; b++) {
+        const int *new_codes = it[idx[b]].codes;
+        int64_t base = fr.off[b];
+        for (int f = 0; f < fr.len[b]; f++) {
+            int code0 = new_codes[f * 16];
+            if (code0 >= 0 && code0 < c->codebook_size && sd->codebook[0]) {
+                const float *emb = sd->codebook[0] + (int64_t)code0 * cb_dim;
+                if (sd->rvq_first_output_proj) {
+                    for (int o = 0; o < vq_hidden; o++) {
+                        float sum = 0;
+                        for (int i = 0; i < cb_dim; i++)
+                            sum += sd->rvq_first_output_proj[(int64_t)o * cb_dim + i] * emb[i];
+                        vq_out[(base + f) * vq_hidden + o] += sum;
+                    }
+                }
+            }
+            memset(cb_sum, 0, cb_dim * sizeof(float));
+            for (int k = 1; k < 16; k++) {
+                int code = new_codes[f * 16 + k];
+                if (code >= 0 && code < c->codebook_size && sd->codebook[k]) {
+                    const float *emb = sd->codebook[k] + (int64_t)code * cb_dim;
+                    for (int d = 0; d < cb_dim; d++) cb_sum[d] += emb[d];
+                }
+            }
+            if (sd->rvq_rest_output_proj) {
+                for (int o = 0; o < vq_hidden; o++) {
+                    float sum = 0;
+                    for (int i = 0; i < cb_dim; i++)
+                        sum += sd->rvq_rest_output_proj[(int64_t)o * cb_dim + i] * cb_sum[i];
+                    vq_out[(base + f) * vq_hidden + o] += sum;
+                }
+            }
+        }
+    }
+
+    if (_ph) { double _t = sd_ph_now(); _ph_p[0] += _t - _ph_mark; _ph_mark = _t; }
+    /* === Step 2: pre-conv (512->1024, k=3, causal, pad_left=2) ===
+     * vq_pad IS the 2-column input tail of this conv, so it is just rag_conv1d with
+     * tails = vq_pad. An unwarmed slot must see zeros there: the per-slot path gets
+     * that from pad_frames=0 (pure causal zero padding), here from a zeroed tail. */
+    vq_cf = (float *)aligned_malloc((int64_t)vq_hidden * TF * sizeof(float));
+    if (!vq_cf) goto done;
+    for (int b = 0; b < nb; b++)
+        for (int f = 0; f < fr.len[b]; f++)
+            for (int ch = 0; ch < vq_hidden; ch++)
+                vq_cf[(int64_t)ch * TF + fr.off[b] + f] = vq_out[(fr.off[b] + f) * vq_hidden + ch];
+    free(vq_out); vq_out = NULL;
+
+    for (int b = 0; b < nb; b++) {
+        if (!sts[b]->vq_pad) {
+            sts[b]->vq_pad = (float *)aligned_calloc((int64_t)vq_hidden * 2, sizeof(float));
+            if (!sts[b]->vq_pad) goto done;
+        }
+        if (!sts[b]->vq_pad_valid) memset(sts[b]->vq_pad, 0, (size_t)vq_hidden * 2 * sizeof(float));
+        tails[b] = sts[b]->vq_pad;
+    }
+    pre_conv_out = (float *)aligned_malloc((int64_t)latent_dim * TF * sizeof(float));
+    if (!pre_conv_out) goto done;
+    if (rag_conv1d(pre_conv_out, vq_cf, vq_hidden, latent_dim, &fr, 3, 1,
+                   sd->pre_conv_weight, sd->pre_conv_bias, tails) != 0) goto done;
+    free(vq_cf); vq_cf = NULL;
+    for (int b = 0; b < nb; b++) sts[b]->vq_pad_valid = 1;
+
+    if (_ph) { double _t = sd_ph_now(); _ph_p[1] += _t - _ph_mark; _ph_mark = _t; }
+    /* === Step 3: input proj (1024->512) — one sgemm over all items' frames === */
+    hidden = (float *)aligned_malloc(TF * dec_hidden * sizeof(float));
+    pre_conv_rm = (float *)aligned_malloc(TF * latent_dim * sizeof(float));
+    if (!hidden || !pre_conv_rm) goto done;
+    for (int64_t f = 0; f < TF; f++)
+        for (int d = 0; d < latent_dim; d++)
+            pre_conv_rm[f * latent_dim + d] = pre_conv_out[(int64_t)d * TF + f];
+    free(pre_conv_out); pre_conv_out = NULL;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                (int)TF, dec_hidden, latent_dim, 1.0f,
+                pre_conv_rm, latent_dim, sd->input_proj_weight, latent_dim,
+                0.0f, hidden, dec_hidden);
+    free(pre_conv_rm); pre_conv_rm = NULL;
+    if (sd->input_proj_bias)
+        for (int64_t f = 0; f < TF; f++)
+            for (int o = 0; o < dec_hidden; o++)
+                hidden[f * dec_hidden + o] += sd->input_proj_bias[o];
+
+    if (_ph) { double _t = sd_ph_now(); _ph_p[2] += _t - _ph_mark; _ph_mark = _t; }
+    /* === Step 4: pre-transformer with a PER-ITEM KV cache ===
+     * The projections and the FFN are batched (one sgemm each, weights read once for
+     * the whole batch); RoPE, the cache append and the attention are per item because
+     * they are the state. Cache growth/compaction is done for every item BEFORE the
+     * layer loop: it rewrites all layers at once. */
+    for (int b = 0; b < nb; b++) {
+        qwen_sd_stream_state_t *st = sts[b];
+        int nf = fr.len[b];
+        int need = (st->kv_len + nf) - st->kv_base;
+        if (need > st->kv_alloc) {
+            int keep_from = st->kv_len - (window - 1);
+            if (keep_from < 0) keep_from = 0;
+            if (keep_from > st->kv_base && st->kv_len > st->kv_base) {
+                int keep = st->kv_len - keep_from;
+                int shift = keep_from - st->kv_base;
+                for (int l = 0; l < c->dec_num_layers; l++) {
+                    if (keep > 0) {
+                        memmove(st->k_cache[l], st->k_cache[l] + (int64_t)shift * qkv_dim,
+                                (int64_t)keep * qkv_dim * sizeof(float));
+                        memmove(st->v_cache[l], st->v_cache[l] + (int64_t)shift * qkv_dim,
+                                (int64_t)keep * qkv_dim * sizeof(float));
+                    }
+                }
+                st->kv_base = keep_from;
+                need = (st->kv_len + nf) - st->kv_base;
+            }
+            if (need > st->kv_alloc) {
+                int new_alloc = need + 256;
+                for (int l = 0; l < c->dec_num_layers; l++) {
+                    st->k_cache[l] = (float *)realloc(st->k_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
+                    st->v_cache[l] = (float *)realloc(st->v_cache[l], (int64_t)new_alloc * qkv_dim * sizeof(float));
+                    if (!st->k_cache[l] || !st->v_cache[l]) goto done;
+                }
+                st->kv_alloc = new_alloc;
+            }
+        }
+    }
+
+    q        = (float *)aligned_malloc(TF * qkv_dim * sizeof(float));
+    new_k    = (float *)aligned_malloc(TF * qkv_dim * sizeof(float));
+    new_v    = (float *)aligned_malloc(TF * qkv_dim * sizeof(float));
+    x_norm   = (float *)aligned_malloc(TF * dec_hidden * sizeof(float));
+    attn_out = (float *)aligned_malloc(TF * qkv_dim * sizeof(float));
+    if (!q || !new_k || !new_v || !x_norm || !attn_out) goto done;
+
+    for (int layer = 0; layer < c->dec_num_layers; layer++) {
+        qwen_sd_pre_layer_t *l = &sd->pre_layers[layer];
+
+        qwen_rms_norm(x_norm, hidden, l->attn_norm, (int)TF, dec_hidden, eps);
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
+                    1.0f, x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
+                    1.0f, x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, new_k, qkv_dim);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
+                    1.0f, x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, new_v, qkv_dim);
+
+        /* NeoX split-half RoPE at the item's own absolute positions */
+        for (int b = 0; b < nb; b++) {
+            for (int s = 0; s < fr.len[b]; s++) {
+                int64_t row = fr.off[b] + s;
+                int abs_pos = sts[b]->kv_len + s;
+                const float *cos_ptr = sd->rope_cos + (int64_t)abs_pos * half_hd;
+                const float *sin_ptr = sd->rope_sin + (int64_t)abs_pos * half_hd;
+                for (int h = 0; h < n_heads; h++) {
+                    float *qh = q + row * qkv_dim + h * head_dim;
+                    float *kh = new_k + row * qkv_dim + h * head_dim;
+                    for (int i = 0; i < half_hd; i++) {
+                        float q1 = qh[i], q2 = qh[i + half_hd];
+                        float k1 = kh[i], k2 = kh[i + half_hd];
+                        float co = cos_ptr[i], si = sin_ptr[i];
+                        qh[i]           = q1 * co - q2 * si;
+                        qh[i + half_hd] = q2 * co + q1 * si;
+                        kh[i]           = k1 * co - k2 * si;
+                        kh[i + half_hd] = k2 * co + k1 * si;
+                    }
+                }
+            }
+        }
+
+        /* Append K/V and run sliding-window causal attention, per item */
+        float scale = 1.0f / sqrtf((float)head_dim);
+        for (int b = 0; b < nb; b++) {
+            qwen_sd_stream_state_t *st = sts[b];
+            int nf = fr.len[b];
+            int64_t base = fr.off[b];
+            memcpy(st->k_cache[layer] + (int64_t)(st->kv_len - st->kv_base) * qkv_dim,
+                   new_k + base * qkv_dim, (int64_t)nf * qkv_dim * sizeof(float));
+            memcpy(st->v_cache[layer] + (int64_t)(st->kv_len - st->kv_base) * qkv_dim,
+                   new_v + base * qkv_dim, (int64_t)nf * qkv_dim * sizeof(float));
+
+            for (int sq = 0; sq < nf; sq++) {
+                int abs_sq = st->kv_len + sq;
+                float *out = attn_out + (base + sq) * qkv_dim;
+                memset(out, 0, qkv_dim * sizeof(float));
+                int sk_start = (abs_sq - window + 1 > 0) ? abs_sq - window + 1 : 0;
+                int sk_end = abs_sq;
+                for (int h = 0; h < n_heads; h++) {
+                    const float *qh = q + (base + sq) * qkv_dim + h * head_dim;
+                    float *oh = out + h * head_dim;
+                    int n_keys = sk_end - sk_start + 1;
+                    float scores_buf[512];
+                    float *scores = n_keys <= 512 ? scores_buf : (float *)malloc(n_keys * sizeof(float));
+                    float max_score = -1e30f;
+                    for (int j = 0; j < n_keys; j++) {
+                        int sk = sk_start + j;
+                        const float *kh = st->k_cache[layer] + (int64_t)(sk - st->kv_base) * qkv_dim + h * head_dim;
+                        float dot = 0;
+                        for (int d = 0; d < head_dim; d++) dot += qh[d] * kh[d];
+                        scores[j] = dot * scale;
+                        if (scores[j] > max_score) max_score = scores[j];
+                    }
+                    float sum_exp = 0;
+                    for (int j = 0; j < n_keys; j++) {
+                        scores[j] = expf(scores[j] - max_score);
+                        sum_exp += scores[j];
+                    }
+                    float inv_sum = 1.0f / sum_exp;
+                    for (int j = 0; j < n_keys; j++) {
+                        int sk = sk_start + j;
+                        const float *vh = st->v_cache[layer] + (int64_t)(sk - st->kv_base) * qkv_dim + h * head_dim;
+                        float w = scores[j] * inv_sum;
+                        for (int d = 0; d < head_dim; d++) oh[d] += vh[d] * w;
+                    }
+                    if (scores != scores_buf) free(scores);
+                }
+            }
+        }
+
+        /* Output proj + layer_scale + residual */
+        {
+            float *oproj = x_norm;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_hidden, qkv_dim,
+                        1.0f, attn_out, qkv_dim, l->attn_o, qkv_dim, 0.0f, oproj, dec_hidden);
+            for (int64_t s = 0; s < TF; s++) {
+                float *xs = hidden + s * dec_hidden;
+                float *ps = oproj + s * dec_hidden;
+                if (l->attn_layer_scale) {
+                    for (int o = 0; o < dec_hidden; o++) xs[o] += ps[o] * l->attn_layer_scale[o];
+                } else {
+                    for (int o = 0; o < dec_hidden; o++) xs[o] += ps[o];
+                }
+            }
+        }
+
+        qwen_rms_norm(x_norm, hidden, l->ffn_norm, (int)TF, dec_hidden, eps);
+
+        {
+            float *ffn_gate = (float *)aligned_malloc(TF * dec_inter * sizeof(float));
+            float *ffn_up   = (float *)aligned_malloc(TF * dec_inter * sizeof(float));
+            float *ffn_down_out = NULL;
+            if (!ffn_gate || !ffn_up) { free(ffn_gate); free(ffn_up); goto done; }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
+                        1.0f, x_norm, dec_hidden, l->ffn_gate, dec_hidden, 0.0f, ffn_gate, dec_inter);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
+                        1.0f, x_norm, dec_hidden, l->ffn_up, dec_hidden, 0.0f, ffn_up, dec_inter);
+            for (int64_t i = 0; i < TF * dec_inter; i++)
+                ffn_gate[i] = (ffn_gate[i] / (1.0f + expf(-ffn_gate[i]))) * ffn_up[i];
+            free(ffn_up);
+            ffn_down_out = (float *)aligned_malloc(TF * dec_hidden * sizeof(float));
+            if (!ffn_down_out) { free(ffn_gate); goto done; }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_hidden, dec_inter,
+                        1.0f, ffn_gate, dec_inter, l->ffn_down, dec_inter, 0.0f, ffn_down_out, dec_hidden);
+            free(ffn_gate);
+            for (int64_t s = 0; s < TF; s++) {
+                float *hs = hidden + s * dec_hidden;
+                float *ds = ffn_down_out + s * dec_hidden;
+                if (l->ffn_layer_scale) {
+                    for (int o = 0; o < dec_hidden; o++) hs[o] += ds[o] * l->ffn_layer_scale[o];
+                } else {
+                    for (int o = 0; o < dec_hidden; o++) hs[o] += ds[o];
+                }
+            }
+            free(ffn_down_out);
+        }
+    }
+    for (int b = 0; b < nb; b++) sts[b]->kv_len += fr.len[b];
+    free(q); q = NULL; free(new_k); new_k = NULL; free(new_v); new_v = NULL;
+    free(x_norm); x_norm = NULL; free(attn_out); attn_out = NULL;
+
+    if (_ph) { double _t = sd_ph_now(); _ph_p[3] += _t - _ph_mark; _ph_mark = _t; }
+    /* === Step 5: final RMSNorm + output proj (512->1024), then per-item latent cache
+     * (grown/compacted per item, then filled by memcpy — the sgemm itself is batched). */
+    if (sd->final_norm_weight)
+        qwen_rms_norm(hidden, hidden, sd->final_norm_weight, (int)TF, dec_hidden, eps);
+
+    lat_tmp = (float *)aligned_malloc(TF * latent_dim * sizeof(float));
+    if (!lat_tmp) goto done;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, latent_dim, dec_hidden,
+                1.0f, hidden, dec_hidden, sd->output_proj_weight, dec_hidden,
+                0.0f, lat_tmp, latent_dim);
+    if (sd->output_proj_bias)
+        for (int64_t f = 0; f < TF; f++)
+            for (int o = 0; o < latent_dim; o++)
+                lat_tmp[f * latent_dim + o] += sd->output_proj_bias[o];
+    free(hidden); hidden = NULL;
+
+    for (int b = 0; b < nb; b++) {
+        qwen_sd_stream_state_t *st = sts[b];
+        int nf = fr.len[b];
+        int lat_need = (st->latent_frames + nf) - st->latent_base;
+        if (lat_need > st->latent_alloc) {
+            int lkeep_from = st->latent_frames - QWEN_SD_STREAM_CONV_RF;
+            if (lkeep_from < 0) lkeep_from = 0;
+            if (lkeep_from > st->latent_base && st->latent_frames > st->latent_base) {
+                int lkeep = st->latent_frames - lkeep_from;
+                int lshift = lkeep_from - st->latent_base;
+                if (lkeep > 0)
+                    memmove(st->latent_cache, st->latent_cache + (int64_t)lshift * latent_dim,
+                            (int64_t)lkeep * latent_dim * sizeof(float));
+                st->latent_base = lkeep_from;
+                lat_need = (st->latent_frames + nf) - st->latent_base;
+            }
+            if (lat_need > st->latent_alloc) {
+                int new_alloc = lat_need + 256;
+                float *nc = (float *)realloc(st->latent_cache,
+                                             (int64_t)new_alloc * latent_dim * sizeof(float));
+                if (!nc) goto done;
+                st->latent_cache = nc;
+                st->latent_alloc = new_alloc;
+            }
+        }
+        memcpy(st->latent_cache + (int64_t)(st->latent_frames - st->latent_base) * latent_dim,
+               lat_tmp + fr.off[b] * latent_dim, (int64_t)nf * latent_dim * sizeof(float));
+        st->latent_frames += nf;
+    }
+
+    if (_ph) { double _t = sd_ph_now(); _ph_p[4] += _t - _ph_mark; _ph_mark = _t; }
+    /* === Step 6: batched conv decoder on the new frames only === */
+    signal = (float *)aligned_malloc((int64_t)latent_dim * TF * sizeof(float));
+    if (!signal) goto done;
+    for (int64_t f = 0; f < TF; f++)
+        for (int d = 0; d < latent_dim; d++)
+            signal[(int64_t)d * TF + f] = lat_tmp[f * latent_dim + d];
+    free(lat_tmp); lat_tmp = NULL;
+
+    {
+        /* conv_decoder_forward_streaming_batch takes ownership of `signal` and mutates
+         * fr.len in place as the stack upsamples (x2, x2, x8, x5, x4, x3 = x1920). */
+        int frc = conv_decoder_forward_streaming_batch(ctx, sts, nb, signal, &fr, auds, ans);
+        signal = NULL;
+        if (frc != 0) { for (int b = 0; b < nb; b++) free(auds[b]); goto done; }
+    }
+    for (int b = 0; b < nb; b++) {
+        sts[b]->frames_decoded += it[idx[b]].nframes;
+        sts[b]->samples_produced += ans[b];
+        it[idx[b]].audio = auds[b];
+        it[idx[b]].n_samples = ans[b];
+        auds[b] = NULL;
+    }
+    rc = 0;
+    SD_PHASE_EMIT("ragged", nb, (int)TF);
+
+done:
+    free(idx); rag_free(&fr);
+    free(sts); free(tails); free(auds); free(ans);
+    free(vq_out); free(cb_sum); free(vq_cf); free(pre_conv_out); free(pre_conv_rm);
+    free(hidden); free(q); free(new_k); free(new_v); free(x_norm); free(attn_out);
+    free(lat_tmp); free(signal);
+    if (rc != 0) for (int i = 0; i < n_items; i++) it[i].rc = rc;
+    return rc;
+}
+#else  /* !USE_BLAS */
+int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
+                                               qwen_sd_batch_item_t *it, int n_items) {
+    /* The ragged helpers are sgemm-based; without BLAS there is no batched twin to
+     * call, and a hand-rolled one would be slower than the scalar per-slot path. */
+    for (int i = 0; i < n_items; i++) { it[i].audio = NULL; it[i].n_samples = 0; it[i].rc = 0; }
+    return sd_batch_fallback(ctx, it, n_items);
+}
+#endif /* USE_BLAS */

@@ -197,29 +197,49 @@ mkdir -p "${MODEL_DIR}/speech_tokenizer"
 
 BASE_URL="https://huggingface.co/${MODEL_ID}/resolve/main"
 
+# Scarica in modo ATOMICO: curl scrive su <dest>.part e SOLO un curl riuscito
+# rinomina in <dest>.
+#
+# PERCHE' NON BASTA `curl -o "$dest"`, ed e' il motivo per cui questa funzione esiste:
+# lo "[skip] (already exists)" qui sotto e' sicuro solo se la presenza del file implica
+# la sua COMPLETEZZA. Scrivendo diretto sulla destinazione, un download interrotto —
+# Ctrl-C, rete che cade, box spento, timeout ssh — lascia un model.safetensors TRONCATO
+# al posto giusto. Ogni run successivo lo salta dicendo "already exists", il modello si
+# carica senza un errore, e i pesi sono spazzatura a meta' file: il sintomo arriva molto
+# piu' tardi, come audio sbagliato, e non come fallimento del download. Con .part+mv un
+# file interrotto non e' MAI scambiabile per un file valido.
+#
+# `-C -` riprende un .part parziale invece di ributtare via i GB gia' scesi, e viene
+# passato solo se il .part c'e' davvero (curl con -C - su un file assente e' legale ma
+# inutile, e cosi' l'intento resta leggibile).
+fetch() {
+    local dest="$1" url="$2" label="$3"
+    if [[ -f "${dest}" ]]; then
+        echo "  [skip] ${label} (already exists)"
+        return 0
+    fi
+    local resume=()
+    [[ -f "${dest}.part" ]] && { resume=(-C -); echo "  [resume] ${label} (ripresa di un .part parziale)"; }
+    echo "  [download] ${label}..."
+    if curl -fL "${resume[@]}" -o "${dest}.part" "${url}" --progress-bar; then
+        mv -f "${dest}.part" "${dest}"
+        echo "  [done] ${label}"
+    else
+        echo "  🚨 download FALLITO: ${label} — il parziale resta in ${dest}.part (rilancia per riprenderlo)"
+        return 1
+    fi
+}
+
 echo "=== Main model files ==="
 for file in "${FILES[@]}"; do
-    dest="${MODEL_DIR}/${file}"
-    if [[ -f "${dest}" ]]; then
-        echo "  [skip] ${file} (already exists)"
-    else
-        echo "  [download] ${file}..."
-        curl -fL -o "${dest}" "${BASE_URL}/${file}" --progress-bar
-        echo "  [done] ${file}"
-    fi
+    fetch "${MODEL_DIR}/${file}" "${BASE_URL}/${file}" "${file}"
 done
 
 echo ""
 echo "=== Speech tokenizer files ==="
 for file in "${SPEECH_TOKENIZER_FILES[@]}"; do
-    dest="${MODEL_DIR}/speech_tokenizer/${file}"
-    if [[ -f "${dest}" ]]; then
-        echo "  [skip] speech_tokenizer/${file} (already exists)"
-    else
-        echo "  [download] speech_tokenizer/${file}..."
-        curl -fL -o "${dest}" "${BASE_URL}/speech_tokenizer/${file}" --progress-bar
-        echo "  [done] speech_tokenizer/${file}"
-    fi
+    fetch "${MODEL_DIR}/speech_tokenizer/${file}" \
+          "${BASE_URL}/speech_tokenizer/${file}" "speech_tokenizer/${file}"
 done
 
 echo ""

@@ -911,6 +911,9 @@ int main(int argc, char **argv) {
     const char *text = NULL;
     const char *output = "output.wav";
     int speaker_id = -1;
+    int speaker_slot = -1;      /* --speaker-id: a raw codec slot, bypassing name lookup */
+    int list_speakers = 0;      /* --list-speakers */
+    const char *speaker_map = NULL;  /* --speaker-map: name->slot table from another model */
     const char *language = NULL;
     const char *instruct = NULL;
     float temperature = 0.9f;
@@ -919,6 +922,9 @@ int main(int argc, char **argv) {
     float top_p = 1.0f;
     float rep_penalty = 1.05f;
     int max_tokens = 8192;
+    /* EOS: -1 / -1.0 = "non passato", cosi' i default del contesto restano intatti */
+    int   eos_strategy = -1, eos_suppress = -1, eos_overhead = -1, eos_topk = -1;
+    float eos_fpt = -1.0f, eos_start_mult = -1.0f, eos_ramp = -1.0f, eos_cap = -1.0f;
     int silent = 0;
     int debug = 0;
     int threads = 0;  /* 0 = auto-detect */
@@ -928,8 +934,21 @@ int main(int argc, char **argv) {
     int serve_port = 0;  /* 0 = not serving */
     int serve_workers = 1;  /* --workers: concurrent synthesis workers (server mode) */
     int serve_batch = 1;    /* --batch-size: vLLM-style request-batching (server; N>=2 enables) */
+    int serve_prefork = 1;         /* --prefork N: N pinned worker PROCESSES, weights shared via COW */
+    int serve_prefork_threads = 0; /* --prefork-threads K: threads per worker (0 = cpus/N) */
+    int serve_max_queue = -1;      /* --max-queue: -1 = auto (1), 0 = nessuna coda */
+    int serve_queue_timeout = 0;   /* --queue-timeout-ms: 0 = nessuna scadenza */
     const char *ml_steer_path = NULL;  /* --ml-steer: multi-layer Talker emotion steer (.qlsteer) */
     float ml_steer_weight = 8.0f;      /* --ml-weight */
+    /* --emotion-weight: doses the steer that --emotion applies. The w12 in the
+     * recipe table was calibrated on CLONED voices, which would not emote at all
+     * without a strong push. A full finetune with baked speakers is already
+     * plastic, so the same push overshoots — and the excess does not become more
+     * emotion, it becomes drift, which shows up as lost accent.
+     * Measured 2026-08-14: --emotion sad on a finetuned voice drops language identity from ~90% to
+     * ~8%. See the design notes. -1 = keep the recipe. */
+    float emotion_weight = -1.0f;
+    int   emotion_layers_l0 = -1, emotion_layers_l1 = -1;   /* --emotion-layers A-B */
     int ml_l0 = 21, ml_l1 = 25;        /* --ml-range "l0-l1" (identity layers) */
     float ml_decay = 0.985f;           /* --ml-decay: per-frame weight multiplier. DEFAULT 0.985 = derail-fix
                                           always-on (tames the EOS "so so so" tail on steering). 1.0 = no decay */
@@ -937,6 +956,7 @@ int main(int argc, char **argv) {
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
     int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
+    int run_matmat_tune = 0;  /* --matmat-tune: measure the kernel-gate thresholds on this box, exit */
     int run_gpu_selftest = 0; /* --gpu-selftest: GPU-vs-CPU matvec/matmat correctness + timing, exit (GPU builds) */
     int run_gpu_selftest_talker = 0; /* --gpu-selftest-talker: fused resident Talker step vs CPU (needs model) */
     int run_gpu_batch_bench = 0; int gpu_batch_B = 4; /* --gpu-batch-bench N: batched Talker correctness + throughput */
@@ -972,6 +992,15 @@ int main(int argc, char **argv) {
     const char *save_voice = NULL;
     const char *load_voice = NULL;
     const char *expr_path = NULL;    /* --expr: additive expressivity weight delta (<lang>.expr) */
+    /* --gguf-talker: replace the Talker's seven per-layer matrices with the weights held
+     * in a quantized GGUF (Q8_0 / Q6_K / Q4_K_M / Q4_0). Purely additive: without it the
+     * safetensors path runs exactly as before. See qwen_tts_gguf.c for what it does not
+     * touch and why. */
+    const char *gguf_talker_path = NULL;
+    int run_q8_bench = 0;
+    const char *export_q4lsq = NULL;
+    const char *q8_selftest_path = NULL;  /* --q8-selftest: repack + kernel check, then exit */
+    const char *gguf_rest_path = NULL;   /* --gguf-rest: Code Predictor + codec_head + text_proj */
     float expr_weight = 1.0f;        /* --expr-weight: dose a factored-LoRA .expr (1=as trained) */
     int   onset_fade_ms = 0;         /* --onset-fade <ms>: fade-in over the REAL attack (0=off) */
     int   tail_trim = 0;             /* --tail-trim: cut a degenerate metallic tail (default off) */
@@ -1031,6 +1060,11 @@ int main(int argc, char **argv) {
         {"icl-frames",    required_argument, 0, 1052},
         {"graft",         no_argument,       0, 1053},
         {"expr",          required_argument, 0, 1054},
+        {"gguf-talker",   required_argument, 0, 1400},
+        {"gguf-rest",     required_argument, 0, 1401},
+        {"q8-selftest",   required_argument, 0, 1402},
+        {"q8-bench",      no_argument,       0, 1403},
+        {"export-q4lsq",  required_argument, 0, 1404},
         {"expr-weight",   required_argument, 0, 1055},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
@@ -1039,12 +1073,19 @@ int main(int argc, char **argv) {
         {"int8",          no_argument,       0, 1014},
         {"int4",          no_argument,       0, 1015},
         {"quant-mixed",   no_argument,       0, 1073},
+        {"quant-mixed-cpu", no_argument,     0, 1075},
+        {"quant-mixed-int6", optional_argument, 0, 1076},
         {"voice-name",    required_argument, 0, 1022},
         {"greedy-warmup", required_argument, 0, 1023},
         {"target-cv",     required_argument, 0, 1024},
+        {"max-queue",     required_argument, 0, 1090},
+        {"queue-timeout-ms", required_argument, 0, 1091},
         {"caps",          no_argument,       0, 1025},
         {"workers",       required_argument, 0, 1026},
         {"batch-size",    required_argument, 0, 1043},
+        {"prefork",         required_argument, 0, 1810},
+        {"prefork-threads", required_argument, 0, 1811},
+        {"prefork-elastic", no_argument,       0, 1812},
         {"ml-steer",      required_argument, 0, 1044},
         {"ml-weight",     required_argument, 0, 1045},
         {"ml-range",      required_argument, 0, 1046},
@@ -1052,6 +1093,7 @@ int main(int argc, char **argv) {
         {"ml-frames",     required_argument, 0, 1048},
         {"self-test",     no_argument,       0, 1027},
         {"matmat-bench",  no_argument,       0, 1038},
+        {"matmat-tune",   no_argument,       0, 1096},
         {"gpu-selftest",  no_argument,       0, 1070},
         {"backend",       required_argument, 0, 1071},
         {"gpu-selftest-talker", no_argument, 0, 1072},
@@ -1071,8 +1113,22 @@ int main(int argc, char **argv) {
         {"batch-multi-test", required_argument, 0, 1042},
         {"onset-fade",    required_argument, 0, 1057},
         {"tail-trim",     no_argument,       0, 1058},
+        /* EOS strategy — the design notes. */
+        {"eos-strategy",  required_argument, 0, 1700},
+        {"eos-suppress",  required_argument, 0, 1701},
+        {"eos-fpt",       required_argument, 0, 1702},
+        {"eos-start-mult",required_argument, 0, 1703},
+        {"eos-overhead",  required_argument, 0, 1704},
+        {"eos-ramp",      required_argument, 0, 1705},
+        {"eos-cap",       required_argument, 0, 1706},
+        {"eos-topk",      required_argument, 0, 1707},
+        {"emotion-weight",required_argument, 0, 1710},
+        {"emotion-layers",required_argument, 0, 1711},
         {"seed-audition", required_argument, 0, 1059},
         {"audition-keep", no_argument,       0, 1060},
+        {"speaker-id",    required_argument, 0, 1061},
+        {"list-speakers", no_argument,       0, 1062},
+        {"speaker-map",   required_argument, 0, 1063},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -1083,7 +1139,9 @@ int main(int argc, char **argv) {
             case 'd': model_dir = optarg; break;
             case 't': text = optarg; break;
             case 'o': output = optarg; break;
-            case 's': speaker_id = qwen_tts_speaker_id(optarg); speaker_name = optarg; break;
+            /* Resolution is deferred to after the model is loaded: the authoritative
+             * speaker table lives in the model's own config.json, which is not read yet. */
+            case 's': speaker_name = optarg; break;
             case 'l': language = optarg; break;
             case 'T': temperature = (float)atof(optarg); temp_set = 1; break;
             case 'k': top_k = atoi(optarg); break;
@@ -1097,6 +1155,32 @@ int main(int argc, char **argv) {
             case 1003: stream_chunk = atoi(optarg); break;
             case 1004: serve_port = atoi(optarg); break;
             case 1005: seed = atoi(optarg); break;
+            case 1700:
+                eos_strategy = qwen_tts_eos_strategy_parse(optarg);
+                if (eos_strategy < 0) {
+                    fprintf(stderr, "Error: unknown --eos-strategy '%s'. "
+                                    "Use: off | v1 | v2 | topk\n", optarg);
+                    return 1;
+                }
+                break;
+            case 1701: eos_suppress   = atoi(optarg); break;
+            case 1702: eos_fpt        = (float)atof(optarg); break;
+            case 1703: eos_start_mult = (float)atof(optarg); break;
+            case 1704: eos_overhead   = atoi(optarg); break;
+            case 1705: eos_ramp       = (float)atof(optarg); break;
+            case 1706: eos_cap        = (float)atof(optarg); break;
+            case 1707: eos_topk       = atoi(optarg); break;
+            case 1710: emotion_weight = (float)atof(optarg); break;
+            case 1711: {
+                int a, b;
+                if (sscanf(optarg, "%d-%d", &a, &b) == 2) {
+                    emotion_layers_l0 = a; emotion_layers_l1 = b;
+                } else {
+                    fprintf(stderr, "Error: --emotion-layers wants A-B, e.g. 21-25\n");
+                    return 1;
+                }
+                break;
+            }
             case 1006: max_duration = (float)atof(optarg); break;
             case 1007: voice_design = 1; break;
             case 1008: ref_audio = optarg; break;
@@ -1105,6 +1189,9 @@ int main(int argc, char **argv) {
             case 1602: emotion_strength = (float)atof(optarg); break;
             case 1601: emo_ref_text = optarg; break;
             case 1010: xvector_only = 1; break;
+            case 1061: speaker_slot = atoi(optarg); break;
+            case 1062: list_speakers = 1; break;
+            case 1063: speaker_map = optarg; break;
             case 1011: save_voice = optarg; break;
             case 1012: load_voice = optarg; break;
             case 1013: max_ref_duration = (float)atof(optarg); break;
@@ -1114,16 +1201,46 @@ int main(int argc, char **argv) {
             case 1052: icl_frames = atoi(optarg); break;
             case 1053: graft = 1; icl_only = 1; break;  /* --graft implies --icl-only (skip WDELTA too) */
             case 1054: expr_path = optarg; break;        /* --expr <lang>.expr expressivity delta */
+            case 1400: gguf_talker_path = optarg; break;
+            case 1401: gguf_rest_path = optarg; break;
+            case 1402: q8_selftest_path = optarg; break;   /* --q8-selftest <q8_0.gguf> */
+            case 1403: run_q8_bench = 1; break;
+            case 1404: export_q4lsq = optarg; break;   /* --export-q4lsq <out.gguf> */            /* --q8-bench: GEMV vs our int8 on CP shapes */   /* --gguf-rest <file.gguf>: Code Predictor + codec_head + text_proj */
             case 1055: expr_weight = atof(optarg); break;/* --expr-weight: scale factored-LoRA delta */
             case 1014: use_int8 = 1; break;
             case 1015: use_int4 = 1; break;
             case 1073: use_int4 = 1; setenv("QWEN_CP_PREC", "int8", 1); break;  /* --quant-mixed: int4 Talker + int8 CP (best CUDA quant) */
+            /* --quant-mixed-cpu: the MIRROR of the line above, and the mirror IS the point.
+             * On CPU the Talker is what must stay at int8. At int4 it drops the language
+             * identity outright: a low-resource-language clip comes out classified as a
+             * different language at 89% confidence, reproducibly, on roughly 1 seed in 5. Measured
+             * 2026-08-16, 4 configs x 5 seeds on one finetuned checkpoint and voice: both
+             * int8-Talker configs collapsed 0/5, both int4-Talker configs collapsed 1/5.
+             * The CP tolerates int4 and is where the bandwidth is bought back.
+             * Net on 1.7B / M1: RTF ~0.90 (sub-realtime) with the HIGHEST language-identity floor of
+             * the four -- 97.4% min, above plain --int8's 91.5%. See PLAN.md 0.septies. */
+            case 1075: use_int8 = 1; setenv("QWEN_CP_PREC", "int4", 1); break;
+            /* --quant-mixed-int6[=top6|top7|none|13,26,...]: PER-LAYER Talker map —
+             * int8 on the layers the sensitivity profile marked critical, q6_0 on the
+             * rest. Rides on --int8 on purpose: the Code Predictor must be quantized
+             * identically to the --int8 baseline, or the A/B measures two changes at
+             * once. Default top6 = L13 L26 L12 L24 L20 L11, the MEASURED top of the
+             * profile (the accent-delta prior picked the wrong layers three times).
+             * The comparison to beat is --int8 on BOTH axes: language identity AND speed. */
+            case 1076: use_int8 = 1;
+                       setenv("QWEN_TALKER_MIXED_INT6", optarg ? optarg : "top6", 1);
+                       break;
             case 1022: voice_name = optarg; break;
             case 1023: { int gw = atoi(optarg); ctx_greedy_warmup = gw; } break;
             case 1024: target_cv_dir = optarg; break;
+            case 1090: serve_max_queue = atoi(optarg); break;
+            case 1091: serve_queue_timeout = atoi(optarg); break;
             case 1025: show_caps = 1; break;
             case 1026: serve_workers = atoi(optarg); break;
             case 1043: serve_batch = atoi(optarg); if (serve_batch < 1) serve_batch = 1; break;
+            case 1810: serve_prefork = atoi(optarg); if (serve_prefork < 1) serve_prefork = 1; break;
+            case 1811: serve_prefork_threads = atoi(optarg); break;
+            case 1812: setenv("QWEN_PREFORK_ELASTIC", "1", 1); break;
             case 1044: ml_steer_path = optarg; break;
             case 1045: ml_steer_weight = atof(optarg); break;
             case 1046: { int a, b; if (sscanf(optarg, "%d-%d", &a, &b) == 2) { ml_l0 = a; ml_l1 = b; } break; }
@@ -1131,6 +1248,7 @@ int main(int argc, char **argv) {
             case 1048: ml_frames = atoi(optarg); break;
             case 1027: run_self_test = 1; break;
             case 1038: run_matmat_bench = 1; break;
+            case 1096: run_matmat_tune = 1; break;
             case 1070: run_gpu_selftest = 1; break;
             case 1071: gpu_backend_str = optarg; break;
             case 1072: run_gpu_selftest_talker = 1; break;
@@ -1170,6 +1288,24 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  -p, --top-p <float>        Top-p sampling\n");
                 fprintf(stderr, "  -r, --rep-penalty <float>  Repetition penalty\n");
                 fprintf(stderr, "  -m, --max-tokens <int>     Max tokens\n");
+                fprintf(stderr, "  --eos-strategy <s>         off|v1|v2|topk - how EOS is helped along:\n");
+                fprintf(stderr, "                             off  = no assist (matches nano-vllm = their prod)\n");
+                fprintf(stderr, "                             v1   = proportional ramp (default, historic)\n");
+                fprintf(stderr, "                             v2   = affine ramp, safe on SHORT text\n");
+                fprintf(stderr, "                             topk = lift EOS to k-th logit (their PyTorch;\n");
+                fprintf(stderr, "                                    inert under greedy by construction)\n");
+                fprintf(stderr, "  --eos-suppress <n>         leading frames with EOS forbidden (2)\n");
+                fprintf(stderr, "  --eos-fpt <f>              assumed frames per BPE token (3.0)\n");
+                fprintf(stderr, "  --eos-start-mult <f>       ramp starts at this multiple of expected (2.0)\n");
+                fprintf(stderr, "  --eos-overhead <n>         v2 only: fixed overhead K in frames (18)\n");
+                fprintf(stderr, "  --eos-ramp <f>             additive slope per frame (0.5)\n");
+                fprintf(stderr, "  --eos-cap <f>              max additive boost (10.0)\n");
+                fprintf(stderr, "  --eos-topk <n>             topk only: rank to lift EOS to (50)\n");
+                fprintf(stderr, "  --emotion-weight <w>       dose the steer --emotion applies (recipe: 12).\n");
+                fprintf(stderr, "                             w12 was calibrated on CLONES, which resist emoting.\n");
+                fprintf(stderr, "                             A full finetune is already plastic, so w12 can\n");
+                fprintf(stderr, "                             overshoot — and the excess shows up as lost accent.\n");
+                fprintf(stderr, "  --emotion-layers <A-B>     steer band for --emotion (recipe: 21-25)\n");
                 fprintf(stderr, "  -j, --threads <int>        Number of threads (0=auto)\n");
                 fprintf(stderr, "  -I, --instruct <text>      Style instruction (1.7B only)\n");
                 fprintf(stderr, "                             e.g. \"Speak in an angry tone\"\n");
@@ -1179,11 +1315,22 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --serve <port>             Start HTTP server on port\n");
                 fprintf(stderr, "  --workers <n>              Concurrent synthesis workers (server; default 1)\n");
                 fprintf(stderr, "  --batch-size <n>           Request-batching: step up to n concurrent users together (server; n>=2)\n");
+                fprintf(stderr, "  --prefork <n>              n pinned worker PROCESSES; weights packed once and shared via COW\n");
+                fprintf(stderr, "  --prefork-threads <k>      threads per prefork worker (default: cpus/n)\n");
+                fprintf(stderr, "  --prefork-elastic          move cores between workers with the load (1->8, 2->8+8, 3->8+4+4, 4+->4 each)\n");
                 fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
                 fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
                 fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model; must be 24 kHz mono WAV: ffmpeg -i in -ar 24000 -ac 1 out.wav)\n");
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
+                fprintf(stderr, "  --list-speakers            List the speakers this model declares, then exit\n");
+                fprintf(stderr, "  --speaker-map <dir|json>   Take the name->slot table from ANOTHER model.\n");
+                fprintf(stderr, "                             For GRAFTS: a grafted model has the finetune's\n");
+                fprintf(stderr, "                             weights but the parent's config, so -s <name>\n");
+                fprintf(stderr, "                             cannot resolve. Point this at the source finetune\n");
+                fprintf(stderr, "                             and names work again (slots come from that file).\n");
+                fprintf(stderr, "  --speaker-id <n>           Select a codec slot directly (bypasses name lookup;\n");
+                fprintf(stderr, "                             pool slots are not contiguous — read voices.json)\n");
                 fprintf(stderr, "  --save-voice <path>        Save voice. DEFAULT .qvoice = ~16-25MB GRAFT (identity+prosody,\n");
                 fprintf(stderr, "                             instruct/expr/steer all work). .bin = 8KB x-vector only. Heavy WDELTA\n");
                 fprintf(stderr, "                             qvoice (~0.8-3GB, exact-identity) ONLY with --target-cv. Without --text: create+exit\n");
@@ -1205,6 +1352,22 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --quant-mixed              int4 Talker + int8 CP (best CUDA quant: q4 Talker win, no CP degradation)\n");
+                fprintf(stderr, "  --quant-mixed-cpu          int8 Talker + int4 CP (best CPU quant: sub-realtime AND keeps the accent;\n");
+                fprintf(stderr, "                             an int4 Talker drops the language ~1 seed in 5 -- see PLAN.md 0.septies)\n");
+                fprintf(stderr, "  --quant-mixed-int6[=SPEC]  PER-LAYER Talker map: int8 on the layers the sensitivity profile\n");
+                fprintf(stderr, "                             marked critical, q6_0 (6-bit, fp16 scale/32) on the rest.\n");
+                fprintf(stderr, "                             THREE levels: int8 (gold) / q6_0 / q4_0, allocated per layer.\n");
+                fprintf(stderr, "                             SPEC = top6 (default, -14.7%%) | top7 (-14.1%%) | none (-18.8%%)\n");
+                fprintf(stderr, "                                  | tri6 (int8 top6 / q4 bottom6 / q6 rest, -20.1%%)\n");
+                fprintf(stderr, "                                  | q4nN  int8 on N layers, q4_0 on ALL the rest\n");
+                fprintf(stderr, "                                         (q4n6 -34.4%%, q4n10 -28.1%%, q4n14 -21.9%%)\n");
+                fprintf(stderr, "                                  | explicit '8=13,26,12;4=10,3,0[;rest=4]'\n");
+                fprintf(stderr, "                             The 10-seed campaign showed WHICH layers stay at int8 does not\n");
+                fprintf(stderr, "                             matter -- HOW MANY does. So q4nN is a ladder on N, not a pick.\n");
+                fprintf(stderr, "                             int4 EVERYWHERE drops the language ~1 seed in 5; int4 only on the\n");
+                fprintf(stderr, "                             layers the profile calls insensitive is a different question, and\n");
+                fprintf(stderr, "                             it gets measured, not assumed. Beat --int8 on BOTH axes: language identity AND\n");
+                fprintf(stderr, "                             speed. EXPERIMENTAL -- see PLAN.md T2.kernel\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
                 fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B). Primaries: sad/joy/anger/fear/disgust/surprise.\n");
                 fprintf(stderr, "                             Dyads: contempt/awe/nostalgia/disapproval/remorse/outrage/despair (blended steer).\n");
@@ -1220,17 +1383,37 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --compose-pause <s>        Default gap between adjacent spoken spans (default 0.12s)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
+                fprintf(stderr, "  --max-queue <n>            Server: how many may WAIT beyond the running slots.\n");
+                fprintf(stderr, "                             0 = none, say 503 at once (right behind a balancer);\n");
+                fprintf(stderr, "                             default 1, one grace slot. A queue deeper than the\n");
+                fprintf(stderr, "                             latency budget yields answers nobody still wants\n");
+                fprintf(stderr, "  --queue-timeout-ms <ms>    Server: drop a request that waited this long -> 503\n");
+                fprintf(stderr, "                             (0 = off). Late audio is worse than an honest refusal\n");
                 fprintf(stderr, "  --caps                     Print compiled SIMD/threading capabilities and exit\n");
                 fprintf(stderr, "  --self-test                Run kernel numeric self-test (matvec vs f32 ref) and exit\n");
+                fprintf(stderr, "  --matmat-bench             Time batched matmat vs B*matvec per precision and exit\n");
+                fprintf(stderr, "  --matmat-tune              Measure the kernel-gate thresholds for this box and exit\n");
                 return opt == 'h' ? 0 : 1;
         }
     }
+
+    /* The early-exit diagnostics below (--caps, --self-test, --matmat-bench,
+     * --gpu-selftest) used to call qwen_init_threads() unconditionally, which
+     * OVERWRITES the thread count with the auto-detected one — so -j was silently
+     * dropped on all of them. `--matmat-bench -j 1` therefore ran at 4 threads
+     * while printing "threads=4", and the -j1 "compute-bound reference" row of
+     * `make matmat-bench` was literally the same measurement as the full-thread
+     * one. A bench that ignores the knob it prints is worse than no bench, so
+     * these paths now honour -j like the synthesis path does (line ~1520). */
+#define QWEN_DIAG_INIT_THREADS() do { \
+        if (threads > 0) qwen_set_threads(threads); else qwen_init_threads(); \
+    } while (0)
 
     /* --caps: report the binary's ACTUAL compiled SIMD/threading capabilities and exit
      * (no model needed). Honest, testable source of truth — catches "we thought AVX
      * existed" regressions that docs/comments can hide. */
     if (show_caps) {
-        qwen_init_threads();
+        QWEN_DIAG_INIT_THREADS();
         qwen_caps_report(stdout);
         return 0;
     }
@@ -1240,22 +1423,43 @@ int main(int argc, char **argv) {
      * the AVX-512/VNNI paths — immune to the greedy trajectory fork that makes
      * end-to-end audio mel-corr a false alarm cross-ISA. Exits non-zero on failure. */
     if (run_self_test) {
-        qwen_init_threads();
+        QWEN_DIAG_INIT_THREADS();
         return qwen_kernel_selftest(stdout);
     }
 
     /* --matmat-bench: time the batched matmat twins (bf16/int8/int4) vs B sequential
      * matvecs, per precision, at the current -j thread count. No model needed. */
     if (run_matmat_bench) {
-        qwen_init_threads();
+        QWEN_DIAG_INIT_THREADS();
         return qwen_matmat_bench(stdout);
+    }
+
+    /* --matmat-tune: sweep B x real model shapes x every dispatchable kernel, at one
+     * thread AND at full threads, and print the g_mm_gate[] thresholds this box
+     * actually wants (the table's current numbers are declared guesses). Optionally
+     * takes the shapes from -d <model>/config.json; no weights are loaded. */
+    if (run_q8_bench) {
+        extern int qwen_q8r_bench(void *out);
+        QWEN_DIAG_INIT_THREADS();
+        return qwen_q8r_bench(stdout);
+    }
+
+    if (q8_selftest_path) {
+        extern int qwen_q8r_selftest(void *out, const char *gguf_path, const char *tensor_name);
+        QWEN_DIAG_INIT_THREADS();
+        return qwen_q8r_selftest(stdout, q8_selftest_path, NULL);
+    }
+
+    if (run_matmat_tune) {
+        QWEN_DIAG_INIT_THREADS();
+        return qwen_matmat_tune(stdout, model_dir);
     }
 
     /* --gpu-selftest: compare the experimental GPU backend's matvec/matmat against
      * the CPU reference (correctness + rough timing). GPU builds only. */
     if (run_gpu_selftest) {
 #if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
-        qwen_init_threads();
+        QWEN_DIAG_INIT_THREADS();
         const char *want = gpu_backend_str;
         if (!want) {
 #if defined(QWEN_HAVE_METAL)
@@ -1310,8 +1514,10 @@ int main(int argc, char **argv) {
     }
     /* --save-voice without --text = create voice only (no generation) */
     int create_voice_only = (save_voice && !text && serve_port <= 0);
-    if (!text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test && !run_batch_bench
-        && !run_gpu_selftest_talker && !run_gpu_batch_bench) {
+    /* --list-speakers is an inspection mode: it loads the model and prints its speaker
+     * table, so it needs no text. */
+    if (!export_q4lsq && !text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test && !run_batch_bench
+        && !run_gpu_selftest_talker && !run_gpu_batch_bench && !list_speakers) {
         fprintf(stderr, "Error: --text, --compose or --serve is required\n");
         return 1;
     }
@@ -1388,6 +1594,65 @@ int main(int argc, char **argv) {
     if (!ctx) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
+    }
+
+    /* --gguf-talker: swap the Talker's per-layer matrices for the ones a quantized
+     * GGUF holds, then re-quantize so --int8/--int4 build from the GGUF weights and
+     * not from the originals they replaced. Runs after the normal load precisely so
+     * the safetensors path stays untouched when the flag is absent. */
+    if (export_q4lsq) {
+        extern int qwen_q4_export_lsq(qwen_tts_ctx_t *ctx, const char *out_path);
+        int rc = qwen_q4_export_lsq(ctx, export_q4lsq);
+        qwen_tts_unload(ctx);
+        return rc;
+    }
+
+    if (gguf_rest_path && !gguf_talker_path) {
+        fprintf(stderr, "Error: --gguf-rest covers the Code Predictor; without --gguf-talker the\n"
+                        "       Talker would still come from safetensors and the run would be a mix.\n");
+        qwen_tts_unload(ctx);
+        return 1;
+    }
+    if (gguf_talker_path) {
+        extern int qwen_gguf_override_talker(qwen_tts_ctx_t *, const char *, int);
+        int n = qwen_gguf_override_talker(ctx, gguf_talker_path, silent);
+        if (n <= 0) {
+            fprintf(stderr, "Error: --gguf-talker applied no tensors from %s\n", gguf_talker_path);
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        if (use_int8 || use_int4) {
+            extern void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx);
+            if (use_int8) {
+                if (!silent) fprintf(stderr, "GGUF: re-quantizing INT8 from the GGUF weights\n");
+                qwen_talker_quantize_int8(ctx);
+            } else if (!silent) {
+                /* Same gap the .expr path documents: the int4 re-quant is not wired,
+                 * so silently keeping the pre-override q4 would misreport the result. */
+                fprintf(stderr, "Warning: --gguf-talker with --int4 does not re-quantize; "
+                                "run without --int4 to hear the GGUF weights.\n");
+            }
+        }
+    }
+
+    if (gguf_rest_path) {
+        extern int qwen_gguf_override_rest(qwen_tts_ctx_t *, const char *, int);
+        int n = qwen_gguf_override_rest(ctx, gguf_rest_path, silent);
+        if (n <= 0) {
+            fprintf(stderr, "Error: --gguf-rest applied no tensors from %s\n", gguf_rest_path);
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+    }
+
+    /* Provenance banner: printed once, after every artifact has had its chance to claim
+     * a weight family. A firing kernel proves the FORMAT, never the PROVENANCE - this
+     * makes every benchmark document its own configuration. */
+    /* Pack for KleidiAI BEFORE the banner, so the banner can report what it cost. */
+    qwen_kleidi_prepack(ctx);
+    if (!silent) {
+        extern void qwen_report_model_sources(qwen_tts_ctx_t *, const char *);
+        qwen_report_model_sources(ctx, model_dir);
     }
 
 #if defined(QWEN_HAVE_CUDA)
@@ -1686,7 +1951,44 @@ int main(int argc, char **argv) {
     ctx->max_tokens = max_tokens;
     ctx->debug = debug;
 
-    if (speaker_id >= 0) ctx->speaker_id = speaker_id;
+    /* EOS: overwrite only what was actually passed, so the context defaults hold. */
+    if (eos_strategy   >= 0)    ctx->eos_strategy         = eos_strategy;
+    if (eos_suppress   >= 0)    ctx->eos_suppress_frames  = eos_suppress;
+    if (eos_fpt        >  0.0f) ctx->eos_frames_per_token = eos_fpt;
+    if (eos_start_mult >  0.0f) ctx->eos_start_multiple   = eos_start_mult;
+    if (eos_overhead   >= 0)    ctx->eos_overhead_frames  = eos_overhead;
+    if (eos_ramp       >= 0.0f) ctx->eos_ramp_per_frame   = eos_ramp;
+    if (eos_cap        >= 0.0f) ctx->eos_ramp_cap         = eos_cap;
+    if (eos_topk       >  0)    ctx->eos_topk             = eos_topk;
+
+    /* Speaker selection, resolved against the model that is actually loaded.
+     *
+     * An unknown name is a hard error. The engine used to ignore it and keep the
+     * default slot 3061 (ryan): on a Base-derived finetune that slot holds untrained
+     * initialisation noise, so the run produced audio for an identity that does not
+     * exist — with no warning, and no way to notice except by listening. */
+    /* --speaker-map prima di tutto: deve valere sia per --list-speakers sia per -s */
+    if (speaker_map) {
+        int n = qwen_tts_load_speaker_map(ctx, speaker_map);
+        if (n < 0) { qwen_tts_unload(ctx); return 1; }
+        if (!silent) fprintf(stderr, "Speaker map: %d speakers from %s\n", n, speaker_map);
+    }
+    if (list_speakers) { qwen_tts_list_speakers(ctx); qwen_tts_unload(ctx); return 0; }
+    if (speaker_slot >= 0) {
+        ctx->speaker_id = speaker_slot;
+        if (!silent) fprintf(stderr, "Speaker: slot %d (given directly)\n", speaker_slot);
+    } else if (speaker_name) {
+        int sid = qwen_tts_resolve_speaker(ctx, speaker_name);
+        if (sid < 0) {
+            fprintf(stderr, "Error: unknown speaker '%s' for this model.\n", speaker_name);
+            fprintf(stderr, "       Run with --list-speakers to see what it exposes,\n");
+            fprintf(stderr, "       or pass a slot directly with --speaker-id N.\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        ctx->speaker_id = sid;
+        speaker_id = sid;
+    }
     if (language) ctx->language_id = qwen_tts_language_id(language);
     if (seed >= 0) ctx->seed = (uint32_t)seed;
     /* Echo the resolved seed so a good (esp. emotional) take is reproducible: without --seed the
@@ -2918,7 +3220,11 @@ int main(int argc, char **argv) {
             if (cell.use_steer && cell.steer_w > 0.0f) {
                 char qs[256];
                 if (resolve_emotion_qlsteer(voice_key, tok, qs, sizeof(qs)) == 0) {
-                    load_ml_steer(ctx, qs, cell.steer_w, 21, 25);
+                    /* the recipe's w12 / L21-25 unless the caller doses them */
+                    float sw = emotion_weight > 0.0f ? emotion_weight : cell.steer_w;
+                    int   l0 = emotion_layers_l0 >= 0 ? emotion_layers_l0 : 21;
+                    int   l1 = emotion_layers_l1 >= 0 ? emotion_layers_l1 : 25;
+                    load_ml_steer(ctx, qs, sw, l0, l1);
                     ctx->ml_steer_decay = ml_decay; ctx->ml_steer_frames = ml_frames;
                 } else if (!silent) {
                     fprintf(stderr, "Note: --emotion: no .qlsteer for '%s' — expr only\n", tok);
@@ -3008,6 +3314,29 @@ int main(int argc, char **argv) {
     /* Server mode: start HTTP server and block */
     if (serve_port > 0) {
         int ret;
+        /* The batched Talker dispatches on the bf16/int8/q4 pointers only, so a q6
+         * layer would quietly fall through to BF16 — a different precision than the one
+         * under test, i.e. a benchmark of something nobody asked for. Refuse loudly.
+         * But gate on what the map ACTUALLY allocated, not on the flag: an int8+q4_0
+         * map (q4nN) is safe under batching, and a flag-level ban would have excluded
+         * exactly the configuration worth serving. */
+        extern int qwen_talker_has_q6(const qwen_tts_ctx_t *ctx);
+        if (serve_batch >= 2 && qwen_talker_has_q6(ctx)) {
+            fprintf(stderr, "ERROR: this --quant-mixed-int6 map has Q6_0 layers, which the "
+                            "batched Talker cannot run (it would silently fall back to bf16).\n"
+                            "       Use --batch-size 1, or pick an int8+q4_0 map such as q4n14.\n");
+            qwen_tts_unload(ctx);
+            return 1;
+        }
+        qwen_tts_server_set_limits(serve_max_queue, serve_queue_timeout);
+        if (serve_prefork > 1) {
+            /* Pack once, then fork: the workers share the packed weights through
+             * copy-on-write instead of each loading its own copy. */
+            ret = qwen_tts_serve_prefork(ctx, serve_port, serve_prefork,
+                                         serve_prefork_threads, serve_batch);
+            qwen_tts_unload(ctx);
+            return ret;
+        }
         if (serve_batch >= 2)
             ret = qwen_tts_serve_batched(ctx, serve_port, serve_batch);  /* vLLM-style request batching */
         else

@@ -910,7 +910,9 @@ static void cp_mtp_project(qwen_tts_ctx_t *ctx, float *dst, const float *src) {
         /* Linear: dst = W @ src + bias, W is [cp_h, emb_dim]. Prefer the int8 twin
          * when the CP is quantized (perf item 5: ¼ the bytes of the 16×-reread bf16). */
         int emb_dim = ctx->cp_emb_dim;
-        if (ctx->cp_mtp_proj_int8)
+        if (ctx->cp_mtp_proj_q4)
+            qwen_matvec_q4_0(dst, ctx->cp_mtp_proj_q4, src, cp_h, emb_dim);
+        else if (ctx->cp_mtp_proj_int8)
             qwen_matvec_int8(dst, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale,
                              src, cp_h, emb_dim);
         else
@@ -924,6 +926,7 @@ static void cp_mtp_project(qwen_tts_ctx_t *ctx, float *dst, const float *src) {
 }
 
 int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes) {
+    qwen_mm_component(QWEN_COMP_CP);   /* MAC audit: attribute this step's kernels */
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
     int emb_dim = ctx->cp_emb_dim;  /* talker_hidden for 1.7B, cp_hidden for 0.6B */
@@ -1071,13 +1074,23 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     int B = bb->B, ch = bb->cp_h, cqd = bb->cp_q_dim, ckvd = bb->cp_kv_dim, cint = bb->cp_inter;
     float eps = c->rms_norm_eps, ascale = 1.0f / sqrtf((float)c->cp_head_dim);
     int fm = bb->force_matvec;
+    /* Projection width = highest active slot + 1 (T5.piano #2). The per-slot loops below
+     * keep using B and skip via CP_SKIP; only the GEMMs shrink. Applies to every ISA —
+     * discarded columns are discarded work on ARM and x86 alike; only the size of the
+     * loss depends on the machine's bandwidth/compute ratio. */
+    int BW = bb->B_eff > 0 ? bb->B_eff : B;
     qwen_cp_layer_t *l = &ctx->cp_layers[layer];
 #define CP_SKIP(b) (active && !active[b])   /* slot compaction: inactive skip per-slot vector work */
 
     /* x_norm = RMSNorm(x) already on entry. QKV (batched, precision-aware) */
-    qwen_batch_proj_q(bb->cp_q, l->wq_bf16, l->wq_int8, l->wq_scale, l->wq_q4, x_norm, cqd,  ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
-    qwen_batch_proj_q(bb->cp_k, l->wk_bf16, l->wk_int8, l->wk_scale, l->wk_q4, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
-    qwen_batch_proj_q(bb->cp_v, l->wv_bf16, l->wv_int8, l->wv_scale, l->wv_q4, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
+    /* The CP is the larger half of the QKV fan-out: 79.7 of the 89.9 triples per frame
+     * measured on the batched server, because it runs 15 sequential passes per frame. */
+    qwen_batch_proj_qkv(bb->cp_q, bb->cp_k, bb->cp_v,
+                        l->wq_bf16, l->wq_int8, l->wq_scale, l->wq_q4,
+                        l->wk_bf16, l->wk_int8, l->wk_scale, l->wk_q4,
+                        l->wv_bf16, l->wv_int8, l->wv_scale, l->wv_q4,
+                        x_norm, cqd, ckvd, ch, ch, BW, bb->act_idx, fm,
+                        bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++) {
         if (CP_SKIP(b)) continue;
         qwen_rms_norm_per_head(bb->cp_q + (size_t)b * cqd,  l->q_norm, 1, c->cp_num_heads,    c->cp_head_dim, eps);
@@ -1093,7 +1106,7 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                      c->cp_num_heads, c->cp_num_kv_heads, c->cp_head_dim, ascale, pos);
     }
     /* O projection (batched, precision-aware) + residual + post-attn norm */
-    qwen_batch_proj_q(bb->cp_proj, l->wo_bf16, l->wo_int8, l->wo_scale, l->wo_q4, bb->cp_attn, ch, cqd, cqd, B, fm, bb->cp_Xt, bb->cp_Yt);
+    qwen_batch_proj_q(bb->cp_proj, l->wo_bf16, l->wo_int8, l->wo_scale, l->wo_q4, bb->cp_attn, ch, cqd, cqd, BW, bb->act_idx, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++) {
         if (CP_SKIP(b)) continue;
         qwen_rms_norm_residual(x_norm + (size_t)b * ch, x + (size_t)b * ch,
@@ -1101,14 +1114,14 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     }
     /* gate+up (batched, precision-aware) + SwiGLU per frame */
     qwen_batch_proj_q(bb->cp_gate, l->gate_up_fused_bf16, l->gate_up_fused_int8, l->gate_up_fused_scale,
-                      l->gate_up_fused_q4, x_norm, 2 * cint, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
+                      l->gate_up_fused_q4, x_norm, 2 * cint, ch, ch, BW, bb->act_idx, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++) {
         if (CP_SKIP(b)) continue;
         qwen_swiglu_inplace(bb->cp_gate + (size_t)b * 2 * cint, bb->cp_swiglu_tmp, cint);
     }
     /* down (batched, precision-aware) */
     qwen_batch_proj_q(bb->cp_proj, l->down_bf16, l->down_int8, l->down_scale, l->down_q4,
-                      bb->cp_gate, ch, cint, 2 * cint, B, fm, bb->cp_Xt, bb->cp_Yt);
+                      bb->cp_gate, ch, cint, 2 * cint, BW, bb->act_idx, fm, bb->cp_Xt, bb->cp_Yt);
     /* residual (+ next layer input norm, or plain add on last layer) */
     if (layer + 1 < c->cp_num_layers) {
         for (int b = 0; b < B; b++) {
@@ -1165,6 +1178,44 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
      * the old "v1 CPU: bf16 only" framing was stale — batch_cp_layer dispatches q4>int8>bf16
      * via qwen_batch_proj_q, so the CPU batched CP has been quantization-aware for a while. */
     if (!ctx->cp_layers[0].wq_bf16 || !ctx->cp_lm_head_bf16[0]) return -2;
+
+    /* B_eff == 1 -> the ordinary single-stream CP, for the same reason as the Talker
+     * (see the long note in qwen_batch_talker_step_ragged): the batched projections run
+     * at bb->B width whatever the occupancy, so one active slot computes B columns and
+     * discards B-1. The CP is where that hurts most, being re-read 15 times per frame.
+     * Its KV is [B][cp_layers][cp_kv_max][cp_kv_dim], so one slot's region is contiguous
+     * and matches the single-stream layout — borrow it and hand the frame to
+     * qwen_cp_predict, which is also the reference the batch self-test checks against.
+     * Off with QWEN_BATCH_NO_SOLO=1, the same switch as the Talker. */
+    if (!qwen_batch_solo_disabled() && active) {
+        int n_act = 0, only = -1;
+        for (int b = 0; b < B; b++) if (active[b]) { n_act++; only = b; }
+        if (n_act == 1) {
+            size_t slot = (size_t)only * bb->cp_num_layers * bb->cp_kv_max * bb->cp_kv_dim;
+            uint16_t *sk = ctx->cp_kv_k, *sv = ctx->cp_kv_v;
+            int smax = ctx->cp_kv_max, slen = ctx->cp_kv_len;
+            ctx->cp_kv_k = bb->cp_kv_k + slot;
+            ctx->cp_kv_v = bb->cp_kv_v + slot;
+            ctx->cp_kv_max = bb->cp_kv_max;
+            ctx->cp_kv_len = 0;                 /* the CP resets its KV per frame */
+            memset(out_codes, 0, (size_t)B * 15 * sizeof(int));
+            int rc = qwen_cp_predict(ctx,
+                                     (float *)(uintptr_t)talker_hidden + (size_t)only * h,
+                                     code0[only], out_codes + (size_t)only * 15);
+            ctx->cp_kv_k = sk; ctx->cp_kv_v = sv;
+            ctx->cp_kv_max = smax; ctx->cp_kv_len = slen;
+            /* Same invariant as the Talker's shortcut: act_idx/B_eff are shared scratch,
+             * and leaving them describing an older step is how a stale set of columns
+             * reaches the next reader. */
+            qwen_batch_pack_active(bb, active);
+            return rc;
+        }
+    }
+
+    /* Effective width for this frame (T5.piano #2) — same rule as the Talker step, set
+     * here because the orchestrator enters the CP directly. ISA-independent. */
+    qwen_batch_pack_active(bb, active);
+
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
     float emb_buf[4096], normed[2048];
 
