@@ -11,6 +11,8 @@
  *
  * Runs with no model on disk, so it belongs in CI.
  * SPDX-License-Identifier: MIT */
+#define _POSIX_C_SOURCE 200809L /* mkstemp under -std=c11 on glibc */
+#define _DARWIN_C_SOURCE        /* macOS: keep the full namespace alongside it */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>

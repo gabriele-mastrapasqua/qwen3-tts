@@ -11,6 +11,8 @@
  * `make fuzz`, and under the memory checker with `make fuzz-leaks`.
  *
  * SPDX-License-Identifier: MIT */
+#define _POSIX_C_SOURCE 200809L /* mkdtemp under -std=c11 on glibc */
+#define _DARWIN_C_SOURCE        /* macOS: keep the full namespace alongside it */
 #include <ingot/gguf.h>
 #include <ingot/safetensors.h>
 #include <ingot/wfile.h>

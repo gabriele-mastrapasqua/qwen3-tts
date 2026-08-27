@@ -9,6 +9,8 @@
  * and the block layouts cross-checked in test_formats.c.
  *
  * SPDX-License-Identifier: MIT */
+#define _POSIX_C_SOURCE 200809L /* mkdtemp under -std=c11 on glibc */
+#define _DARWIN_C_SOURCE        /* macOS: keep the full namespace alongside it */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

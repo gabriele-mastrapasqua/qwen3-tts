@@ -30,6 +30,7 @@ static void specialized(int type, matvec_fn *mv, matmat_fn *mm, deqmat_fn *dq) {
     case INGOT_TYPE_Q4_K: *mv = ingot_q4_k_matvec; *mm = ingot_q4_k_matmat; *dq = ingot_q4_k_dequant; break;
     case INGOT_TYPE_Q5_K: *mv = ingot_q5_k_matvec; *mm = ingot_q5_k_matmat; *dq = ingot_q5_k_dequant; break;
     case INGOT_TYPE_Q6_K: *mv = ingot_q6_k_matvec; *mm = ingot_q6_k_matmat; *dq = ingot_q6_k_dequant; break;
+    case INGOT_TYPE_Q4_0: *mv = ingot_q4_0_matvec; *dq = ingot_q4_0_dequant; break;
     case INGOT_TYPE_Q8_0: *mv = ingot_q8_0_matvec; *mm = ingot_q8_0_matmat; *dq = ingot_q8_0_dequant; break;
     case INGOT_TYPE_BF16: *mv = ingot_bf16_matvec; *mm = ingot_bf16_matmat; *dq = ingot_bf16_dequant; break;
     case INGOT_TYPE_F16:  *mv = ingot_f16_matvec;  *mm = ingot_f16_matmat;  *dq = ingot_f16_dequant;  break;

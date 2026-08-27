@@ -11,6 +11,8 @@
  *  - the tolerance is chosen by asking ingot_matmat_is_exact(), never guessed.
  *
  * SPDX-License-Identifier: MIT */
+#define _POSIX_C_SOURCE 200809L /* setenv/unsetenv under -std=c11 on glibc */
+#define _DARWIN_C_SOURCE        /* macOS: keep the full namespace alongside it */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +100,70 @@ static void test_quantize(void) {
     const float scale = fmaxf(1.0f, fabsf(manual));
     CHECK(fabsf(output - manual) <= 1e-3f * scale,
           "matvec agrees with dequant-then-dot (%.6f vs %.6f)", (double)output, (double)manual);
+}
+
+/* ── the K-quant encoders: round-trip through ingot's OWN dequant ─────────
+ * A packing bug lands orders of magnitude above the bit width's floor, so the
+ * budget is a real gate. The budgets are what these encoders actually deliver
+ * on a bell-shaped block — the shape a weight matrix has — with headroom for
+ * the last ulp, not aspirations: at 2 bits a quarter of the signal is simply
+ * not representable, and a number far BELOW the budget means the test data
+ * stopped being bell-shaped, not that the encoder improved. */
+static void test_k_quant_encoders(void) {
+    printf("Q2_K / Q3_K / Q5_K encoders\n");
+    static const struct { const char *name; int type; int bytes;
+                          int (*deq)(const void *, size_t, size_t, float *);
+                          double budget;
+    } cases[] = {
+        { "Q2_K", INGOT_TYPE_Q2_K, 84,  ingot_q2_k_dequant, 0.290 },
+        { "Q3_K", INGOT_TYPE_Q3_K, 110, ingot_q3_k_dequant, 0.175 },
+        { "Q5_K", INGOT_TYPE_Q5_K, 176, ingot_q5_k_dequant, 0.040 },
+        { "Q6_K", INGOT_TYPE_Q6_K, 210, ingot_q6_k_dequant, 0.020 },
+    };
+
+    float values[512], decoded[512];
+    rng_state = 0x9E3779B9u;
+    for (int i = 0; i < 512; i++) {
+        float acc = 0;
+        for (int k = 0; k < 12; k++) acc += rnd_unit() + 0.5f;
+        values[i] = 0.02f * (acc - 6.0f);
+    }
+
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+        unsigned char blocks[2 * 210];
+        CHECK(ingot_can_quantize(cases[c].type), "%s: can_quantize says yes", cases[c].name);
+        CHECK(ingot_quantize(cases[c].type, values, 512, blocks) == 0,
+              "%s: quantize returns 0", cases[c].name);
+        CHECK(cases[c].deq(blocks, 2, 256, decoded) == 0, "%s: dequant returns 0", cases[c].name);
+        const double err = rel_l2(decoded, values, 512);
+        CHECK(err < cases[c].budget, "%s: bell rel_l2 %.4f < %.4f",
+              cases[c].name, err, cases[c].budget);
+
+        /* More bits must mean less error — the cheapest way to catch a
+         * scale packed into the wrong field, which passes a loose budget. */
+        if (c > 0) {
+            unsigned char coarser[2 * 210];
+            float coarse_out[512];
+            ingot_quantize(cases[c - 1].type, values, 512, coarser);
+            cases[c - 1].deq(coarser, 2, 256, coarse_out);
+            CHECK(err < rel_l2(coarse_out, values, 512),
+                  "%s beats %s on the same data", cases[c].name, cases[c - 1].name);
+        }
+
+        /* A constant block is the degenerate case every scale search can trip
+         * on: max_step is zero, and nothing may divide by it. */
+        float flat[256], flat_out[256];
+        for (int i = 0; i < 256; i++) flat[i] = 0.0f;
+        CHECK(ingot_quantize(cases[c].type, flat, 256, blocks) == 0,
+              "%s: an all-zero block quantizes", cases[c].name);
+        cases[c].deq(blocks, 1, 256, flat_out);
+        int zero = 1;
+        for (int i = 0; i < 256; i++) if (flat_out[i] != 0.0f) zero = 0;
+        CHECK(zero, "%s: an all-zero block round-trips to zero", cases[c].name);
+
+        CHECK(ingot_quantize(cases[c].type, values, 255, blocks) != 0,
+              "%s: rejects a partial block", cases[c].name);
+    }
 }
 
 /* ── every format: dequant and matvec must tell the same story ──────────── */
@@ -201,6 +267,95 @@ static void test_matmat(void) {
           "tokens == 1 is bit-identical to matvec");
 
     free(w); free(row); free(input); free(batched); free(single);
+}
+
+/* ── alignment invariance ───────────────────────────────────────────────────
+ * The GGUF contract guarantees the weight base is 32-byte aligned and nothing
+ * more, so two files with byte-identical tensor data whose data_base differs
+ * mod 64 (or 128) must produce byte-identical results. Any divergence means a
+ * kernel is taking address-dependent decisions — an alignment peel that
+ * changes the order of float sums, or a vector access that assumes 64 bytes.
+ * That class of symptom was seen in the field: same weights, shifted
+ * data_base, reproducibly different output. Same bytes, four bases, every
+ * ISA level, memcmp. */
+static void test_alignment_invariance(void) {
+    printf("alignment invariance (same bytes, shifted base)\n");
+    const size_t rows = 37, cols = 512, tokens = 131, dense_tokens = 5;
+    const size_t qbytes = rows * (cols / 256) * 144;
+    const size_t dbytes = rows * cols * 2;
+    const size_t offsets[] = { 0, 32, 64, 96 };
+    const size_t n_off = sizeof(offsets) / sizeof(offsets[0]);
+
+    unsigned char *master_q = malloc(qbytes);
+    unsigned char *master_d = malloc(dbytes);
+    unsigned char *arena = malloc((qbytes > dbytes ? qbytes : dbytes) + 96 + 64);
+    unsigned char *base =
+        (unsigned char *)(((uintptr_t)arena + 63) & ~(uintptr_t)63);
+    float *row = malloc(cols * sizeof(float));
+    float *input = malloc(tokens * cols * sizeof(float));
+    /* [0] holds the offset-0 reference, [1] the shifted run under test. */
+    float *mv[2], *mm[2], *mmx[2], *dq[2], *dmv[2], *dmm[2];
+    for (int s = 0; s < 2; s++) {
+        mv[s] = malloc(rows * sizeof(float));
+        mm[s] = malloc(tokens * rows * sizeof(float));
+        mmx[s] = malloc(tokens * rows * sizeof(float));
+        dq[s] = malloc(rows * cols * sizeof(float));
+        dmv[s] = malloc(rows * sizeof(float));
+        dmm[s] = malloc(dense_tokens * rows * sizeof(float));
+    }
+
+    rng_state = 0xA11C0DEu;
+    for (size_t r = 0; r < rows; r++) {
+        for (size_t i = 0; i < cols; i++) row[i] = 0.02f * rnd_unit();
+        ingot_q4_k_quantize(row, cols, master_q + r * (cols / 256) * 144);
+    }
+    for (size_t i = 0; i < rows * cols; i++) {
+        const uint16_t h = ingot_f32_to_bf16(rnd_unit());
+        master_d[2 * i] = (unsigned char)(h & 0xff);
+        master_d[2 * i + 1] = (unsigned char)(h >> 8);
+    }
+    for (size_t i = 0; i < tokens * cols; i++) input[i] = rnd_unit();
+
+    static const char *levels[] = { "scalar", "neon", "dotprod" };
+    for (size_t l = 0; l < sizeof(levels) / sizeof(levels[0]); l++) {
+        if (ingot_cpu_set_level(levels[l]) < 0) continue;
+        int same_mv = 1, same_mm = 1, same_mmx = 1, same_dq = 1, same_dense = 1;
+        for (size_t o = 0; o < n_off; o++) {
+            const int s = o == 0 ? 0 : 1;
+            unsigned char *w = base + offsets[o];
+            memcpy(w, master_q, qbytes);
+            ingot_q4_k_matvec(w, rows, cols, input, mv[s]);
+            ingot_q4_k_matmat(w, rows, cols, input, mm[s], tokens);
+            ingot_q4_k_matmat_exact(w, rows, cols, input, mmx[s], tokens);
+            ingot_q4_k_dequant(w, rows, cols, dq[s]);
+            if (s == 1) {
+                same_mv &= memcmp(mv[0], mv[1], rows * sizeof(float)) == 0;
+                same_mm &= memcmp(mm[0], mm[1], tokens * rows * sizeof(float)) == 0;
+                same_mmx &= memcmp(mmx[0], mmx[1], tokens * rows * sizeof(float)) == 0;
+                same_dq &= memcmp(dq[0], dq[1], rows * cols * sizeof(float)) == 0;
+            }
+            memcpy(w, master_d, dbytes);
+            ingot_bf16_matvec(w, rows, cols, input, dmv[s]);
+            ingot_bf16_matmat(w, rows, cols, input, dmm[s], dense_tokens);
+            if (s == 1) {
+                same_dense &= memcmp(dmv[0], dmv[1], rows * sizeof(float)) == 0;
+                same_dense &= memcmp(dmm[0], dmm[1],
+                                     dense_tokens * rows * sizeof(float)) == 0;
+            }
+        }
+        CHECK(same_mv, "%s: Q4_K matvec is base-invariant", levels[l]);
+        CHECK(same_mm, "%s: Q4_K matmat is base-invariant", levels[l]);
+        CHECK(same_mmx, "%s: Q4_K matmat_exact is base-invariant", levels[l]);
+        CHECK(same_dq, "%s: Q4_K dequant is base-invariant", levels[l]);
+        CHECK(same_dense, "%s: BF16 matvec/matmat are base-invariant", levels[l]);
+    }
+    ingot_cpu_set_level("auto");
+
+    free(master_q); free(master_d); free(arena); free(row); free(input);
+    for (int s = 0; s < 2; s++) {
+        free(mv[s]); free(mm[s]); free(mmx[s]); free(dq[s]);
+        free(dmv[s]); free(dmm[s]);
+    }
 }
 
 /* ── argument validation ────────────────────────────────────────────────── */
@@ -312,9 +467,11 @@ static void test_dense(void) {
 int main(void) {
     test_caps_env();
     test_quantize();
+    test_k_quant_encoders();
     test_formats();
     test_matmat();
     test_dense();
+    test_alignment_invariance();
     test_guards();
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures != 0;
