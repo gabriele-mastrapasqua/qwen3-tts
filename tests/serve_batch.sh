@@ -10,7 +10,7 @@
 # Requires: python3 + librosa (tests/compare_audio.py), a quiet machine.
 #
 # NOTE: always kill the server by name and use timeout on curls — never `wait` on
-# the server pid (it never exits). See CLAUDE.md server-testing rules.
+# the server pid (it never exits).
 set -u
 MODEL="${1:-qwen3-tts-0.6b}"
 PORT="${2:-8779}"

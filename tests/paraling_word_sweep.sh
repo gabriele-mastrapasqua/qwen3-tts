@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Word-mapping SWEEP (user 2026-06-25): find the special word that makes each voice actually LAUGH / SIGH,
 # rendered INLINE + the matching emotion steer (clean). Latin onomatopoeia + Chinese phonetic chars (clean
-# laugh/sigh sources per docs/markup.md). ryan/vivian/galatea. -> samples/paraling_sweep/
+# laugh/sigh sources). ryan/vivian/galatea. -> samples/paraling_sweep/
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/paraling_sweep; mkdir -p $O

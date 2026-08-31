@@ -6,7 +6,7 @@ re-injects that recording's room acoustics ("muffled metallic / faint reverb") i
 generation — and the CSP-FT `.expr` makes it more audible (it re-attends the ref_codes harder).
 The speaker x-vector alone carries abstract identity WITHOUT the room. Loading an embedding-only
 `.bin` with `--xvector-only` gives a clean clone (identity preserved) and MORE force headroom for
-the emotion `.expr` (sweet spot ~w1.6-2.0 @ T1.3). See plan_emo_v2.md / docs/csp-ft-emotion.md.
+the emotion `.expr` (sweet spot ~w1.6-2.0 @ T1.3).
 
 The .qvoice (QVCE) layout: magic[4]="QVCE", version[u32], enc_dim[u32] (v>=2), then enc_dim
 float32 = the speaker embedding. This tool slices exactly those floats out → an 8KB .bin that

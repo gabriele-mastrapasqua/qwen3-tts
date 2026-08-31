@@ -3,7 +3,7 @@
 #
 # WHAT: for each (language × voice × emotion) cell, render N seeds with --seed-audition N
 # --audition-keep (saving EVERY take), capture per-seed glitch+duration + the binary's auto-pick,
-# and emit a markdown table of RECOMMENDED seeds (docs/emotion-seeds.md by default). The kept takes
+# and emit a markdown table of RECOMMENDED seeds. The kept takes
 # form a browsable palette; the auto-pick (glitch+duration) is a HEURISTIC — it picks the cleanest/
 # most-typical take, NOT necessarily the most expressive one → EAR-VERIFY before promoting a seed to
 # the README. (A SER-judge in the loop would rank recognizability; pass JUDGE_MODEL=<dir> if you have

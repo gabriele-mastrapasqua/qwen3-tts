@@ -933,7 +933,7 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
     /* Drop a trailing fade-out / silence so the clone doesn't learn a decrescendo. */
     qwen_trim_trailing_silence(audio, &n_samples, sample_rate, ctx->silent);
 
-    /* By design (decided 2026-06-03; documented in docs/voice-cloning.md + --help):
+    /* By design (decided 2026-06-03; also stated in --help):
      * reference audio MUST be 24 kHz. We deliberately do NOT bundle a resampler —
      * ffmpeg does it better and keeps this engine dependency-free. The speaker-encoder
      * mel features are computed at 24 kHz (n_fft=1024, hop=256, 128 mels), so a wrong

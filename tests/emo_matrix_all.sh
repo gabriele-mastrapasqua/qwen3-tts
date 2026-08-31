@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================================
 # emo_matrix_all.sh — FULL re-verification matrix: every language × every emotion, driven by the
-# C engine's `--emotion` flag (THE recipe, docs/emotion-THE-recipe.md). Recommended GOLD voice per
+# C engine's `--emotion` flag (THE recipe). Recommended GOLD voice per
 # language (ryan = IT/EN/PT-Romance; vivian = DE/FR/ES/ZH; ono_anna = JA; sohee = KO). One neutral
 # carrier per language → the emotion comes purely from the recipe (instruct/steer/expr the router applies).
 # Output: samples/tests/2026-06-29_emo-matrix-all/  (gitignored). 1.7B CustomVoice, seed 42.

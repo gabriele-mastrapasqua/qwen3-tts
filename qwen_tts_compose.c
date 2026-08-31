@@ -52,14 +52,14 @@ static const cmacro_t COMPOSE_MACROS[] = {
  * The tag becomes an onomatopoeia INSIDE the sentence, so the event is produced in the active
  * voice's own timbre within ONE generation — never a separate "splice" span. Mapping is
  * universal across voices/languages; sigh differs per voice (唉 s42 ryan/clone, ahh s7 vivian).
- * [yawn] 哈啊 is vocal + cross-voice (preset s7 / clone s42). [moan]/[throat] stay ryan-only (unshipped,
- * see docs/para-experiments.md 2026-07-07); cry is decoder-ceiling-blocked (needs FT). */
+ * [yawn] 哈啊 is vocal + cross-voice (preset s7 / clone s42). [moan]/[throat] stay ryan-only and
+ * unshipped; cry is decoder-ceiling-blocked (needs a finetune). */
 static void para_pick(const char *tag, int voice_class, int small_model,
                       const char **onom, int *seed, float *temp) {
     /* voice_class: 0 = ryan / other preset · 1 = vivian · 2 = clone (--load-voice).
      * small_model: 1 = 0.6B. The seeds below were tuned on the 1.7B and DO NOT transfer — on the
      * 0.6B the (onomatopoeia × seed) cells land on different attractors of the vocal family, so the
-     * small model gets its own branch (ear-validated 2026-08-05, docs/para-experiments.md).
+     * small model gets its own branch (ear-validated 2026-08-05).
      * *temp = the per-tag validated temperature (default 1.1; a tag may soften it). */
     *onom = NULL; *seed = 7; *temp = 1.1f;
 

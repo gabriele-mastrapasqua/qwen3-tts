@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# PARA-FT — ALL-8-TAGS eval (for Step 2+, plan_emo_v3.md §9.8). Mac-side, no GPU.
+# PARA-FT — ALL-8-TAGS eval (for Step 2 onward). Mac-side, no GPU.
 # Pulls a LoRA adapter from the GPU box, exports a factored .expr, and synthesizes
 # one EN sentence per tag (+ a no-tag control) so each [tag] can be A/B-judged
 # for mapping to ITS OWN event. sigh!=laugh is the key check Step 2 must fix.

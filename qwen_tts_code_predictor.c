@@ -82,7 +82,7 @@ void qwen_cp_microbench_report(int frames) {
  *                           (default 1e-4) → contextual-sparsity headroom %.
  *                           Reported to stderr at process exit.
  *
- * This is the cheap "measure first" instrument behind PLAN.md future-research C:
+ * This is the cheap "measure first" instrument behind a question left open:
  * it tells us WHERE and HOW MUCH int4 drifts vs int8/bf16 before we build any
  * speculative-decode / sparsity / roughness machinery.
  * ======================================================================== */

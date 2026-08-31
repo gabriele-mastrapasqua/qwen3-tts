@@ -9,7 +9,7 @@ the 4 KB x-vector, and the 16 MB is shared prosody machinery.
 
 Use: build an EMOTIONAL graft by dropping an emotional x-vector into an existing graft, so the
 voice carries the emotion AND keeps the graft's sighs/pauses/micro-prosody (which a bare .bin
-omits). See plan_06b_emo.md §E6.
+omits).
 
   python3 tests/graft_set_xvector.py <in.qvoice> <xvector.bin> <out.qvoice> [--name NAME]
 """

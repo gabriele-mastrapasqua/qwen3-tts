@@ -7,7 +7,7 @@ Reads code-dump files produced by QWEN_DUMP_CODES (one line per audio frame:
 Talker is held at bf16 across all of them (QWEN_CP_PREC), so code0 is identical
 run-to-run and any disagreement in c1..c15 is PURE Code-Predictor quantization
 drift — exactly the "where/how-much does int4 drift vs int8/bf16" question from
-PLAN.md future-research C.
+a question left open in the research notes.
 
 Usage:
     quant_ladder.py bf16:bf16.codes int8:int8.codes int4:int4.codes q2:q2.codes

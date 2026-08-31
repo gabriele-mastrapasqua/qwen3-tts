@@ -1,6 +1,6 @@
 /* qwen_tts_emotion.c - compound-emotion manifest (see qwen_tts_emotion.h)
  *
- * Each row is an ear-validated recipe from docs/expressivity-recipes.md.
+ * Each row is an ear-validated recipe.
  * KEY findings baked in here:
  *   - joy = `excited` (NOT `happy`) pushed hard + faster + louder. `happy`
  *     loses energy when pushed because neutral is already upbeat.

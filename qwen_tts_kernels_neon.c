@@ -20,5 +20,5 @@
  *
  * NOT at peak on post-M1 ARM (M2/M3/M4, Graviton): bf16 matvec still does
  * dequant->FMA (no vbfdot/vbfmmla, __ARM_FEATURE_BF16) and int8 uses 1-vector
- * SDOT (no smmla/i8mm, __ARM_FEATURE_MATMUL_INT8). See PLAN.md 21.3b.
+ * SDOT (no smmla/i8mm, __ARM_FEATURE_MATMUL_INT8).
  */

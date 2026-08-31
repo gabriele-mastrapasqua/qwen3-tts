@@ -294,8 +294,8 @@ int qwen_arm_bf16_matmat_available(void) {
 #define QWEN_SIMD_PROFILE "unknown"
 #endif
 
-/* Le variabili che cambiano i NUMERI o l'AUDIO, non ogni QWEN_* esistente: un elenco
- * che include il rumore non viene letto. Registro completo in docs/feature-flags.md. */
+/* The variables that change the NUMBERS or the AUDIO, not every QWEN_* that exists: a list
+ * that includes the noise does not get read. */
 static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
@@ -426,7 +426,7 @@ void qwen_caps_report(void *out) {
      * was compiled above). This is the "does the extension fire?" check — run it on
      * a freshly-rented box to see what the CPU offers before deciding the build/kernel
      * path. A gap vs the compiled features is the "compiled past the CPU -> SIGILL" trap.
-     * See docs/hardware-testing.md for the per-platform plan. */
+     * The per-platform plan lives with the hardware notes. */
 #if defined(__x86_64__)
     __builtin_cpu_init();
     /* clang's __builtin_cpu_supports rejects the "amx-int8" feature string (gcc-only) →
@@ -1528,7 +1528,7 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
  *   - ARM SVE/SVE2 (Grace/Spark): vector-length-agnostic B loop.
  *   - x86 AVX-512-BF16 (VDPBF16PS) to fuse decode+FMA; AVX-512-VNNI for int8 batched.
  * Add an int8/int4 batched twin (qwen_matmat_int8/_int4) — that's where batching
- * pays most (it amortizes the unpack). See docs/batching.md. */
+ * pays most (it amortizes the unpack). */
 /* Generic batched matmat (any B up to 64). Vectorizes over the B (accumulator)
  * dimension. Used as the FALLBACK for B values without a compile-time
  * specialization below. NOTE: `acc[64]` is indexed by a runtime b, so it lives
@@ -8739,8 +8739,8 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
     memset(agg_name, 0, sizeof(agg_name));
     memset(agg_mmk, 0, sizeof(agg_mmk));
 
-    /* Noise floor, measured rather than assumed (CLAUDE.md: state a metric's noise
-     * floor before reporting a number). The reference is re-measured once per cell and
+    /* Noise floor, measured rather than assumed: state a metric's noise floor before
+     * reporting a number. The reference is re-measured once per cell and
      * compared with itself; whatever spread that shows is the smallest difference this
      * box can resolve, and any "win" inside it is not a win. */
     double noise_max = 0.0, noise_sum = 0.0; int noise_n = 0;

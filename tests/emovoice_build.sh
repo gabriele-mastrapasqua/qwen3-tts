@@ -2,7 +2,7 @@
 # Build the 6 emotional VOICE assets that give the 0.6B its --emotion flag.
 #
 # On the small model emotion is not an inference-time lever, it is a property of the voice
-# (docs/emotion-06b-recipe.md). This builds one asset per emotion for a given voice:
+# This builds one asset per emotion for a given voice:
 #   1.7B generates ~25 s of that voice, emotional  ->  0.6B Base extracts the 4 KB x-vector
 #
 # Usage:
@@ -28,7 +28,7 @@ DONORS="${DONORS:-samples/tests/emovoice_donors/$VOICE}"
 
 # ~25 s of carrier text: enough for a stable ECAPA embedding. Use a language the voice speaks
 # natively — the donor's delivery is what we are capturing, so a voice fighting the language is
-# a worse donor (see the native-preset-per-language rule in docs/emotion-THE-recipe.md).
+# a worse donor (the native-preset-per-language rule).
 TEXT="Ma ti rendi conto di quello che è successo? Te l'avevo detto mille volte, mille volte, e alla fine è andata proprio così. Adesso non venirmi a dire che non lo sapevi, perché lo sapevi benissimo. È sempre la stessa storia, ogni volta la stessa identica storia, e io continuo a ripetere le cose a vuoto."
 case "$LANG_" in
   English)  TEXT="Do you realise what just happened? I told you a thousand times, a thousand times, and in the end it went exactly like that. Now do not tell me you did not know, because you knew perfectly well. It is always the same story, every single time the same story, and I keep repeating myself for nothing." ;;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bench_matrix.sh — one-command SIMD check + RTF benchmark matrix for ANY box.
 #
-# Runs the full per-box validation from docs/hardware-testing.md: what the CPU has
+# Runs the full per-box validation: what the CPU has
 # (--caps), kernel correctness (--self-test native + fallback), batched-matmat twins
 # (--matmat-bench), and the RTF matrix (single / batch [/ stream / server]) x precision.
 # Designed to be copy-pasted onto a freshly-rented ARM/x86 box. Quiet-machine only.
@@ -149,6 +149,6 @@ if [ "$FULL" = "1" ]; then
 fi
 
 hr
-echo "  Paste this block + the --caps output into docs/hardware-testing.md (§5 matrix)."
+echo "  Paste this block + the --caps output into the per-box hardware notes."
 echo "  Correctness gate (separate, run once): make test-serve-all"
 hr

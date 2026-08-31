@@ -386,7 +386,7 @@ typedef qwen_cspan_t cspan_t;
  * para_inline_substitute above): the tag becomes a validated onomatopoeia IN the sentence, one
  * generation, event in the active voice's own timbre. Do NOT reintroduce the split-span. */
 
-/* INLINE paralinguistics — the shipped method (2026-07-01, docs/para-experiments.md). A `[laugh]`/`[sigh]`
+/* INLINE paralinguistics — the shipped method (2026-07-01). A `[laugh]`/`[sigh]`
  * is replaced by a validated ONOMATOPOEIA *inside* the sentence, so the event is produced in the active
  * voice's own timbre within ONE generation — NEVER a separate "splice" span (which mixed voices). The
  * mapping is universal across voices AND languages (ear-validated on ryan EN/IT, vivian IT, galatea clone):
@@ -418,7 +418,7 @@ static const char *emotion_tok(const char *spec) {
 }
 /* The shippable per-(voice×emotion) recipe (plan §8.3). use_expr/use_steer pick the cell's MODE. */
 typedef struct { const char *voice; const char *tok; int use_expr; float expr_w; int use_steer; float steer_w; } emo_cell_t;
-/* THE emotion recipe (docs/emotion-THE-recipe.md, ear-validated 2026-06-29 across ALL languages):
+/* THE emotion recipe, ear-validated across all languages:
  * pure STEER WINS everywhere, clean, timbre intact — `ryan_<emo>` @ **w12** (w10 also good) — so the recipe is
  * DEAD SIMPLE. The earlier per-(voice×emotion) cells and per-language EXPR/COMBINE policy are SUPERSEDED.
  *   PRESET voice → STEER ryan_<emo> @ w12 (no expr, no instruct). Use the NATIVE preset per language.
@@ -1222,7 +1222,7 @@ int main(int argc, char **argv) {
              * int8-Talker configs collapsed 0/5, both int4-Talker configs collapsed 1/5.
              * The CP tolerates int4 and is where the bandwidth is bought back.
              * Net on 1.7B / M1: RTF ~0.90 (sub-realtime) with the HIGHEST language-identification accuracy floor of
-             * the four -- 97.4% min, above plain --int8's 91.5%. See PLAN.md 0.septies. */
+             * the four -- 97.4% min, above plain --int8's 91.5%. */
             case 1075: use_int8 = 1; setenv("QWEN_CP_PREC", "int4", 1); break;
             /* --quant-mixed-int6[=top6|top7|none|13,26,...]: PER-LAYER Talker map —
              * int8 on the layers the sensitivity profile marked critical, q6_0 on the
@@ -1359,7 +1359,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --quant-mixed              int4 Talker + int8 CP (best CUDA quant: q4 Talker win, no CP degradation)\n");
                 fprintf(stderr, "  --quant-mixed-cpu          int8 Talker + int4 CP (best CPU quant: sub-realtime AND keeps the accent;\n");
-                fprintf(stderr, "                             an int4 Talker drops the language ~1 seed in 5 -- see PLAN.md 0.septies)\n");
+                fprintf(stderr, "                             an int4 Talker drops the language ~1 seed in 5)\n");
                 fprintf(stderr, "  --quant-mixed-int6[=SPEC]  PER-LAYER Talker map: int8 on the layers the sensitivity profile\n");
                 fprintf(stderr, "                             marked critical, q6_0 (6-bit, fp16 scale/32) on the rest.\n");
                 fprintf(stderr, "                             THREE levels: int8 (gold) / q6_0 / q4_0, allocated per layer.\n");
@@ -1373,7 +1373,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "                             int4 EVERYWHERE drops the language ~1 seed in 5; int4 only on the\n");
                 fprintf(stderr, "                             layers the profile calls insensitive is a different question, and\n");
                 fprintf(stderr, "                             it gets measured, not assumed. Beat --int8 on BOTH axes: language AND\n");
-                fprintf(stderr, "                             speed. EXPERIMENTAL -- see PLAN.md T2.kernel\n");
+                fprintf(stderr, "                             speed. EXPERIMENTAL\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
                 fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B). Primaries: sad/joy/anger/fear/disgust/surprise.\n");
                 fprintf(stderr, "                             Dyads: contempt/awe/nostalgia/disapproval/remorse/outrage/despair (blended steer).\n");
@@ -2053,7 +2053,7 @@ int main(int argc, char **argv) {
     }
     /* ── --emotion on the 0.6B: the emotion rides on the VOICE ──────────────────────────────
      * The small model has no steerable emotion subspace (steer/expr/COMBINE all fail — see
-     * docs/emotion-06b-recipe.md), but it clones very well. So --emotion here resolves an
+     * but it clones very well. So --emotion here resolves an
      * emotional voice asset built once from emotional audio of that same voice, and loads it
      * through the normal clone path. Presets and clones both work. */
     static char emo06b_path[1024];
@@ -2099,7 +2099,7 @@ int main(int argc, char **argv) {
             } else {
                 if (dp) fclose(dp);
                 fprintf(stderr, "Error: no '%s' voice asset for '%s' on the 0.6B.\n", tok, key);
-                fprintf(stderr, "  On the small model the emotion rides on the VOICE (docs/emotion-06b-recipe.md).\n");
+                fprintf(stderr, "  On the small model the emotion rides on the VOICE.\n");
                 if (!load_voice)
                     fprintf(stderr, "  Presets need their own asset — build it once with:  make emovoice VOICE=%s\n", key);
                 fprintf(stderr, "  Or build this one cell by hand:\n");
@@ -2123,7 +2123,7 @@ int main(int argc, char **argv) {
      * (-s ryan) on CustomVoice AND with a loaded clone. This is the emotion lever for the 0.6B,
      * where --emotion is a no-op (no steerable emotion subspace); it works because the speech
      * tokenizer is bit-identical across model sizes, so codec frames mean the same thing
-     * everywhere. See plan_06b_emo.md §E1. */
+     * everywhere. */
     if (emo_ref) {
         if (!emo_ref_text) {
             fprintf(stderr, "Error: --emo-ref requires --emo-ref-text (the reference's transcript)\n");
@@ -3198,7 +3198,7 @@ int main(int argc, char **argv) {
             const char *voice_key = emotion_voice_key(ctx->voice_clone, load_voice, speaker_name,
                                                       vkbuf, sizeof(vkbuf));
             /* THE recipe — per-language policy (DE/FR/ZH/JA/KO/RU/ES) or per-(voice×emotion) for IT/EN.
-             * docs/emotion-THE-recipe.md is the aligned single source of truth. */
+             * The emotion recipe is mirrored here and in the docs. */
             emo_cell_t cell; float rtemp;
             resolve_emotion_recipe(language, voice_key, ctx->voice_clone, tok, &cell, &rtemp);
             /* PARA+EMO: when a paralinguistic [tag] is active, force COMBINE even on a preset STEER cell —

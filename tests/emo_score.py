@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Automatic emotion scoring via a pre-trained Speech-Emotion-Recognition model — replaces listening
-to N audio clips by hand when ranking TTS expressivity variants (see docs/emotion-research.md).
+to N audio clips by hand when ranking TTS expressivity variants.
 
 Model: audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim — a wav2vec2 fine-tuned on MSP-Podcast to
 regress the 3 affect DIMENSIONS arousal / dominance / valence in [0,1]. Dimensional (not categorical)

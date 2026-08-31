@@ -1,6 +1,6 @@
 #!/bin/bash
 # E6 full battery — can the 0.6B support EVERYTHING (emo + para + clone)?
-# plan_06b_emo.md §7. Writes to samples/tests/2026-08-05_06b_full_matrix/
+# Writes to samples/tests/2026-08-05_06b_full_matrix/
 set -u
 cd "$(dirname "$0")/.."
 D=samples/tests/2026-08-05_06b_full_matrix

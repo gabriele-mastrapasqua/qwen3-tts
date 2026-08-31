@@ -309,7 +309,7 @@ typedef struct {
 
 /* ── QWEN_CANCEL_ON_DISCONNECT — stop generating for a request whose client has gone.
  * DEFAULT OFF: both arms of the A/B are then the SAME binary, and the OFF arm reproduces
- * the historical behaviour exactly. docs/feature-flags.md carries the register entry. */
+ * the historical behaviour exactly. */
 static int qwen_cancel_on_disconnect(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("QWEN_CANCEL_ON_DISCONNECT"); v = (e && e[0] == '1'); }

@@ -559,7 +559,7 @@ typedef struct qwen_tts_ctx {
      * Rationale: the speech tokenizer is bit-identical across 0.6B/1.7B, so a codec sequence is
      * the one exact channel between models — an emotional reference rendered by the 1.7B (or any
      * emotional audio at all) transfers its STYLE to the 0.6B, which has no steerable emotion
-     * subspace of its own. See plan_06b_emo.md §E1. */
+     * subspace of its own. */
     char *emo_ref_path;          /* Path to the emotional reference audio (style donor) */
     char *emo_ref_text;          /* Its transcript — required by the ICL prompt format */
 

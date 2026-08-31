@@ -4,7 +4,7 @@
 #
 # Each preset gets its donors in a language it speaks NATIVELY — the donor's delivery is what we
 # capture, and a voice fighting the language makes a worse donor. See the native-preset-per-language
-# rule in docs/emotion-THE-recipe.md.
+# native-preset-per-language rule.
 #
 #   bash tests/emovoice_all_presets.sh          # ~40 min: 48 donors on the 1.7B + extraction
 #

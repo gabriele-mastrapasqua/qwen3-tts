@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# seed_sweep.sh — hunt "seed magics" for an emotion (see plan_emo_v2.md TODO "SEED MAGICS").
+# seed_sweep.sh — hunt "seed magics" for an emotion.
 #
 # WHY: with temp>0 the seed fixes the ENTIRE sampling trajectory (one LCG, qwen_tts_sampling.c). At
 # expressive temp+steering the conditional is wide, so different seeds realize VERY different valid

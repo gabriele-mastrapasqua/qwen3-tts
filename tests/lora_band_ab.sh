@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A/B the layer BAND: emotion-only L16-26 vs broad early+emotion (0-27), same EMOVO data.
-# Tests both goals (docs/prosody-map.md hypothesis): better EMOTION + better Italian RENDERING.
+# Tests both goals: better EMOTION + better Italian RENDERING.
 # Usage: tests/lora_band_ab.sh   (edit BASE/BB paths below if needed)
 set -uo pipefail
 D=qwen3-tts-1.7b; SEED=42; T=1.1; L=Italian

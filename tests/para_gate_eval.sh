@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# PARA-FT STEP 1 — GATE EVAL (plan_emo_v3.md §9.5 "THIS IS THE GATE")
+# PARA-FT STEP 1 — GATE EVAL
 #
 # Runs Mac-side, NO GPU. The instant Step 1 training finishes on the GPU box:
 #   1. pull the chosen LoRA adapter (16MB) from the GPU box

@@ -361,8 +361,8 @@ def result_slug(workload, arrival, topo, conc, model_label, precision):
 
 # ── THE HEADER IS NOT DECORATION ───────────────────────────────────────────────
 # A result whose configuration has to be reconstructed from memory the next morning is
-# anonymous (docs/bench/AXION-PRODUCTION-CONTRACT.md). Every run prints the whole
-# identity, read from the machine and from the binary - never from a constant in here.
+# anonymous. Every run prints the whole identity, read from the machine and from the
+# binary - never from a constant in here.
 def result_header(a, model_path, extra_env):
     def sh(cmd, default="UNKNOWN"):
         try:
