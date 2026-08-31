@@ -1,134 +1,35 @@
 #!/usr/bin/env python3
-"""load_test.py — load bench for the streaming TTS server, with FIRST-AUDIO LATENCY as a
-FIRST-CLASS METRIC.
+"""Load bench for the streaming TTS server, with first-audio latency as the primary metric.
 
-The product objective, in words:
+Arrival modes: all-at-once (synchronised worst case, the default), poisson and uniform
+(open loop, arrivals do not wait for the server). The generator seed is fixed and printed
+so two runs are comparable.
 
-    serve 2-4 parallel requests with first audio <= 500 ms per user,
-    without degrading and without spikes.
+Definitions (wall clock, client side):
+  ttfa     first audio byte - request sent
+  total    last audio byte  - request sent
+  audio_s  PCM bytes / 2 / 24000 (int16 mono 24 kHz)
+  RTF      total / audio_s
+  Q        sum(audio_s) / wall
 
-RTF and throughput are SECONDARY. A p99 that explodes is a quality incident in a call
-centre even when the mean is excellent — so here the distribution matters more than the
-mean, and spikes have to be ATTRIBUTED, not merely counted.
-
-── WHY STAGGERED ARRIVALS (the reason this file changed) ────────────────────────
-
-The historical mode (`--arrival all-at-once`) fires every request together at the start of
-the level. That is the SYNCHRONISED WORST CASE, and it is useful: it stays the default and
-stays comparable with every measurement taken so far. But it is not real traffic, and above
-all it CANNOT DISTINGUISH two things we need to separate:
-
-    first audio is late because the machine is saturated
-    first audio is late because the request arrived while another was finishing
-
-That distinction is exactly what has to be optimised (admission, priority for new arrivals,
-split prefill). With everything arriving at t=0 every request is simultaneously "queued"
-and "contended": no request ever arrives alone onto a loaded machine, so there is no
-control.
-
-Hence `--arrival poisson --rate <req/s>` and `--arrival uniform --interval <s>`: open loop,
-arrivals do NOT wait for the server to free up. The generator's seed is fixed and DECLARED
-(printed and written into the JSON) so two runs are comparable: without it a different p95
-may be nothing but another draw of random numbers, and we would have credited an
-optimisation for it.
-
-── WHAT "c" MEANS WITH STAGGERED ARRIVALS ───────────────────────────────────────
-
-In open loop `c` is not a semaphore. Without `--rate`/`--interval` the arrival pace is
-CALIBRATED on the machine:
-
-    mean inter-arrival interval = S / c        (S = the duration of ONE request alone)
-
-By Little's law (L = lambda * W): if the server held c streams WITHOUT degrading, exactly c
-would be in flight. So "c=4" means "an offered load such that a perfectly scaling server
-would show 4 requests in flight". The number actually in flight is measured and printed
-beside it: if it exceeds c, the server is NOT keeping up with the offered load — and that
-is the result, not a defect of the measurement. S is measured with a probe request on an
-idle machine (`--service-s` skips it if you already know it).
-
-WITH STAGGERED ARRIVALS, THROUGHPUT IS NO LONGER A CAPACITY MEASURE: it depends on the
-offered load, and if arrivals are sparse the machine sits idle between them. Throughput is
-only meaningful compared AT EQUAL ARRIVAL MODE, never across modes. For pure capacity,
-`all-at-once` remains.
-
-── ATTRIBUTING THE SPIKES ───────────────────────────────────────────────────────
-
-For every request above threshold, say WHAT WAS HAPPENING when it arrived:
-
-  in flight on arrival     how many requests were already open (from the client: exact)
-  arrivals in the last 200 ms  how many others started just before (from the client: exact)
-  completions while waiting    how many others closed while this one waited
-                           - from the client (last byte)  -> exact
-                           - from the server ([BATCH] done) -> if you pass --server-log
-
-The hypothesis to FALSIFY or confirm is "this spike coincides with the arrival or the
-completion of another request". The control that makes it falsifiable is the case
-`in flight on arrival = 0`: if a request arrives onto an IDLE machine and still pays 2 s of
-first-audio latency, contention is not the cause — it is the prefill, the model, or a cold
-start. Without that row the scheduler gets optimised for a problem that is not the
-scheduler's.
-
-`--server-log` reads the server's stderr LIVE (tail) and stamps a client timestamp on every
-line: the engine prints `[BATCH] done #N (..., in-flight admitted=K)` without a clock, so
-the time is ours, taken when the line appears. stderr in C is unbuffered, so the slack is
-the file traversal, not a buffer. It is a correlation at ~ms, declared as such: admissions
-are NOT logged, so the `admitted` counter is only visible when something finishes — for
-arrivals the exact source remains the client.
-
-── DEFINITIONS (all wall-clock, client side) ────────────────────────────────────
-  ttfa       first audio byte     - request sent
-  total      last audio byte      - request sent
-  audio_s    PCM bytes / 2 / 24000 (int16 mono 24 kHz)
-  RTF        total / audio_s                  (<1 = faster than realtime)
-  Q          sum(audio_s) / wall              (audio-seconds per second)
-  degradation  ttfa p95(c) / ttfa p95(c=1)    "serving 4 users costs the worst one 4.6x"
-  stability    ttfa p95 / ttfa p50            if it separates, there is a spike even with
-                                              a good median
-
-Standard library only — asyncio plus a hand-written HTTP/1.1 client: the ARRIVAL TIME of
-each chunk is exactly what is being measured, and a library's buffering would hide it.
-
-Use:
-  # start a server first:
-  #   ./qwen_tts -d qwen3-tts-0.6b --serve 8900 --int8 --batch-size 4 -j 4
+Usage:
   tests/load_test.py --speaker ryan --concurrency 1,2,4 --requests 8
-  tests/load_test.py --concurrency 1,2,3,4 --arrival poisson --requests 6 \
-                     --server-log /tmp/tts/mini_bench/int8_server.log
-  tests/load_test.py --concurrency 4 --arrival uniform --interval 1.5 --csv /tmp/l.csv
+  tests/load_test.py --concurrency 1,2,3,4 --arrival poisson --requests 6
+  tests/load_test.py --concurrency 4 --arrival uniform --interval 1.5 --csv out.csv
 
-Environment variables (for callers reached through another script that does not pass the
-flags — for example the mini-bench wrapper, which this file does not modify):
+Environment overrides for callers that cannot pass flags:
   QWEN_LT_ARRIVAL  QWEN_LT_RATE  QWEN_LT_INTERVAL  QWEN_LT_ARRIVAL_SEED
   QWEN_LT_TTFA_BUDGET_MS  QWEN_LT_SERVER_LOG  QWEN_LT_SERVICE_S
 """
 import argparse, asyncio, csv, json, math, os, random, statistics, sys, time
 from urllib.parse import urlparse
 
-SR = 24000          # il server emette PCM grezzo int16 mono 24 kHz su /v1/tts/stream
+SR = 24000
 BYTES_PER_SAMPLE = 2
-# The DEFAULT text bank is English, and that is a phase decision rather than a taste one.
-#
-#   PHASE 1 (now): characterise the ENGINE on open Qwen3-TTS models, on rented servers.
-#   Compute, bandwidth and disk are the same whatever the checkpoint is -- a finetune
-#   only changes the tuning on top -- so open weights are enough to measure RTF, TTFA,
-#   throughput, the concurrency ceiling and RSS, and there is no reason to ship private
-#   weights to a machine you rent.
-#
-#   PHASE 2 (later): once the CPU side is understood, a finetune, its target language and a
-#   language-identification accuracy gate come back. They are not discarded: a longer bank stays available
-#   and is selected with --text-file.
-#
-# The wrong default does not fail, it silently measures open weights with another bank's
-# texts. So the default is the one needed NOW, and the other is explicit.
 DEFAULT_TEXTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "load_texts_en.txt")
 
-# Co-occurrence window for attribution. 200 ms is not a magic number: it is the order of
-# magnitude of one admission step + one frame (80 ms) + scheduling slack. Below it, real
-# coincidences are lost; above it, everything "coincides with everything".
 NEIGHBOR_MS = 200.0
 
-
-# ── banco di testi ──────────────────────────────────────────────────────────
 def load_texts(path, only_classes=None):
     """-> [(cls, text)]. Le righe sono '<classe>\\t<testo>'; '#' e vuote ignorate."""
     out = []
@@ -148,25 +49,8 @@ def load_texts(path, only_classes=None):
                 continue
             out.append((cls, txt))
     if not out:
-        sys.exit(f"{path}: nessun testo usabile (filtro={only_classes})")
+        sys.exit(f"{path}: no usable text (filter={only_classes})")
 
-    # ── INTERLEAVE BY CLASS, and it is not cosmetic ──────────────────────────────
-    # The bank is written GROUPED by class (all the short ones, then medium, then long)
-    # and the selection downstream is `texts[idx % len(texts)]`, i.e. round-robin from the
-    # head. Measured consequence: a c=4 level with 4 requests emitted FOUR nearly identical
-    # SHORT sentences, and over a full run of 8 the `long` class NEVER appeared — the
-    # opposite of the "mixed lengths" design declared at the top of the bank.
-    #
-    # Why that is the worst case for exactly what we want to measure: with requests of
-    # equal length every slot in the batch reaches EOS on the same frame, so the batch
-    # fills and empties together and the RAGGED regime is never exercised — which is
-    # precisely the regime of continuous batching in production, where finishing slots are
-    # replaced while the others carry on.
-    #
-    # The interleave happens HERE rather than by reordering the file, because
-    # `only_classes` may select a subset: the alternation has to hold over whatever
-    # survives the filter. Class order = first appearance in the file (deterministic, no
-    # randomness: the bank must stay reproducible between two runs).
     buckets = {}
     for cls, txt in out:
         buckets.setdefault(cls, []).append(txt)
@@ -181,8 +65,6 @@ def load_texts(path, only_classes=None):
         i += 1
     return mixed
 
-
-# ── tail dello stderr del server ────────────────────────────────────────────
 class ServerLogTail:
     """Read the server's stderr WHILE it runs and stamp each line as it appears.
 
@@ -201,7 +83,7 @@ class ServerLogTail:
     def __init__(self, path, poll_s=0.02):
         self.path = path
         self.poll_s = poll_s
-        self.events = []          # [(t_rel_ms, riga)]
+        self.events = []
         self._stop = False
         self._fh = None
         self._buf = b""
@@ -259,15 +141,12 @@ class ServerLogTail:
                 out.append((t, adm))
         return out
 
-
-# ── una richiesta ───────────────────────────────────────────────────────────
 async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audio,
                       timeout, t0, arrival_sched_ms, inflight, gate):
-    """Lancia una richiesta in streaming e cronometra a parte il PRIMO byte del corpo.
+    """Stream one request, timing the FIRST body byte separately.
 
-    `t0` e' l'origine dei tempi DEL LIVELLO: tutti gli istanti sono relativi a quello,
-    perche' l'attribuzione dei picchi ha bisogno di una linea del tempo comune fra
-    richieste diverse. Una durata da sola non permette di attribuire niente.
+    `t0` is the level's time origin: every instant is relative to it, because spike
+    attribution needs a timeline shared across requests.
     """
     body = json.dumps(payload).encode()
     head = (
@@ -281,12 +160,11 @@ async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audi
     rec = {"request_id": req_id, "class": cls, "text": payload["text"],
            "ttfa_ms": None, "total_ms": None, "audio_s": 0.0, "rtf": None,
            "bytes": 0, "status": None, "error": "",
-           # ── linea del tempo, relativa all'inizio del livello ──
-           "arrival_sched_ms": arrival_sched_ms,   # quando DOVEVA arrivare
-           "arrival_ms": None,                     # quando e' partita davvero
-           "first_ms": None,                       # primo byte audio
-           "end_ms": None,                         # ultimo byte
-           "admit_wait_ms": 0.0}                   # attesa nel client (solo --max-inflight)
+           "arrival_sched_ms": arrival_sched_ms,
+           "arrival_ms": None,
+           "first_ms": None,
+           "end_ms": None,
+           "admit_wait_ms": 0.0}
 
     if gate is not None:
         g0 = time.perf_counter()
@@ -302,13 +180,11 @@ async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audi
         writer.write(head + body)
         await writer.drain()
 
-        # ── header ──────────────────────────────────────────────────────────
         raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)
         status_line = raw.split(b"\r\n", 1)[0].decode("latin1")
         rec["status"] = int(status_line.split()[1]) if len(status_line.split()) > 1 else 0
         chunked = b"transfer-encoding: chunked" in raw.lower()
 
-        # ── corpo; il TTFA si timbra sul primo byte che e' davvero audio ─────
         chunks, first = [], None
         while True:
             if chunked:
@@ -317,7 +193,7 @@ async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audi
                 if n == 0:
                     break
                 data = await asyncio.wait_for(reader.readexactly(n), timeout)
-                await reader.readexactly(2)          # CRLF finale
+                await reader.readexactly(2)
             else:
                 data = await asyncio.wait_for(reader.read(65536), timeout)
                 if not data:
@@ -342,7 +218,7 @@ async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audi
         if save_audio and payload_bytes:
             _write_wav(os.path.join(out_dir, f"req{req_id:04d}_{cls}.wav"), payload_bytes)
 
-    except Exception as e:                        # noqa: BLE001 — ogni fallimento e' un dato
+    except Exception as e:                        # noqa: BLE001
         rec["error"] = f"{type(e).__name__}: {e}"
         t_end = time.perf_counter()
         rec["total_ms"] = (t_end - t_start) * 1000.0
@@ -362,10 +238,8 @@ async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audi
                 pass
     return rec
 
-
 def _write_wav(path, pcm):
-    """PCM int16 grezzo -> un vero file RIFF. Il server strema PCM senza header; un
-    client che lo scrive dritto in .wav produce un file che nessun player apre."""
+    """Raw int16 PCM -> a real RIFF file. The server streams headerless PCM."""
     import struct
     n = len(pcm)
     hdr = (b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, SR, SR * 2, 2, 16)
@@ -374,8 +248,6 @@ def _write_wav(path, pcm):
         f.write(hdr)
         f.write(pcm)
 
-
-# ── the arrival process ─────────────────────────────────────────────────────
 def arrival_offsets(mode, n, conc, rate, interval, service_s, seed):
     """Arrival instants (seconds from the start of the level) for n requests.
 
@@ -395,15 +267,10 @@ def arrival_offsets(mode, n, conc, rate, interval, service_s, seed):
         out, t = [], 0.0
         for _ in range(n):
             out.append(t)
-            # inter-arrivi esponenziali = processo di Poisson (memoryless: e' il
-            # modello standard di arrivi indipendenti, ed e' anche il caso in cui
-            # i "grappoli" capitano da soli, senza doverli costruire a mano).
             t += -math.log(1.0 - rng.random()) / lam
         return out, lam
     raise SystemExit(f"modalita' di arrivo sconosciuta: {mode}")
 
-
-# ── un livello di concorrenza ───────────────────────────────────────────────
 async def run_level(args, host, port, texts, conc, service_s):
     out_dir = os.path.join(args.output_dir, f"c{conc}")
     if args.save_audio:
@@ -413,7 +280,7 @@ async def run_level(args, host, port, texts, conc, service_s):
     if args.server_log:
         tail = ServerLogTail(args.server_log)
         if not tail.open_at_end():
-            print(f"  ⚠️  --server-log {args.server_log}: non apribile, attribuzione solo lato client")
+            print(f"  ⚠️  --server-log {args.server_log}: cannot open, client-side attribution only")
             tail = None
 
     def payload_for(idx):
@@ -421,15 +288,13 @@ async def run_level(args, host, port, texts, conc, service_s):
         return cls, {"text": txt, "speaker": args.speaker, "language": args.language,
                      "temperature": args.temperature, "seed": args.seed + idx}
 
-    inflight = []                     # ids of the requests open at this instant
+    inflight = []
     gate = asyncio.Semaphore(args.max_inflight) if args.max_inflight > 0 else None
     records = []
     t0 = time.perf_counter()
     tail_task = asyncio.create_task(tail.run(t0)) if tail else None
 
     if args.arrival == "all-at-once" and args.duration:
-        # soak storico: si tengono `conc` richieste in volo finche' scade il tempo.
-        # E' closed loop per costruzione, e resta com'era: e' il regime di tenuta.
         stop_at = t0 + args.duration
         sem = asyncio.Semaphore(conc)
 
@@ -450,10 +315,6 @@ async def run_level(args, host, port, texts, conc, service_s):
         lam = None
 
     elif args.arrival == "all-at-once":
-        # THE SYNCHRONISED WORST CASE, and it stays the default: all at t=0, `conc` in
-        # flight, the next starting when one finishes. It is the regime every historical
-        # number in this project was taken under — changing it quietly would make all of
-        # them incomparable.
         sem = asyncio.Semaphore(conc)
 
         async def worker(idx):
@@ -467,9 +328,6 @@ async def run_level(args, host, port, texts, conc, service_s):
         lam = None
 
     else:
-        # ── ARRIVI SCAGLIONATI, open loop: nessuno trattiene le richieste. E' l'unico
-        # modo di avere richieste che arrivano su una macchina GIA' carica ma non
-        # sincronizzate con le altre — cioe' di poter attribuire un picco.
         n = args.requests
         offs, lam = arrival_offsets(args.arrival, n, conc, args.rate, args.interval,
                                     service_s, args.arrival_seed)
@@ -498,8 +356,6 @@ async def run_level(args, host, port, texts, conc, service_s):
     attribute(records, done_ev, args.ttfa_budget_ms)
     return records, wall, len(records), lam, done_ev
 
-
-# ── spike attribution ───────────────────────────────────────────────────────
 def attribute(records, server_done_events, budget_ms):
     """For each request: what was happening in the server when it arrived, and while it
     waited for the first byte.
@@ -508,9 +364,9 @@ def attribute(records, server_done_events, budget_ms):
     EXACT: we generate the arrivals and we see the last byte. The ones from the server log
     are an independent confirmation, timestamped by the tail.
 
-    Il controllo che rende l'ipotesi falsificabile e' `inflight_at_arrival == 0`:
-    un picco su macchina scarica NON e' contesa, ed e' l'unico caso in cui si puo'
-    escludere lo scheduler senza ricorrere ad altri strumenti.
+    The control that makes the hypothesis falsifiable is `inflight_at_arrival == 0`:
+    a spike on an idle machine is not contention, and it is the only case that rules
+    out the scheduler without further instrumentation.
     """
     ev = [(r["arrival_ms"], r["end_ms"], r["request_id"]) for r in records
           if r["arrival_ms"] is not None]
@@ -534,32 +390,23 @@ def attribute(records, server_done_events, budget_ms):
                 1 for (s, _e, _i) in others if s is not None and a <= s <= f)
             r["finishes_in_wait"] = sum(
                 1 for (_s, e, _i) in others if e is not None and a <= e <= f)
-            # in volo massimo durante l'attesa: il picco di contesa che ha davvero
-            # visto, non quello all'istante dell'arrivo (che puo' essere basso).
             hi = r["inflight_at_arrival"]
             for (s, _e, _i) in others:
                 if s is not None and a <= s <= f:
                     hi += 1
             r["max_inflight_in_wait"] = hi
-        # conferma indipendente dal server: quante `[BATCH] done` sono state stampate
-        # mentre questa richiesta aspettava il primo byte.
         if f is not None:
             r["srv_done_in_wait"] = sum(1 for (t, _k) in server_done_events if a <= t <= f)
             r["srv_done_prev_200ms"] = sum(
                 1 for (t, _k) in server_done_events if a - NEIGHBOR_MS <= t < a)
             adm = [k for (t, k) in server_done_events if a <= t <= f and k is not None]
             adm0 = [k for (t, k) in server_done_events if t < a and k is not None]
-            # the `admitted` counter is cumulative and we only see it attached to a
-            # `done`: if it grew within the window, somebody else WAS admitted. With no
-            # `done` inside the window nothing can be said -> None, which the report reads
-            # as "n/a", not as "zero".
             r["srv_admits_in_wait"] = (max(adm) - max(adm0)) if (adm and adm0) else None
         else:
             r["srv_done_in_wait"] = r["srv_done_prev_200ms"] = 0
             r["srv_admits_in_wait"] = None
         r["spike"] = bool(r["ttfa_ms"] is not None and r["ttfa_ms"] > budget_ms)
         r["attribution"] = _verdict(r)
-
 
 def _verdict(r):
     """One short line saying what the spike COINCIDES with. Not a causal explanation: the
@@ -581,8 +428,6 @@ def _verdict(r):
                     f"flight, no event inside the window)")
     return " · ".join(bits)
 
-
-# ── statistiche ─────────────────────────────────────────────────────────────
 def pct(values, p):
     if not values:
         return float("nan")
@@ -592,7 +437,6 @@ def pct(values, p):
     k = (len(v) - 1) * (p / 100.0)
     lo, hi = int(k), min(int(k) + 1, len(v) - 1)
     return v[lo] + (v[hi] - v[lo]) * (k - lo)
-
 
 def mean_inflight(records, wall):
     """Requests in flight, time-averaged (integral of the overlaps / wall).
@@ -614,7 +458,6 @@ def mean_inflight(records, wall):
         hi = max(hi, cur)
     return (tot / wall) if wall > 0 else 0.0, hi
 
-
 def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
     ok = [r for r in records if not r["error"] and r["status"] == 200]
     bad = [r for r in records if r not in ok]
@@ -627,7 +470,6 @@ def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
     return {
         "concurrency": conc, "requests": len(records), "ok": len(ok), "errors": len(bad),
         "wall_s": wall, "audio_s": audio, "throughput_Q": (audio / wall) if wall else 0.0,
-        # ── TTFA: la metrica di prima classe ──
         "ttfa_p50": p50, "ttfa_p95": p95, "ttfa_p99": pct(ttfa, 99),
         "ttfa_max": max(ttfa) if ttfa else float("nan"),
         "ttfa_mean": statistics.fmean(ttfa) if ttfa else float("nan"),
@@ -636,9 +478,7 @@ def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
         "ttfa_over_budget_pct": (100.0 * len(over) / len(ok)) if ok else float("nan"),
         "ttfa_stability": (p95 / p50) if (p50 and p50 == p50 and p50 > 0) else float("nan"),
         "ttfa_within_budget": bool(ok) and (p95 <= budget_ms),
-        # ── secondarie ──
         "rtf_p50": pct(rtf, 50), "rtf_p95": pct(rtf, 95),
-        # ── how the load arrived (without this the row is not reproducible) ──
         "arrival": arrival, "arrival_rate_hz": lam, "arrival_seed": seed,
         "service_s_estimate": service_s,
         "mean_inflight": mi, "max_inflight_observed": hi,
@@ -650,8 +490,6 @@ def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
                    for r in sorted(over, key=lambda x: -x["ttfa_ms"])],
     }
 
-
-# ── stampa ──────────────────────────────────────────────────────────────────
 def print_table(rows, budget_ms):
     base = next((s for s in rows if s["concurrency"] == 1), None)
     b95 = base["ttfa_p95"] if base else None
@@ -697,10 +535,9 @@ def print_table(rows, budget_ms):
         print(f"   contention: for a clean baseline use --arrival uniform, which by construction")
         print(f"   does not cluster.")
 
-
 def print_verdict(rows, budget_ms):
     print()
-    print(f"=============== VERDETTO — TTFA p95 <= {budget_ms:.0f} ms (PLAN 0.nonies, bersaglio di prodotto)")
+    print(f"=============== VERDICT — TTFA p95 <= {budget_ms:.0f} ms (product target)")
     best = 0
     for s in sorted(rows, key=lambda r: r["concurrency"]):
         ok = s["ttfa_within_budget"] and s["errors"] == 0
@@ -709,34 +546,33 @@ def print_verdict(rows, budget_ms):
         mark = "✅" if ok else "❌"
         why = []
         if s["errors"]:
-            why.append(f"{s['errors']} errori")
+            why.append(f"{s['errors']} errors")
         if not s["ttfa_within_budget"]:
             why.append(f"p95 {s['ttfa_p95']:.0f} ms > {budget_ms:.0f}")
         if s["ttfa_over_budget"]:
-            why.append(f"{s['ttfa_over_budget']}/{s['ok']} richieste sopra soglia (max {s['ttfa_max']:.0f} ms)")
+            why.append(f"{s['ttfa_over_budget']}/{s['ok']} requests over budget (max {s['ttfa_max']:.0f} ms)")
         print(f"  c={s['concurrency']:<3} {mark}  p95 {s['ttfa_p95']:>7.0f} ms"
-              + (("   " + " · ".join(why)) if why else "   dentro soglia, nessun picco"))
+              + (("   " + " · ".join(why)) if why else "   within budget, no spike"))
     print()
     if best:
-        print(f"  -> MASSIMA CONCORRENZA CHE REGGE TTFA p95 <= {budget_ms:.0f} ms:  c = {best}")
+        print(f"  -> HIGHEST CONCURRENCY HOLDING TTFA p95 <= {budget_ms:.0f} ms:  c = {best}")
     else:
-        print(f"  -> MASSIMA CONCORRENZA CHE REGGE TTFA p95 <= {budget_ms:.0f} ms:  NESSUNA (nemmeno c=1)")
-    print("     E' il numero di prodotto: quante conversazioni parallele questa macchina")
-    print("     serve senza che l'utente senta il silenzio. Q e RTF vengono dopo.")
-
+        print(f"  -> HIGHEST CONCURRENCY HOLDING TTFA p95 <= {budget_ms:.0f} ms:  NONE (not even c=1)")
+    print("     This is the product number: how many parallel conversations this machine")
+    print("     serves without the user hearing silence. Q and RTF come after.")
 
 def print_spikes(rows, budget_ms, limit=12):
     spikes = [(s["concurrency"], sp) for s in rows for sp in s["spikes"]]
     print()
-    print(f"=============== ATTRIBUZIONE DEI PICCHI (TTFA > {budget_ms:.0f} ms)")
+    print(f"=============== SPIKE ATTRIBUTION (TTFA > {budget_ms:.0f} ms)")
     if not spikes:
-        print("  nessun picco: nessuna richiesta sopra soglia a nessun livello.")
+        print("  no spike: no request over budget at any level.")
         return
-    print("  L'ipotesi da confermare o FALSIFICARE: \"il picco coincide con l'arrivo o la fine")
-    print("  di un'altra richiesta\". La riga che la falsifica e' 'macchina SCARICA'.")
+    print("  The hypothesis to confirm or FALSIFY: \"the spike coincides with another")
+    print("  request arriving or finishing\". The row that falsifies it is 'IDLE machine'.")
     print()
-    hdr = (f"  {'c':>2}{'req':>5}{'classe':>8}{'arrivo':>9}{'TTFA':>8}{'volo':>6}"
-           f"{'arr-200':>8}{'fini':>6}{'srv':>5}  coincidenza")
+    hdr = (f"  {'c':>2}{'req':>5}{'class':>8}{'arrival':>9}{'TTFA':>8}{'flight':>6}"
+           f"{'arr-200':>8}{'ends':>6}{'srv':>5}  coincidence")
     print(hdr)
     print("  " + "-" * (len(hdr) + 30))
     for c, sp in sorted(spikes, key=lambda x: -x[1]["ttfa_ms"])[:limit]:
@@ -745,29 +581,24 @@ def print_spikes(rows, budget_ms, limit=12):
               f"{sp['ttfa_ms']:>7.0f}m{sp['inflight_at_arrival']:>6}"
               f"{sp['arrivals_prev_200ms']:>8}{sp['finishes_in_wait']:>6}{srv:>5}  {sp['attribution']}")
     if len(spikes) > limit:
-        print(f"  ... e altri {len(spikes) - limit} (tutti nel CSV/JSON)")
+        print(f"  ... and {len(spikes) - limit} more (all in the CSV/JSON)")
     print()
-    print("  volo    = richieste gia' aperte quando questa e' arrivata (lato client, esatto)")
-    print("  arr-200 = altre arrivate nei 200 ms precedenti (grappolo)")
-    print("  fini    = altre CHIUSE mentre questa aspettava il primo byte (lato client)")
-    print("  srv     = righe `[BATCH] done` del server nella stessa finestra (--server-log)")
+    print("  flight  = requests already open when this one arrived (client side, exact)")
+    print("  arr-200 = others that arrived in the previous 200 ms (cluster)")
+    print("  ends    = others that CLOSED while this one waited for the first byte")
+    print("  srv     = server `[BATCH] done` lines in the same window (--server-log)")
 
-
-# ── calibrazione del ritmo di arrivo ────────────────────────────────────────
 async def calibrate(args, host, port, texts):
-    """Una richiesta SOLA su macchina scarica -> S, la durata di servizio di
-    riferimento. Serve solo a scegliere il ritmo degli arrivi quando non lo passi:
-    intervallo = S/c rende "c" confrontabile fra macchine diverse senza numeri
-    cablati (su M1 e su un C3 la stessa `--rate` significherebbe carichi diversi).
-    NON entra nelle statistiche: e' fuori dalla misura, per costruzione.
+    """One request alone on an idle machine -> S, the reference service time.
 
-    ⚠️ La sonda usa UN testo, ma il livello ne usa una MISCELA di lunghezze diverse:
-    prendere la durata della sonda come S paga un errore proporzionale al rapporto
-    fra le lunghezze, e con banco misto e' un fattore 3-5 (misurato: sonda 17 s
-    contro media reale ~3 s -> arrivi cinque volte troppo radi, e la concorrenza
-    offerta non si realizza mai). Quindi si RISCALA sulla lunghezza media del banco,
-    che e' il predittore piu' semplice della durata dell'audio. Resta una stima: il
-    ritmo vero viene poi RICALIBRATO sul livello c=1, che e' l'unico senza contesa.
+    It only sets the arrival pace when you do not pass one: interval = S/c makes "c"
+    comparable across machines without hardwired numbers. It does not enter the
+    statistics.
+
+    The probe uses ONE text while the level uses a MIXTURE of lengths, so taking the
+    probe duration as S costs an error proportional to the length ratio. S is therefore
+    rescaled on the bank's mean length, and the pace is recalibrated on the c=1 level,
+    the only one without contention.
     """
     mid = texts[len(texts) // 2]
     pl = {"text": mid[1], "speaker": args.speaker, "language": args.language,
@@ -781,14 +612,13 @@ async def calibrate(args, host, port, texts):
     scale = mean_len / max(len(mid[1]), 1)
     return (r["total_ms"] / 1000.0) * scale, r
 
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
     ap.add_argument("--url", default="http://localhost:8900")
     ap.add_argument("--path", default="/v1/tts/stream")
     ap.add_argument("--concurrency", default="1,2,4,8", help="sweep separato da virgole, es. 1,2,4,8")
-    ap.add_argument("--requests", type=int, default=16, help="richieste per livello di concorrenza")
+    ap.add_argument("--requests", type=int, default=16, help="requests per concurrency level")
     ap.add_argument("--duration", type=float, default=0.0, help="secondi; scavalca --requests (soak)")
     ap.add_argument("--text-file", default=DEFAULT_TEXTS)
     ap.add_argument("--classes", default="", help="filtro sulle classi di testo, es. short,long")
@@ -799,31 +629,29 @@ def main():
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--output-dir", default="/tmp/tts/loadtest")
     ap.add_argument("--no-save-audio", dest="save_audio", action="store_false")
-    ap.add_argument("--csv", default="", help="scrive qui i record per richiesta")
-    ap.add_argument("--json", default="", help="scrive qui il riepilogo per livello")
-    # ── arrivi ──
+    ap.add_argument("--csv", default="", help="write the per-request records here")
+    ap.add_argument("--json", default="", help="write the per-level summary here")
     ap.add_argument("--arrival", default=env("QWEN_LT_ARRIVAL", "all-at-once"),
                     choices=["all-at-once", "poisson", "uniform"],
                     help="all-at-once = caso peggiore sincronizzato (default, storico); "
                          "poisson = inter-arrivi esponenziali; uniform = spaziatura fissa")
     ap.add_argument("--rate", type=float, default=float(env("QWEN_LT_RATE", "0") or 0),
-                    help="richieste/s per --arrival poisson (0 = calibrato: c/S)")
+                    help="requests/s for --arrival poisson (0 = calibrated: c/S)")
     ap.add_argument("--interval", type=float, default=float(env("QWEN_LT_INTERVAL", "0") or 0),
                     help="secondi fra arrivi per --arrival uniform (0 = calibrato: S/c)")
     ap.add_argument("--arrival-seed", type=int, default=int(env("QWEN_LT_ARRIVAL_SEED", "1234")),
-                    help="seme del processo di arrivo: FISSO e dichiarato, cosi' due corse "
-                         "vedono la stessa sequenza di arrivi")
+                    help="arrival-process seed: FIXED and declared, so two runs see the "
+                         "same arrival sequence")
     ap.add_argument("--service-s", type=float, default=float(env("QWEN_LT_SERVICE_S", "0") or 0),
-                    help="durata di una richiesta da sola (s); 0 = misurata con una sonda")
+                    help="duration of one request alone (s); 0 = measured with a probe")
     ap.add_argument("--max-inflight", type=int, default=0,
-                    help="valvola di sicurezza in open loop (0 = nessun tetto). ⚠️ se scatta, "
-                         "l'attesa e' NEL CLIENT e non e' del server: viene registrata a parte")
-    # ── soglia di prodotto ──
+                    help="open-loop safety valve (0 = no cap). If it trips, "
+                         "the wait is IN THE CLIENT, not the server, and is recorded separately")
     ap.add_argument("--ttfa-budget-ms", type=float,
                     default=float(env("QWEN_LT_TTFA_BUDGET_MS", "500")),
-                    help="soglia di TTFA per il verdetto (default 500 ms, PLAN 0.nonies)")
+                    help="TTFA threshold for the verdict (default 500 ms)")
     ap.add_argument("--server-log", default=env("QWEN_LT_SERVER_LOG", ""),
-                    help="stderr del server, letto in diretta: correla i picchi con le "
+                    help="server stderr, read live: correlates spikes with the "
                          "righe `[BATCH] done`")
     args = ap.parse_args()
 
@@ -837,14 +665,13 @@ def main():
     print(f"speaker  {args.speaker} · lingua {args.language} · temp {args.temperature}")
     print(f"testi    {len(texts)} da {os.path.basename(args.text_file)}"
           f"{' (' + ','.join(classes) + ')' if classes else ''}")
-    mode = f"soak {args.duration:.0f}s" if args.duration else f"{args.requests} richieste"
-    print(f"sweep    concorrenza {levels} · {mode} per livello")
-    print(f"soglia   TTFA p95 <= {args.ttfa_budget_ms:.0f} ms  (bersaglio di prodotto)")
+    mode = f"soak {args.duration:.0f}s" if args.duration else f"{args.requests} requests"
+    print(f"sweep    concurrency {levels} · {mode} per level")
+    print(f"budget   TTFA p95 <= {args.ttfa_budget_ms:.0f} ms  (product target)")
 
-    # ── ritmo degli arrivi: calibrato una volta sola, a macchina scarica ──
     service_s = args.service_s or None
     if args.arrival != "all-at-once" and not service_s and not (args.rate or args.interval):
-        print("arrivi   calibrazione: una richiesta sola a macchina scarica...", end=" ", flush=True)
+        print("arrivals calibration: one request alone on an idle machine...", end=" ", flush=True)
         service_s, probe = asyncio.run(calibrate(args, host, port, texts))
         if service_s:
             print(f"S = {service_s:.2f} s  (audio {probe['audio_s']:.1f} s, "
@@ -857,10 +684,10 @@ def main():
         print("arrivi   all-at-once — tutte a t=0 (caso peggiore sincronizzato)")
     else:
         if args.arrival == "poisson":
-            ritmo = (f"rate {args.rate:.3f} req/s (dichiarato)" if args.rate
+            pace = (f"rate {args.rate:.3f} req/s (declared)" if args.rate
                      else f"rate = c/S = c/{service_s:.2f}s (calibrato)")
         else:
-            ritmo = (f"intervallo {args.interval:.2f} s (dichiarato)" if args.interval
+            pace = (f"interval {args.interval:.2f} s (declared)" if args.interval
                      else f"intervallo = S/c = {service_s:.2f}s/c (calibrato)")
         print(f"arrivi   {args.arrival} · {ritmo} · seme {args.arrival_seed} (FISSO: due corse "
               f"vedono gli stessi arrivi)")
@@ -875,35 +702,21 @@ def main():
         all_records.extend(recs)
         s = summarize(recs, wall, conc, args.ttfa_budget_ms, args.arrival, lam,
                       args.arrival_seed, service_s)
-        # THE ENDPOINT BELONGS IN THE ROW, not only on the command line. /v1/tts/stream
-        # and /v1/tts produce the same audio but NOT the same metric: on the stream, first
-        # audio is the first chunk (the silence the user actually lives through); on
-        # /v1/tts the first byte arrives once generation has finished, so "first audio"
-        # there equals total latency and is not a product constraint. Without this field
-        # an aggregator combining two runs has no way to notice, and prints a false
-        # verdict.
         s["path"] = args.path
         s["workload"] = "stream" if args.path.endswith("/stream") else "offline"
         summaries.append(s)
-        # ── the real pace comes from the c=1 level: it is measured on the actual MIX of
-        # texts and on this machine, while the probe is a single text. The probe is there
-        # to start from; from here on the later levels are calibrated on a measured number.
-        # The MEDIAN is used rather than the mean: with Poisson arrivals some clustering
-        # happens even at c=1, and one request that waited in the queue would inflate the
-        # mean -> arrivals too sparse at the levels after it, which is the very error being
-        # corrected, again. ──
         if conc == 1 and args.arrival != "all-at-once" and not (args.rate or args.interval):
             tot = [r["total_ms"] / 1000.0 for r in recs if not r["error"] and r["total_ms"]]
             if tot:
                 new_s = statistics.median(tot)
                 if abs(new_s - service_s) / max(service_s, 1e-9) > 0.15:
-                    print(f"      ritmo ricalibrato su c=1 (senza contesa): "
+                    print(f"      pace recalibrated on c=1 (no contention): "
                           f"S {service_s:.2f} s -> {new_s:.2f} s")
                 service_s = new_s
         err = f" · {s['errors']} ERRORI" if s["errors"] else ""
         print(f"  c={conc:<3} {n:>3} req in {wall:6.1f}s · TTFA p50 {s['ttfa_p50']:.0f}ms "
               f"p95 {s['ttfa_p95']:.0f}ms max {s['ttfa_max']:.0f}ms · "
-              f"{s['ttfa_over_budget']}/{s['ok']} sopra soglia · Q {s['throughput_Q']:.2f}"
+              f"{s['ttfa_over_budget']}/{s['ok']} over budget · Q {s['throughput_Q']:.2f}"
               f"{' · ' + str(len(dev)) + ' [BATCH] done' if dev else ''}{err}")
 
     print_table(summaries, args.ttfa_budget_ms)
@@ -912,7 +725,7 @@ def main():
 
     bad = [r for r in all_records if r["error"]]
     if bad:
-        print(f"\n{len(bad)} richieste fallite; le prime:")
+        print(f"\n{len(bad)} failed requests; the first ones:")
         for r in bad[:5]:
             print(f"  c={r['concurrency']} req{r['request_id']} status={r['status']} {r['error']}")
 
@@ -923,16 +736,15 @@ def main():
             w.writeheader()
             for r in all_records:
                 w.writerow({k: r.get(k, "") for k in keys})
-        print(f"record per richiesta -> {args.csv}")
+        print(f"per-request records -> {args.csv}")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(summaries, f, indent=2, default=str)
-        print(f"riepilogo per livello -> {args.json}")
+        print(f"per-level summary -> {args.json}")
     if args.save_audio:
         print(f"audio                -> {args.output_dir}/c*/")
 
     return 1 if bad else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

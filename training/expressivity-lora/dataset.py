@@ -1,12 +1,7 @@
-# Instruct-conditioned TTSDataset for the L16-26 expressivity LoRA.
-# Prepends a ChatML user turn (the emotion instruct), exactly like CustomVoice inference does.
-# Based on QwenLM/Qwen3-TTS finetuning/dataset.py. The speaker slot is filled voice-agnostically
-# in train_lora.py (a random preset per sample), so the adapter learns emotion, not a timbre.
 import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 from torch.utils.data import Dataset
-
 
 class TTSDataset(Dataset):
     def __init__(self, data_list, processor, config: Qwen3TTSConfig, lag_num=-1):
@@ -80,7 +75,7 @@ class TTSDataset(Dataset):
             labels[i, o+8+tlen-1+clen] = tk.codec_eos_token_id
             codec_ids[i, o+8+tlen-1:o+8+tlen-1+clen, :] = acs
             cmask[i, o+3:o+8+tlen+clen] = True
-            cmask[i, o+6] = False              # speaker-embedding slot (filled in train_lora.py)
+            cmask[i, o+6] = False
             codec_mask[i, o+8+tlen-1:o+8+tlen-1+clen] = True
             attn[i, :o+8+tlen+clen] = 1
 

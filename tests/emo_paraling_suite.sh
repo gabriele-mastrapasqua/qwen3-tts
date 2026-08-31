@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# ===========================================================================================
-# EMO+PARALINGUISTIC SUITE v3 (user 2026-06-25) — the upgraded sound-suite.
-# Not 1:1 isolated mapping. Instead: the paralinguistic WORD embedded inline in a REAL emotional
-# sentence, rendered "at regime" with the NEW v3 levers (steer-clean + CSP .expr + instruct =
-# COMBINE), across multiple SPEAKERS (incl. the 25MB clone graft), sweeping SEEDS per
-# (speaker x emotion) — because seeds shift the emotion/paralinguistic a lot (best-of-N by ear).
-#
-# Configure: SPEAKERS, EMOS (emo|word|sentence|steertag), SEEDS, MODE below.
-# MODE: combine (expr+steer+instruct) | steer (steer+nothing) | expr (expr+instruct, no steer).
-# Run:  bash tests/emo_paraling_suite.sh        ->  samples/emo_paraling_suite/
-# ===========================================================================================
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/emo_paraling_suite; mkdir -p $O
@@ -18,7 +7,6 @@ IT=presets/expr/italian_csp_topk6.expr
 MODE="${MODE:-combine}"
 SEEDS=(${SEEDS:-42 777 123})
 SPEAKERS=(${SPEAKERS:-ryan vivian serena galatea})
-# emo | inline paralinguistic word | real emotional sentence (word inline) | steer tag
 EMOS=(
   "joy|ahah|Non ci posso credere, ahah, e la notizia piu bella della mia vita.|joy"
   "sad|ahh|Ho perso tutto quello che avevo, ahh, e adesso non so piu cosa fare.|sad"

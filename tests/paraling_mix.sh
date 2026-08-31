@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
-# Paralinguistics MIXED INTO emotion (user idea 2026-06-24): blend laugh/growl/sigh/bleah INTO the emotional
-# delivery (not a separate concatenated macro span). Method B = onomatopoeia IN the carrier text + emotion steer
-# (the steer renders the vocalization WITH the emotion). Compare vs A = emotion steer ALONE (what it produces
-# naturally) and C = the existing [tag] macro composer (separate synth span). galatea clone, IT, steer-clean w8.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 D=samples/emo_retest_0622; O=samples/paraling_mix; mkdir -p $O
 GV="--load-voice voices/galatea_graft.qvoice --icl-only"
 dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframes()/w.getframerate():.2f}s')" "$1" 2>/dev/null||echo FAIL; }
-# A/B use --no-compose so bracket-free onomatopoeia is just rendered as text (no macro routing)
 gen(){ local o="$1"; shift; ./qwen_tts -d qwen3-tts-1.7b -l Italian --seed 42 -T 1.1 "$@" -o $O/$o >/dev/null 2>&1; echo "  $o -> $(dur $O/$o)"; }
 steer(){ local emo="$1"; echo "$D/ryan_${emo}.qlsteer"; }
 

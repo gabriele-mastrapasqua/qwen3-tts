@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-# Build train_raw.jsonl for the Japanese .expr LoRA from JVNV (asahi417/jvnv-emotional-speech-corpus).
-# Sibling of prepare_resd.py — JVNV ships as HF parquet with the audio IN-MEMORY (struct {bytes,path})
-# and emotion in `style` + `speaker_id`, but it has NO transcript column, so this loader runs ASR
-# (faster-whisper, Japanese) on each clip to recover `text`. Output schema is IDENTICAL to
-# prepare_manifest.py, so the downstream pipeline (prepare_data.py -> train_lora.py -> export_expr.py)
-# is unchanged. Meant to RUN ON THE GPU BOX (ASR + 2GB download live there).
-#
-# JVNV: 6 emotions (anger/disgust/fear/happiness/sadness/surprise — NO neutral), 4 pro speakers,
-# ~3.94h / 1,615 utt, studio 48kHz/24-bit anechoic. License CC-BY-SA-4.0.
-# NOTE: the HF repo exposes only a "test" split label, but it is the FULL corpus (5 shards ~2GB).
+# LICENSE: CC-BY-SA-4.0.
 import argparse, io, json, os
 from collections import Counter
 
@@ -19,8 +10,6 @@ from huggingface_hub import HfApi, hf_hub_download
 
 REPO = "asahi417/jvnv-emotional-speech-corpus"
 
-# JVNV `style` -> vivid ENGLISH instruct (instruct-following is EN/ZH-centric; speech stays Japanese).
-# JVNV `style` values (verified via --histogram): anger, disgust, fear, happy, sad, surprise (NO neutral).
 EMOTION_INSTRUCT = {
     "anger":    "Speak with hot, furious anger, sharp and forceful.",
     "disgust":  "Speak with physical disgust, repulsed and recoiling.",
@@ -54,8 +43,6 @@ def main():
         print("JVNV style counts:", dict(c))
         return
 
-    # openai-whisper (torch-based) — uses CUDA via torch (the GB10's ctranslate2 wheel has no CUDA,
-    # so faster-whisper can't GPU here; torch CUDA works since the LoRA trainer uses it).
     import whisper
     asr = whisper.load_model(args.whisper_model, device="cuda")
 

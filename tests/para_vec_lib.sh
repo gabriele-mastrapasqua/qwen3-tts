@@ -1,27 +1,15 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# PARALINGUISTIC VECTOR LIBRARY builder (user 2026-06-25). Industrializes the laugh breakthrough:
-# each event = an injectable activation DIRECTION built from EVENT minus its CONFUSABLE OPPOSITE
-# (RAW, NO --clean — energy IS the signal), injected at L21-25, speaker+language-agnostic.
-#
-# Add a paralinguistic = ONE line in EVENTS:  name|event_instruct|opp_instruct|carrier_it|weights
-#   - captures EVENT + OPPOSITE on ryan-EN (where it renders), builds <name>.qlsteer
-#   - generates a cross-voice test grid (galatea clone / vivian / ryan) in the carrier IT sentence
-# Run:  WAVE=1 bash tests/para_vec_lib.sh      ->  samples/para_vectors/
-# ============================================================================================
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/para_vectors; mkdir -p $O
 M=qwen3-tts-1.7b
 IT=presets/expr/italian_csp_topk6.expr
 SEED=42
-# EN source texts: event = stuffed with the sound; opposite = the confusable twin.
 EVTXT="Hahaha wow, oh no, mmm, ugh, ahh, grr, that is really something else entirely."
 dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframes()/w.getframerate():.2f}s')" "$1" 2>/dev/null||echo FAIL; }
 vf(){ case "$1" in galatea) echo "--load-voice voices/galatea_graft.qvoice --icl-only";; *) echo "-s $1";; esac; }
 ew(){ [ "$1" = galatea ] && echo 1.0 || echo 1.2; }
 
-# name | EVENT instruct (EN) | OPPOSITE instruct (EN) | carrier IT sentence (tag inline) | weights csv
 EVENTS=(
 "growl|Snarl and growl with furious aggression, voice harsh, low and gravelly, baring teeth in rage.|Speak in a soft, tender, gentle and soothing tone, calm and warm.|Come ti permetti di parlarmi cosi, grr, questo proprio non lo accetto.|6,8"
 "disgust|React with strong revulsion and disgust, recoiling, going ugh and yuck, sneering with contempt.|Savor with delight and pleasure, going mmm, warm and satisfied and pleased.|Che cosa disgustosa, bleah, non riesco nemmeno a guardarla.|6,8"

@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-# MULTILINGUAL paralinguistic data by AUGMENTATION (user idea 2026-06-13). Inline-tagged
-# paralinguistic data exists only in EN/ZH; Romance/Germanic/etc. do NOT exist. But a
-# paralinguistic EVENT (laugh/sigh) is language-INDEPENDENT audio. So we MANUFACTURE the
-# cross-lingual data: splice a real isolated event (VocalSound) into a NEUTRAL carrier
-# sentence in any language (our existing per-language neutral clips) and insert the [marker]
-# in the transcript at the splice point. Mixing many languages forces the LoRA to bind
-# marker->EVENT, not marker->language => transfer to IT/DE/... that EN-only training misses.
-#
-# Events: lmms-lab/vocalsound (CC, isolated Laughter/Sigh/Cough/... , ~599 each, 0.6GB).
-# Carriers: --carriers <jsonl> with {audio (24k wav path), text} neutral rows (multilingual).
-# Output: train_raw.jsonl (IDENTICAL schema) — marked clips (spliced event + [marker] in text)
-# + a fraction kept PLAIN as the neutral anchor ("force less").
 import argparse, io, json, os, random
 from collections import Counter
 import numpy as np
@@ -20,7 +8,6 @@ from huggingface_hub import HfApi, hf_hub_download
 
 SR = 24000
 VOCALSOUND = "lmms-lab/vocalsound"
-# VocalSound 'answer' label -> our inline marker (only the ones we want to teach).
 LABEL_MARKER = {"Laughter": "[laugh]", "Sigh": "[sigh]", "Cough": "[cough]"}
 
 def load_events(which):
@@ -37,7 +24,6 @@ def load_events(which):
             if y.ndim > 1: y = y.mean(axis=1)
             y = y.astype("float32")
             if sr != SR: y = librosa.resample(y, orig_sr=sr, target_sr=SR)
-            # trim leading/trailing silence so the event is tight
             yt, _ = librosa.effects.trim(y, top_db=30)
             ev[want[lab]].append(yt if len(yt) > SR // 10 else y)
     return ev
@@ -46,10 +32,9 @@ def splice_point(carrier):
     """Return a sample index near a low-energy pause in the middle 45-70% of the carrier."""
     n = len(carrier)
     lo, hi = int(0.45 * n), int(0.72 * n)
-    if hi - lo < SR // 20: return n  # too short -> append at end
-    win = SR // 50  # 20ms energy window
+    if hi - lo < SR // 20: return n
+    win = SR // 50
     region = carrier[lo:hi]
-    # short-time energy, pick the quietest frame
     e = np.array([np.sum(region[i:i+win]**2) for i in range(0, len(region) - win, win)])
     if len(e) == 0: return n
     return lo + int(np.argmin(e)) * win
@@ -98,7 +83,7 @@ def main():
             if not text: continue
             name = f"aug_{i:06d}"
             if rnd.random() < args.plain_frac:
-                out_text, out_y, emo = text, y, "neutral"            # PLAIN anchor
+                out_text, out_y, emo = text, y, "neutral"
                 used["[plain]"] += 1
             else:
                 m = rnd.choice(markers)
@@ -110,10 +95,9 @@ def main():
                     sp = splice_point(y)
                     out_y = xfade_concat(xfade_concat(y[:sp], ev), y[sp:]) if sp < len(y) else xfade_concat(y, ev)
                     out_text = insert_marker_text(text, m, sp / max(1, len(y)))
-                    emo = m.strip("[]"); used[m] += 1     # emotion field = the MARKER (laugh/sigh/cough) for the CSP probe
+                    emo = m.strip("[]"); used[m] += 1
             out = os.path.join(wav_dir, name + ".wav")
             sf.write(out, out_y, SR, subtype="PCM_16")
-            # language = full name (from carrier lang code) so the CSP trainer's lang-tagged dataset works
             LANG_FULL = {"IT":"Italian","DE":"German","ES":"Spanish","FR":"French","RU":"Russian",
                          "KO":"Korean","JA":"Japanese","EN":"English","ZH":"Chinese","PT":"Portuguese"}
             lang = LANG_FULL.get((c.get("lang") or "").upper(), "English")

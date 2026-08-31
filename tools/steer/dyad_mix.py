@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""dyad_mix.py — blend N emotion .qlsteer steering vectors into one dyad vector.
+"""Blend N emotion .qlsteer steering vectors into one dyad vector.
 
-A .qlsteer is: 'QLST' magic (4B) + int32 L + int32 D + L*D float32 (row-major, per-layer).
-A dyad = weighted element-wise sum of two (or more) same-shape vectors. Apply the result
-with the usual `--ml-steer dyad.qlsteer --ml-weight 12 --ml-range 21-25` (no --emotion).
+A .qlsteer is 'QLST' magic (4B) + int32 L + int32 D + L*D float32, row-major per layer.
+Apply the result with --ml-steer dyad.qlsteer --ml-weight 12 --ml-range 21-25.
 
 Usage:
   dyad_mix.py OUT.qlsteer A.qlsteer:0.5 B.qlsteer:0.5
-  dyad_mix.py OUT.qlsteer A.qlsteer B.qlsteer          # equal weights (0.5/0.5)
+  dyad_mix.py OUT.qlsteer A.qlsteer B.qlsteer          # equal weights
 """
 import struct, sys
 
-MAGIC = 0x54534C51  # 'QLST'
+MAGIC = 0x54534C51
 
 def load(path):
     with open(path, "rb") as f:
@@ -34,7 +33,6 @@ def main(argv):
         else:
             path, w = p, None
         specs.append([path, w])
-    # default equal weights if none given
     if all(w is None for _, w in specs):
         for s in specs: s[1] = 1.0 / len(specs)
     elif any(w is None for _, w in specs):

@@ -1,44 +1,16 @@
 #!/usr/bin/env python3
-"""serve_topology_bench.py — which topology keeps TTFA low at LOW concurrency?
-
-WHY THIS EXISTS AND WHY IT USES tests/load_test.py
-The c=16 result said "when the box is saturated, 4x4 beats one pool". It did not
-answer the commercial question, which is how many STREAMING requests can be served
-while TTFA still feels immediate. And it was measured with a synchronized burst,
-while every earlier number on this box (the design notes:
-c=4 -> TTFA p50 643 ms / p95 695 ms) came from tests/load_test.py with POISSON
-arrivals. A burst and an open-loop Poisson stream are different workloads; comparing
-them is how you invent a regression that is not there. So this drives the canonical
-harness, in its arrival mode, and adds only what the harness does not measure:
-cores, context switches and REAL memory (Pss, never summed RSS).
-
-TOPOLOGIES
-  A  1x16                  one process, one 16-thread pool          (today)
-  B  1x16 stage-aware      prefill at 16, decode at 8 (QWEN_THREADS_TALKER=8)
-  C  2x8   prefork+dispatch
-  D  4x4   prefork+dispatch
-  E  8x2   prefork+dispatch   -- reopened: pre-fork shares the packed weights, so the
-                                 memory argument that excluded it no longer applies
-
-Per-worker in-flight cap is 16/W, so every topology can hold 16 concurrent requests.
-
-Usage:
-  python3 tests/serve_topology_bench.py --model DIR [--topo A,B,C,D,E]
-                                         [--conc 1,2,3,4,5,6,8,16] [--arrival poisson]
-"""
+"""serve_topology_bench.py — which topology keeps TTFA low at LOW concurrency?"""
 import argparse, csv as csvmod, json, os, re, signal, socket, statistics, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import serve_procstats as PS
 
 TOPOS = {
-    #        workers, threads/worker, batch(cap), extra env
     "A": (1, 16, 16, {}),
     "B": (1, 16, 16, {"QWEN_THREADS_TALKER": "8"}),
     "C": (2, 8, 8, {}),
     "D": (4, 4, 4, {}),
     "E": (8, 2, 2, {}),
 }
-
 
 def wait_port(port, timeout=300):
     t0 = time.time()
@@ -49,7 +21,6 @@ def wait_port(port, timeout=300):
         except OSError:
             time.sleep(0.5)
     return False
-
 
 def tree_pids(root):
     out, seen = [root], {root}
@@ -66,7 +37,6 @@ def tree_pids(root):
             except Exception:
                 pass
     return out
-
 
 def counters(pids):
     vol = nonvol = migr = ut = st_ = rss = pss = 0
@@ -105,7 +75,6 @@ def counters(pids):
             pass
     return dict(vol=vol, nonvol=nonvol, migr=migr, ut=ut, st=st_, rss=rss, pss=pss)
 
-
 def start_server(a, topo, port, out):
     W, K, cap, env_extra = TOPOS[topo]
     env = dict(os.environ); env.update(env_extra)
@@ -120,7 +89,6 @@ def start_server(a, topo, port, out):
     f = open(log, "wb")
     p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
     return p, f, log, (W, K, cap)
-
 
 def run_level(a, port, conc, out, tag):
     reqs = max(a.min_requests, 3 * conc)
@@ -141,7 +109,6 @@ def run_level(a, port, conc, out, tag):
     row = data[0] if isinstance(data, list) else data
     if isinstance(row, dict) and "levels" in row:
         row = row["levels"][0]
-    # total latency from the per-request csv, which the summary does not carry
     tot = []
     try:
         with open(cs) as fh:
@@ -156,7 +123,6 @@ def run_level(a, port, conc, out, tag):
         row["total_p50"] = tot[len(tot) // 2]
         row["total_p95"] = tot[min(len(tot) - 1, int(round(0.95 * (len(tot) - 1))))]
     return row, None
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -188,14 +154,12 @@ def main():
                 print(f"  {topo}: server did not come up"); continue
             time.sleep(5)
             pids = tree_pids(p.pid)
-            # For a single-process topology the "worker" is the process itself, so the
-            # per-worker row means the same thing in both tables.
             wmap = {i: pid for i, pid, _c, _t in PS.worker_pids_from_log(log)} or {0: p.pid}
             print(f"  processes: {len(pids)}", flush=True)
             for c in concs:
                 tag = f"{topo}_c{c}"
                 if W > 1:
-                    try: p.send_signal(signal.SIGUSR1)   # reset the dispatcher counters
+                    try: p.send_signal(signal.SIGUSR1)
                     except Exception: pass
                     time.sleep(0.8)
                 mark = os.path.getsize(log)
@@ -206,7 +170,7 @@ def main():
                 pw1 = {i: PS.proc_sample(pid) for i, pid in wmap.items()}
                 stats_line = ""
                 if W > 1:
-                    try: p.send_signal(signal.SIGUSR1)   # dump
+                    try: p.send_signal(signal.SIGUSR1)
                     except Exception: pass
                     time.sleep(0.8)
                     try:
@@ -259,7 +223,6 @@ def main():
         best = max(ins, key=lambda r: r["conc"]) if ins else None
         print(f"  {topo}: " + (f"c={best['conc']} (TTFA p95 {best['ttfa_p95']:.0f} ms, "
                                f"Q {best['throughput_Q']:.2f})" if best else "never inside budget"))
-
 
 if __name__ == "__main__":
     main()

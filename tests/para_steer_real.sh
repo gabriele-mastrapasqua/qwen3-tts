@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# STEER-FROM-REAL experiment (option-2 steering variant, 2026-06-26): build the event direction from
-# a REAL VocalSound clip (encoded -> codes -> QWEN_TF_CODES replay -> QWEN_ACT_MAP) instead of a
-# generated source. vec = event_real - neutral_real. Inject on IT voices. Tests whether a CLEAN real
-# source can push the decoder to a cough-like output (vs the ceiling: target can't produce it).
-#   -> samples/para_steer_real/   (A/B the SAME sentences as samples/para_splice/)
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/para_steer_real; rm -rf $O; mkdir -p $O
@@ -12,10 +7,8 @@ dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframe
 vf(){ case "$1" in galatea) echo "--load-voice voices/galatea_graft.qvoice --icl-only";; *) echo "-s $1";; esac; }
 ew(){ [ "$1" = galatea ] && echo 1.0 || echo 1.2; }
 
-# capture neutral once
 QWEN_TF_CODES=$K/neutral.codes QWEN_ACT_MAP=$K/neutral_real.qamp ./qwen_tts -d $M -s ryan -l English --seed $SEED -T 0.7 --text "Listen to this now." -o /tmp/_n.wav >/dev/null 2>&1
 
-# event | carrier IT (no tag)
 EVENTS=(
 "cough|Scusatemi un momento, devo schiarirmi la voce prima di continuare."
 "sneeze|Aspetta un attimo, scusa, non riesco proprio a trattenermi."

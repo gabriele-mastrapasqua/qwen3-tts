@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
-"""serve_procstats.py — per-worker facts, read from /proc instead of guessed from htop.
-
-Shared by BOTH load harnesses (serve_parallel_wave.py and
-serve_topology_bench.py) so the per-worker row means the same thing in the
-synchronized table and in the Poisson table, even though the two tables must never
-be merged.
-
-Per worker it answers four questions that were previously inferred:
-  active / B        how many requests that worker actually held, time-weighted -
-                    from the dispatcher's own SIGUSR1 dump, not sampled from outside
-  core-seconds      utime+stime of that PROCESS AND ITS THREADS over the level, so
-                    "worker 3 did nothing" is a number and not an impression
-  Cpus_allowed_list the affinity mask the kernel actually granted. sched_setaffinity
-                    can fail silently; printing what the kernel says closes that hole
-  threads / Pss     pool size actually spawned, and the worker's share of memory
-"""
+"""serve_procstats.py — per-worker facts, read from /proc instead of guessed from htop."""
 import os, re
-
 
 def _read(p):
     try:
         return open(p).read()
     except OSError:
         return ""
-
 
 def worker_pids_from_log(log_path):
     """[(index, pid, declared_cpu_range)] from the parent's startup lines.
@@ -37,7 +20,6 @@ def worker_pids_from_log(log_path):
                          _read(log_path)):
         out.append((int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4))))
     return out
-
 
 def proc_sample(pid):
     """One snapshot of a process: CPU ticks, affinity, threads, memory, switches."""
@@ -57,7 +39,6 @@ def proc_sample(pid):
             d["cpus"] = line.split(":", 1)[1].strip()
         elif line.startswith("VmHWM"):
             d["rss_kb"] = int(re.search(r"(\d+)", line).group(1))
-    # switches are per-thread; the main thread alone reported zero on a 16-wide pool
     for t in os.listdir(f"/proc/{pid}/task") if os.path.isdir(f"/proc/{pid}/task") else []:
         s = _read(f"/proc/{pid}/task/{t}/status")
         for line in s.splitlines():
@@ -70,7 +51,6 @@ def proc_sample(pid):
         if m and m.group(1) == "Pss":
             d["pss_kb"] = int(m.group(2))
     return d
-
 
 def parse_prefork_stats(line):
     """The dispatcher's SIGUSR1 line -> {worker: {assigned, completed, active, B}}.
@@ -98,7 +78,6 @@ def parse_prefork_stats(line):
         }
     return out
 
-
 def per_worker_rows(before, after, stats, wall_s, hz=None):
     """Join a /proc delta with the dispatcher's own counters into printable rows."""
     hz = hz or os.sysconf("SC_CLK_TCK")
@@ -118,7 +97,6 @@ def per_worker_rows(before, after, stats, wall_s, hz=None):
             "pss_mb": a["pss_kb"] / 1024.0,
         })
     return rows
-
 
 def format_rows(rows, indent="      "):
     if not rows:

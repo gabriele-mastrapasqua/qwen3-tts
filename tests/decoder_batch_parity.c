@@ -1,61 +1,4 @@
-/*
- * decoder_batch_parity.c — does the CROSS-SLOT BATCHED streaming decoder produce the
- * same audio as the per-slot one?
- *
- * WHY THIS TEST EXISTS. `make test-serve-stream-batch` is an end-to-end gate: it
- * compares a streamed request against a single-stream reference and prints corr to
- * five decimals, so a small numeric drift would still read 1.00000. This one is the
- * microscope: same codes, same chunk schedule, same per-slot states, decoded BOTH
- * ways, compared sample by sample, and it prints the max absolute difference. The
- * expected answer is 0 (or, if it is not, a number small enough to be argued about
- * out loud — see the note on sgemm below).
- *
- * WHAT IT DELIBERATELY EXERCISES:
- *   - RAGGED batches. Every round gives each stream a DIFFERENT number of frames,
- *     which is the normal case under the ramped chunking, and the case a naive
- *     "batch only equal lengths" implementation would never reach.
- *   - streams that skip a round entirely (0 frames), i.e. a slot that has nothing
- *     pending while its neighbours decode.
- *   - the cold path (first chunk, all conv tails still zero) AND the warm path.
- *
- * WHAT WOULD FALSIFY THE BATCHING: any nonzero difference that grows with the number
- * of rounds. A per-item state that got shared would not show up as noise, it would
- * show up as one stream's audio leaking into another's — i.e. a LARGE difference,
- * localised in one stream. Read the per-stream lines, not only the max.
- *
- * NOTE ON EXACTNESS — measured on Apple M1 / Accelerate, 2026-08-18.
- * Most streams come out at exactly 0.000e+00. The residue that remains is NOT the
- * batching: it is the BLAS refusing to be shape-invariant, and it is reproducible with
- * a standalone sgemm probe that never touches this engine:
- *   - M == 1 goes through a GEMV kernel with a different K-reduction order than the
- *     M > 1 sgemm kernel: M=1 vs M=5, N=512, K=1024 -> 2.9e-05; M=2..16 vs 18 -> 0.
- *     This fires on the FIRST chunk of the ramp (one frame), in the pre-transformer.
- *   - N is not always neutral either: M=768, K=5376 gives exactly 0 for N=256, 262,
- *     274, 320 and 608 against N=608, but 2.4e-04 for N=310. 310 is exactly what the
- *     per-slot conv1d asks for (256 columns + a 54-column dilation-9 tail), which is
- *     why it shows up here and nowhere else.
- * Both are properties the PER-SLOT path already has: change a chunk size and its own
- * last bits move. Worst observed end-to-end here: 8.1e-06 with 1-frame chunks,
- * 3.1e-07 without — against a 16-bit LSB of 3.05e-05, i.e. below a quarter of one
- * output quantisation step.
- *
- * TWO REAL BUGS THIS TEST FOUND, both worth remembering because neither is arithmetic:
- * the depthwise conv and the final conv were first written as strided copies of the
- * per-slot loops. Identical source, different codegen — through an out-parameter the
- * compiler cannot prove non-aliasing and does not contract the k-loop into FMAs, while
- * in the per-slot version the output buffer is malloc'd locally and it does. One ULP,
- * amplified 480x by the upsampling stack into ~1e-05 on the audio. The fix was to make
- * both paths call literally the same function. **When two code paths must agree to the
- * last bit, share the function — do not copy the loop.**
- *
- * Build:  see the Makefile snippet in the task report, or by hand:
- *   gcc -Wall -O3 -march=native -ffast-math -Ivendor -DUSE_BLAS -DACCELERATE_NEW_LAPACK \
- *       -Ithird_party/ingot/include -o qwen_tts_batch_parity \
- *       tests/decoder_batch_parity.c $(ls *.o | grep -v main.o) vendor/lz4.o \
- *       third_party/ingot/libingot.a -lm -lpthread -framework Accelerate
- * Run:    ./qwen_tts_batch_parity [model_dir] [n_streams] [n_rounds] [codes.txt]
- */
-
+/* decoder_batch_parity.c — does the CROSS-SLOT BATCHED streaming decoder produce the */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,26 +20,12 @@ extern void qwen_sd_stream_free(qwen_sd_stream_state_t *st);
 #define NCB 16
 #define MAX_STREAMS 8
 
-/* Deterministic codes. Real dumped codes can be supplied instead (argv[4]); the
- * arithmetic under test does not care what the values are, only that BOTH paths see
- * exactly the same ones. */
 static uint32_t rng_state = 0x9E3779B9u;
 static uint32_t rng_next(void) {
     rng_state ^= rng_state << 13; rng_state ^= rng_state >> 17; rng_state ^= rng_state << 5;
     return rng_state;
 }
 
-/* Ragged chunk schedule: stream s in round r gets a different frame count than its
- * neighbours, and sometimes zero. This is the shape the server actually produces.
- *
- * QWEN_PARITY_PAT=2 switches to a schedule with no 1-frame chunk. That is not
- * cosmetic, it ISOLATES the one thing that is genuinely not bit-exact: Accelerate
- * routes an sgemm with M==1 through a GEMV kernel whose K-reduction order differs
- * from the M>1 sgemm kernel. So a per-slot call on a ONE-frame chunk (the first chunk
- * of the ramp) and the same frame inside a multi-row batched call disagree in the last
- * bits — a property of the BLAS, not of this batching. Measured on this box with a
- * standalone sgemm probe: M=1 vs M=5, N=512, K=1024 -> 2.9e-05; M=3 vs M=5 -> exactly 0.
- * With PAT=2 the whole decoder is expected to come out bit-identical. */
 static int chunk_for(int s, int r) {
     static const int pat_a[6] = {1, 2, 0, 4, 3, 8};
     static const int pat_b[6] = {2, 3, 0, 4, 5, 8};
@@ -124,7 +53,6 @@ int main(int argc, char **argv) {
     if (n_streams > MAX_STREAMS) n_streams = MAX_STREAMS;
     if (n_rounds < 1) n_rounds = 1;
 
-    /* How many frames each stream will consume in total */
     int total_frames[MAX_STREAMS];
     int max_total = 0;
     for (int s = 0; s < n_streams; s++) {
@@ -133,7 +61,6 @@ int main(int argc, char **argv) {
         if (total_frames[s] > max_total) max_total = total_frames[s];
     }
 
-    /* Load the model first: codebook_size bounds the codes we may generate. */
     fprintf(stderr, "[parity] loading %s ...\n", model_dir);
     qwen_tts_ctx_t *ctx = qwen_tts_load(model_dir);
     if (!ctx) { fprintf(stderr, "[parity] model load failed (%s)\n", model_dir); return 1; }
@@ -164,7 +91,6 @@ int main(int argc, char **argv) {
             codes_file = NULL;
             free(flat);
         } else {
-            /* Give each stream a different slice, wrapping if the dump is short. */
             for (int s = 0; s < n_streams; s++)
                 for (int f2 = 0; f2 < max_total; f2++)
                     memcpy(codes[s] + (size_t)f2 * NCB,
@@ -179,7 +105,6 @@ int main(int argc, char **argv) {
                 codes[s][f2] = (int)(rng_next() % (uint32_t)cbsz);
     }
 
-    /* ---- arm A: per-slot, one call per stream per round (the reference) ---- */
     qwen_sd_stream_state_t st_a[MAX_STREAMS], st_b[MAX_STREAMS];
     float *aud_a[MAX_STREAMS], *aud_b[MAX_STREAMS];
     int na[MAX_STREAMS], ca[MAX_STREAMS], nb_[MAX_STREAMS], cb_[MAX_STREAMS];
@@ -208,7 +133,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ---- arm B: one batched call per round, ragged over the same streams ---- */
     fprintf(stderr, "=== ARM B (batched) ===\n");
     int batched_rounds = 0, max_bsize = 0;
     for (int r = 0; r < n_rounds; r++) {
@@ -234,14 +158,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ---- compare ---- */
     int fail = 0;
     double worst = 0.0;
 
-    /* Split the verdict in two. The latent cache is the output of steps 1-5 (VQ,
-     * pre-conv, pre-transformer, output proj); the audio is that plus the conv
-     * decoder. Reporting only the audio would leave "which half drifted" a guess,
-     * and the two halves have completely different suspects. */
     {
         double lworst = 0.0;
         for (int s = 0; s < n_streams; s++) {

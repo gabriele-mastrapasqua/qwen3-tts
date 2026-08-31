@@ -1,40 +1,5 @@
 #!/usr/bin/env python3
-"""Confronta le soglie del dispatcher fra MACCHINE DIVERSE — x86 e ARM insieme.
-
-PERCHE' ESISTE. `./qwen_tts --matmat-tune` misura, per QUESTA cpu, da quale B ogni
-kernel batchato comincia a battere B x matvec sulle forme vere del modello. Ottimo, ma
-il risultato vive in un JSON per box e si dimentica. La domanda che conta quando si
-sceglie una macchina — o quando si porta un kernel da un'architettura all'altra — non e'
-"quanto vale qui", e':
-
-    la stessa soglia vale su AMX, su VNNI, su AVX2 e su SMMLA? E se no, di quanto cambia?
-
-Perche' una soglia sbagliata non fa rumore: manda il lavoro sul kernel meno adatto e si
-paga in silenzio, esattamente come una build mutilata. Ed e' gia' successo di ereditare
-soglie tagliate su un'altra macchina (i commenti nel codice lo dicono: "guesses to be
-re-cut on the box").
-
-COSA STAMPA
-  1. l'intestazione di ogni box (arch, cpu, thread pieni, data)
-  2. per ogni (formato, forma, thread): quale kernel vince su ciascun box e DA QUALE B
-     - "smmla@2"  = quel kernel vince da B=2 in su
-     - "—"        = nessun kernel batchato vince: resta B x matvec
-  3. le righe `recommend` pronte da esportare, per box
-
-USO
-  tests/mm_tune_compare.py                             # tutti i *_tune.json in docs/boxes/
-  tests/mm_tune_compare.py a_tune.json b_tune.json     # due box specifici
-  tests/mm_tune_compare.py --format int8               # solo un formato
-  tests/mm_tune_compare.py --json                      # aggregato, per farci altro
-
-COME SI PRODUCE UN NUOVO FILE (sul box, dopo aver costruito):
-  ./qwen_tts --matmat-tune -d <modello> > /tmp/tune.json
-  scp <box>:/tmp/tune.json docs/boxes/<data>_<machine-type>_<nome>_tune.json
-
-⚠️ Un tune vale per il BINARIO con cui e' stato preso. Dopo un cambio di micro-kernel le
-soglie vecchie sono obsolete per costruzione — sul c4a le soglie pre-2026-08-21 erano
-state tagliate su un SMMLA 2x2 che non esiste piu'.
-"""
+"""Confronta le soglie del dispatcher fra MACCHINE DIVERSE — x86 e ARM insieme."""
 import argparse
 import glob
 import json
@@ -44,27 +9,23 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_GLOB = os.path.join(REPO, "docs", "boxes", "*_tune.json")
 
-
 def load(path):
     with open(path) as f:
         d = json.load(f)
     d["_file"] = os.path.basename(path)
-    # il nome del box: dal file, che per convenzione e' <data>_<machine-type>_<nome>_tune.json
     stem = d["_file"].replace("_tune.json", "")
     parts = stem.split("_")
     d["_box"] = "_".join(parts[1:]) if len(parts) > 1 else stem
     return d
 
-
 def cell_key(c):
     return (c["format"], c["rows"], c["cols"], c["threads"])
 
-
 def winners(d):
-    """Per ogni (formato, forma, thread) il kernel col crossover_B piu' basso > 0.
+    """For each (format, shape, threads) the kernel with the lowest crossover_B > 0.
 
     crossover_B = 0 nel JSON significa 'non vince mai', ed e' un dato utile: dice che su
-    quella macchina quella forma va lasciata a B x matvec. Non e' un buco.
+    that shape stays on B x matvec on that machine. It is not a gap.
     """
     best = {}
     for c in d.get("cells", []):
@@ -80,7 +41,6 @@ def winners(d):
             best[k] = (c["kernel"], xb)
     return best
 
-
 def short(kernel):
     """Nome corto e confrontabile fra ISA: e' il nome che si legge in una tabella."""
     k = kernel.lower()
@@ -91,18 +51,17 @@ def short(kernel):
             return tag
     return kernel.split()[0][:6]
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="*", help="tune JSON (default: docs/boxes/*_tune.json)")
-    ap.add_argument("--format", dest="fmt", help="solo questo formato (int8/q4/bf16)")
-    ap.add_argument("--threads", type=int, help="solo questo numero di thread")
+    ap.add_argument("--format", dest="fmt", help="this format only (int8/q4/bf16)")
+    ap.add_argument("--threads", type=int, help="this thread count only")
     ap.add_argument("--json", action="store_true", help="aggregato in JSON")
     a = ap.parse_args()
 
     paths = a.files or sorted(glob.glob(DEFAULT_GLOB))
     if not paths:
-        print(f"nessun tune trovato in {DEFAULT_GLOB}\n"
+        print(f"no tune found in {DEFAULT_GLOB}\n"
               f"  prendine uno sul box:  ./qwen_tts --matmat-tune -d <modello> > /tmp/tune.json",
               file=sys.stderr)
         return 1
@@ -141,9 +100,9 @@ def main():
 
     print()
     print("  legenda: KERNEL@B = da quel B in su il kernel batchato vince · — = mai,")
-    print("           quella forma resta su B x matvec su quella macchina.")
+    print("           that shape stays on B x matvec on that machine.")
     print("  ⚠️ un kernel che vince SOLO a thread pieni non sta vincendo: sta ammortizzando")
-    print("     i lanci del pool. Per questo la colonna -j 1 va sempre letta per prima.")
+    print("     the pool launches. Read the -j 1 column first.")
     print()
 
     for d in boxes:
@@ -157,7 +116,6 @@ def main():
         print(json.dumps({n: {f"{k[0]}|{k[1]}x{k[2]}|j{k[3]}": (v[0], v[1]) if v else None
                               for k, v in w.items()} for n, w in allw.items()}, indent=1))
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

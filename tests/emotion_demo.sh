@@ -1,19 +1,4 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# emotion_demo.sh — render the VALIDATED --emotion recipe for new users to listen to.
-#
-# Uses the WIN texts from the ear-validated scripts (recipe_final.sh = Italian; crosslang_emo.sh =
-# RU/ZH/JA/KO; german/french/spanish_ab.sh). The engine's `--emotion` auto-router applies the
-# ear-validated per-(voice×emotion) recipe itself (expr / steer / instruct / temperature) — this
-# script only supplies voice + language + text, so the win can't drift.
-#
-#   ryan (preset)   — Italian, ALL 6 emotions (the primary showcase)
-#   ryan (preset)   — multilingual highlights (emotion works in every Qwen language)
-#   galatea (clone) — Italian, a few emotions (the 25 MB cloned voice emotes too)
-#
-# Output dir: $EMO_DEMO_DIR (default samples/emotion_demo). Needs the 1.7B model + the .expr packs
-# (`bash download_assets.sh` — STEER-only cells still render without them). 1.7B CustomVoice only.
-# ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42
@@ -22,7 +7,6 @@ OUT="${EMO_DEMO_DIR:-samples/tests/emotion_demo}"; mkdir -p "$OUT"   # samples/t
 [ -f presets/expr/italian_csp_topk6.expr ] || \
   echo "NOTE: emotion .expr packs missing — run: bash download_assets.sh (EXPR/COMBINE cells need them; STEER cells still render)"
 
-# gen <out.wav>  <voiceflags...>  --  <emotion> <language> <text>
 gen(){
   local out="$1"; shift
   local vf=(); while [ "$1" != "--" ]; do vf+=("$1"); shift; done; shift

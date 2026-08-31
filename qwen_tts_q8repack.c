@@ -1,27 +1,4 @@
-/* qwen_tts_q8repack.c — see the header for why this exists instead of KleidiAI.
- *
- * THE LAYOUT, AND WHY IT COSTS NOTHING
- * ggml's `make_block_q8_0x4` is one loop:
- *     chunk i (8 bytes)  <-  row (i % 4), byte offset (i / 4) * 8
- * Sixteen chunks, 128 bytes, plus the four fp16 scales copied verbatim. Nothing is
- * dequantized, nothing is rescaled, and 136 bytes in = 136 bytes out. That is what
- * "lossless" means here, and `qwen_q8r_derepack` exists to prove it by memcmp rather
- * than by argument.
- *
- * WHY THE INTERLEAVE IS EXACTLY WHAT SMMLA WANTS
- * For offset group g (weights j = 8g..8g+7), the chunks for rows 0..3 are consecutive:
- *     qs[32g .. 32g+15]  = rows 0,1  ->  a 2x8 int8 operand
- *     qs[32g+16 .. +31]  = rows 2,3  ->  another one
- * `vmmlaq_s32(acc, A, B)` multiplies two 2x8 int8 operands into a 2x2 int32 tile, so a
- * plain `vld1q_s8` is the whole load. This is the repack paying for itself: our own
- * int8 SMMLA kernel synthesises that pairing in registers on every call
- * (qwen_tts_kernels.c:3113), reading two rows `cols` bytes apart.
- *
- * ACTIVATIONS ARE PER-32 TOO
- * The weights keep a scale every 32 values, so the activation is quantized the same
- * way (int8 + fp16 scale per 32). Both sides per-block is the whole point: a per-row
- * activation scale would give back the precision the format was chosen for.
- */
+/* qwen_tts_q8repack.c — see the header for why this exists instead of KleidiAI. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,9 +29,6 @@
 
 #ifdef __linux__
 #include <sys/auxv.h>
-/* asm/hwcap.h is ARM-only and absent on x86 Linux, where this translation unit is
- * still compiled (the NEON body below is guarded, the file is not). The only reader
- * of these macros is already behind __aarch64__. */
 #if defined(__aarch64__) || defined(__arm__)
 #include <asm/hwcap.h>
 #endif
@@ -63,8 +37,6 @@
 #include <sys/sysctl.h>
 #endif
 
-/* Runtime feature check, asked of the OS. Same reasoning as the KleidiAI path: a
- * binary built with +i8mm on a CPU without it is a SIGILL with no diagnostic. */
 static int q8r_cpu(int *has_dot, int *has_i8mm) {
     int d = 0, m = 0;
 #if defined(__linux__) && defined(__aarch64__)
@@ -106,8 +78,6 @@ int qwen_q8r_enabled(void) {
     return v;
 }
 
-/* ── repack / de-repack ───────────────────────────────────────────────────────── */
-
 size_t qwen_q8r_packed_bytes(int rows, int cols) {
     if (rows <= 0 || cols <= 0 || rows % 4 || cols % Q8_0_BLOCK_SIZE) return 0;
     return (size_t)(rows / 4) * (cols / Q8_0_BLOCK_SIZE) * sizeof(q8_0x4_block_t);
@@ -145,7 +115,6 @@ int qwen_q8r_derepack(q8_0_block_t *dst, const q8_0x4_block_t *src, int rows, in
     return 1;
 }
 
-/* ── registry (same shape as the KleidiAI one, keyed by weight pointer) ────────── */
 typedef struct {
     const void     *key;
     q8_0x4_block_t *packed;
@@ -169,8 +138,6 @@ int qwen_q8r_register(const void *key, const q8_0_block_t *src, int rows, int co
     if (!qwen_q8r_enabled() || !key || !src) return 0;
     size_t sz = qwen_q8r_packed_bytes(rows, cols);
     if (!sz) return 0;
-    /* The byte count must be identical to the source. Asserting it here is cheap and
-     * turns a layout mistake into a refusal instead of a silent misread. */
     size_t src_bytes = (size_t)rows * (cols / Q8_0_BLOCK_SIZE) * sizeof(q8_0_block_t);
     if (sz != src_bytes) {
         fprintf(stderr, "Q8repack: packed %zu != source %zu bytes - refusing\n", sz, src_bytes);
@@ -199,11 +166,6 @@ void qwen_q8r_stats(int *n_packed, size_t *bytes) {
     if (bytes)    *bytes    = g_q8r_bytes;
 }
 
-/* ── activation quantization: int8 + fp16 scale, every 32 values ──────────────── */
-
-/* The scalar reference. Kept, and reachable with QWEN_Q8_SCALAR_ACT=1, for two
- * reasons: it is the definition of what the vector version must reproduce, and it is
- * the "before" side of the before/after measurement without rebuilding. */
 static void q8r_quant_act_scalar(q8_0_block_t *dst, const float *x, int cols) {
     const int nb = cols / Q8_0_BLOCK_SIZE;
     for (int b = 0; b < nb; b++) {
@@ -226,16 +188,6 @@ static void q8r_quant_act_scalar(q8_0_block_t *dst, const float *x, int cols) {
 }
 
 #if Q8R_NEON
-/* NEON. Same arithmetic, same per-block scale, same rounding - only the loop is
- * vectorized. Nothing here touches the FORMAT: the scale stays one fp16 per 32
- * weights, which is the whole reason Q8_0 was chosen over a per-row int8.
- *
- * Rounding: `lrintf` above uses the default mode, round-half-to-even, and
- * `vcvtnq_s32_f32` is exactly that. `vcvtaq_s32_f32` (ties away from zero) would
- * differ on exact halves and silently make this a different quantizer.
- *
- * No clamp: id = 127/amax by construction, so |v * id| <= 127 for every element of
- * the block. The scalar version clamps defensively; here the bound is the definition. */
 static void q8r_quant_act_neon(q8_0_block_t *dst, const float *x, int cols) {
     const int nb = cols / Q8_0_BLOCK_SIZE;
     for (int b = 0; b < nb; b++) {
@@ -284,36 +236,15 @@ static void q8r_quant_act(q8_0_block_t *dst, const float *x, int cols) {
     q8r_quant_act_scalar(dst, x, cols);
 }
 
-/* ── the kernels ──────────────────────────────────────────────────────────────── */
-
 typedef struct {
     const q8_0x4_block_t *W;
-    const q8_0_block_t   *A;      /* quantized activations, B rows of nb blocks */
+    const q8_0_block_t   *A;
     float *Y;
     int rows, cols, B, nb;
 } q8r_job_t;
 
-/* GEMV, B = 1. dotprod, not a one-row GEMM: for a single activation vector SMMLA
- * would leave half of every 2x2 tile idle, which is exactly the asymmetry ggml
- * encodes by pairing an i8mm GEMM with a dotprod GEMV. */
 static void q8r_gemv_rows(const q8r_job_t *j, int r0, int r1) {
 #if Q8R_NEON && Q8R_DOT
-    /* Faithful port of ggml's `ggml_gemv_q8_0_4x8_q8_0` NEON+dotprod inner loop
-     * (llama.cpp ggml/src/ggml-cpu/arch/arm/repack.cpp). The first version of this
-     * function was a simplification of it, and the simplification is what cost the
-     * performance: it extracted the four int32 lanes to scalars, converted five fp16
-     * scales one at a time, and accumulated in a scalar array. Per 32-block that is
-     * 4 SIMD->GPR transfers + 5 scalar fp16 conversions + 12 scalar FP ops, against
-     * the 5 vector instructions below - and SIMD->GPR moves are exactly the transfer
-     * ARM cores are slowest at.
-     *
-     * The two things that make it work, and that the simplification threw away:
-     *   - the four weight scales are CONTIGUOUS fp16 in the block (`d[4]`), so
-     *     `vld1_f16` loads all four in one instruction and `vcvt_f32_f16` widens them
-     *     in one more. No per-row conversion.
-     *   - the float accumulator stays in a float32x4 register across every block of
-     *     the row group; nothing returns to memory or to a general register until the
-     *     final store. */
     const int nb = j->nb;
     for (int r = r0; r < r1; r += 4) {
         const q8_0x4_block_t *b_ptr = j->W + (size_t)(r / 4) * nb;
@@ -339,7 +270,7 @@ static void q8r_gemv_rows(const q8r_job_t *j, int r0, int r1) {
             ret1 = vdotq_s32(ret1, b_high.val[1], a2);
             ret0 = vdotq_s32(ret0, b_high.val[2], a3);
             ret1 = vdotq_s32(ret1, b_high.val[3], a3);
-            int32x4_t ret = vpaddq_s32(ret0, ret1);   /* -> [row0, row1, row2, row3] */
+            int32x4_t ret = vpaddq_s32(ret0, ret1);
 
             acc = vfmaq_f32(acc, vcvtq_f32_s32(ret),
                             vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
@@ -351,12 +282,11 @@ static void q8r_gemv_rows(const q8r_job_t *j, int r0, int r1) {
 #endif
 }
 
-/* GEMM, B >= 2. Two activation rows and two weight rows per SMMLA. */
 #if Q8R_NEON && Q8R_I8MM
 static void q8r_gemm_rows(const q8r_job_t *j, int r0, int r1) {
     const int nb = j->nb, B = j->B, rows = j->rows;
     for (int bb = 0; bb < B; bb += 2) {
-        const int b1 = (bb + 1 < B) ? bb + 1 : bb;      /* odd B: duplicate, discard */
+        const int b1 = (bb + 1 < B) ? bb + 1 : bb;
         for (int r = r0; r < r1; r += 4) {
             const q8_0x4_block_t *w = j->W + (size_t)(r / 4) * nb;
             float o[4][2] = { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } };
@@ -366,12 +296,10 @@ static void q8r_gemm_rows(const q8r_job_t *j, int r0, int r1) {
                 const int8_t *qs = w[b].qs;
                 int32x4_t acc01 = vdupq_n_s32(0), acc23 = vdupq_n_s32(0);
                 for (int g = 0; g < 4; g++) {
-                    /* A: 2 activation rows x 8 values.  B: 2 weight rows x 8 values. */
                     int8x16_t A = vcombine_s8(vld1_s8(a0->qs + g * 8), vld1_s8(a1->qs + g * 8));
                     acc01 = vmmlaq_s32(acc01, A, vld1q_s8(qs + g * 32));
                     acc23 = vmmlaq_s32(acc23, A, vld1q_s8(qs + g * 32 + 16));
                 }
-                /* vmmla lays the 2x2 tile out as [a0.w0, a0.w1, a1.w0, a1.w1] */
                 const float d0 = qwen_f16_to_f32(a0->d), d1 = qwen_f16_to_f32(a1->d);
                 const float w0 = qwen_f16_to_f32(w[b].d[0]), w1 = qwen_f16_to_f32(w[b].d[1]);
                 const float w2 = qwen_f16_to_f32(w[b].d[2]), w3 = qwen_f16_to_f32(w[b].d[3]);
@@ -406,8 +334,6 @@ static void q8r_task(size_t tid, size_t nt, void *ctx) {
     q8r_gemv_rows(j, r0, r1);
 }
 
-/* Per-thread scratch for the quantized activations, same mould as the rest of the
- * engine: TLS pointer, high-water growth, owned by the calling thread. */
 static __thread q8_0_block_t *g_q8r_act;
 static __thread size_t        g_q8r_act_cap;
 
@@ -416,11 +342,11 @@ int qwen_q8r_matmul(float *Y, const void *key, const float *X, int rows, int col
     const q8r_entry_t *e = q8r_lookup(key);
     if (!e || e->rows != rows || e->cols != cols) return 0;
 #if !(Q8R_NEON && Q8R_DOT)
-    return 0;                       /* no GEMV means no path at all */
+    return 0;
 #else
     int has_dot = 0, has_i8mm = 0;
     q8r_cpu(&has_dot, &has_i8mm);
-    if (B > 1 && !has_i8mm) return 0;      /* declared: no i8mm, no batched path */
+    if (B > 1 && !has_i8mm) return 0;
     if (!has_dot) return 0;
 
     const int nb = cols / Q8_0_BLOCK_SIZE;
@@ -435,7 +361,6 @@ int qwen_q8r_matmul(float *Y, const void *key, const float *X, int rows, int col
     if (B == 1) {
         q8r_quant_act(g_q8r_act, X, cols);
     } else {
-        /* X is [cols, B]; the kernel wants each batch row contiguous. */
         float *tmp = (float *)malloc((size_t)cols * sizeof(float));
         if (!tmp) return 0;
         for (int b = 0; b < B; b++) {
@@ -455,18 +380,6 @@ int qwen_q8r_matmul(float *Y, const void *key, const float *X, int rows, int col
 #endif
 }
 
-
-/* ── the vertical slice: one real Q8_0 matrix, end to end ─────────────────────────
- *
- * Two questions, answered separately because they fail differently:
- *   1. STRUCTURAL - is the repack bit-preserving? De-repack and memcmp. A shuffle
- *      that is "numerically close" has put a scale or a quant on the wrong row, and
- *      that produces confident, plausible audio rather than an obvious break.
- *   2. NUMERICAL  - does the kernel compute the same product as a scalar reference
- *      built from the SOURCE blocks? Same quantized values on both sides, so any
- *      difference is the kernel's, not the format's. fp32 accumulation order differs,
- *      so the bar is a relative error near the fp32 epsilon, not zero.
- */
 #include "ingot/gguf.h"
 #include "ingot/dtype.h"
 
@@ -508,7 +421,6 @@ int qwen_q8r_selftest(void *out, const char *gguf_path, const char *tensor_name)
     fprintf(f, "  matrix: %s [%d, %d] = %d blocks/row, %d Q8_0 blocks\n",
             name, rows, cols, nb, rows * nb);
 
-    /* 1. structural */
     size_t packed_bytes = qwen_q8r_packed_bytes(rows, cols);
     size_t src_bytes    = (size_t)rows * nb * sizeof(q8_0_block_t);
     q8_0x4_block_t *pk  = (q8_0x4_block_t *)malloc(packed_bytes);
@@ -530,9 +442,6 @@ int qwen_q8r_selftest(void *out, const char *gguf_path, const char *tensor_name)
                 i, i / sizeof(q8_0_block_t));
     }
 
-    /* 1.bis the vectorized activation quantizer must reproduce the scalar one EXACTLY.
-     * It is the same format and the same rounding mode; anything else would be a
-     * different quantizer wearing the same name. */
 #if Q8R_NEON
     {
         int nbq = cols / Q8_0_BLOCK_SIZE;
@@ -555,7 +464,6 @@ int qwen_q8r_selftest(void *out, const char *gguf_path, const char *tensor_name)
     }
 #endif
 
-    /* 2. numerical, against a scalar reference over the SOURCE blocks */
     float *x  = (float *)malloc((size_t)cols * sizeof(float));
     float *y  = (float *)malloc((size_t)rows * sizeof(float));
     float *yr = (float *)malloc((size_t)rows * sizeof(float));
@@ -579,13 +487,12 @@ int qwen_q8r_selftest(void *out, const char *gguf_path, const char *tensor_name)
         yr[r] = (float)acc;
     }
 
-    /* run the real path through the registry, exactly as inference would */
     int ok_gemv = 0, ok_gemm = 0;
     double worst_v = 0.0, worst_m = 0.0, ref_rms = 0.0;
     for (int r = 0; r < rows; r++) ref_rms += (double)yr[r] * (double)yr[r];
     ref_rms = sqrt(ref_rms / rows);
 
-    if (qwen_q8r_register(pk /* any unique key */, src, rows, cols)) {
+    if (qwen_q8r_register(pk  , src, rows, cols)) {
         ok_gemv = qwen_q8r_matmul(y, pk, x, rows, cols, 1);
         if (ok_gemv)
             for (int r = 0; r < rows; r++) {
@@ -630,13 +537,6 @@ int qwen_q8r_selftest(void *out, const char *gguf_path, const char *tensor_name)
     return pass ? 0 : 1;
 }
 
-
-/* ── microbenchmark on the Code Predictor's real shapes ───────────────────────────
- * The CP is where B=1 hurts: five layers, fifteen lm_heads, all of it fifteen times
- * per frame. Timing the kernel on synthetic data of the RIGHT shapes isolates the
- * kernel from everything else in the pipeline, which is the only way to tell a slow
- * kernel from a slow pipeline. Compared against our own INT8 GEMV on the same shape,
- * because that is the number Q8_0 has to approach. */
 static double q8r_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -652,7 +552,7 @@ int qwen_q8r_bench(void *out) {
         { "CP attn_output ", 1024, 2048,  5 * 15 },
         { "CP ffn gate+up ", 6144, 1024,  5 * 15 },
         { "CP ffn_down    ", 1024, 3072,  5 * 15 },
-        { "CP lm_head     ", 2048, 1024, 15 },   /* one head per pass */
+        { "CP lm_head     ", 2048, 1024, 15 },
         { "Talker attn_q  ", 2048, 2048,  0 },
         { "Talker gate+up ", 12288, 2048, 0 },
     };
@@ -679,17 +579,8 @@ int qwen_q8r_bench(void *out) {
         for (int r = 0; r < rows; r++) sc[r] = 0.01f;
         for (int c = 0; c < cols; c++) x[c] = 0.5f - (float)(c % 7) / 7.0f;
 
-        /* NOT freed until the end: the registry is keyed by pointer, and malloc reuses
-         * freed addresses - a later shape then matched an earlier, stale entry and the
-         * call silently declined. The engine never hits this (its keys are live model
-         * weights), but a benchmark that frees as it goes does. */
         keep[i] = W;
         if (!qwen_q8r_register(W, W, rows, cols)) { fprintf(f, "  %-16s register failed\n", shapes[i].what); goto next; }
-        /* Warm BOTH thoroughly first: the first shape measured used to pay the page
-         * faults of its own fresh allocation while the second contender ran on pages
-         * already touched, which flattered whichever went second. Then time each twice
-         * in opposite order and keep the minimum - the floor is the kernel, the excess
-         * is the machine. */
         for (int w = 0; w < 20; w++) {
             qwen_q8r_matmul(y, W, x, rows, cols, 1);
             qwen_matvec_int8(y, Wi, sc, x, rows, cols);
@@ -705,7 +596,6 @@ int qwen_q8r_bench(void *out) {
             double q = (a1 - a0) * 1000.0 / REP, i = (a2 - a1) * 1000.0 / REP;
             if (q < q8us) q8us = q;
             if (i < i8us) i8us = i;
-            /* second pass: swap the order so neither contender is always the warm one */
             a0 = q8r_now_ms();
             for (int r = 0; r < REP; r++) qwen_matvec_int8(y, Wi, sc, x, rows, cols);
             a1 = q8r_now_ms();
@@ -728,9 +618,6 @@ int qwen_q8r_bench(void *out) {
     for (int i = 0; i < ns; i++) free(keep[i]);
     fprintf(f, "  CP total (15 passes/frame):  q8_0 %.2f ms/f  vs  int8 %.2f ms/f\n", tot_q8, tot_i8);
 
-    /* The activation quantizer on its own. It is the part of the Q8_0 GEMV that has no
-     * counterpart in our int8 path (which quantizes the activation once per vector,
-     * not once per 32), so it is the first place to look for the gap. */
     fprintf(f, "\n  activation quantization alone (one call, us):\n");
     fprintf(f, "  %-10s %12s %12s %8s\n", "cols", "scalar", "NEON", "speedup");
     for (int ci = 0; ci < 4; ci++) {

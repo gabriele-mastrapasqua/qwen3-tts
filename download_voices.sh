@@ -1,22 +1,10 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# download_voices.sh — fetch the CC0/Public-Domain REFERENCE VOICES (lite ~25MB grafts) so the
-# demos/tests run out-of-the-box and users have ready clones to listen to / reuse.
-#
-# Source: https://huggingface.co/gabrione/qwen3-tts-voices  (LibriVox PD readers, CC0).
-# Each is a ~25MB graft .qvoice → load with --icl-only (keeps CV weights, emotion works). 1.7B.
-#
-# Usage:  bash download_voices.sh            # fetch any missing reference voice into voices/
-#         bash download_voices.sh --verify   # only sha256-verify present files
-#         BASE_URL=<url> bash download_voices.sh
-# ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
 DEST=voices
 BASE_URL="${BASE_URL:-https://huggingface.co/gabrione/qwen3-tts-voices/resolve/main}"
 mkdir -p "$DEST"
 
-# filename  sha256  (CC0/PD reference voices — see the HF repo README for attribution)
 read -r -d '' VOICES <<'EOF'
 galatea_graft.qvoice  0ba4be1fab09b511b19fb2ff765f5737d2ead963964b9c8d9d605916ffd42994
 quijote_graft.qvoice  5f15d4c8964b77eadc0b7232756bdc8bb97759a2b3655cd6bdc69ac780a714c9

@@ -1,7 +1,4 @@
 #!/bin/bash
-# run_sub4_ladder.sh — E7.2 sub-4-bit quality gate (see docs/quant-sub4.md §3).
-# Phase A: bf16 rails. Phase B: teacher-forced replay per variant (C int8/int4 refs +
-# Python fake-quant formats). Output: per-codebook agreement via tests/quant_ladder.py.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 

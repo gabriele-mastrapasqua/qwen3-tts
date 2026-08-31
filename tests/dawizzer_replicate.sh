@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Faithful replication of Dawizzer's ComfyUI-Qwen3TTS-Emotional flow:
-#   Base model + generate_voice_clone(ref_audio) + 3 sampling levers (NO instruct).
-# His base params: T=1.0, top_p=0.8, rep=1.05; emotion = additive delta, intensity 1.0.
-# His cap: max_new_tokens=2048. Two modes: fast (x_vector_only) + accurate (ICL ref_text).
-# Q: does audio change emotionally? does it hang (no EOS)?  --max-duration 25 + timeout flags a hang.
 cd "$(dirname "$0")/.."
 OUT=samples/dawizzer
 mkdir -p "$OUT"
@@ -13,7 +8,6 @@ RT="Notizie mie, eccole. Sono venuto qua, come sai, per dar pace a questi poveri
 TEXT="Non riesco proprio a crederci. Come hai potuto farmi questo?"
 S=42
 
-# emotion: name T top_p rep  (his base 1.0/0.8/1.05 + delta, intensity 1.0)
 EMOS=(
   "neutral 1.0 0.8 1.05"
   "angry   1.3 0.85 1.15"

@@ -1,18 +1,4 @@
 #!/bin/bash
-# Build the 6 emotional VOICE assets that give the 0.6B its --emotion flag.
-#
-# On the small model emotion is not an inference-time lever, it is a property of the voice
-# This builds one asset per emotion for a given voice:
-#   1.7B generates ~25 s of that voice, emotional  ->  0.6B Base extracts the 4 KB x-vector
-#
-# Usage:
-#   make emovoice VOICE=ryan                                  # a preset
-#   make emovoice VOICE=galatea LOAD=voices/galatea_graft.qvoice   # a cloned voice
-#   make emovoice VOICE=ryan TTS_LANG=English GRAFT=voices/galatea_06b_graft.qvoice
-#
-# GRAFT=<0.6B graft .qvoice> additionally emits a 16.8 MB graft per emotion (x-vector swapped in).
-# Recommended for high-arousal emotions: with a bare 4 KB x-vector, anger compresses the delivery
-# and can swallow a short word — the graft's TPAD+WOVR hold the sentence together (ear 2026-08-05).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -26,9 +12,6 @@ OUT="${OUT:-presets/emovoice}"
 SEED="${SEED:-42}"
 DONORS="${DONORS:-samples/tests/emovoice_donors/$VOICE}"
 
-# ~25 s of carrier text: enough for a stable ECAPA embedding. Use a language the voice speaks
-# natively — the donor's delivery is what we are capturing, so a voice fighting the language is
-# a worse donor (the native-preset-per-language rule).
 TEXT="Ma ti rendi conto di quello che è successo? Te l'avevo detto mille volte, mille volte, e alla fine è andata proprio così. Adesso non venirmi a dire che non lo sapevi, perché lo sapevi benissimo. È sempre la stessa storia, ogni volta la stessa identica storia, e io continuo a ripetere le cose a vuoto."
 case "$LANG_" in
   English)  TEXT="Do you realise what just happened? I told you a thousand times, a thousand times, and in the end it went exactly like that. Now do not tell me you did not know, because you knew perfectly well. It is always the same story, every single time the same story, and I keep repeating myself for nothing." ;;

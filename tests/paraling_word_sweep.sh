@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Word-mapping SWEEP (user 2026-06-25): find the special word that makes each voice actually LAUGH / SIGH,
-# rendered INLINE + the matching emotion steer (clean). Latin onomatopoeia + Chinese phonetic chars (clean
-# laugh/sigh sources). ryan/vivian/galatea. -> samples/paraling_sweep/
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/paraling_sweep; mkdir -p $O
@@ -10,13 +7,11 @@ dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframe
 vf(){ case "$1" in ryan) echo "-s ryan";; vivian) echo "-s vivian";; galatea) echo "--load-voice voices/galatea_graft.qvoice --icl-only";; esac; }
 gen(){ local out="$1" v="$2" emo="$3" txt="$4"; ./qwen_tts -d qwen3-tts-1.7b $(vf $v) -l Italian --seed 42 -T 1.1 --ml-steer $D/ryan_${emo}.qlsteer --ml-weight 8 --ml-range 21-25 --text "$txt" -o $O/$out >/dev/null 2>&1; echo "  $out -> $(dur $O/$out)"; }
 
-# LAUGH words (with joy steer) — the gap: make galatea/vivian laugh
 declare -a LW=( "ahahah:Che bella notizia, ahahah, non ci posso credere."
                 "hahaha:Che bella notizia, hahaha, non ci posso credere."
                 "ahahahah:Che bella notizia, ahahahah, non ci posso credere."
                 "zhCN:Che bella notizia, 哈哈哈, non ci posso credere."
                 "ihih:Che bella notizia, ihihih, non ci posso credere." )
-# SIGH words (with sad steer) — confirm/extend
 declare -a SW=( "ahh:Che giornata, ahh, sono stanco e non ce la faccio piu."
                 "ahhh:Che giornata, ahhh, sono stanco e non ce la faccio piu."
                 "uff:Che giornata, uff, sono stanco e non ce la faccio piu."

@@ -1,23 +1,4 @@
 #!/usr/bin/env bash
-# ============================================================================
-# x86_bench.sh — clean check + RTF/TTFA/batching A/B on an x86 box.
-# "git pull && bash tests/x86_bench.sh <model>" — no fragile copy-paste pipes.
-#
-# Sections:
-#   [0] CORRECTNESS gate — --caps (does VNNI fire?) + --self-test (kernels correct
-#       on THIS ISA, incl. the batched int8/q4 VNNI matmat twins). MUST pass first.
-#   [A] Same-core (-j1): does the kernel work help? scalar-bf16 vs VNNI-int8.
-#   [B] Full single-stream RTF matrix (-j4): scalar/avx2/VNNI × bf16/int8/int4/quant-mixed,
-#       incl. VNNI-on/off A/B and the int4 SDOT-q4 (C7) on/off A/B.
-#   [C] Batched matmat (--matmat-bench): the server-throughput kernel win (weight read
-#       ONCE for B streams). int8/q4 now use VNNI (the batched-no-VNNI bug is fixed).
-#   [D] TTFA (streaming): ms to first audio chunk, per precision.
-#   [E] (optional) e2e server request-batching — set BATCH=1 to run it.
-#
-# Usage:  bash tests/x86_bench.sh                 # uses qwen3-tts-0.6b
-#         bash tests/x86_bench.sh qwen3-tts-1.7b  # 1.7B (int4/quant-mixed are 1.7B)
-#         BATCH=1 bash tests/x86_bench.sh qwen3-tts-1.7b   # + [E] server batching
-# ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 MODEL="${1:-qwen3-tts-0.6b}"
@@ -28,7 +9,6 @@ if [ ! -d "$MODEL" ]; then
     exit 1
 fi
 
-# Build a SIMD level into a named binary if not already present.
 build() { # $1=SIMD  $2=outname
     if [ -x "$2" ]; then echo ">> reuse $2"; return 0; fi
     echo ">> building $2 (SIMD=$1) ..."

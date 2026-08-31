@@ -1,24 +1,5 @@
 #!/usr/bin/env python3
-"""batch_determinism.py — the cheap permanent guard behind a claim we nearly overstated.
-
-On 2026-08-24 a quality gate found that C=4 and C=6 produced BIT-IDENTICAL audio for the
-same request, which reframed RTF>1 at C=6 from "the audio degrades under load" to "correct
-audio, delivered too slowly". That is a strong and useful conclusion — and it rested on
-eight md5 pairs from one configuration. Eight md5s are not a theorem.
-
-This is the test that makes it an assertion instead of an impression, and it costs seconds
-rather than the half hour a capacity campaign costs:
-
-    same text + same seed + same speaker  ->  fired at C = 2, 4, 6, 8
-    every response at every C >= 2 must hash identically
-
-WHY C>=2 AND NOT C>=1. At C=1 the engine runs B=1 and takes the GEMV path; from C=2 it takes
-GEMM. The two sum in a different order, so C=1 differing is EXPECTED and is reported, not
-failed. Within GEMM the result must not depend on how many columns share the batch - column
-j does not depend on column k - and that is exactly what is asserted here.
-
-    python3 tests/batch_determinism.py --url http://127.0.0.1:8000 [--conc 2,4,6,8]
-"""
+"""batch_determinism.py — the cheap permanent guard behind a claim we nearly overstated."""
 import argparse, concurrent.futures as cf, hashlib, json, sys, urllib.request
 
 def one(url, path, body, timeout):
@@ -40,7 +21,7 @@ def main():
     ap.add_argument("--speaker", default="ryan")
     ap.add_argument("--language", default="english")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--text", default="Abeg tell me wetin bi the problem, I go check am now now.")
+    ap.add_argument("--text", default="Please tell me what the problem is, I will check it now.")
     ap.add_argument("--timeout", type=float, default=600.0)
     a = ap.parse_args()
 

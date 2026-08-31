@@ -1,26 +1,10 @@
 #!/usr/bin/env python3
-# Build train_raw.jsonl for the Korean .expr LoRA from EmotionTTS Open DB (ETOD).
-# Sibling of prepare_manifest.py — ETOD ships as on-disk WAV + per-clip transcript .txt, with the
-# emotion encoded in the filename NUMBER RANGE (not a folder), so it gets its own loader. Output
-# schema is IDENTICAL to prepare_manifest.py (audio/text/ref_audio/instruct/emotion), so the
-# downstream pipeline (prepare_data.py -> train_lora.py -> export_expr.py) is unchanged.
-#
-# DATA: clone github.com/emotiontts/emotiontts_open_db (the repo holds the 5% public sample, ~300
-# clips; the full ~6,000-clip set is via the Google-form in Dataset/SpeechCorpus/Emotional/README.md).
-# Point --root at the cloned repo (or any dir containing the Emotional/ tree).
-#
-# LICENSE: CC-BY-NC-SA-4.0 (research, NON-commercial). We don't redistribute the data, only train a
-# micro-LoRA -> OK to USE; do not ship the data. See DATASETS.md.
-#
-# ETOD emotion = filename range per speaker (e.g. emaNNNNN):
-#   00001-00100 일반 neutral | 00101-00200 기쁨 happy | 00201-00300 화남 angry | 00301-00400 슬픔 sad
-# WAV: PCM 16-bit, 22.05 kHz mono -> resampled up to 24 kHz.
+# LICENSE: CC-BY-NC-SA-4.0 (research, NON-commercial). We do not redistribute the data,
+# only train a micro-LoRA, so it is fine to USE; do not ship the data. See DATASETS.md.
 import argparse, glob, json, os, re
 from collections import Counter
 import librosa, soundfile as sf
 
-# Korean emotion -> vivid ENGLISH instruct (instruct-following is EN/ZH-centric; speech stays Korean).
-# neutral -> "" anchors the no-instruct case, like prepare_manifest.py.
 EMOTION_INSTRUCT = {
     "neutral": "",
     "happy":   "Speak happily, bright and warm, smiling through the words.",
@@ -65,7 +49,6 @@ def main():
         if not m: skipped += 1; continue
         emo = emo_from_num(int(m.group(2)))
         if emo not in EMOTION_INSTRUCT: skipped += 1; continue
-        # transcript: sibling transcript/<base>.txt (strip UTF-8 BOM); fall back to script/.
         txt = None
         for sub in ("transcript", "script"):
             tp = os.path.join(os.path.dirname(os.path.dirname(w)), sub, base + ".txt")

@@ -1,12 +1,4 @@
-/*
- * qwen_tts_backend.c — backend resolver + CPU default (G1 seam).
- *
- * Compiled into the GPU build targets (`make metal` / `make cuda`), NOT into the
- * default `make blas` (which stays byte-identical). The CPU thunks forward to
- * the existing kernels, so a GPU backend that only implements SOME ops can be
- * mixed with CPU for the rest by copying the CPU thunk into the empty slots.
- */
-
+/* qwen_tts_backend.c — backend resolver + CPU default (G1 seam). */
 #include "qwen_tts_backend.h"
 #include "qwen_tts_kernels.h"
 
@@ -22,7 +14,6 @@
 #include "qwen_tts_cuda.h"
 #endif
 
-/* ---- CPU thunks (the default; always available) ------------------------- */
 static void cpu_matvec_bf16(qwen_backend_t *b, float *y,
                             const uint16_t *W, const float *x, int rows, int cols) {
     (void)b;
@@ -153,7 +144,6 @@ void qwen_backend_free(qwen_backend_t *b) {
     if (b && b->free) b->free(b);
 }
 
-/* ---- global offload wiring --------------------------------------------- */
 static qwen_backend_t *g_active_backend = NULL;
 static void hook_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
     g_active_backend->matvec_bf16(g_active_backend, y, W, x, rows, cols);
@@ -173,7 +163,6 @@ void qwen_backend_install_global(qwen_backend_t *b) {
     }
 }
 
-/* ---- selftest ----------------------------------------------------------- */
 #include <time.h>
 #include <math.h>
 
@@ -185,17 +174,15 @@ static double now_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
-/* xorshift32 — deterministic, no dependence on rand() impl */
 static uint32_t rng_state = 0x1234567u;
 static float rnd_unit(void) {
     rng_state ^= rng_state << 13; rng_state ^= rng_state >> 17; rng_state ^= rng_state << 5;
-    return ((float)(rng_state & 0xFFFFFF) / (float)0xFFFFFF) * 2.0f - 1.0f; /* [-1,1] */
+    return ((float)(rng_state & 0xFFFFFF) / (float)0xFFFFFF) * 2.0f - 1.0f;
 }
 
 int qwen_gpu_selftest(qwen_backend_kind_t kind, void *out) {
     FILE *f = out ? (FILE *)out : stdout;
 #ifdef QWEN_HAVE_METAL
-    /* Metal has a full per-op suite (all tensors, resident weights). */
     if (kind == QWEN_BACKEND_METAL && qwen_metal_available())
         return qwen_metal_selftest(out);
 #endif
@@ -227,7 +214,6 @@ int qwen_gpu_selftest(qwen_backend_kind_t kind, void *out) {
         fprintf(f, "  NOTE: GPU backend unavailable — nothing to validate against CPU.\n");
     }
 
-    /* ---- matvec correctness ---- */
     cpu->matvec_bf16(cpu, y_cpu, W, x, rows, cols);
     gpu->matvec_bf16(gpu, y_gpu, W, x, rows, cols);
     double mv_abs = 0, mv_ref = 0;
@@ -240,7 +226,6 @@ int qwen_gpu_selftest(qwen_backend_kind_t kind, void *out) {
     fprintf(f, "  matvec_bf16: max|abs|=%.3e  rel=%.3e  %s\n", mv_abs, mv_rel, mv_ok ? "PASS" : "FAIL");
     if (!mv_ok) fails++;
 
-    /* ---- matmat correctness ---- */
     cpu->matmat_bf16(cpu, Y_cpu, W, X, rows, cols, B);
     gpu->matmat_bf16(gpu, Y_gpu, W, X, rows, cols, B);
     double mm_abs = 0, mm_ref = 0;
@@ -253,7 +238,6 @@ int qwen_gpu_selftest(qwen_backend_kind_t kind, void *out) {
     fprintf(f, "  matmat_bf16: max|abs|=%.3e  rel=%.3e  %s\n", mm_abs, mm_rel, mm_ok ? "PASS" : "FAIL");
     if (!mm_ok) fails++;
 
-    /* ---- rough throughput (matmat is the compute-bound win on M1) ---- */
     const int iters = 20;
     double t0 = now_ms();
     for (int it = 0; it < iters; ++it) cpu->matmat_bf16(cpu, Y_cpu, W, X, rows, cols, B);

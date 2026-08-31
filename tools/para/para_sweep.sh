@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# E1.3 — para_sweep: grid runner for paralinguistic [tag] DISCOVERY.
-#   trigger(onomatopoeia) x seed x voice x language -> wavs into a dated samples/tests/ folder
-#   + a manifest.json (file/tag/onom/seed/voice/lang) ready to pipe into para_judge.py.
-#
-# DISCOVERY path: we inject the CANDIDATE onomatopoeia directly (comma-delimited inline, one
-# generation, seed pinned) to FIND new (onom,seed) cells. The "real [tag] path" rule applies later,
-# when we PROMOTE a validated cell into para_pick — not during discovery. Ear stays final judge.
-#
-# Config via env (defaults = a ryan SIGH sweep, the calibrated-trusted event):
-#   TAG=sigh ONOMS="唉,ahh" SEEDS="7,42,2024" VOICES="ryan" LANGS="English,Italian" EMO=sad \
-#   MODEL=qwen3-tts-1.7b TEMP=1.1 NAME=explore JUDGE=1 ./tools/para/para_sweep.sh
-#
-# VOICES entries: a preset name (e.g. "ryan") OR "clone:relative/path.qvoice" (uses --load-voice --icl-only).
-# JUDGE=1 runs para_judge.py on the manifest at the end (cnn14 for sigh, add --tagger for laugh).
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
 
@@ -30,13 +16,10 @@ BIN=${BIN:-./qwen_tts}
 DATE=$(date +%F)
 OUTDIR=${OUTDIR:-samples/tests/${DATE}_${TAG}_${NAME}}
 
-# default emotion per event (empty -> --emotion omitted; "none" also omits)
 if [ -z "$EMO" ]; then case "$TAG" in
   sigh) EMO=sad;; laugh) EMO=joy;; cry) EMO=sad;; gasp) EMO=surprise;;
   groan) EMO=disgust;; yawn) EMO=none;; moan) EMO=joy;; throat) EMO=none;; *) EMO=none;; esac; fi
 
-# carrier per (tag,lang): %s is where the onomatopoeia goes (comma-delimited inline).
-# New-event carriers are emotionally primed so the model has context for the vocalization.
 carrier() { # $1=tag $2=lang
   case "$1:$2" in
     sigh:Italian)  echo "Ho perso tutto quello che avevo, %s e adesso non so più cosa fare.";;
@@ -94,7 +77,6 @@ for voice in "${VOICE_A[@]}"; do
   done
 done
 
-# assemble manifest.json (array) from the rows
 MANIFEST="$OUTDIR/manifest.json"
 python3 - "$ROWS" "$MANIFEST" <<'PY'
 import json, sys

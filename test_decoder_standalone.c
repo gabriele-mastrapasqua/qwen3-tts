@@ -5,20 +5,10 @@
 
 #include "qwen_tts.h"
 
-/* Standalone speech-decoder test tool: decode a dumped codes file through the C
- * speech decoder alone — no Talker/CP — and write a WAV. Useful to A/B the decoder
- * against Python or across kernel changes with a FIXED code input (no sampling noise).
- *
- * Input = the QWEN_DUMP_CODES text format the engine emits: one line per frame,
- * 16 whitespace-separated ints ("code0 c1 ... c15"). Produce one with e.g.:
- *   QWEN_DUMP_CODES=codes.txt ./qwen_tts -d qwen3-tts-0.6b --text "..." -o /dev/null
- * Build + run: `make test-decoder-tool` then
- *   ./qwen_tts_decoder_tool codes.txt [model_dir] [out.wav]                       */
-
 extern int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
                                       float **audio_out, int *n_samples);
 
-#define QDT_NCB 16   /* codebooks per frame */
+#define QDT_NCB 16
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -31,7 +21,6 @@ int main(int argc, char **argv) {
     const char *model_dir = (argc > 2) ? argv[2] : "qwen3-tts-0.6b";
     const char *output = (argc > 3) ? argv[3] : "decoder_test.wav";
 
-    /* Read codes (text: one frame per line, 16 ints) */
     FILE *f = fopen(codes_file, "r");
     if (!f) {
         fprintf(stderr, "Cannot open %s\n", codes_file);
@@ -49,7 +38,7 @@ int main(int argc, char **argv) {
         }
         int *row = codes + (size_t)n_frames * QDT_NCB, got = 0;
         while (got < QDT_NCB && fscanf(f, "%d", &row[got]) == 1) got++;
-        if (got == 0) break;                     /* clean EOF */
+        if (got == 0) break;
         if (got < QDT_NCB) {
             fprintf(stderr, "Truncated frame %d in %s (%d/%d codes)\n",
                     n_frames, codes_file, got, QDT_NCB);
@@ -66,7 +55,6 @@ int main(int argc, char **argv) {
     }
     printf("Loaded %d frames x %d codebooks from %s\n", n_frames, QDT_NCB, codes_file);
 
-    /* Load model (decoder weights ride along with the full ctx) */
     printf("Loading model from %s...\n", model_dir);
     qwen_tts_ctx_t *ctx = qwen_tts_load(model_dir);
     if (!ctx) {
@@ -75,7 +63,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Decode */
     float *audio = NULL;
     int n_samples = 0;
     if (qwen_speech_decoder_decode(ctx, codes, n_frames, &audio, &n_samples) != 0) {
@@ -85,7 +72,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Write WAV via the engine's writer (24 kHz, 16-bit PCM mono) */
     if (qwen_tts_write_wav(output, audio, n_samples, 24000) != 0) {
         fprintf(stderr, "Cannot write %s\n", output);
         free(audio); qwen_tts_unload(ctx); free(codes);

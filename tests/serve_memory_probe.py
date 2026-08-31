@@ -1,21 +1,6 @@
 #!/usr/bin/env python3
-"""serve_memory_probe.py — how much memory does a multi-worker server ACTUALLY use?
-
-Summing RSS over W processes counts every SHARED page W times. With pre-fork that is
-exactly the wrong thing to measure, because sharing is the whole point: the topology
-matrix reported 47.8 GB for 4x4 by summing RSS, and most of it was one physical copy
-counted four times.
-
-Pss (Proportional Set Size) divides each page by the number of processes mapping it,
-so summing Pss across the tree gives the true footprint. This prints both, side by
-side, plus the shared/private split that says WHERE the sharing is.
-
-Usage:
-  python3 tests/serve_memory_probe.py <pid>            # that process and its children
-  python3 tests/serve_memory_probe.py --match qwen_tts # every matching process
-"""
+"""serve_memory_probe.py — how much memory does a multi-worker server ACTUALLY use?"""
 import os, re, sys
-
 
 def rollup(pid):
     out = {}
@@ -32,7 +17,6 @@ def rollup(pid):
         out["cmd"] = "?"
     return out
 
-
 def children(pid):
     kids = []
     for d in os.listdir("/proc"):
@@ -45,7 +29,6 @@ def children(pid):
         except Exception:
             pass
     return kids
-
 
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--match":
@@ -91,7 +74,6 @@ def main():
     if tot["Rss"]:
         print(f"  sharing saves {(tot['Rss']-tot['Pss'])/1024:.0f} MB "
               f"({100.0*(tot['Rss']-tot['Pss'])/tot['Rss']:.0f}% of the naive sum)")
-    # /proc/meminfo is the final arbiter: if Pss is right, MemAvailable agrees.
     mi = {}
     for line in open("/proc/meminfo"):
         m = re.match(r"(\w+):\s+(\d+) kB", line)
@@ -99,7 +81,6 @@ def main():
     print(f"  system: MemTotal {mi.get('MemTotal',0)/1048576:.1f} GB, "
           f"MemAvailable {mi.get('MemAvailable',0)/1048576:.1f} GB, "
           f"used {(mi.get('MemTotal',0)-mi.get('MemAvailable',0))/1048576:.1f} GB")
-
 
 if __name__ == "__main__":
     main()

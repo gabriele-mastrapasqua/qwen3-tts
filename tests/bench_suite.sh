@@ -1,28 +1,6 @@
 #!/usr/bin/env bash
-# ONE command for the numbers that leave this repo.
-#
-# WHY IT EXISTS. The suite has been run by hand more than once, and a run that forgets a
-# setting still prints a table. Measured 2026-08-31, same binary, same bank, same host:
-# C=1 on the FAST bank was 108 ms without the platform's declared OPENBLAS_THREAD_TIMEOUT=1
-# and 66 ms with it -- and the bare arm was bimodal between the two, so a single run could
-# land on either and look definitive. Nothing in the output said which had been measured.
-#
-# So this script owns the whole invocation: the profile, the forbidden variables, the
-# binary's identity, the idle check, every rung, the identity gates, and a manifest that
-# repeats the exact commands. If a number is quoted to anyone outside this repo, it came
-# from here.
-#
-#   bash tests/bench_suite.sh --model DIR --profile axion-16c-ttfa --out DIR
-#
-# Every gate below exits non-zero. A suite that warns and continues is a suite that ships
-# a warning nobody read.
 set -u
 
-# DEFAULTS ARE GENERIC AND MUST STAY GENERIC. This engine is public; a benchmark script
-# that names a particular deployment's model, voice or text bank carries that name into
-# every log, filename and report it produces. So the defaults run against an open-weights
-# checkpoint with a preset voice and the neutral bank, and any other configuration is
-# passed in on the command line by whoever owns it.
 MODEL=""; PROFILE="axion-16c-ttfa"; OUT="/tmp/bench_suite"; BIN="./qwen_tts"
 SPK="ryan"; LANG_="English"; TOPO="2x8"
 DEFAULT_MODEL="qwen3-tts-1.7b"
@@ -60,7 +38,6 @@ die  () { echo "GATE FAILED: $1" >&2; exit 3; }
 
 echo "########## PREFLIGHT — every one of these exits non-zero ##########"
 
-# 1. the binary exists, runs, and says who it is
 [ -x "$BIN" ] || die "$BIN is not an executable"
 BSHA=$("$BIN" --caps >/dev/null 2>&1 && shasum -a 256 "$BIN" 2>/dev/null | cut -d' ' -f1)
 [ -n "$BSHA" ] || BSHA=$(sha256sum "$BIN" | cut -d' ' -f1)
@@ -69,13 +46,9 @@ gate "binary            = $BIN"
 gate "binary_sha256     = $BSHA"
 gate "binary_build_tag  = $BTAG"
 
-# 2. the model is the one that was asked for, and it exists
 [ -d "$MODEL" ] || die "model directory $MODEL does not exist"
 gate "model             = $MODEL"
 
-# 3. the profile resolves, and its forbidden variables are ABSENT from this environment.
-#    Not "we did not set them" -- absent. Someone else's export is exactly the invisible
-#    variable this script exists to prevent.
 SENV=$(python3 tools/perf_profile.py server-env "$PROFILE") || die "profile $PROFILE did not resolve"
 gate "profile           = $PROFILE"
 gate "server_env        = $SENV"
@@ -87,9 +60,6 @@ for V in $(python3 tools/perf_profile.py forbidden-env "$PROFILE"); do
 done
 gate "forbidden env     = none present"
 
-# 4. nothing else is running that would share the cores
-# `pgrep -c` PRINTS 0 and EXITS 1 when nothing matches, so `|| echo 0` appended a second
-# zero and the comparison failed against a clean box. Count the lines instead.
 STALE=$(pgrep -x qwen_tts 2>/dev/null | wc -l | tr -d ' ')
 [ "${STALE:-0}" = "0" ] || die "$STALE qwen_tts processes already running"
 gate "stale engines     = 0"
@@ -99,7 +69,6 @@ if [ "$SKIP_IDLE" = "0" ] && [ -r /proc/loadavg ]; then
   gate "loadavg           = $L1"
 fi
 
-# 5. the tree's provenance travels with the numbers
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo UNKNOWN)
 DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo yes || echo no)
 gate "source_commit     = $COMMIT   dirty= $DIRTY"
@@ -122,7 +91,6 @@ echo "########## RUNGS ##########"
 PORT=9400
 rung () {   # name bank conc waves [extra...]
   NAME="$1"; BANK="$2"; CONC="$3"; W="$4"; shift 4
-  # $@ now holds the extra arguments (e.g. --classes), reused by the identity pass below
   PORT=$((PORT + 10))
   echo "=== $NAME  bank=$(basename "$BANK")  conc=$CONC  waves=$W ==="
   CMD="python3 tests/serve_parallel_wave.py --model $MODEL --bin $BIN --speaker $SPK
@@ -132,8 +100,6 @@ rung () {   # name bank conc waves [extra...]
   $CMD > "$OUT/$NAME.log" 2>&1
   RC=$?
   if [ $RC -ne 0 ]; then
-    # Say WHY, on the line that reports the failure. "rc=2, see the log" sends a reader
-    # hunting through 70 lines for a sentence the script had already read.
     WHY=$(grep -m1 -E 'REFUSING TO RUN|CROSS-CHECK FAILED|Traceback|GATE FAILED|Error' \
           "$OUT/$NAME.log" 2>/dev/null | cut -c1-100)
     echo "  rc=$RC  RUNG FAILED${WHY:+ — $WHY}"
@@ -141,12 +107,6 @@ rung () {   # name bank conc waves [extra...]
     FAILED=1; return
   fi
   grep -E '^topo|^2x8|^4x4|^8x2|^1x16' "$OUT/$NAME.log" | head -20
-  # THE IDENTITY GATE NEEDS DATA THAT COSTS TIMING TO PRODUCE.
-  # It pairs every client-side record to a server-side one, and the server side only exists
-  # when the request trace is on -- which perturbs the very numbers this rung just measured.
-  # Running it anyway reported "NO PAIRS" and then "SUITE FAILED", which is a gate failing
-  # because its input was never produced: the worst kind of red, because it looks like the
-  # engine. So the rungs stay clean and the gate is a separate, explicitly traced pass.
   if [ "$IDENTITY" = "1" ] && [ -f tests/serve_identity_gate.py ]; then
     PORT=$((PORT + 1))
     QWEN_LIFE_TRACE=1 QWEN_REQ_TRACE=1 python3 tests/serve_parallel_wave.py \
@@ -165,10 +125,6 @@ cls_arg () { [ -n "$1" ] && printf -- "--classes %s" "$1"; }
 rung realistic "$REAL" 1,2,4,6,8 4 $(cls_arg "$REAL_CLASSES")
 rung fast      "$FAST" 1,4       5 $(cls_arg "$FAST_CLASSES")
 
-# The duration-calibrated corpus is optional: it is built per deployment by
-# `make corpus-calibrate`, because a class boundary drawn from MEASURED audio duration on
-# one checkpoint does not describe another. Without one, the two diverse rungs are skipped
-# and SAY SO -- a silently missing rung reads as a rung that passed.
 if [ -n "$CORPUS" ] && [ -f "$CORPUS" ]; then
   rung short-diverse "$CORPUS" 4,6   3 --classes short
   rung long-diverse  "$CORPUS" 1,4,6 3 --classes long

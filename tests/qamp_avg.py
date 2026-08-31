@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Average N QWEN_ACT_MAP captures (.qamp) into one — denoise a per-layer fingerprint
-by averaging the per-frame means across several utterances (cancels content-specific
-noise, keeps the shared instruct/emotion component).
+"""Average N QWEN_ACT_MAP captures (.qamp) into one.
 
 Usage: tests/qamp_avg.py OUT.qamp IN1.qamp IN2.qamp [IN3.qamp ...]
 """

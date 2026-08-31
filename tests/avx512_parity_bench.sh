@@ -1,28 +1,4 @@
 #!/usr/bin/env bash
-# ============================================================================
-# avx512_parity_bench.sh — validation battery for the perf/avx512-parity branch
-# on a real AVX-512 box (Scaleway STANDARD3-X4C = EPYC 9555P Zen5, VNNI+BF16).
-#
-# What this branch adds (all COMPILE-CHECKED ONLY on M1 — this script is the
-# hardware gate):
-#   - attention dots/accumulators + rms_norm + bf16<->f32 bulk conv: AVX-512
-#     (compile-time; A/B = branch binary vs main binary, same SIMD=)
-#   - C4  bf16 matvec via VDPBF16PS       (runtime A/B: QWEN_NO_BF16DOT=1)
-#   - C7v4 q4-VNNI deferred-reduce matvec (ladder: QWEN_Q4_VNNI_V4=0 -> v3,
-#                                          + QWEN_Q4_VNNI_V3=0 -> v2)
-#   - fused-QKV q4 VNNI twin              (runtime A/B: QWEN_NO_VNNI_QKV=1)
-#   - + the audit leftover:                QWEN_PREFILL_MATMAT=1/0 A/B on Linux
-#
-# Usage on the box (QUIET machine, read --caps FIRST — lesson 2026-07-11:
-# the default build is portable AVX2; without SIMD= the whole battery is invalid):
-#   git clone https://github.com/<repo> && cd qwen-tts && git checkout perf/avx512-parity
-#   apt install -y build-essential libopenblas-dev python3-pip && pip3 install librosa
-#   ./download_model.sh   # 0.6B (+ 1.7B if benching int4/quant-mixed properly)
-#   bash tests/avx512_parity_bench.sh qwen3-tts-0.6b
-# Optional: MAIN_BIN=/path/qwen_tts_main for branch-vs-main RTF + mel-corr
-# (build it from a worktree: git worktree add /tmp/qmain main && cd /tmp/qmain &&
-#  make blas SIMD=avx512bf16 && cp qwen_tts /tmp/qwen_tts_main).
-# ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 MODEL="${1:-qwen3-tts-0.6b}"

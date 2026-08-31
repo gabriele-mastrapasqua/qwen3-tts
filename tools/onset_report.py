@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""How many leading codec frames does every render share, and are they silent?
-
-Reads a directory of paired <cell>.code0 / <cell>.wav produced by QWEN_DUMP_CODE0.
-Reports the code0 opening of each cell, the leading silence of its waveform, and the
-number of leading frames that are identical across EVERY cell in the set. Cells are
-meant to differ in speaker, seed, text and sampling: what survives all of that is a
-property of the model, not of the request.
-"""
+"""How many leading codec frames does every render share, and are they silent?"""
 import sys, os, glob, wave, array
 
 

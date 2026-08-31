@@ -1,22 +1,8 @@
 #!/usr/bin/env python3
-"""cancel_correctness.py — K1-K7 for server-side cancellation. Correctness, not performance.
-
-The property that matters most, and the one a cancellation bug breaks first:
-**cancelling ONE row of a concurrent batch must not change the output of the others.**
-
-The comparison is NEVER against a serial reference - C=1/GEMV and B>=2/GEMM legitimately
-differ, and the frozen baseline documents that. It is:
-
-    same concurrency · same schedule · same request ids · cancellation OFF vs ON
-
-Every non-aborted request must produce, in the ON run, exactly what it produced in the OFF
-run at the same concurrency. That is the determinism contract already qualified for this
-path by tests/batch_determinism.py.
-"""
+"""cancel_correctness.py — K1-K7 for server-side cancellation. Correctness, not performance."""
 import argparse, hashlib, json, os, re, socket, subprocess, sys, threading, time
 
 SR = 24000
-
 
 def wait_health(port, timeout=600):
     import urllib.request
@@ -29,7 +15,6 @@ def wait_health(port, timeout=600):
         except Exception:
             time.sleep(0.5)
     return False
-
 
 def stream(port, text, speaker, language, seed, abort_after=None):
     body = json.dumps({"text": text, "speaker": speaker, "language": language,
@@ -46,9 +31,6 @@ def stream(port, text, speaker, language, seed, abort_after=None):
         while True:
             if abort_after is not None and time.time() - t0 >= abort_after:
                 aborted = True
-                # stamped IMMEDIATELY before the FIN, on the same clock the server prints,
-                # so detect-lag is a subtraction of two comparable instants and not of two
-                # different clocks' origins.
                 abort_abs_ms = time.monotonic() * 1000.0
                 s.shutdown(socket.SHUT_RDWR)
                 break
@@ -85,12 +67,8 @@ def stream(port, text, speaker, language, seed, abort_after=None):
             "aborted": aborted, "wall_s": time.time()-t0,
             "abort_abs_ms": abort_abs_ms}
 
-
-# Allocation made once at model load and never freed before exit. It does not grow with
-# requests, so it is reported and kept separate rather than counted against a change.
 LOAD_FRAMES = ("qwen_tts_load_ex", "qwen_talker_load", "qwen_cp_load",
                "qwen_speech_decoder_load", "qwen_tts_load", "qwen_kleidi")
-
 
 def parse_leaks(path):
     """LeakSanitizer blocks in a server log -> (load_bytes, request_bytes, examples).
@@ -133,7 +111,6 @@ def parse_leaks(path):
     flush()
     return dict(ran=ran, load=load_b, req=req_b, examples=examples, sigs=sigs)
 
-
 def parse_log(path):
     life, cancel, req = {}, {}, {}
     for ln in open(path, errors="replace"):
@@ -154,7 +131,6 @@ def parse_log(path):
                                           cancelled=bool(m.group(4)))
     return life, cancel, req
 
-
 def run_arm(a, on, log):
     env = dict(os.environ)
     env["QWEN_LIFE_TRACE"] = "1"; env["QWEN_REQ_TRACE"] = "1"
@@ -172,7 +148,6 @@ def run_arm(a, on, log):
         if not wait_health(a.port):
             p.kill(); sys.exit(f"server did not come up ({log})")
         time.sleep(2)
-        # N concurrent streams; the MIDDLE ones abort at several heard fractions
         jobs, res, lk = [], {}, threading.Lock()
         for i, frac in enumerate(a.fracs):
             jobs.append((900100 + i, a.longtext, frac * a.expected))
@@ -192,7 +167,6 @@ def run_arm(a, on, log):
         except subprocess.TimeoutExpired: p.kill()
         lf.close()
     return out
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -285,10 +259,6 @@ def main():
         "every issued request has a lifecycle record (no orphan)")
     for name, path in (("OFF", "off.log"), ("ON", "on.log")):
         txt = open(os.path.join(a.out, path), errors="replace").read()
-        # Count ERRORS, not the string "AddressSanitizer" - which also appears in every
-        # "SUMMARY: AddressSanitizer: N byte(s) leaked" line. Once the worker leak check
-        # was switched on, that substring made this gate fail on its own new output.
-        # Leaks are K9's subject and are not memory errors.
         bad = txt.count("ERROR: AddressSanitizer") + txt.count("runtime error")
         chk(bad == 0, f"K5 {name}: no memory-error finding (leaks are K9)", f"{bad} found")
     print("K8 disconnect detection latency  ·  ONE clock (CLOCK_MONOTONIC), or nothing")
@@ -328,12 +298,6 @@ def main():
                   f"(both are one-time scratch, not per-request growth — see K9-growth)")
     chk(lk["OFF"]["ran"] and lk["ON"]["ran"], "    the leak check actually ran in both arms")
 
-    # ── K9-growth. Comparing OFF against ON in absolute bytes is NOT a leak test: the two
-    # arms execute different code paths by construction (a cancelled row drops the batch,
-    # which routes the Code Predictor through its single-row path and allocates that path's
-    # one-time __thread scratch). The question that matters for a server is whether the
-    # leak SCALES WITH THE NUMBER OF CANCELLATIONS. So: two ON runs, A aborts and B aborts,
-    # same everything else, and read the slope.
     if a.growth:
         A, B = a.growth
         print(f"K9-growth  does the leak scale with cancellations?  {A} aborts vs {B} aborts, "
@@ -350,15 +314,9 @@ def main():
             print(f"    {nab} aborts: request-path {pts[nab]['req']:>9} B   "
                   f"load-time {pts[nab]['load']:>9} B")
         if B > A:
-            # TOTAL BYTES CANNOT DECIDE THIS. Which worker serves which request, and how far
-            # each got, moves the one-time scratch high-water marks by hundreds of KB between
-            # runs - a spread far larger than the leak worth catching. It is printed so the
-            # verdict is not read as tighter than it is, and it decides nothing.
             spread = pts[B]["req"] - pts[A]["req"]
             print(f"    total request-path bytes moved {spread:+d} B between the two runs — "
                   f"RUN-TO-RUN NOISE in one-time scratch, NOT the verdict")
-            # The verdict: a leak caused by cancelling shows up as an allocation SITE whose
-            # OBJECT COUNT tracks the number of cancellations. Sizes may vary; counts do not.
             grew = []
             for sig, (b, o) in pts[B]["sigs"].items():
                 o0 = pts[A]["sigs"].get(sig, [0, 0])[1]
@@ -376,7 +334,6 @@ def main():
     if fails:
         print(f"❌ {len(fails)} CHECK(S) FAILED"); return 1
     print("✅ K1-K7 PASSED"); return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

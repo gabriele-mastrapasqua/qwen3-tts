@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# PARA NATIVE (2026-06-26): the discovery WINNERS applied in ITALIAN, cross-voice (the model emits them
-# itself => cross-voice for free). Onomatopoeia-as-sound trigger + matching EN instruct + expr (IT
-# language-correction) + T1.1. Plus the user's asks: "godimento" (mmm/savoring) and para x emotion
-# (joy+laugh, excited).  -> samples/para_native/
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/para_native; rm -rf $O; mkdir -p $O
@@ -15,7 +11,6 @@ gen(){ local sp="$1" id="$2" ins="$3" txt="$4"
     --text "$txt" -o $O/${sp}_${id}.wav >/dev/null 2>&1
   echo "  ${sp}_${id} -> $(dur $O/${sp}_${id}.wav)"
 }
-# id | instruct(EN) | italian text (winning trigger inline)
 ITEMS=(
 "disgust_ugh|React with strong disgust, a revolted ugh.|Che cosa orribile, ugh, non riesco nemmeno a guardarla."
 "throatclear_ahem|Clear your throat audibly before speaking.|Allora, ahem, vorrei dire una cosa molto importante."

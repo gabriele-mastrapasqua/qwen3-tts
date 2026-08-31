@@ -1,22 +1,4 @@
 #!/usr/bin/env bash
-# bench_m2.sh — one-command Metal/CPU RTF bench for a rented Apple Silicon box (M2 Pro, M4, ...).
-#
-# Drives the SHIPPED fused Metal pipeline (resident Talker + CP, device-frame CP, qk-fusion)
-# across  precision (bf16/int8/int4) × mode (single/stream) × model (0.6B/1.7B),  logs everything
-# to a timestamped file, prints a clean RTF summary table at the end.
-#
-# ── HOW IT'S MEANT TO BE USED ──────────────────────────────────────────────────────────────────
-# You can run this with EITHER:
-#   (A) an scp'd M1-built Metal binary  → the GPU/Metal path uses THIS box's GPU at full speed
-#       (shaders are compiled at runtime by the local Metal driver — no rebuild needed). The CPU
-#       numbers, however, stay M1-level (no i8mm/bf16) because those are baked in at build time.
-#   (B) a NATIVE build here (./setup_m2.sh → make metal CC=clang) → both Metal AND the true M2/M4
-#       CPU path (i8mm/bf16). Use this if you want an honest CPU-vs-Metal comparison on the box.
-#
-# Metal-vs-Metal across boxes is always apples-to-apples (runtime shaders); only the CPU column
-# differs between (A) and (B). The header prints which mode this binary is.
-#
-# ── CONFIG (env overridable) ────────────────────────────────────────────────────────────────────
 set -u
 BIN=${BIN:-./qwen_tts}
 SEED=${SEED:-42}
@@ -37,7 +19,6 @@ mkdir -p "$OUTDIR"
 
 say(){ echo "$@" | tee -a "$LOG" >&2; }
 
-# ── 0. environment / caps ───────────────────────────────────────────────────────────────────────
 say "════════════════════════════════════════════════════════════════════════════"
 say " qwen-tts  bench_m2  —  $STAMP"
 say "════════════════════════════════════════════════════════════════════════════"
@@ -50,16 +31,13 @@ fi
 say ""
 say "── --caps (compiled SIMD; note the CPU tier) ──"
 "$BIN" --caps 2>&1 | tee -a "$LOG" >&2
-# Detect whether the CPU path is native-M2+ or M1-level (scp'd), for the summary caveat.
 CPU_TIER=$("$BIN" --caps 2>&1 | grep -iE "^ *note:" | head -1 | sed -E 's/^ *note: *//')
 say ""
 
-# ── 1. correctness gates (Metal) ─────────────────────────────────────────────────────────────────
 say "── GPU self-test (matvec/matmat vs CPU) ──"
 "$BIN" --gpu-selftest --backend metal 2>&1 | tee -a "$LOG" | tail -3 >&2 || say "(gpu-selftest not available in this binary)"
 say ""
 
-# ── 2. RTF matrix ─────────────────────────────────────────────────────────────────────────────────
 prec_flag(){ case "$1" in bf16) echo "";; int8) echo "--int8";; int4) echo "--int4";; esac; }
 mode_flag(){ case "$1" in single) echo "";; stream) echo "--stream";; esac; }
 
@@ -77,7 +55,6 @@ for M in $MODELS; do
         CMD="$ENVP $BIN -d $M $BKFLAG $(prec_flag "$P") $(mode_flag "$MD") \
              --seed $SEED -s $SPK -l $LNG --text \"$TXT\" -o $OUTDIR/o_${BK}_${P}_${MD}.wav"
         echo ">>> $CMD" >> "$LOG"
-        # run (env prefix applied via env so it survives the quoting)
         env $ENVP "$BIN" -d "$M" $BKFLAG $(prec_flag "$P") $(mode_flag "$MD") \
             --seed "$SEED" -s "$SPK" -l "$LNG" --text "$TXT" \
             -o "$OUTDIR/o_${BK}_${P}_${MD}.wav" > "$RUNLOG" 2>&1

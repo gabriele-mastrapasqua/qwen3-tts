@@ -1,26 +1,4 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# structured_instruct_test.sh — plan_emo_v3 §8.8: STRUCTURED-TEMPLATE instruct vs free-form.
-#
-# QUESTION: does a DEFINED-STRUCTURE instruct (slots VoiceStyle/Tone/Pitch/Tempo/Intensity/Expression)
-#   (a) emote BETTER / more controllably than our free-form vivid instruct, and
-#   (b) unlock controllable PROSODY by prompt (does Tempo:+X% actually speed up? Pitch:higher raise F0?)
-#
-# ISOLATED A/B: identical COMBINE recipe (k6 expr + ryan_<emo> steer w8 @L21-25 + instruct), same
-#   seed/voice/text/expr/steer — the ONLY variable is the instruct TEXT (free-form vs structured).
-#   This does NOT touch emo_suite / THE recipe; it writes a NEW gitignored test folder.
-#
-# 1.7B only (instruct is 1.7B; 0.6B ignores it). Native preset per language; EMOTION-MATCHED sentences.
-#
-# PART 1 — emotional quality (full suite 4 voices x 6 emo): neutral / free / tmpl per cell.
-#          metric = mel-movement vs the SAME sentence rendered flat (lower corr = moved more) + F0/RMS/dur.
-# PART 2 — per-slot prosody control (ryan EN, neutral carrier): sweep ONE slot, others neutral.
-#          Tempo->dur_s, Pitch->f0_med, Intensity->rms_db, Expression->f0_std. Does the slot DO anything?
-#
-# Usage:  bash tests/structured_instruct_test.sh           (full)
-#         PART=1 bash tests/structured_instruct_test.sh    (only quality A/B)
-#         PART=2 bash tests/structured_instruct_test.sh    (only per-slot sweep)
-# ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42
@@ -35,7 +13,6 @@ mkdir -p "$P1" "$P2"
 tok(){ case "$1" in anger)echo ang;; *)echo "$1";; esac; }
 run(){ local out="$1"; shift; if "$@" -o "$out" >"${out%.wav}.log" 2>&1; then echo "  ok $(basename "$out")"; else echo "  FAIL $(basename "$out")"; tail -2 "${out%.wav}.log"; fi; }
 
-# ---- FREE-FORM vivid instruct per emotion (the current baseline, copied from emo_suite) ----
 declare -A FREE=(
  [sad]="Speak in a sad, sorrowful, gloomy and downcast tone, voice low and heavy, on the verge of tears."
  [joy]="Speak with bright, radiant joy, light and warm, smiling through every word."
@@ -44,7 +21,6 @@ declare -A FREE=(
  [disgust]="Speak with deep disgust and revulsion, lip-curling contempt, as if something repels you."
  [surprise]="Speak with sudden astonishment and surprise, gasping and caught off guard.")
 
-# ---- STRUCTURED-TEMPLATE instruct per emotion (the thing under test) ----
 declare -A TMPL=(
  [sad]="VoiceStyle: deeply_sad. Tone: sorrowful, gloomy, downcast. Pitch: lower. Tempo: -15%. Intensity: low. Expression: heavy, on the verge of tears."
  [joy]="VoiceStyle: happy_excited. Tone: cheerful, radiant, warm. Pitch: higher. Tempo: +15%. Intensity: medium-high. Expression: bright enunciation, smiling voice."
@@ -53,7 +29,6 @@ declare -A TMPL=(
  [disgust]="VoiceStyle: disgusted. Tone: revolted, contemptuous. Pitch: lower. Tempo: -5%. Intensity: medium. Expression: lip-curling, recoiling."
  [surprise]="VoiceStyle: astonished. Tone: startled, caught off guard. Pitch: higher. Tempo: +5%. Intensity: medium-high. Expression: gasping, wide-eyed.")
 
-# ---- EMOTION-MATCHED sentences (native language per voice) ----
 declare -A TX=(
  [en_sad]="I've lost everything I had, and now I don't know what to do."
  [en_joy]="I can't believe it, this is the best news of my whole life!"
@@ -80,7 +55,6 @@ declare -A TX=(
  [ko_disgust]="이게 뭐야? 정말 역겨워, 쳐다보기도 싫어."
  [ko_surprise]="뭐?! 전혀 예상 못 했어, 이건 정말 믿을 수 없어!")
 
-# voice config: tag|Language|voiceflag|voicelabel
 P1_VOICES=(
  "en|English|-s ryan|ryan"
  "zh|Chinese|-s vivian|vivian"
@@ -88,7 +62,6 @@ P1_VOICES=(
  "ko|Korean|-s sohee|sohee")
 EMOS="${EMOS:-sad joy anger fear disgust surprise}"
 
-# COMBINE render with a given instruct ("" = none, used for neutral anchor: no expr/steer/instruct)
 combine(){ # out lang vf emo instruct
   local out="$1" lang="$2" vf="$3" e="$4" ins="$5" txt="$6"; local ql="$QL/ryan_$(tok "$e").qlsteer"
   if [ -z "$ins" ]; then
@@ -120,24 +93,18 @@ if [ "$PART" = "0" ] || [ "$PART" = "2" ]; then
   slot(){ # name instruct
     run "$P2/p2_$1.wav" $BIN -d $M $VF -l "$LANG" -T 1.1 --seed $SEED --expr "$EXPR" --expr-weight 1.2 \
       --ml-steer "$QL/ryan_joy.qlsteer" --ml-weight 8 --ml-range 21-25 --instruct "$2" --text "$CARR"; }
-  # anchor: all-neutral template
   slot "anchor"        "$(base neutral +0% medium 'plain enunciation')"
-  # Tempo sweep (others neutral) -> expect dur_s to DECREASE as % rises
   slot "tempo_-20"     "$(base neutral -20% medium 'plain enunciation')"
   slot "tempo_+20"     "$(base neutral +20% medium 'plain enunciation')"
   slot "tempo_+40"     "$(base neutral +40% medium 'plain enunciation')"
-  # Pitch sweep -> expect f0_med to RISE lower->higher
   slot "pitch_lower"   "$(base lower +0% medium 'plain enunciation')"
   slot "pitch_higher"  "$(base higher +0% medium 'plain enunciation')"
-  # Intensity sweep -> expect rms_db to RISE low->high
   slot "intensity_low" "$(base neutral +0% low 'plain enunciation')"
   slot "intensity_high" "$(base neutral +0% high 'plain enunciation')"
-  # Expression sweep -> f0_std (variance) + ear
   slot "expr_flat"     "$(base neutral +0% medium 'flat monotone, no inflection')"
   slot "expr_smiling"  "$(base neutral +0% medium 'smiling, warm, lively voice')"
 fi
 
-# ---- MEASURE ----
 echo "==== measuring ===="
 MEAS="$ROOT/metrics.tsv"
 python3 tests/measure_prosody.py --header > "$MEAS"

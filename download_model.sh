@@ -1,17 +1,4 @@
 #!/bin/bash
-# Download Qwen3-TTS model files from HuggingFace.
-#
-# Usage:
-#   ./download_model.sh
-#   ./download_model.sh --model small
-#   ./download_model.sh --model large --dir my-model-dir
-#   ./download_model.sh --model voice-design
-#   ./download_model.sh --model base-small
-#   ./download_model.sh --model base-large
-#
-# Options:
-#   --model small|large|voice-design|base-small|base-large
-#   --dir DIR             Override output directory
 
 set -e
 
@@ -197,21 +184,6 @@ mkdir -p "${MODEL_DIR}/speech_tokenizer"
 
 BASE_URL="https://huggingface.co/${MODEL_ID}/resolve/main"
 
-# Scarica in modo ATOMICO: curl scrive su <dest>.part e SOLO un curl riuscito
-# rinomina in <dest>.
-#
-# PERCHE' NON BASTA `curl -o "$dest"`, ed e' il motivo per cui questa funzione esiste:
-# lo "[skip] (already exists)" qui sotto e' sicuro solo se la presenza del file implica
-# la sua COMPLETEZZA. Scrivendo diretto sulla destinazione, un download interrotto —
-# Ctrl-C, rete che cade, box spento, timeout ssh — lascia un model.safetensors TRONCATO
-# al posto giusto. Ogni run successivo lo salta dicendo "already exists", il modello si
-# carica senza un errore, e i pesi sono spazzatura a meta' file: il sintomo arriva molto
-# piu' tardi, come audio sbagliato, e non come fallimento del download. Con .part+mv un
-# file interrotto non e' MAI scambiabile per un file valido.
-#
-# `-C -` riprende un .part parziale invece di ributtare via i GB gia' scesi, e viene
-# passato solo se il .part c'e' davvero (curl con -C - su un file assente e' legale ma
-# inutile, e cosi' l'intento resta leggibile).
 fetch() {
     local dest="$1" url="$2" label="$3"
     if [[ -f "${dest}" ]]; then

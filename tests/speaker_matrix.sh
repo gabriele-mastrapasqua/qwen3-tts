@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Speaker emotion matrix: all 9 CV presets + galatea clone graft, Italian, same instruct/seed/temp.
-# Q: is the expressivity "cap" ryan-specific or a true clone cap? (does any non-ryan preset emote MORE?)
 cd "$(dirname "$0")/.."
 OUT=samples/speaker_matrix; mkdir -p "$OUT"
 M=qwen3-tts-1.7b

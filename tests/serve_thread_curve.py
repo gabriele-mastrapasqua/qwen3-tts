@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
-"""serve_thread_curve.py — how many cores does ONE B=1 stream actually use?
-
-THE QUESTION
-The concurrency matrix showed the server burning 15.1 of 16 cores and 112,857
-context switches per second to serve ONE request at RTF 0.55, and the switch rate
-FALLING as concurrency rose. That is the signature of a pool fanned out over work
-too small to fill it. This sweeps -j on a single stream and asks where the curve
-flattens: if B=1 saturates at 2-4 threads, then giving a request 16 is not a tuning
-mistake, it is the wrong shape for the serving layer.
-
-WHAT IT MEASURES PER CELL
-  from the engine : prefill ms, Talker ms/frame, CP ms/frame, RTF, TTFA
-  from getrusage  : CPU seconds, voluntary and involuntary context switches, peak RSS
-Context switches come from RUSAGE_CHILDREN, which counts the WHOLE process including
-its pool - the per-thread /proc problem that made the first server matrix report zero
-does not exist here, because the child has already exited when we read it.
-
-Usage:
-  python3 tests/serve_thread_curve.py --model DIR [--threads 1,2,4,8,16]
-                                       [--runs 3] [--precision int8]
-"""
+"""serve_thread_curve.py — how many cores does ONE B=1 stream actually use?"""
 import argparse, os, re, resource, statistics, subprocess, time
 
 TEXT = ("The engine renders speech from text, one frame at a time. "
         "This sentence is long enough to make the measurement stable.")
-
 
 def parse(log):
     t = open(log, errors="replace").read()
@@ -40,7 +19,6 @@ def parse(log):
         "frames":     g(r"Generated\s+(\d+)\s+frames"),
         "audio_s":    g(r"Audio:\s+([\d.]+)s generated"),
     }
-
 
 def run_one(args, kai, j, out, tag):
     env = dict(os.environ)
@@ -67,9 +45,8 @@ def run_one(args, kai, j, out, tag):
     d["nivcsw"] = after.ru_nivcsw - before.ru_nivcsw
     d["csw_s"] = (d["nvcsw"] + d["nivcsw"]) / wall if wall > 0 else 0
     d["cores"] = d["cpu_s"] / wall if wall > 0 else 0
-    d["rss_mb"] = after.ru_maxrss / 1024.0     # linux: kB
+    d["rss_mb"] = after.ru_maxrss / 1024.0
     return d
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -85,7 +62,7 @@ def main():
 
     rows = {}
     for j in js:
-        for kai in (False, True):        # alternate: drift hits both equally
+        for kai in (False, True):
             cells = []
             for i in range(a.runs):
                 tag = f"{'on' if kai else 'off'}_j{j}_{i}"
@@ -122,7 +99,6 @@ def main():
             a_, b_ = rows[(js[i - 1], kai)]["rtf"], rows[(js[i], kai)]["rtf"]
             line += f"{js[i-1]}->{js[i]}={a_ / b_:.2f}x  "
         print(line)
-
 
 if __name__ == "__main__":
     main()

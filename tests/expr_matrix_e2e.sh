@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# E2E expressivity listening matrix: the Italian emotion LoRA at the tuned weight, on PRESET + CLONE,
-# SHORT + LONG text, across MODES (single / stream / audiobook-batch / server request-batching).
-# Prints an afplay-path + prompt table so the user can map what they hear to what produced it.
-# (Release E2E matrix TODO.) Usage: tests/expr_matrix_e2e.sh [out_dir]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT="${1:-/tmp/e2e}"; mkdir -p "$OUT"

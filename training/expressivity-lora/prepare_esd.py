@@ -1,35 +1,7 @@
 #!/usr/bin/env python3
-"""ESD (Emotional Speech Dataset, Zhou et al.) -> train_raw.jsonl in the SAME schema as EMOVO
-(gpu_emovo_prep.py), so multi-speaker ESD aligns ALONGSIDE EMOVO for a voice-agnostic, multi-speaker
-emotion fine-tune (the deep-research lever: emotion learned across MANY identities -> generalizes to
-cloned/novel x-vectors). See docs/emotion-research.md, PLAN Phase 2.
-
-ESD layout (HLTSingapore/Emotional-Speech-Data, 16 kHz):
-  ESD/
-    0001/                       # 0001-0010 = English speakers, 0011-0020 = Mandarin
-      0001.txt                  # tab-separated lines: "<utt_id>\t<transcript>\t<Emotion>"
-      Angry/ Happy/ Neutral/ Sad/ Surprise/   *.wav
-    0002/ ...
-
-This script:
-  - resamples 16 kHz -> 24 kHz mono (codec requirement; mirrors the EMOVO 48->24 step),
-  - maps the 5 ESD emotions -> (label, English instruct) using the SAME instruct strings as EMOVO
-    where they overlap (neutral = empty instruct = the anchor),
-  - emits one row per utterance with a unique `actor` (e.g. esd0001) for speaker diversity.
-
-Usage (on the GPU box, after downloading ESD):
-  python3 prepare_esd.py --esd-root ~/qwen-ft/esd/raw --out ~/qwen-ft/esd/train_raw.jsonl \
-      --speakers 0001-0010            # English only (cross-lingual transfer); add 0011-0020 for ZH too
-  # then run the SAME codec-encode step as EMOVO (prepare_data.py) to get train_with_codes.jsonl,
-  # then concatenate with emovo/train_with_codes.jsonl and fine-tune via gpu_sft_expr.py.
-
-NOTE: verify the exact ESD folder/txt layout on the box (releases vary slightly); the emotion folder
-names and the per-speaker .txt are the parts to confirm. License: ESD is released for research — verify
-before shipping any derived weights (PLAN sanitize TODO).
-"""
+"""ESD (Emotional Speech Dataset, Zhou et al.) -> train_raw.jsonl in the SAME schema as EMOVO"""
 import os, glob, json, argparse, subprocess, sys
 
-# ESD emotion folder -> (our label, English instruct). neutral = empty (anchor). ESD has no fear/disgust.
 EMO = {
     "Neutral":  ("neutral",  ""),
     "Happy":    ("joy",      "Speak happily, bright and warm, smiling through the words."),
@@ -83,7 +55,6 @@ def main():
                 if not text:
                     n_skip += 1; continue
                 out_wav = os.path.join(wav24, f"esd{spk}_{utt}.wav")
-                # resample 16k -> 24k mono
                 subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", wav,
                                 "-ar", "24000", "-ac", "1", out_wav], check=False)
                 rows.append({"audio": out_wav, "text": text, "ref_audio": out_wav,

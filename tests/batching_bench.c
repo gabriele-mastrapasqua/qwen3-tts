@@ -1,19 +1,4 @@
-/* batching_bench.c — premise test for text-chunk BATCHING, across precisions.
- *
- * Single-stream TTS re-reads the weights from DRAM for EVERY token (matrix-VECTOR /
- * GEMV). Batching steps B chunks together so each weight is read+decoded ONCE and
- * reused across all B chunks (matrix-MATRIX / GEMM). This bench measures the
- * batching speedup (16x GEMV vs GEMM(16)) for bf16 / int8 / int4 / int2 weights,
- * to answer: does quantization make batching more or less worthwhile?
- *
- * Two opposing effects as precision drops: (a) the weight READ shrinks -> less to
- * amortize -> batching helps LESS; (b) the UNPACK gets costlier and GEMV redoes it
- * per token while GEMM does it once -> batching amortizes unpack -> helps MORE.
- *
- * For a clean cross-precision trend, ALL precisions use the same scalar decode +
- * scalar GEMV vs NEON-accumulated GEMM(16). Weights are stored at their real byte
- * size so DRAM traffic is realistic. Build/run: make batching-bench
- */
+/* batching_bench.c — premise test for text-chunk BATCHING, across precisions. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,17 +15,15 @@ enum { P_BF16, P_INT8, P_INT4, P_INT2, NPREC };
 static const char *PNAME[NPREC] = { "bf16", "int8", "int4", "int2" };
 static const double PBYTES[NPREC] = { 2.0, 1.0, 0.5, 0.25 };
 
-/* decode weight element i from a precision-P packed buffer (scalar; same in both kernels) */
 static inline float decode(const uint8_t *W, size_t i, int prec) {
     switch (prec) {
         case P_BF16: { uint32_t u=((uint32_t)((const uint16_t*)W)[i])<<16; float f; memcpy(&f,&u,4); return f; }
         case P_INT8: return (float)((int8_t)W[i]) * 0.01f;
         case P_INT4: { uint8_t b=W[i>>1]; int n=(i&1)?(b>>4):(b&0xF); return (float)(n-8)*0.02f; }
-        default:     { uint8_t b=W[i>>2]; int q=(b>>((i&3)*2))&0x3; return (float)(q-2)*0.05f; } /* int2 */
+        default:     { uint8_t b=W[i>>2]; int q=(b>>((i&3)*2))&0x3; return (float)(q-2)*0.05f; }
     }
 }
 
-/* GEMV over rows [r0,r1): y = W @ x. */
 static float gemv(const uint8_t *W, const float *x, int r0, int r1, int C, int prec) {
     float sink=0;
     for (int r=r0; r<r1; r++) { const uint8_t *w=W+(size_t)r*C*0; size_t base=(size_t)r*C; (void)w;
@@ -50,8 +33,6 @@ static float gemv(const uint8_t *W, const float *x, int r0, int r1, int C, int p
     return sink;
 }
 
-/* GEMM(16): Y[R x 16] = W @ X[C x 16]; 16 accumulators stay in 4 NEON regs across k
- * -> each weight is read+decoded once and reused across all 16 chunks. */
 static float gemm16(const uint8_t *W, const float *X, int r0, int r1, int C, int prec) {
     float sink=0;
     for (int r=r0; r<r1; r++) {
@@ -91,7 +72,6 @@ static double timed_T(const uint8_t *W,const float *X,int R,int C,int B,int T,in
 
 static void run_shape(const char *name, int R, int C, int T) {
     const int B=16;
-    /* allocate the largest (bf16) footprint; reuse the buffer for all precisions */
     uint8_t *W = malloc((size_t)R*C*2);
     float *X = malloc((size_t)C*B*sizeof(float));
     for (size_t i=0;i<(size_t)R*C*2;i++) W[i]=(uint8_t)((i*1103515245u+12345u)>>16);
@@ -101,7 +81,7 @@ static void run_shape(const char *name, int R, int C, int T) {
     printf("  %-13s [%d x %d]\n", name, R, C);
     for (int p=0;p<NPREC;p++) {
         double wMB=(double)R*C*PBYTES[p]/(1024*1024);
-        sink+=gemv(W,X,0,R,C,p); sink+=gemm16(W,X,0,R,C,p);            /* warm */
+        sink+=gemv(W,X,0,R,C,p); sink+=gemm16(W,X,0,R,C,p);
         double tv1=now_s(); for(int it=0;it<reps;it++) for(int b=0;b<B;b++) sink+=gemv(W,X+(size_t)b,0,R,C,p);
         tv1=(now_s()-tv1)/reps*1e3;
         double tg1=now_s(); for(int it=0;it<reps;it++) sink+=gemm16(W,X,0,R,C,p); tg1=(now_s()-tg1)/reps*1e3;

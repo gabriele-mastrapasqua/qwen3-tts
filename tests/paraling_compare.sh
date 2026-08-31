@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# SINGLE comparison folder: the two paralinguistic methods side by side, on ryan/vivian/galatea.
-#   M1 = MACRO (improved, 45ms crossfade, no 120ms gap) — tag in --text, auto-compose.
-#   M2 = FT no-L0 CSP .expr (paraling_csp_no0_*) — --no-compose, model emits the real event.
-# laugh/sigh on both; cough on M2 only (macro has no cough). ryan/vivian preset + galatea graft clone.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 O=samples/paraling_compare; mkdir -p $O
@@ -12,7 +8,6 @@ LAUGH="Che bella notizia, davvero, [laugh] non ci posso credere."
 SIGH="Sono davvero stanco oggi, [sigh] non ce la faccio piu."
 COUGH="Scusami un attimo, [cough] dicevo che dobbiamo andare."
 
-# voice flag sets
 voiceflags(){ case "$1" in
   ryan)    echo "-s ryan";;
   vivian)  echo "-s vivian";;

@@ -1,27 +1,4 @@
-/*
- * qwen_tts_speech_encoder.c - Speech Tokenizer Encoder
- * Converts 24kHz audio waveform → 16 codebook codes per frame (12.5 Hz)
- *
- * Architecture (inverse of decoder):
- * 1. Conv encoder: initial conv → 4× (ResBlock + ELU + downsample) → ELU → final conv
- *    - Downsample rates: [4, 5, 6, 8] (channels: 1→64→128→256→512→1024→512)
- *    - All convolutions are causal (left-padded)
- *    - ELU activation (NOT Snake)
- * 2. Encoder transformer (8 layers, hidden=512, heads=8, window=250)
- *    - LayerNorm (with bias), NOT RMSNorm
- *    - GELU MLP (fc1→GELU→fc2), NOT SwiGLU
- *    - Causal attention with sliding window 250
- *    - NeoX split-half RoPE
- * 3. Downsample conv (stride=2, k=4, no bias)
- * 4. RVQ quantization (16 codebooks: 1 semantic + 15 acoustic)
- *    - Input projection (512→256)
- *    - Nearest-neighbor search in codebook (L2 distance)
- *    - Residual subtraction for each codebook level
- *
- * Weights from speech_tokenizer/model.safetensors (encoder.* prefix)
- * Quantizer codebooks reused from decoder (already loaded)
- */
-
+/* qwen_tts_speech_encoder.c - Speech Tokenizer Encoder */
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
 #include "ingot/safetensors.h"
@@ -39,43 +16,31 @@
 #endif
 #endif
 
-/* ========================================================================
- * Helper: get f32 tensor from speech safetensors
- * ======================================================================== */
-
 static const float *enc_get_f32(void *ms, const char *name) {
     const ingot_st_tensor *t = ingot_st_find((ingot_st *)ms, name);
     return t ? (const float *)ingot_st_data((ingot_st *)ms, t) : NULL;
 }
 
-/* ========================================================================
- * Conv helpers (same as decoder but extracted here)
- * ======================================================================== */
-
-/* Causal Conv1d output length */
 static int enc_conv1d_out_len(int in_len, int kernel, int stride) {
-    int pad_left = kernel - stride;  /* causal: all padding on left */
+    int pad_left = kernel - stride;
     return (in_len + pad_left - kernel) / stride + 1;
 }
 
-/* ELU activation: x if x > 0, else exp(x) - 1 */
 static void elu_activation(float *data, int n) {
     for (int i = 0; i < n; i++)
         if (data[i] < 0) data[i] = expf(data[i]) - 1.0f;
 }
 
-/* Causal Conv1d: [out_ch, in_ch, kernel], pad_left = kernel - stride */
 static void enc_causal_conv1d(float *out, const float *in,
                                const float *weight, const float *bias,
                                int in_ch, int out_ch, int in_len,
                                int kernel, int stride, int dilation) {
     int pad_left = (kernel - 1) * dilation;
-    if (stride > 1) pad_left = kernel - stride; /* for strided convs */
+    if (stride > 1) pad_left = kernel - stride;
     int out_len = (in_len + pad_left - (kernel - 1) * dilation - 1) / stride + 1;
 
 #ifdef USE_BLAS
     if (kernel == 1 && stride == 1) {
-        /* k=1: direct matmul */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     out_ch, in_len, in_ch, 1.0f,
                     weight, in_ch, in, in_len, 0.0f, out, out_len);
@@ -105,55 +70,41 @@ static void enc_causal_conv1d(float *out, const float *in,
     }
 }
 
-/* ========================================================================
- * Encoder Conv Layer Weights
- * ======================================================================== */
-
 typedef struct {
     const float *weight;
     const float *bias;
 } enc_conv_t;
 
 typedef struct {
-    /* ResBlock: block.1 (conv k=3) + block.3 (conv k=1) */
-    enc_conv_t conv1;  /* dim→dim/2, k=3 */
-    enc_conv_t conv2;  /* dim/2→dim, k=1 */
+    enc_conv_t conv1;
+    enc_conv_t conv2;
 } enc_resblock_t;
 
 typedef struct {
-    /* Conv encoder layers */
-    enc_conv_t initial_conv;     /* 1→64, k=7 */
-    enc_resblock_t resblocks[4]; /* dim/2→dim, for each stage */
-    enc_conv_t stride_convs[4];  /* 64→128 k=8/s=4, 128→256 k=10/s=5, etc. */
-    enc_conv_t final_conv;       /* 1024→512, k=3 */
+    enc_conv_t initial_conv;
+    enc_resblock_t resblocks[4];
+    enc_conv_t stride_convs[4];
+    enc_conv_t final_conv;
 
-    /* Encoder transformer (8 layers) */
     struct {
-        const float *attn_norm_w, *attn_norm_b;    /* LayerNorm */
-        const float *attn_q, *attn_k, *attn_v, *attn_o; /* [512, 512] */
-        const float *attn_layer_scale;              /* [512] */
-        const float *ffn_norm_w, *ffn_norm_b;       /* LayerNorm */
-        const float *ffn_fc1, *ffn_fc2;            /* [2048,512] and [512,2048] */
-        const float *ffn_layer_scale;               /* [512] */
+        const float *attn_norm_w, *attn_norm_b;
+        const float *attn_q, *attn_k, *attn_v, *attn_o;
+        const float *attn_layer_scale;
+        const float *ffn_norm_w, *ffn_norm_b;
+        const float *ffn_fc1, *ffn_fc2;
+        const float *ffn_layer_scale;
     } transformer[8];
 
-    /* Downsample conv */
-    const float *downsample_weight; /* [512, 512, 4], stride=2, no bias */
+    const float *downsample_weight;
 
-    /* RVQ input projections (encoder-side, different from decoder's output projections) */
-    const float *rvq_semantic_input_proj;  /* [256, 512, 1] — for codebook 0 */
-    const float *rvq_acoustic_input_proj;  /* [256, 512, 1] — for codebooks 1-15 */
+    const float *rvq_semantic_input_proj;
+    const float *rvq_acoustic_input_proj;
 
-    /* RoPE cache */
-    float *rope_cos; /* [max_pos, head_dim/2] */
+    float *rope_cos;
     float *rope_sin;
 
     int loaded;
 } qwen_speech_encoder_t;
-
-/* ========================================================================
- * Weight Loading
- * ======================================================================== */
 
 static qwen_speech_encoder_t g_encoder;
 
@@ -163,18 +114,15 @@ int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx) {
     memset(enc, 0, sizeof(*enc));
     int ok = 0;
 
-    /* Initial conv: encoder.encoder.layers.0 */
     enc->initial_conv.weight = enc_get_f32(ms, "encoder.encoder.layers.0.conv.weight");
     enc->initial_conv.bias = enc_get_f32(ms, "encoder.encoder.layers.0.conv.bias");
     if (enc->initial_conv.weight) ok++;
 
-    /* 4 stages: resblock at layers [1,4,7,10], stride conv at layers [3,6,9,12] */
     int res_layers[] = {1, 4, 7, 10};
     int stride_layers[] = {3, 6, 9, 12};
 
     for (int i = 0; i < 4; i++) {
         char buf[128];
-        /* ResBlock */
         snprintf(buf, sizeof(buf), "encoder.encoder.layers.%d.block.1.conv.weight", res_layers[i]);
         enc->resblocks[i].conv1.weight = enc_get_f32(ms, buf);
         snprintf(buf, sizeof(buf), "encoder.encoder.layers.%d.block.1.conv.bias", res_layers[i]);
@@ -185,7 +133,6 @@ int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx) {
         enc->resblocks[i].conv2.bias = enc_get_f32(ms, buf);
         if (enc->resblocks[i].conv1.weight) ok++;
 
-        /* Stride conv */
         snprintf(buf, sizeof(buf), "encoder.encoder.layers.%d.conv.weight", stride_layers[i]);
         enc->stride_convs[i].weight = enc_get_f32(ms, buf);
         snprintf(buf, sizeof(buf), "encoder.encoder.layers.%d.conv.bias", stride_layers[i]);
@@ -193,12 +140,10 @@ int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx) {
         if (enc->stride_convs[i].weight) ok++;
     }
 
-    /* Final conv: encoder.encoder.layers.14 */
     enc->final_conv.weight = enc_get_f32(ms, "encoder.encoder.layers.14.conv.weight");
     enc->final_conv.bias = enc_get_f32(ms, "encoder.encoder.layers.14.conv.bias");
     if (enc->final_conv.weight) ok++;
 
-    /* Encoder transformer (8 layers) */
     for (int l = 0; l < 8; l++) {
         char buf[128];
         #define ENC_LOAD(field, suffix) do { \
@@ -223,11 +168,9 @@ int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx) {
         if (enc->transformer[l].attn_q) ok++;
     }
 
-    /* Downsample */
     enc->downsample_weight = enc_get_f32(ms, "encoder.downsample.conv.weight");
     if (enc->downsample_weight) ok++;
 
-    /* RVQ input projections (encoder-specific) */
     enc->rvq_semantic_input_proj = enc_get_f32(ms,
         "encoder.quantizer.semantic_residual_vector_quantizer.input_proj.weight");
     enc->rvq_acoustic_input_proj = enc_get_f32(ms,
@@ -235,8 +178,7 @@ int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx) {
     if (enc->rvq_semantic_input_proj) ok++;
     if (enc->rvq_acoustic_input_proj) ok++;
 
-    /* RoPE cache: theta=10000.0, head_dim=64, max_pos=8000 */
-    int half_dim = 32; /* 64 / 2 */
+    int half_dim = 32;
     enc->rope_cos = (float *)aligned_malloc(8000 * half_dim * sizeof(float));
     enc->rope_sin = (float *)aligned_malloc(8000 * half_dim * sizeof(float));
     for (int pos = 0; pos < 8000; pos++) {
@@ -251,12 +193,8 @@ int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx) {
     if (!ctx->silent)
         fprintf(stderr, "  Speech encoder: %d/15 components loaded\n", ok);
 
-    return (ok >= 12) ? 0 : -1; /* need conv encoder + transformer + downsample */
+    return (ok >= 12) ? 0 : -1;
 }
-
-/* ========================================================================
- * Encode: audio samples → codec codes
- * ======================================================================== */
 
 int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_samples,
                                 int **codes_out, int *n_frames_out) {
@@ -268,10 +206,8 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         return -1;
     }
 
-    int cb_dim = QWEN_TTS_CODEBOOK_DIM; /* 256 */
+    int cb_dim = QWEN_TTS_CODEBOOK_DIM;
 
-    /* === Stage 1: Conv Encoder === */
-    /* Input: [1, n_samples] channel-first */
     int cur_ch = 1, cur_len = n_samples;
     float *signal = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
     memcpy(signal, audio, cur_len * sizeof(float));
@@ -279,7 +215,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     if (ctx->debug)
         fprintf(stderr, "[ENC] Input: %d samples\n", n_samples);
 
-    /* Initial conv: 1→64, k=7, s=1 */
     {
         int out_ch = 64, kernel = 7;
         int out_len = enc_conv1d_out_len(cur_len, kernel, 1);
@@ -292,47 +227,38 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     if (ctx->debug)
         fprintf(stderr, "[ENC] After initial conv: ch=%d, len=%d\n", cur_ch, cur_len);
 
-    /* 4 stages: ResBlock → ELU → stride conv */
     int out_channels[] = {128, 256, 512, 1024};
     int strides[] = {4, 5, 6, 8};
     int kernels[] = {8, 10, 12, 16};
 
     for (int stage = 0; stage < 4; stage++) {
-        /* ResBlock: ELU → conv1(ch→ch/2, k=3) → ELU → conv2(ch/2→ch, k=1) + residual */
         {
             int half_ch = cur_ch / 2;
             float *residual = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
             memcpy(residual, signal, (int64_t)cur_ch * cur_len * sizeof(float));
 
-            /* ELU */
             elu_activation(signal, (int64_t)cur_ch * cur_len);
 
-            /* Conv1: ch→ch/2, k=3 */
             float *c1 = (float *)calloc((int64_t)half_ch * cur_len, sizeof(float));
             enc_causal_conv1d(c1, signal, enc->resblocks[stage].conv1.weight,
                               enc->resblocks[stage].conv1.bias,
                               cur_ch, half_ch, cur_len, 3, 1, 1);
 
-            /* ELU */
             elu_activation(c1, (int64_t)half_ch * cur_len);
 
-            /* Conv2: ch/2→ch, k=1 */
             float *c2 = (float *)calloc((int64_t)cur_ch * cur_len, sizeof(float));
             enc_causal_conv1d(c2, c1, enc->resblocks[stage].conv2.weight,
                               enc->resblocks[stage].conv2.bias,
                               half_ch, cur_ch, cur_len, 1, 1, 1);
             free(c1);
 
-            /* Residual */
             for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
                 signal[i] = residual[i] + c2[i];
             free(residual); free(c2);
         }
 
-        /* ELU before stride conv */
         elu_activation(signal, (int64_t)cur_ch * cur_len);
 
-        /* Stride conv */
         int out_ch = out_channels[stage];
         int out_len = enc_conv1d_out_len(cur_len, kernels[stage], strides[stage]);
         float *out = (float *)calloc((int64_t)out_ch * out_len, sizeof(float));
@@ -345,10 +271,8 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             fprintf(stderr, "[ENC] After stage %d: ch=%d, len=%d\n", stage, cur_ch, cur_len);
     }
 
-    /* ELU */
     elu_activation(signal, (int64_t)cur_ch * cur_len);
 
-    /* Final conv: 1024→512, k=3 */
     {
         int out_ch = 512;
         int out_len = enc_conv1d_out_len(cur_len, 3, 1);
@@ -362,8 +286,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         fprintf(stderr, "[ENC] After conv encoder: ch=%d, len=%d (%.1f Hz)\n",
                 cur_ch, cur_len, (float)cur_len / ((float)n_samples / 24000.0f));
 
-    /* === Stage 2: Encoder Transformer === */
-    /* Transpose signal from channel-first [512, len] to row-major [len, 512] */
     int n_seq = cur_len;
     int hidden = 512;
     float *h_buf = (float *)aligned_malloc((int64_t)n_seq * hidden * sizeof(float));
@@ -385,7 +307,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     float *attn_out = (float *)aligned_malloc((int64_t)n_seq * qkv_dim * sizeof(float));
 
     for (int layer = 0; layer < 8; layer++) {
-        /* LayerNorm (with bias) */
         for (int s = 0; s < n_seq; s++) {
             const float *xs = h_buf + s * hidden;
             float *xn = x_norm + s * hidden;
@@ -402,7 +323,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
                          + enc->transformer[layer].attn_norm_b[i];
         }
 
-        /* QKV projections */
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_seq, qkv_dim, hidden, 1.0f,
@@ -430,7 +350,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         }
 #endif
 
-        /* NeoX split-half RoPE */
         for (int s = 0; s < n_seq; s++) {
             const float *cos_ptr = enc->rope_cos + s * half_hd;
             const float *sin_ptr = enc->rope_sin + s * half_hd;
@@ -449,7 +368,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             }
         }
 
-        /* Sliding window causal attention */
         float scale = 1.0f / sqrtf((float)head_dim);
         for (int sq = 0; sq < n_seq; sq++) {
             float *out = attn_out + sq * qkv_dim;
@@ -461,7 +379,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
                 float *oh = out + h * head_dim;
                 int n_keys = sq - sk_start + 1;
 
-                /* Use fixed buffer for scores (max window size is small, typically <= 512) */
                 float scores_buf[512];
                 float *scores = n_keys <= 512 ? scores_buf : (float *)aligned_malloc(n_keys * sizeof(float));
                 float max_score = -1e30f;
@@ -491,10 +408,9 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             }
         }
 
-        /* Output proj + layer_scale + residual */
 #ifdef USE_BLAS
         {
-            float *oproj = x_norm; /* reuse as temp */
+            float *oproj = x_norm;
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         n_seq, hidden, qkv_dim, 1.0f,
                         attn_out, qkv_dim, enc->transformer[layer].attn_o, qkv_dim,
@@ -525,7 +441,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         }
 #endif
 
-        /* Post-attn LayerNorm */
         for (int s = 0; s < n_seq; s++) {
             const float *xs = h_buf + s * hidden;
             float *xn = x_norm + s * hidden;
@@ -542,7 +457,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
                          + enc->transformer[layer].ffn_norm_b[i];
         }
 
-        /* GELU MLP: fc1→GELU→fc2 + layer_scale + residual */
 #ifdef USE_BLAS
         {
             float *fc1_out = (float *)aligned_malloc((int64_t)n_seq * inter * sizeof(float));
@@ -550,7 +464,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
                         n_seq, inter, hidden, 1.0f,
                         x_norm, hidden, enc->transformer[layer].ffn_fc1, hidden,
                         0.0f, fc1_out, inter);
-            /* Exact GELU */
             for (int64_t i = 0; i < (int64_t)n_seq * inter; i++)
                 fc1_out[i] = 0.5f * fc1_out[i] * (1.0f + erff(fc1_out[i] * 0.7071067811865476f));
 
@@ -603,7 +516,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
 
     free(q); free(kk); free(vv); free(x_norm); free(attn_out);
 
-    /* Transpose back to channel-first [512, n_seq] */
     signal = (float *)aligned_malloc((int64_t)hidden * n_seq * sizeof(float));
     for (int f = 0; f < n_seq; f++)
         for (int d = 0; d < hidden; d++)
@@ -615,7 +527,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
     if (ctx->debug)
         fprintf(stderr, "[ENC] After transformer: ch=%d, len=%d\n", cur_ch, cur_len);
 
-    /* === Stage 3: Downsample conv (stride=2, k=4, no bias) === */
     {
         int out_len = enc_conv1d_out_len(cur_len, 4, 2);
         float *out = (float *)calloc((int64_t)cur_ch * out_len, sizeof(float));
@@ -629,24 +540,18 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
         fprintf(stderr, "[ENC] After downsample: len=%d (%.1f Hz)\n",
                 n_frames, (float)n_frames / ((float)n_samples / 24000.0f));
 
-    /* === Stage 4: RVQ Quantization === */
-    /* Project from hidden (512) to codebook dim (256) */
-    /* Transpose to row-major [n_frames, 512] for projection */
     float *enc_hidden = (float *)aligned_malloc((int64_t)n_frames * hidden * sizeof(float));
     for (int f = 0; f < n_frames; f++)
         for (int d = 0; d < hidden; d++)
             enc_hidden[(int64_t)f * hidden + d] = signal[(int64_t)d * n_frames + f];
     free(signal);
 
-    /* Allocate output codes */
     int *codes = (int *)malloc((int64_t)n_frames * 16 * sizeof(int));
     memset(codes, 0, (int64_t)n_frames * 16 * sizeof(int));
 
-    /* Codebook 0 (semantic / rvq_first) */
     {
-        /* Project: [n_frames, 512] → [n_frames, 256] using encoder's semantic input_proj */
         float *projected = (float *)aligned_malloc((int64_t)n_frames * cb_dim * sizeof(float));
-        const float *proj_w = enc->rvq_semantic_input_proj; /* [256, 512, 1] = [256, 512] */
+        const float *proj_w = enc->rvq_semantic_input_proj;
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_frames, cb_dim, hidden, 1.0f,
@@ -662,11 +567,9 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             }
 #endif
 
-        /* Nearest neighbor in codebook 0 */
-        const float *codebook = sd->codebook[0]; /* [2048, 256] */
+        const float *codebook = sd->codebook[0];
         int cb_size = ctx->config.codebook_size;
 
-        /* Precompute ||e||² for each codebook entry */
         float *cb_norm2 = (float *)aligned_malloc(cb_size * sizeof(float));
         for (int e = 0; e < cb_size; e++) {
             float sum = 0;
@@ -679,11 +582,9 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
 
         for (int f = 0; f < n_frames; f++) {
             const float *x = projected + (int64_t)f * cb_dim;
-            /* Compute x_norm2 */
             float x_norm2 = 0;
             for (int d = 0; d < cb_dim; d++) x_norm2 += x[d] * x[d];
 
-            /* L2 = x_norm2 + e_norm2 - 2*x·e → find min */
             int best_idx = 0;
             float best_dist = 1e30f;
             for (int e = 0; e < cb_size; e++) {
@@ -695,14 +596,11 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             }
             codes[f * 16] = best_idx;
 
-            /* Subtract quantized from projected for residual */
             for (int d = 0; d < cb_dim; d++)
                 projected[(int64_t)f * cb_dim + d] -= codebook[(int64_t)best_idx * cb_dim + d];
         }
         free(cb_norm2);
 
-        /* Codebooks 1-15 (acoustic / rvq_rest) */
-        /* Re-project using encoder's acoustic input_proj for the residual */
         float *residual = (float *)aligned_malloc((int64_t)n_frames * cb_dim * sizeof(float));
         const float *rest_proj_w = enc->rvq_acoustic_input_proj;
 #ifdef USE_BLAS
@@ -720,15 +618,9 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
             }
 #endif
 
-        /* Subtract the semantic codebook's quantized contribution from residual */
-        /* Wait — actually the rvq_first and rvq_rest operate on independent projections.
-         * The residual for rvq_rest starts from its own projection, and each codebook
-         * within rvq_rest does residual subtraction from the previous level. */
-
         for (int k = 1; k < 16; k++) {
             const float *cb = sd->codebook[k];
 
-            /* Precompute cb norms */
             float *cn2 = (float *)aligned_malloc(cb_size * sizeof(float));
             for (int e = 0; e < cb_size; e++) {
                 float sum = 0;
@@ -755,7 +647,6 @@ int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_sa
                 }
                 codes[f * 16 + k] = best;
 
-                /* Subtract for next level */
                 for (int d = 0; d < cb_dim; d++)
                     x[d] -= cb[(int64_t)best * cb_dim + d];
             }

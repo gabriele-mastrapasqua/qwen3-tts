@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Validation for the server performance profiles.
-
-Cheap by design: it runs no engine and needs no model. What it protects is the property that
-makes the format worth having -- that the recommended values exist in ONE place and that a
-profile which drifts from the qualification, or asks for something the engine cannot honour,
-fails loudly instead of producing a plausible command.
-"""
+"""Validation for the server performance profiles."""
 import json, os, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,12 +8,10 @@ import perf_profile as P  # noqa: E402
 
 FAILURES = []
 
-
 def check(name, cond, detail=""):
     print(f"{'ok  ' if cond else 'FAIL'} {name}" + (f"  — {detail}" if detail and not cond else ""))
     if not cond:
         FAILURES.append(name)
-
 
 def rejects(name, mutate):
     """A profile mutated this way must be refused, not repaired."""
@@ -37,13 +29,10 @@ def rejects(name, mutate):
         refused, why = True, str(e)
     check(name, refused, why)
 
-
-# 1 · every committed profile validates
 r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "perf_profile.py"),
                     "validate", "--engine", "1"], capture_output=True, text=True)
 check("committed profiles validate", r.returncode == 0, r.stdout + r.stderr)
 
-# 2 · the refusals
 rejects("unknown field is refused", lambda p: p["server"].update(mystery_knob=1))
 rejects("missing required field is refused", lambda p: p["server"].pop("batch_size"))
 rejects("oversubscription is refused",
@@ -58,7 +47,6 @@ rejects("a setting fixed twice is refused",
         lambda p: p["launch"].update(extra_arguments=["--prefork", "4"]))
 rejects("a malformed profile id is refused", lambda p: p["profile"].update(id="Axion 16C"))
 
-# 3 · an alias may not carry its own values
 raw, path = P.load_raw("recommended")
 raw["server"] = {"prefork_workers": 4, "threads_per_worker": 4, "batch_size": 4}
 try:
@@ -67,12 +55,10 @@ except P.Bad:
     ok = True
 check("an alias carrying its own values is refused", ok)
 
-# 4 · the alias resolves to the same configuration as its target
 a, _ = P.load("recommended")
 b, _ = P.load("axion-16c-ttfa")
 check("recommended resolves to axion-16c-ttfa", a == b)
 
-# 5 · the resolved invocation reproduces the qualification topology
 prof, _ = P.load("recommended")
 argv = P.argv(prof, "MODEL", 9000)
 def val(flag):
@@ -85,16 +71,13 @@ check("resolved precision carries --int8", "--int8" in argv)
 check("server-env is comma separated",
       "," in P.server_env(prof) and " " not in P.server_env(prof), P.server_env(prof))
 
-# 6 · the profile and the documentation next to it have not drifted apart
 readme = open(os.path.join(P.PERF, "README.md")).read()
 for token, why in ("2 workers x 8 threads", "the topology"), ("--int8", "the precision"), \
                   ("OPENBLAS_THREAD_TIMEOUT", "the OpenBLAS idle policy"):
     check(f"README still states {why}", token in readme)
-# every environment variable the profile sets must be explained, not merely listed
 for k, spec in prof["runtime"]["environment"].items():
     check(f"{k} carries a reason", bool(spec.get("why", "").strip()))
 
-# 7 · check-flags refuses a log in which the engine never declared
 with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
     f.write("Server listening on http://0.0.0.0:9000\n")
     silent = f.name
@@ -102,8 +85,6 @@ r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "perf_profile.py
                     "check-flags", "recommended", "--log", silent], capture_output=True, text=True)
 check("a log without a [FLAGS] declaration fails the check", r.returncode != 0, r.stdout)
 with open(silent, "a") as f:
-    # Derived from the profile rather than restated: a hardcoded list means the test fails
-    # the day a lever is added to the profile, which is the day it is least useful.
     _env = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "perf_profile.py"),
                            "server-env", "recommended"], capture_output=True, text=True).stdout.strip()
     _qwen = " ".join(kv for kv in _env.split(",") if kv.startswith("QWEN_"))

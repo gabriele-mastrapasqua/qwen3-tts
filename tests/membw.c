@@ -1,36 +1,4 @@
-/* membw.c — how much memory bandwidth this machine REALLY has, and where it saturates.
- *
- * WHY IT EXISTS, and why the datasheet figure is not enough. This engine's bottleneck is
- * not the ALU: the Code Predictor re-reads its weights 16 TIMES PER FRAME. So the question
- * that decides batching is not "how many GFLOP/s" but:
- *
- *     at how many threads does bandwidth stop rising?
- *
- * Because that is the fork: if bandwidth saturates at 2 threads, giving 8 threads to ONE
- * request is wasted and 2 threads to FOUR requests is better; if it scales to every core,
- * the opposite holds. Without this number the thread x batch matrix is explored by
- * guesswork, and on a machine rented by the hour guesswork is expensive.
- *
- * WHAT IT IS. STREAM cut to the bone: Copy (a=b) and Triad (a=b+s*c) over three double
- * arrays, with a thread sweep and best-of-N. A few seconds, not a paper benchmark.
- *
- * THE TWO THINGS THAT WOULD MAKE IT A LIE, both handled here:
- *   1. ARRAYS TOO SMALL -> it measures cache rather than DRAM and the number comes out
- *      5-10x too high. The arrays are sized to at least 4x the L3 (--l3-mb, passed by the
- *      box-info script, which actually reads the L3).
- *   2. SEQUENTIAL FIRST TOUCH -> on a NUMA machine every page lands on the initialising
- *      thread's node, and the test then measures only that node forever. Here the
- *      initialisation is PARALLEL and uses the same partition as the measurement, so pages
- *      land where the thread that reads them is running.
- *
- * Use:
- *   membw [--l3-mb N] [--threads LIST] [--reps N] [--json] [--label TEXT]
- *     --l3-mb N     size the arrays to max(4*N, 64) MiB each (default 32)
- *     --threads     "1,2,4,8" (default: 1, 2, 4, half the cores, all the cores)
- *     --reps N      runs per cell, the BEST is kept (default 5)
- *     --json        one JSON line, to be embedded in the machine's report
- *     --label TEXT  free-form label (used for numactl cells: "numa-local"/"numa-cross")
- */
+/* membw.c — how much memory bandwidth this machine REALLY has, and where it saturates. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,15 +9,13 @@
 #include <sys/sysctl.h>
 #endif
 
-/* no pthread_barrier on macOS: threads are created per timed run, with enough inner
- * iterations that the create/join cost is noise (<1 %). */
 #define INNER 4
 
 typedef struct {
     double *a, *b, *c;
     size_t  lo, hi;
     double  s;
-    int     kernel;          /* 0 = copy, 1 = triad */
+    int     kernel;
 } job_t;
 
 static void *worker(void *p) {
@@ -84,7 +50,6 @@ static int n_cpus(void) {
 #endif
 }
 
-/* un giro cronometrato: nt thread, INNER passate, ritorna i secondi */
 static double run_once(double *a, double *b, double *c, size_t n, int nt, int kernel) {
     pthread_t th[256];
     job_t     jb[256];
@@ -118,8 +83,6 @@ int main(int argc, char **argv) {
 
     int ncpu = n_cpus();
 
-    /* default sweep: 1, 2, 4, half the cores, all of them. The knee is almost always
-     * between 2 and "half", which is exactly the point that decides threads per request. */
     int  ts[16], nts = 0;
     if (tlist) {
         char buf[256]; snprintf(buf, sizeof buf, "%s", tlist);
@@ -136,8 +99,6 @@ int main(int argc, char **argv) {
     }
     if (nts == 0) ts[nts++] = 1;
 
-    /* >= 4x la L3 per array, cosi' nessun riuso di cache puo' gonfiare il numero.
-     * Tetto a 512 MiB per array: oltre non si misura di piu', si aspetta e basta. */
     size_t per_mb = (size_t)l3_mb * 4;
     if (per_mb < 64)  per_mb = 64;
     if (per_mb > 512) per_mb = 512;
@@ -148,7 +109,6 @@ int main(int argc, char **argv) {
     double *c = (double *)malloc(n * sizeof(double));
     if (!a || !b || !c) { fprintf(stderr, "membw: malloc fallita (%zu MiB x3)\n", per_mb); return 1; }
 
-    /* first-touch PARALLELO, con la stessa partizione della misura (vedi testata) */
     {
         pthread_t th[256]; job_t jb[256];
         int nt = ts[nts - 1] > 256 ? 256 : ts[nts - 1];
@@ -168,21 +128,17 @@ int main(int argc, char **argv) {
         double best_c = 0.0, best_t = 0.0;
         for (int r = 0; r < reps; r++) {
             double dt = run_once(a, b, c, n, ts[i], 0);
-            /* Copy tocca 2 array (1 letto + 1 scritto) per iterazione interna */
             double gbs = (double)INNER * 2.0 * (double)n * sizeof(double) / dt / 1e9;
             if (gbs > best_c) best_c = gbs;
         }
         for (int r = 0; r < reps; r++) {
             double dt = run_once(a, b, c, n, ts[i], 1);
-            /* Triad ne tocca 3 (2 letti + 1 scritto) */
             double gbs = (double)INNER * 3.0 * (double)n * sizeof(double) / dt / 1e9;
             if (gbs > best_t) best_t = gbs;
         }
         copy_gbs[i] = best_c; triad_gbs[i] = best_t;
     }
 
-    /* IL numero che serve: il picco, e il PRIMO conteggio di thread che arriva al 95%
-     * del picco. Quello e' il ginocchio — oltre, i thread in piu' non comprano banda. */
     double peak = 0.0; int peak_t = ts[0];
     for (int i = 0; i < nts; i++) if (triad_gbs[i] > peak) { peak = triad_gbs[i]; peak_t = ts[i]; }
     int knee = peak_t;
@@ -203,10 +159,10 @@ int main(int argc, char **argv) {
         printf("  %-8s %12s %12s\n", "thread", "Copy GB/s", "Triad GB/s");
         for (int i = 0; i < nts; i++)
             printf("  %-8d %12.1f %12.1f\n", ts[i], copy_gbs[i], triad_gbs[i]);
-        printf("  picco Triad %.1f GB/s a %d thread; GINOCCHIO a %d thread (95%% del picco)\n",
+        printf("  Triad peak %.1f GB/s at %d threads; KNEE at %d threads (95%% of peak)\n",
                peak, peak_t, knee);
-        printf("  -> oltre %d thread la banda non sale: conviene dare %d thread a PIU' richieste\n"
-               "     invece che tutti i core a una sola (il CP rilegge i pesi 16x per frame).\n",
+        printf("  -> past %d threads bandwidth stops rising: give %d threads to MORE requests\n"
+               "     rather than every core to one (the CP rereads the weights 16x per frame).\n",
                knee, knee);
     }
     free(a); free(b); free(c);

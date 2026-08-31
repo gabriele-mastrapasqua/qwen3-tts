@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# perlang_emo_compare.sh — RE-LISTEN set for the per-language emotion recipes extracted from the
-# validated notes/scripts (2026-06-29). DIRECT commands (NOT the --emotion router, which is still
-# Italian-only) so we hear the REAL per-language GOLD before encoding it. seed 42, 1.7B CustomVoice.
-#
-# NOTE: the per-language *_r32/_r64 packs (DE/FR/ES) were deleted in a prior asset-hygiene and are
-# unrecoverable without retraining → DE/FR use the shipped native *_csp_k6 only (no r32 to compare).
-# ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42
@@ -22,15 +14,12 @@ INST_joy="Speak with bright, radiant joy, light and warm, smiling through every 
 tok(){ case "$1" in anger)echo ang;; *)echo "$1";; esac; }
 say(){ printf '  %-28s\n' "$1"; }
 
-# EXPR-only:  out  voiceflags  lang  expr  exprw  emo  "text"
 EXPR(){ local o="$1" vf="$2" lang="$3" ex="$4" ew="$5" e="$6" t="$7"; local I="INST_$e"
   say "$o"; $BIN -d $M $vf -l "$lang" -T "${8:-1.1}" --seed $SEED --expr "$ex" --expr-weight "$ew" \
     --instruct "${!I}" --text "$t" -o "$OUT/$o" >"$OUT/${o%.wav}.log" 2>&1 || echo "    FAIL $o"; }
-# STEER-only: out voiceflags lang emo "text"  (no instruct)
 STEER(){ local o="$1" vf="$2" lang="$3" e="$4" t="$5"
   say "$o"; $BIN -d $M $vf -l "$lang" -T 1.1 --seed $SEED --ml-steer "$QL/ryan_$(tok $e).qlsteer" \
     --ml-weight 8 --ml-range 21-25 --text "$t" -o "$OUT/$o" >"$OUT/${o%.wav}.log" 2>&1 || echo "    FAIL $o"; }
-# COMBINE: out voiceflags lang exprw emo "text"  (IT expr + ryan steer + instruct)
 COMB(){ local o="$1" vf="$2" lang="$3" ew="$4" e="$5" t="$6"; local I="INST_$e"
   say "$o"; $BIN -d $M $vf -l "$lang" -T 1.1 --seed $SEED --expr "$IT" --expr-weight "$ew" \
     --ml-steer "$QL/ryan_$(tok $e).qlsteer" --ml-weight 8 --ml-range 21-25 \

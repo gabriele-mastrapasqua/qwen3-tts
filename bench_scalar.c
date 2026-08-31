@@ -1,9 +1,4 @@
-/*
- * Micro-benchmark: measure time spent in scalar hot loops
- * Supports both 0.6B and 1.7B model dimensions
- * Build: clang -O3 -march=native -ffast-math -o bench_scalar bench_scalar.c -lm
- * Usage: ./bench_scalar [0.6b|1.7b]
- */
+/* Micro-benchmark: measure time spent in scalar hot loops */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -19,17 +14,16 @@ static double now_ms(void) {
 int main(int argc, char **argv) {
     int large = (argc > 1 && strstr(argv[1], "1.7"));
 
-    /* Model dimensions */
     int hidden     = large ? 2048 : 1024;
-    int inter      = large ? 6144 : 3072;  /* Talker intermediate */
-    int cp_inter   = 1024;                  /* CP intermediate (same for both!) */
+    int inter      = large ? 6144 : 3072;
+    int cp_inter   = 1024;
     int talker_layers = 28;
     int cp_layers  = 5;
     int cp_passes  = 15;
     int n_frames   = 60;
-    int vocab      = 3072;      /* codec vocab for sampling */
+    int vocab      = 3072;
     int convnext_ch  = 1024;
-    int convnext_len = 120;     /* ~60 frames * 2 upsample */
+    int convnext_len = 120;
     int pw_dim     = 4096;
 
     printf("=== SCALAR HOT LOOP MICRO-BENCHMARKS (%s model, %d frames) ===\n",
@@ -37,7 +31,6 @@ int main(int argc, char **argv) {
     printf("Talker: hidden=%d, inter=%d, layers=%d\n", hidden, inter, talker_layers);
     printf("CP: hidden=1024, inter=%d, layers=%d, passes=%d\n\n", cp_inter, cp_layers, cp_passes);
 
-    /* Allocate buffers */
     float *gate = (float *)malloc(2 * inter * sizeof(float));
     float *cp_gate = (float *)malloc(2 * cp_inter * sizeof(float));
     float *logits = (float *)malloc(vocab * sizeof(float));
@@ -50,7 +43,6 @@ int main(int argc, char **argv) {
     float *norm_w = (float *)malloc(convnext_ch * sizeof(float));
     float *norm_b = (float *)malloc(convnext_ch * sizeof(float));
 
-    /* Fill with random data */
     srand(42);
     for (int i = 0; i < 2 * inter; i++) gate[i] = (float)rand()/RAND_MAX * 2 - 1;
     for (int i = 0; i < 2 * cp_inter; i++) cp_gate[i] = (float)rand()/RAND_MAX * 2 - 1;
@@ -64,7 +56,6 @@ int main(int argc, char **argv) {
     double t0, t1;
     volatile float sink = 0;
 
-    /* 1. Talker SwiGLU: 28 layers × n_frames steps */
     int talker_swiglu_calls = talker_layers * n_frames;
     t0 = now_ms();
     for (int c = 0; c < talker_swiglu_calls; c++) {
@@ -79,7 +70,6 @@ int main(int argc, char **argv) {
     printf("1. Talker SwiGLU expf:    %7.2f ms  (%d calls × %d elements = %.1fM expf)\n",
            t1-t0, talker_swiglu_calls, inter, (double)talker_swiglu_calls * inter / 1e6);
 
-    /* 2. CP SwiGLU: 5 layers × 15 passes × n_frames */
     int cp_swiglu_calls = cp_layers * cp_passes * n_frames;
     t0 = now_ms();
     for (int c = 0; c < cp_swiglu_calls; c++) {
@@ -94,7 +84,6 @@ int main(int argc, char **argv) {
     printf("2. CP SwiGLU expf:        %7.2f ms  (%d calls × %d elements = %.1fM expf)\n",
            t1-t0, cp_swiglu_calls, cp_inter, (double)cp_swiglu_calls * cp_inter / 1e6);
 
-    /* 3. Residual add: talker + CP */
     int residual_calls = (talker_layers * 2 + cp_layers * cp_passes * 2) * n_frames;
     t0 = now_ms();
     for (int c = 0; c < residual_calls; c++) {
@@ -106,7 +95,6 @@ int main(int argc, char **argv) {
     printf("3. Residual add (T+CP):   %7.2f ms  (%d calls × %d elements)\n",
            t1-t0, residual_calls, hidden);
 
-    /* 4. Softmax (codec vocab, once per frame) */
     t0 = now_ms();
     for (int f = 0; f < n_frames; f++) {
         float max_val = logits[0];
@@ -124,7 +112,6 @@ int main(int argc, char **argv) {
     printf("4. Softmax (codec):       %7.2f ms  (%d frames × %d vocab = %.0fk expf)\n",
            t1-t0, n_frames, vocab, (double)n_frames * vocab / 1e3);
 
-    /* 5. ConvNeXt depthwise conv k=7 (2 blocks, speech decoder) */
     t0 = now_ms();
     for (int block = 0; block < 2; block++) {
         memset(dw_out, 0, (size_t)convnext_ch * convnext_len * sizeof(float));
@@ -145,7 +132,6 @@ int main(int argc, char **argv) {
     printf("5. Depthwise conv k=7:    %7.2f ms  (2 blocks × %d ch × %d len)\n",
            t1-t0, convnext_ch, convnext_len);
 
-    /* 6. ConvNeXt LayerNorm per timestep */
     t0 = now_ms();
     for (int block = 0; block < 2; block++) {
         for (int t = 0; t < convnext_len; t++) {
@@ -168,7 +154,6 @@ int main(int argc, char **argv) {
     printf("6. LayerNorm per-t:       %7.2f ms  (2 blocks × %d timesteps × %d ch)\n",
            t1-t0, convnext_len, convnext_ch);
 
-    /* 7. GELU (erff) */
     t0 = now_ms();
     for (int block = 0; block < 2; block++) {
         for (size_t i = 0; i < (size_t)pw_dim * convnext_len; i++) {
@@ -181,7 +166,6 @@ int main(int argc, char **argv) {
     printf("7. GELU erff:             %7.2f ms  (2 blocks × %d × %d = %.0fk erff)\n",
            t1-t0, pw_dim, convnext_len, 2.0 * pw_dim * convnext_len / 1e3);
 
-    /* 8. ConvNeXt gamma+residual */
     float *gamma_vec = (float *)malloc(convnext_ch * sizeof(float));
     float *resid = (float *)malloc((size_t)convnext_ch * convnext_len * sizeof(float));
     for (int i = 0; i < convnext_ch; i++) gamma_vec[i] = 0.99f;

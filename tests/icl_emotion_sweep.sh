@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# ICL emotion-dilution sweep: does --icl-frames N free up emotion on a faithful ICL clone?
-# Fixed text/seed/lang; sweep the ref-frame cap × {neutral, angry, sad}.
-# Movement = mel-corr(emotion@cap, neutral@cap)  (LOWER = emotes more)
-# Identity = mel-corr(neutral@cap, neutral@full) (HIGHER = voice preserved)
 set -e
 cd "$(dirname "$0")/.."
 OUT=samples/icl_emotion

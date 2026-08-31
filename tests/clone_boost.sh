@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Can --expr-weight>1 on a CLONE recover preset-level emotion? (clones damp the .expr).
-# galatea graft + r32 LoRA, sad+anger, weight sweep. Watch for collapse (tiny duration).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=samples/clone_boost; mkdir -p "$OUT"

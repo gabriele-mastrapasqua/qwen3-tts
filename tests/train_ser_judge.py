@@ -1,43 +1,20 @@
 #!/usr/bin/env python3
-"""Train a CATEGORICAL 7-class Italian Speech-Emotion-Recognition JUDGE on Emozionalmente.
-
-WHY: to test our TTS emotion output FAST and OBJECTIVELY (the way Catania's Emoty does — SER as the judge
-of how well an emotion was *expressed*), instead of listening to dozens of clips by hand. `emo_score.py`
-is DIMENSIONAL (arousal/valence) and blurs anger/disgust/fear (all high-arousal); a categorical model gives
-a real recognizability % + confusion matrix per emotion. Catania reports ~81-83% acc on Emozionalmente
-(vs 66% human) fine-tuning wav2vec2 — reproducible because we now have the corpus + the official
-speaker-independent split (metadata/split/{train,dev,test}.csv) so the judge never sees a test speaker.
-
-The judge is INDEPENDENT of our TTS model (a separate wav2vec2 classifier), so it is an unbiased referee
-for A/B-ing emotion .expr packs (all vs >=3/5 vs smart vs τ_wide) on ryan/vivian/clones.
-
-This is a NEW dedicated script (does not touch the TTS training scripts). Pairs with tests/emo_judge.py
-(which loads the saved model and scores generated wavs).
-
-Run (GPU box, qwen-ft:latest; needs transformers + datasets + soundfile + torchaudio/librosa):
-  python3 train_ser_judge.py --data-dir /root/qwen-ft/emozionalmente_zenodo \
-      --out /root/qwen-ft/ser_judge_it --epochs 8
-Self-test (no model/data): python3 train_ser_judge.py --self-test
-"""
+"""Train a CATEGORICAL 7-class Italian Speech-Emotion-Recognition JUDGE on Emozionalmente."""
 import argparse, csv, json, os, sys, collections
 
 LABELS = ["anger", "disgust", "fear", "joy", "neutral", "sadness", "surprise"]
 LAB2ID = {l: i for i, l in enumerate(LABELS)}
-# Emozionalmente samples.csv vocab -> our label space
 ALIAS = {"joy": "joy", "happiness": "joy", "neutrality": "neutral", "neutral": "neutral"}
-
 
 def norm(e):
     e = str(e).strip().lower()
     return ALIAS.get(e, e)
-
 
 def _find_root(d):
     for c in (d, os.path.join(d, "emozionalmente")):
         if os.path.exists(os.path.join(c, "metadata", "samples.csv")):
             return c
     sys.exit(f"[ser] metadata/samples.csv not found under {d}")
-
 
 def _read_split(root, which):
     """Return [(abs_wav_path, label_id)] for split in {train,dev,test}."""
@@ -54,7 +31,6 @@ def _read_split(root, which):
             if os.path.exists(wp):
                 rows.append((wp, LAB2ID[lab]))
     return rows
-
 
 def train(args):
     import numpy as np
@@ -102,7 +78,6 @@ def train(args):
     def metrics(pred):
         logits, labels = pred
         preds = np.argmax(logits, axis=-1)
-        # UAR = unweighted average recall (Catania's metric); robust to class imbalance
         recalls = []
         for c in range(len(LABELS)):
             m = labels == c
@@ -116,12 +91,11 @@ def train(args):
         learning_rate=args.lr, eval_strategy="epoch", save_strategy="epoch",
         load_best_model_at_end=True, metric_for_best_model="uar", greater_is_better=True,
         logging_steps=20, warmup_ratio=0.1, fp16=torch.cuda.is_available(), report_to=[],
-        remove_unused_columns=False)   # our DS returns {"wav","label"} (not model arg names) -> keep them
+        remove_unused_columns=False)
     trainer = Trainer(model=model, args=ta, train_dataset=DS(tr), eval_dataset=DS(dv),
                       data_collator=collate, compute_metrics=metrics)
     trainer.train()
 
-    # final test-set report (the honest, speaker-independent number)
     pred = trainer.predict(DS(te))
     np = __import__("numpy")
     preds = np.argmax(pred.predictions, axis=-1); labs = pred.label_ids
@@ -139,7 +113,6 @@ def train(args):
     for i, row in enumerate(conf.tolist()):
         print(f"  {LABELS[i]:9s} {row}", flush=True)
 
-
 def _self_test():
     """No model/data: verify the label map + split-vocab normalization are consistent."""
     assert len(LABELS) == 7 and LAB2ID["anger"] == 0
@@ -149,7 +122,6 @@ def _self_test():
         assert norm(l) in LAB2ID, f"label {l} not round-tripping"
     print("label set:", LABELS)
     print("SELF-TEST PASS — 7-class judge label map + Emozionalmente vocab normalization consistent.")
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -168,7 +140,6 @@ def main():
     if not a.data_dir:
         ap.error("--data-dir required (or --self-test)")
     train(a)
-
 
 if __name__ == "__main__":
     main()

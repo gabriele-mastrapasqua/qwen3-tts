@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-# 3-point A/B for the paralinguistic .expr LoRA (NonverbalTTS-trained).
-# Usage: tests/paraling_ab.sh presets/expr/paralinguistic_ep0.expr [speaker]
-#
-# Identical explicit params across every run (seed/speaker/lang/text/model) per the repo
-# testing rules. 1.7B only (--expr is 1.7B-only). The KEY flag is --no-compose: it passes
-# [laugh]/[sigh] LITERALLY to the model so the LoRA renders them (else COMPOSE_MACROS
-# intercepts the tag and synthesizes "Eheh.../Hah..." instead).
-#
-# Answers the 3 questions:
-#   1. MARKER RENDERING — does the LoRA emit a real [laugh]/[sigh] (vs the macro / vs base)?  EN + IT
-#   2. PLAIN ENGLISH (no markers), LoRA on/off — more natural, or rougher?
-#   3. PLAIN ITALIAN (no markers), LoRA on/off — better, or ANGLICIZED?
 set -uo pipefail
 EXPR="${1:?usage: paraling_ab.sh <expr-file> [speaker]}"
 S="${2:-ryan}"
@@ -27,7 +15,6 @@ PLAIN_EN="The weather today is quite nice, so I think we should go for a long wa
 PLAIN_IT="Il tempo oggi è davvero bello, quindi penso che dovremmo fare una lunga passeggiata al parco."
 
 echo "===== 1) MARKER RENDERING — English ====="
-# a) current macro (no flag): [laugh]->\"Eheh...\" synth   b) base literal   c) LoRA literal
 Q ./qwen_tts -d $D -s $S -l English --seed $SEED -T $T --text "$MARK_EN"                          -o "$OUT/1_marker_en_macro.wav"
 Q ./qwen_tts -d $D -s $S -l English --seed $SEED -T $T --text "$MARK_EN" --no-compose             -o "$OUT/1_marker_en_base.wav"
 Q ./qwen_tts -d $D -s $S -l English --seed $SEED -T $T --text "$MARK_EN" --no-compose --expr "$EXPR" -o "$OUT/1_marker_en_lora.wav"

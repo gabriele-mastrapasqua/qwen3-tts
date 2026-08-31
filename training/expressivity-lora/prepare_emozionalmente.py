@@ -1,59 +1,11 @@
 #!/usr/bin/env python3
-"""Emozionalmente -> train_raw.jsonl in the SAME schema as EMOVO (gpu_emovo_prep.py) / CREMA-D
-(prepare_cremad.py), so it aligns ALONGSIDE them for a voice-agnostic, MANY-speaker emotion FT.
-
-WHY Emozionalmente: it is THE 10x lever for Italian emotion. EMOVO is ~0.5 h / 6 actors; Emozionalmente
-is ~6 h / **6,902 clips / 431 speakers**, with a PERFECTLY BALANCED 986 clips x 7 emotions, same Big-6 +
-neutral schema. 431 identities = exactly the speaker diversity the deep-research lever wants (emotion
-learned across many voices -> generalizes to cloned/novel x-vectors instead of staying voice-specific).
-With EMOVO it gets us to ~6.5 h of Italian emotional speech (the 5-10 h entry point).
-
-DATA QUALITY (measured 2026-06-17 on the real shard): tagging is EXCELLENT (986x7 exact balance, 431 spk,
-clean labels, gender/age, 0 empty transcriptions, 18 fixed sentences). Audio is AMATEUR/crowdsourced:
-16 kHz, ~6% clipped (peak>=0.99), very variable levels (mean peak 0.74), home-recording ambient noise.
-For an EMOTION FT this is low-risk (emotion lives in prosody = noise-robust; the 12.5Hz codec is lossy/
-speech-first and suppresses background; 986/emotion across 431 spk decorrelates recording-condition from
-emotion). So: default = KEEP ALL, then optionally clean the worst (--drop-clipped) or clean WITHOUT losing
-data (--loudnorm / --denoise). Use --report first to see the SNR/peak distribution.
-
-TWO SOURCES:
-  (A) HF `amu-cai/CAMEO`, split `emozionalmente` (default). One parquet shard, audio as wav bytes, column
-      `emotion` = the actor's INTENDED label only. No human-validation data. Quick, but no quality filters.
-  (B) --local-dir <Zenodo records/12616095 export> (the ORIGINAL). Has the HUMAN-VALIDATION CSVs:
-      metadata/samples.csv (file_name,sentence,actor,emotion_expressed), metadata/evaluations.csv
-      (file_name,evaluator,audio_quality good|bad,emotion_recognized; ~5 evals/clip), metadata/split/*.csv
-      (speaker-independent). This unlocks the PERCEPTUAL quality filters --min-agreement / --clean-only and
-      the official --split. PREFERRED for a quality run.
-  Measured agreement (recognized==intended): >=3/5 keeps ~70% (anger 72% / joy 67% intact; disgust/fear ~51%
-  — the genuinely ambiguous ones drop). audio_quality: 96% good, 84% of clips all-5-good.
-  No license — cite-only: F. Catania et al., "Emozionalmente...", IEEE TASLP 33:1142-1155, 2025,
-  doi:10.1109/TASLPRO.2025.3540662.
-
-This script (NEW, dedicated -- does NOT touch gpu_emovo_prep.py / prepare_cremad.py / prepare_esd.py):
-  - reads the Emozionalmente split (or a local dir),
-  - OPTIONAL quality filtering/cleaning (off by default): drop clipped, light denoise, loudness-normalize,
-  - resamples 16 kHz -> 24 kHz mono (codec requirement; mirrors EMOVO/CREMA),
-  - maps the 7 emotions -> (label, English instruct) using the SAME instruct strings as EMOVO/CREMA,
-  - emits one row per utterance with a unique `actor` (emozionalmente<speaker_id>) for speaker diversity,
-  - stamps `language: Italian` (single-language FT path, ready for gpu_dataset_expr_lang.py),
-  - prints PROGRESS every --log-every rows and a final per-emotion / per-speaker breakdown.
-
-Usage (GPU box, qwen-ft:latest docker -- needs huggingface_hub + pyarrow + soundfile + ffmpeg):
-  python3 prepare_emozionalmente.py --report                          # just inspect SNR/peak, write nothing
-  python3 prepare_emozionalmente.py --out ~/qwen-ft/emozionalmente/train_raw.jsonl            # KEEP ALL
-  python3 prepare_emozionalmente.py --out ... --loudnorm              # clean levels, lose no data
-  python3 prepare_emozionalmente.py --out ... --drop-clipped 0.98     # also drop the worst-clipped
-
-Self-test (no network): python3 prepare_emozionalmente.py --self-test
-"""
+"""Emozionalmente -> train_raw.jsonl in the SAME schema as EMOVO (gpu_emovo_prep.py) / CREMA-D"""
 import os, json, argparse, subprocess, tempfile, collections, time, sys, io
 
 HF_REPO = "amu-cai/CAMEO"
-HF_SPLIT = "emozionalmente"      # the Italian split (verified: only IT split in CAMEO)
+HF_SPLIT = "emozionalmente"
 HF_PARQUET = "data/emozionalmente-00000-of-00001.parquet"
 
-# emotion string -> (our label, English instruct). neutral = empty instruct (the no-instruct anchor).
-# SAME instruct strings as gpu_emovo_prep.py / prepare_cremad.py so all sources speak one instruct vocab.
 EMO = {
     "anger":     ("anger",    "Speak with hot, furious anger, sharp and forceful."),
     "disgust":   ("disgust",  "Speak with physical disgust, repulsed and recoiling."),
@@ -63,19 +15,13 @@ EMO = {
     "sadness":   ("sadness",  "Speak with a sad, sorrowful, downcast tone, voice low and heavy."),
     "surprise":  ("surprise", "Speak with surprise, startled and taken aback, held through the whole sentence."),
 }
-# vocab differs by source: CAMEO uses happiness/neutral; the Zenodo samples.csv uses joy/neutrality.
 EMO_ALIAS = {"joy": "happiness", "neutrality": "neutral"}
-
 
 def _norm_emo(e):
     e = str(e).strip().lower()
     return EMO_ALIAS.get(e, e)
 
-
-# well-recognized emotions (our label space) get the >=3/5 bar under --smart-agreement;
-# disgust/fear are intrinsically ambiguous + data-scarce -> keep all their non-zero clips.
 STRONG_AGREE = {"anger", "joy", "sadness", "surprise", "neutral"}
-
 
 def _agree_threshold(exp_raw, a):
     """Per-clip min-agreement bar. exp_raw = the source's emotion_expressed string."""
@@ -84,14 +30,12 @@ def _agree_threshold(exp_raw, a):
         return 3 if lab in STRONG_AGREE else 0
     return a.min_agreement or 0
 
-
 def _peak(arr):
     import numpy as np
     a = np.asarray(arr, dtype="float32")
     if a.ndim > 1:
         a = a.mean(axis=1)
     return float(abs(a).max()) if a.size else 0.0
-
 
 def _est_snr_db(arr, sr):
     """Crude SNR proxy: energy of the loudest 20% frames over the quietest 20% (noise floor), in dB.
@@ -102,7 +46,7 @@ def _est_snr_db(arr, sr):
         a = a.mean(axis=1)
     if a.size < sr // 10:
         return 0.0
-    win = max(1, sr // 100)                       # 10 ms frames
+    win = max(1, sr // 100)
     n = (a.size // win) * win
     fr = a[:n].reshape(-1, win)
     e = (fr ** 2).mean(axis=1) + 1e-12
@@ -110,7 +54,6 @@ def _est_snr_db(arr, sr):
     noise = e_sorted[: max(1, len(e_sorted) // 5)].mean()
     sig = e_sorted[-max(1, len(e_sorted) // 5):].mean()
     return float(10.0 * np.log10(sig / max(noise, 1e-12)))
-
 
 def _emit(rows, per_spk, wav24, arr, sr, emo, spk, text, opts, write_audio=True):
     """Map one example -> a row (and a cleaned 24k wav). Returns True if emitted, False if skipped.
@@ -128,12 +71,11 @@ def _emit(rows, per_spk, wav24, arr, sr, emo, spk, text, opts, write_audio=True)
         import soundfile as sf
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             sf.write(tmp.name, arr, sr); src = tmp.name
-        # build the ffmpeg audio-filter chain: optional denoise -> optional loudness-normalize.
         af = []
         if opts.get("denoise"):
-            af.append("afftdn=nf=-25")                 # light spectral denoise (~conservative)
+            af.append("afftdn=nf=-25")
         if opts.get("loudnorm"):
-            af.append("loudnorm=I=-23:TP=-2:LRA=11")   # EBU R128 loudness normalize (kills level variance)
+            af.append("loudnorm=I=-23:TP=-2:LRA=11")
         cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ar", "24000", "-ac", "1"]
         if af:
             cmd += ["-af", ",".join(af)]
@@ -144,7 +86,6 @@ def _emit(rows, per_spk, wav24, arr, sr, emo, spk, text, opts, write_audio=True)
                  "emotion": label, "actor": actor, "language": "Italian"})
     per_spk[spk] += 1
     return True
-
 
 def _iter_hf_rows():
     """Yield (arr, sr, emotion, speaker_id, transcription) from the Emozionalmente parquet shard.
@@ -166,7 +107,6 @@ def _iter_hf_rows():
             continue
         arr, sr = sf.read(io.BytesIO(b))
         yield arr, sr, str(e).strip().lower(), s, (x or "")
-
 
 def _report():
     """Inspect-only: peak + crude-SNR distribution per emotion. Writes nothing."""
@@ -192,14 +132,12 @@ def _report():
           f"median {np.median(a):.1f}  -> the 'worst' tail is below ~p10; "
           f"use --drop-clipped and/or --loudnorm/--denoise to clean without dropping much.")
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=False)
     ap.add_argument("--wav24-dir", default=None, help="where to write 24k wavs (default: <out_dir>/wav24k)")
     ap.add_argument("--local-dir", default=None,
                     help="read a local Zenodo Emozionalmente dir (has the human-validation CSVs) instead of HF CAMEO")
-    # --- PERCEPTUAL quality filters (Zenodo --local-dir only; CAMEO parquet lacks the eval data) ---
     ap.add_argument("--min-agreement", type=int, default=0,
                     help="keep clips where >= N of 5 human evaluators RECOGNIZED the intended emotion "
                          "(0=all; 3=majority, ~70%% kept, drops emotionally-ambiguous clips; 4=~50%%, 5=unanimous ~26%%). "
@@ -216,7 +154,6 @@ def main():
     ap.add_argument("--max-per-speaker", type=int, default=0,
                     help="0 = all (default). Cap utterances per speaker to balance vs EMOVO if needed.")
     ap.add_argument("--max-rows", type=int, default=0, help="0 = all; cap total rows (debug/quick runs)")
-    # --- quality knobs (ALL OFF by default: first run keeps EVERYTHING) ---
     ap.add_argument("--drop-clipped", type=float, default=0.0,
                     help="drop clips whose peak >= this (e.g. 0.98). 0 = keep all (default).")
     ap.add_argument("--loudnorm", action="store_true",
@@ -278,7 +215,6 @@ def main():
           f"(clipped-dropped {opts.get('_n_clipped_dropped', 0)}), {time.time()-t0:.0f}s total", flush=True)
     print("[emoz]   emotions:", dict(by_emo), flush=True)
 
-
 def _find_meta_root(local_dir):
     """Return the dir that directly contains metadata/samples.csv (handles dir, dir/emozionalmente, ...)."""
     for cand in (local_dir, os.path.join(local_dir, "emozionalmente")):
@@ -288,7 +224,6 @@ def _find_meta_root(local_dir):
         if dirpath.endswith(os.path.join("metadata")) and "samples.csv" in files:
             return os.path.dirname(dirpath)
     sys.exit(f"[emoz] could not find metadata/samples.csv under {local_dir}")
-
 
 def _from_local(a, rows, per_spk, wav24, opts, t0):
     """Read the Zenodo Emozionalmente package (records/12616095) WITH its human-validation CSVs:
@@ -303,13 +238,11 @@ def _from_local(a, rows, per_spk, wav24, opts, t0):
     audio_dir = os.path.join(root, "audio")
     print(f"[emoz] local root: {root}", flush=True)
 
-    # samples: file_name -> (emotion_expressed, actor, sentence)
     samples = {}
     with open(os.path.join(meta, "samples.csv"), newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             samples[r["file_name"]] = (r["emotion_expressed"], r["actor"], r.get("sentence", ""))
 
-    # split restriction (optional)
     keep_fn = None
     if a.split != "all":
         sp = os.path.join(meta, "split", f"{a.split}.csv")
@@ -317,7 +250,6 @@ def _from_local(a, rows, per_spk, wav24, opts, t0):
             keep_fn = {r["file_name"] for r in csv.DictReader(f)}
         print(f"[emoz] split={a.split}: {len(keep_fn)} clips", flush=True)
 
-    # evaluations: per clip count agreement (recognized==expressed) and good-quality votes
     agree = collections.Counter(); good = collections.Counter(); nev = collections.Counter()
     with open(os.path.join(meta, "evaluations.csv"), newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
@@ -335,7 +267,7 @@ def _from_local(a, rows, per_spk, wav24, opts, t0):
         thr = _agree_threshold(exp, a)
         if thr and agree[fn] < thr:
             n_skip_agree += 1; continue
-        if a.clean_only and good[fn] < nev[fn]:           # require ALL evals good
+        if a.clean_only and good[fn] < nev[fn]:
             n_skip_clean += 1; continue
         if a.max_per_speaker and per_spk[spk] >= a.max_per_speaker:
             continue
@@ -354,11 +286,10 @@ def _from_local(a, rows, per_spk, wav24, opts, t0):
     print(f"[emoz] local filters: dropped {n_skip_agree} (agreement {bar}), "
           f"{n_skip_clean} (not all-good-quality)", flush=True)
 
-
 def _self_test():
     """No network: exercise the emotion map + row shape + clip-drop on fake examples."""
     rows, per_spk = [], collections.Counter()
-    fake_arr = [0.0, 0.1, -0.1, 0.0]   # write_audio=False -> array/ffmpeg never touched
+    fake_arr = [0.0, 0.1, -0.1, 0.0]
     opts = {"drop_clipped": 0.0, "loudnorm": False, "denoise": False}
     for emo in ["anger", "happiness", "neutral", "surprise", "BOGUS"]:
         _emit(rows, per_spk, "/tmp/wav24", fake_arr, 16000, emo, "spk7", "Ciao mondo.", opts, write_audio=False)
@@ -368,7 +299,6 @@ def _self_test():
     assert all(r["language"] == "Italian" for r in rows), "language must be stamped Italian"
     assert rows[0]["instruct"] and rows[2]["instruct"] == "", "neutral must have empty instruct, anger must not"
     assert all(r["actor"] == "emozionalmentespk7" for r in rows), "actor id malformed"
-    # crude SNR helper must run and be finite on a noisy synthetic signal
     import numpy as np
     sig = np.concatenate([np.random.randn(1600) * 0.02, np.sin(np.linspace(0, 50, 3200)) * 0.5,
                           np.random.randn(1600) * 0.02]).astype("float32")
@@ -377,7 +307,6 @@ def _self_test():
     print(f"crude-SNR proxy on synthetic: {snr:.1f} dB (sane)")
     print("SELF-TEST PASS — 7-emotion map -> EMOVO schema, neutral anchor empty, language=Italian, "
           "bogus skipped, SNR proxy sane.")
-
 
 if __name__ == "__main__":
     main()

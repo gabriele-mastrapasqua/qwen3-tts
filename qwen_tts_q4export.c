@@ -1,25 +1,4 @@
-/* qwen_tts_q4export.c — write a GGUF Q4_0 quantized by OUR weighted-LSQ quantizer.
- *
- * WHY
- * `llama-quantize`'s Q4_0 is plain absmax RTN. Ours (qwen_quantize_bf16_to_q4_0) is a
- * weighted least-squares fit. On a finetuned checkpoint the difference is not academic:
- * measured 2026-08-22, same speaker, same seed, same text —
- *     our 4-bit (LSQ)           94.6 % target language,  0.4 % base language
- *     GGUF Q4_0 (llama.cpp RTN)  0.0 % target language, 96.8 % base language  (same kernel!)
- * while their AVERAGE weight error differs by 0.03 percentage points (8.786 vs 8.820).
- * The finetune's delta from base is at most ~0.002 per weight and the 4-bit step is
- * ~absmax/8 ≈ 0.006: the finetune lives BELOW the quantization step, so how the scale
- * is chosen decides whether it survives at all.
- *
- * WHAT THIS DOES, AND WHAT IT DELIBERATELY DOES NOT
- * It runs the SAME function that produces `--int4`, on the same bf16 weights, and only
- * changes the SERIALIZATION: our q4_0_block_t pairs nibbles adjacently, ggml's
- * block_q4_0 pairs k with k+16. Nothing is dequantized and re-quantized on the way —
- * that would be a different quantizer with the same name.
- *
- * The written file is a drop-in for both --gguf-talker and --gguf-rest: the two name
- * spaces (`blk.*` and `cp.*`/`codec_head`/`text_proj.*`) do not collide.
- */
+/* qwen_tts_q4export.c — write a GGUF Q4_0 quantized by OUR weighted-LSQ quantizer. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,14 +8,12 @@
 #include "ingot/gguf.h"
 #include "ingot/write.h"
 
-/* our adjacent-pair nibbles -> ggml's split-half. Exact inverse of q4_from_ggml(). */
 static void q4_to_ggml(uint8_t *dst, const q4_0_block_t *src, size_t nblocks) {
     for (size_t b = 0; b < nblocks; b++) {
         uint8_t *o = dst + b * 18;
         memcpy(o, &src[b].scale_f16, 2);
         const uint8_t *qs = src[b].qs;
         for (int k = 0; k < 16; k++) {
-            /* value at index k goes in the low nibble, k+16 in the high nibble */
             uint8_t lo = (k % 2 == 0) ? (uint8_t)(qs[k / 2] & 0x0F) : (uint8_t)(qs[k / 2] >> 4);
             int k2 = k + 16;
             uint8_t hi = (k2 % 2 == 0) ? (uint8_t)(qs[k2 / 2] & 0x0F) : (uint8_t)(qs[k2 / 2] >> 4);
@@ -47,10 +24,6 @@ static void q4_to_ggml(uint8_t *dst, const q4_0_block_t *src, size_t nblocks) {
 
 typedef struct { const char *name; const uint16_t *w; int rows, cols; } q4x_item_t;
 
-/* Every tensor gets its OWN buffer, kept alive until save. `ingot_gguf_add_tensor`
- * stores the POINTER, it does not copy: reusing one scratch buffer made the writer
- * fwrite from memory that had already been overwritten, which is a segfault inside
- * ingot with a backtrace that looks like ingot's fault and is not. */
 typedef struct { void **buf; int n, cap; } q4x_keep_t;
 
 static int q4x_add(ingot_gguf_writer *gw, const q4x_item_t *it,
@@ -75,10 +48,9 @@ static int q4x_add(ingot_gguf_writer *gw, const q4x_item_t *it,
     }
     keep->buf[keep->n++] = gbuf;
 
-    qwen_quantize_bf16_to_q4_0(it->w, it->rows, it->cols, *scratch);   /* THE function */
+    qwen_quantize_bf16_to_q4_0(it->w, it->rows, it->cols, *scratch);
     q4_to_ggml(gbuf, *scratch, nblk);
 
-    /* ggml order: ne[0] is the fastest-moving dimension = K */
     uint64_t ne[2] = { (uint64_t)it->cols, (uint64_t)it->rows };
     if (ingot_gguf_add_tensor(gw, it->name, INGOT_TYPE_Q4_0, 2, ne, gbuf) != 0) {
         fprintf(stderr, "  add_tensor failed for %s\n", it->name);
@@ -169,10 +141,6 @@ int qwen_q4_export_lsq(qwen_tts_ctx_t *ctx, const char *out_path) {
     if (rc != 0) { fprintf(stderr, "write failed: %s\n", err); free(sc); return 1; }
     fprintf(stderr, "Wrote %d tensors (weighted-LSQ Q4_0) to %s\n", n, out_path);
 
-    /* ── the proof the owner asked for, before any audio ──────────────────────────
-     * Re-read what was written, undo the ggml nibble order, and compare against a
-     * FRESH in-process quantization of the same bf16. Bit-identical or it is not the
-     * same quantizer, whatever the file says in its metadata. */
     ingot_gguf *g = NULL;
     if (ingot_gguf_open(&g, out_path, err, sizeof err) != 0) {
         fprintf(stderr, "verify: cannot reopen: %s\n", err); free(sc); return 1;

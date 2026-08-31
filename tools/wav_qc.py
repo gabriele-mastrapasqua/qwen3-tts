@@ -1,27 +1,11 @@
 #!/usr/bin/env python3
-"""Signal-level screen for generated speech: clipping, DC, silence holes, clicks.
-
-WHAT THIS IS FOR, AND WHAT IT IS NOT FOR
-----------------------------------------
-It answers "did the waveform break?" — clipped runs, a hole in the middle of a
-sentence, a step discontinuity, a file that is all silence. Those are defects a
-listener should not have to hunt for one clip at a time.
-
-It does NOT answer "is this good speech". Nothing here scores pronunciation,
-accent, prosody or naturalness, and a clean row is not a pass: a render can be
-perfect by every number below and still be wrong to the ear. The ear is the
-verdict; this only decides what to listen to first.
-
-Usage:  python3 tools/wav_qc.py <dir-or-wav> [more...]
-"""
+"""Signal-level screen for generated speech: clipping, DC, silence holes, clicks."""
 import os, sys, wave, array, math
 
-CLIP = 32700          # 16-bit peak minus a little headroom
-SIL   = 0.005         # |s| below this fraction of full scale counts as silence
-HOLE_MS = 1200        # an internal silence longer than this is reported. Natural
-                      # sentence pauses run 0.5-0.9 s, so a lower bar flags correct speech.
-STEP  = 0.35          # single-sample jump, as a fraction of full scale
-
+CLIP = 32700
+SIL   = 0.005
+HOLE_MS = 1200
+STEP  = 0.35
 
 def scan(path):
     with wave.open(path, "rb") as w:
@@ -41,7 +25,7 @@ def scan(path):
     clipped = 0; clip_run = 0; clip_run_max = 0
     prev = a[0]; step_max = 0; steps = 0
     sil_thr = SIL * 32768.0
-    runs = []            # (start, end) silent runs, in samples
+    runs = []
     run_start = None
     for i in range(n):
         s = a[i]
@@ -78,7 +62,6 @@ def scan(path):
         "step": step_max / 32768.0, "steps": steps,
     }
 
-
 def verdict(r):
     bad, warn = [], []
     if r.get("error"):        bad.append(r["error"])
@@ -95,7 +78,6 @@ def verdict(r):
     if r.get("lead", 0) > 1.0:  warn.append("lead silence %.1fs" % r["lead"])
     return ("FAIL" if bad else ("WARN" if warn else "ok")), "; ".join(bad + warn)
 
-
 def collect(args):
     out = []
     for a in args:
@@ -108,7 +90,6 @@ def collect(args):
             out.append(a)
     return sorted(out)
 
-
 def main():
     files = collect(sys.argv[1:])
     if not files:
@@ -119,7 +100,7 @@ def main():
     for p in files:
         try:
             r = scan(p)
-        except Exception as e:                       # a file that cannot be read IS a finding
+        except Exception as e:
             r = {"file": p, "error": "unreadable: %s" % e}
         v, note = verdict(r)
         if v == "FAIL": n_fail += 1
@@ -132,7 +113,6 @@ def main():
           (len(files), n_fail, n_warn, len(files) - n_fail - n_warn))
     print("A clean row means the waveform is intact, not that the speech is good.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

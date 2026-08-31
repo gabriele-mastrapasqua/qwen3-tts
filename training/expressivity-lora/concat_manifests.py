@@ -1,28 +1,8 @@
 #!/usr/bin/env python3
-"""Concatenate several *_with_codes.jsonl manifests into ONE multi-speaker training file, with
-validation + a full breakdown so the merge can't go wrong silently.
-
-This is a NEW, dedicated step (it does NOT touch the original prep/encode/train scripts). The dense
-expressivity FT (gpu_sft_expr.py) reads ONE --train_jsonl; this produces it from EMOVO (IT) + ESD (EN) +
-CREMA-D (EN), i.e. the Phase-2 many-speaker emotion set (PLAN Phase 2, docs/emotion-research.md step 1).
-
-It:
-  - reads each input jsonl, VALIDATES every row has the keys the FT needs
-    (text, instruct, emotion, actor, audio_codes) -- a row missing audio_codes means the encode step
-    didn't run on it, so we FAIL LOUD instead of training on a half-encoded set,
-  - tags each row with `source` (basename of its file) for traceability,
-  - writes the merged jsonl and prints a per-source / per-emotion / per-speaker breakdown.
-
-Usage:
-  python3 concat_manifests.py --out ~/qwen-ft/multi_emotion/train_with_codes.jsonl \
-      ~/qwen-ft/emovo/train_with_codes.jsonl \
-      ~/qwen-ft/esd/train_with_codes.jsonl \
-      ~/qwen-ft/cremad/train_with_codes.jsonl
-"""
+"""Concatenate several *_with_codes.jsonl manifests into ONE multi-speaker training file, with"""
 import os, json, argparse, collections, sys
 
 REQUIRED = ("text", "instruct", "emotion", "actor", "audio_codes")
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -64,7 +44,6 @@ def main():
                 continue
             r = json.loads(line)
             miss = [k for k in REQUIRED if k not in r or r[k] in (None, "")]
-            # neutral has an intentionally-empty instruct -> don't treat that as missing
             miss = [k for k in miss if not (k == "instruct" and r.get("emotion") == "neutral")]
             if miss:
                 bad += 1
@@ -96,7 +75,6 @@ def main():
     print(f"[concat]   speakers   : {len(speakers)} unique (source/actor)")
     print(f"[concat]   by source  : {dict(by_source)}")
     print(f"[concat]   by emotion : {dict(by_emo)}")
-
 
 if __name__ == "__main__":
     main()

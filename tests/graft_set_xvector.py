@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
-"""Swap the x-vector inside a graft .qvoice, keeping TPAD+WOVR untouched.
+"""Swap the x-vector inside a graft .qvoice, keeping TPAD and WOVR untouched.
 
-Why this is a 20-line script and not a re-export: two graft files for DIFFERENT voices of the
-same model are byte-identical except for the speaker embedding + the name in META (measured
-2026-08-05: galatea_06b_graft vs silvio_06b_graft differ only in bytes 12..4158 of 16,806,036).
-So TPAD and WOVR are properties of the MODEL, not of the voice — the whole voice identity is
-the 4 KB x-vector, and the 16 MB is shared prosody machinery.
-
-Use: build an EMOTIONAL graft by dropping an emotional x-vector into an existing graft, so the
-voice carries the emotion AND keeps the graft's sighs/pauses/micro-prosody (which a bare .bin
-omits).
-
+Usage:
   python3 tests/graft_set_xvector.py <in.qvoice> <xvector.bin> <out.qvoice> [--name NAME]
 """
 import sys, struct

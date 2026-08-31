@@ -1,8 +1,4 @@
-"""DEPRECATED SHIM — renamed to `tests/serve_procstats.py`.
-
-`kai_` named the KleidiAI campaign this was written during; the module reads /proc and
-knows nothing about any backend. Importing this name still works and warns once.
-"""
+"""DEPRECATED SHIM — renamed to `tests/serve_procstats.py`."""
 import warnings
 warnings.warn("tests/kai_procstats.py is deprecated — import tests/serve_procstats.py",
               DeprecationWarning, stacklevel=2)

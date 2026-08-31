@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-# Assemble a MULTILINGUAL neutral-carrier jsonl for prepare_paraling_aug.py from the per-language
-# neutral clips we already prepped on the box. Reads each <dir>/train_raw.jsonl, keeps emotion==neutral
-# rows (capped), and rewrites the audio path to /root/qwen-ft/<dir>/wav24k/<basename> (container path).
 import argparse, json, os
 from collections import Counter
 
-# (dir, lang) — neutral clips with transcripts already at 24k on the box.
 DEFAULT = [("emovo","IT"),("emodb_bb","DE"),("mesd_bb","ES"),("cafe_bb","FR"),
            ("resd","RU"),("etod","KO"),("jvnv","JA")]
 

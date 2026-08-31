@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# SPLICE with TIMBRE-ADAPTED real clip (2026-06-26): answer to "render the real clip cross-voice".
-# Adapt each real VocalSound clip toward the target voice timbre (tests/timbre_adapt.py), THEN splice.
-# A/B: raw splice (para_splice/) vs adapted splice (here).  -> samples/para_splice_adapt/
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/para_splice_adapt; rm -rf $O; mkdir -p $O
@@ -17,7 +14,6 @@ EVENTS=(
 )
 echo "===== SPLICE (timbre-ADAPTED) -> $O ====="
 for sp in galatea ryan vivian; do
-  # one voice reference for timbre adaptation (a longer neutral line)
   synth "$sp" "Questa e la mia voce, parlo in modo naturale e tranquillo." $O/_ref_${sp}.wav
   for e in "${EVENTS[@]}"; do
     IFS='|' read -r name clip pre post <<< "$e"

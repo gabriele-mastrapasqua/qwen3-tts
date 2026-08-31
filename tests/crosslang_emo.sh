@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# CROSS-LANGUAGE clone-emotion validation (2026-06-24). The clone-emotion problem spans ALL Qwen-TTS langs
-# (a user reported it broken in Chinese). We have CSP-FT only for IT — but STEER is an activation direction
-# (should transfer cross-script). Test: galatea clone (graft) speaking RU/ZH/JA/KO × {anger,sad,joy} ×
-# {STEER-clean w8, COMBINE = IT expr + steer}. EN vivid instruct. CLEAN + decay 0.985 default. seed 42, T1.1.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 IT=presets/expr/italian_csp_topk6.expr; D=samples/emo_retest_0622; O=samples/crosslang_emo; mkdir -p $O
@@ -15,7 +11,6 @@ declare -A INS=(
   [sad]="Speak in a sad, sorrowful, gloomy and downcast tone, voice low and heavy, on the verge of tears."
   [joy]="Speak with bright, radiant joy, light and warm, smiling through every word.")
 
-# language -> codec lang name (for -l) ; texts keyed "<Lang>_<emo>"
 LANGS=(Russian Chinese Japanese Korean)
 declare -A TXT=(
   [Russian_anger]="Как ты смеешь так со мной разговаривать? Это неприемлемо, я этого не потерплю!"

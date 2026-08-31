@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Rich-palette validation of the CLONE (galatea graft): r64 vs r128 across 10 varied,
-# particular emotions (curated instructs). Same seed/params.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=samples/galatea_rich; mkdir -p "$OUT"

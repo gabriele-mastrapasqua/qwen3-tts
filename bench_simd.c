@@ -1,9 +1,4 @@
-/*
- * Micro-benchmark: SIMD vs scalar for hot loops
- * Tests NEON versions of the top scalar consumers
- * Build: clang -O3 -march=native -ffast-math -o bench_simd bench_simd.c -lm
- * Usage: ./bench_simd [0.6b|1.7b]
- */
+/* Micro-benchmark: SIMD vs scalar for hot loops */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -21,9 +16,6 @@ static double now_ms(void) {
 }
 
 #ifdef __ARM_NEON
-/* Fast sigmoid via Padé approximant of tanh:
- * sigmoid(x) = 0.5 * (1 + tanh(0.5*x))
- * tanh(a) ≈ a*(27+a²)/(27+9a²) — good for |a|<4, max error ~0.004 */
 static inline float32x4_t fast_sigmoid_neon(float32x4_t x) {
     float32x4_t half = vdupq_n_f32(0.5f);
     float32x4_t hx = vmulq_f32(half, x);
@@ -99,7 +91,6 @@ int main(int argc, char **argv) {
     volatile float sink = 0;
 
 #ifdef __ARM_NEON
-    /* === 1. Talker SwiGLU === */
     int talker_calls = talker_layers * n_frames;
 
     memcpy(gate, gate_backup, 2 * inter * sizeof(float));
@@ -126,7 +117,6 @@ int main(int argc, char **argv) {
     printf("1b. Talker SwiGLU NEON fast_sig: %7.2f ms  (%.1fx speedup)\n",
            t_swiglu_fast, t_swiglu_scalar/t_swiglu_fast);
 
-    /* Accuracy check */
     memcpy(gate, gate_backup, 2 * inter * sizeof(float));
     float ref_vals[4], fast_vals[4];
     for (int o = 0; o < 4; o++) {
@@ -142,7 +132,6 @@ int main(int argc, char **argv) {
     }
     printf("   Accuracy: max relative error = %.6f (first 4 elements)\n", max_err);
 
-    /* === 2. CP SwiGLU === */
     int cp_calls = cp_layers * cp_passes * n_frames;
 
     memcpy(cp_gate, cp_gate_backup, 2 * cp_inter * sizeof(float));
@@ -169,7 +158,6 @@ int main(int argc, char **argv) {
     printf("2b. CP SwiGLU NEON fast_sig:     %7.2f ms  (%.1fx speedup)\n",
            t_cp_fast, t_cp_scalar/t_cp_fast);
 
-    /* === 3. GELU === */
     memcpy(pw1, pw1_backup, (size_t)pw_dim * convnext_len * sizeof(float));
     t0 = now_ms();
     for (int block = 0; block < 2; block++) {
@@ -220,7 +208,6 @@ int main(int argc, char **argv) {
     printf("3b. GELU NEON tanh-approx:       %7.2f ms  (%.1fx speedup)\n",
            t_gelu_neon, t_gelu_scalar/t_gelu_neon);
 
-    /* === 4. Depthwise conv NEON === */
     t0 = now_ms();
     for (int block = 0; block < 2; block++) {
         memset(dw_out, 0, (size_t)convnext_ch * convnext_len * sizeof(float));
@@ -251,7 +238,6 @@ int main(int argc, char **argv) {
     sink += dw_out[0];
     printf("\n4. Depthwise conv NEON:          %7.2f ms  (scalar ~0.88ms)\n", t1-t0);
 
-    /* === 5. LayerNorm NEON === */
     t0 = now_ms();
     for (int block = 0; block < 2; block++) {
         for (int t = 0; t < convnext_len; t++) {
@@ -287,7 +273,6 @@ int main(int argc, char **argv) {
     sink += signal[0];
     printf("5. LayerNorm NEON accum:         %7.2f ms  (scalar ~0.29ms)\n", t1-t0);
 
-    /* === SUMMARY === */
     printf("\n=== POTENTIAL SAVINGS ===\n");
     double main_saved = (t_swiglu_scalar - t_swiglu_fast) + (t_cp_scalar - t_cp_fast);
     double decoder_saved = (t_gelu_scalar - t_gelu_neon);

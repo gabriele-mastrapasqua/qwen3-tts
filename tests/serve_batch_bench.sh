@@ -1,17 +1,4 @@
 #!/usr/bin/env bash
-# serve_batch_bench.sh — THROUGHPUT bench for the vLLM-style request-batching server.
-#
-# Answers the one question M1 can't: does stepping N users together actually raise
-# throughput on THIS box? Compares M concurrent requests served with --batch-size N
-# against the single-stream baseline, per precision (bf16 / int8 / int4).
-#
-#   throughput speedup = (M × single_wall) / burst_wall      (≈N on a bandwidth-bound
-#                                                              box; ≈1 on bandwidth-rich M1)
-#
-# Usage: tests/serve_batch_bench.sh [MODEL] [PORT] [BATCH_N] [CLIENTS_M] [THREADS]
-#   defaults: qwen3-tts-0.6b 8900 4 4 4
-#
-# Quiet machine only. Kills the server by name; times only client PIDs.
 set -u
 MODEL="${1:-qwen3-tts-0.6b}"
 PORT="${2:-8900}"
@@ -37,14 +24,12 @@ run_prec(){ # $1=label  $2=extra qwen flag (e.g. --int8 or "")
   pkill -9 -f "qwen_tts.*--serve" 2>/dev/null; sleep 1
   $BIN -d "$MODEL" --serve "$PORT" --batch-size "$N" -j "$TH" $flag > "$TMP/srv.log" 2>&1 &
   sleep 6
-  # warm + single-stream baseline (1 request alone)
   timeout 180 curl -s "http://localhost:$PORT/v1/tts" -d "$(body)" -o "$TMP/warm.wav" >/dev/null 2>&1
   local s0 s1 single_wall aud
   s0=$(now); timeout 180 curl -s "http://localhost:$PORT/v1/tts" -d "$(body)" -o "$TMP/base.wav" >/dev/null 2>&1; s1=$(now)
   single_wall=$(python3 -c "print(round($s1-$s0,2))")
   aud=$(audio_s "$TMP/base.wav")
   local single_rtf="n/a"; [ "$aud" != "0" ] && single_rtf=$(python3 -c "print(round($single_wall/$aud,2))")
-  # burst: M concurrent identical requests
   local b0 b1 burst_wall pids=""
   b0=$(now)
   for i in $(seq 1 "$M"); do
@@ -53,7 +38,6 @@ run_prec(){ # $1=label  $2=extra qwen flag (e.g. --int8 or "")
   done
   for p in $pids; do wait "$p"; done
   b1=$(now); burst_wall=$(python3 -c "print(round($b1-$b0,2))")
-  # totals
   local total_aud=0 ok=0
   for i in $(seq 1 "$M"); do
     local a; a=$(audio_s "$TMP/c_$i.wav")

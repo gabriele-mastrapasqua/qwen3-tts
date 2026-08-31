@@ -1,6 +1,4 @@
-/*
- * qwen_tts_sampling.c - Sampling utilities
- */
+/* qwen_tts_sampling.c - Sampling utilities */
 
 #include "qwen_tts.h"
 #include <stdio.h>
@@ -8,16 +6,6 @@
 #include <string.h>
 #include <math.h>
 
-/* Pre-allocated work buffers (avoids malloc per sample call).
- * __thread (per-thread, like g_seed below): concurrent synthesis is a real,
- * supported config — `--serve --workers N` on macOS/GCD runs qwen_tts_generate
- * on N persistent worker threads in parallel (g_serialize_synth==0), and the
- * --batch-size scheduler thread synthesizes concurrently with the single-job
- * clone worker. Process-global buffers here would (a) data-race the memcpy +
- * quickselect -> corrupt the top-k threshold -> wrong sampling distribution, and
- * (b) let ensure_work_buffers() free()/realloc a buffer another thread is mid-use
- * (UAF/double-free). Per-thread buffers are allocated once per persistent worker
- * (reachable-at-exit, harmless — same tradeoff as g_seed). Leaks-audit #2 HIGH. */
 static __thread float *g_topk_tmp = NULL;
 static __thread int   *g_topp_idx = NULL;
 static __thread int    g_work_cap = 0;
@@ -30,11 +18,6 @@ static void ensure_work_buffers(int n) {
     g_work_cap = n;
 }
 
-/* Simple LCG random number generator.
- * __thread (per-thread state): the concurrent server runs one synthesis per
- * worker thread, each seeded per-request. A shared g_seed would race across
- * workers and break per-request seed reproducibility. Single-threaded callers
- * are unaffected (each thread sees its own seed). */
 static __thread uint32_t g_seed = 12345;
 static float rand_uniform(void) {
     g_seed = g_seed * 1103515245 + 12345;
@@ -43,12 +26,8 @@ static float rand_uniform(void) {
 
 void qwen_set_seed(uint32_t seed) { g_seed = seed; }
 
-/* Read back the current RNG state. The batched-multi engine swaps RNG state
- * per slot per frame (set seed[b], sample, save seed[b]) so each request
- * reproduces the single-stream RNG sequence bit-for-bit even at temp>0. */
 uint32_t qwen_get_seed(void) { return g_seed; }
 
-/* Softmax with temperature */
 static void softmax(float *logits, int n, float temp) {
     float max_val = logits[0];
     for (int i = 1; i < n; i++) if (logits[i] > max_val) max_val = logits[i];
@@ -61,13 +40,11 @@ static void softmax(float *logits, int n, float temp) {
     for (int i = 0; i < n; i++) logits[i] /= sum;
 }
 
-/* Quickselect: find k-th largest value in O(n) average time */
 static float quickselect_kth_largest(float *arr, int n, int k) {
     int lo = 0, hi = n - 1;
     while (lo < hi) {
         float pivot = arr[lo + (hi - lo) / 2];
         int i = lo, j = hi;
-        /* 3-way partition: [>pivot] [==pivot] [<pivot] (descending) */
         int p = lo;
         while (i <= j) {
             if (arr[i] > pivot) {
@@ -80,7 +57,6 @@ static float quickselect_kth_largest(float *arr, int n, int k) {
                 i++;
             }
         }
-        /* arr[lo..p-1] > pivot, arr[p..j] == pivot, arr[j+1..hi] < pivot */
         if (k - 1 < p) {
             hi = p - 1;
         } else if (k - 1 > j) {
@@ -92,16 +68,13 @@ static float quickselect_kth_largest(float *arr, int n, int k) {
     return arr[lo];
 }
 
-/* Top-k filtering */
 static int topk_filter(float *logits, int n, int k) {
     if (k <= 0 || k >= n) return n;
 
-    /* Find k-th largest value via quickselect on copy */
     float *tmp = g_topk_tmp;
     memcpy(tmp, logits, n * sizeof(float));
     float threshold = quickselect_kth_largest(tmp, n, k);
 
-    /* Zero out below threshold */
     int count = 0;
     for (int i = 0; i < n; i++) {
         if (logits[i] < threshold) logits[i] = 0;
@@ -110,20 +83,12 @@ static int topk_filter(float *logits, int n, int k) {
     return count;
 }
 
-/* Top-p (nucleus) filtering */
 static int topp_filter(float *logits, int n, float p) {
     if (p >= 1.0f) return n;
-    
+
     int *idx = g_topp_idx;
     for (int i = 0; i < n; i++) idx[i] = i;
 
-    /* Partial selection sort (audit perf fix): the old loop fully sorted all n logits
-     * — O(n^2), ~9.4M compares/frame at n=3072 — even though the nucleus is tiny. Extract
-     * the sorted prefix only until the cumulative probability exceeds p, then stop. This is
-     * PROVABLY EQUIVALENT to the old full-sort: selection sort produces the same prefix
-     * idx[0..cutoff-1] whether or not it continues, the cumsum sequence and cutoff are
-     * identical, and idx[cutoff..n-1] remains exactly the (unsorted) complement set — order
-     * is irrelevant when we only zero it below. Same sample, ~cutoff/n of the work. */
     float cumsum = 0;
     int cutoff = n;
     for (int i = 0; i < n; i++) {
@@ -135,17 +100,11 @@ static int topp_filter(float *logits, int n, float p) {
         if (cumsum > p) { cutoff = i + 1; break; }
     }
 
-    /* Zero out tokens outside the nucleus — in SORTED (probability) order via idx[].
-     * BUG FIX (2026-06-10): the old loop zeroed logits[i] by RAW token index >= cutoff,
-     * which kept low-probability low-id tokens and zeroed high-probability high-id ones —
-     * including the high-id EOS token. With any top_p<1.0 the EOS was always masked out,
-     * so the Talker never terminated (runaway to max_frames). The mask must follow idx[]. */
     for (int i = cutoff; i < n; i++)
         logits[idx[i]] = 0.0f;
     return cutoff;
 }
 
-/* Sample from probability distribution */
 static int sample_from_probs(float *probs, int n) {
     float r = rand_uniform();
     float cumsum = 0;
@@ -156,12 +115,10 @@ static int sample_from_probs(float *probs, int n) {
     return n - 1;
 }
 
-/* Main sampling function */
 int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float top_p,
                     float rep_penalty, int *prev_tokens, int n_prev) {
     ensure_work_buffers(vocab_size);
 
-    /* Apply repetition penalty */
     if (rep_penalty != 1.0f && n_prev > 0) {
         for (int i = 0; i < n_prev; i++) {
             int tok = prev_tokens[i];
@@ -171,32 +128,25 @@ int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float 
             }
         }
     }
-    
-    /* Temperature scaling */
+
     if (temp < 1e-6f) {
-        /* Greedy */
         int best = 0; float best_v = logits[0];
         for (int i = 1; i < vocab_size; i++)
             if (logits[i] > best_v) { best_v = logits[i]; best = i; }
         return best;
     }
-    
-    /* Softmax */
+
     softmax(logits, vocab_size, temp);
-    
-    /* Top-k */
+
     if (top_k > 0 && top_k < vocab_size)
         topk_filter(logits, vocab_size, top_k);
-    
-    /* Top-p */
+
     if (top_p < 1.0f && top_p > 0.0f)
         topp_filter(logits, vocab_size, top_p);
-    
-    /* Renormalize */
+
     float sum = 0;
     for (int i = 0; i < vocab_size; i++) sum += logits[i];
     if (sum > 0) for (int i = 0; i < vocab_size; i++) logits[i] /= sum;
-    
-    /* Sample */
+
     return sample_from_probs(logits, vocab_size);
 }

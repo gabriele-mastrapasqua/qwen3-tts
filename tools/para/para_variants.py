@@ -1,25 +1,5 @@
 #!/usr/bin/env python3
-"""Group para-event VARIANTS instead of classifying them.
-
-Why this exists: `para_judge.py` (CNN14 / CLAP) answers "is this a sigh?" and on our material it
-answers wrong — measured 2026-08-05 on the 0.6B seed sweep, every clip the ear calls a TOP sigh
-comes back MISS with P<0.05, on both backends. Those taggers are trained on isolated, salient
-AudioSet-style events; a 0.4 s "ehhh" inside an Italian sentence is drowned by the speech.
-
-So we drop the naming problem, which is the hard one, and keep the useful one: **the same [tag]
-with different seeds produces different VARIANTS of the event** (user, 2026-08-05: on the 1.7B too).
-Hand-mapping those variants by ear is what makes tag discovery so slow. This tool clusters them, so
-you listen to ONE representative per behaviour instead of every seed.
-
-It describes the event region acoustically (no pretrained tagger, no labels):
-  - F0 contour stats     -> pitch shape of the event ("eh!" rises, "ahhh" falls)
-  - RMS envelope stats   -> attack/decay ("eh!" is short+sharp, "awhhh" is long+flat)
-  - spectral centroid    -> brightness (laugh is brighter than a sigh)
-  - voiced fraction, event duration up to the first pause
-
-Use:
-  ./.venv/bin/python para_variants.py --wavs <dir> --pattern 'sigh_*.wav' [--k 2] [--window 1.2]
-"""
+"""Group para-event VARIANTS instead of classifying them."""
 import argparse, glob, os, sys
 import numpy as np
 
@@ -27,7 +7,6 @@ try:
     import librosa
 except ImportError:
     sys.exit("need librosa: ./.venv/bin/pip install librosa")
-
 
 def features(path, window):
     y, sr = librosa.load(path, sr=24000, duration=window)
@@ -38,7 +17,6 @@ def features(path, window):
     f0, voiced, _ = librosa.pyin(y, sr=sr, fmin=60, fmax=500,
                                  frame_length=1024, hop_length=256)
     f0v = f0[~np.isnan(f0)]
-    # where the event stops: first frame under 20% of peak energy, after the onset
     thr = 0.2 * rms.max() if rms.max() > 0 else 0
     onset = int(np.argmax(rms > thr)) if thr else 0
     after = np.where(rms[onset:] < thr)[0]
@@ -56,10 +34,8 @@ def features(path, window):
         float(voiced.mean()), dur,
     ])
 
-
 NAMES = ["f0_mean", "f0_std", "f0_slope", "rms_mean", "rms_std", "rms_slope",
          "centroid", "centroid_std", "voiced", "dur"]
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -79,7 +55,7 @@ def main():
         if v is not None:
             X.append(v); keep.append(f)
     X = np.array(X)
-    Z = (X - X.mean(0)) / (X.std(0) + 1e-9)          # z-score so no feature dominates
+    Z = (X - X.mean(0)) / (X.std(0) + 1e-9)
 
     print(f"\n{'clip':28s}" + "".join(f"{n:>11s}" for n in NAMES))
     for f, row in zip(keep, X):
@@ -107,7 +83,6 @@ def main():
             idx = [i for i in range(len(keep)) if lab[i] == j]
             rep = keep[idx[int(np.argmin(((Z[idx] - C[j]) ** 2).sum(-1)))]]
             print(f"  gruppo {j}: {', '.join(members)}   -> ascolta {os.path.basename(rep)}")
-
 
 if __name__ == "__main__":
     main()

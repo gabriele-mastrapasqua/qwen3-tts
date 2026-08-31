@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Build a multi-layer Talker steer (.qlsteer) from two QWEN_ACT_MAP captures:
-the per-layer emotion delta  vec[l] = scale * (EMOTION[l] - NEUTRAL[l]).
-
-Capture both at temp>0 with a STRONG (English/Chinese) instruct on a PRESET voice
-(where the instruct actually emotes), then apply on any voice/qvoice via
-  ./qwen_tts ... --ml-steer OUT.qlsteer --ml-weight N --ml-range 21-25
-
-.qamp  : 'QAMP' + int32 L + int32 D + L*D f32  (per-layer mean residual stream)
-.qlsteer: 'QLST' + int32 L + int32 D + L*D f32  (per-layer delta to add)
-
-Usage:
-  tests/act_map_steer.py NEUTRAL.qamp EMOTION.qamp OUT.qlsteer [--scale 1.0] [--unit-per-layer]
-"""
+"""Build a multi-layer Talker steer (.qlsteer) from two QWEN_ACT_MAP captures:"""
 import struct, sys, argparse, math
 
 QAMP = 0x504D4151

@@ -1,40 +1,4 @@
-/* kernel_census_bench.c — shape-aware kernel census: OUR kernels vs Arm KleidiAI,
- * on the REAL shapes of the Talker, the Code Predictor and the prefill.
- *
- * TWO SLICES, NOT A CATALOGUE
- *   1. INT8 per-row -> KleidiAI qsi8cxp. Our INT8 weight format is int8 + ONE SCALE
- *      PER OUTPUT ROW, which is exactly KleidiAI's per-channel semantics: the same
- *      bytes and the same per-row scales feed both packers, no requantization. What
- *      DOES differ is the ACTIVATION quantizer (ours symmetric amax/127 per column,
- *      KleidiAI's asymmetric min/max with a zero point per row), which is why every
- *      row carries the error against TWO references instead of an assertion.
- *   2. BF16 prefill -> KleidiAI bf16p, same input, same weights, other backend.
- *
- * ── THE LAYOUT QUESTION, AND WHY IT IS NOT A TAX TO OPTIMIZE ────────────────────
- * The engine's batched projection (qwen_tts_talker.c:qwen_batch_proj_q) does:
- *
- *     batch_gather(Xt, src, B, cols, srcstride, idx);   // src[b][k]  ->  Xt[k][b]
- *     qwen_matmat_*(Yt, W, Xt, rows, cols, B);          //             ->  Yt[n][b]
- *     batch_scatter(dst, Yt, B, rows, idx);             // Yt[n][b]   ->  dst[b][n]
- *
- * The per-request activations ALREADY live as src[b][k] row-major; the engine
- * TRANSPOSES them into [k][b] because our kernels want that. KleidiAI wants [m][k] --
- * the layout the engine had BEFORE the transpose. Same story at the output end.
- *
- * So Kleidi is measured in two modes:
- *   NATIVE - fed src[b][k] directly, writing dst[b][n] directly. The gather and the
- *            scatter still happen but become memcpy instead of a strided transpose,
- *            i.e. CHEAPER than what the engine pays today.
- *   XPOSE  - fed the engine's Xt[k][b], transposing in and out. What a naive drop-in
- *            would cost, and an ARTIFICIAL cost that a producer change removes.
- * The winner is decided on lhs_pack + kernel, with gather and scatter excluded from
- * BOTH sides, because both pay one of each either way.
- *
- * PORTABILITY
- * The candidate list is ISA-specific; the table is not. On x86 the same shapes and
- * columns get VNNI/AMX candidates, and the latency-lane (B=1) vs throughput-lane
- * (B>=4) split carries over unchanged.
- */
+/* kernel_census_bench.c — shape-aware kernel census: OUR kernels vs Arm KleidiAI, */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,12 +37,6 @@
 #define KAI_HAVE_BF16 0
 #endif
 
-/* ── shapes ─────────────────────────────────────────────────────────────────────
- * NOTE on qkv: the TALKER fuses q|k|v into one 4096xK matrix; the CODE PREDICTOR
- * does NOT - it calls qwen_batch_proj_q three times on wq/wk/wv with the same
- * x_norm (qwen_tts_code_predictor.c:1086-1088), so it quantizes that activation
- * three times per layer per pass. The --qkv pass measures that, instead of
- * pretending the CP has a fused matrix. */
 typedef struct { const char *comp, *op; int N, K; double calls_per_frame; } shape_t;
 
 static const shape_t SHAPES_17B[] = {
@@ -106,7 +64,6 @@ static const shape_t SHAPES_06B[] = {
     { "cp",     "down",     1024, 3072, 78.43 },
     { "cp",     "lm_head",  2048, 1024, 14.71 },
 };
-/* Prefill projections are UNFUSED (qwen_tts_talker.c:prefill_proj_matmat). B = prompt. */
 static const shape_t PREFILL_17B[] = {
     { "prefill", "wq",      2048, 2048, 28.0 },
     { "prefill", "wk",      1024, 2048, 28.0 },
@@ -124,8 +81,6 @@ static const shape_t PREFILL_06B[] = {
     { "prefill", "down",    1024, 3072, 28.0 },
 };
 
-/* ── timing: MEDIAN over repeats. The mean is the wrong statistic on a shared VM:
- * one preemption in fifty inflates it and the row silently lies. ─────────────── */
 static double now_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec * 1e9 + (double)t.tv_nsec;
@@ -153,16 +108,14 @@ static float frand(void) {
     return ((float)(rng_s >> 8) / (float)(1u << 24)) * 2.0f - 1.0f;
 }
 
-/* ── weights: built ONCE per shape, shared by every candidate ────────────────── */
 typedef struct {
     int N, K;
     float    *Wf32;
     uint16_t *Wbf16;
     int8_t   *Wi8;
     float    *Wscale;
-    float    *Wi8_deq;    /* dequantized int8 weights: the reference that isolates the
-                             ACTIVATION quantizer from the weight quantizer */
-    float    *Wbf16_deq;  /* same idea for the bf16 slice */
+    float    *Wi8_deq;
+    float    *Wbf16_deq;
 } weights_t;
 
 static void weights_build(weights_t *w, int N, int K) {
@@ -200,9 +153,6 @@ static void weights_free(weights_t *w) {
     free(w->Wi8_deq); free(w->Wbf16_deq);
 }
 
-/* Activations, produced in BOTH layouts from the same values:
- *   Xbk[b*K + k]  the engine's per-request layout, and what KleidiAI's LHS wants
- *   Xkb[k*B + b]  what batch_gather transposes it into for our kernels */
 static void acts_build(int K, int B, float **Xbk, float **Xkb) {
     float *a = (float *)xaligned((size_t)K * B * sizeof(float));
     float *t = (float *)xaligned((size_t)K * B * sizeof(float));
@@ -214,7 +164,6 @@ static void acts_build(int K, int B, float **Xbk, float **Xkb) {
         }
     *Xbk = a; *Xkb = t;
 }
-/* Reference in double from a chosen f32 weight matrix. Y[n*B+b], engine layout. */
 static double *reference(const float *W, const float *Xkb, int N, int K, int B) {
     double *R = (double *)xaligned((size_t)N * B * sizeof(double));
     for (int n = 0; n < N; n++)
@@ -235,7 +184,6 @@ static double rel_err(const float *Y, const double *R, int N, int B) {
     return den > 0.0 ? sqrt(num / den) : 0.0;
 }
 
-/* ── output row ────────────────────────────────────────────────────────────────── */
 static FILE *g_csv = NULL;
 static void csv_header(void) {
     fprintf(g_csv, "comp,op,dtype,N,K,B,calls_per_frame,impl,mode,isa,tile,mr,nr,kr,"
@@ -249,8 +197,8 @@ typedef struct {
     int N, K, B, mr, nr, kr, m_step, n_step, threads;
     double calls_per_frame, rhs_pack_ns; size_t rhs_pack_bytes;
     double gather, lhspack, kernel, out;
-    double ns_compare;   /* what the winner is decided on: lhs_pack + kernel */
-    double ns_dropin;    /* the naive drop-in: gather + lhs_pack + kernel + out */
+    double ns_compare;
+    double ns_dropin;
     double err_f32, err_qw;
 } row_t;
 static void row_emit(const row_t *r, double baseline_ns) {
@@ -267,9 +215,6 @@ static void row_emit(const row_t *r, double baseline_ns) {
     fflush(g_csv);
 }
 
-/* ── the engine's own gather/scatter, copied from qwen_tts_talker.c ─────────────
- * Copied rather than called because they are file-static there. They are the cost
- * BOTH sides pay, which is exactly why they are measured and then excluded. */
 static void eng_gather(float *Xt, const float *src, int n, int dim) {
     for (int j = 0; j < n; j++) {
         const float *s = src + (size_t)j * dim;
@@ -282,8 +227,6 @@ static void eng_scatter(float *dst, const float *Yt, int n, int rows) {
         for (int j = 0; j < n; j++) dst[(size_t)j * rows + r] = yr[j];
     }
 }
-/* The same two in the layout KleidiAI consumes: a row copy, not a strided
- * transpose. This is the whole point of the NATIVE mode. */
 static void kai_gather(float *Xbk, const float *src, int n, int dim) {
     for (int j = 0; j < n; j++)
         memcpy(Xbk + (size_t)j * dim, src + (size_t)j * dim, (size_t)dim * sizeof(float));
@@ -292,7 +235,6 @@ static void kai_scatter(float *dst, const float *D, int n, int rows) {
     for (int j = 0; j < n; j++)
         memcpy(dst + (size_t)j * rows, D + (size_t)j * rows, (size_t)rows * sizeof(float));
 }
-/* engine layout -> Kleidi layout: the ARTIFICIAL cost a naive drop-in would pay. */
 static void xpose_in(float *dst, const float *Xkb, int K, int B) {
     if (B == 1) { memcpy(dst, Xkb, (size_t)K * sizeof(float)); return; }
     for (int b = 0; b < B; b++)
@@ -304,7 +246,6 @@ static void xpose_out(float *Y, const float *D, int N, int B) {
         for (int b = 0; b < B; b++) Y[(size_t)n * B + b] = D[(size_t)b * N + n];
 }
 
-/* ── our kernels ───────────────────────────────────────────────────────────────── */
 static double bench_our(int int8, const weights_t *w, const float *Xkb, float *Y,
                         int B, int iters, int reps) {
     double *t = (double *)xaligned((size_t)reps * sizeof(double));
@@ -352,9 +293,6 @@ static kai_i8_cand_t KAI_I8[] = {
 };
 #define KAI_I8_N ((int)(sizeof(KAI_I8) / sizeof(KAI_I8[0])))
 
-/* N-split across the engine's own pool: KleidiAI ships no threading by design, and a
- * single-threaded Kleidi row against a 16-thread engine row would not be a comparison.
- * Slices are cut on n_step, which is what get_dst_offset asserts on. */
 typedef struct {
     const kai_i8_cand_t *c; int M, N, K;
     const void *lhs_p, *rhs_p; float *dst;
@@ -372,7 +310,6 @@ static void kai_i8_task(size_t tid, size_t nt, void *vc) {
     j->c->uk.run_matmul((size_t)j->M, n1 - n0, (size_t)j->K, j->lhs_p, rhs, dst,
                         (size_t)j->N * sizeof(float), sizeof(float), -FLT_MAX, FLT_MAX);
 }
-/* RHS pack: our int8 rows and our per-row scales, verbatim. No requantization. */
 static void *kai_i8_pack_rhs(const weights_t *w, size_t nr, size_t kr, size_t sr,
                              size_t *bytes, double *ns) {
     *bytes = kai_get_rhs_packed_size_rhs_pack_nxk_qsi8cxp_qsi8cx_neon((size_t)w->N, (size_t)w->K, nr, kr, sr);
@@ -384,7 +321,7 @@ static void *kai_i8_pack_rhs(const weights_t *w, size_t nr, size_t kr, size_t sr
     *ns = now_ns() - t0;
     return p;
 }
-#endif /* KAI_HAVE_INT8 */
+#endif
 
 #if KAI_HAVE_BF16
 typedef struct {
@@ -392,8 +329,6 @@ typedef struct {
     struct kai_matmul_clamp_f32_bf16p_bf16p_ukernel uk;
     void (*lhs_pack)(size_t, size_t, size_t, size_t, size_t, size_t, const void *, size_t, void *);
     size_t (*lhs_size)(size_t, size_t, size_t, size_t, size_t);
-    /* The 1x4 LHS packer asserts `m == 1` (kai_lhs_quant_pack_bf16p1x4_f32_neon.c:59),
-     * so that candidate is GEMV-only. Without this gate the whole bf16 pass aborts. */
     int only_m1;
 } kai_bf_cand_t;
 static kai_bf_cand_t KAI_BF[] = {
@@ -434,9 +369,6 @@ static void kai_bf_task(size_t tid, size_t nt, void *vc) {
     j->c->uk.run_matmul((size_t)j->M, n1 - n0, (size_t)j->K, j->lhs_p, rhs, dst,
                         (size_t)j->N * sizeof(float), sizeof(float), -FLT_MAX, FLT_MAX);
 }
-/* The only f32-source RHS packer KleidiAI ships for this family is KxN and our
- * weights are NxK, so the pack transposes. Load-time only; it is why this column
- * is large and why the bf16 slice is a bigger integration than the int8 one. */
 static void *kai_bf_pack_rhs(const weights_t *w, size_t nr, size_t kr, size_t sr,
                              size_t *bytes, double *ns) {
     *bytes = kai_get_rhs_packed_size_rhs_quant_pack_kxn_bf16p12x4biasf32_f32_neon(
@@ -455,9 +387,8 @@ static void *kai_bf_pack_rhs(const weights_t *w, size_t nr, size_t kr, size_t sr
     free(bias); free(WkxN);
     return p;
 }
-#endif /* KAI_HAVE_BF16 */
+#endif
 
-/* ── one (shape, B) cell ───────────────────────────────────────────────────────── */
 static int g_threads = 1, g_reps = 5, g_iters = 0, g_check = 1;
 
 static int iters_for(double macs) {
@@ -487,7 +418,7 @@ static void cell(const shape_t *S, const weights_t *w, int B, int int8) {
     base.N = w->N; base.K = w->K; base.B = B; base.threads = g_threads;
     base.calls_per_frame = S->calls_per_frame;
 
-    bench_our(int8, w, Xkb, Y, B, 1, 1);   /* warm the pool with the timed call */
+    bench_our(int8, w, Xkb, Y, B, 1, 1);
     double ours = bench_our(int8, w, Xkb, Y, B, it, g_reps);
     {
         row_t r = base;
@@ -517,7 +448,7 @@ static void cell(const shape_t *S, const weights_t *w, int B, int int8) {
         float *lhsT = (float *)xaligned((size_t)B * w->K * sizeof(float));
         float *D    = (float *)xaligned((size_t)B * w->N * sizeof(float));
 
-        for (int mode = 0; mode < 2; mode++) {   /* 0 = native, 1 = xpose drop-in */
+        for (int mode = 0; mode < 2; mode++) {
             double *tg = (double *)xaligned((size_t)g_reps * sizeof(double));
             double *tp = (double *)xaligned((size_t)g_reps * sizeof(double));
             double *tk = (double *)xaligned((size_t)g_reps * sizeof(double));
@@ -627,11 +558,6 @@ static void cell(const shape_t *S, const weights_t *w, int B, int int8) {
     free(Xbk); free(Xkb); free(Y); free(Yk); free(dst); free(Xtm);
 }
 
-/* ── QKV shared-LHS ────────────────────────────────────────────────────────────
- * Q, K and V are three PHYSICALLY SEPARATE matrices sharing one activation. The Code
- * Predictor calls qwen_batch_proj_q three times on the same x_norm
- * (qwen_tts_code_predictor.c:1086-1088), so it quantizes that activation THREE TIMES
- * per layer per pass. This measures what one shared quantize+pack is worth. */
 static void qkv_pass(const char *comp, int Nq, int Nk, int K, const int *BS, int nBS) {
 #if !KAI_HAVE_INT8
     (void)comp; (void)Nq; (void)Nk; (void)K; (void)BS; (void)nBS;
@@ -641,7 +567,6 @@ static void qkv_pass(const char *comp, int Nq, int Nk, int K, const int *BS, int
     for (int bi = 0; bi < nBS; bi++) {
         int B = BS[bi];
         if (B <= 0) continue;
-        /* One candidate: the census already picked the winner per B. */
         kai_i8_cand_t *cd = &KAI_I8[B == 1 ? 1 : 3];
         const size_t mr = cd->uk.get_mr(), nr = cd->uk.get_nr();
         const size_t kr = cd->uk.get_kr(), sr = cd->uk.get_sr();
@@ -728,9 +653,6 @@ int main(int argc, char **argv) {
     const char *model = "1.7b", *csv_path = NULL;
     int do_int8 = 1, do_bf16 = 1, do_qkv = 1;
     int blist[16] = { 1, 2, 4, 8, 16 }, nb = 5;
-    /* B=5 is in the default prefill list on purpose: the real 21-token flow issues
-     * 16+5, and B=5 cannot be interpolated from B=4 and B=8 - the 8x12 tile pads to
-     * 8 rows either way, so 5 and 8 cost nearly the same while 4 does not. */
     int plist[16] = { 1, 4, 5, 8, 16, 32, 64 }, npf = 7;
 
     for (int i = 1; i < argc; i++) {
@@ -787,9 +709,7 @@ int main(int argc, char **argv) {
             weights_free(&w);
         }
     if (do_qkv) {
-        /* CP: hidden 1024, q_dim 2048, kv_dim 1024 - three separate matrices today. */
         qkv_pass("cp", 2048, 1024, 1024, blist, nb);
-        /* Talker 1.7B: hidden 2048, same q/kv dims - fused today, measured for contrast. */
         if (!is06) qkv_pass("talker", 2048, 1024, 2048, blist, nb);
     }
     if (csv_path) fclose(g_csv);

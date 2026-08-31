@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""ASR-gate: an OBJECTIVE "is this take realistically OK?" judge for emotion seed-audition.
-
-The emotion (anger/sad/...) does NOT change the WORDS, so for a known target sentence a clean take
-transcribes back to (near) that text, while a BROKEN take — gibberish, a code-switch to Chinese, a
-runaway repetition — transcribes to something far from it. So:
-
-    score = CER( asr_transcript , target_text )      (lower = cleaner, more intelligible, right language)
-
-This catches exactly the failures the duration+glitch picker can't see (gibberish at a normal duration,
-language drift). It is ORTHOGONAL to the emotion, so it never penalizes an expressive-but-correct take.
-
-ASR engine: qwen-asr (antirez's pure-C CPU Qwen3-ASR — same family/ethos as qwen-tts, MIT, no Python ML
-deps; transcript on stdout with --silent). Build it (`make blas` in ../qwen-asr) + a model first.
-
-USAGE:
-  tests/audition_asr_gate.py --wav-dir samples/emotion_seeds/italian/ryan \\
-      --text "Domani mattina ci vediamo davanti alla stazione." --lang Italian \\
-      --asr-bin ../qwen-asr/qwen_asr --asr-model ../qwen-asr/qwen3-asr-0.6b
-  # or a single cell's takes by glob:
-  tests/audition_asr_gate.py --wav "samples/.../anger.seed*.wav" --text "..." --lang Italian ...
-
-Per take it prints: seed | CER | OK/BROKEN | transcript. Plus the best (lowest-CER) seed = the
-ASR-recommended pick. Pairs with the in-binary glitch+duration picker (Tier 1); this is Tier 2.
-
-  --self-test   exercise the CER/normalize math with NO model/binary (CI-safe).
-"""
+"""ASR-gate: an OBJECTIVE "is this take realistically OK?" judge for emotion seed-audition."""
 import argparse, glob, os, re, subprocess, sys
 
 

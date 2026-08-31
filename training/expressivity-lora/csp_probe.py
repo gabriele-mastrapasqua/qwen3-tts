@@ -1,35 +1,7 @@
-# CSP-FT step 1/2 — Characteristic-Specific layer PROBING for Qwen3-TTS (arXiv 2501.14273).
-#
-# WHAT: find WHICH Talker layers carry the EMOTION characteristic, so the CSP-FT trainer can fine-tune
-#       ONLY those and FREEZE the rest (incl. the pronunciation/prosody layers) -> clean speech (the paper
-#       gets CER 1.2% vs full-FT 3.9%). This REPLACES our hand-picked band (L16-26 / L0-27) with a
-#       principled, data-driven selection, and removes the need for the disentangle τ subtraction
-#       (freezing the knowledge-rich layers does the protecting instead). See plan_emo_v2.md.
-#
-# HOW (the paper's method): keep the backbone FROZEN. Add a learnable softmax weight-vector W_e over the
-#   (num_layers+1) Talker layer outputs + a tiny emotion classifier. Train ONLY (W_e, classifier) to
-#   predict the emotion label from a softmax-weighted sum of the per-layer hidden states. After training,
-#   softmax(W_e) = per-layer IMPORTANCE for emotion. Select the characteristic-specific layers from it
-#   (paper: highest-weight + lowest-weight = 2 layers; we also report top-k for our own A/B).
-#
-# INPUT: an ENCODED manifest jsonl (rows with `audio_codes`, `emotion`, `language`, optional `instruct`)
-#        — the SAME file the CSP-FT trainer consumes. The probe only READS the model (no weight updates),
-#        so it is cheap. OUTPUT: a small JSON with per-layer weights + the selected layer set, consumed by
-#        gpu_sft_expr_csp.py via --csp-layers.
-#
-# Self-test (NO model, NO data — verifies the probe head learns to pick a planted layer):
-#   python3 csp_probe.py --self-test
-#
-# Real run (on the GPU box, model + encoded data present):
-#   python3 csp_probe.py --train_jsonl /root/qwen-ft/data/multi_emotion_tagged.jsonl \
-#       --init_model_path /root/qwen-ft/models/1.7B-CustomVoice \
-#       --out_json /root/qwen-ft/csp_layers_italian.json --epochs 3 --top_k 2
 import argparse, json, os, random, sys
 import torch
 import torch.nn as nn
 
-
-# ----------------------------------------------------------------------------- probe head (model-free)
 class LayerProbe(nn.Module):
     """Softmax-weighted combination of per-layer hidden states -> emotion classifier.
 
@@ -39,7 +11,7 @@ class LayerProbe(nn.Module):
 
     def __init__(self, n_layers, hidden, n_emotions, p_drop=0.1):
         super().__init__()
-        self.layer_logits = nn.Parameter(torch.zeros(n_layers))  # -> softmax = per-layer importance
+        self.layer_logits = nn.Parameter(torch.zeros(n_layers))
         self.classifier = nn.Sequential(
             nn.LayerNorm(hidden), nn.Dropout(p_drop),
             nn.Linear(hidden, hidden // 2), nn.GELU(),
@@ -50,11 +22,9 @@ class LayerProbe(nn.Module):
         return torch.softmax(self.layer_logits, dim=0)
 
     def forward(self, layer_pooled):
-        # layer_pooled: [B, n_layers, hidden] (each layer already mean-pooled over the audio frames)
-        w = self.weights().view(1, -1, 1)            # [1, n_layers, 1]
-        mixed = (layer_pooled * w).sum(dim=1)        # [B, hidden]
+        w = self.weights().view(1, -1, 1)
+        mixed = (layer_pooled * w).sum(dim=1)
         return self.classifier(mixed)
-
 
 def select_layers(weights, top_k, n_layers):
     """Pick the characteristic-specific layers from per-layer importance.
@@ -64,8 +34,7 @@ def select_layers(weights, top_k, n_layers):
     Paper picks {argmax, argmin}; we return both that pair and a top_k list for our own sweeps.
     """
     w = weights.tolist()
-    # block-only view: indices 1..n_layers-1 of hidden_states map to talker blocks 0..n_layers-2
-    block = [(i - 1, w[i]) for i in range(1, n_layers)]  # (block_idx, weight)
+    block = [(i - 1, w[i]) for i in range(1, n_layers)]
     ranked = sorted(block, key=lambda t: t[1], reverse=True)
     topk = sorted(b for b, _ in ranked[:top_k])
     hi = ranked[0][0]
@@ -74,8 +43,6 @@ def select_layers(weights, top_k, n_layers):
     return {"top_k": topk, "paper_pair": paper_pair,
             "ranked_blocks": [{"layer": b, "weight": round(wt, 5)} for b, wt in ranked]}
 
-
-# ----------------------------------------------------------------------------- real probing (needs model)
 def run_probe(args):
     from accelerate import Accelerator
     from gpu_dataset_expr_lang import TTSDataset
@@ -89,7 +56,7 @@ def run_probe(args):
                                              attn_implementation="eager")
     config = AutoConfig.from_pretrained(args.init_model_path)
     for p in qwen3tts.model.parameters():
-        p.requires_grad = False           # backbone FROZEN — only the probe head trains
+        p.requires_grad = False
     qwen3tts.model.eval()
 
     data = [json.loads(l) for l in open(args.train_jsonl)]
@@ -98,11 +65,9 @@ def run_probe(args):
     acc.print(f"[probe] {len(data)} rows, {len(emos)} emotions: {emos}")
 
     ds = TTSDataset(data, qwen3tts.processor, config)
-    # carry the emotion label alongside the collated batch (collate_fn ignores extra keys per item)
     labels_by_idx = [emo2idx[r["emotion"]] for r in data]
 
     def collate(batch_items):
-        # batch_items are (item_dict, label) — split, collate the dicts, stack labels
         dicts = [b[0] for b in batch_items]
         labs = torch.tensor([b[1] for b in batch_items], dtype=torch.long)
         out = ds.collate_fn(dicts)
@@ -111,14 +76,13 @@ def run_probe(args):
 
     paired = list(zip([ds[i] for i in range(len(ds))], labels_by_idx)) if args.preload else None
     if paired is None:
-        # lazy: wrap indices
         class _Paired(torch.utils.data.Dataset):
             def __len__(self): return len(ds)
             def __getitem__(self, i): return (ds[i], labels_by_idx[i])
         paired = _Paired()
     dl = DataLoader(paired, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
 
-    n_layers = config.talker_config.num_hidden_layers + 1   # +1 for the embedding output
+    n_layers = config.talker_config.num_hidden_layers + 1
     hidden = config.talker_config.hidden_size
     probe = LayerProbe(n_layers, hidden, len(emos), p_drop=args.dropout)
     opt = AdamW(probe.parameters(), lr=args.lr, weight_decay=0.01)
@@ -139,12 +103,11 @@ def run_probe(args):
             with torch.no_grad():
                 out = model.talker(inputs_embeds=emb[:, :-1, :], attention_mask=b["attention_mask"][:, :-1],
                                    output_hidden_states=True)
-            # out.hidden_states[0] = per-layer tuple (matches the trainer's [0][-1] final-layer access)
             hs_tuple = out.hidden_states[0]
             assert len(hs_tuple) == n_layers, f"expected {n_layers} layer outputs, got {len(hs_tuple)}"
-            cm = b["codec_mask"][:, :-1].unsqueeze(-1).to(emb.dtype)   # [B, T-1, 1] — pool over audio frames
-            denom = cm.sum(dim=1).clamp(min=1.0)                       # [B, 1]
-            pooled = torch.stack([(h.to(emb.dtype) * cm).sum(dim=1) / denom for h in hs_tuple], dim=1)  # [B, n_layers, hidden]
+            cm = b["codec_mask"][:, :-1].unsqueeze(-1).to(emb.dtype)
+            denom = cm.sum(dim=1).clamp(min=1.0)
+            pooled = torch.stack([(h.to(emb.dtype) * cm).sum(dim=1) / denom for h in hs_tuple], dim=1)
             logits = probe(pooled.float())
             loss = lossf(logits, b["emotion_label"])
             acc.backward(loss)
@@ -167,18 +130,15 @@ def run_probe(args):
         acc.print(f"[probe] selected paper_pair={sel['paper_pair']} top_k={sel['top_k']} -> {args.out_json}")
         acc.print(json.dumps(result, indent=2))
 
-
-# ----------------------------------------------------------------------------- self-test (model-free)
 def _self_test():
     """Plant emotion signal in ONE layer of synthetic hidden states; the probe must select that layer."""
     torch.manual_seed(0)
     n_layers, hidden, n_emo, N = 8, 64, 4, 512
-    PLANT = 5  # the layer that actually carries the emotion signal (block idx 4 -> hidden idx 5)
-    # build per-sample, per-layer pooled hidden: noise everywhere, signal only in layer PLANT
+    PLANT = 5
     y = torch.randint(0, n_emo, (N,))
     centers = torch.randn(n_emo, hidden) * 3.0
     pooled = torch.randn(N, n_layers, hidden) * 0.5
-    pooled[:, PLANT, :] += centers[y]           # only this layer separates the classes
+    pooled[:, PLANT, :] += centers[y]
     probe = LayerProbe(n_layers, hidden, n_emo, p_drop=0.0)
     opt = torch.optim.AdamW(probe.parameters(), lr=5e-3)
     lossf = nn.CrossEntropyLoss()
@@ -198,7 +158,6 @@ def _self_test():
     assert acc > 0.9, "probe failed to classify the planted signal"
     print("SELF-TEST PASS — probe concentrates weight on the emotion-carrying layer and selects it.")
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true", help="run the model-free sanity check and exit")
@@ -217,7 +176,6 @@ def main():
     if not args.train_jsonl:
         ap.error("--train_jsonl required (or use --self-test)")
     run_probe(args)
-
 
 if __name__ == "__main__":
     main()

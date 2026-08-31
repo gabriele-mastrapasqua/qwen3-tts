@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """Load, validate and resolve a server performance profile.
 
-A profile answers "given this hardware and this objective, how should the engine be run?".
-This turns it into the exact argv and environment, so the recommended values live in ONE
-place instead of being restated in JSON, in shell scripts and in prose - which is how three
-copies start disagreeing.
+A profile answers "given this hardware and this objective, how should the engine be run?"
+and turns it into the exact argv and environment.
 
-    tools/perf_profile.py validate                       # every profile in configs/perf
-    tools/perf_profile.py show      recommended
-    tools/perf_profile.py command   axion-16c-ttfa --model DIR --port 8000
-    tools/perf_profile.py server-env axion-16c-ttfa      # comma form for the harness
-    tools/perf_profile.py check-flags axion-16c-ttfa --log server.log
+    tools/perf_profile.py validate
+    tools/perf_profile.py show       recommended
+    tools/perf_profile.py command    <profile> --model DIR --port 8000
+    tools/perf_profile.py server-env <profile>
+    tools/perf_profile.py check-flags <profile> --log server.log
 
-The last one closes the loop: the engine prints one [FLAGS] line naming every registered
-variable it actually read, and this compares it against what the profile asked for. A flag
+check-flags compares the engine's [FLAGS] line against what the profile asked for: a flag
 is on when the process says so, never when the invocation intended it.
 """
 import argparse, json, os, re, sys
@@ -21,11 +18,8 @@ import argparse, json, os, re, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERF = os.path.join(ROOT, "configs", "perf")
 
-
-# ── a small validator for exactly the constructs schema.json uses ────────────────────
 class Bad(Exception):
     pass
-
 
 def _resolve(schema, root):
     while "$ref" in schema:
@@ -37,7 +31,6 @@ def _resolve(schema, root):
             node = node[part]
         schema = node
     return schema
-
 
 def check(node, schema, root, path="$"):
     schema = _resolve(schema, root)
@@ -103,8 +96,6 @@ def check(node, schema, root, path="$"):
             if "items" in schema:
                 check(v, schema["items"], root, f"{path}[{i}]")
 
-
-# ── profile loading ──────────────────────────────────────────────────────────────────
 def load_raw(name):
     p = name if os.path.sep in name else os.path.join(PERF, f"{name}.json")
     if not p.endswith(".json"):
@@ -114,9 +105,7 @@ def load_raw(name):
     with open(p) as f:
         return json.load(f), p
 
-
 SECTIONS = ("hardware", "build", "server", "streaming", "runtime", "launch", "qualification")
-
 
 def shape_check(raw, path):
     """A profile is either COMPLETE or an ALIAS. Nothing in between: a half-alias that
@@ -132,7 +121,6 @@ def shape_check(raw, path):
         if missing:
             raise Bad(f"{path}: not an alias, so these sections are required: {missing}")
 
-
 def load(name, _seen=None):
     """Resolve aliases. An alias carries a pointer and nothing else."""
     _seen = _seen or []
@@ -146,8 +134,6 @@ def load(name, _seen=None):
         return load(alias, _seen + [pid])
     return prof, path
 
-
-# ── semantic checks the schema cannot express ────────────────────────────────────────
 def semantic(prof, path, engine=None):
     errs = []
     hw, sv = prof["hardware"], prof["server"]
@@ -161,15 +147,11 @@ def semantic(prof, path, engine=None):
         if not re.match(r"^[A-Z][A-Z0-9_]*$", k):
             errs.append(f"environment key {k!r} is not a shell variable name")
         v = spec["value"]
-        # The streaming block holds integers and they are turned into environment values by
-        # environ(); here the schema has already established that a declared value is a
-        # string or null, so a non-string is a schema failure and not this check's business.
         if v is not None and not isinstance(v, str):
             continue
         if v is not None and (v != v.strip() or " " in v or "\t" in v):
             errs.append(f"{k}={v!r} has whitespace; --server-env splits on COMMAS, and a "
                         f"space folds every later variable into this one's value")
-    # a value fixed both on the command line and in the environment is two sources of truth
     cli = {a.split("=", 1)[0] for a in prof["launch"].get("extra_arguments", [])}
     for dup in cli & {"--prefork", "--prefork-threads", "--batch-size"}:
         errs.append(f"{dup} is set in extra_arguments and also in the server section")
@@ -182,7 +164,6 @@ def semantic(prof, path, engine=None):
                                 f"set but never declared, so no run could verify it")
     return errs
 
-
 def engine_known_flags(binary):
     """The variables the engine declares in its [FLAGS] line, read from the source register."""
     src = os.path.join(ROOT, "qwen_tts_kernels.c")
@@ -193,8 +174,6 @@ def engine_known_flags(binary):
     m = re.search(r"g_qwen_reported_flags\[\]\s*=\s*\{(.*?)\};", txt, re.S)
     return set(re.findall(r'"([A-Z0-9_]+)"', m.group(1))) if m else None
 
-
-# ── resolution ───────────────────────────────────────────────────────────────────────
 def argv(prof, model, port):
     sv = prof["server"]
     a = [prof["launch"]["executable"], "-d", model]
@@ -211,14 +190,8 @@ def argv(prof, model, port):
             a += [flag, str(v)]
     return a + prof["launch"].get("extra_arguments", [])
 
-
-# Fields that are declared elsewhere in the profile but reach the engine as environment
-# variables. Without this mapping a value could sit in the file, be read by a human, and
-# never be applied -- which is the same failure as forgetting the value entirely, except
-# harder to notice because the file says the right thing.
 STREAMING_ENV = {"decode_chunk": "QWEN_STREAM_DECODE_CHUNK",
                  "decode_chunk_busy": "QWEN_STREAM_DECODE_CHUNK_BUSY"}
-
 
 def environ(prof):
     env = {k: s["value"] for k, s in prof["runtime"]["environment"].items()
@@ -226,15 +199,11 @@ def environ(prof):
     for key, var in STREAMING_ENV.items():
         v = prof.get("streaming", {}).get(key)
         if isinstance(v, int):
-            # str(): the engine reports its flags as text, and comparing 8 against "8" made
-            # check-flags disagree with a process that was configured exactly as asked.
-            env.setdefault(var, str(v))  # an explicit runtime.environment entry still wins
+            env.setdefault(var, str(v))
     return env
-
 
 def server_env(prof):
     return ",".join(f"{k}={v}" for k, v in sorted(environ(prof).items()))
-
 
 def forbidden_env(prof):
     """Variables the profile declares with a null value: they must be ABSENT, not merely unset
@@ -244,8 +213,6 @@ def forbidden_env(prof):
     profile qualified, and no table would show it."""
     return sorted(k for k, s in prof["runtime"]["environment"].items() if s["value"] is None)
 
-
-# ── commands ─────────────────────────────────────────────────────────────────────────
 def cmd_validate(a):
     files = sorted(f for f in os.listdir(PERF) if f.endswith(".json") and f != "schema.json")
     with open(os.path.join(PERF, "schema.json")) as f:
@@ -272,12 +239,10 @@ def cmd_validate(a):
     print(f"\n{len(files)-bad}/{len(files)} profiles valid")
     return 1 if bad else 0
 
-
 def cmd_show(a):
     prof, path = load(a.name)
     print(json.dumps(prof, indent=2))
     return 0
-
 
 def cmd_command(a):
     prof, _ = load(a.name)
@@ -286,11 +251,9 @@ def cmd_command(a):
     print((line + " " if line else "") + " ".join(argv(prof, a.model, a.port)))
     return 0
 
-
 def cmd_server_env(a):
     print(server_env(load(a.name)[0]))
     return 0
-
 
 def cmd_new(a):
     """Emit a skeleton for a new deployment, with everything unmeasured marked as such.
@@ -301,17 +264,13 @@ def cmd_new(a):
     a field a decision.
     """
     ref, _ = load(a.like)
-    out = json.loads(json.dumps(ref))          # deep copy, then blank what is not portable
+    out = json.loads(json.dumps(ref))
     out["profile"]["id"] = a.name
     out["profile"]["description"] = ("FILL IN: what this deployment is, and note that every value "
                                      "here must come from a measurement on it.")
     hw = out["hardware"]
     for k in ("cpu_family", "notes"):
         hw[k] = "unspecified"
-    # The counts keep the reference's shape rather than becoming zero: a skeleton that fails
-    # `validate` cannot sit in the tree while someone fills it in, and the honesty lives in
-    # qualification.status rather than in an invalid number. The description says to replace
-    # them, and the sweep is what replaces them.
     hw["notes"] = ("PLACEHOLDER counts, copied from the reference profile for shape only. Replace "
                    "them with what this machine reports before anything here is quoted.")
     out["qualification"] = {
@@ -334,13 +293,11 @@ def cmd_new(a):
     print("next: edit it, then `tools/perf_profile.py validate`")
     return 0
 
-
 def cmd_forbidden_env(a):
     """Print the variables that must not be present in the environment of a qualifying run."""
     for k in forbidden_env(load(a.name)[0]):
         print(k)
     return 0
-
 
 def cmd_check_flags(a):
     prof, _ = load(a.name)
@@ -366,7 +323,6 @@ def cmd_check_flags(a):
     print(f"ok: engine declares {' '.join(f'{k}={v}' for k, v in sorted(seen.items()))}")
     return 0
 
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -391,7 +347,6 @@ def main():
     except Bad as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
-
 
 if __name__ == "__main__":
     sys.exit(main())

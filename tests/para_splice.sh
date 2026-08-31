@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# REAL-AUDIO SPLICE (option-2 splice variant, 2026-06-26): for events the model CAN'T synthesize
-# (cough/sneeze/sniff/throat-clear), splice a REAL VocalSound clip at the [tag] position. Method-1
-# macro with real audio: synth the sentence split at the tag, concat pre + real-clip(xfade+RMS-match)
-# + post.  -> samples/para_splice/
 set -uo pipefail
 cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
 O=samples/para_splice; rm -rf $O; mkdir -p $O
@@ -12,7 +8,6 @@ vf(){ case "$1" in galatea) echo "--load-voice voices/galatea_graft.qvoice --icl
 ew(){ [ "$1" = galatea ] && echo 1.0 || echo 1.2; }
 synth(){ ./qwen_tts -d $M $(vf "$1") -l Italian --seed $SEED -T 1.0 --expr $IT --expr-weight $(ew "$1") --text "$2" -o "$3" >/dev/null 2>&1; }
 
-# event | clip | sentence-before-tag | sentence-after-tag
 EVENTS=(
 "cough|cough_1|Scusatemi un momento,|devo schiarirmi la voce prima di continuare."
 "sneeze|sneeze_1|Aspetta un attimo,|scusa, non riesco proprio a trattenermi."

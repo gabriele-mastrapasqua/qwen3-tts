@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# 2nd-clone generalization test: es_quijote (Spanish male) cloned at 1.7B, speaking ITALIAN, with the emotion
-# levers (cross-lingual clone + emotion). Clone = voices/quijote_graft.qvoice (25MB, born lite from --save-voice).
-# CLEAN + decay 0.985 default. seed 42, T1.1.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 IT=presets/expr/italian_csp_topk6.expr; D=samples/emo_retest_0622; O=samples/quijote_matrix; mkdir -p $O

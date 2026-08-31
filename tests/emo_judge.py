@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
-"""Score generated TTS clips with the categorical SER JUDGE -> a RECOGNIZABILITY table (intended vs
-recognized), so we rank emotion .expr variants FAST without listening to every clip (listen only to the
-winners). This is the Catania/Emoty loop: SER as the referee of how well an emotion was expressed.
-
-Pairs with tests/train_ser_judge.py (which trains the 7-class Italian judge on Emozionalmente).
-
-INPUT: clips whose INTENDED emotion is known. Two ways:
-  --wav-dir DIR     every file stem is the intended emotion: anger.wav joy.wav sad.wav ... (one variant)
-  --wav anger=path  repeatable explicit pairs
-Compare variants by running once per dir (e.g. samples/judge/{all,smart,tau_wide}/), or pass --tag to label.
-
-OUTPUT: per intended emotion -> predicted label + confidence + hit/miss; overall accuracy + UAR
-(unweighted avg recall, Catania's metric); confusion matrix. Higher UAR = the emotions come through
-more recognizably -> the better .expr.
-
-Run (CPU ok): python3 emo_judge.py --model ser_judge_it --wav-dir samples/judge/csp --tag csp
-Self-test (no model): python3 emo_judge.py --self-test
-"""
+"""Score generated TTS clips with the categorical SER JUDGE -> a RECOGNIZABILITY table (intended vs"""
 import argparse, glob, os, sys, collections
 
 LABELS = ["anger", "disgust", "fear", "joy", "neutral", "sadness", "surprise"]
-
 
 def _intended_from_name(path):
     """Pick the intended emotion from a filename (stem, or any LABEL token in it)."""
@@ -31,16 +13,14 @@ def _intended_from_name(path):
     for t in toks:
         if t in LABELS:
             return t
-    # aliases sometimes used in our gen scripts
     alias = {"happy": "joy", "happiness": "joy", "neutrality": "neutral", "sad": "sadness", "angry": "anger"}
     for t in toks + [stem]:
         if t in alias:
             return alias[t]
     return None
 
-
 def _collect(args):
-    items = []  # (intended, path)
+    items = []
     if args.wav_dir:
         for p in sorted(glob.glob(os.path.join(args.wav_dir, "*.wav"))):
             emo = _intended_from_name(p)
@@ -53,12 +33,11 @@ def _collect(args):
         items.append((emo.strip().lower(), path))
     return items
 
-
 def _print_table(results, tag):
     """results: list of (intended, predicted, confidence)."""
     hits = sum(1 for i, p, _ in results if i == p)
     n = len(results)
-    per = collections.defaultdict(lambda: [0, 0])  # intended -> [hit, total]
+    per = collections.defaultdict(lambda: [0, 0])
     conf = collections.defaultdict(collections.Counter)
     for i, p, _ in results:
         per[i][1] += 1; per[i][0] += int(i == p); conf[i][p] += 1
@@ -72,7 +51,6 @@ def _print_table(results, tag):
     print("-" * 34)
     print(f"accuracy {hits}/{n} = {hits/max(n,1):.2f}   UAR = {uar:.2f}")
     return {"tag": tag, "n": n, "acc": hits / max(n, 1), "uar": uar}
-
 
 def judge(args):
     import numpy as np
@@ -106,13 +84,11 @@ def judge(args):
             results.append((intended, str(id2lab[k]).lower(), float(prob[k])))
     _print_table(results, args.tag)
 
-
 def _self_test():
     assert _intended_from_name("anger.wav") == "anger"
     assert _intended_from_name("ryan_joy_csp.wav") == "joy"
-    assert _intended_from_name("happy.wav") == "joy"        # alias
+    assert _intended_from_name("happy.wav") == "joy"
     assert _intended_from_name("clip_0001.wav") is None
-    # table aggregation: 5/7 correct -> sane acc/uar
     fake = [("anger", "anger", .9), ("joy", "joy", .8), ("fear", "anger", .5),
             ("sadness", "sadness", .7), ("disgust", "disgust", .6),
             ("surprise", "surprise", .8), ("neutral", "sadness", .4)]
@@ -120,7 +96,6 @@ def _self_test():
     assert abs(s["acc"] - 5/7) < 1e-6, "accuracy aggregation wrong"
     assert 0 < s["uar"] <= 1.0
     print("SELF-TEST PASS — filename->intended parsing + recognizability/UAR aggregation correct.")
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -135,7 +110,6 @@ def main():
     if not a.model:
         ap.error("--model required (the trained judge dir) — or use --self-test")
     judge(a)
-
 
 if __name__ == "__main__":
     main()
