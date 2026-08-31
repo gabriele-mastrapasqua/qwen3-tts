@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contrast QWEN_ACT_MAP fingerprints — where, layer by layer, an instruct/emotion"""
+"""Contrast QWEN_ACT_MAP fingerprints layer by layer."""
 import struct, sys, argparse, math
 
 MAGIC = 0x504D4151

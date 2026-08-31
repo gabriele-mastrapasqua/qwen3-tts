@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emotion TASK VECTOR via FLOAT weight arithmetic (the pro method, arXiv 2507.03382):"""
+"""Emotion task vector via float weight arithmetic."""
 import argparse, os, struct, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

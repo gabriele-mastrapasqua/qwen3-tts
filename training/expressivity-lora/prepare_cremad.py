@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CREMA-D -> train_raw.jsonl in the SAME schema as EMOVO (gpu_emovo_prep.py) / ESD (prepare_esd.py),"""
+"""CREMA-D -> train_raw.jsonl, in the same schema as the other prepare_* loaders."""
 import os, json, argparse, subprocess, sys, tempfile, collections, time
 
 REPO = "yukat237/emotional-speech-audio-dataset-3eng-4noneng"

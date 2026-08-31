@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 O=samples/emo_paraling_suite; mkdir -p $O
 D=samples/emo_retest_0622
 IT=presets/expr/italian_csp_topk6.expr

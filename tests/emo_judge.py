@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score generated TTS clips with the categorical SER JUDGE -> a RECOGNIZABILITY table (intended vs"""
+"""Score generated clips with the categorical SER judge into a recognizability table."""
 import argparse, glob, os, sys, collections
 
 LABELS = ["anger", "disgust", "fear", "joy", "neutral", "sadness", "surprise"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concatenate several *_with_codes.jsonl manifests into ONE multi-speaker training file, with"""
+"""Concatenate several *_with_codes.jsonl manifests into one multi-speaker training file."""
 import os, json, argparse, collections, sys
 
 REQUIRED = ("text", "instruct", "emotion", "actor", "audio_codes")

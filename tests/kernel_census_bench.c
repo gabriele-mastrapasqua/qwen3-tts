@@ -1,4 +1,4 @@
-/* kernel_census_bench.c — shape-aware kernel census: OUR kernels vs Arm KleidiAI, */
+/* kernel_census_bench.c - shape-aware kernel census against Arm KleidiAI */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

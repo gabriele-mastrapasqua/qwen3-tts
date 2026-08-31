@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interpretable ACOUSTIC emotion-distance: how far each emotion sits from a voice's own"""
+"""Interpretable acoustic emotion distance from a voice's own neutral."""
 import sys, json, argparse, math
 import numpy as np, librosa
 

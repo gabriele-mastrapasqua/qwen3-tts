@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatic emotion scoring via a pre-trained Speech-Emotion-Recognition model — replaces listening"""
+"""Automatic emotion scoring via a pre-trained speech-emotion-recognition model."""
 import argparse, glob, os, sys
 import numpy as np
 

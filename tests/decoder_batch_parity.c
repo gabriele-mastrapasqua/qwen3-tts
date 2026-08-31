@@ -1,4 +1,4 @@
-/* decoder_batch_parity.c — does the CROSS-SLOT BATCHED streaming decoder produce the */
+/* decoder_batch_parity.c - does the cross-slot batched streaming decoder match the reference */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

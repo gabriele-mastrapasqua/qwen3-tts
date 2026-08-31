@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract a tiny `<lang>.expr` micro-file = (expr - base) delta on ONLY the"""
+"""Extract a tiny <lang>.expr micro-file as the (expr - base) delta."""
 import argparse, json, os, struct, sys
 import numpy as np
 import lz4.block

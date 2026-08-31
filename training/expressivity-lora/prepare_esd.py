@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ESD (Emotional Speech Dataset, Zhou et al.) -> train_raw.jsonl in the SAME schema as EMOVO"""
+"""ESD (Emotional Speech Dataset) -> train_raw.jsonl, in the same schema as the other prepare_* loaders."""
 import os, glob, json, argparse, subprocess, sys
 
 EMO = {

@@ -1,4 +1,4 @@
-/* decode_quantum_bench.c — how long does ONE batched speech-decode call hold the */
+/* decode_quantum_bench.c - how long one batched speech-decode call holds the thread pool */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a PEFT LoRA adapter (route-b, ~16MB) into a `.expr` micro-file the C engine"""
+"""Convert a PEFT LoRA adapter into a .expr micro-file the C engine can load."""
 import argparse, json, os, struct, sys
 import numpy as np
 

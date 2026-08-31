@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 O=samples/para_vectors; mkdir -p $O
 M=qwen3-tts-1.7b
 IT=presets/expr/italian_csp_topk6.expr

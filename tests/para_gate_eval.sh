@@ -2,7 +2,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GPU="${GPU:-gpubox}"
-REMOTE_OUT="/home/gabriele/qwen-ft/out_para_step1_lr2e6_s031"
+REMOTE_OUT="${REMOTE_HOME:-$HOME}/qwen-ft/out_para_step1_lr2e6_s031"
 EP="${1:-final}"
 W="${2:-1.0}"
 ADIR="adapter-${EP}"

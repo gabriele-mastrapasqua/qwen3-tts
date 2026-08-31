@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emozionalmente -> train_raw.jsonl in the SAME schema as EMOVO (gpu_emovo_prep.py) / CREMA-D"""
+"""Emozionalmente -> train_raw.jsonl, in the same schema as the other prepare_* loaders."""
 import os, json, argparse, subprocess, tempfile, collections, time, sys, io
 
 HF_REPO = "amu-cai/CAMEO"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a multi-layer Talker steer (.qlsteer) from two QWEN_ACT_MAP captures:"""
+"""Build a multi-layer Talker steer (.qlsteer) from two QWEN_ACT_MAP captures."""
 import struct, sys, argparse, math
 
 QAMP = 0x504D4151

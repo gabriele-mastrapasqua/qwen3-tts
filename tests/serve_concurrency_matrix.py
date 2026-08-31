@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""serve_concurrency_matrix.py — the concurrency matrix that decides whether the KleidiAI"""
+"""Concurrency matrix over a running server."""
 import argparse, json, os, re, signal, socket, statistics, subprocess, sys, threading, time
 import urllib.request
 
