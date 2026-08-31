@@ -1295,11 +1295,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  -r, --rep-penalty <float>  Repetition penalty\n");
                 fprintf(stderr, "  -m, --max-tokens <int>     Max tokens\n");
                 fprintf(stderr, "  --eos-strategy <s>         off|v1|v2|topk - how EOS is helped along:\n");
-                fprintf(stderr, "                             off  = no assist (matches nano-vllm = their prod)\n");
+                fprintf(stderr, "                             off  = no assist at all\n");
                 fprintf(stderr, "                             v1   = proportional ramp (default, historic)\n");
                 fprintf(stderr, "                             v2   = affine ramp, safe on SHORT text\n");
-                fprintf(stderr, "                             topk = lift EOS to k-th logit (their PyTorch;\n");
-                fprintf(stderr, "                                    inert under greedy by construction)\n");
+                fprintf(stderr, "                             topk = lift EOS to the k-th logit, so it\n");
+                fprintf(stderr, "                                    survives top-k; inert under greedy)\n");
                 fprintf(stderr, "  --eos-suppress <n>         leading frames with EOS forbidden (2)\n");
                 fprintf(stderr, "  --eos-fpt <f>              assumed frames per BPE token (3.0)\n");
                 fprintf(stderr, "  --eos-start-mult <f>       ramp starts at this multiple of expected (2.0)\n");

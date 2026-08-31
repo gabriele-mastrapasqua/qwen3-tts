@@ -30,10 +30,10 @@ int qwen_verbose = 0;
  * silently pick one of them. */
 const char *qwen_tts_eos_strategy_name(int strategy) {
     switch (strategy) {
-        case QWEN_EOS_OFF:  return "off";   /* = nano-vllm, i.e. their production */
+        case QWEN_EOS_OFF:  return "off";
         case QWEN_EOS_V1:   return "v1";    /* historic proportional ramp          */
         case QWEN_EOS_V2:   return "v2";    /* affine ramp (fixed overhead added)  */
-        case QWEN_EOS_TOPK: return "topk";  /* = their PyTorch EosBoost processor  */
+        case QWEN_EOS_TOPK: return "topk";
         default:            return "?";
     }
 }
@@ -1976,19 +1976,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         if (ctx->eos_strategy != QWEN_EOS_OFF && frame < ctx->eos_suppress_frames)
             ctx->logits[QWEN_TTS_CODEC_EOS] = -1e30f;
 
-        /* ── EOS assist, switchable ─────────────────────────────────────────
-         * There is nothing to "conform" to: their PyTorch path and their
-         * production runtime disagree with each other. Measurements behind V2:
-         */
+        /* ── EOS assist, switchable: reference implementations disagree ─────── */
         if (ctx->eos_strategy == QWEN_EOS_V1 || ctx->eos_strategy == QWEN_EOS_V2) {
-            /* V1 assumes the clip length scales with the token count. It does
-             * not: onset and leading/trailing silence are FIXED cost. Measured
-             * on a finetuned pool checkpoint, the real ratio is 5.75
-             * frames per token on a 4-token text but 3.19 on a 62-token one, so
-             * a purely proportional threshold sits right on top of short clips
-             * — "Abeg wait." generated 23 frames against a V1 threshold of 24.
-             * V2 adds that fixed overhead K back, which is what makes the
-             * threshold track reality at both ends. */
+            /* V1 assumes clip length scales with the token count. It does not: onset and
+             * leading/trailing silence are a FIXED cost. Measured, the real ratio is 5.75
+             * frames per token on a 4-token text against 3.19 on a 62-token one, so a
+             * purely proportional threshold sits right on top of short clips. V2 adds that
+             * fixed overhead back, which is what makes it track reality at both ends. */
             float expected = (ctx->eos_strategy == QWEN_EOS_V2)
                 ? (float)ctx->eos_overhead_frames + text_content_len * ctx->eos_frames_per_token
                 : text_content_len * ctx->eos_frames_per_token;
@@ -1999,10 +1993,9 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                 ctx->logits[QWEN_TTS_CODEC_EOS] += boost;
             }
         } else if (ctx->eos_strategy == QWEN_EOS_TOPK) {
-            /* Their PyTorch EosBoostLogitsProcessor: from step `suppress_frames`
-             * onward, lift EOS *to* the k-th highest logit when it sits below,
-             * so it survives top-k filtering. NOTE: under greedy this cannot
-             * change the argmax — the k-th logit is never the maximum — so it is
+            /* From step `suppress_frames` onward, lift EOS *to* the k-th highest logit
+             * when it sits below, so it survives top-k filtering. NOTE: under greedy this
+             * cannot change the argmax — the k-th logit is never the maximum — so it is
              * inert by construction unless sampling. Kept for parity work. */
             if (frame >= ctx->eos_suppress_frames) {
                 float top[64];
@@ -3258,7 +3251,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
      * placed at the single boundary where the new slot's first chunk can still join the
      * batched decode call of the CURRENT iteration.
      * Diagnostic, one request per iteration, and it changes nothing when unset.
-     * See docs/bench/2026-08-26-NEXT2E-step3e-admission-point-design.md. */
+     */
     int admit_m1 = (getenv("QWEN_ADMIT_M1") && atoi(getenv("QWEN_ADMIT_M1")) != 0);
     long long m1_admitted = 0, m1_rejected = 0, m1_cancelled = 0, m1_first_audio = 0;
     /* Why M1 did NOT fire is as much an observation as why it did: a scan that found no
@@ -3382,10 +3375,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
       if (e && atoi(e) > 0) g_stream_dec_chunk = atoi(e);
       if (g_stream_dec_chunk > 32) g_stream_dec_chunk = 32; }
 
-    /* S17 · THE TWO LEVERS vLLM-Omni USES ON THE SAME STAGE, made measurable here.
-     *
-     * Their Code2Wav does exactly what our speech decoder does, and their design doc
-     * names two knobs we did not have:
+    /* Two levers that the same stage takes elsewhere, made measurable here. A
+     * non-autoregressive codec decoder has the same shape as this speech decoder, and two
+     * knobs this engine did not have:
      *
      *   (a) a chunk that is much LONGER than ours in steady state (codec_chunk_frames
      *       = 25 frames, ~2 s of audio, against our 8), because a non-autoregressive
@@ -4090,7 +4082,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
          * sooner. Admitting AFTER the decode call (or anywhere else) buys nothing: the
          * first chunk would wait for the next iteration regardless, and the only thing
          * that moved would be the queue-time label. See §2-3 of
-         * docs/bench/2026-08-26-NEXT2E-step3e-admission-point-design.md.
+         * measured over every request of a full run.
          *
          * WHAT IT DELIBERATELY DOES NOT TOUCH. Decoder placement, decoder batching and the
          * gang policy, batch capacity, the prefill policy, cancellation, and the order the
@@ -4098,7 +4090,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
          * decode call that was going to happen anyway.
          *
          * THE COST, measured before this was written: the narrow pass is 9.53-9.63 ms p95
-         * and is 98.8 % Code Predictor (docs/bench/2026-08-26-NEXT2E-step3e0-killfirst.md).
+         * and is 98.8 % Code Predictor.
          * Its time is charged to pf_m1 and handed back to the enclosing pf_decode mark, so
          * the decode line keeps meaning "decode".
          *

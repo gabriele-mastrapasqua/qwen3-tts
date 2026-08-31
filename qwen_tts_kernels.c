@@ -8577,7 +8577,7 @@ typedef struct {
 
 /* Kernels this BINARY could dispatch for a format, in dispatcher order. The #if set
  * mirrors qwen_matmat_{bf16,int8,q4_0} exactly; the qwen_amx_*_ready() calls mirror
- * their runtime capability check, so an AMX build on a pre-5.16 kernel lists no AMX
+ * the runtime capability check, so an AMX build on a pre-5.16 kernel lists no AMX
  * row instead of listing one that cannot fire. */
 static int qtune_kernels(int fmt, qtune_kres_t *out) {
     int n = 0;

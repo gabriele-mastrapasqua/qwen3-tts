@@ -125,7 +125,7 @@ galatea** (`3× eh eh eh`) — do NOT use `ahh` s7 as a universal sigh. `ahh` s2
 
 ---
 
-## ✅ FINAL inline `[tag]` mapping — SHIPPED in main.c (commit 2a6d661, 2026-07-01)
+## ✅ FINAL inline `[tag]` mapping — SHIPPED in main.c (2026-07-01)
 The **user writes the friendly tag `[laugh]`/`[sigh]`**; the engine rewrites it under the hood to the
 onomatopoeia below, **COMMA-DELIMITED** (`", onom, "` — the pause that makes it a discrete event), pins the
 validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`para_inline_substitute` in main.c.)

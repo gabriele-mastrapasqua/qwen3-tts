@@ -3,8 +3,8 @@
 # vps_validate.sh — turnkey AVX-512/VNNI validation for a rented x86 VPS.
 #
 # Validates the UNVALIDATED AVX-512 kernels written 2026-06-04 (PLAN 21.3):
-#   - VNNI native int8 dot   (_mm512_dpbusd_epi32, SIMD=avx512vnni, commit d67648a)
-#   - __m512 16-wide bf16 matvec (commit b89f30e)
+#   - VNNI native int8 dot   (_mm512_dpbusd_epi32, SIMD=avx512vnni)
+#   - __m512 16-wide bf16 matvec
 # The Ryzen 7 6800H is AVX2-only and CAN'T run these — needs a Zen4+/Intel box
 # with AVX-512 (ideally a V-cache chip like a 9950X3D → likely sub-1.0 RTF).
 #

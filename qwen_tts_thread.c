@@ -358,7 +358,7 @@ static int qwen_pool_spin(void) {
  * not worse - and there is none in any shipping configuration. It becomes interesting
  * where the freed cores have a beneficiary (multi-process topologies, co-tenancy), which
  * is not measured. QWEN_POOL_NARROW=1 turns it on.
- * Numbers: docs/bench/2026-08-24-arm-vllm-audit/todo1-idle-workers.md */
+ */
 static int qwen_pool_narrow(void) {
     static int v = -1;
     if (v < 0) {

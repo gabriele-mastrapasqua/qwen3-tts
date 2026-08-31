@@ -47,7 +47,7 @@ void qwen_kleidi_stats(int *n_packed, size_t *bytes);
  * -- and the ACTIVATION quantizer, which KleidiAI does inside its LHS pack
  * (asymmetric min/max with a zero point per row, against our symmetric amax/127).
  * Measured equivalent to within 3% of the relative error, Kleidi marginally better:
- * docs/bench/2026-08-23-axion-kernel-census.
+ * measured by the per-shape kernel census.
  *
  * `key` is the int8 weight pointer the engine's kernels are called with. */
 int qwen_kleidi_register_i8(const void *key, const int8_t *W, const float *scale,

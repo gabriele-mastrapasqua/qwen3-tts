@@ -2205,7 +2205,7 @@ void qwen_batch_proj_q(float *dst,
 /* ── One QKV, one pack, one barrier — the B>=2 twin of qwen_kleidi_matmul_i8_qkv ──
  * Q, K and V read the SAME activation. Called through qwen_batch_proj_q they pack it
  * three times and pay three fork-join barriers; measured on the batched server that is
- * 26.0% of all dispatches (docs/bench/2026-08-24-arm-vllm-audit/todo1-idle-workers.md).
+ * 26.0% of all dispatches, measured.
  *
  * Declines - and falls back to exactly the three calls it replaces - unless every
  * condition the fused kernel needs holds: int8 weights, no q4, batching actually on,

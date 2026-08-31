@@ -53,18 +53,16 @@
 #define QWEN_TTS_CODEC_THINK_EOS     2157
 
 /* ── EOS strategies ─────────────────────────────────────────────────────────
- * There is no single upstream behaviour to conform to. Measured 2026-08-14 on
- * a downstream stack: upstream Qwen has no EOS assist; that PyTorch path
- * adds EosBoostLogitsProcessor (their own patch, commit 54447c3, described as
- * an "inference safety net" — and a no-op under greedy, since lifting EOS to
- * the top-k boundary can never make it the argmax); their PRODUCTION runtime
- * (nano-vllm) has none at all. So this is a switch, not a constant.
- * So this is a switch with a documented default, not a constant. */
+ * There is no single behaviour to conform to. Reference implementations differ: some
+ * apply no EOS assist at all, others lift the EOS logit toward the top-k boundary so it
+ * survives filtering. The second is inert under greedy decoding by construction — the
+ * k-th logit is never the argmax — so it changes nothing unless you are sampling.
+ * A constant would silently pick one of them, so this is a switch with a default. */
 typedef enum {
-    QWEN_EOS_OFF  = 0,  /* no assist — matches nano-vllm, i.e. their production */
+    QWEN_EOS_OFF  = 0,  /* no assist at all                                     */
     QWEN_EOS_V1   = 1,  /* historic: ramp from start_mult * (tokens * fpt)      */
     QWEN_EOS_V2   = 2,  /* affine: ramp from start_mult * (K + tokens * fpt)    */
-    QWEN_EOS_TOPK = 3,  /* lift EOS to the k-th logit, like their PyTorch path  */
+    QWEN_EOS_TOPK = 3,  /* lift EOS to the k-th logit so it survives top-k      */
 } qwen_eos_strategy_t;
 
 const char *qwen_tts_eos_strategy_name(int strategy);

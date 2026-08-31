@@ -58,7 +58,7 @@
 #include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32p_f32.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm.h"
-/* INT8 per-channel: the census winner per B (docs/bench/2026-08-23-axion-kernel-census).
+/* INT8 per-channel: the kernel census winner per B.
  * kr=8 beat kr=4 in every cell, and the 16x4 GEMM tile at B=1 was 0.46-0.55x, so the
  * split is by B and not by dtype. */
 #include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
@@ -441,7 +441,7 @@ void qwen_kleidi_stats(int *n_packed, size_t *bytes) {
  * memory. What changes is the compute engine, and the activation quantizer that
  * KleidiAI fuses into its LHS pack. Measured on Neoverse V2, end-to-end with each
  * side paying only the conversions it actually needs, KleidiAI won 55 of 55 cells
- * at 16 threads (docs/bench/2026-08-23-axion-kernel-census).
+ * at 16 threads, from the kernel census.
  * ════════════════════════════════════════════════════════════════════════════════ */
 
 /* GEMV at B=1, GEMM at B>1. The census made this split, not a guess: the 16x4 GEMM
