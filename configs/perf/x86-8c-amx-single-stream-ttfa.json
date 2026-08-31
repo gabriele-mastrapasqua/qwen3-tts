@@ -14,9 +14,9 @@
   "hardware": {
     "architecture": "x86_64",
     "cpu_family": "Intel Xeon Platinum 8581C",
-    "logical_cpus": 8,
+    "logical_cpus": 16,
     "physical_cores": 8,
-    "threads_per_core": 1,
+    "threads_per_core": 2,
     "numa_nodes": 1,
     "isa_features_used": [
       "avx512f",
@@ -29,7 +29,7 @@
       "amx_int8",
       "amx_bf16"
     ],
-    "notes": "The host exposes 16 logical CPUs for 8 physical cores. This profile assumes SMT siblings are disabled and CPUs 0-7 remain online; verify that state before launch."
+    "notes": "The host exposes 16 logical CPUs for 8 physical cores. The qualified single worker is pinned to CPUs 0-7, one sibling per physical core; SMT remains enabled and CPUs 8-15 are outside its affinity. Verify topology before launch."
   },
   "build": {
     "target": "blas",
@@ -51,7 +51,7 @@
     "max_queue": 1,
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
-    "worker_affinity": "one process on CPUs 0-7"
+    "worker_affinity": "one process on CPUs 0-7, one logical sibling per physical core"
   },
   "streaming": {
     "first_chunk_ramp": [1, 2, 4],
@@ -68,9 +68,9 @@
     },
     "environment": {
       "OPENBLAS_NUM_THREADS": {
-        "value": "8",
-        "why": "Matches the eight compute threads assigned to the single worker in this profile.",
-        "revert": "unset to let the engine size OpenBLAS per worker"
+        "value": null,
+        "why": "Must be absent so the engine can size OpenBLAS per phase from the worker thread budget.",
+        "revert": "set it explicitly only for a measured override"
       },
       "OPENBLAS_THREAD_TIMEOUT": {
         "value": "1",
