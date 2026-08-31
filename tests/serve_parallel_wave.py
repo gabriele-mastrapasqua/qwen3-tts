@@ -743,7 +743,14 @@ def main():
                 rows.append(row)
                 if C == 1 and not a.no_crosscheck and not crosschecked:
                     crosschecked = True
-                    orc = canonical_ttfa(port, 3, a.speaker, a.language, a.seed,
+                    # THE SAME NUMBER OF REQUESTS AS THE CELL, not a fixed 3.
+                    # Both harnesses take a MEDIAN, and on a mixed-length bank a median over
+                    # three texts is not a median over four: measured on the qualification
+                    # bank at C=1, the four requests were 88, 166, 87 and 103 ms, so three of
+                    # them give 88 and four give 103 — 26 % apart, and the cross-check called
+                    # that a harness disagreement. It was a corpus-subset difference, which is
+                    # exactly what this gate must NOT confuse itself with.
+                    orc = canonical_ttfa(port, a.waves, a.speaker, a.language, a.seed,
                                          a.text_file, a.classes, a.out, f"{label}_{topo}")
                     if orc is None:
                         print("  ⚠️  cross-check: the oracle did not run — TTFA UNVERIFIED",

@@ -6,7 +6,8 @@
  * same cores inside one process — which is precisely the defect this whole audit found in
  * the engine, and reproducing it inside the instrument would make every number a lie.
  * So: same shapes, same protocol (median of 5), same columns, separate process. The
- * KleidiAI side is READ from the design notes
+ * The library side is READ from a previously recorded kernel census rather than re-measured
+ * here, so the two columns cannot disagree about which run they came from
  *
  * PROTOCOL, kept identical to the census
  *   - weights: int8 + ONE f32 scale per output row (our format, verbatim)

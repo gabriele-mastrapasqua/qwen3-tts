@@ -26,7 +26,8 @@ int qwen_verbose = 0;
 
 /* ── EOS strategy names ──────────────────────────────────────────────────────
  * Next to the parser so a new strategy cannot be added without a name.
- * Why this is a switch at all: see the design notes. */
+ * Why this is a switch at all: the upstream implementations disagree, so a constant would
+ * silently pick one of them. */
 const char *qwen_tts_eos_strategy_name(int strategy) {
     switch (strategy) {
         case QWEN_EOS_OFF:  return "off";   /* = nano-vllm, i.e. their production */
@@ -1978,7 +1979,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         /* ── EOS assist, switchable ─────────────────────────────────────────
          * There is nothing to "conform" to: their PyTorch path and their
          * production runtime disagree with each other. Measurements behind V2:
-         * see the design notes. */
+         */
         if (ctx->eos_strategy == QWEN_EOS_V1 || ctx->eos_strategy == QWEN_EOS_V2) {
             /* V1 assumes the clip length scales with the token count. It does
              * not: onset and leading/trailing silence are FIXED cost. Measured

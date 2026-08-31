@@ -59,7 +59,7 @@
  * an "inference safety net" — and a no-op under greedy, since lifting EOS to
  * the top-k boundary can never make it the argmax); their PRODUCTION runtime
  * (nano-vllm) has none at all. So this is a switch, not a constant.
- * Full analysis: the design notes. */
+ * So this is a switch with a documented default, not a constant. */
 typedef enum {
     QWEN_EOS_OFF  = 0,  /* no assist — matches nano-vllm, i.e. their production */
     QWEN_EOS_V1   = 1,  /* historic: ramp from start_mult * (tokens * fpt)      */
@@ -508,7 +508,7 @@ typedef struct qwen_tts_ctx {
     int cp_top_k;
     int greedy_warmup;  /* initial frames sampled greedily (temp=0) for cross-model stability */
 
-    /* EOS strategy — see qwen_eos_strategy_t above and the design notes */
+    /* EOS strategy — see qwen_eos_strategy_t above */
     int   eos_strategy;          /* qwen_eos_strategy_t                              */
     int   eos_suppress_frames;   /* leading frames where EOS is forbidden        (2) */
     float eos_frames_per_token;  /* assumed frames per BPE token               (3.0) */
