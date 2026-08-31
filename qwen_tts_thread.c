@@ -46,6 +46,10 @@ void qwen_parallel_meter_read(double *busy_ms, long long *chunks, long long *dis
     if (chunks)    *chunks    = atomic_load(&g_qp_chunks);
     if (dispatches)*dispatches= atomic_load(&g_qp_dispatches);
 }
+/* Used only by the pthread backend's worker loop, but declared here beside the meter it
+ * feeds. Marked unused so the GCD build, which never calls it, does not warn: moving it
+ * inside the other branch would separate it from the counters it exists for. */
+__attribute__((unused))
 static inline long long qp_now_us(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (long long)t.tv_sec * 1000000LL + t.tv_nsec / 1000;
