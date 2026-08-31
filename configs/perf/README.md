@@ -93,6 +93,8 @@ Individual rungs remain available for investigation. The suite is the gate for a
 |---|---|---|
 | `axion-16c-ttfa` | **qualified** | a 16-core Arm host, measured end to end: topology, thread split, batch width, runtime environment and the concurrency band the claim covers |
 | `generic-16c-starting-point` | **unqualified** | a place to START on a 16-core Arm server. Nothing in it was measured on your machine, and it says so in its own `qualification.notes` |
+| `x86-8c-amx-single-stream-ttfa` | **provisional** | an 8-core Intel AMX host, latency-first single-stream topology |
+| `x86-8c-amx-multiclient-ttfa` | **provisional** | the same host, a four-worker concurrent low-TTFA topology |
 | `recommended` | alias | resolves to the qualified one; carries no values of its own |
 
 There is deliberately no profile per machine type we have ever touched. A profile claims

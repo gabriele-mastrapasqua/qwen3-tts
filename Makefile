@@ -644,8 +644,9 @@ bench-suite: $(TARGET)
 	  --bank-real $(BENCH_BANK) --out $(BENCH_OUT) \
 	  $(if $(BENCH_RUNG),--only $(BENCH_RUNG),) $(BENCH_ARGS)
 
-PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c
-PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I.
+PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c \
+             qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I. -I$(INGOT_DIR)/include $(KAI_INC)
 check-matmat-parity:
 	@echo "=== matmat parity — ISA nativa ==="
 ifeq ($(UNAME_S),Darwin)

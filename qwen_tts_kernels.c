@@ -207,6 +207,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
     "QWEN_NO_AMX", "QWEN_NO_VNNI", "QWEN_NO_SDOT", "QWEN_NO_BF16DOT",
+    "QWEN_NO_VNNI_TILE",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_TTFA_PRIORITY",
     "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_AMX_MIN_B", "QWEN_VNNI_MIN_B", "QWEN_BATCH_STATS", "QWEN_THP", "QWEN_POOL_SPIN",
@@ -271,6 +272,9 @@ void qwen_caps_report(void *out) {
     fprintf(f, "  int8 dot:         widen->FMA (AVX2; no VNNI)\n");
 #else
     fprintf(f, "  int8 dot:         dequant->FMA (no SDOT/VNNI)\n");
+#endif
+#if defined(__AVX512VNNI__)
+    fprintf(f, "  VNNI GEMM tile:   MR=4/NR=4 for B=2..4; MR=2/NR=4 for compact B=5..8\n");
 #endif
 #if defined(__AVX512BF16__)
     fprintf(f, "  bf16 dot:         VDPBF16PS _mm512_dpbf16_ps (native; QWEN_NO_BF16DOT=1 disables)\n");
@@ -1632,10 +1636,10 @@ static void qwen_mm_force_kernel(int mmk) {
 static int qwen_mm_use(int mmk, int B, int rows, int cols) QWEN_MAYBE_UNUSED;
 static int qwen_mm_use(int mmk, int B, int rows, int cols) {
     if (mmk <= 0 || mmk >= QWEN_MMK_COUNT) return 0;
-    int force = atomic_load_explicit(&g_mm_force, memory_order_relaxed);
-    if (force != 0) return force == mmk;
     const qwen_mm_gate_t *g = &g_mm_gate[mmk];
     if (g->max_b == 0) return 0;
+    int force = atomic_load_explicit(&g_mm_force, memory_order_relaxed);
+    if (force != 0) return force == mmk && B <= g->max_b;
     int st = atomic_load_explicit(&g_mm_gate_on[mmk], memory_order_relaxed);
     if (st == 0) {
         int on = 1;
@@ -2521,42 +2525,223 @@ static void q4_amx_task(size_t tid, size_t nt, void *vc) {
 #endif
 
 #if defined(__AVX512VNNI__)
-static void int8_matmat_vnni_slice(float *Y, const int8_t *W, const float *scale,
-                                   const int8_t *qXt, const float *sx,
-                                   int r0, int r1, int cols, int B) {
-    MMSTAT(QWEN_MMK_INT8_VNNI, r1 - r0, cols, B);
+#if defined(__GNUC__) || defined(__clang__)
+#define QWEN_VNNI_NOINLINE __attribute__((noinline))
+#else
+#define QWEN_VNNI_NOINLINE
+#endif
+
+static void int8_matmat_vnni_row(float *Y, const int8_t *W, const float *scale,
+                                 const int8_t *qXt, const float *sx,
+                                 int r, int cols, int B) {
     const __m512i ones = _mm512_set1_epi8(1);
     const __m512i v128 = _mm512_set1_epi8((char)128);
-    for (int r = r0; r < r1; r++) {
-        const int8_t *w = W + (size_t)r * cols;
-        __m512i acc[16], ws = _mm512_setzero_si512();
-        for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_si512();
-        int k = 0;
-        for (; k + 64 <= cols; k += 64) {
-            __m512i wv = _mm512_loadu_si512((const void *)(w + k));
-            ws = _mm512_dpbusd_epi32(ws, ones, wv);
-            for (int b = 0; b < B; b++) {
-                __m512i ua = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qXt + (size_t)b * cols + k)), v128);
-                acc[b] = _mm512_dpbusd_epi32(acc[b], ua, wv);
-            }
-        }
-        int sw = _mm512_reduce_add_epi32(ws);
-        float s = scale[r];
+    const int8_t *w = W + (size_t)r * cols;
+    __m512i acc[16], ws = _mm512_setzero_si512();
+    for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_si512();
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i wv = _mm512_loadu_si512((const void *)(w + k));
+        ws = _mm512_dpbusd_epi32(ws, ones, wv);
         for (int b = 0; b < B; b++) {
-            int sum = _mm512_reduce_add_epi32(acc[b]) - 128 * sw;
-            const int8_t *qb = qXt + (size_t)b * cols;
-            for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
-            Y[(size_t)r * B + b] = (float)sum * s * sx[b];
+            __m512i ua = _mm512_add_epi8(
+                _mm512_loadu_si512((const void *)(qXt + (size_t)b * cols + k)), v128);
+            acc[b] = _mm512_dpbusd_epi32(acc[b], ua, wv);
         }
     }
+    int sw = _mm512_reduce_add_epi32(ws);
+    for (int b = 0; b < B; b++) {
+        int sum = _mm512_reduce_add_epi32(acc[b]) - 128 * sw;
+        const int8_t *qb = qXt + (size_t)b * cols;
+        for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
+        Y[(size_t)r * B + b] = (float)sum * scale[r] * sx[b];
+    }
 }
+
+static inline void int8_matmat_vnni_store(float *Y, const int8_t *W, const float *scale,
+                                          const int8_t *qXt, const float *sx,
+                                          int r, int b, int cols, int k,
+                                          __m512i acc, __m512i ws, int B) {
+    const int8_t *w = W + (size_t)r * cols;
+    int sum = _mm512_reduce_add_epi32(acc) - 128 * _mm512_reduce_add_epi32(ws);
+    const int8_t *qb = qXt + (size_t)b * cols;
+    for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
+    Y[(size_t)r * B + b] = (float)sum * scale[r] * sx[b];
+}
+
+static void int8_matmat_vnni_tile_m4n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m4n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
+    __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+    __m512i a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+    __m512i a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+    __m512i ws0 = a00, ws1 = a00, ws2 = a00, ws3 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 0) * cols + k)), v128);
+        __m512i ua1 = _mm512_setzero_si512(), ua2 = ua1, ua3 = ua1;
+        if (nb > 1) ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 1) * cols + k)), v128);
+        if (nb > 2) ua2 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 2) * cols + k)), v128);
+        if (nb > 3) ua3 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 3) * cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
+        ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        if (nb > 1) a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+        if (nb > 2) a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
+        if (nb > 3) a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
+        ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        if (nb > 1) a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+        if (nb > 2) a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
+        if (nb > 3) a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 2) * cols + k));
+        ws2 = _mm512_dpbusd_epi32(ws2, ones, wv);
+        a20 = _mm512_dpbusd_epi32(a20, ua0, wv);
+        if (nb > 1) a21 = _mm512_dpbusd_epi32(a21, ua1, wv);
+        if (nb > 2) a22 = _mm512_dpbusd_epi32(a22, ua2, wv);
+        if (nb > 3) a23 = _mm512_dpbusd_epi32(a23, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 3) * cols + k));
+        ws3 = _mm512_dpbusd_epi32(ws3, ones, wv);
+        a30 = _mm512_dpbusd_epi32(a30, ua0, wv);
+        if (nb > 1) a31 = _mm512_dpbusd_epi32(a31, ua1, wv);
+        if (nb > 2) a32 = _mm512_dpbusd_epi32(a32, ua2, wv);
+        if (nb > 3) a33 = _mm512_dpbusd_epi32(a33, ua3, wv);
+    }
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, ws0, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, ws0, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, ws0, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, ws0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, ws1, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, ws1, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, ws1, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, ws1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 0, cols, k, a20, ws2, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 1, cols, k, a21, ws2, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 2, cols, k, a22, ws2, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 3, cols, k, a23, ws2, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 0, cols, k, a30, ws3, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 1, cols, k, a31, ws3, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 2, cols, k, a32, ws3, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 3, cols, k, a33, ws3, B);
+}
+
+static void int8_matmat_vnni_tile_m2n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m2n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
+    __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+    __m512i ws0 = a00, ws1 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 0) * cols + k)), v128);
+        __m512i ua1 = _mm512_setzero_si512(), ua2 = ua1, ua3 = ua1;
+        if (nb > 1) ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 1) * cols + k)), v128);
+        if (nb > 2) ua2 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 2) * cols + k)), v128);
+        if (nb > 3) ua3 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 3) * cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
+        ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        if (nb > 1) a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+        if (nb > 2) a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
+        if (nb > 3) a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
+        ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        if (nb > 1) a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+        if (nb > 2) a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
+        if (nb > 3) a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
+    }
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, ws0, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, ws0, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, ws0, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, ws0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, ws1, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, ws1, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, ws1, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, ws1, B);
+}
+
+static int qwen_vnni_tile_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *off = getenv("QWEN_NO_VNNI_TILE");
+        v = !(off && off[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static void int8_matmat_vnni_slice(float *Y, const int8_t *W, const float *scale,
+                                   const int8_t *qXt, const float *sx,
+                                   int r0, int r1, int rows, int cols, int B) {
+    MMSTAT(QWEN_MMK_INT8_VNNI, r1 - r0, cols, B);
+    const int compact = B <= 4 || (B <= 8 && rows <= 2048 && cols <= 3072);
+    if (!qwen_vnni_tile_enabled() || cols < 64 || B < 2 || B > 8 || !compact) {
+        for (int r = r0; r < r1; r++)
+            int8_matmat_vnni_row(Y, W, scale, qXt, sx, r, cols, B);
+        return;
+    }
+
+    int r = r0;
+    if (B <= 4) {
+        for (; r + 4 <= r1; r += 4)
+            for (int b0 = 0; b0 < B; b0 += 4) {
+                const int nb = (B - b0 < 4) ? (B - b0) : 4;
+                int8_matmat_vnni_tile_m4n4(Y, W, scale, qXt, sx,
+                                            r, b0, nb, cols, B);
+            }
+    } else {
+        for (; r + 2 <= r1; r += 2)
+            for (int b0 = 0; b0 < B; b0 += 4) {
+                const int nb = (B - b0 < 4) ? (B - b0) : 4;
+                int8_matmat_vnni_tile_m2n4(Y, W, scale, qXt, sx,
+                                            r, b0, nb, cols, B);
+            }
+    }
+    for (; r < r1; r++)
+        int8_matmat_vnni_row(Y, W, scale, qXt, sx, r, cols, B);
+}
+
 typedef struct { float *Y; const int8_t *W; const float *scale; const int8_t *qXt; const float *sx; int rows, cols, B; } int8_vmm_ctx;
 static void int8_vmm_task(size_t tid, size_t nt, void *vc) {
     int8_vmm_ctx *c = (int8_vmm_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
-    int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx, r0, r1, c->cols, c->B);
+    int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx,
+                           r0, r1, c->rows, c->cols, c->B);
 }
+#undef QWEN_VNNI_NOINLINE
 #endif
 
 #if defined(__AVX2__)
@@ -2779,7 +2964,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                     int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
                     qwen_parallel((size_t)nt, int8_vmm_task, &c);
                 } else {
-                    int8_matmat_vnni_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
+                    int8_matmat_vnni_slice(Y, W, scale, qXt, sx, 0, rows, rows, cols, B);
                 }
                 return;
             }
