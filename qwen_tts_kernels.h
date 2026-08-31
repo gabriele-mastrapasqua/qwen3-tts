@@ -371,7 +371,7 @@ void qwen_matvec_q2_0(float *y, const q2_0_block_t *W, const float *x,
  * outright (a target-language clip classified as another language at 89%, ~1 seed in 5).
  * But that wall was measured on FLAT per-row scales. With a scale every 32 weights
  * the same bit budget carries far more information, and the fakequant sweep (error
- * baked into a bf16 copy, no kernel) scored it on LANGUAGE IDENTITY, not on perplexity:
+ * baked into a bf16 copy, no kernel) scored it on LANGUAGE IDENTIFICATION ACCURACY, not on perplexity:
  *
  *     int8r (= what ships today)   lang-id 98.0% mean / 96.3% min   control
  *     int7b            -6% band    lang-id 97.6% / 93.0%            holds

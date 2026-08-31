@@ -115,7 +115,7 @@ BYTES_PER_SAMPLE = 2
 #   weights to a machine you rent.
 #
 #   PHASE 2 (later): once the CPU side is understood, a finetune, its target language and a
-#   language-identity gate come back. They are not discarded: a longer bank stays available
+#   language-identification accuracy gate come back. They are not discarded: a longer bank stays available
 #   and is selected with --text-file.
 #
 # The wrong default does not fail, it silently measures open weights with another bank's

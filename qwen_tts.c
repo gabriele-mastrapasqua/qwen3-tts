@@ -3968,7 +3968,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
          * it realigns to the text: ~4 s of sounds that are neither the target language nor
          * anything else, then the correct sentence to the end. It only strikes when the new
          * slot is NOT one act_idx already names -- that is, after an overlap -- which is why
-         * it survived the language-identity average (67 % instead of 0) while being obvious
+         * it survived the language-identification accuracy average (67 % instead of 0) while being obvious
          * to a listener. */
         qwen_batch_pack_active(bb, step_active);
         PF_START();

@@ -947,7 +947,7 @@ int main(int argc, char **argv) {
      * without a strong push. A full finetune with baked speakers is already
      * plastic, so the same push overshoots — and the excess does not become more
      * emotion, it becomes drift, which shows up as lost accent.
-     * Measured: --emotion sad on a finetuned voice drops language identity from ~90%
+     * Measured: --emotion sad on a finetuned voice drops language identification accuracy from ~90%
      * to ~8%. -1 = keep the recipe. */
     float emotion_weight = -1.0f;
     int   emotion_layers_l0 = -1, emotion_layers_l1 = -1;   /* --emotion-layers A-B */
@@ -1221,7 +1221,7 @@ int main(int argc, char **argv) {
              * over 4 configs x 5 seeds on a finetuned pool checkpoint: both
              * int8-Talker configs collapsed 0/5, both int4-Talker configs collapsed 1/5.
              * The CP tolerates int4 and is where the bandwidth is bought back.
-             * Net on 1.7B / M1: RTF ~0.90 (sub-realtime) with the HIGHEST language-identity floor of
+             * Net on 1.7B / M1: RTF ~0.90 (sub-realtime) with the HIGHEST language-identification accuracy floor of
              * the four -- 97.4% min, above plain --int8's 91.5%. See PLAN.md 0.septies. */
             case 1075: use_int8 = 1; setenv("QWEN_CP_PREC", "int4", 1); break;
             /* --quant-mixed-int6[=top6|top7|none|13,26,...]: PER-LAYER Talker map —
@@ -1230,7 +1230,7 @@ int main(int argc, char **argv) {
              * identically to the --int8 baseline, or the A/B measures two changes at
              * once. Default top6 = L13 L26 L12 L24 L20 L11, the MEASURED top of the
              * profile (the accent-delta prior picked the wrong layers three times).
-             * The comparison to beat is --int8 on BOTH axes: language identity AND speed. */
+             * The comparison to beat is --int8 on BOTH axes: language identification accuracy AND speed. */
             case 1076: use_int8 = 1;
                        setenv("QWEN_TALKER_MIXED_INT6", optarg ? optarg : "top6", 1);
                        break;

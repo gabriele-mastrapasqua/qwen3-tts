@@ -1138,7 +1138,7 @@ static void bf16_matvec_dpbf16(float *y, const uint16_t *xb, const float *x,
  * by default. BFDOT truncates the ACTIVATION to bf16 (the weights already are). That is
  * the same truncation the KV cache and the BFMMLA twin already take, so it is a known and
  * accepted loss elsewhere -- but on a finetuned checkpoint the only proof that counts is a
- * language-identity gate, not a self-test: this class of change loses the trained language
+ * language-identification accuracy gate, not a self-test: this class of change loses the trained language
  * long before it damages anything a signal metric can see.
  * QWEN_ARM_BFDOT=1 enables it. Before making it a default: that gate, on real finetunes. */
 enum { QWEN_ARM_BFDOT_XMAX = 8192 };
@@ -5842,7 +5842,7 @@ void qwen_matvec_q2_0(float *y, const q2_0_block_t *W, const float *x,
  * The cheap half of the per-layer mixed map (int8 on the sensitive layers, int6
  * on the rest). See the type comment in qwen_tts_kernels.h for WHY 6 bits and why
  * bit-exactness with tools/quant/fakequant_cp.py `int6b` is load-bearing: it is the
- * only thing that carries the measured language-identity numbers over to the real kernel.
+ * only thing that carries the measured language-identification accuracy numbers over to the real kernel.
  *
  * ONE ARITHMETIC IDENTITY SHARED BY ALL THREE ISAs. The stored code is unsigned,
  * u = q + 32 in [1,63]. Every dot product then uses u directly and corrects once
@@ -5903,7 +5903,7 @@ void qwen_quantize_bf16_to_q6_0(const uint16_t *src_bf16, int rows, int cols,
                      * where |x|+0.5 rounds up to the next integer in f32). The
                      * audio cannot tell, but the parity gate can — and the gate is
                      * only worth having if it is exact, so the kernel matches the
-                     * reference the language-identity numbers were measured on.
+                     * reference the language-identification accuracy numbers were measured on.
                      * Changing this to true round-half-away-from-zero is a real
                      * (if tiny) format change and must be re-gated, not assumed. */
                     float a = fabsf(vals[i] / s);

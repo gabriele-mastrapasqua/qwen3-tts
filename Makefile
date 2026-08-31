@@ -273,20 +273,20 @@ help:
 	@echo "  make bench-full      - Full benchmark (+ server, qvoice, instruct, INT8)"
 	@echo "  make cp-microbench   - Build qwen_tts_cpbench (per-op Code Predictor breakdown)"
 	@echo ""
-	@echo "Box appena affittato (in QUESTO ordine — vedi docs/hardware-testing.md):"
-	@echo "  make server-hw-check       - LA VERITA' SUL SILICIO: hardware + banda di memoria"
-	@echo "  make server-batch-microbench - la curva B=1->2->4 e BatchEfficiency (~4 min, solo OSS)"
+	@echo "A freshly rented box (IN THIS ORDER — see docs/hardware-testing.md):"
+	@echo "  make server-hw-check       - the truth about the silicon: hardware + memory bandwidth"
+	@echo "  make server-batch-microbench - the B=1->2->4 curve and batch efficiency (~4 min, open weights)"
 	@echo "  make mini-bench-06b|-17b   - 1/2/4 richieste parallele su un modello OSS"
-	@echo "  make kernel-tune           - misura le soglie del dispatcher invece di indovinarle"
+	@echo "  make kernel-tune           - measure the dispatcher thresholds instead of guessing them"
 	@echo "  make tune-archive BOX=<name> - the same, and archives the JSON for a cross-ISA comparison"
 	@echo "                               (tools/box_info.sh + tests/membw.c) + --caps + --self-test"
 	@echo "                               + --matmat-bench. Nessun modello richiesto. JSON in HW_JSON=."
 	@echo "                               (alias storico: make box-report)"
-	@echo "  make membw                 - solo la banda: Copy/Triad con sweep di thread + ginocchio"
+	@echo "  make membw                 - bandwidth only: Copy/Triad with a thread sweep, and the knee"
 	@echo "  make bench-matrix[-full]   - poi la matrice RTF (richiede un modello scaricato)"
 	@echo "  make check-matmat-parity   - i gemelli batched fanno l'aritmetica che dichiarano? (ISA nativa)"
-	@echo "  make check-matmat-parity-x86 - idem sui kernel AVX2 x86, eseguiti sotto Rosetta 2 dal Mac ARM"
-	@echo "  make check-isa             - compile-check dei percorsi ISA che questa macchina non ha"
+	@echo "  make check-matmat-parity-x86 - the same on the x86 AVX2 kernels, run under Rosetta 2 from an Arm Mac"
+	@echo "  make check-isa             - compile-check the ISA paths this machine does not have"
 	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
 	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
@@ -1351,11 +1351,11 @@ test-serve-continuous: $(TARGET)
 test-serve-stream-batch: $(TARGET)
 	@bash tests/serve_stream_batch.sh $(MODEL_SMALL)
 
-## make server-soak — S16.5: il soak lungo. Trenta minuti di carico costante e le
-## quattro derive che una corsa da tre minuti non puo' vedere: RSS (pendenza sulla
-## seconda meta', non valore assoluto), thread/descrittori, latenza per finestra da
-## 5 minuti, e una SONDA audio identica ogni 10 minuti — perche' la degenerazione di
-## un decoder la sente l'orecchio, non una soglia. Solo modelli OSS.
+## make server-soak — the long soak. Thirty minutes of steady load and the four drifts a
+## three-minute run cannot see: RSS (the slope over the second half, not the absolute
+## value), threads and descriptors, latency per five-minute window, and an IDENTICAL audio
+## probe every ten minutes — because a decoder degenerating is something the ear hears and
+## a threshold does not. Open weights only.
 ##   make server-soak                      # 30 min, 0.6B int8, c=2
 ##   make server-soak MINUTES=60 LEVEL=4 MODEL=qwen3-tts-1.7b
 MINUTES ?= 30
