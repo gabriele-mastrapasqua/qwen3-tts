@@ -12,6 +12,11 @@ Arm, x86, GPU, or whatever comes next. It is not an Axion rule and not a TTFA ru
 Understand the machine. Understand the data. Shape the work for the machine. Measure
 reality. Never trust intuition when it can be measured.
 
+*The lineage is Michael Abrash's* Graphics Programming Black Book *— the machine is the
+authority, the profiler outranks the intuition, and the largest wins come from changing the
+shape of the work rather than the instructions that do it. What follows is that stance
+applied to this engine, with the mistakes this project actually made written into it.*
+
 A note on what this is not: it is not an aesthetic of low-level programming. Hand-written
 SIMD is not the point, and preferring it for its own sake would be the opposite of the
 lesson. The rule exists to make us **more suspicious, especially of results we like**.
