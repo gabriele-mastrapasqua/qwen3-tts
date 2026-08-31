@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Splice a REAL paralinguistic clip into synthesized speech at a [tag] point.
-Method-1 macro, but with REAL VocalSound audio instead of onomatopoeia text.
-  para_splice.py out.wav pre.wav clip.wav post.wav [--xfade 0.04] [--gain 0.9] [--gap 0.06]
-RMS-matches the clip to the speech level, equal-power crossfade at both seams."""
+"""Splice a REAL paralinguistic clip into synthesized speech at a [tag] point."""
 import sys, wave, struct, argparse
 import numpy as np
 
@@ -22,7 +19,7 @@ def rms(a):
 def xfade(a,b,n):
     if n<=0 or len(a)==0 or len(b)==0: return np.concatenate([a,b])
     n=min(n,len(a),len(b)); t=np.linspace(0,1,n)
-    fo=np.cos(t*np.pi/2); fi=np.sin(t*np.pi/2)   # equal-power
+    fo=np.cos(t*np.pi/2); fi=np.sin(t*np.pi/2)
     mid=a[-n:]*fo+b[:n]*fi
     return np.concatenate([a[:-n],mid,b[n:]])
 
@@ -32,9 +29,7 @@ ap.add_argument("--xfade",type=float,default=0.04); ap.add_argument("--gain",typ
 ap.add_argument("--gap",type=float,default=0.05)
 a=ap.parse_args()
 pre,sr=rd(a.pre); clip,_=rd(a.clip); post,_=rd(a.post)
-# RMS-match the clip to the speech (use full pre as the level reference)
 clip=clip*(rms(pre)/rms(clip))*a.gain
-# small silence gap padding around the event so it doesn't collide with phonemes
 g=int(a.gap*sr); pad=np.zeros(g,dtype=np.float32)
 nx=int(a.xfade*sr)
 out=xfade(pre, np.concatenate([pad,clip,pad]), nx)

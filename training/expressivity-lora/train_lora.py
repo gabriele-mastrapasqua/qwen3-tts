@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# Train a tiny expressivity LoRA on Qwen3-TTS 1.7B CustomVoice: adapters on Talker L16-26
-# (self_attn q/k/v/o + mlp.gate_proj) ONLY, instruct-conditioned + voice-agnostic. Output = a
-# small PEFT adapter; convert it with export_expr.py into a <lang>.expr the C engine loads.
-#
-#   python3 train_lora.py --init_model_path models/1.7B-CustomVoice \
-#       --train_jsonl data/train_with_codes.jsonl --output_dir out_lora_r32 \
-#       --lora_r 32 --lora_alpha 64 --num_epochs 8
 import argparse, json, os, random
 import torch
 from accelerate import Accelerator
@@ -16,11 +9,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
-# Codec token ids of the 9 built-in CustomVoice preset speakers (1.7B). Voice-agnostic training
-# injects a random one at the speaker slot per sample, so the LoRA learns emotion, not a timbre.
 PRESET_IDS = [3066, 3065, 3010, 3061, 2861, 2873, 2864, 2875, 2878]
-TRAIN_LAYERS = list(range(16, 27))   # where Qwen3-TTS's instruct/expressivity competence lives
-
+TRAIN_LAYERS = list(range(16, 27))
 
 def train():
     ap = argparse.ArgumentParser()
@@ -31,7 +21,7 @@ def train():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--num_epochs", type=int, default=8)
     ap.add_argument("--lora_r", type=int, default=32)
-    ap.add_argument("--lora_alpha", type=int, default=64)   # keep alpha = 2*r
+    ap.add_argument("--lora_alpha", type=int, default=64)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
     args = ap.parse_args()
 
@@ -90,7 +80,6 @@ def train():
         acc.unwrap_model(model).save_pretrained(out_dir)
         sz = sum(os.path.getsize(os.path.join(out_dir, f)) for f in os.listdir(out_dir) if f.endswith(".safetensors"))
         acc.print(f"[save] adapter -> {out_dir}  ({sz/1e6:.1f} MB)")
-
 
 if __name__ == "__main__":
     train()

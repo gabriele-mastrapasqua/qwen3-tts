@@ -1,36 +1,4 @@
-/* membw.c — quanta banda di memoria ha DAVVERO questa macchina, e a quanti thread satura.
- *
- * PERCHE' ESISTE, e perche' non basta il numero di targa. Il collo di questo motore
- * non e' l'ALU: il Code Predictor rilegge i suoi pesi 16 VOLTE PER FRAME. Quindi la
- * domanda che decide il batching non e' "quanti GFLOP fa" ma:
- *
- *     a quanti thread la banda smette di salire?
- *
- * Perche' e' quello il bivio: se la banda satura a 2 thread, dare 8 thread a UNA
- * richiesta e' sprecato e conviene dare 2 thread a QUATTRO richieste; se scala fino
- * a tutti i core, vale il contrario. Senza questo numero la matrice thread x batch
- * si esplora a tentoni, e su un box a ore i tentoni costano.
- *
- * COS'E'. Uno STREAM ridotto all'osso: Copy (a=b) e Triad (a=b+s*c) su tre array di
- * double, con sweep di thread e best-of-N. Pochi secondi, non un benchmark da paper.
- *
- * LE DUE COSE CHE LO RENDEREBBERO UNA BUGIA, ed entrambe sono gestite qui:
- *   1. ARRAY TROPPO PICCOLI -> si misura la cache, non la DRAM, e il numero esce 5-10x
- *      troppo alto. Gli array sono dimensionati ad almeno 4x la L3 (--l3-mb, passato
- *      da tools/box_info.sh che la L3 la legge davvero).
- *   2. FIRST-TOUCH SEQUENZIALE -> su una macchina NUMA tutte le pagine finiscono sul
- *      nodo di chi ha inizializzato, e il test misura sempre e solo quel nodo. Qui
- *      l'inizializzazione e' PARALLELA e con la stessa partizione della misura, cosi'
- *      le pagine cadono dove il thread che le legge sta girando.
- *
- * Uso:
- *   membw [--l3-mb N] [--threads LISTA] [--reps N] [--json] [--label TESTO]
- *     --l3-mb N     dimensiona gli array a max(4*N, 64) MiB ciascuno (default 32)
- *     --threads     "1,2,4,8" (default: 1,2,4,meta' dei core,tutti i core)
- *     --reps N      giri per cella, si tiene il MIGLIORE (default 5)
- *     --json        una riga JSON, per essere incorporata nel report della macchina
- *     --label TESTO etichetta libera (usata per le celle numactl: "numa-local"/"numa-cross")
- */
+/* membw.c — how much memory bandwidth this machine REALLY has, and where it saturates. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,15 +9,13 @@
 #include <sys/sysctl.h>
 #endif
 
-/* niente pthread_barrier su macOS: si creano i thread per ogni giro cronometrato e si
- * fanno abbastanza iterazioni interne perche' il costo di create/join sia rumore (<1%). */
 #define INNER 4
 
 typedef struct {
     double *a, *b, *c;
     size_t  lo, hi;
     double  s;
-    int     kernel;          /* 0 = copy, 1 = triad */
+    int     kernel;
 } job_t;
 
 static void *worker(void *p) {
@@ -84,7 +50,6 @@ static int n_cpus(void) {
 #endif
 }
 
-/* un giro cronometrato: nt thread, INNER passate, ritorna i secondi */
 static double run_once(double *a, double *b, double *c, size_t n, int nt, int kernel) {
     pthread_t th[256];
     job_t     jb[256];
@@ -118,8 +83,6 @@ int main(int argc, char **argv) {
 
     int ncpu = n_cpus();
 
-    /* sweep di default: 1, 2, 4, meta' dei core, tutti. Il ginocchio sta quasi sempre
-     * fra 2 e "meta'", ed e' esattamente il punto che decide thread-per-richiesta. */
     int  ts[16], nts = 0;
     if (tlist) {
         char buf[256]; snprintf(buf, sizeof buf, "%s", tlist);
@@ -136,8 +99,6 @@ int main(int argc, char **argv) {
     }
     if (nts == 0) ts[nts++] = 1;
 
-    /* >= 4x la L3 per array, cosi' nessun riuso di cache puo' gonfiare il numero.
-     * Tetto a 512 MiB per array: oltre non si misura di piu', si aspetta e basta. */
     size_t per_mb = (size_t)l3_mb * 4;
     if (per_mb < 64)  per_mb = 64;
     if (per_mb > 512) per_mb = 512;
@@ -148,7 +109,6 @@ int main(int argc, char **argv) {
     double *c = (double *)malloc(n * sizeof(double));
     if (!a || !b || !c) { fprintf(stderr, "membw: malloc fallita (%zu MiB x3)\n", per_mb); return 1; }
 
-    /* first-touch PARALLELO, con la stessa partizione della misura (vedi testata) */
     {
         pthread_t th[256]; job_t jb[256];
         int nt = ts[nts - 1] > 256 ? 256 : ts[nts - 1];
@@ -168,21 +128,17 @@ int main(int argc, char **argv) {
         double best_c = 0.0, best_t = 0.0;
         for (int r = 0; r < reps; r++) {
             double dt = run_once(a, b, c, n, ts[i], 0);
-            /* Copy tocca 2 array (1 letto + 1 scritto) per iterazione interna */
             double gbs = (double)INNER * 2.0 * (double)n * sizeof(double) / dt / 1e9;
             if (gbs > best_c) best_c = gbs;
         }
         for (int r = 0; r < reps; r++) {
             double dt = run_once(a, b, c, n, ts[i], 1);
-            /* Triad ne tocca 3 (2 letti + 1 scritto) */
             double gbs = (double)INNER * 3.0 * (double)n * sizeof(double) / dt / 1e9;
             if (gbs > best_t) best_t = gbs;
         }
         copy_gbs[i] = best_c; triad_gbs[i] = best_t;
     }
 
-    /* IL numero che serve: il picco, e il PRIMO conteggio di thread che arriva al 95%
-     * del picco. Quello e' il ginocchio — oltre, i thread in piu' non comprano banda. */
     double peak = 0.0; int peak_t = ts[0];
     for (int i = 0; i < nts; i++) if (triad_gbs[i] > peak) { peak = triad_gbs[i]; peak_t = ts[i]; }
     int knee = peak_t;
@@ -203,10 +159,10 @@ int main(int argc, char **argv) {
         printf("  %-8s %12s %12s\n", "thread", "Copy GB/s", "Triad GB/s");
         for (int i = 0; i < nts; i++)
             printf("  %-8d %12.1f %12.1f\n", ts[i], copy_gbs[i], triad_gbs[i]);
-        printf("  picco Triad %.1f GB/s a %d thread; GINOCCHIO a %d thread (95%% del picco)\n",
+        printf("  Triad peak %.1f GB/s at %d threads; KNEE at %d threads (95%% of peak)\n",
                peak, peak_t, knee);
-        printf("  -> oltre %d thread la banda non sale: conviene dare %d thread a PIU' richieste\n"
-               "     invece che tutti i core a una sola (il CP rilegge i pesi 16x per frame).\n",
+        printf("  -> past %d threads bandwidth stops rising: give %d threads to MORE requests\n"
+               "     rather than every core to one (the CP rereads the weights 16x per frame).\n",
                knee, knee);
     }
     free(a); free(b); free(c);

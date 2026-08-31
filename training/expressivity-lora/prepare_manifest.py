@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-# Build train_raw.jsonl for the expressivity LoRA from an emotional-speech dataset.
-# Resamples each clip to 24 kHz mono (codec requirement) and attaches an English emotion
-# instruct. Then run the upstream Qwen3-TTS finetuning/prepare_data.py on the output to add
-# `audio_codes`, giving train_with_codes.jsonl for train_lora.py.
-#
-# Input modes:
-#   --manifest m.csv   CSV/TSV with header columns: audio,text,emotion
-#   --emovo DIR        built-in EMOVO (Italian) example (DIR contains <actor>/<code>.wav)
-#   --emodb DIR        built-in EmoDB (German) example (original download; coded filenames)
-#                      transcripts/codes sourced from audeering audformat + Burkhardt 2005.
-#
-# Edit EMOTION_INSTRUCT for your emotion labels. Use vivid ENGLISH instructs (the model's
-# instruct-following is EN/ZH-centric). neutral -> "" anchors the no-instruct case.
 import argparse, csv, glob, json, os
 from collections import Counter
 import librosa, soundfile as sf
@@ -29,7 +16,6 @@ EMOTION_INSTRUCT = {
     "boredom":  "Speak in a bored, flat, disinterested monotone, low energy.",
 }
 
-# EMOVO filename codes -> transcript (the worked Italian example).
 EMOVO_SENT = {
     "b1": "Gli operai si alzano presto.", "b2": "I vigili sono muniti di pistola.",
     "b3": "La cascata fa molto rumore.",
@@ -45,8 +31,6 @@ EMOVO_SENT = {
 EMOVO_EMO = {"neu": "neutral", "gio": "joy", "rab": "anger", "tri": "sadness",
              "pau": "fear", "sor": "surprise", "dis": "disgust"}
 
-# EmoDB (Berlin) German example. Filename: <spk(2)><textcode(3)><emotion(1)><version>.wav
-# e.g. 03a01Fa.wav. Sentences/codes from the audeering audformat EmoDB reference + Burkhardt 2005.
 EMODB_SENT = {
     "a01": "Der Lappen liegt auf dem Eisschrank.",
     "a02": "Das will sie am Mittwoch abgeben.",
@@ -62,13 +46,9 @@ EMODB_SENT = {
 EMODB_EMO = {"W": "anger", "L": "boredom", "E": "disgust", "A": "fear",
              "F": "joy", "T": "sadness", "N": "neutral"}
 
-# MESD (Mexican Spanish) example. Filename: <emotion>_<voice>_<corpus>[_<level>]_<word>.wav
-# e.g. Anger_F_A_perro.wav. The WORD is the transcript. Source: dataset README (Mendeley cy34mh68j9).
 MESD_EMO = {"anger": "anger", "disgust": "disgust", "fear": "fear",
             "happiness": "happy", "neutral": "neutral", "sadness": "sadness"}
 
-# CaFE (Canadian French) example. Filename AA-E-I-S.wav (actor-emotion-intensity-sentence).
-# Emotion letters + the 6 sentences are from the dataset's own Readme.txt (Lahaie & Gournay).
 CAFE_EMO = {"C": "anger", "D": "disgust", "J": "happy", "N": "neutral",
             "P": "fear", "S": "surprise", "T": "sadness"}
 CAFE_SENT = {
@@ -80,7 +60,6 @@ CAFE_SENT = {
     "6": "Six ours aimants domestiqués.",
 }
 
-
 def manifest_rows(args):
     """Yield (src_audio_path, text, emotion_label). Customize for your dataset."""
     if args.emovo:
@@ -89,7 +68,6 @@ def manifest_rows(args):
             if emo in EMOVO_EMO and sent in EMOVO_SENT:
                 yield wav, EMOVO_SENT[sent], EMOVO_EMO[emo]
     elif args.emodb:
-        # original EmoDB download (filenames encode the text/emotion code)
         for wav in sorted(glob.glob(f"{args.emodb}/**/*.wav", recursive=True)):
             base = os.path.basename(wav)[:-4]
             if len(base) < 6:
@@ -98,21 +76,18 @@ def manifest_rows(args):
             if code in EMODB_SENT and emo in EMODB_EMO:
                 yield wav, EMODB_SENT[code], EMODB_EMO[emo]
     elif args.mesd:
-        # MESD: <emotion>_<voice>_<corpus>[_<level>]_<word...>.wav — the word may contain
-        # underscores ("de_nada"); naturalness-reduced files add an L1/L2 level token.
         for wav in sorted(glob.glob(f"{args.mesd}/**/*.wav", recursive=True)):
             parts = os.path.basename(wav)[:-4].split("_")
             if len(parts) < 4:
                 continue
             emo = parts[0].lower()
             rest = parts[3:]
-            if rest and rest[0] in ("L1", "L2"):   # skip naturalness-reduction level
+            if rest and rest[0] in ("L1", "L2"):
                 rest = rest[1:]
             word = " ".join(rest).strip().lower()
             if emo in MESD_EMO and word:
                 yield wav, word, MESD_EMO[emo]
     elif args.cafe:
-        # CaFE: filename AA-E-I-S.wav → emotion letter (field 2), sentence number (field 4).
         for wav in sorted(glob.glob(f"{args.cafe}/**/*.wav", recursive=True)):
             parts = os.path.basename(wav)[:-4].split("-")
             if len(parts) != 4:
@@ -125,7 +100,6 @@ def manifest_rows(args):
             dialect = csv.Sniffer().sniff(f.read(2048)); f.seek(0)
             for r in csv.DictReader(f, dialect=dialect):
                 yield r["audio"], r["text"], r["emotion"].strip().lower()
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -158,7 +132,6 @@ def main():
     print(f"wrote {len(rows)} rows (skipped {skipped} unknown-emotion) -> {out_jsonl}")
     print("emotions:", dict(Counter(r["emotion"] for r in rows)))
     print("NEXT: run the upstream prepare_data.py on this jsonl to add audio_codes.")
-
 
 if __name__ == "__main__":
     main()

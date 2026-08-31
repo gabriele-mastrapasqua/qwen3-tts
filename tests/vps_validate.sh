@@ -1,22 +1,4 @@
 #!/usr/bin/env bash
-# ============================================================================
-# vps_validate.sh — turnkey AVX-512/VNNI validation for a rented x86 VPS.
-#
-# Validates the UNVALIDATED AVX-512 kernels written 2026-06-04 (PLAN 21.3):
-#   - VNNI native int8 dot   (_mm512_dpbusd_epi32, SIMD=avx512vnni, commit d67648a)
-#   - __m512 16-wide bf16 matvec (commit b89f30e)
-# The Ryzen 7 6800H is AVX2-only and CAN'T run these — needs a Zen4+/Intel box
-# with AVX-512 (ideally a V-cache chip like a 9950X3D → likely sub-1.0 RTF).
-#
-# Usage (on the VPS, inside the repo):
-#     bash tests/vps_validate.sh                 # correctness only (no model needed)
-#     bash tests/vps_validate.sh qwen3-tts-0.6b  # + RTF bench on that model dir
-#
-# THE DECISIVE GATE is `make test-selftest` (kernel numeric self-test): it compares
-# the VNNI/AVX-512 matvecs to an f32 reference, so it's IMMUNE to the greedy-decode
-# trajectory fork that makes cross-ISA end-to-end audio mel-corr a false alarm.
-# Paste the full output back.
-# ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 MODEL="${1:-}"
@@ -28,9 +10,6 @@ hr "0. CPU capabilities"
 if command -v lscpu >/dev/null 2>&1; then
     lscpu | grep -iE "model name|^Flags" | sed 's/  */ /g' | head -2 || true
 fi
-# What we need (NOTE: the Linux /proc/cpuinfo flags use underscores for VNNI/BF16:
-# 'avx512_vnni', 'avx512_bf16' — but 'avx512f/bw/vl/dq/cd' have NO underscore. The gcc
-# build flags are the opposite (-mavx512vnni, no underscore). Don't mix them up.)
 for feat in avx2 avx512f avx512bw avx512vl avx512_vnni avx512_bf16; do
     if grep -qw "$feat" /proc/cpuinfo 2>/dev/null; then
         echo "  HAVE  $feat"
@@ -49,7 +28,6 @@ if command -v apt-get >/dev/null 2>&1; then
         || echo "  (apt failed — install build-essential + libopenblas-dev manually)"
 fi
 
-# Build a given SIMD level into a uniquely-named binary, report size + caps.
 build_one() {
     local simd="$1" bin="qwen_tts_$1"
     hr "BUILD SIMD=$simd"
@@ -64,7 +42,6 @@ build_one() {
     fi
 }
 
-# ---- AVX-512 VNNI build = the target under test ----
 if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then
     build_one avx512vnni || fail=1
     if [ -x qwen_tts_avx512vnni ]; then
@@ -82,10 +59,8 @@ else
     echo "  (skipping avx512vnni build — no VNNI on this CPU)"
 fi
 
-# ---- AVX2 baseline for A/B (always buildable on any x86-64) ----
 build_one avx2 || build_one scalar || fail=1
 
-# ---- Optional RTF bench (needs a model dir) ----
 if [ -n "$MODEL" ] && [ -d "$MODEL" ]; then
     hr "3. RTF bench on $MODEL (int8 + int4, -j1 and -j4; VNNI on vs off)"
     TXT="The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs."

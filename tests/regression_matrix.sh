@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# RELEASE STEP-1 regression: every expressivity path × precision × voice still produces coherent
-# audio (WAV valid + sane duration) + capture RTF. Single-mode first slice (the LoRA/instruct/clone
-# paths that predated quant/batching were never re-tested). Prints a PASS/FAIL + RTF table.
-# Usage: tests/regression_matrix.sh [model_dir] [out_dir]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 MODEL="${1:-qwen3-tts-1.7b}"
@@ -28,12 +24,10 @@ run() {  # $1=label  $2..=extra qwen args
 echo -e "CASE\tRTF\tDUR(s)\tVERDICT" | tee "$RES.head"
 for PREC in bf16 int8 int4; do
   Q=""; [ "$PREC" = int8 ] && Q="--int8"; [ "$PREC" = int4 ] && Q="--int4"
-  # preset ryan
   run "ryan_${PREC}_plain"        -s ryan $Q
   run "ryan_${PREC}_expr"         -s ryan $Q --expr "$EXPR" --expr-weight 0.6
   run "ryan_${PREC}_instruct"     -s ryan $Q -I "$INSTR"
   run "ryan_${PREC}_expr+instr"   -s ryan $Q --expr "$EXPR" --expr-weight 0.6 -I "$INSTR"
-  # clone galatea (lite ICL)
   run "galicl_${PREC}_plain"      --load-voice "$ICL" $Q
   run "galicl_${PREC}_expr"       --load-voice "$ICL" $Q --expr "$EXPR" --expr-weight 0.6
   run "galicl_${PREC}_instruct"   --load-voice "$ICL" $Q -I "$INSTR"

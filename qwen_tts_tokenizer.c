@@ -1,19 +1,10 @@
-/*
- * qwen_tts_tokenizer.c - GPT-2 style byte-level BPE tokenizer for Qwen3-TTS
- *
- * Loads vocab.json + merges.txt and performs proper BPE encoding.
- * Based on the HuggingFace GPT-2 tokenizer implementation.
- */
-
+/* qwen_tts_tokenizer.c - GPT-2 style byte-level BPE tokenizer for Qwen3-TTS */
 #include "qwen_tts_tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdatomic.h>
-
-
-/* ---- Hash table (open addressing, linear probing) ---- */
 
 typedef struct {
     char *key;
@@ -52,7 +43,7 @@ static void ht_free(hash_table_t *ht) {
 }
 
 static bool ht_set(hash_table_t *ht, const char *key, int key_len, int32_t value) {
-    if (ht->count * 3 >= ht->capacity * 2) return false; /* load > 66% */
+    if (ht->count * 3 >= ht->capacity * 2) return false;
     uint32_t idx = ht_hash(key, key_len) % (uint32_t)ht->capacity;
     for (;;) {
         ht_entry_t *e = &ht->entries[idx];
@@ -87,28 +78,19 @@ static bool ht_get(const hash_table_t *ht, const char *key, int key_len, int32_t
     }
 }
 
-/* ---- GPT-2 byte encoder ---- */
-
-/* Maps byte 0-255 to unicode codepoint used in vocab/merges.
- * Printable ASCII (33-126), Latin-1 supplement (161-172, 174-255) map to themselves.
- * Remaining bytes (0-32, 127-160, 173) map to U+0100..U+0143. */
 static uint32_t byte_to_unicode[256];
-static uint8_t  unicode_to_byte[512]; /* codepoints up to ~U+0143 */
-/* audit #10: atomic flag with acquire/release so a worker that lazily loads its own
- * tokenizer concurrently either sees the flag set (with all table writes visible) or
- * runs the idempotent init itself — no torn read of the byte_to_unicode arrays. */
+static uint8_t  unicode_to_byte[512];
 static atomic_bool byte_tables_initialized = false;
 
 static void init_byte_tables(void) {
     if (atomic_load_explicit(&byte_tables_initialized, memory_order_acquire)) return;
     memset(unicode_to_byte, 0, sizeof(unicode_to_byte));
 
-    /* "Good" bytes that map to themselves */
     int good_bytes[256];
     int n_good = 0;
-    for (int b = '!'; b <= '~'; b++) good_bytes[n_good++] = b;  /* 33-126 */
-    for (int b = 0xa1; b <= 0xac; b++) good_bytes[n_good++] = b; /* 161-172 */
-    for (int b = 0xae; b <= 0xff; b++) good_bytes[n_good++] = b; /* 174-255 */
+    for (int b = '!'; b <= '~'; b++) good_bytes[n_good++] = b;
+    for (int b = 0xa1; b <= 0xac; b++) good_bytes[n_good++] = b;
+    for (int b = 0xae; b <= 0xff; b++) good_bytes[n_good++] = b;
 
     bool is_good[256] = {false};
     for (int i = 0; i < n_good; i++) {
@@ -117,7 +99,6 @@ static void init_byte_tables(void) {
         is_good[b] = true;
     }
 
-    /* Remaining bytes map to U+0100 onwards */
     int extra = 0;
     for (int b = 0; b < 256; b++) {
         if (!is_good[b]) {
@@ -126,7 +107,6 @@ static void init_byte_tables(void) {
         }
     }
 
-    /* Build reverse: unicode codepoint -> byte */
     for (int b = 0; b < 256; b++) {
         uint32_t cp = byte_to_unicode[b];
         if (cp < 512) unicode_to_byte[cp] = (uint8_t)b;
@@ -135,7 +115,6 @@ static void init_byte_tables(void) {
     atomic_store_explicit(&byte_tables_initialized, true, memory_order_release);
 }
 
-/* Encode a single unicode codepoint to UTF-8, return number of bytes written */
 static int cp_to_utf8(uint32_t cp, char *out) {
     if (cp < 0x80) {
         out[0] = (char)cp;
@@ -157,45 +136,35 @@ static int cp_to_utf8(uint32_t cp, char *out) {
     return 4;
 }
 
-/* Convert input byte to GPT-2 unicode UTF-8 string, return length */
 static int byte_to_gpt2_utf8(uint8_t b, char *out) {
     return cp_to_utf8(byte_to_unicode[b], out);
 }
 
-/* ---- Tokenizer struct ---- */
-
 struct qwen_tokenizer {
-    hash_table_t vocab;      /* token_string -> token_id */
-    hash_table_t merges;     /* "a\xff b" -> priority rank (lower = higher priority) */
-    char **id_to_token;      /* reverse lookup: token_id -> token_string */
+    hash_table_t vocab;
+    hash_table_t merges;
+    char **id_to_token;
     int max_id;
     int vocab_count;
 };
 
-/* ---- JSON parsing for vocab.json ---- */
-
-/* Parse a JSON string starting at *pos (pointing at opening quote).
- * Returns malloc'd string, advances *pos past closing quote. */
 static char *parse_json_string(const char *json, int *pos) {
     if (json[*pos] != '"') return NULL;
-    (*pos)++; /* skip opening quote */
+    (*pos)++;
 
-    /* First pass: compute length */
     int len = 0;
     int p = *pos;
     while (json[p] && json[p] != '"') {
         if (json[p] == '\\') {
             p++;
-            if (json[p] == 'u') { /* \uXXXX */
+            if (json[p] == 'u') {
                 p += 4;
-                /* Could be surrogate pair \uXXXX\uXXXX */
-                len += 4; /* max UTF-8 bytes */
+                len += 4;
             } else {
                 len += 1;
             }
             p++;
         } else {
-            /* Count UTF-8 bytes */
             unsigned char c = (unsigned char)json[p];
             if (c < 0x80) { len++; p++; }
             else if (c < 0xE0) { len += 2; p += 2; }
@@ -222,10 +191,8 @@ static char *parse_json_string(const char *json, int *pos) {
                 case 'f':  out[o++] = '\f'; break;
                 case 'u': {
                     (*pos)++;
-                    /* audit #8: a truncated "\uXX"+NUL must not read past the terminator.
-                     * Require all 4 hex digits to be present; otherwise bail to end. */
                     if (!json[*pos] || !json[*pos+1] || !json[*pos+2] || !json[*pos+3]) {
-                        while (json[*pos]) (*pos)++;   /* jump to NUL; outer loop stops */
+                        while (json[*pos]) (*pos)++;
                         break;
                     }
                     uint32_t cp = 0;
@@ -236,12 +203,10 @@ static char *parse_json_string(const char *json, int *pos) {
                         else if (c >= 'a' && c <= 'f') cp |= 10 + c - 'a';
                         else if (c >= 'A' && c <= 'F') cp |= 10 + c - 'A';
                     }
-                    *pos += 3; /* will be incremented by 1 below */
-                    /* Handle surrogate pairs (audit #8: also require the low \uXXXX's 4 hex
-                     * digits to be present before reading them). */
+                    *pos += 3;
                     if (cp >= 0xD800 && cp <= 0xDBFF && json[*pos + 1] == '\\' && json[*pos + 2] == 'u' &&
                         json[*pos+3] && json[*pos+4] && json[*pos+5] && json[*pos+6]) {
-                        *pos += 3; /* skip \u */
+                        *pos += 3;
                         uint32_t lo = 0;
                         for (int i = 0; i < 4; i++) {
                             char c = json[*pos + i];
@@ -265,17 +230,15 @@ static char *parse_json_string(const char *json, int *pos) {
         }
     }
     out[o] = '\0';
-    if (json[*pos] == '"') (*pos)++; /* skip closing quote */
+    if (json[*pos] == '"') (*pos)++;
     return out;
 }
 
-/* Skip whitespace */
 static void skip_ws(const char *json, int *pos) {
     while (json[*pos] == ' ' || json[*pos] == '\t' || json[*pos] == '\n' || json[*pos] == '\r')
         (*pos)++;
 }
 
-/* Parse JSON integer (may be negative) */
 static int32_t parse_json_int(const char *json, int *pos) {
     int32_t val = 0;
     int sign = 1;
@@ -291,7 +254,6 @@ static bool load_vocab(qwen_tokenizer_t *tok, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "tokenizer: cannot open %s\n", path); return false; }
 
-    /* Read entire file */
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -306,15 +268,12 @@ static bool load_vocab(qwen_tokenizer_t *tok, const char *path) {
     }
     json[fsize] = '\0';
 
-    /* Estimate vocab size: count colons (rough) */
     int est_size = 0;
     for (long i = 0; i < fsize; i++) if (json[i] == ':') est_size++;
     if (est_size < 1000) est_size = 200000;
 
-    /* Init hash table with ~3x capacity for <66% load */
     ht_init(&tok->vocab, est_size * 3);
 
-    /* Parse: { "token": id, "token": id, ... } */
     int pos = 0;
     skip_ws(json, &pos);
     if (json[pos] != '{') { free(json); return false; }
@@ -328,7 +287,6 @@ static bool load_vocab(qwen_tokenizer_t *tok, const char *path) {
         if (json[pos] == '}') break;
         if (json[pos] == ',') { pos++; continue; }
 
-        /* Parse key */
         char *key = parse_json_string(json, &pos);
         if (!key) break;
 
@@ -337,10 +295,8 @@ static bool load_vocab(qwen_tokenizer_t *tok, const char *path) {
         pos++;
         skip_ws(json, &pos);
 
-        /* Parse value */
         int32_t id = parse_json_int(json, &pos);
 
-        /* Store in hash table */
         int key_len = (int)strlen(key);
         ht_set(&tok->vocab, key, key_len, id);
 
@@ -350,13 +306,12 @@ static bool load_vocab(qwen_tokenizer_t *tok, const char *path) {
         free(key);
     }
 
-    /* Build reverse lookup */
     tok->id_to_token = (char **)calloc(tok->max_id + 1, sizeof(char *));
     if (tok->id_to_token) {
         for (int i = 0; i < tok->vocab.capacity; i++) {
             ht_entry_t *e = &tok->vocab.entries[i];
             if (e->key && e->value >= 0 && e->value <= tok->max_id) {
-                tok->id_to_token[e->value] = e->key; /* points into hash table */
+                tok->id_to_token[e->value] = e->key;
             }
         }
     }
@@ -366,10 +321,6 @@ static bool load_vocab(qwen_tokenizer_t *tok, const char *path) {
     return true;
 }
 
-/* ---- Merges loading ---- */
-
-/* Build a merge key: "tokenA\xfftokenB" for hash lookup.
- * Uses \xff as separator (cannot appear in GPT-2 encoded tokens which are valid UTF-8). */
 static char *make_merge_key(const char *a, int a_len, const char *b, int b_len, int *out_len) {
     int len = a_len + 1 + b_len;
     char *key = (char *)malloc(len + 1);
@@ -385,7 +336,6 @@ static bool load_merges(qwen_tokenizer_t *tok, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "tokenizer: cannot open %s\n", path); return false; }
 
-    /* Read entire file */
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -400,24 +350,19 @@ static bool load_merges(qwen_tokenizer_t *tok, const char *path) {
     }
     data[fsize] = '\0';
 
-    /* Count lines */
     int n_lines = 0;
     for (long i = 0; i < fsize; i++) if (data[i] == '\n') n_lines++;
-    n_lines += 1; /* last line may not end with \n */
+    n_lines += 1;
 
     ht_init(&tok->merges, n_lines * 3);
 
-    /* Parse line by line */
     int rank = 0;
     char *line = data;
     while (*line) {
-        /* Find end of line */
         char *eol = strchr(line, '\n');
         int line_len = eol ? (int)(eol - line) : (int)strlen(line);
 
-        /* Skip empty lines and header lines starting with # */
         if (line_len > 0 && line[0] != '#') {
-            /* Find the space separator */
             char *sep = NULL;
             for (int i = 0; i < line_len; i++) {
                 if (line[i] == ' ') { sep = line + i; break; }
@@ -425,7 +370,6 @@ static bool load_merges(qwen_tokenizer_t *tok, const char *path) {
             if (sep) {
                 int a_len = (int)(sep - line);
                 int b_len = line_len - a_len - 1;
-                /* Strip trailing \r */
                 while (b_len > 0 && line[a_len + 1 + b_len - 1] == '\r') b_len--;
 
                 if (a_len > 0 && b_len > 0) {
@@ -447,19 +391,14 @@ static bool load_merges(qwen_tokenizer_t *tok, const char *path) {
     return true;
 }
 
-/* ---- Pre-tokenization ---- */
-
-/* Check if byte is ASCII letter */
 static inline bool is_letter(unsigned char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
-/* Check if byte is start of a multi-byte UTF-8 sequence (non-ASCII) */
 static inline bool is_utf8_start(unsigned char c) {
     return c >= 0xC0;
 }
 
-/* Get length of UTF-8 character starting at c */
 static inline int utf8_char_len(unsigned char c) {
     if (c < 0x80) return 1;
     if (c < 0xE0) return 2;
@@ -467,9 +406,6 @@ static inline int utf8_char_len(unsigned char c) {
     return 4;
 }
 
-/* Simple pre-tokenizer: splits text into chunks for BPE.
- * Returns array of malloc'd strings, sets *n_chunks.
- * Approximates GPT-2 regex: 's|'t|'re|'ve|'m|'ll|'d| ?\w+| ?\d+| ?[^\s\w]+|\s+ */
 typedef struct {
     char **chunks;
     int count;
@@ -496,21 +432,15 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
     while (i < len) {
         unsigned char c = (unsigned char)text[i];
 
-        /* Whitespace: group consecutive whitespace, attach single space to next word */
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            /* If single space followed by a letter/digit/non-space, attach to next chunk */
             if (c == ' ' && i + 1 < len) {
                 unsigned char next = (unsigned char)text[i + 1];
                 if (next != ' ' && next != '\t' && next != '\n' && next != '\r') {
-                    /* Space will be part of next chunk - let the next iteration handle it */
-                    /* Actually, consume space + following word together */
                     int start = i;
-                    i++; /* consume space */
+                    i++;
 
-                    /* Determine type of what follows and consume accordingly */
                     unsigned char nc = (unsigned char)text[i];
                     if (is_letter(nc) || is_utf8_start(nc)) {
-                        /* Space + letters */
                         while (i < len) {
                             unsigned char cc = (unsigned char)text[i];
                             if (is_letter(cc)) { i++; }
@@ -522,13 +452,11 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
                             else break;
                         }
                     } else if (nc >= '0' && nc <= '9') {
-                        /* Space + digits (up to 3) */
                         int dcount = 0;
                         while (i < len && text[i] >= '0' && text[i] <= '9' && dcount < 3) {
                             i++; dcount++;
                         }
                     } else if (nc != ' ' && nc != '\t' && nc != '\n' && nc != '\r') {
-                        /* Space + punctuation/symbols */
                         while (i < len) {
                             unsigned char cc = (unsigned char)text[i];
                             if (is_letter(cc) || (cc >= '0' && cc <= '9') ||
@@ -541,7 +469,6 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
                     continue;
                 }
             }
-            /* Consecutive whitespace */
             int start = i;
             while (i < len) {
                 unsigned char cc = (unsigned char)text[i];
@@ -552,7 +479,6 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
             continue;
         }
 
-        /* English contractions: 's, 't, 're, 've, 'm, 'll, 'd */
         if (c == '\'' && i + 1 < len) {
             unsigned char next = (unsigned char)text[i + 1];
             int clen = 0;
@@ -574,20 +500,15 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
             }
         }
 
-        /* Qwen2 pattern: [^\r\n\p{L}\p{N}]?\p{L}+
-         * Optional one non-letter/non-digit/non-newline char, then letters.
-         * This allows _start, >assistant etc. to be single chunks. */
         {
             bool next_is_letter = false;
             int lookahead = i;
-            /* Check if current char is a non-letter/non-digit that precedes letters */
             if (!is_letter(c) && !(c >= '0' && c <= '9') && c != '\n' && c != '\r') {
-                /* Optional prefix: check if next char is a letter */
                 if (i + 1 < len) {
                     unsigned char nc = (unsigned char)text[i + 1];
                     if (is_letter(nc) || is_utf8_start(nc)) {
                         next_is_letter = true;
-                        lookahead = i; /* start from the non-letter prefix */
+                        lookahead = i;
                     }
                 }
             }
@@ -598,10 +519,8 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
 
             if (next_is_letter) {
                 int start = lookahead;
-                /* Skip optional non-letter prefix */
                 if (!is_letter((unsigned char)text[lookahead]) && !is_utf8_start((unsigned char)text[lookahead]))
                     lookahead++;
-                /* Consume letters */
                 while (lookahead < len) {
                     unsigned char cc = (unsigned char)text[lookahead];
                     if (is_letter(cc)) { lookahead++; }
@@ -618,7 +537,6 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
             }
         }
 
-        /* Digits: \p{N}{1,3} */
         if (c >= '0' && c <= '9') {
             int start = i;
             int dcount = 0;
@@ -629,7 +547,6 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
             continue;
         }
 
-        /* Punctuation / symbols: [^\s\p{L}\p{N}]+[\r\n]* */
         {
             int start = i;
             while (i < len) {
@@ -639,9 +556,8 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
                     is_utf8_start(cc)) break;
                 i++;
             }
-            /* Include trailing \r\n */
             while (i < len && (text[i] == '\r' || text[i] == '\n')) i++;
-            if (i == start) i++; /* safety: always advance */
+            if (i == start) i++;
             chunk_add(&cl, text + start, i - start);
         }
     }
@@ -650,9 +566,6 @@ static char **pre_tokenize(const char *text, int *n_chunks) {
     return cl.chunks;
 }
 
-/* ---- BPE encoding ---- */
-
-/* A BPE word is a dynamic array of token strings */
 typedef struct {
     char **pieces;
     int   *piece_lens;
@@ -689,10 +602,8 @@ static void bpe_word_free(bpe_word_t *w) {
     w->count = w->capacity = 0;
 }
 
-/* Apply BPE merges to a word. Modifies word in place. */
 static void apply_bpe(bpe_word_t *word, const hash_table_t *merges) {
     while (word->count >= 2) {
-        /* Find the pair with lowest rank (highest priority) */
         int best_rank = INT32_MAX;
         int best_idx = -1;
 
@@ -709,9 +620,8 @@ static void apply_bpe(bpe_word_t *word, const hash_table_t *merges) {
             free(key);
         }
 
-        if (best_idx < 0) break; /* no more merges possible */
+        if (best_idx < 0) break;
 
-        /* Merge pieces[best_idx] and pieces[best_idx+1] */
         int new_len = word->piece_lens[best_idx] + word->piece_lens[best_idx + 1];
         char *merged = (char *)malloc(new_len + 1);
         memcpy(merged, word->pieces[best_idx], word->piece_lens[best_idx]);
@@ -724,7 +634,6 @@ static void apply_bpe(bpe_word_t *word, const hash_table_t *merges) {
         word->pieces[best_idx] = merged;
         word->piece_lens[best_idx] = new_len;
 
-        /* Shift remaining pieces left */
         for (int i = best_idx + 1; i < word->count - 1; i++) {
             word->pieces[i] = word->pieces[i + 1];
             word->piece_lens[i] = word->piece_lens[i + 1];
@@ -733,15 +642,12 @@ static void apply_bpe(bpe_word_t *word, const hash_table_t *merges) {
     }
 }
 
-/* ---- Public API ---- */
-
 qwen_tokenizer_t *qwen_tokenizer_load(const char *dir) {
     init_byte_tables();
 
     qwen_tokenizer_t *tok = (qwen_tokenizer_t *)calloc(1, sizeof(qwen_tokenizer_t));
     if (!tok) return NULL;
 
-    /* Build paths */
     int dir_len = (int)strlen(dir);
     char *vocab_path = (char *)malloc(dir_len + 20);
     char *merges_path = (char *)malloc(dir_len + 20);
@@ -778,12 +684,10 @@ qwen_tokenizer_t *qwen_tokenizer_load_files(const char *vocab_path, const char *
 int32_t *qwen_tokenizer_encode(qwen_tokenizer_t *tok, const char *text, int *out_len) {
     if (!tok || !text) { *out_len = 0; return NULL; }
 
-    /* Pre-tokenize: split text into chunks */
     int n_chunks = 0;
     char **chunks = pre_tokenize(text, &n_chunks);
     if (!chunks || n_chunks == 0) { *out_len = 0; return NULL; }
 
-    /* Output buffer */
     int cap = n_chunks * 4 + 16;
     int n = 0;
     int32_t *ids = (int32_t *)malloc(cap * sizeof(int32_t));
@@ -792,7 +696,6 @@ int32_t *qwen_tokenizer_encode(qwen_tokenizer_t *tok, const char *text, int *out
         const char *chunk = chunks[ci];
         int chunk_len = (int)strlen(chunk);
 
-        /* Convert chunk bytes to GPT-2 unicode characters */
         bpe_word_t word;
         bpe_word_init(&word);
 
@@ -802,10 +705,8 @@ int32_t *qwen_tokenizer_encode(qwen_tokenizer_t *tok, const char *text, int *out
             bpe_word_push(&word, buf, blen);
         }
 
-        /* Apply BPE */
         apply_bpe(&word, &tok->merges);
 
-        /* Look up token IDs */
         for (int j = 0; j < word.count; j++) {
             int32_t id;
             if (ht_get(&tok->vocab, word.pieces[j], word.piece_lens[j], &id)) {
@@ -815,7 +716,6 @@ int32_t *qwen_tokenizer_encode(qwen_tokenizer_t *tok, const char *text, int *out
                 }
                 ids[n++] = id;
             } else {
-                /* Token not in vocab - encode individual bytes as fallback */
                 for (int k = 0; k < word.piece_lens[j]; k++) {
                     char single[4];
                     int slen = byte_to_gpt2_utf8((uint8_t)word.pieces[j][k], single);
@@ -844,11 +744,6 @@ int32_t *qwen_tokenizer_encode_with_special(qwen_tokenizer_t *tok, const char *t
     return qwen_tokenizer_encode(tok, text, out_len);
 }
 
-/* PARALINGUISTIC TAG carve-out. Canonical map: training/expressivity-lora/para_tag_map.json.
- * Each [tag] is rewritten to a SINGLE reserved Qwen special-token id (LLM vision/box/tool/fim
- * slots the TTS path never uses; the para LoRA re-binds them). Without this, the BPE splits
- * "[sigh]" into "[","sigh","]" and the model reads it literally / falls back to laughter.
- * Non-tag spans are BPE-encoded normally; tag ids are emitted atomically in place. */
 int32_t *qwen_tokenizer_encode_para(qwen_tokenizer_t *tok, const char *text, int *out_len) {
     static const struct { const char *tag; int32_t id; } PARA_TAGS[] = {
         {"[laugh]",151646},{"[sigh]",151647},{"[cough]",151648},{"[breath]",151649},
@@ -865,7 +760,7 @@ int32_t *qwen_tokenizer_encode_para(qwen_tokenizer_t *tok, const char *text, int
     #define PARA_PUSH(v) do { if (n >= cap) { cap *= 2; ids = (int32_t *)realloc(ids, cap * sizeof(int32_t)); } ids[n++] = (v); } while (0)
 
     const char *p = text;
-    const char *seg = text;   /* start of the current non-tag span */
+    const char *seg = text;
     while (*p) {
         int matched = -1, mlen = 0;
         if (*p == '[') {
@@ -875,7 +770,7 @@ int32_t *qwen_tokenizer_encode_para(qwen_tokenizer_t *tok, const char *text, int
             }
         }
         if (matched >= 0) {
-            if (p > seg) {  /* flush the BPE of the text before this tag */
+            if (p > seg) {
                 size_t sl = (size_t)(p - seg);
                 char *sub = (char *)malloc(sl + 1);
                 memcpy(sub, seg, sl); sub[sl] = '\0';
@@ -890,7 +785,7 @@ int32_t *qwen_tokenizer_encode_para(qwen_tokenizer_t *tok, const char *text, int
             p++;
         }
     }
-    if (p > seg) {  /* flush trailing text */
+    if (p > seg) {
         int subn = 0;
         int32_t *sub_ids = qwen_tokenizer_encode(tok, seg, &subn);
         for (int i = 0; i < subn; i++) PARA_PUSH(sub_ids[i]);
@@ -908,8 +803,6 @@ char *qwen_tokenizer_decode(qwen_tokenizer_t *tok, const int32_t *tokens,
         return NULL;
     }
 
-    /* Concatenate token strings, then decode GPT-2 unicode back to bytes */
-    /* First pass: compute total GPT-2 string length */
     int total = 0;
     for (int i = 0; i < num_tokens; i++) {
         int32_t id = tokens[i];
@@ -918,7 +811,6 @@ char *qwen_tokenizer_decode(qwen_tokenizer_t *tok, const int32_t *tokens,
         }
     }
 
-    /* Concatenate */
     char *gpt2_str = (char *)malloc(total + 1);
     int pos = 0;
     for (int i = 0; i < num_tokens; i++) {
@@ -932,12 +824,10 @@ char *qwen_tokenizer_decode(qwen_tokenizer_t *tok, const int32_t *tokens,
     }
     gpt2_str[pos] = '\0';
 
-    /* Decode GPT-2 unicode back to bytes */
-    char *out = (char *)malloc(pos + 1); /* at most same length */
+    char *out = (char *)malloc(pos + 1);
     int o = 0;
     int j = 0;
     while (j < pos) {
-        /* Read one UTF-8 codepoint */
         unsigned char c = (unsigned char)gpt2_str[j];
         uint32_t cp;
         int clen;
@@ -949,11 +839,9 @@ char *qwen_tokenizer_decode(qwen_tokenizer_t *tok, const int32_t *tokens,
             cp = (cp << 6) | ((unsigned char)gpt2_str[j + k] & 0x3F);
         j += clen;
 
-        /* Map unicode codepoint back to byte */
         if (cp < 512) {
             out[o++] = (char)unicode_to_byte[cp];
         } else {
-            /* High codepoint - just output UTF-8 directly */
             o += cp_to_utf8(cp, out + o);
         }
     }

@@ -1,7 +1,7 @@
 # Instruct control — strength & prosody (the `--instruct` lever, 1.7B)
 
 What the free-text `--instruct` can and cannot do **on top of** THE emotion recipe, and how to write it well.
-Ear-validated 2026-06-30 (`samples/tests/2026-06-30_structured-instruct/` + `..._instruct-strength/`).
+Ear-validated by listening.
 
 > **Scope.** `--instruct` is **1.7B only** (the 0.6B ignores it). It matters only in the **COMBINE / instruct
 > path** — cloned voices, or a preset used *with* an instruct. **Preset pure-STEER emotion (THE recipe) needs no
@@ -59,8 +59,7 @@ Compose these hints into the instruct when you want pacing/pitch, e.g.
 - Escalate to the `very-strong` wording for more push; back off if it gets noisy/unstable on that emotion.
 
 ## Reproduce
-- `tests/structured_instruct_test.sh` — the full §8.8 A/B (slot template vs free-form) + per-slot + NL-prosody.
+- `tests/structured_instruct_test.sh` — the full A/B (slot template vs free-form) + per-slot + NL-prosody.
 - `tests/measure_prosody.py <wav…>` — objective dur / median-F0 / RMS-dB (+ `--move ref out` for mel-movement).
-- Instruct-strength sweep + the reusable library: `samples/tests/2026-06-30_instruct-strength/README.md`.
 
 See also: **`docs/emotion-THE-recipe.md`** (the emotion recipe this rides on top of).

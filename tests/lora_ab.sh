@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# 3-way: base vs route-a (.expr 186MB, = full-FT exact) vs route-b LoRA (.expr 16MB).
-# vivian (preset) + galatea (clone graft), sad + anger. Same seed/params. Reports mel
-# LoRA-vs-routeA per case (how close the tiny 16MB file is to the 186MB one).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=samples/lora_ab; mkdir -p "$OUT"

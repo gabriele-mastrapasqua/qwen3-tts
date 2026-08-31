@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# Add a NEUTRAL anchor to the JVNV Japanese manifest. JVNV has 6 emotions but NO neutral, so the
-# emotion LoRA over-forces (no baseline). This appends N neutral clips from JSUT basic5000
-# (japanese-asr/ja_asr.jsut_basic5000, CC-BY-SA, clean studio read speech WITH transcripts -> no ASR)
-# as emotion="neutral" / instruct="" rows, so the LoRA learns a proper neutral baseline.
-#
-# Reads JSUT parquet bytes via pyarrow+soundfile (dodges datasets>=4 torchcodec), resamples to 24k,
-# writes into <out_dir>/wav24k and APPENDS rows to <out_dir>/train_raw.jsonl (the JVNV manifest).
 import argparse, io, json, os
 import librosa, soundfile as sf
 import pyarrow.parquet as pq
@@ -45,7 +38,7 @@ def main():
                              "instruct": "", "emotion": "neutral"})
             added += 1
 
-    with open(out_jsonl, "a") as f:   # APPEND to the JVNV manifest
+    with open(out_jsonl, "a") as f:
         for r in new_rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     total = sum(1 for _ in open(out_jsonl))

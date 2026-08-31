@@ -1,5 +1,11 @@
 # HTTP Server
 
+> **This page is the API.** For how to run the process in production — pre-forked workers,
+> finding the `W x K` topology for a given box before quoting anything from it, the deployment
+> profile, the benchmark suite and what its numbers mean — see
+> [`serving-operations.md`](serving-operations.md).
+
+
 The built-in HTTP server loads the model once at startup and keeps weights in memory
 across requests. The tokenizer is cached after the first call, so subsequent requests
 skip all loading overhead and go straight to inference.

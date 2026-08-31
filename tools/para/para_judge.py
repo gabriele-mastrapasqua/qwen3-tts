@@ -1,39 +1,11 @@
 #!/usr/bin/env python3
-"""
-E1.1 — para_judge: offline no-ear screening for paralinguistic [tag] candidates.
-
-Given a directory of TTS wavs (a sweep of trigger x seed x voice x language), score each
-clip with an audio-event tagger + whisper ASR and emit a markdown table.
-
-Taggers (pluggable, --tagger):
-  * cnn14  — PANNs CNN14 AudioSet tagger. Calibrated 2026-07-07: TRUSTED for SIGH, blind to laugh.
-  * clap   — msclap zero-shot (text-prompt) tagger. The fallback for events AudioSet misses (laugh).
-  * both   — run both; the verdict routes each tag to its calibrated-best backend (TAG_BACKEND).
-
-whisper ASR gives the transcript, to catch the "literal onomatopoeia spoken" failure (the model
-READ 哈哈哈 as words instead of RENDERING a laugh sound).
-
-Verdicts (plan_v4 E1.1):
-  WIN_CAND   P(event) >= tau  AND the literal onomatopoeia is NOT in the transcript
-  KO_LITERAL the onomatopoeia is spoken literally in the transcript (any P)
-  DRIFT      a DIFFERENT target event class dominates (serendipity: flags a WIN for another tag)
-  MISS       no target event fired and nothing literal -> just neutral speech
-
-Screener, NOT the final judge (plan E1.2): trust its shortlists only after the calibration gate;
-the ear stays final judge for promotions. CPU-first (keeps the M1 cool); --device mps/cuda optional.
-
-Usage:
-  python para_judge.py --wavs DIR --onom 哈哈哈 --tag laugh --tagger clap
-  python para_judge.py --manifest sweep.json --tagger both --out report.md
-  python para_judge.py --manifest calib.json --tagger both --calibrate
-"""
+"""Offline, no-ear screening for paralinguistic [tag] candidates."""
 import argparse
 import glob
 import json
 import os
 import sys
 
-# ---- CNN14: our tags -> AudioSet class names (max prob over the group). ----
 CNN14_CLASSES = {
     "laugh":  ["Laughter", "Giggle", "Snicker", "Chuckle, chortle", "Belly laugh", "Baby laughter"],
     "sigh":   ["Sigh"],
@@ -49,7 +21,6 @@ CNN14_CLASSES = {
     "hum":    ["Humming"],
 }
 
-# ---- CLAP zero-shot: our tags -> a natural-language prompt. A neutral anchor competes in the softmax. ----
 CLAP_PROMPTS = {
     "laugh":  "the sound of a person laughing out loud",
     "sigh":   "the sound of a person sighing",
@@ -67,16 +38,12 @@ CLAP_PROMPTS = {
 }
 CLAP_NEUTRAL = "a person speaking normally"
 
-# ---- Per-tag best backend, set by the E1.2 calibration (2026-07-07). Used when --tagger both. ----
 TAG_BACKEND = {"sigh": "cnn14", "laugh": "clap", "throat": "cnn14", "cough": "cnn14", "sneeze": "cnn14"}
-DEFAULT_BACKEND = "clap"   # for events AudioSet misses; sigh is the proven cnn14 exception
-
+DEFAULT_BACKEND = "clap"
 
 def eprint(*a):
     print(*a, file=sys.stderr)
 
-
-# ---------------------------------------------------------------- taggers ----
 class Cnn14Tagger:
     name = "cnn14"
 
@@ -102,16 +69,14 @@ class Cnn14Tagger:
         cw = clipwise[0]
         return {t: float(max(cw[i] for i in ix)) for t, ix in self.resolved.items()}
 
-
 def _patch_torchaudio_soundfile():
     """torchaudio>=2.9 delegates load() to torchcodec; route it through soundfile instead
     (already a dep, no ffmpeg/torchcodec needed). Returns (channels, time) tensor + sr."""
     import torchaudio, torch, soundfile as sf
     def _load(path, *a, **k):
-        data, sr = sf.read(path, dtype="float32", always_2d=True)  # (T, C)
-        return torch.from_numpy(data.T).contiguous(), sr           # (C, T)
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        return torch.from_numpy(data.T).contiguous(), sr
     torchaudio.load = _load
-
 
 class ClapTagger:
     name = "clap"
@@ -128,19 +93,17 @@ class ClapTagger:
     def probs(self, wav):
         import torch.nn.functional as F
         a = self.m.get_audio_embeddings([wav])
-        sim = self.m.compute_similarity(a, self.text_emb)   # [1, T+1] scaled cosine
+        sim = self.m.compute_similarity(a, self.text_emb)
         p = F.softmax(sim, dim=-1)[0]
         return {t: float(p[i]) for i, t in enumerate(self.tags)}
-
 
 def load_taggers(which, device):
     taggers = {}
     if which in ("cnn14", "both"):
         taggers["cnn14"] = Cnn14Tagger(device)
     if which in ("clap", "both"):
-        taggers["clap"] = ClapTagger("cpu" if device == "mps" else device)  # msclap mps is patchy
+        taggers["clap"] = ClapTagger("cpu" if device == "mps" else device)
     return taggers
-
 
 def route_backend(tag, taggers):
     """Pick the backend for a tag: calibrated map if loaded, else any loaded one."""
@@ -149,13 +112,10 @@ def route_backend(tag, taggers):
         return want
     return next(iter(taggers))
 
-
-# --------------------------------------------------------------- ASR + verdict ----
 def load_asr(model, device):
     import whisper
     eprint(f"[load] whisper '{model}' ...")
     return whisper.load_model(model, device=("cpu" if device == "mps" else device))
-
 
 def transcribe(asr, wav):
     try:
@@ -163,7 +123,6 @@ def transcribe(asr, wav):
     except Exception as e:  # noqa
         eprint(f"[warn] ASR failed on {os.path.basename(wav)}: {e}")
         return ""
-
 
 def verdict(p_backend, tag, backend, onom, transcript, tau):
     """Classify one clip using the routed backend's probs."""
@@ -181,7 +140,6 @@ def verdict(p_backend, tag, backend, onom, transcript, tau):
         return "DRIFT", f"{backend} other='{drift_tag}' P={drift_p:.2f} (wanted {tag} {p_target:.2f})"
     return "MISS", f"{backend} P({tag})={p_target:.2f} < tau; top='{drift_tag}' {drift_p:.2f}"
 
-
 def load_items(args):
     if args.manifest:
         base = os.path.dirname(os.path.abspath(args.manifest))
@@ -198,13 +156,11 @@ def load_items(args):
         for wav in sorted(glob.glob(os.path.join(args.wavs, "**", "*.wav"), recursive=True)):
             yield {"file": wav, "tag": args.tag, "onom": args.onom}
 
-
 def tau_for(backend, args):
     return args.tau_clap if backend == "clap" else args.tau
 
-
 def main():
-    ap = argparse.ArgumentParser(description="E1.1 para-judge — offline paralinguistic screener")
+    ap = argparse.ArgumentParser(description="para-judge - offline paralinguistic screener")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--wavs", help="directory of wavs (recursive)")
     src.add_argument("--manifest", help="JSON list of clips w/ per-clip tag/onom/expected")
@@ -213,7 +169,7 @@ def main():
     ap.add_argument("--tagger", default="cnn14", choices=["cnn14", "clap", "both"])
     ap.add_argument("--tau", type=float, default=0.15, help="cnn14 event-prob threshold (default 0.15)")
     ap.add_argument("--tau-clap", dest="tau_clap", type=float, default=0.20,
-                    help="clap softmax threshold (default 0.20, from E1.2 laugh calibration)")
+                    help="clap softmax threshold (default 0.20, from the laugh calibration)")
     ap.add_argument("--asr-model", default="tiny", help="whisper model tiny/base/small")
     ap.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     ap.add_argument("--out", help="write markdown table here (else stdout)")
@@ -270,7 +226,7 @@ def main():
             prec = tp / (tp + fp) if (tp + fp) else float("nan")
             rec = tp / (tp + fn) if (tp + fn) else float("nan")
             return tp, fp, fn, tn, prec, rec
-        md += "\n\n### Calibration (E1.2)\n| set | TP | FP | FN | TN | precision | recall |\n|---|---|---|---|---|---|---|"
+        md += "\n\n### Calibration\n| set | TP | FP | FN | TN | precision | recall |\n|---|---|---|---|---|---|---|"
         tags = sorted({r.get("tag") for r in rows if r.get("tag")})
         for label, subset in [("ALL", rows)] + [(t, [r for r in rows if r.get("tag") == t]) for t in tags]:
             tp, fp, fn, tn, prec, rec = score(subset)
@@ -284,7 +240,6 @@ def main():
         eprint(f"[out] wrote {args.out}")
     else:
         print(md)
-
 
 if __name__ == "__main__":
     main()

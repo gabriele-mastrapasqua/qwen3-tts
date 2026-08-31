@@ -1,9 +1,4 @@
 #!/bin/bash
-# The 0.6B showcase: emotion + paralinguistics + cloning, all on the SMALL model, sub-realtime.
-#
-# For a long time the 0.6B was "the fast neutral TTS" — --emotion did nothing on it. That changed
-# 2026-08-05: on the small model the emotion rides on the VOICE (docs/emotion-06b-recipe.md), so
-# everything the 1.7B does expressively is now available here too, at RTF < 1.
 set -u
 cd "$(dirname "$0")/.."
 D="${OUT:-samples/tests/emo_06b_demo}"

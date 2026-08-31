@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
-# ============================================================================
-# PARA-FT — ALL-8-TAGS eval (for Step 2+, plan_emo_v3.md §9.8). Mac-side, no GPU.
-# Pulls a LoRA adapter from the GPU box, exports a factored .expr, and synthesizes
-# one EN sentence per tag (+ a no-tag control) so each [tag] can be A/B-judged
-# for mapping to ITS OWN event. sigh!=laugh is the key check Step 2 must fix.
-#
-# Usage:
-#   tests/para_tags_eval.sh [OUT_DIR_NAME] [EPOCH] [WEIGHT]
-#     OUT_DIR_NAME : remote out dir under ~/qwen-ft (default out_para_step2_8tag)
-#     EPOCH        : adapter-epN (default final)
-#     WEIGHT       : --expr-weight (default 1.5; tags vary, sweep if weak)
-# ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GPU="${GPU:-gpubox}"
 OUTDIR_NAME="${1:-out_para_step2_8tag}"
 EP="${2:-final}"
 W="${3:-1.5}"
-REMOTE_OUT="/home/gabriele/qwen-ft/$OUTDIR_NAME"
+REMOTE_OUT="${REMOTE_HOME:-$HOME}/qwen-ft/$OUTDIR_NAME"
 ADIR="adapter-${EP}"
 MODEL="qwen3-tts-1.7b"
 OUTD="samples/para_tags_${OUTDIR_NAME}"
@@ -36,7 +24,6 @@ synth() { # name text extra...
   ./qwen_tts -d "$MODEL" -s ryan -l English --seed 42 --no-compose --text "$text" "$@" -o "$OUTD/$name.wav" --silent 2>/dev/null && echo "   wrote $name.wav"
 }
 echo "### synth all 8 tags @ w=$W (+ baseline + no-tag control)"
-# one natural EN carrier per tag, event mid/clause boundary
 synth tag_laugh   "That is the funniest thing I have heard all week [laugh] I cannot even."        --expr "$EXPR" --expr-weight "$W"
 synth tag_sigh    "Well [sigh] I suppose we have to start all over again."                          --expr "$EXPR" --expr-weight "$W"
 synth tag_cough   "Excuse me for a second [cough] sorry, where was I."                              --expr "$EXPR" --expr-weight "$W"
@@ -45,7 +32,6 @@ synth tag_breath  "Okay [breath] let me explain the whole thing from the start."
 synth tag_grunt   "He lifted the box [grunt] and set it down by the door."                          --expr "$EXPR" --expr-weight "$W"
 synth tag_sneeze  "The dust everywhere made me [sneeze] excuse me, allergies."                      --expr "$EXPR" --expr-weight "$W"
 synth tag_yawn    "It is getting really late [yawn] I should head to bed."                          --expr "$EXPR" --expr-weight "$W"
-# controls
 synth ctrl_notag  "Let me tell you exactly what happened yesterday afternoon."                      --expr "$EXPR" --expr-weight "$W"
 synth sigh_base   "Well [sigh] I suppose we have to start all over again."
 

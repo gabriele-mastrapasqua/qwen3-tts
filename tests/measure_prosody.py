@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""measure_prosody.py — objective prosody metrics for the structured-instruct test (§8.8).
-
-Two modes:
-  per-file metrics (default):
-      measure_prosody.py a.wav [b.wav ...]
-      -> TSV: file  dur_s  f0_med_hz  f0_std_hz  rms_db
-      (dur for Tempo slot, f0_med for Pitch slot, rms_db for Intensity slot, f0_std for Expression slot)
-
-  mel-movement (how far a clip moved from a neutral anchor of the SAME text):
-      measure_prosody.py --move neutral.wav out.wav
-      -> prints: <mel_corr>   (LOWER corr = moved MORE; 1.0 = identical)
-
-Why these metrics: they let us check whether each structured slot actually DOES something —
-Tempo:+X% should shorten dur_s, Pitch:higher should raise f0_med, Intensity:high should raise
-rms_db, Expression should change f0_std/timbre. mel-movement isolates the emotional shift the
-instruct produces over the same sentence rendered flat.
-"""
+"""Objective prosody metrics for the structured-instruct test."""
 import sys, os
 import numpy as np
 

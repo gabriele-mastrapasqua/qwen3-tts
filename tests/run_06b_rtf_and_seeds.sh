@@ -1,12 +1,4 @@
 #!/bin/bash
-# E6 batteria 2 — (A) RTF sub-1.0 con lo stack COMPLETO  (B) sweep dei seed para NATIVO sul 0.6B
-#
-# (B) esiste perché le costanti di para_pick (onomatopea × seed × temperatura) sono tarate sul
-# 1.7B — vedi memoria feedback_06b_constants_not_transferable. Sul piccolo un tag che esce male
-# NON è un KO finché non hai fatto lo sweep. Qui l'onomatopea la passiamo LETTERALE nel testo e
-# variamo --seed, così misuriamo il tag senza le costanti del grosso di mezzo.
-#
-# ⚠️ Lanciare a MACCHINA SCARICA: l'RTF è la metrica, non il wall-clock.
 set -u
 cd "$(dirname "$0")/.."
 D=samples/tests/2026-08-05_06b_rtf_seeds
@@ -20,7 +12,6 @@ GRAFT="$M/voices/galatea_anger_graft.qvoice"
 
 say() { echo; echo "=============== $* ==============="; }
 
-# ── A. RTF: lo stack completo scende sotto 1.0? ────────────────────────────────────
 say "A. RTF con voce EMOTIVA (4KB) — ladder di quantizzazione, -j4"
 for q in "" "--int8" "--quant-mixed" "--int4"; do
   lbl=$(echo "${q:-bf16}" | tr -d '-')
@@ -45,15 +36,13 @@ for q in "" "--int8"; do
     -o "$D/rtf/all_${lbl}.wav" 2>&1 | grep -E "Audio:" | sed "s/^/  emo+para ${lbl}: /"
 done
 
-say "D. riferimento: 0.6B nudo (nessuna voce, nessun tag)"
+say "D. reference: bare 0.6B (no voice, no tag)"
 for q in "" "--int8"; do
   lbl=$(echo "${q:-bf16}" | tr -d '-')
   ./qwen_tts -d $SMALL -s ryan -l Italian --seed $SEED $q --text "$EVAL" \
     -o "$D/rtf/bare_${lbl}.wav" 2>&1 | grep -E "Audio:" | sed "s/^/  nudo ${lbl}: /"
 done
 
-# ── B. sweep seed/onomatopea per la para, NATIVO sul piccolo ───────────────────────
-# --no-compose passa il testo letterale: niente para_pick, niente costanti del 1.7B.
 say "E. sweep para NATIVO 0.6B — onomatopea letterale x seed (voce clonata neutra)"
 NEU="$M/voices/galatea_neutral.bin"
 for onom_lbl in "sigh:唉" "laugh:哈哈哈" "yawn:哈啊" "wow:哇"; do

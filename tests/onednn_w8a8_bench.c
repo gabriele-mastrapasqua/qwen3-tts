@@ -1,26 +1,4 @@
-/* onednn_w8a8_bench.c — oneDNN against the SAME cells the KleidiAI census already measured.
- *
- * WHY IT IS A SEPARATE FILE AND NOT A THIRD ARM INSIDE kernel_census_bench.c
- * oneDNN brings its own threading runtime (OMP on the Ubuntu aarch64 build). Linking it
- * into a bench that also drives our pthread pool would have two runtimes fighting for the
- * same cores inside one process — which is precisely the defect this whole audit found in
- * the engine, and reproducing it inside the instrument would make every number a lie.
- * So: same shapes, same protocol (median of 5), same columns, separate process. The
- * KleidiAI side is READ from the design notes
- *
- * PROTOCOL, kept identical to the census
- *   - weights: int8 + ONE f32 scale per output row (our format, verbatim)
- *   - activations: f32, quantized to int8 by a symmetric absmax quantizer, so what is
- *     compared is the GEMM and not the quantizer. PER TENSOR, because oneDNN refuses a
- *     per-row source scale here — see quant_tensor() for why that matters from B=2 up
- *   - the RHS "pack" (oneDNN reorder into the primitive's preferred weights format) is
- *     timed SEPARATELY and never charged to the per-call number, exactly as rhs_pack_ns
- *   - err_vs_f32: relative L2 against a float64 reference computed from the same tensors
- *
- * Build (only where oneDNN is installed):
- *   gcc -O3 -march=native -I/usr/include/oneapi/dnnl -o onednn_bench \
- *       tests/onednn_w8a8_bench.c -ldnnl -lm
- */
+/* onednn_w8a8_bench.c — oneDNN against the SAME cells the KleidiAI census already measured. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,11 +21,10 @@ static int cmp_d(const void *a, const void *b) {
 }
 static double median(double *v, int n) { qsort(v, n, sizeof *v, cmp_d); return v[n / 2]; }
 
-/* same LCG shape as the census, so the operand distribution is comparable */
 static uint32_t rng_s = 0x2b3c4d5eu;
 static float frand(void) {
     rng_s = rng_s * 1664525u + 1013904223u;
-    return ((float)(rng_s >> 8) / 8388608.0f) - 1.0f;   /* [-1, 1) */
+    return ((float)(rng_s >> 8) / 8388608.0f) - 1.0f;
 }
 
 typedef struct { const char *comp, *op; int N, K; } shape_t;
@@ -60,15 +37,6 @@ static const shape_t SHAPES[] = {
     { "talker", "down",     2048, 6144 },
 };
 
-/* Symmetric activation quantizer.
- *
- * ⚠️ PER TENSOR, NOT PER ROW — and that is a finding, not a shortcut. oneDNN 3.9.1's
- * `gemm:jit` s8 matmul REFUSES a per-M source scale mask: asking for
- * set_scales_mask(DNNL_ARG_SRC, 1<<0) makes primitive creation fail with
- * unimplemented on every one of the 30 cells. Only a per-tensor source scale is
- * accepted. At B=1 per-tensor and per-row are the SAME thing, so the B=1 comparison
- * against KleidiAI (which quantizes per row) is exact; from B=2 up, oneDNN is being
- * given a COARSER quantization than KleidiAI gets, which shows up in err_vs_f32. */
 static void quant_tensor(int8_t *q, float *scale, const float *X, int M, int K) {
     float amax = 0.0f;
     for (size_t i = 0; i < (size_t)M * K; i++) { float a = fabsf(X[i]); if (a > amax) amax = a; }
@@ -90,8 +58,7 @@ static dnnl_memory_t mem_from(dnnl_engine_t eng, const_dnnl_memory_desc_t md, vo
 static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, int reps) {
     const int N = S->N, K = S->K, M = B;
 
-    /* ---- operands ------------------------------------------------------------- */
-    int8_t *W  = (int8_t *)malloc((size_t)N * K);          /* [N][K], our layout      */
+    int8_t *W  = (int8_t *)malloc((size_t)N * K);
     float  *Ws = (float *)malloc((size_t)N * sizeof(float));
     float  *X  = (float *)malloc((size_t)M * K * sizeof(float));
     int8_t *Xq = (int8_t *)malloc((size_t)M * K);
@@ -104,11 +71,8 @@ static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, 
     for (size_t i = 0; i < (size_t)M * K; i++) X[i] = frand();
     quant_tensor(Xq, Xs, X, M, K);
 
-    /* oneDNN wants weights as [K][N]; ours are [N][K]. The transpose is part of the
-     * ONE-TIME preparation, exactly like KleidiAI's rhs pack, so it is timed with it. */
     int8_t *Wkn = (int8_t *)malloc((size_t)K * N);
 
-    /* ---- descriptors ---------------------------------------------------------- */
     dnnl_dims_t sd = {M, K}, wd = {K, N}, dd = {M, N};
     dnnl_memory_desc_t smd, wmd_any, dmd, wmd_plain;
     CK(dnnl_memory_desc_create_with_tag(&smd, 2, sd, dnnl_s8, dnnl_ab));
@@ -118,8 +82,8 @@ static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, 
 
     dnnl_primitive_attr_t attr;
     CK(dnnl_primitive_attr_create(&attr));
-    CK(dnnl_primitive_attr_set_scales_mask(attr, DNNL_ARG_SRC, 0));          /* per TENSOR: see quant_tensor */
-    CK(dnnl_primitive_attr_set_scales_mask(attr, DNNL_ARG_WEIGHTS, 1 << 1));  /* per column N */
+    CK(dnnl_primitive_attr_set_scales_mask(attr, DNNL_ARG_SRC, 0));
+    CK(dnnl_primitive_attr_set_scales_mask(attr, DNNL_ARG_WEIGHTS, 1 << 1));
 
     dnnl_primitive_desc_t pd;
     dnnl_status_t st = dnnl_matmul_primitive_desc_create(&pd, eng, smd, wmd_any, NULL, dmd, attr);
@@ -132,7 +96,6 @@ static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, 
     const_dnnl_memory_desc_t wmd_req = dnnl_primitive_desc_query_md(pd, dnnl_query_weights_md, 0);
     size_t wpacked_bytes = dnnl_memory_desc_get_size(wmd_req);
 
-    /* ---- ONE-TIME preparation: transpose + reorder into the primitive's layout --- */
     void *Wpacked = malloc(wpacked_bytes);
     double t0 = now_ns();
     for (int k = 0; k < K; k++)
@@ -152,7 +115,6 @@ static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, 
     }
     double rhs_pack_ns = now_ns() - t0;
 
-    /* ---- the primitive and its arguments -------------------------------------- */
     dnnl_primitive_t prim;
     CK(dnnl_primitive_create(&prim, pd));
     dnnl_memory_t m_src = mem_from(eng, smd, Xq);
@@ -171,7 +133,6 @@ static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, 
         { DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, m_swei },
     };
 
-    /* ---- correctness against a float64 reference from the same tensors --------- */
     CK(dnnl_primitive_execute(prim, str, 5, args));
     CK(dnnl_stream_wait(str));
     double num = 0, den = 0;
@@ -180,14 +141,12 @@ static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, 
             double acc = 0;
             for (int k = 0; k < K; k++)
                 acc += (double)X[(size_t)m * K + k] * (double)W[(size_t)n * K + k] * (double)Ws[n];
-            /* acc is the TRUE f32 reference: same definition the census uses for err_vs_f32 */
             double got = Y[(size_t)m * N + n];
             num += (got - acc) * (got - acc);
             den += acc * acc;
         }
     double err = den > 0 ? sqrt(num / den) : -1.0;
 
-    /* ---- timing: median of 5, enough iterations to swamp the clock ------------- */
     double macs = (double)M * N * K;
     int iters = (int)(2e8 / macs); if (iters < 1) iters = 1; if (iters > 2000) iters = 2000;
     for (int w = 0; w < 3; w++) {
@@ -219,11 +178,6 @@ static void cell(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, int B, 
     free(W); free(Ws); free(X); free(Xq); free(Xs); free(Y); free(Wkn); free(Wpacked);
 }
 
-
-/* ── BF16 arm: the PREFILL shapes, the B values the real 21-token prompt produces ──
- * Same protocol. oneDNN gets the same weights, converted to bf16 with round-to-nearest
- * (which is what KleidiAI's packer does; our own engine TRUNCATES, and that is visible
- * in err_vs_f32 in the census: 5.8e-3 ours vs 2.2e-3 Kleidi). */
 static uint16_t f32_to_bf16_rne(float f) {
     union { float f; uint32_t u; } v = { f };
     uint32_t u = v.u;
@@ -239,7 +193,7 @@ static void cell_bf16(dnnl_engine_t eng, dnnl_stream_t str, const shape_t *S, in
     const int N = S->N, K = S->K, M = B;
     float *Wf = (float *)malloc((size_t)N * K * sizeof(float));
     float *Xf = (float *)malloc((size_t)M * K * sizeof(float));
-    uint16_t *Wb = (uint16_t *)malloc((size_t)K * N * sizeof(uint16_t));   /* KxN for oneDNN */
+    uint16_t *Wb = (uint16_t *)malloc((size_t)K * N * sizeof(uint16_t));
     uint16_t *Xb = (uint16_t *)malloc((size_t)M * K * sizeof(uint16_t));
     float *Y = (float *)malloc((size_t)M * N * sizeof(float));
     if (!Wf || !Xf || !Wb || !Xb || !Y) { fprintf(stderr, "oom\n"); exit(1); }
@@ -343,7 +297,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof SHAPES / sizeof *SHAPES; i++)
         for (size_t b = 0; b < sizeof BS / sizeof *BS; b++)
             cell(eng, str, &SHAPES[i], BS[b], reps);
-    int PB[] = {5, 8, 16};   /* the real prefill batch: a 21-token prompt is 16 + 5 */
+    int PB[] = {5, 8, 16};
     for (size_t i = 0; i < sizeof PREFILL / sizeof *PREFILL; i++)
         for (size_t b = 0; b < sizeof PB / sizeof *PB; b++)
             cell_bf16(eng, str, &PREFILL[i], PB[b]);

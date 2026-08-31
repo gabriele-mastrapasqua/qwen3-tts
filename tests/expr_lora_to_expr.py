@@ -1,33 +1,13 @@
 #!/usr/bin/env python3
-"""Convert a PEFT LoRA adapter (route-b, ~16MB) into a `.expr` micro-file the C engine
-loads. Default = FACTORED (dtype 5): stores the A/B factors + scale, the engine
-reconstructs delta = scale*(B@A) at load → file stays ~16MB (the real win).
-
-`--merge` = dense (dtype 4): pre-computes scale*B@A, bakes it onto the base CV bf16
-weights, stores the int16 bit-delta (like tests/expr_extract.py). Big file (~186MB),
-used ONLY to A/B-validate that the C factored reconstruction == the dense merge.
-
-Adapter tensor names: base_model.model.<weight>.lora_{A,B}.weight
-  lora_A: [r, in]   lora_B: [out, r]   →  delta[out,in] = (alpha/r) * B @ A
-
-.expr layout: "QEXP" + u32 ver + char lang[16] + u32 reserved + "WDLT" + u32 hidden +
-u32 n_tensors + per-tensor records. dtype 5 record payload:
-  u32 r, u32 in, u32 out, f32 scale, A[r*in] f32, B[out*r] f32
-
-Usage:
-  python3 tests/expr_lora_to_expr.py ADAPTER_DIR OUT.expr --lang Italian --hidden 2048
-  python3 tests/expr_lora_to_expr.py ADAPTER_DIR OUT.expr --merge --base qwen3-tts-1.7b
-"""
+"""Convert a PEFT LoRA adapter into a .expr micro-file the C engine can load."""
 import argparse, json, os, struct, sys
 import numpy as np
-
 
 def parse_header(path):
     with open(path, "rb") as f:
         hlen = struct.unpack("<Q", f.read(8))[0]
         hdr = json.loads(f.read(hlen))
     return hdr, 8 + hlen
-
 
 def read_tensor(path, hdr, data_off, name, np_dtype):
     e = hdr[name]
@@ -37,15 +17,11 @@ def read_tensor(path, hdr, data_off, name, np_dtype):
         raw = f.read(en - s)
     return np.frombuffer(raw, dtype=np_dtype).reshape(e["shape"])
 
-
 def bf16_to_f32(u16):
     return (u16.astype(np.uint32) << 16).view(np.float32)
 
-
 def f32_to_bf16(f32):
-    # TRUNCATE (bits >> 16) — matches the engine's main_f32_to_bf16 exactly (no rounding)
     return (f32.astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -64,7 +40,7 @@ def main():
     ah, ao = parse_header(ap_path)
 
     PREFIX = "base_model.model."
-    mods = {}  # weight_name -> {"A":..., "B":...}
+    mods = {}
     for k in ah:
         if k == "__metadata__":
             continue
@@ -83,8 +59,8 @@ def main():
     stream = bytearray()
     tot_payload = 0
     for wn in names:
-        A = mods[wn]["A"]              # [r, in]
-        B = mods[wn]["B"]             # [out, r]
+        A = mods[wn]["A"]
+        B = mods[wn]["B"]
         r, n_in = A.shape
         n_out = B.shape[0]
         name_b = wn.encode()
@@ -92,12 +68,12 @@ def main():
             payload = struct.pack("<IIIf", r, n_in, n_out, scale_default)
             payload += A.astype("<f4").tobytes() + B.astype("<f4").tobytes()
             stream += struct.pack("<H", len(name_b)) + name_b
-            stream += struct.pack("<I", len(payload))   # data_bytes
-            stream += struct.pack("<B", 5)              # dtype 5 = LoRA factors
+            stream += struct.pack("<I", len(payload))
+            stream += struct.pack("<B", 5)
             stream += struct.pack("<I", len(payload)) + payload
             tot_payload += len(payload)
         else:
-            delta = (scale_default * (B @ A)).astype(np.float32)   # [out,in]
+            delta = (scale_default * (B @ A)).astype(np.float32)
             cv = read_tensor(os.path.join(args.base, "model.safetensors"), bh, bo, wn, np.uint16).ravel()
             new = f32_to_bf16(bf16_to_f32(cv) + delta.ravel())
             d16 = (new.astype(np.int32) - cv.astype(np.int32)).astype(np.int16)
@@ -124,7 +100,6 @@ def main():
     print(f"wrote {args.out}  ({'merged dense' if args.merge else 'factored LoRA'})")
     print(f"  modules : {len(names)}  (r={r_cfg} alpha={alpha} scale={scale_default:.3f})")
     print(f"  on disk : {disk:.1f} MB")
-
 
 if __name__ == "__main__":
     main()

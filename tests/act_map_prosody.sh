@@ -1,17 +1,5 @@
 #!/usr/bin/env bash
-# Map WHERE general PROSODY (not emotion) lives in the Talker layers, using the existing
-# QWEN_ACT_MAP instrument. Two prosodic axes at CONSTANT neutral emotion, per language:
-#   - INTONATION: same sentence as statement vs question ("?" only) — no instruct.
-#   - PACING:     same sentence + neutral vs slow vs fast instruct (neutral-instruct base
-#                 cancels "instruct presence", isolating the pacing/duration shift).
-# Then act_map_diff.py gives the per-layer shift profile -> compare to the known emotion
-# bands (magnitude mid L06-11, identity late L21-25). If prosody shows up EARLIER, it's a
-# partially-distinct band -> the target for a "language-prosody" LoRA vs the emotion one.
-#
-# Run on M1 (1.7B present). Audio is throwaway; we only want the .qamp fingerprints.
 set -uo pipefail
-# T0 (greedy, default) = deterministic -> ZERO seed-noise floor, so every contrast shift is
-# pure signal (intonation/pacing are prompt-driven, survive greedy). Override with ACT_T=0.9.
 D=qwen3-tts-1.7b; S=ryan; SEED=42; T="${ACT_T:-0}"
 A="${ACT_DIR:-/tmp/actmap}"; mkdir -p "$A"
 JUNK=/tmp/actmap_junk.wav

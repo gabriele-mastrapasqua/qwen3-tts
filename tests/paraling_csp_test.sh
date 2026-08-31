@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Test the NEW CSP-surgical paralinguistic .expr (probed layers, --no-compose = model emits the real event)
-# vs the OLD blind-L16-26 aug (which read [laugh] literally) vs the method-1 macro. ryan IT T1.1 seed42.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 O=samples/paraling_csp; mkdir -p $O

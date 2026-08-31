@@ -1,32 +1,11 @@
 #!/usr/bin/env python3
-"""Automatic emotion scoring via a pre-trained Speech-Emotion-Recognition model — replaces listening
-to N audio clips by hand when ranking TTS expressivity variants (see docs/emotion-research.md).
-
-Model: audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim — a wav2vec2 fine-tuned on MSP-Podcast to
-regress the 3 affect DIMENSIONS arousal / dominance / valence in [0,1]. Dimensional (not categorical)
-on purpose: continuous, ~language-robust, and maps cleanly onto our emotions
-  anger/joy/fear -> high AROUSAL ; sad -> low arousal + low valence ; joy -> high valence.
-
-We measure each emotion as the SHIFT vs that condition's NEUTRAL clip (so per-voice/per-pack bias
-cancels — valid for RELATIVE A/B even though absolute SER on Italian/clones is only a proxy).
-
-Runs on CPU or GPU. Needs: torch + transformers + soundfile + (librosa OR torchaudio) for resampling.
-On the GPU box: add `transformers soundfile librosa` to the qwen-ft image (torch already there), or
-  pip install --break-system-packages transformers soundfile librosa
-
-Usage:
-  # score individual files vs a neutral baseline:
-  python3 emo_score.py --neutral neu.wav anger.wav joy.wav sad.wav
-  # OR auto-build the A/B table over a dir named like  neu_<cond>.wav / <emotion>_<cond>.wav :
-  python3 emo_score.py --ab-dir samples/multispk_ab
-"""
+"""Automatic emotion scoring via a pre-trained speech-emotion-recognition model."""
 import argparse, glob, os, sys
 import numpy as np
 
 MODEL_ID = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
 SR = 16000
 DIMS = ("arousal", "dominance", "valence")
-
 
 def load_model(device):
     import torch, torch.nn as nn
@@ -59,7 +38,6 @@ def load_model(device):
     model = EmotionModel.from_pretrained(MODEL_ID).to(device).eval()
     return proc, model
 
-
 def read_16k(path):
     import soundfile as sf
     y, sr = sf.read(path, dtype="float32")
@@ -74,7 +52,6 @@ def read_16k(path):
             y = torchaudio.functional.resample(torch.from_numpy(y), sr, SR).numpy()
     return y
 
-
 def score(proc, model, device, path):
     import torch
     y = read_16k(path)
@@ -83,10 +60,8 @@ def score(proc, model, device, path):
         out = model(x).cpu().numpy()[0]
     return dict(zip(DIMS, out.tolist()))
 
-
 def fmt(d):
     return "  ".join(f"{k[:3]}={d[k]:.3f}" for k in DIMS)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -102,10 +77,8 @@ def main():
     proc, model = load_model(device)
 
     if a.ab_dir:
-        # filename = <state>_<cond>[_<reptag>].wav  (reptag e.g. t0s42 lets us average over text/seed reps).
-        # shift for a rep = score(emotion rep) - score(neutral rep with the SAME cond+reptag).
         conds, emos = [], []
-        files = {}  # (state,cond,reptag) -> path
+        files = {}
         for f in sorted(glob.glob(os.path.join(a.ab_dir, "*.wav"))):
             b = os.path.basename(f)[:-4]
             parts = b.split("_")
@@ -119,7 +92,6 @@ def main():
             if state != "neu" and state not in emos:
                 emos.append(state)
         reps = sorted({k[2] for k in files})
-        # cache every score once
         sc = {k: score(proc, model, device, v) for k, v in files.items()}
         nrep = len(reps)
         print(f"\nA/B AROUSAL+VALENCE SHIFT vs neutral (mean over {nrep} rep(s))  dir={a.ab_dir}")
@@ -152,7 +124,6 @@ def main():
     else:
         for f in a.files:
             print(f"{os.path.basename(f):16s} {fmt(score(proc, model, device, f))}")
-
 
 if __name__ == "__main__":
     main()

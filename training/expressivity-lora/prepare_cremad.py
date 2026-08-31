@@ -1,36 +1,10 @@
 #!/usr/bin/env python3
-"""CREMA-D -> train_raw.jsonl in the SAME schema as EMOVO (gpu_emovo_prep.py) / ESD (prepare_esd.py),
-so CREMA-D's 91 actors align ALONGSIDE EMOVO + ESD for a voice-agnostic, MANY-SPEAKER emotion FT.
-
-WHY CREMA-D: the deep-research lever (docs/emotion-research.md, PLAN Phase 2) is emotion learned across
-MANY identities -> it generalizes to cloned / novel x-vectors instead of staying voice-specific. ESD
-gives 10 EN speakers with rich text; CREMA-D adds *91* actors (huge identity diversity) over 12 FIXED
-sentences and 6 emotions. The two are complementary (text diversity + speaker diversity).
-
-SOURCE: the HF mirror `yukat237/emotional-speech-audio-dataset-3eng-4noneng` (CREMA_D split, parquet,
-16 kHz audio bytes). The mirror has NO transcript column, but CREMA-D's 12 sentences are FIXED and keyed
-by the 3-letter `sentenceID` -> we look them up below (canonical CREMA-D sentence set).
-
-This script (NEW, dedicated -- it does NOT touch the original gpu_emovo_prep.py / prepare_esd.py):
-  - downloads the CREMA_D parquet shards from the mirror,
-  - decodes each audio blob and resamples 16 kHz -> 24 kHz mono (codec requirement; mirrors EMOVO/ESD),
-  - maps the 6 CREMA-D emotions -> (label, English instruct) using the SAME instruct strings as EMOVO,
-  - emits one row per utterance with a unique `actor` (e.g. cremad1001) for speaker diversity,
-  - prints PROGRESS every --log-every rows and a final per-emotion / per-speaker breakdown.
-
-Usage (on the GPU box, inside the pytorch docker -- needs pyarrow + soundfile + ffmpeg):
-  python3 prepare_cremad.py --out ~/qwen-ft/cremad/train_raw.jsonl
-  # then the SAME codec-encode step as EMOVO/ESD (prepare_data.py) -> train_with_codes.jsonl,
-  # then concat with the others via concat_manifests.py and fine-tune via gpu_sft_expr.py.
-
-License: CREMA-D is released for research (Open Database License). Verify before shipping derived weights.
-"""
+"""CREMA-D -> train_raw.jsonl, in the same schema as the other prepare_* loaders."""
 import os, json, argparse, subprocess, sys, tempfile, collections, time
 
 REPO = "yukat237/emotional-speech-audio-dataset-3eng-4noneng"
 SHARDS = ["data/CREMA_D-00000-of-00002.parquet", "data/CREMA_D-00001-of-00002.parquet"]
 
-# CREMA-D 12 fixed sentences, keyed by the 3-letter sentenceID (canonical CREMA-D set).
 SENT = {
     "IEO": "It's eleven o'clock.",
     "TIE": "That is exactly what happened.",
@@ -46,9 +20,6 @@ SENT = {
     "WSI": "We'll stop in a couple of minutes.",
 }
 
-# parquet `emotion` is a class-label INT into the mirror's global names list. CREMA-D uses these 6
-# (verified from the mirror schema: 0 Anger, 2 Disgust, 3 Fear, 4 Happy, 5 Neutral, 6 Sad).
-# -> (our label, English instruct). neutral = empty instruct (the anchor), same strings as EMOVO/ESD.
 EMO = {
     0: ("anger",    "Speak with hot, furious anger, sharp and forceful."),
     2: ("disgust",  "Speak with physical disgust, repulsed and recoiling."),
@@ -57,7 +28,6 @@ EMO = {
     5: ("neutral",  ""),
     6: ("sadness",  "Speak with a sad, sorrowful, downcast tone, voice low and heavy."),
 }
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -99,7 +69,6 @@ def main():
                 label, instruct = EMO[em]
                 actor = f"cremad{sp}"
                 out_wav = os.path.join(wav24, f"{actor}_{se}_{em}_{per_spk[sp]:04d}.wav")
-                # decode the parquet audio blob (16k wav bytes) -> resample 24k mono via ffmpeg
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp.write(au["bytes"]); src = tmp.name
                 subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src,
@@ -121,7 +90,6 @@ def main():
     print(f"[cremad] DONE: wrote {a.out}: {len(rows)} rows, {len(per_spk)} speakers, "
           f"skipped {n_skip}, {time.time()-t0:.0f}s total", flush=True)
     print("[cremad]   emotions:", dict(by_emo), flush=True)
-
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "recommended",
+    "description": "Stable entry point for \"what should I run on this machine?\". It POINTS at the currently recommended profile and repeats none of its values - a second copy is a copy that drifts. This is a recommended deployment profile for the hardware it names, not a claim that 2x8 is optimal on every CPU, and none of it is compiled into the engine as a universal default.",
+    "alias_of": "axion-16c-ttfa",
+    "objective": {
+      "primary": "ttfa",
+      "concurrency_range": [1, 8],
+      "quality_changes_allowed": false
+    }
+  }
+}

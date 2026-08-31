@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
-"""serve_identity_gate.py — the gate that must pass BEFORE any KPI table is printed.
-
-WHY IT EXISTS
-  A ratio of percentiles is not the percentile of a ratio. That is how ENGINE_SERVICE_RTF
-  p50 once came out LARGER than TOTAL_RTF p50 - a part bigger than the whole - and the
-  table looked perfectly plausible. And request-to-request pairing that relies on splitting
-  a log at marker lines is an assumption about the flush order of two child processes'
-  stderr, not a measurement: it silently produced 21 requests out of 32 with a NEGATIVE
-  overhead, the worker claiming a longer service than the client's entire wall time.
-
-WHAT IT CHECKS, on EVERY request, never on aggregates
-  1. client and worker pair by a globally unique seed (the request id)
-  2. no seed appears twice anywhere in the worker log
-  3. audio_client == audio_engine
-  4. client_total - (pre_service + service) >= 0, and that remainder is small and stable
-
-Only if all of it holds does it print the frozen KPIs:
-  C | TTFA50 | TTFA95 | STREAM_RTF50 | STREAM_RTF95 | rejects | errors
-with TTFA and STREAM_RTF on one row coming from the SAME requests.
-
-Usage:  tests/serve_identity_gate.py <run_out_dir> [<run_out_dir> ...]
-Exit:   0 all gates passed · 1 at least one cell failed (and no table was printed)
-"""
+"""serve_identity_gate.py — the gate that must pass BEFORE any KPI table is printed."""
 import json, os, re, sys
 
 def pct(v, q):
@@ -55,8 +33,6 @@ def engine_index(logpath):
     return out, dup
 
 def run(d):
-    # accept both the legacy name (req_<label>_<topo>_C<N>.jsonl) and the readable one
-    # (<date>_<workload>_<arrival>_<model>-<prec>_<topo>_c<N>_requests.jsonl)
     def conc_of(f):
         m = re.search(r"_C(\d+)\.jsonl$", f) or re.search(r"_c(\d+)_requests\.jsonl$", f)
         return int(m.group(1)) if m else None

@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-# Per-language EMOTION × VOICE × TEMP listening matrix for the L16-26 emotion LoRA.
-#
-# WHY THIS EXISTS: so we never re-spell the test format by hand again. For EVERY clip it prints,
-# cleanly spaced, test-by-test:
-#   - a header line: voice (CLONED vs PRESET, and WHICH clone) · EMOTION · temp · duration
-#   - desc     : one short line of what it uses
-#   - instruct : the exact instruct prompt
-#   - the FULL command actually run (verify it uses e.g. the SMALL ICL file, not the 3GB WDELTA)
-#   - a copy-paste `afplay <abs path>   # comment` line to listen
-#
-# Voices: { galatea SMALL-ICL clone , galatea HEAVY 3GB qvoice WDELTA clone , ryan preset }.
-# Emotions: all 7 EMOVO (incl. never-tested disgust/fear/surprise); neutral = no instruct (anchor).
-# Temps: 0.9 and 1.1. The 7 instructs are EXACTLY the ones the Italian LoRA was trained on (EMOVO).
-#
-# Usage: tests/lora_matrix.sh [Language] [expr_path] [model_dir] [out_dir]
-#   e.g. tests/lora_matrix.sh Italian presets/expr/italian_l1626_r64.expr
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
@@ -29,7 +13,6 @@ mkdir -p "$OUT"
 REPORT="$OUT/LISTEN.md"
 EXPR_BASE="$(basename "$EXPR")"
 
-# emotion -> instruct (EMOVO training instructs; neutral = empty)
 EMOS=(
   "neutral|"
   "joy|Speak happily, bright and warm, smiling through the words."
@@ -39,7 +22,6 @@ EMOS=(
   "surprise|Speak with surprise, startled and taken aback, held through the whole sentence."
   "disgust|Speak with physical disgust, repulsed and recoiling."
 )
-# voice: key | kind-tag | one-line desc | qwen-args
 VOICES=(
   "galatea-smallICL|CLONED (small ICL file)|small ICL clone (ref_codes — NOT the 3GB WDELTA); timbre from ICL, emotion from L16-26 LoRA + instruct|--load-voice voices/galatea_icl.qvoice"
   "galatea-heavyWDELTA|CLONED (heavy 3GB qvoice WDELTA)|full WDELTA weight-swap clone (the heavy path) + L16-26 LoRA + instruct — for comparison vs small ICL|--load-voice voices/galatea_graft.qvoice"

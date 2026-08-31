@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# RE-VALIDATE the two paralinguistic methods (user 2026-06-24):
-#   METHOD 1 = MACRO composer (tag -> synth onomatopoeia span, no train): just put [tag] in --text (auto-routes).
-#   METHOD 2 = paralinguistic .expr LoRA (model emits a REAL event from the inline tag): --no-compose + --expr.
-# Past verdict: [sigh] worked (LoRA > macro), [laugh] failed (read literally), ep8 over-forced. aug = the
-# cross-lingual augmentation (VocalSound spliced into multilingual carriers). ryan 1.7B, IT, T1.1, seed42.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 O=samples/paraling_reval; mkdir -p $O

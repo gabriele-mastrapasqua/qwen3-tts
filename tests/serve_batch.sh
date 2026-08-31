@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-# serve_batch.sh — validate the vLLM-style request-batching server (--batch-size N).
-#
-# Fires concurrent requests with DIFFERENT text/speaker/language at temp 0 and,
-# with QWEN_BATCH_FORCE_MATVEC=1 (batched compute bit-exact to single-stream),
-# asserts each response mel-corr 1.0 vs its own single-stream reference + zero
-# cross-talk. Also smoke-tests the production matmat path and the stream fallback.
-#
-# Usage: tests/serve_batch.sh [model_dir] [port]
-# Requires: python3 + librosa (tests/compare_audio.py), a quiet machine.
-#
-# NOTE: always kill the server by name and use timeout on curls — never `wait` on
-# the server pid (it never exits). See CLAUDE.md server-testing rules.
 set -u
 MODEL="${1:-qwen3-tts-0.6b}"
 PORT="${2:-8779}"
@@ -29,7 +17,6 @@ chk() { # label refwav gotwav  -> expect PASS
 echo "=== request-batching server test (model=$MODEL port=$PORT) ==="
 pkill -9 -f "qwen_tts.*--serve" 2>/dev/null; sleep 1
 
-# ── A) rigorous gate: force_matvec, 3 different concurrent requests, temp 0 ──
 QWEN_BATCH_FORCE_MATVEC=1 $BIN -d "$MODEL" --serve "$PORT" --batch-size 4 > "$TMP/srv.log" 2>&1 &
 sleep 6
 TA='{"text":"Il primo messaggio di prova del server.","speaker":"ryan","language":"Italian","temperature":0,"seed":100}'
@@ -42,7 +29,6 @@ wait $PA $PB $PC            # only the curls — NEVER the server
 echo "--- batch log ---"; grep BATCH "$TMP/srv.log" | tail -3
 pkill -9 -f "qwen_tts.*--serve" 2>/dev/null; sleep 1
 
-# single-stream references (force_matvec → bit-exact), same params
 QWEN_BATCH_FORCE_MATVEC=1 $BIN -d "$MODEL" --text "Il primo messaggio di prova del server." -s ryan -l Italian -T 0 --seed 100 -j1 -o "$TMP/ra.wav" --silent 2>/dev/null
 QWEN_BATCH_FORCE_MATVEC=1 $BIN -d "$MODEL" --text "This is the second concurrent test message." -s vivian -l English -T 0 --seed 200 -j1 -o "$TMP/rb.wav" --silent 2>/dev/null
 QWEN_BATCH_FORCE_MATVEC=1 $BIN -d "$MODEL" --text "Terzo ed ultimo esempio di sintesi vocale batched." -s serena -l Italian -T 0 --seed 300 -j1 -o "$TMP/rc.wav" --silent 2>/dev/null
@@ -54,7 +40,6 @@ echo "--- cross-talk (expect FAIL = independent) ---"
 xr=$(python3 "$CMP" "$TMP/rc.wav" "$TMP/sa.wav" 2>/dev/null)
 echo "$xr" | grep -q FAIL && echo "  OK (independent) :: $xr" || { echo "  CROSS-TALK! :: $xr"; fail=$((fail+1)); }
 
-# ── B) production smoke: matmat path batches + stream fallback works ──
 echo "--- production smoke (matmat path) ---"
 $BIN -d "$MODEL" --serve "$PORT" --batch-size 4 > "$TMP/srv2.log" 2>&1 &
 sleep 6

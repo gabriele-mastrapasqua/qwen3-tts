@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# German .expr A/B: preset vivian (base vs +german_r32) + galatea clone cross-lingual (+german_r64).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=samples/german_ab; mkdir -p "$OUT"

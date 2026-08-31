@@ -175,7 +175,7 @@ performance to **RTF ~1.3–1.7** (up to 2.7x total speedup):
 > — AVX2 + threading + int4 on a Ryzen 7 6800H, AVX-512/VNNI on an EPYC 9555P (Zen5); see
 > "Cross-device CPU benchmarks" above. The remaining caveat is **physics, not missing code**: decode
 > is memory/cache-bound, so SIMD/threading give modest gains and the chip's cache dominates
-> single-stream RTF. Measure your box with `tests/x86_bench.sh`. Details in PLAN.md Phase 21.
+> single-stream RTF. Measure your box with `tests/x86_bench.sh`.
 
 ## Running Benchmarks
 
@@ -191,10 +191,10 @@ and wall time for each configuration. Logs and WAVs saved in `/tmp/qwen_tts_benc
 
 - **SIMD-optimized kernels** — NEON (+ native SDOT int8) on ARM and **AVX2 + AVX-512/VNNI on x86**
   for the BF16/INT8 matrix-vector ops, with a scalar fallback and a runtime ISA guard (validated on
-  Ryzen 6800H + EPYC 9555P, PLAN.md 21.3).
+  Ryzen 6800H + EPYC 9555P).
 - **Cache-line aligned buffers** — 64B `posix_memalign` for optimal BLAS/SIMD throughput
 - **Multi-threaded decode** — a **cross-OS thread pool**: GCD (`dispatch_apply`) on macOS, a
-  persistent pthread pool on Linux/Windows (PLAN.md 21.2). Threading scales on bare metal; in a
+  persistent pthread pool on Linux/Windows. Threading scales on bare metal; in a
   multi-CCD VM the hypervisor's vCPU placement can limit it. Prefill uses BLAS (`cblas_sgemm`).
 - **Memory-mapped weights** — BF16 safetensors mmap'd directly, near-instant loading
 - **Pipeline parallelism** — Speech decoder runs in background thread during Talker+CP generation

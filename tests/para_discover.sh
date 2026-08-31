@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# PARA DISCOVERY (user 2026-06-26, strada 2): find which paralinguistics the MODEL can emit NATIVELY
-# (= cross-voice for free) via the right TRIGGER. Hypothesis (why "hahaha" worked): onomatopoeia spelled
-# AS THE SOUND get PERFORMED, words get READ. Sweep many spell-as-sound triggers (Latin + Chinese +
-# Japanese) + a strong EN instruct, on ryan (discovery voice). Winners -> later cross-voice + steer-extract.
-#   -> samples/para_discover/   (one subfolder per event)
 set -uo pipefail
-cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 O=samples/para_discover; rm -rf $O
 M=qwen3-tts-1.7b; SEED=42; SP="${SP:-ryan}"; L="${L:-English}"
 dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframes()/w.getframerate():.2f}s')" "$1" 2>/dev/null||echo FAIL; }

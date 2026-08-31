@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
-# PARA-VEC retry v2 (2026-06-25): fix the wave-1 failures. (1) EVENT-SPECIFIC source text (stuffed
-# with the real sound, like "hahaha" was for laugh) instead of one generic line; (2) test each vector
-# on BOTH a carrier WITH the literal tag and WITHOUT it (the tag word gets "read" → no-tag lets the
-# vector add the event as prosody). Per-voice weight: galatea/vivian 8, ryan 6.  -> samples/para_vectors/
 set -uo pipefail
-cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 O=samples/para_vectors; M=qwen3-tts-1.7b; IT=presets/expr/italian_csp_topk6.expr; SEED=42
 dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframes()/w.getframerate():.2f}s')" "$1" 2>/dev/null||echo FAIL; }
 vf(){ case "$1" in galatea) echo "--load-voice voices/galatea_graft.qvoice --icl-only";; *) echo "-s $1";; esac; }
 ew(){ [ "$1" = galatea ] && echo 1.0 || echo 1.2; }
 wt(){ [ "$1" = ryan ] && echo 6 || echo 8; }
 
-# name | EVENT instruct | EVENT text (EN, stuffed) | OPP instruct | OPP text | carrier WITH tag | carrier NO tag
 EVENTS=(
 "growl2|Snarl and growl with raw furious aggression, low gravelly chest growl, baring teeth, seething.|Grrr, how dare you, get away from me right now, grrr, I am so furious, grrr!|Speak in a soft tender gentle soothing tone, calm warm and reassuring.|It is all right, just calm down, everything is fine now, take a slow deep breath.|Come ti permetti di parlarmi cosi, grr, questo proprio non lo accetto.|Come ti permetti di parlarmi cosi, questo proprio non lo accetto."
 "disgust2|React with intense revulsion and disgust, recoiling, sneering, going ugh and yuck and ewww.|Ugh, yuck, that is so gross and revolting, ewww, disgusting, it makes me sick, ugh!|Savor with warm delight and pleasure, going mmm, satisfied and pleased and content.|Mmm, this is so delicious and wonderful, mmm, so good, mmm, absolutely satisfying.|Che cosa disgustosa, bleah, non riesco nemmeno a guardarla.|Che cosa disgustosa, non riesco nemmeno a guardarla."

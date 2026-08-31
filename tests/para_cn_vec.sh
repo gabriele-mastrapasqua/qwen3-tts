@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# PARA-VEC from CHINESE source (2026-06-26). The CN probe showed the model emits REAL-ish paralinguistics
-# in Chinese (sigh TOP, laugh real, gasp/growl/disgust present) — and CN interjections (哈哈/唉/呸) behave
-# like the SOUND, not a read word. So capture EVENT vs its OPPOSITE on vivian in CHINESE, build the L21-25
-# direction (opposite-contrast, RAW, no --clean), inject on the Italian voices.  -> samples/para_cn_vec/
 set -uo pipefail
-cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 O=samples/para_cn_vec; rm -rf $O; mkdir -p $O
 M=qwen3-tts-1.7b; IT=presets/expr/italian_csp_topk6.expr; SEED=42
 dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframes()/w.getframerate():.2f}s')" "$1" 2>/dev/null||echo FAIL; }
@@ -12,7 +8,6 @@ vf(){ case "$1" in galatea) echo "--load-voice voices/galatea_graft.qvoice --icl
 ew(){ [ "$1" = galatea ] && echo 1.0 || echo 1.2; }
 wt(){ [ "$1" = ryan ] && echo 6 || echo 8; }
 
-# name | EVENT instruct(CN) | EVENT text(CN) | OPP instruct(CN) | OPP text(CN) | carrier IT (no tag)
 EVENTS=(
 "gasp|突然受惊倒吸一口气，震惊地喘息，难以置信。|啊，我简直不敢相信，哎呀，太意外了！|缓缓地长长地叹气，气息缓缓呼出，疲惫而无奈。|唉，今天真累，唉，我撑不下去了。|Oh, non ci posso credere, non me lo aspettavo per niente!"
 "growl|用愤怒咆哮的语气，从胸腔发出低沉的怒吼，咬牙切齿，怒不可遏。|你竟然敢这样对我，哼，我绝对不能接受。|用温柔轻柔、亲切安抚的语气说话，平静而温暖。|没关系，慢慢来，一切都会好的，深呼吸。|Come ti permetti di parlarmi cosi, questo proprio non lo accetto."

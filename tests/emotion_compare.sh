@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Compare the Italian emotion palette across two .qvoice voices on a given model.
-# Same text + seed + language for every render → only the voice/emotion vary.
-#
-# Usage: bash tests/emotion_compare.sh <model_dir> <outdir> <voiceA.qvoice> [voiceB.qvoice ...]
 set -euo pipefail
 
 MODEL="${1:?model dir, e.g. qwen3-tts-0.6b}"
@@ -15,7 +11,6 @@ SEED=42
 LANG=Italian
 TEXT="Non ci posso credere, è davvero una notizia fantastica! Sono così felice per te."
 EMO_DIR=presets/emotions/it
-# weak tones we want to scrutinise + a couple of controls
 TONES=(neutral happy excited eager proud calm sad)
 
 mkdir -p "$OUTDIR"

@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Extract the GRAFT-LITE .qvoice = everything `--icl-only` uses, WITHOUT the giant WDELTA.
-
-A heavy v3 .qvoice = x-vector + META + TPAD + WOVR + WDELTA. `--icl-only` uses the first four
-(x-vector identity + source tts_pad/bos/eos embeds + text_projection/codec_embedding override =
-the prosody richness: sighs/pauses) and SKIPS the multi-GB WDELTA weight-swap. So a file truncated
-at the start of WDELTA reproduces `--icl-only` BIT-IDENTICALLY at ~25MB instead of ~3GB (120x smaller).
-
-  ./qwen_tts ... --load-voice X_graft.qvoice --icl-only   ==   ... --load-voice X.qvoice --icl-only   (md5-identical)
-
-Usage:
-  tests/qvoice_to_graft.py voices/galatea_17b.qvoice           # -> voices/galatea_17b_graft.qvoice
-  tests/qvoice_to_graft.py in.qvoice -o out.qvoice
-"""
+"""Extract the GRAFT-LITE .qvoice = everything `--icl-only` uses, WITHOUT the giant WDELTA."""
 import struct, sys, os, argparse
 
 def wdelta_offset(path):
@@ -21,11 +9,11 @@ def wdelta_offset(path):
         ver = u32()
         if ver < 3: sys.exit(f"need v3 qvoice (got v{ver}); v1/v2 have no WOVR/WDELTA split")
         enc = u32()
-        f.seek(12 + enc * 4)                      # past x-vector
-        rtl = u32(); f.seek(rtl, 1)               # ref_text
-        nrf = u32(); f.seek(nrf * 16 * 4, 1)      # ref_codes
+        f.seek(12 + enc * 4)
+        rtl = u32(); f.seek(rtl, 1)
+        nrf = u32(); f.seek(nrf * 16 * 4, 1)
         if f.read(4) != b"META": sys.exit("expected META block")
-        f.seek(4 + 16 + 4 + 4 + 4 + 64 + 4, 1)    # lang_id,name,model,enc,refdur,voicename,flags
+        f.seek(4 + 16 + 4 + 4 + 4 + 64 + 4, 1)
         pos = f.tell()
         if f.read(4) == b"TPAD":
             th = u32(); f.seek(th * 4 * 3, 1)

@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# serve_stream_batch.sh — validate S3: per-request STREAMING composed with batching.
-# Fires concurrent /v1/tts/stream requests (preset voice). Each gets a chunked PCM
-# stream while the Talker+CP compute stays batched. With force_matvec the streamed
-# audio must mel-corr ~1.0 vs the single-stream reference (streaming decoder ≈ full
-# decoder of the same codes).
-#
-# Usage: tests/serve_stream_batch.sh [model] [port]
 set -u
 MODEL="${1:-qwen3-tts-0.6b}"
 PORT="${2:-8788}"
@@ -13,7 +6,6 @@ BIN=./qwen_tts
 TMP=$(mktemp -d)
 trap 'pkill -9 -f "qwen_tts.*--serve" 2>/dev/null; rm -rf "$TMP"' EXIT
 
-# raw s16le PCM (24k mono) vs WAV reference → mel-corr
 pcmcorr() { # ref.wav  stream.pcm
 python3 - "$1" "$2" <<'PY'
 import sys, numpy as np, wave
@@ -43,7 +35,6 @@ wait $PA $PB
 echo "--- batch log (should show streamed + batched admission) ---"; grep "BATCH\] done" "$TMP/srv.log" | tail -4
 pkill -9 -f "qwen_tts.*--serve" 2>/dev/null; sleep 1
 
-# single-stream references (force_matvec → same codes)
 QWEN_BATCH_FORCE_MATVEC=1 $BIN -d "$MODEL" --text "Primo flusso in streaming dal server batched." -s ryan -l Italian -T 0 --seed 100 -j1 -o "$TMP/ra.wav" --silent 2>/dev/null
 QWEN_BATCH_FORCE_MATVEC=1 $BIN -d "$MODEL" --text "Second streaming flow served concurrently." -s vivian -l English -T 0 --seed 200 -j1 -o "$TMP/rb.wav" --silent 2>/dev/null
 

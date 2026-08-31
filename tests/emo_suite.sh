@@ -1,36 +1,16 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# emo_suite.sh — ORDERED emotion test suite (per the 2026-06-29 methodology).
-#
-#   • PER-LANGUAGE subfolders: samples/tests/<DATE>_emo-suite/<lang>/
-#   • EMOTION-MATCHED prompts per (language × emotion) — a sentence whose MEANING fits the emotion
-#     (Qwen-TTS emotes better on meaningful text than on one neutral carrier reused everywhere).
-#   • STEER WEIGHT SWEEP around the sweet spot: w8 / w10 / w12 (w12 wins with the right native speaker — 2026-06-29)
-#     PLUS a COMBINE variant (per-language .expr + steer w8 + instruct).
-#   • FILENAME encodes voice + mode + steer weight + expr, so you hear the file and KNOW what produced it:
-#       <lang>_<voice>_<emo>_steer_w<W>.wav            (pure steer, no expr/instruct)
-#       <lang>_<voice>_<emo>_combine_w8_expr.wav       (expr + steer w8 + instruct)
-#   • GALATEA clone folder: contrasting emotions across a few languages (COMBINE, the clone cross-lang win).
-#
-# GOLD native preset per language: ryan = IT/EN/PT/RU ; vivian = DE/FR/ES/ZH ; ono_anna = JA ; sohee = KO.
-#   (RU = ryan: vivian sits too high-pitched on Russian — ear-verdict 2026-06-30.)
-# 1.7B CustomVoice, seed 42, ml-range 21-25, ml-decay 0.985 (engine default).
-#
-# Scope to a subset: LANGS="de fr es" bash tests/emo_suite.sh   (default = all). EMOS="anger sad" to subset emotions.
-# ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42
 ROOT="${EMO_SUITE_DIR:-samples/tests/2026-06-29_emo-suite}"; mkdir -p "$ROOT"
 [ -d "$M" ] || { echo "SKIP: $M not present"; exit 0; }
 QL=presets/steer/emotion
-WEIGHTS_DEFAULT="8 10 12"   # steer sweep around the w12 sweet spot (2026-06-29 verdict; w12 wins clean)
+WEIGHTS_DEFAULT="8 10 12"   # steer sweep around w12, the weight the recipe uses
 EMOS="${EMOS:-sad joy anger fear disgust surprise}"
 LANGS="${LANGS:-it en de fr es zh ja ko ru pt}"
 
 tok(){ case "$1" in anger)echo ang;; *)echo "$1";; esac; }
 
-# English instruct per emotion (for COMBINE; pure-STEER uses none).
 declare -A INS=(
  [sad]="Speak in a sad, sorrowful, gloomy and downcast tone, voice low and heavy, on the verge of tears."
  [joy]="Speak with bright, radiant joy, light and warm, smiling through every word."
@@ -39,7 +19,6 @@ declare -A INS=(
  [disgust]="Speak with deep disgust and revulsion, lip-curling contempt, as if something repels you."
  [surprise]="Speak with sudden astonishment and surprise, gasping and caught off guard.")
 
-# language config: tag -> "Language|voiceflags|voicelabel|exprfile"
 declare -A LCFG=(
  [it]="Italian|-s ryan|ryan|presets/expr/italian_csp_topk6.expr"
  [en]="English|-s ryan|ryan|presets/expr/italian_csp_topk6.expr"
@@ -52,7 +31,6 @@ declare -A LCFG=(
  [ru]="Russian|-s ryan|ryan|presets/expr/italian_csp_topk6.expr"
  [pt]="Portuguese|-s ryan|ryan|presets/expr/italian_csp_topk6.expr")
 
-# EMOTION-MATCHED prompts: "tag_emo" -> sentence whose meaning fits the emotion.
 declare -A TX=(
  [it_sad]="Ho perso tutto quello che avevo, e adesso non so più cosa fare."
  [it_joy]="Non ci posso credere, è la notizia più bella della mia vita!"
@@ -125,25 +103,19 @@ for tag in $LANGS; do
   for e in $EMOS; do
     txt="${TX[${tag}_${e}]:-}"; [ -z "$txt" ] && continue
     ql="$QL/ryan_$(tok $e).qlsteer"
-    # steer sweep (pure steer, emotion-matched text, no expr/instruct)
     for w in $WEIGHTS_DEFAULT; do
       run "$d/${tag}_${vlabel}_${e}_steer_w${w}.wav" \
         $BIN -d $M $vf -l "$lang" -T 1.1 --seed $SEED --ml-steer "$ql" --ml-weight $w --ml-range 21-25 --text "$txt"
     done
-    # combine (per-language expr @1.2 + steer w8 + instruct)
     run "$d/${tag}_${vlabel}_${e}_combine_w8_expr.wav" \
       $BIN -d $M $vf -l "$lang" -T 1.1 --seed $SEED --expr "$expr" --expr-weight 1.2 \
       --ml-steer "$ql" --ml-weight 8 --ml-range 21-25 --instruct "${INS[$e]}" --text "$txt"
   done
 done
 
-# ---- REFERENCE CLONES (CC0/PD, downloadable via download_voices.sh) — the clone recipe = COMBINE everywhere.
-#      Reproducible for anyone who clones the repo (galatea IT, quijote ES, ohenry EN, hugo FR). The "one easy
-#      way" for clones: IT expr @1.0 (renders) + ryan_<emo> steer w8 + English instruct. ----
 gd="$ROOT/reference_clones"; mkdir -p "$gd"
 echo "==== reference clones (CC0 25MB grafts) — COMBINE in each native language -> $gd ===="
 IT_EXPR=presets/expr/italian_csp_topk6.expr
-# voice-file | native-tag | Language
 for rv in "galatea_graft|it|Italian" "quijote_graft|es|Spanish" "ohenry_graft|en|English" "hugo_graft|fr|French"; do
   IFS='|' read -r vfile tg lng <<< "$rv"
   if [ ! -f "voices/$vfile.qvoice" ]; then echo "  SKIP $vfile (run: bash download_voices.sh)"; continue; fi
@@ -155,7 +127,6 @@ for rv in "galatea_graft|it|Italian" "quijote_graft|es|Spanish" "ohenry_graft|en
       --ml-steer "$ql" --ml-weight 8 --ml-range 21-25 --instruct "${INS[$e]}" --text "$txt"
   done
 done
-# galatea cross-language bonus (the §8.6 win: an IT clone emoting in far languages)
 if [ -f voices/galatea_graft.qvoice ]; then
   GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
   for pair in "zh|Chinese|sad" "ru|Russian|anger" "ja|Japanese|joy"; do

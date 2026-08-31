@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "generic-16c-starting-point",
+    "description": "A STARTING POINT for a 16-core server, not a qualification. Every value here is either a property of the engine or a measured rule of thumb that held on more than one machine; the topology in particular must be re-measured on the target before any number from it is quoted.",
+    "objective": {
+      "primary": "ttfa",
+      "secondary": "realtime_factor",
+      "concurrency_range": [
+        1,
+        8
+      ],
+      "preferred_concurrency": 4,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_family": "any 16-core Arm server class (Neoverse N1/V1/V2 and equivalents)",
+    "logical_cpus": 16,
+    "physical_cores": 16,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 32,
+    "ram_gib": 32,
+    "notes": "16 physical cores without SMT is the shape this starting point assumes. On a cloud vCPU that is a HYPERTHREAD unless the instance was created with one thread per core, and with SMT on, eight threads means four real cores contending for the same FMA units -- which looks like the batching's fault and is not. Recreate the instance with one thread per core, or halve the thread split and re-measure."
+  },
+  "build": {
+    "target": "blas",
+    "make": {
+      "command": "make blas GIT_REV=$(git rev-parse --short HEAD)",
+      "variables": {
+        "SIMD": "auto -> native",
+        "ARCH_FLAGS": "-march=native (resolved by the build, per host)"
+      }
+    },
+    "requirements": {
+      "blas": "any OpenBLAS with a pthread build",
+      "kleidiai": "vendored; the Arm matrix-unit paths are compiled and gated at runtime",
+      "note": "GIT_REV must be passed on the command line: a synced tree has no .git, so the binary cannot certify its own commit."
+    }
+  },
+  "server": {
+    "prefork_workers": 2,
+    "threads_per_worker": 8,
+    "batch_size": 8,
+    "max_queue": 1,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "worker_affinity": "contiguous core slices, one per worker"
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 8,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8 (per-row absmax), from --int8",
+      "code_predictor_weights": "int8 - follows --int8 unless QWEN_CP_PREC overrides",
+      "speech_decoder_weights": "fp32 - QWEN_SD_INT8 is off by default and int4 measured slower on the first frame",
+      "activations": "fp32; int8 activations are quantized per call inside the int8 kernels",
+      "gemm_backend": "KleidiAI BFMMLA for bf16 matmat, SMMLA for int8 matmat, OpenBLAS sgemm for the speech decoder convolutions"
+    },
+    "environment": {
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "MUST be set. Without it OpenBLAS idles by spinning and contends with the engine's own pool. Measured on this platform, same binary and bank, arms interleaved: first audio at concurrency 1 was 108 ms without it and 66 ms with it, and the bare arm was BIMODAL between the two, so one run lands on either and looks definitive. Beside it: 42,500 context switches per second against 12,000, and 7.9 cores busy against 7.2. At concurrency 4 the same lever is worth nothing (173 against 169 ms), because busy workers leave no idle time to spin through.",
+        "revert": "unset"
+      },
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "deliberately NOT set, and it must be ABSENT rather than merely unset by us. The engine binds OpenBLAS to the thread budget at startup, and qwen_blas_set_threads() returns immediately when this variable is present -- so an unrelated export in the operating shell silently replaces the thread split this profile was qualified with, for every stage and every load. It would also disable the opt-in per-load adjustment (QWEN_SERVE_BLAS / QWEN_SERVE_BLAS_BUSY), which is off by default.",
+        "revert": "set it explicitly only to override the engine's own sizing, knowingly"
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "reuses the request-independent prompt head; measured 9 of 13-79 positions on the production prompts",
+        "revert": "QWEN_PREFIX_CACHE=0"
+      },
+      "QWEN_SERVE_PROFILE": {
+        "value": null,
+        "why": "diagnostics; counters and timing never share a binary in a run that produces a number",
+        "revert": "QWEN_SERVE_PROFILE=1 for the driver phase table"
+      },
+      "QWEN_SD_PHASE": {
+        "value": null,
+        "why": "diagnostics, as above",
+        "revert": "QWEN_SD_PHASE=1"
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "unqualified",
+    "workload": "NONE. Nothing here was measured on the machine you are about to run it on.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-1.7b",
+    "speaker": "ryan",
+    "notes": "Use this to START, then replace it. Two workers of eight threads is where a 16-core Arm host landed, and it rests on one measured fact that generalises -- a single request saturates at about eight threads and regresses at sixteen -- and one that does not: which topology wins depends on the concurrency you expect, because a worker only sees a batch at C >= 2W and the engine takes a different kernel above batch 2. Run the sweep in docs/serving-operations.md, then write your own profile with status 'qualified' and the numbers that earned it."
+  }
+}

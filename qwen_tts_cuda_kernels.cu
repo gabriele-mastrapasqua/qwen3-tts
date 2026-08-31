@@ -1,17 +1,8 @@
 /*
- * qwen_tts_cuda_kernels.cu — CUDA compute kernels (G3), nvcc.
- *
- * Compiled only by `make cuda` (nvcc). Mirrors the M1-VALIDATED Metal kernels in
- * qwen_tts_metal.m 1:1 (same math, validated there via --gpu-selftest rel<5e-3),
- * so numerical correctness is high-confidence; only nvcc compilation is verified
- * on the DGX (no CUDA on the M1 dev box). cuBLAS handles the GEMM (matmat/matvec)
- * in qwen_tts_cuda.c; these kernels cover the ops cuBLAS can't: norm/rope/swiglu/
- * silu/elementwise/snake/attention/conv1d/transpose. Host-array launchers
- * (extern "C") mirror the Metal host API so a DGX selftest can reuse the CPU refs.
- *
- * PERF NOTE: these launchers upload/run/download per call (correctness harness).
- * The resident/fused versions (weights on device, one CUDA-graph per step) are
- * the perf follow-up — same as the Metal per-op → fused progression.
+ * qwen_tts_cuda_kernels.cu - CUDA compute kernels, built by `make cuda` (nvcc).
+ * Mirrors the Metal kernels in qwen_tts_metal.m one to one. cuBLAS handles the GEMMs in
+ * qwen_tts_cuda.c; these cover norm, rope, swiglu, silu, elementwise, snake, attention,
+ * conv1d and transpose, and upload/run/download per call. Fused paths: the other CUDA files.
  */
 
 #include <cuda_runtime.h>

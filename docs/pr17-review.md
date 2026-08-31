@@ -65,7 +65,7 @@ x86 VNNI (`5095e31`/`9a53787`/`fc49db3`) che noi abbiamo. Ma contiene due miglio
   `qwen_tts_cuda_talker.cu`, che la loro base non conosceva: mergiarlo lascerebbe i decoder GPU a
   leggere il layout vecchio su byte nuovi → **audio GPU sbagliato, in silenzio**. E non risolve il vero
   collo di bottiglia x86 (il q4-VNNI è compute-bound sulla reduce per blocco + datapath 512-bit
-  mezzo vuoto — vedi `project_x86_epyc_vnni_validation`). Da rivalutare **dopo** aver misurato se la
+  mezzo vuoto). Da rivalutare **dopo** aver misurato se la
   `vzipq` è ancora sul percorso critico una volta applicato l'accumulo.
 
 **Misura M1** (0.6B, `--int4 -j4`, A/B interleaved ×5, talker+CP, mediana):
@@ -184,7 +184,6 @@ la generazione è veloce, il decoder emerge, e si vede tutto.
 - **leaks**: 137 leak / 420096 B, **identici a `main`**, nessuna traccia dei nuovi `cs_*` (debito preesistente).
 - **1.7B + emotion** (`--emotion sad|joy`): stream esatto == file == windowed, `mel_corr 1.00000`.
 - **inline `[joy]`/`[sad]`** e **`[laugh]`**: OK (prima del fix Makefile: SIGABRT).
-- Ascolto: `samples/tests/2026-07-10_pr17-review/` (17 file, README con cosa ascoltare per ognuno).
 
 ---
 
@@ -353,7 +352,7 @@ Compilati entrambi sulla N1, stesso testo/seed/flag (0.6B, `--int4 -j4`, min di 
 2. **Il pezzo grosso non è quello che pensava nessuno dei due.** Non lo spin-pool, non la snake, non il
    packing: è la **conv int8 del decoder**. `1.41 → 1.15` in stream (**−18%**), `1.31 → 1.11` in file,
    decoder 7735 → 5112 ms. È **l'unica cosa che avevo messo da parte per la qualità** (26 dB worst-segment).
-   → La decisione è **d'orecchio, non di benchmark**: audio in `samples/tests/2026-07-10_pr17-int8-conv/`.
+   → La decisione è **d'orecchio, non di benchmark**.
 
 3. **Lo spin-pool vale poco, isolato.** Sul suo stesso binario, `QWEN_POOL_SPIN=0` vs default:
    **1.43 → 1.39** (~3%). La sua *diagnosi* (~7300 futex/frame) era giusta e preziosa — il profilo la
@@ -407,7 +406,7 @@ M1 ha dotprod, quindi la conv int8 gira anche qui: la qualità si valida in loca
 > mostra regressione. Il costo della conv int8 sul TTFA va rimisurato appaiato — non è ancora fatto.
 
 Gate su M1: default OFF **bit-identico** al HEAD precedente · `--self-test` PASS · `make test-golden` PASS ·
-leaks invariati (137 / 420096 B, come `main`). Audio: `samples/tests/2026-07-10_pr17-int8-conv/audio_our_port/`.
+leaks invariati (137 / 420096 B, come `main`).
 
 ## 5.5 Debito aperto (nostro, creato oggi)
 
@@ -508,7 +507,7 @@ nostro pool ha sezioni seriali in cui i core devono poter andare al decoder.
 La PR dichiarava int4 > int8 su N1, e **sul suo albero era vero**: lì il decoder era lentissimo e il Talker
 dominava. Ora che il decoder è sceso del 57%, **il collo si è spostato**: il vantaggio dell'int4 sul Talker
 non è più sul percorso critico, mentre il decoder è identico nei due casi.
-→ La regola "int4 batte int8 su ARM" ([[project_quant_ladder_findings]]) resta vera **per il Talker isolato**,
+→ La regola "int4 batte int8 su ARM" resta vera **per il Talker isolato**,
 non end-to-end. Ottimizzare una parte riordina la classifica di tutte le altre.
 
 ## 5.10 Snake threading + leva BLAS per fase (`8ea26fc`) — le due leve del profilo
@@ -615,7 +614,7 @@ v2, per l'A/B on-box senza rebuild.
 
   v3 è **−9% vs v2** su Talker E CP (traiettoria appaiata: v3 95 frame, v2 96 → confronto pulito), e il
   **kernel int4-v3 batte quello int8 per-frame** (22.9 vs 25.3; 63.5 vs 69.6). Sulla STESSA box dove la v2
-  era il 37% più lenta di int8 ([[project_x86_epyc_vnni_validation]]), il throughput-packing (2 blocchi/512b
+  era il 37% più lenta di int8, il throughput-packing (2 blocchi/512b
   + 4-row unroll) risolve il collo compute della v2. **Il TODO "il kernel q4-VNNI è compute-bound" è chiuso.**
 
   ⚠️ **Attenzione a NON sovra-affermare.** Questo è un fatto **sul kernel** (ms/frame). Al **wall RTF**

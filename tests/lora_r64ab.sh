@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Does more RANK move the CLONE's expressivity (at fixed --expr-weight 1.0, isolating
-# capacity not magnitude)? galatea r16/r32/r64, sad+anger. vivian r32/r64 as control.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=samples/lora_r64ab; mkdir -p "$OUT"

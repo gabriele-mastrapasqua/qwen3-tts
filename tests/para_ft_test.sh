@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
-# PARA-FT EXP1 A/B (2026-06-26): does the band-corrected (L0-27) nonverbal LoRA make the model emit the
-# event from the [tag] ALONE (--no-compose = tag passed literally), WITHOUT the onomatopoeia trigger?
-# Tags trained with real data: laugh/cough/sigh/sniff/breath. vs baseline (no expr).  -> samples/para_ft_test/
 set -uo pipefail
-cd /Users/gabrielemastrapasqua/source/personal/qwen-tts
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 O=samples/para_ft_test; rm -rf $O; mkdir -p $O
 M=qwen3-tts-1.7b; EXPR=presets/expr/para_nonverbal_b027.expr; SEED=42
 dur(){ python3 -c "import wave,sys;w=wave.open(sys.argv[1]);print(f'{w.getnframes()/w.getframerate():.2f}s')" "$1" 2>/dev/null||echo FAIL; }
 vf(){ case "$1" in galatea) echo "--load-voice voices/galatea_graft.qvoice --icl-only";; *) echo "-s $1";; esac; }
-# id | italian text with [tag] inline (trained tags only)
 ITEMS=(
 "laugh|Non ci posso credere, [laugh] e una notizia fantastica!"
 "cough|Scusatemi un momento, [cough] fatemi continuare."
@@ -21,12 +17,10 @@ for sp in ryan galatea vivian; do
   echo "--- $sp ---"
   for it in "${ITEMS[@]}"; do
     IFS='|' read -r id txt <<< "$it"
-    # WITH FT (expr) + tag literal
     ./qwen_tts -d $M $(vf $sp) -l Italian --seed $SEED -T 1.0 --expr $EXPR --no-compose --text "$txt" -o $O/${sp}_${id}_FT.wav >/dev/null 2>&1
     echo "  ${sp}_${id}_FT -> $(dur $O/${sp}_${id}_FT.wav)"
   done
 done
-# baseline (no FT) for ryan, to A/B
 echo "--- ryan BASELINE (no expr) ---"
 for it in "${ITEMS[@]}"; do
   IFS='|' read -r id txt <<< "$it"

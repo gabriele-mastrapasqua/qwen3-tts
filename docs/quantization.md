@@ -16,7 +16,7 @@ reducing memory usage and (for INT8) improving speed.
 > (AVX2) and an EPYC 9555P / Zen5 (AVX-512/VNNI), where the int8 kernel is a ~1.85× win at equal core
 > count. x86 single-stream RTF is memory/cache-bound (so it won't reach Apple's sub-1.0 without a
 > cache-rich chip), but `--int8`/`--int4` are the right levers there too. Toggle SDOT/VNNI off with
-> `QWEN_NO_SDOT=1` / `QWEN_NO_VNNI=1`. Measure your box: `bash tests/x86_bench.sh`. See PLAN.md 21.3.
+> `QWEN_NO_SDOT=1` / `QWEN_NO_VNNI=1`. Measure your box: `bash tests/x86_bench.sh`.
 
 ## INT8 (Recommended on Apple Silicon, both models)
 

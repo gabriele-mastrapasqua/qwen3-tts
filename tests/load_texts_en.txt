@@ -1,0 +1,47 @@
+# Text bank for tests/load_test.py — OSS models, English + Italian, neutral register.
+#
+# Format:  <class>\t<text>
+# Classes: short | medium | long | conversational | italian
+#
+# WHY THIS BANK EXISTS. What a hardware benchmark measures — RTF, TTFA, throughput, the
+# concurrency ceiling, RSS — is a property of the engine and of the silicon, not of the
+# weights. So the bank runs on open weights, and must not depend on one checkpoint's
+# language or on a quality metric only that checkpoint can be scored against.
+#
+# WHY MIXED LENGTHS: request batching behaves differently at different sequence
+# lengths — a bank of one sentence measures one corner of the space and calls it the
+# answer. The classes are the axis, not decoration. Short requests dominate TTFA;
+# long ones dominate throughput and are where a slot stays occupied.
+#
+# WHY BOTH LANGUAGES: prompt construction differs per language (codec token count),
+# so a single-language bank can hide a per-language cost. Italian is the second
+# language we ship demos in.
+#
+# ⚠️ Keep the texts STABLE. They are the x-axis of every cross-box comparison: change
+# a sentence and yesterday's numbers stop being comparable with today's.
+
+short	The order is confirmed.
+short	Your balance is up to date.
+short	Please hold for a moment.
+short	The line is now open.
+short	Thank you for waiting.
+
+medium	Your appointment has been moved to Thursday morning at nine o'clock.
+medium	The payment went through, and the receipt is on its way to your inbox.
+medium	I can see two active plans on this account, and only one of them renews.
+medium	If the code does not arrive in a minute, I can send it again right away.
+medium	The delivery is scheduled for tomorrow between ten and twelve.
+
+long	Thank you for calling. I have looked at the account and the transfer you are asking about was received yesterday evening, but it is still being processed by the receiving bank, which usually takes one working day. If it has not cleared by tomorrow afternoon, call back with the reference number and we will open a trace on it.
+long	Here is what I can do for you today. I can move the appointment to any morning next week, I can add a reminder by text the day before, and I can note on the file that you prefer to be called rather than emailed. None of that changes the price of the plan, and you can undo any of it later by calling this same number.
+long	Before we finish, let me read the details back to you so we are sure nothing is wrong. The address on the file is the one you gave me, the delivery window is tomorrow between ten and twelve, and the payment method is the card ending in the four digits you confirmed. If any of that is not right, tell me now and I will correct it while the record is still open.
+
+conversational	Sure, I can check that for you. One second.
+conversational	That is a good question, and the honest answer is that it depends on the plan.
+conversational	No problem at all. Let me look it up and I will tell you exactly what I see.
+conversational	I understand. Let us take it one step at a time.
+
+italian	L'ordine è confermato.
+italian	Il pagamento è andato a buon fine e la ricevuta è già in arrivo.
+italian	Grazie per aver chiamato. Ho controllato il conto e il bonifico di ieri sera risulta ricevuto, ma è ancora in lavorazione presso la banca destinataria, cosa che di solito richiede un giorno lavorativo. Se domani pomeriggio non risulta ancora accreditato, richiami con il numero di riferimento e apriamo una ricerca.
+italian	Posso spostare l'appuntamento a giovedì mattina alle nove, se le va bene.

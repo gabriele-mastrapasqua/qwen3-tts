@@ -1,28 +1,4 @@
-/* matmat_parity.c — il gemello batched fa la STESSA aritmetica del riferimento intero?
- *
- * PERCHE' ESISTE. I GEMM quantizzati sono per-ISA: VNNI su AVX-512, SMMLA su i8mm,
- * il nuovo maddubs su AVX2 puro, il twin f32 altrove. Ogni percorso e' codice diverso
- * per lo stesso formato, e finora l'unico modo di verificarne uno era affittare la
- * macchina che lo esegue. Cosi' i kernel AVX-512 sono stati scritti a giugno e mai
- * eseguiti da noi.
- *
- * ⭐ SU M1 SI PUO' ESEGUIRE LO STESSO IL PERCORSO x86: Rosetta 2 supporta AVX2 (misurato
- * su questa macchina, 2026-08-18). Quindi questo test, compilato per x86_64 con
- * -march=x86-64-v3, ESEGUE davvero il kernel AVX2 e ne verifica i numeri — sul portatile,
- * prima di pagare un'ora di cloud. (Rosetta NON emula AVX-512: VNNI e AMX restano da
- * validare sul metallo.)
- *
- * L'ORACOLO, e perche' e' questo. Non si confronta il matmat contro il matvec: quello e'
- * un percorso f32 con un'altra quantizzazione delle attivazioni, quindi una differenza
- * non direbbe se il kernel e' sbagliato o solo diversamente arrotondato. Si confronta
- * contro un riferimento INTERO in C semplice che quantizza le attivazioni esattamente
- * come il motore e somma in int32. Il kernel deve dare lo STESSO numero: l'aritmetica
- * intera non ha ordine di somma da discutere. Atteso: errore relativo 0.
- *
- * Uso:
- *   make check-matmat-parity        # ISA nativa
- *   make check-matmat-parity-x86    # x86-64-v3 sotto Rosetta, dal Mac ARM
- */
+/* matmat_parity.c — does the batched twin do the SAME arithmetic as the integer reference? */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +9,6 @@
 static uint64_t rs = 0x243F6A8885A308D3ull;
 static double rnd(void) { rs = rs * 6364136223846793005ull + 1442695040888963407ull; return (double)((rs >> 40) / (double)(1u << 24)) * 2.0 - 1.0; }
 
-/* la stessa quantizzazione per colonna che usano i gemelli batched */
 static float qcol(int8_t *qb, const float *X, int cols, int B, int b) {
     float amax = 0.0f;
     for (int k = 0; k < cols; k++) { float a = fabsf(X[(size_t)k * B + b]); if (a > amax) amax = a; }
@@ -46,12 +21,6 @@ static float qcol(int8_t *qb, const float *X, int cols, int B, int b) {
     return amax / 127.0f;
 }
 
-/* DUE SOGLIE, perche' non tutte le ISA prendono il percorso intero. Dove il
- * dispatcher ha un GEMM intero vero (AVX2/maddubs, AVX-512/VNNI, i8mm/SMMLA) il
- * risultato deve coincidere col riferimento intero a meno del solo arrotondamento
- * finale: rel ~ 0. Dove invece cade sul twin f32 (M1 senza i8mm, o QWEN_NO_*=1) le
- * attivazioni restano in f32 e la differenza e' l'errore di quantizzazione, non un
- * bug: si dichiara, non si nasconde. Un FAIL e' solo oltre la seconda soglia. */
 static int check(const char *what, const float *got, const float *ref, int n) {
     double mx = 0.0, den = 0.0;
     int worst = -1;
@@ -85,7 +54,6 @@ int main(int argc, char **argv) {
         scale[r] = (float)(0.002 + 0.001 * fabs(rnd()));
         for (int k = 0; k < cols; k++) { int v = (int)(rnd() * 127.0); W[(size_t)r * cols + k] = (int8_t)v; }
     }
-    /* pesi bf16 -> q4_0, per il gemello q4 */
     uint16_t *Wb = (uint16_t *)malloc((size_t)rows * cols * sizeof(uint16_t));
     for (int i = 0; i < rows * cols; i++) {
         float f = (float)(rnd() * 0.1);
@@ -104,7 +72,6 @@ int main(int argc, char **argv) {
         float *sx = (float *)malloc((size_t)B * sizeof(float));
         for (int b = 0; b < B; b++) sx[b] = qcol(qXt + (size_t)b * cols, X, cols, B, b);
 
-        /* ── int8: riferimento intero ── */
         for (int r = 0; r < rows; r++)
             for (int b = 0; b < B; b++) {
                 const int8_t *w = W + (size_t)r * cols, *qb = qXt + (size_t)b * cols;
@@ -115,7 +82,6 @@ int main(int argc, char **argv) {
         qwen_matmat_int8(Y, W, scale, X, rows, cols, B);
         fail += check("int8 matmat", Y, R, rows * B);
 
-        /* ── q4_0: riferimento intero, stesso ordine di accumulo (per blocco) ── */
         int nb = cols / 32;
         for (int r = 0; r < rows; r++) {
             const q4_0_block_t *row = Wq4 + (size_t)r * nb;

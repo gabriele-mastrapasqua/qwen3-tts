@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""serve_topology_probe.py — one big pool, or several small pinned ones?
-
-THE QUESTION
-The concurrency matrix showed the box already saturated by ONE request (15.1 of 16
-cores, 112,857 context switches/s at c=1) and req/s flat from c=8. The thread curve
-says where a single stream stops scaling. This asks the consequence: for the same 16
-cores, is W workers of K threads each - pinned, independent, no shared pool - better
-than one 16-thread pool, for concurrent streaming requests?
-
-  1x16   one server, 16 threads          (today)
-  2x8    two servers, 8 threads,  cores 0-7   / 8-15
-  4x4    four servers, 4 threads, cores 0-3   / 4-7 / 8-11 / 12-15
-  8x2    eight servers, 2 threads, cores 0-1  / ... / 14-15
-
-Requests are dealt round-robin across the workers, so a topology's advantage has to
-come from scheduling and locality, not from an easier load.
-
-⚠️ MEMORY. Every worker is a full model copy. On the 1.7B with KleidiAI packed that
-is ~13 GB each, so 4x4 needs ~53 GB and 8x2 does not fit in 64 GB. The script REFUSES
-a topology it cannot hold rather than swapping and reporting a nonsense number - run
-those cells on the 0.6B, where the shape of the curve still transfers.
-
-Usage:
-  python3 tests/serve_topology_probe.py --model DIR [--topo 1x16,2x8,4x4]
-                                   [--conc 4,8,16] [--rounds 3] [--kleidi both]
-"""
+"""serve_topology_probe.py — one big pool, or several small pinned ones?"""
 import argparse, json, os, re, signal, socket, subprocess, threading, time
 import urllib.request
 
@@ -32,13 +7,11 @@ TEXT = ("The engine renders speech from text, one frame at a time. "
         "This sentence is long enough that every request stays in flight "
         "while the others arrive.")
 
-
 def total_mem_gb():
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(re.search(r"(\d+)", line).group(1)) / 1048576.0
     return 0.0
-
 
 def wait_port(port, timeout=240):
     t0 = time.time()
@@ -50,7 +23,6 @@ def wait_port(port, timeout=240):
             time.sleep(0.5)
     return False
 
-
 def one_request(port, results, lock):
     body = json.dumps({"text": TEXT, "speaker": "ryan", "language": "English",
                        "seed": 42}).encode()
@@ -60,8 +32,6 @@ def one_request(port, results, lock):
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
             while True:
-                # read1(), not read(): read(n) on a chunked response blocks until it
-                # has n bytes, which turns TTFA into 'time to buffer 1.4 s of audio'.
                 c = r.read1(65536)
                 if not c: break
                 if ttfb is None: ttfb = time.time() - t0
@@ -70,11 +40,10 @@ def one_request(port, results, lock):
         with lock: results.append({"err": str(e)})
         return
     total = time.time() - t0
-    secs = n / 2.0 / 24000.0          # s16le @ 24 kHz
+    secs = n / 2.0 / 24000.0
     with lock:
         results.append({"ttfa": ttfb, "total": total, "audio_s": secs,
                         "rtf": total / secs if secs > 0 else float("nan")})
-
 
 def proc_counters(pid):
     vol = nonvol = migr = 0; rss = 0
@@ -112,7 +81,6 @@ def proc_counters(pid):
         pass
     return dict(vol=vol, nonvol=nonvol, migr=migr, rss_kb=rss, utime=ut, stime=st_)
 
-
 def run_topology(a, W, K, kai, conc, port0, out):
     tag = f"{'on' if kai else 'off'}_{W}x{K}_c{conc}"
     env = dict(os.environ)
@@ -140,7 +108,7 @@ def run_topology(a, W, K, kai, conc, port0, out):
             if not wait_port(p):
                 raise RuntimeError(f"worker on {p} did not come up")
         res, lock = [], threading.Lock()
-        for i, p in enumerate(ports):      # warm every worker, not just the first
+        for i, p in enumerate(ports):
             one_request(p, res, lock)
         res.clear()
 
@@ -149,7 +117,7 @@ def run_topology(a, W, K, kai, conc, port0, out):
         for _ in range(a.rounds):
             ts = [threading.Thread(target=one_request,
                                    args=(ports[i % len(ports)], res, lock))
-                  for i in range(conc)]           # round-robin across workers
+                  for i in range(conc)]
             for t in ts: t.start()
             for t in ts: t.join()
         wall = time.time() - t0
@@ -185,7 +153,6 @@ def run_topology(a, W, K, kai, conc, port0, out):
         "csw_s": csw / wall if wall else 0,
         "migr": migr, "rss_mb": rss,
     }
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -251,7 +218,6 @@ def main():
                       f"RTF {base['rtf_p50']/r['rtf_p50']:.2f}x  "
                       f"csw {r['csw_s']/base['csw_s']:.2f}x  "
                       f"RSS {r['rss_mb']/base['rss_mb']:.2f}x")
-
 
 if __name__ == "__main__":
     main()

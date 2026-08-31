@@ -27,15 +27,12 @@ def parse(path):
     rc_bytes = nrf*16*4
     f.seek(rc_bytes, 1)
     out['ref_codes_bytes'] = rc_bytes
-    # ICL prefix = spk_emb + ref_text + ref_codes + tiny headers
     icl_prefix_end = f.tell()
-    out['icl_prefix_bytes'] = icl_prefix_end  # everything from start of file
-    # META
+    out['icl_prefix_bytes'] = icl_prefix_end
     meta_start = f.tell()
     mm = rd(4)
     meta_bytes = 0
     if mm == b'META':
-        # lang_id u32, lang_name 16, model_size u32, enc_dim u32, ref_dur f32, voice_name 64, flags u32
         body = 4+16+4+4+4+64+4
         f.seek(body, 1)
         meta_bytes = 4+body
@@ -43,13 +40,11 @@ def parse(path):
     else:
         f.seek(meta_start, 0)
     out['meta_bytes'] = meta_bytes
-    # TPAD
     tp_start = f.tell()
     tm = rd(4)
     tpad_bytes = 0
     if tm == b'TPAD':
         th = u32()
-        # 3 * hidden floats
         body = 3*th*4
         f.seek(body, 1)
         tpad_bytes = 4+4+body
@@ -57,13 +52,11 @@ def parse(path):
     else:
         f.seek(tp_start, 0)
     out['tpad_bytes'] = tpad_bytes
-    # WOVR
     wo_start = f.tell()
     wm = rd(4)
     wovr_bytes = 0
     if wm == b'WOVR':
         wh = u32(); wth = u32(); wcv = u32()
-        # fc1: th*th u16, fc1_b: th f32, fc2: h*th u16, fc2_b: h f32, ce: cv*h u16
         body = wth*wth*2 + wth*4 + wh*wth*2 + wh*4 + wcv*wh*2
         f.seek(body, 1)
         wovr_bytes = 4+12+body
@@ -71,7 +64,6 @@ def parse(path):
     else:
         f.seek(wo_start, 0)
     out['wovr_bytes'] = wovr_bytes
-    # remainder = WDELTA/WFULL bulk
     wdelta_start = f.tell()
     out['wdelta_bulk_bytes'] = sz - wdelta_start
     out['total_bytes'] = sz

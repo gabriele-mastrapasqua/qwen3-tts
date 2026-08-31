@@ -1,36 +1,15 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# download_assets.sh — fetch the VALIDATED expressivity .expr weight-deltas that `--emotion` needs.
-#
-# WHY: .expr files are 140-210MB each → NOT committed to git. They are hosted on Hugging Face
-# (gabrione/qwen3-tts-italian-expr) and fetched on demand. The tiny steering vectors
-# (presets/steer/**) ARE committed — no download needed for those.
-#
-# THE recipe (docs/emotion-THE-recipe.md) uses ONLY the 3 ESSENTIAL packs below — that's the default.
-# italian_csp_topk6 also covers Spanish/Japanese/Korean/Russian (the IT pack renders them). The LEGACY
-# packs are older A/B + research artifacts, not used by --emotion → fetched only with --all.
-#
-# Usage:   bash download_assets.sh            # the 3 .expr --emotion needs + ASK about the CC0 voices  (~720 MB)
-#          bash download_assets.sh --voices   # also fetch the 4 reference voices, no prompt (CI)
-#          bash download_assets.sh --no-voices# .expr only, never prompt
-#          bash download_assets.sh --all      # + the 6 legacy/experimental .expr packs                (~1.4 GB)
-#          bash download_assets.sh --verify   # only sha256-verify the files already present
-#          BASE_URL=<url> bash download_assets.sh   # mirror elsewhere
-# (Reference voices come from a separate repo via download_voices.sh — invoked automatically when you opt in.)
-# ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
 DEST=presets/expr
 BASE_URL="${BASE_URL:-https://huggingface.co/gabrione/qwen3-tts-italian-expr/resolve/main}"
 mkdir -p "$DEST"
 
-# ESSENTIAL — the only packs THE --emotion recipe needs (filename  sha256). See presets/expr/MANIFEST.md.
 read -r -d '' ESSENTIAL <<'EOF'
 italian_csp_topk6.expr            9315f80a9181b18db6148574b92946ec2fa0af3234a3c2e72cdb5bd066cc58d9
 german_csp_k6.expr                f77d471da62fff068222da7f9961b0ef037c20c62ff33ee0e59919bfea1533fe
 french_csp_k6.expr                eff743ea6cae4ab2d26931b77cff4ce1ab1621978f45eda00af1f34197470ce2
 EOF
-# LEGACY / experimental — older A/B + research packs; NOT used by --emotion (fetched only with --all).
 read -r -d '' LEGACY <<'EOF'
 italian_csp_topk4.expr            6a65f031fe06c55893877f97fb5f11357434242c2b3f1c862ec4ff69f52ed211
 italian_l1626_dense.expr          dc86f9de302d6afc888dfb10e9a5f3134363a4101cfcef577a9cc8895239f671
@@ -77,7 +56,6 @@ echo "$ASSETS" | while read -r name want; do
 done
 echo "done with .expr. (--emotion needs only the 3 essential packs; use --all for the legacy/experimental set.)"
 
-# ---- CC0 reference voices (the other HF repo) — interactive opt-in (or --voices / --no-voices for CI) ----
 if [ "$MODE" != verify ]; then
   get_voices=0
   case "$VOICES" in

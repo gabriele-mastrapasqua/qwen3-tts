@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# A/B: base preset/clone  vs  base + --expr italian.expr  vs  full 4GB ft checkpoint.
-# Proves --expr reproduces yesterday's fine-tune (timbre + emotion) on vivian (preset)
-# and galatea (clone graft). Same params everywhere: seed 42, -j1, T1.1, -l Italian.
 set -e
 cd "$(dirname "$0")/.."
 OUT=samples/expr_ab; mkdir -p "$OUT"
@@ -11,7 +8,6 @@ FT=qwen3-tts-1.7b-expr
 EXPR=presets/expr/italian.expr
 COMMON="-l Italian -T 1.1 --seed 42 -j1 --silent"
 
-# emotion -> instruct ("" = neutral, no instruct)
 declare -A INST=(
   [neutral]=""
   [anger]="Speak with intense, heated, furious anger."

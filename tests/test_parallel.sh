@@ -1,15 +1,4 @@
 #!/bin/bash
-# test_parallel.sh — concurrent server worker pool correctness.
-#
-# For each config {bf16 no-quant, int8, int4, voice+int8} it:
-#   1. starts a single-worker server, fires ONE request  -> reference WAV
-#   2. starts a TWO-worker  server, fires TWO concurrent requests -> a.wav b.wav
-#   3. asserts both concurrent outputs are valid WAVs and match the reference
-#      via mel-corr (>= MIN_CORR) — proving the per-worker clone shares weights
-#      correctly and the two workers don't corrupt each other's state.
-#
-# Safety (runaway lesson): every curl is wrapped in `timeout`, and the server is
-# ALWAYS killed by NAME (pkill -f), never via $!/wait (a blocked curl orphans it).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -28,7 +17,6 @@ start_server() { # $1=workers  $2..=extra flags
     local workers=$1; shift
     sweep
     ./qwen_tts -d "$MODEL" --serve "$PORT" --workers "$workers" "$@" >"$TMP/srv.log" 2>&1 &
-    # wait for health (max ~25s)
     for i in $(seq 1 50); do
         if timeout 3 curl -s "http://localhost:$PORT/v1/health" >/dev/null 2>&1; then return 0; fi
         sleep 0.5
@@ -47,7 +35,6 @@ test_config() { # $1=label  $2..=server flags
     local label=$1; shift
     echo "── config: $label ─────────────────────────────"
 
-    # 1) reference (single worker)
     start_server 1 "$@" || { RC=1; return; }
     local rc_ref; rc_ref=$(req "$TMP/ref.wav")
     sweep
@@ -56,7 +43,6 @@ test_config() { # $1=label  $2..=server flags
     fi
     echo "  ref: http=200 bytes=$(wc -c <"$TMP/ref.wav")"
 
-    # 2) two concurrent requests on a 2-worker server
     start_server 2 "$@" || { RC=1; return; }
     local ca cb
     ( req "$TMP/a.wav" >"$TMP/ca" ) &
@@ -75,7 +61,6 @@ test_config() { # $1=label  $2..=server flags
     fi
     echo "  concurrent: a=200 ($(wc -c <"$TMP/a.wav")B)  b=200 ($(wc -c <"$TMP/b.wav")B)"
 
-    # 3) correctness: each concurrent output must match the single-worker reference
     for f in a b; do
         if python3 tests/compare_audio.py "$TMP/ref.wav" "$TMP/$f.wav" --min-corr "$MIN_CORR" >"$TMP/cmp" 2>&1; then
             echo "  $f vs ref: PASS ($(grep -o 'corr=[0-9.]*' "$TMP/cmp" | head -1))"

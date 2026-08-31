@@ -1,7 +1,7 @@
-# Sub-4-bit quantization for the Code Predictor (E7) — survey, method, verdict
+# Sub-4-bit quantization for the Code Predictor — survey, method, verdict
 
-**Status: CLOSED 2026-07-14 — NO GO (see §5). E7.1 survey + E7.2/E7.3 measurements DONE;
-E7.4 kernels never started, by design (quality gate failed first).**
+**Status: CLOSED — NO GO (see §5). Survey and measurements done;
+Kernels never started, by design: the quality gate failed first.**
 Branch: `feat/quant-sub4`. Style: like `docs/pr17-review.md` — this doc is the durable
 record, including a possible NO verdict (so nobody re-attempts sub-4 naïvely in 6 months).
 
@@ -9,7 +9,7 @@ record, including a possible NO verdict (so nobody re-attempts sub-4 naïvely in
 
 ## 1. Why re-open a closed question
 
-PLAN.md §21.1 (2026-06-04) closed sub-int4 with: *"int2/int1 = research only; with simple
+Sub-int4 was closed with: *"int2/int1 = research only; with simple
 absmax/group scales quality dies; realistic floor = int4-CP / int8-Talker"*. The quant-ladder
 measured it: teacher-forced per-codebook agreement vs bf16 on the 0.6B CP was **int8 78%,
 int4 46% (collapsing to 23-27% on late codebooks c11-c15), q2 9%**.
@@ -18,7 +18,7 @@ That verdict was for **our naïve format**: Q4_0-style per-32 absmax round-to-ne
 one fp16 scale per block, no error minimization, no activation awareness. The int4 story
 itself teaches the parabola: int4 was "broken" (naïve), then "slow on M1" (unpack cost),
 then became the **fastest 1.7B M1 config** once group scales + SDOT-native decode landed
-(B1 + PR#17). The hypothesis of E7: the same parabola may apply one level down, because the
+(B1 + PR#17). The hypothesis: the same parabola may apply one level down, because the
 modern formats we never tried are precisely "the group-scale trick, one level up".
 
 Why the CP is the right (and only) target:
@@ -34,7 +34,7 @@ transformer + bf16 heads = 48%; bf16 transformer + int4 heads = 84%). So a sub-4
 be *better per-bit than Q4_0-RTN by a lot* on exactly the shared-transformer matvecs, or it
 must go into a mixed map (sub-4 only on tolerant tensors).
 
-## 2. Survey of modern formats (E7.1)
+## 2. Survey of modern formats
 
 ### 2.1 llama.cpp k-quants (the "scale-of-scale" family)
 
@@ -98,7 +98,7 @@ complexity, and our kernels want a block layout, not GPTQ's arbitrary residual s
    measured C int4 46% — validates the fake-quant harness), `q3_0`/`q2_0` naïve RTN
    (quantifies how much of the gap is *format* vs *bits*).
 
-## 3. Method (E7.2): quality gate BEFORE any kernel
+## 3. Method: quality gate BEFORE any kernel
 
 The old attempt's avoidable mistake was kernels-first. Here: **fake-quant in Python, zero C**.
 
@@ -114,15 +114,15 @@ The old attempt's avoidable mistake was kernels-first. Here: **fake-quant in Pyt
 - Known small bias: dequantized values get re-rounded to bf16 in the safetensors (the real
   kernel would compute f32 from ints × fp16 scale). This *underestimates* format quality
   slightly → conservative, acceptable for a go/no-go gate.
-- **Gate to proceed to E7.3/E7.4 kernels:** best sub-4 format on the full CP must land
+- **Gate to proceed to mixed precision and kernels:** best sub-4 format on the full CP must land
   **well above int4's 46% — target zone ≥ 60-65% overall** with late codebooks not
-  collapsing below ~40% (int4: 23-27%); otherwise mixed-precision per-tensor (E7.3) must
+  collapsing below ~40% (int4: 23-27%); otherwise mixed-precision per-tensor must
   recover ≥15-20% CP bytes vs pure int4 or the epic closes with NO.
 
-## 4. Results (E7.2) — measured 2026-07-14
+## 4. Results — measured
 
 0.6B, 143 frames, `--seed 42 -s ryan -l Italian --temperature 0 -j1`, full protocol in
-`samples/tests/2026-07-14_quant-sub4-ladder/` (`ladder_results.txt`). Harness sanity:
+the ladder harness output. Harness sanity:
 **bf16-TF control = 100.00%**, code0 identical across all dumps, and **q4_0 fake-quant
 (46.67%) reproduces C int4 (46.34%)** → the fake-quant method is validated; the June and
 today's ladders are directly comparable (int8 79.4% today vs 78% June — same instrument).
@@ -154,7 +154,7 @@ matvec weights — hence lower. Not a regression, a different denominator.
   Only QAT-class methods could — out of scope by design (no training in this engine's
   quant pipeline).
 
-## 4b. Mixed-precision map (E7.3) — measured 2026-07-14
+## 4b. Mixed-precision map — measured
 
 Same protocol (`ladder_heads_results.txt`). June's decomposition already showed the drift
 lives in the shared transformer (int4 heads + bf16 transformer = 84%); today quantifies
@@ -174,7 +174,7 @@ how far DOWN the heads can go, and what the realistic mix buys:
   transformer accumulating error across the 15 intra-frame steps*, not head precision.
 - **But heads are only ~29% of CP matvec bytes** (31.4M of 106.4M params) and ~4.3% of CP
   compute → the best defensible mix (q4 transformer + q2_k heads) saves **12.3% of CP
-  bytes, below the 15-20% E7.3 gate**, while costing 7.5 agreement points vs pure int4
+  bytes, below the 15-20% mixed-precision gate**, while costing 7.5 agreement points vs pure int4
   (46.3 → 38.8). The tensor that would pay (the transformer) is exactly the one that can't.
 
 ## 4c. Follow-up round: BETTER 4-bit ("the legitimate heir") — measured 2026-07-14
@@ -210,7 +210,7 @@ LUT), `q4_k` (superblock, asymmetric, two-level scales). Talker measured via
   weight at load time. Fake-quant variant `q4_0s1` validates it end-to-end.
 - iq4_nl kernel cost if ever wanted for the CP: kvalues fit int8 → NEON decode =
   nibble-unpack + `vqtbl1q` table lookup + SDOT (llama.cpp does exactly this; x86 =
-  `vpshufb`). A real E7-style candidate — but gate it on ear need, not on this table.
+  `vpshufb`). A real candidate — but gate it on ear need, not on this table.
 
 **✅ q4_0s1 PORTED TO C (same day)** — `qwen_quantize_bf16_to_q4_0` in
 `qwen_tts_kernels.c` now does signed-max→-8 + weighted-LSQ rescale (w=v²) in the same
@@ -219,7 +219,7 @@ the binary: Talker code0 **90.91%** / CP **48.81%** (fake-quant predicted 92.31/
 naive lever reproduces the historical 83.92/46.34 exactly), `--self-test` PASS,
 `make test-golden` ALL PASS (bf16/int8 paths byte-identical, no int4 golden in the set).
 Every `--int4` / quant-mixed config on every ISA gets the words-accuracy jump for free.
-Ear A/B: `samples/tests/2026-07-14_quant-sub4-ladder/ear_int4_{OLD_naive,NEW_lsq}.wav`.
+Ear A/B between the naive and LSQ int4 renders.
 
 **RTF + duration (free-running A/B, same text/seed, M1 -j4):** per-frame cost is
 unchanged BY CONSTRUCTION (same kernels, same bytes — only the scale VALUES differ;
@@ -232,12 +232,12 @@ further changes: Metal calls `qwen_quantize_bf16_to_q4_0` itself; the CUDA q4 st
 mirrors `q4_0_block_t` byte-for-byte (single-producer / read-only consumers). Ear trio
 for 1.7B: `ear_1.7b_{bf16_ref,int4_OLD_naive,int4_NEW_lsq}.wav`.
 
-## 5. Verdict (E7.5) — **NO GO for sub-4-bit kernels** (2026-07-14)
+## 5. Verdict — **NO GO for sub-4-bit kernels**
 
-- **E7.2 gate: FAILED.** Best modern format on the full CP: q3_k **27.9%** vs gate ≥60%
-  (int4 baseline 46.3%, int8 gold 79.4%). q2_k 4.9% = dead. No q3/q2 SDOT kernels (E7.4
+- **Quality gate: FAILED.** Best modern format on the full CP: q3_k **27.9%** vs gate ≥60%
+  (int4 baseline 46.3%, int8 gold 79.4%). q2_k 4.9% = dead. No q3/q2 SDOT kernels (
   not started, by design).
-- **E7.3 gate: FAILED.** Max justifiable mixed saving = 12.3% CP bytes < 15-20% threshold,
+- **Mixed-precision gate: FAILED.** Max justifiable mixed saving = 12.3% CP bytes < 15-20% threshold,
   at a real quality cost.
 - **What survives as durable knowledge:**
   1. The **format thesis is real but insufficient**: k-quant structure ≈ 2× naïve RTN at

@@ -2,7 +2,7 @@
 
 > Companion to `docs/para-experiments.md` (the WIN/KO test log). This doc is the **menu we aim for**: the set of
 > `[tag]` events we want, with a clear definition of each, which pros offer it, whether WE have it (via the INLINE
-> method), and the variants we want. Built from web research 2026-07-01 (§10.1/T1 of plan_emo_v3). Not one laugh —
+> method), and the variants we want. Built from published work on expressive TTS. Not one laugh —
 > a *range*: multiple laughs/sighs (short/medium/long) + more vocal events, all in the active voice's own timbre.
 
 ## 1. How the pros do it (method matters)
@@ -76,7 +76,7 @@ Legend: **HAVE** = shipped/validated (see para-experiments.md) · **CAND** = ser
 - **Chinese-onomatopoeia lever** cracks events Latin letters can't (laugh in IT: `哈哈哈` laughs, `hahaha` sighs).
 - **Named duration/style VARIANTS** per event (`[sigh:short|long]`) — nobody exposes this.
 - **Style-carryover**: an inline para tag can shift the MOOD/SPEED/PROSODY of the following speech → a mid-prompt
-  style pivot (plan_emo_v3 §10.2/T5). Potentially a headline feature no tag-TTS advertises.
+  style pivot. Potentially a headline feature no tag-TTS advertises.
 
 ## Sources
 ElevenLabs v3 audio tags · Bark (suno-ai) special tokens · Hume Octave acting instructions · OpenAI

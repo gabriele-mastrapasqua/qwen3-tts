@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "axion-16c-ttfa",
+    "description": "Recommended low-TTFA server configuration for a 16-core Google Axion host. Every value was read from the qualification harness and the engine source, not from memory.",
+    "objective": {
+      "primary": "ttfa",
+      "secondary": "realtime_factor",
+      "concurrency_range": [
+        1,
+        8
+      ],
+      "preferred_concurrency": 4,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_family": "Google Axion / Arm Neoverse-V2",
+    "logical_cpus": 16,
+    "physical_cores": 16,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 80,
+    "ram_gib": 62,
+    "isa_features_used": [
+      "asimd",
+      "asimddp",
+      "i8mm",
+      "bf16"
+    ],
+    "notes": "GCP c4a-standard-16, no SMT. SVE/SVE2 are present at 128-bit but the engine has no SVE kernel path today."
+  },
+  "build": {
+    "target": "blas",
+    "make": {
+      "command": "make blas GIT_REV=$(git rev-parse --short HEAD)",
+      "variables": {
+        "SIMD": "auto -> native",
+        "ARCH_FLAGS": "-march=native (resolves to -mcpu=neoverse-v2+crc+sve2-aes+sve2-sha3+sve2-sm4+nossbs)"
+      }
+    },
+    "requirements": {
+      "blas": "OpenBLAS 0.3.32, pthread build (libopenblas0-pthread)",
+      "kleidiai": "vendored subset of ARM-software/kleidiai; SMMLA and BFMMLA both compiled and active",
+      "note": "GIT_REV must be passed on the command line: a synced tree has no .git, so the binary cannot certify its own commit."
+    }
+  },
+  "server": {
+    "prefork_workers": 2,
+    "threads_per_worker": 8,
+    "batch_size": 8,
+    "max_queue": 1,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "worker_affinity": "contiguous core slices, worker 0 -> CPU 0-7, worker 1 -> CPU 8-15"
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 8,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8 (per-row absmax), from --int8",
+      "code_predictor_weights": "int8 - follows --int8 unless QWEN_CP_PREC overrides",
+      "speech_decoder_weights": "fp32 - QWEN_SD_INT8 is off by default and int4 measured slower on the first frame",
+      "activations": "fp32; int8 activations are quantized per call inside the int8 kernels",
+      "gemm_backend": "KleidiAI BFMMLA for bf16 matmat, SMMLA for int8 matmat, OpenBLAS sgemm for the speech decoder convolutions"
+    },
+    "environment": {
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "MUST be set. Without it OpenBLAS idles by spinning and contends with the engine's own pool. Measured on this platform, same binary and bank, arms interleaved: first audio at concurrency 1 was 108 ms without it and 66 ms with it, and the bare arm was BIMODAL between the two, so one run lands on either and looks definitive. Beside it: 42,500 context switches per second against 12,000, and 7.9 cores busy against 7.2. At concurrency 4 the same lever is worth nothing (173 against 169 ms), because busy workers leave no idle time to spin through.",
+        "revert": "unset"
+      },
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "deliberately NOT set, and it must be ABSENT rather than merely unset by us. The engine binds OpenBLAS to the thread budget at startup, and qwen_blas_set_threads() returns immediately when this variable is present -- so an unrelated export in the operating shell silently replaces the thread split this profile was qualified with, for every stage and every load. It would also disable the opt-in per-load adjustment (QWEN_SERVE_BLAS / QWEN_SERVE_BLAS_BUSY), which is off by default.",
+        "revert": "set it explicitly only to override the engine's own sizing, knowingly"
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "reuses the request-independent prompt head; measured 9 of 13-79 positions on the production prompts",
+        "revert": "QWEN_PREFIX_CACHE=0"
+      },
+      "QWEN_SERVE_PROFILE": {
+        "value": null,
+        "why": "diagnostics; counters and timing never share a binary in a run that produces a number",
+        "revert": "QWEN_SERVE_PROFILE=1 for the driver phase table"
+      },
+      "QWEN_SD_PHASE": {
+        "value": null,
+        "why": "diagnostics, as above",
+        "revert": "QWEN_SD_PHASE=1"
+      },
+      "QWEN_KAI_NCHUNK": {
+        "value": "384",
+        "why": "sub-tile the GEMM's n dimension so the microkernel's second height pass finds the packed RHS in cache. Measured on this platform: prefill p50 45.02 -> 42.87 ms and first audio 72.20 -> 70.20 across three paired rounds, output bitwise identical. 192 and 96 both measured WORSE than either 384 or 0, so smaller is not better.",
+        "revert": "QWEN_KAI_NCHUNK=0 restores one kernel call per slice"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "route the prefill projections through the native bf16 matmat instead of BLAS. On this platform it wins at every thread budget (-j1 2014 -> 1439 ms, -j16 310 -> 167). It is already the default where the matrix unit is real; pinned here so a change of default elsewhere cannot silently move this configuration.",
+        "revert": "QWEN_PREFILL_MATMAT=0 returns to BLAS without a rebuild"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "65536",
+        "why": "generations a pool worker re-reads before parking on the condvar. 4096 was tuned on other hardware and costs 40 % of the Code Predictor here; 65536 measured CP 16.0 -> 9.6 ms/f and 491,320 -> 35,132 context switches. Higher buys nothing and 262144 at -j16 is worse.",
+        "revert": "QWEN_POOL_SPIN=4096 for the previous value, 0 to park immediately"
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "1",
+        "why": "batch the speech decoder across slots. Measured +8.1 % throughput with first-audio p50 -8.9 % and p95 -6.1 % at concurrency 4, and the audio moves by one LSB in 32768 on 81 samples of 161,280. The server enables it by default; pinned so the profile records what ran.",
+        "revert": "QWEN_DECODER_BATCH=0"
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "qualified",
+    "workload": "REALISTIC - a mixed-length text bank, 21 texts, audio p50 3.84 s per request. Short-text banks are an engineering inner loop and never a production figure.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-1.7b",
+    "speaker": "ryan",
+    "notes": "preferred_concurrency is 4 because at C=6 the realtime factor measured ~1.1: first audio still good, sustained realtime not. The band claims nothing above C=8. Topology and thread split were qualified on this host; the model named here is the base checkpoint the profile is exercised against, and a profile makes no claim about any particular checkpoint's audio."
+  }
+}

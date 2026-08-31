@@ -90,7 +90,7 @@ tooling — never part of the C engine):
    use as primary signal; Whisper-AT replaces it.
 
 **Mandatory calibration step (learned from the SER-judge failure)**: before trusting the judge, run it on
-the EXISTING ear-validated WIN/KO table (samples in `samples/tests/*para*`) — we have dozens of
+the EXISTING ear-validated WIN/KO table — we have dozens of
 ground-truth clips. Measure per-event precision/recall, pick per-event thresholds τ. If CNN14 agrees with
 the ear on the known table, it earns referee status for *screening*; the ear stays the final judge on
 promotions (same philosophy as mel-corr vs ear for emotion).
@@ -132,7 +132,7 @@ we own the forward pass:
    `sigh_vs_laugh` L21-25 vectors. Dot-product hidden states against them during generation → a per-frame
    "event-direction activation" trace. Cheap to add behind `--debug`; correlating the trace with WIN/KO
    seeds tells us whether the event decision is visible mid-network (it should be — act-map already showed
-   L23-26 carries laugh identity, PROJECT-COMPASS §act-map).
+   L23-26 carries laugh identity).
 
 These three feed each other: (1) proposes triggers, §2's judge screens them at scale, (2)/(3) explain the
 seed classes and might eventually let us *pick* good seeds by probing instead of sampling.
@@ -161,7 +161,7 @@ decoder-ceiling hypothesis, don't burn sweeps there.
 ## 5. If the para FT is ever revisited (long-term note)
 
 The FT was exhausted because bracket tags tokenize as sub-words with no gradient anchor (memory
-`project_para_recipe`). The literature suggests the viable variant is different: **CosyVoice-style
+the shipped recipe). The literature suggests the viable variant is different: **CosyVoice-style
 plain-text-marker data** — transcripts that contain the *native interjection chars* aligned with real
 events, no new tokens at all. **SynParaSpeech** ([arXiv 2509.14946](https://arxiv.org/html/2509.14946v2),
 [repo](https://github.com/ShawnPi233/SynParaSpeech)) is an automated pipeline that mined 118.75 h of
@@ -181,5 +181,3 @@ from the emotion plugin per the design contract. Not scheduled; recorded so we d
 3. Embedding-similarity trigger mining over the vocab (weights-only, one script).
 4. T4 variants grid (laugh ×10, sigh ×5) judged at scale; ear only on the shortlist.
 5. Optional `--debug` steering-projection trace for mechanism insight (§3.3).
-
-Tracked in `plan_v4.md` §E1.

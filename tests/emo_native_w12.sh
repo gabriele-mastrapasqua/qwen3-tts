@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Focused follow-up (2026-06-29 ear verdicts): STEER wins (w10/w8). Two open items:
-#  (1) JA/KO must use the NATIVE PRESET speakers (ono_anna=JA, sohee=KO), NOT the galatea clone.
-#  (2) anger/fear: try w12 (does it hold or break?). STEER pure (emotion-matched text, no instruct).
-# Out: samples/tests/2026-06-29_native-w12/  (gitignored). 1.7B, seed 42, L21-25.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42
@@ -14,7 +10,6 @@ S(){ local out="$1" vf="$2" lang="$3" e="$4" w="$5" txt="$6"
        --ml-weight $w --ml-range 21-25 --text "$txt" -o "$O/$out" >"$O/${out%.wav}.log" 2>&1; then
     echo "  ok $out"; else echo "  FAIL $out"; tail -2 "$O/${out%.wav}.log"; fi; }
 
-# emotion-matched prompts
 JA_anger="よくも私にそんな口のきき方ができるな！絶対に受け入れられない！"
 JA_sad="私が持っていたものを全て失って、もうどうすればいいのか分からない。"
 JA_joy="信じられない、人生で一番いい知らせだ、本当に幸せだ！"

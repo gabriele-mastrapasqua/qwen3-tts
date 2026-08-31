@@ -9,8 +9,8 @@ Inject with `--ml-steer <file> --ml-range 21-25 --ml-weight W`. Built on the **1
 
 | file | = (event − opposite) | recommended weight | ear verdict |
 |---|---|---|---|
-| `laugh_vs_cry.qlsteer` | ryan-EN laugh − ryan-EN cry | galatea 8 · vivian 8 · ryan 6 | 2026-06-25 TOP (plan §8.9-DONE) |
-| `sigh_vs_laugh.qlsteer` | ryan-EN sigh − ryan-EN laugh | galatea 8 · vivian 8 · ryan 6 | 2026-06-28 WIN (plan §9.13) |
+| `laugh_vs_cry.qlsteer` | ryan-EN laugh − ryan-EN cry | galatea 8 · vivian 8 · ryan 6 | top result |
+| `sigh_vs_laugh.qlsteer` | ryan-EN sigh − ryan-EN laugh | galatea 8 · vivian 8 · ryan 6 | win |
 
 Source captures to rebuild: `ryan_en_laugh.qamp`, `ryan_en_sigh.qamp` (cry capture in `samples/para_steer_vec/`).
 
@@ -24,7 +24,7 @@ w12 over-steers everywhere; ryan caps at w6.
 
 ## Scope
 VOCAL family only (laugh, sigh). Articulatory events (cough/sneeze/disgust/gasp/growl) FAIL via steering
-(decoder ceiling — plan §8.10) → use native-trigger onomatopoeia inline (`ugh`/`ahem`/`tsk`/`haaa`) instead.
+(decoder ceiling) → use native-trigger onomatopoeia inline (`ugh`/`ahem`/`tsk`/`haaa`) instead.
 
 ## How to rebuild
 `act_map_steer.py <opposite>.qamp <event>.qamp out.qlsteer --unit-per-layer` (RAW, NO --clean).

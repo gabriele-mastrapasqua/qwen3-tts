@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Lean A/B: (A) reproduce yesterday's TOP graft (x-vector + CV + EN-instruct),
-#           (B) Dawizzer sampling-knobs on the faithful ICL-lite file.
-# Safety: --max-duration 15 + per-run timeout (runaway = EOS break -> 8192-frame/10min cap).
 cd "$(dirname "$0")/.."
 OUT=samples/icl_levers
 mkdir -p "$OUT"
@@ -30,15 +27,11 @@ run graft_ang  --load-voice "$GRAFT" --icl-only -T 0.9 --instruct "$ANGRY"
 run graft_sad  --load-voice "$GRAFT" --icl-only -T 0.9 --instruct "$SAD"
 
 echo "=== B) Dawizzer sampling-knobs on FAITHFUL ICL-lite (no instruct) ==="
-# base ICL neutral (recipe temp) for reference
 run icl_neu    --load-voice "$ICL" -T 0.9
-# angry  = punchier: higher temp, lower top_p, higher rep_pen (gentle, EOS-safe)
 run icl_ang_s1 --load-voice "$ICL" -T 0.9 -p 0.85 -r 1.25
 run icl_ang_s2 --load-voice "$ICL" -T 1.1 -p 0.80 -r 1.30
-# sad    = softer/slower: lower temp, gentle rep_pen
 run icl_sad_s1 --load-voice "$ICL" -T 0.7 -p 0.95 -r 1.10
 run icl_sad_s2 --load-voice "$ICL" -T 0.6 -p 0.90 -r 1.15
-# C) STACK: Dawizzer sampling ON TOP of EN-instruct on the faithful ICL
 echo "=== C) STACK: ICL + EN-instruct + sampling knobs ==="
 run icl_ang_stack --load-voice "$ICL" -T 1.1 -p 0.85 -r 1.25 --instruct "$ANGRY"
 run icl_sad_stack --load-voice "$ICL" -T 0.7 -p 0.95 -r 1.10 --instruct "$SAD"

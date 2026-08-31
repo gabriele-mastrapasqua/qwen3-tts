@@ -1,46 +1,7 @@
 #!/usr/bin/env bash
-# serve_slot_drift.sh — LA DERIVA DI STATO MULTI-SLOT (PLAN 0.nonies S0). Correttezza.
-#
-# IL SINTOMO (2026-08-17, tests/quant_experiments/server_q4n14_vs_int4.log): nel
-# mini-bench la passata 2 a c=1 genera audio LUNGO IL DOPPIO (12,1 -> 27,4 s) su
-# q4n14, mentre int4 e' immune. A c=1 isolato NON si riproduce (deriva +0,0 s, con i
-# fix accesi E spenti). Quindi il sospetto non e' il formato: e' stato lasciato
-# sporco dai livelli c=2 / c=4.
-#
-# IL DISEGNO, e perche' e' fatto cosi'.
-#
-#   * UN SOLO SERVER attraverso tutta la sequenza. Riavviarlo fra le fasi azzererebbe
-#     esattamente lo stato che stiamo cercando: e' l'oggetto della misura, non rumore.
-#   * SEQUENZA 1 -> 2 -> 4 -> 1. La prima e l'ultima fase sono IDENTICHE (stesso testo,
-#     stesso seed, stessa concorrenza): se differiscono, in mezzo e' rimasto qualcosa.
-#     E' il controllo che mancava ieri, dove c=1 era stato provato solo in isolamento.
-#   * CAMPIONAMENTO BLOCCATO (temperature 0 -> argmax, qwen_tts_sampling.c:176; seed
-#     fisso per indice). Con il sampling acceso una differenza di durata puo' sempre
-#     essere la lotteria: bloccandolo, una differenza E' un bug. Questo e' il punto
-#     dell'esperimento — non si misura la velocita', si decide se c'e' un difetto.
-#   * CONFRONTO PER RICHIESTA, non in media: durata E sha256 del PCM. La media
-#     nasconderebbe una richiesta rotta su quattro (la lezione di T2.spk).
-#   * MODELLI OSS. Il difetto e' nello scheduler degli slot, non nei pesi: si riproduce
-#     con il Qwen open, e cosi' lo script gira anche su un box affittato.
-#
-# I BRACCI (l'ordine e' diagnostico, non estetico):
-#   base     tutto acceso — e' la configurazione che ha mostrato la deriva
-#   nosolo   QWEN_BATCH_NO_SOLO=1  -> niente scorciatoia B_eff==1: se la deriva sparisce,
-#            il colpevole e' il passaggio matvec/matmat a meta' sequenza
-#   nobeff   QWEN_BATCH_NO_BEFF=1  -> niente packing delle colonne attive: se sparisce
-#            qui, e' una colonna stantia di uno slot liberato
-#   matvec   QWEN_BATCH_FORCE_MATVEC=1 -> il batched fa B matvec, bit-esatto al
-#            single-stream: se la deriva RESTA anche qui, non e' ordine fp, e' stato
-#
-# Uso:
-#   tests/serve_slot_drift.sh                      # braccio base, 0.6B OSS
-#   ARMS="base nosolo nobeff matvec" tests/serve_slot_drift.sh
-#   MODEL=qwen3-tts-1.7b QUANT=--int8 REQS=6 tests/serve_slot_drift.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-# Portatile: su mac l'idle sleep falsifica i tempi (incidente 2026-08-17, 917 s letti
-# come calcolo); su Linux non esiste caffeinate e non serve.
 if [ -z "${QWEN_BENCH_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
     export QWEN_BENCH_CAFFEINATED=1
     exec caffeinate -i -s "$0" "$@"
@@ -67,7 +28,7 @@ BIN=./qwen_tts
 [ -x "$BIN" ] || { echo "build first: make blas"; exit 1; }
 [ -d "$MODEL" ] || { echo "modello assente: $MODEL  (./download_model.sh --model small)"; exit 1; }
 if pgrep -f "qwen_tts .*--serve" >/dev/null 2>&1; then
-    echo "c'e' gia' un qwen_tts --serve attivo: fermalo, o la misura non vale."; exit 1
+    echo "a qwen_tts --serve is already running: stop it, or the measurement is void."; exit 1
 fi
 
 rm -rf "$OUT"; mkdir -p "$OUT"
@@ -77,7 +38,7 @@ trap kill_server EXIT
 ncpu=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "?")
 echo "modello   $MODEL ($QUANT) · voce $SPK · $LANG_"
 echo "server    --batch-size $BATCH -j $J   ($ncpu core logici)"
-echo "sequenza  c = $SEQ   ($REQS richieste per fase, temperature=$TEMP, seed fisso)"
+echo "sequence  c = $SEQ   ($REQS requests per phase, temperature=$TEMP, fixed seed)"
 echo "bracci    $ARMS"
 
 rss_of() {  # RSS in MB del server, portabile
@@ -136,10 +97,9 @@ $PY - "$OUT" "$ARMS" "$SEQ" <<'PYEOF'
 import sys, os, re, hashlib, wave
 
 out, arms, seq = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
-# le fasi a c=1: la prima e l'ultima sono lo stesso esperimento, e devono coincidere
 c1 = [i+1 for i, c in enumerate(seq) if c == "1"]
 if len(c1) < 2:
-    print("la sequenza non ha due fasi a c=1: niente da confrontare"); sys.exit(0)
+    print("sequence has no two c=1 phases: nothing to compare"); sys.exit(0)
 first, last = c1[0], c1[-1]
 
 def clips(d):
@@ -163,10 +123,10 @@ for arm in arms:
     a = clips(f"{out}/{arm}_f{first}_c1")
     b = clips(f"{out}/{arm}_f{last}_c1")
     ids = sorted(set(a) & set(b))
-    print(f"\n{arm}:  fase {first} contro fase {last}   ({len(ids)} richieste confrontabili)")
+    print(f"\n{arm}:  phase {first} vs phase {last}   ({len(ids)} comparable requests)")
     if not ids:
-        print("  (nessuna clip — il braccio e' fallito)"); bad += 1; continue
-    print(f"  {'req':>4}{'durata f'+str(first):>14}{'durata f'+str(last):>14}{'delta':>9}{'delta %':>9}  hash")
+        print("  (no clip — the arm failed)"); bad += 1; continue
+    print(f"  {'req':>4}{'dur f'+str(first):>14}{'dur f'+str(last):>14}{'delta':>9}{'delta %':>9}  hash")
     worst = 0.0
     for i in ids:
         (sa, ha), (sb, hb) = a[i], b[i]
@@ -176,11 +136,11 @@ for arm in arms:
         print(f"  {i:>4}{sa:>14.2f}{sb:>14.2f}{d:>9.2f}{pct:>8.1f}%  {'uguale' if ha==hb else 'DIVERSO'}")
     ident = all(a[i][1] == b[i][1] for i in ids)
     if ident:
-        print("  ✅ bit-identiche: nessuna deriva di stato su questo braccio")
+        print("  ✅ bit-identical: no state drift on this arm")
     elif worst < 1.0:
         print(f"  🟡 hash diversi ma durate entro {worst:.1f}% — ordine fp, non stato (vedi il caveat B_eff==1)")
     else:
-        print(f"  🔴 DERIVA: la durata cambia fino al {worst:.1f}% dopo le fasi c=2/c=4"); bad += 1
+        print(f"  🔴 DRIFT: duration changes by up to {worst:.1f}% after the c=2/c=4 phases"); bad += 1
 
 print("\nRIPRODOTTA" if bad else "\nNON riprodotta su questi bracci")
 PYEOF

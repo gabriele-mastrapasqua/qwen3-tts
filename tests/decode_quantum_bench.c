@@ -1,31 +1,4 @@
-/*
- * decode_quantum_bench.c — how long does ONE batched speech-decode call hold the
- * driver, as a function of (group = slots in the call) x (chunk = frames per slot)?
- *
- * WHY THIS EXISTS. The serving trace records the wall time of every decode call and
- * how many SLOTS were in it, but not how many FRAMES. So from artifacts alone the
- * cost-per-frame curve is NOT AVAILABLE, and every question about making the call
- * smaller ("cap the quantum at 4 frames instead of 8") reduces to a number the trace
- * cannot produce: what fraction of a call's cost is per-frame work, and what fraction
- * is per-call overhead that a split would pay twice.
- *
- * WHAT IT MEASURES. The real decoder, the real weights, the same entry point the
- * driver calls (qwen_speech_decoder_decode_streaming_batch), on WARM stream states —
- * the steady-state case, where the conv tails and the ConvTranspose carries are
- * already populated. The cold first call is reported separately because it is a
- * different animal and the ramp already treats it as one.
- *
- * WHAT IT DOES NOT MEASURE, and must not be read as: this runs the decoder ALONE on
- * an otherwise idle box. A serving worker pays the same call under memory-system
- * contention from the other worker's Talker. The curve's SHAPE transfers; its absolute
- * level does not, and the built-in cross-check prints the serving p50 next to the
- * bench number for the one cell where both exist (group=1, chunk=8) so the gap is
- * visible instead of assumed.
- *
- * Build: make test-decode-quantum
- * Run:   ./qwen_tts_decode_quantum <model_dir> [threads] [reps]
- */
-
+/* decode_quantum_bench.c - how long one batched speech-decode call holds the thread pool */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,8 +47,6 @@ static uint32_t rng_next(void) {
     return rng_state;
 }
 
-/* One cell of the grid. Returns the p50 of `reps` warm calls; `cold_out` gets the
- * very first (cold-state) call, which is NOT included in the warm statistics. */
 static double run_cell(qwen_tts_ctx_t *ctx, int group, int chunk, int reps,
                        int **codes, double *p95_out, double *max_out, double *cold_out)
 {
@@ -86,8 +57,6 @@ static double run_cell(qwen_tts_ctx_t *ctx, int group, int chunk, int reps,
 
     for (int s = 0; s < group; s++) { qwen_sd_stream_init(&st[s]); pos[s] = 0; }
 
-    /* WARM-UP. Four rounds is enough to fill every conv tail and ConvTranspose carry
-     * in the stack; the first of them is the cold call and is reported on its own. */
     const int warm = 4;
     for (int r = 0; r < warm + reps; r++) {
         for (int s = 0; s < group; s++) {
@@ -104,7 +73,7 @@ static double run_cell(qwen_tts_ctx_t *ctx, int group, int chunk, int reps,
         for (int s = 0; s < group; s++) {
             free(items[s].audio);
             pos[s] += chunk;
-            if (pos[s] + chunk > MAX_FRAMES) pos[s] = 0;   /* wrap the code source */
+            if (pos[s] + chunk > MAX_FRAMES) pos[s] = 0;
         }
         if (r == 0) *cold_out = dt;
         if (r >= warm) t[r - warm] = dt;

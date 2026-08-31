@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
-"""cadence_dump.py — reconstruct the playback timeline of individual turns, by request id.
-
-WHY: min_prebuffer and GAP_FREE_START are about to become reference numbers. Before that,
-they have to be reproducible BY HAND from a raw timeline - not merely produced by the same
-code that reports them. This prints the timeline and recomputes the prebuffer from it
-independently, then checks the two agree.
-
-It also answers where the deficit comes from: early (a slow start), spread through the
-stream (a cadence problem), or at the end (a tail).
-"""
+"""cadence_dump.py — reconstruct the playback timeline of individual turns, by request id."""
 import argparse, glob, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from playback_sim import analyse, audio_s
-
 
 def pct(v, q):
     v = sorted(x for x in v if x == x)
     if not v:
         return float("nan")
     return v[min(len(v) - 1, int(round(q / 100.0 * (len(v) - 1))))]
-
 
 def timeline(t):
     """Independent reconstruction. Returns rows and the prebuffer derived from them."""
@@ -33,8 +22,8 @@ def timeline(t):
         if i:
             gap = ta - prev
             want = played + gap
-            deficit = want - avail                 # >0 means starved
-            need = max(need, (ta - t_first) - avail)   # the prebuffer constraint
+            deficit = want - avail
+            need = max(need, (ta - t_first) - avail)
             if deficit > 0:
                 if stall_from is None:
                     stall_from = prev
@@ -57,7 +46,6 @@ def timeline(t):
                      "stall_end_ms": None})
     return rows, max(0.0, need) * 1000
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
@@ -76,7 +64,6 @@ def main():
         pre = [t["min_prebuffer_ms"] for t in comp]
         print(f"\n  min_prebuffer over completed turns: p50 {pct(pre,50):.0f}  p95 {pct(pre,95):.0f}  max {max(pre):.0f} ms")
 
-        # cadence statistics across ALL completed turns
         durs = [audio_s(nb) * 1000 for t in comp for _ta, nb in t["marks"]]
         gaps = [(t["marks"][i][0] - t["marks"][i-1][0]) * 1000
                 for t in comp for i in range(1, len(t["marks"]))]
@@ -88,7 +75,6 @@ def main():
         var = sum((g - mean) ** 2 for g in gaps) / len(gaps)
         print(f"  gap dispersion:          mean {mean:.0f} ms  CV {var**0.5/mean:.2f}")
 
-        # where does the deficit come from?
         early = mid = late = 0
         for t in comp:
             rows, _ = timeline(t)
@@ -104,7 +90,6 @@ def main():
             print(f"  worst deficit position:  early {100*early/tot:.0f}%  "
                   f"middle {100*mid/tot:.0f}%  late {100*late/tot:.0f}%  (n={tot})")
 
-        # representative turns: median-like and p95-like, named by request id
         idx = [len(comp) // 2, min(len(comp) - 1, int(0.95 * (len(comp) - 1)))][:a.per_cell]
         for j in idx:
             t = comp[j]
@@ -126,7 +111,6 @@ def main():
             if len(rows) > 14:
                 print(f"      ... {len(rows)-14} more chunks")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

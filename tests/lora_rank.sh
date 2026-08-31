@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Direct A/B: LoRA r=16 (16MB) vs r=32 (32MB), vivian + galatea, neutral/sad/anger.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=samples/lora_rank; mkdir -p "$OUT"

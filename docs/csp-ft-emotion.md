@@ -26,7 +26,7 @@ cloned `.qvoice`, in Italian, with no word/length glitches. Ear-validated.
 "muffled metallic / faint reverb") into every generation — and the CSP `.expr` makes it MORE audible (it
 re-attends the ref_codes harder). The x-vector carries abstract identity WITHOUT the room → glitch gone,
 **identity holds**, and the clone takes **much higher weight** (the ICL amplification path is removed, so you
-push the `.expr` harder for the same emotional movement). See `docs/icl-graft-portability.md` / plan_emo_v2.md.
+push the `.expr` harder for the same emotional movement). See `docs/icl-graft-portability.md`.
 
 - **Preset defaults: `--expr-weight ≈ 1.2`, T1.1.** Above ~1.4 at T1.1 it *svaria* (over-steers); **T1.3 holds
   higher weights** — temperature lets you push weight.
@@ -123,7 +123,7 @@ is the design, and the **probe** is what makes the few layers the *right* few ra
 Nicely, the probe independently landed on **L22, 23** (peak), i.e. **inside the late identity band L21–25** the
 act-map had flagged — two different methods, same region.
 
-**3. So what were the "11"?** That was the **older** recipe ([[project_lora_band_l1626]] / `docs/expressivity-lora.md`):
+**3. So what were the "11"?** That was the **older** recipe (`docs/expressivity-lora.md`):
 a hand-picked **dense band L16–26** (= 11 layers, 16…26) trained densely as a block. CSP-FT is the refinement of
 it: of those 11, the probe shows you really only need the **2–4 most causal** to move emotion, and training fewer
 keeps pronunciation cleaner. The CSP 2–4 sit *inside* that band — they are its causal core.
@@ -160,7 +160,7 @@ make it a TTS referee it would need domain-adaptation (fine-tune on TTS-generate
 standalone `italian-ser-judge` repo (MIT for code; Emozionalmente is cite-only — Catania et al., IEEE TASLP
 33:1142-1155, 2025, doi:10.1109/TASLPRO.2025.3540662).
 
-## Open refinements (TODO — see plan_emo_v2.md)
+## Open refinements
 
 1. **Clone metallic — ✅ RESOLVED 2026-06-18.** It was the **ICL ref_codes** (the reference recording's room
    reverb), NOT clipping and NOT embedding quality (the two galatea qvoices have byte-identical x-vectors).

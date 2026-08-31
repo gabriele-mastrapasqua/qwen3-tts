@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# FINAL per-(voice×emotion) recipe — winners from plan_emo_v3 §8.2, with CLEAN + decay 0.985 NOW DEFAULT.
-# galatea generated on BOTH clone paths: qvoice (3GB, --icl-only=x-vector-only) AND galatea.bin (8KB, --xvector-only)
-# → does the tiny file hold? (WIN-WIN small-clone + emotion levers). seed 42, T1.1, Italian, 1.7b.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42; T=1.1
@@ -25,7 +22,6 @@ declare -A INS=(
   [surprise]="Speak with sudden astonishment and surprise, gasping and caught off guard.")
 ql(){ echo "$QL/ryan_${1/anger/ang}.qlsteer"; }
 g(){ local out="$1"; shift; $BIN -d $M -l Italian --seed $SEED -T $T "$@" -o "$O/$out" >/dev/null 2>&1; echo "  $out -> $(dur "$O/$out")"; }
-# mode helpers (take: voiceflags... | emo | exprw)
 EXPR(){ local vf="$1" e="$2" ew="$3" o="$4"; g "$o" $vf --expr $IT --expr-weight $ew -I "${INS[$e]}" --text "${TXT[$e]}"; }
 STEER(){ local vf="$1" e="$2" w="$3" o="$4"; g "$o" $vf --ml-steer "$(ql $e)" --ml-weight $w --ml-range 21-25 --text "${TXT[$e]}"; }
 COMBINE(){ local vf="$1" e="$2" ew="$3" w="$4" o="$5"; g "$o" $vf --expr $IT --expr-weight $ew --ml-steer "$(ql $e)" --ml-weight $w --ml-range 21-25 -I "${INS[$e]}" --text "${TXT[$e]}"; }

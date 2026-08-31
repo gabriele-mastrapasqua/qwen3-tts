@@ -1,40 +1,11 @@
 #!/usr/bin/env python3
-"""serve_concurrency_matrix.py — the concurrency matrix that decides whether the KleidiAI
-backend is a throughput lever or a latency one.
-
-THE QUESTION
-Single-stream is B=1 and measured 1.02x end-to-end. The census says the same kernels
-give 1.9-4.6x at B>=2. The server is the only place B>=2 actually exists, so this
-sweeps concurrency and correlates, per cell:
-
-    concurrency  ->  effective B  ->  which kernel fired  ->  speedup
-
-WHAT IT REPORTS PER CELL
-  client side : req/s, TTFA p50/p95 (time to FIRST BYTE on /v1/tts/stream, which is
-                the real first-audio instant), RTF p50/p95
-  server side : Talker ms/frame, CP ms/frame, mean active slots (= the effective B,
-                straight from [serve-profile]), the shape-census B histogram over the
-                projections, the GEMV-vs-GEMM split and GMAC per kernel from the
-                batch audit
-  os side     : context switches/s, CPU utilisation, core migrations, peak RSS
-
-TOPOLOGY IS FIXED HERE, ON PURPOSE
-One server, one pool, --batch-size and -j held constant across every cell. Changing
-worker count or affinity in the same matrix would confound the concurrency curve with
-a topology change; the topology series is a SECOND matrix, run after this one.
-
-Usage:
-  python3 tests/serve_concurrency_matrix.py --model DIR [--out DIR] [--rounds 3]
-                                        [--conc 1,2,4,8,16] [--threads 16]
-                                        [--batch-size 16] [--precision int8]
-"""
+"""Concurrency matrix over a running server."""
 import argparse, json, os, re, signal, socket, statistics, subprocess, sys, threading, time
 import urllib.request
 
 TEXT = ("The engine renders speech from text, one frame at a time. "
         "This sentence is long enough that every request stays in flight "
         "while the others arrive.")
-
 
 def wait_port(port, timeout=180):
     t0 = time.time()
@@ -45,7 +16,6 @@ def wait_port(port, timeout=180):
         except OSError:
             time.sleep(0.5)
     return False
-
 
 def proc_snapshot(pid):
     """The three /proc files that answer 'was it computing or scheduling'."""
@@ -58,9 +28,6 @@ def proc_snapshot(pid):
     for line in _read(f"/proc/{pid}/status").splitlines():
         if line.startswith("VmHWM"):
             out["rss_kb"] = int(re.search(r"(\d+)", line).group(1))
-    # Context switches and migrations are PER THREAD in /proc, and this server runs a
-    # 16-wide pool: reading only the main thread reported 0 switches while the pool was
-    # thrashing. Sum over /proc/PID/task/*, which is the whole point of the metric.
     vol = nonvol = migr = 0
     try:
         tids = os.listdir(f"/proc/{pid}/task")
@@ -79,13 +46,11 @@ def proc_snapshot(pid):
     out["nthreads"] = len(tids)
     return out
 
-
 def _read(p):
     try:
         return open(p).read()
     except Exception:
         return ""
-
 
 def one_request(port, results, lock):
     """POST to /v1/tts/stream and time the FIRST BYTE. On the streaming endpoint that
@@ -100,8 +65,6 @@ def one_request(port, results, lock):
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             while True:
-                # read1(), not read(): read(n) on a chunked response blocks until it
-                # has n bytes, which turns TTFA into 'time to buffer 1.4 s of audio'.
                 chunk = r.read1(65536)
                 if not chunk:
                     break
@@ -113,13 +76,10 @@ def one_request(port, results, lock):
             results.append({"err": str(e)})
         return
     total = time.time() - t0
-    # /v1/tts/stream emits s16le mono at 24 kHz (qwen_tts_server.c:stream_http_callback);
-    # urllib de-chunks for us, so n is raw PCM bytes and 2 bytes = 1 sample.
     secs = n / 2.0 / 24000.0
     with lock:
         results.append({"ttfa": ttfb, "total": total, "bytes": n, "audio_s": secs,
                         "rtf": total / secs if secs > 0 else float("nan")})
-
 
 def parse_server_log(txt):
     out = {}
@@ -139,7 +99,6 @@ def parse_server_log(txt):
         for k in ("talker_ms", "cp_ms", "dec_ms"):
             if k in out:
                 out[k.replace("_ms", "_msf")] = out[k] / out["frames"]
-    # batch audit: kernel -> GMAC, and the class split line
     kern = {}
     for m in re.finditer(r"^\s{2}(\S.*?)\s{2,}([\d.]+)\s+(\d+)\s+([\d.]+)%", txt, re.M):
         name = m.group(1).strip()
@@ -151,7 +110,6 @@ def parse_server_log(txt):
     m = re.search(r"matrix-matrix\s+([\d.]+)%.*?GEMV\s+([\d.]+)%", txt, re.S)
     if m:
         out["gemm_pct"], out["gemv_pct"] = float(m.group(1)), float(m.group(2))
-    # shape census: B histogram weighted by calls, over the projections only
     hist = {}
     for m in re.finditer(r"^census,\w+,\w+,(\d+),(\d+),(\d+),(\d+),", txt, re.M):
         B, calls = int(m.group(3)), int(m.group(4))
@@ -161,7 +119,6 @@ def parse_server_log(txt):
         tot = sum(hist.values())
         out["b_mean_calls"] = sum(b * c for b, c in hist.items()) / tot
     return out
-
 
 def cell(args, kai_on, conc, port):
     env = dict(os.environ)
@@ -182,8 +139,6 @@ def cell(args, kai_on, conc, port):
     try:
         if not wait_port(port):
             raise RuntimeError("server did not come up")
-        # Warm: the first request pays page faults and a cold pool on BOTH configs,
-        # and leaving it in would flatter whichever ran first.
         res, lock = [], threading.Lock()
         one_request(port, res, lock)
         res.clear()
@@ -198,7 +153,7 @@ def cell(args, kai_on, conc, port):
         wall = time.time() - t0
         s1 = proc_snapshot(p.pid)
     finally:
-        p.send_signal(signal.SIGTERM)     # clean exit -> atexit -> audit + census flush
+        p.send_signal(signal.SIGTERM)
         try:
             p.wait(timeout=120)
         except subprocess.TimeoutExpired:
@@ -237,7 +192,6 @@ def cell(args, kai_on, conc, port):
         "kernels": srv.get("kernels", {}),
     }
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -256,7 +210,7 @@ def main():
     rows = []
     port = a.port
     for c in concs:
-        for kai in (False, True):     # alternate so drift hits both equally
+        for kai in (False, True):
             print(f"--- running {'kleidi' if kai else 'baseline'} c={c} ...", flush=True)
             try:
                 r = cell(a, kai, c, port)
@@ -264,7 +218,7 @@ def main():
                 r = {"tag": f"{'on' if kai else 'off'}_c{c}", "kai": kai, "conc": c,
                      "error": str(e)}
             rows.append(r)
-            port += 1                 # never reuse a port a dying server still holds
+            port += 1
             json.dump(rows, open(os.path.join(a.out, "matrix.json"), "w"), indent=1)
 
     hdr = (f"{'cell':<10}{'req/s':>7}{'TTFA50':>8}{'TTFA95':>8}{'RTF50':>7}{'RTF95':>7}"
@@ -293,7 +247,6 @@ def main():
         print(f"  c={c:<3} B={on.get('mean_slots')}  req/s {sp('req_s', inv=True):.2f}x  "
               f"RTF {sp('rtf_p50'):.2f}x  TTFA {sp('ttfa_p50'):.2f}x  "
               f"tk {sp('talker_msf'):.2f}x  cp {sp('cp_msf'):.2f}x   [{khist}]")
-
 
 if __name__ == "__main__":
     main()

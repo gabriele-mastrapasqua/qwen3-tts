@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Spot-check the LoRA .expr doesn't over-recite NEUTRAL or break other emotions.
-# neutral/happy/excited on vivian (preset) + galatea (graft), base vs LoRA. Same params.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=samples/lora_spot; mkdir -p "$OUT"

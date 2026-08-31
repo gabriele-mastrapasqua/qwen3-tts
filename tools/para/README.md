@@ -1,7 +1,7 @@
-# tools/para — paralinguistic discovery automation (plan_v4 E1)
+# tools/para — paralinguistic discovery automation
 
 Offline, **CPU-first** tooling to screen `[tag]` paralinguistic candidates without ear-sweeping.
-Runs entirely on the M1 — **no DGX / CUDA needed** (E1 is inference + screening, not training).
+Runs on CPU — **no GPU needed**: this is inference and screening, not training.
 
 ## Heavy artifacts — where they live & cleanup (DO NOT COMMIT)
 
@@ -11,7 +11,7 @@ Runs entirely on the M1 — **no DGX / CUDA needed** (E1 is inference + screenin
 | CNN14 AudioSet checkpoint | `~/panns_data/` | ~330 MB | outside repo |
 | Whisper tiny/base weights | `~/.cache/whisper/` | ~75–140 MB | outside repo |
 
-**Cleanup once the E1 loop is done** (tracked as a TODO in `plan_v4.md` E1):
+**Cleanup once the discovery loop is done:**
 ```bash
 rm -rf tools/para/.venv ~/panns_data ~/.cache/whisper
 ```
@@ -24,15 +24,15 @@ python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
 ```
 
-## Use — `para_judge.py` (E1.1)
+## Use — `para_judge.py`
 ```bash
 # judge a folder, check each clip for one onomatopoeia
 ./.venv/bin/python para_judge.py --wavs /path/to/sweep --onom 哈哈哈 --tag laugh --out report.md
 
-# manifest with per-clip tag/onom/expected (produced by para_sweep.sh, E1.3)
+# manifest with per-clip tag/onom/expected (produced by para_sweep.sh)
 ./.venv/bin/python para_judge.py --manifest sweep.json --out report.md
 
-# calibration gate (E1.2): known WIN/KO clips -> precision/recall vs the ear
+# calibration gate: known WIN/KO clips -> precision/recall vs the ear
 ./.venv/bin/python para_judge.py --manifest calib.json --calibrate
 ```
 
@@ -41,6 +41,6 @@ Verdicts: `WIN_CAND` (event fired, not read literally) · `KO_LITERAL` (onomatop
 
 Default device = `cpu` (keeps the M1 cool). `--device mps` to use the Apple GPU.
 
-**Screener, not judge**: it must pass the E1.2 calibration gate against the ear-validated
-WIN/KO clips (`samples/tests/*para*`) before we trust its shortlists. The ear stays the
+**Screener, not judge**: it must pass the calibration gate against the ear-validated
+WIN/KO clips before we trust its shortlists. The ear stays the
 final judge for promotions into `para_pick`.

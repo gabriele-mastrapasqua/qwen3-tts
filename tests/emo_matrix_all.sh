@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# ============================================================================================
-# emo_matrix_all.sh — FULL re-verification matrix: every language × every emotion, driven by the
-# C engine's `--emotion` flag (THE recipe, docs/emotion-THE-recipe.md). Recommended GOLD voice per
-# language (ryan = IT/EN/PT-Romance; vivian = DE/FR/ES/ZH; ono_anna = JA; sohee = KO). One neutral
-# carrier per language → the emotion comes purely from the recipe (instruct/steer/expr the router applies).
-# Output: samples/tests/2026-06-29_emo-matrix-all/  (gitignored). 1.7B CustomVoice, seed 42.
-# ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN=./qwen_tts; M=qwen3-tts-1.7b; SEED=42
@@ -13,7 +6,6 @@ OUT=samples/tests/2026-06-29_emo-matrix-all; mkdir -p "$OUT"
 [ -d "$M" ] || { echo "SKIP: $M not present"; exit 0; }
 EMOS="sad joy anger fear disgust surprise"
 
-# tag | language | voiceflags | carrier text
 LANGS=(
 "it|Italian|-s ryan|Allora, lascia che ti spieghi come stanno le cose."
 "en|English|-s ryan|So, let me explain to you how things really are."
@@ -39,8 +31,6 @@ for row in "${LANGS[@]}"; do
   done
 done
 
-# ---- A/B: DE/FR/ES are EXPR-only in the recipe (never tested WITH steer). Add a COMBINE (+steer) variant
-#      so we can hear if steer improves them (user hypothesis: steer almost always helps). Manual flags. ----
 echo "== +STEER A/B (DE/FR/ES COMBINE: native/IT expr + ryan_<emo> steer) =="
 declare -A IN=(
  [sad]="Speak in a sad, sorrowful, gloomy and downcast tone, voice low and heavy, on the verge of tears."
