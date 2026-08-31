@@ -179,9 +179,12 @@ def argv(prof, model, port):
     a = [prof["launch"]["executable"], "-d", model]
     if "int8" in prof["runtime"]["precision"].get("talker_weights", ""):
         a.append("--int8")
-    a += ["--serve", str(port), "--batch-size", str(sv["batch_size"]),
-          "--prefork", str(sv["prefork_workers"]),
-          "--prefork-threads", str(sv["threads_per_worker"])]
+    a += ["--serve", str(port), "--batch-size", str(sv["batch_size"])]
+    if sv["prefork_workers"] > 1:
+        a += ["--prefork", str(sv["prefork_workers"]),
+              "--prefork-threads", str(sv["threads_per_worker"])]
+    else:
+        a += ["-j", str(sv["threads_per_worker"])]
     for key, flag in (("max_queue", "--max-queue"),
                       ("queue_timeout_ms", "--queue-timeout-ms"),
                       ("max_request_seconds", "--max-request-seconds")):

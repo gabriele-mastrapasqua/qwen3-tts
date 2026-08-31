@@ -361,7 +361,7 @@ def resolve_profile(a):
         print("### profile_args=      " + " ".join(a.profile_argv))
     return ",".join("%s=%s" % (k, v) for k, v in sorted(merged.items()))
 
-HARNESS_OWNED = {"--serve", "--batch-size", "--prefork", "--prefork-threads",
+HARNESS_OWNED = {"--serve", "--batch-size", "--prefork", "--prefork-threads", "-j",
                  "--prefork-elastic", "-d", "--int8"}
 
 def profile_server_argv(a):
@@ -454,7 +454,10 @@ def main():
         cmd = [a.bin, "-d", a.model, "--serve", str(port), "--batch-size", str(cap)]
         if a.precision == "int8":
             cmd.insert(3, "--int8")
-        cmd += ["--prefork", str(W), "--prefork-threads", str(8 if elastic else K)]
+        if W > 1:
+            cmd += ["--prefork", str(W), "--prefork-threads", str(8 if elastic else K)]
+        else:
+            cmd += ["-j", str(K)]
         if elastic:
             cmd += ["--prefork-elastic"]
         cmd += getattr(a, "profile_argv", [])
@@ -513,10 +516,12 @@ def main():
                 one_request(port, res, lock, wi, a.speaker, a.language, a.seed + 900000)
             res.clear()
             wmap = {i: pid for i, pid, _cpus, _thr in PS.worker_pids_from_log(log)}
+            dump_signal_supported = W > 1
 
             for C in concs:
-                try: p.send_signal(signal.SIGUSR1)
-                except Exception: pass
+                if dump_signal_supported:
+                    try: p.send_signal(signal.SIGUSR1)
+                    except Exception: pass
                 time.sleep(1.2)
                 mark = os.path.getsize(log)
                 c0 = counters(pids); t0 = time.time()
@@ -536,8 +541,9 @@ def main():
                     wave_s.append(time.time() - w0)
                 wall = time.time() - t0; c1 = counters(pids)
                 pw1 = {i: PS.proc_sample(pid) for i, pid in wmap.items()}
-                try: p.send_signal(signal.SIGUSR1)
-                except Exception: pass
+                if dump_signal_supported:
+                    try: p.send_signal(signal.SIGUSR1)
+                    except Exception: pass
                 time.sleep(1.2)
                 stats = ""
                 try:
