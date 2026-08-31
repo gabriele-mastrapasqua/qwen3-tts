@@ -122,7 +122,7 @@ The old attempt's avoidable mistake was kernels-first. Here: **fake-quant in Pyt
 ## 4. Results — measured
 
 0.6B, 143 frames, `--seed 42 -s ryan -l Italian --temperature 0 -j1`, full protocol in
-`samples/tests/2026-07-14_quant-sub4-ladder/` (`ladder_results.txt`). Harness sanity:
+the ladder harness output. Harness sanity:
 **bf16-TF control = 100.00%**, code0 identical across all dumps, and **q4_0 fake-quant
 (46.67%) reproduces C int4 (46.34%)** → the fake-quant method is validated; the June and
 today's ladders are directly comparable (int8 79.4% today vs 78% June — same instrument).
@@ -219,7 +219,7 @@ the binary: Talker code0 **90.91%** / CP **48.81%** (fake-quant predicted 92.31/
 naive lever reproduces the historical 83.92/46.34 exactly), `--self-test` PASS,
 `make test-golden` ALL PASS (bf16/int8 paths byte-identical, no int4 golden in the set).
 Every `--int4` / quant-mixed config on every ISA gets the words-accuracy jump for free.
-Ear A/B: `samples/tests/2026-07-14_quant-sub4-ladder/ear_int4_{OLD_naive,NEW_lsq}.wav`.
+Ear A/B between the naive and LSQ int4 renders.
 
 **RTF + duration (free-running A/B, same text/seed, M1 -j4):** per-frame cost is
 unchanged BY CONSTRUCTION (same kernels, same bytes — only the scale VALUES differ;

@@ -61,7 +61,7 @@ int4 −6% (-j1), int4 −4.5% (-j4). BUT **int8 stays the 1.7B single-stream ki
 mel-corr BETWEEN kernel variants is NOT a valid gate:
 greedy trajectory forks at ~frame 8 from fp-level logit shifts (first 7 frames
 bit-identical — benign known class); quality gate = self-test + ear on the -j1 wavs
-(`samples/tests/2026-08-04_avx512-parity-epyc/`). Follow-up found: batched q4 matmat is
+Follow-up found: batched q4 matmat is
 now 0.80× vs the faster seq matvec → port the VNNI-matvec tricks to `q4_matmat_vnni_slice`.
 
 ### The 2-command rented-box workflow
@@ -357,7 +357,7 @@ Self-test 5/5 PASS on-silicon (both models). `QWEN_PREFILL_MATMAT` A/B: neutral 
 BLAS clearly better on 1.7B (1.43 vs 1.52) → BLAS stays default, audit leftover CLOSED.
 mel-corr between kernel variants is NOT a gate (greedy fork at ~frame 8, first 7 frames
 bit-identical — benign); quality gate = self-test + ear
-(`samples/tests/2026-08-04_avx512-parity-epyc/`). Follow-up: batched q4 matmat now 0.80-0.90×
+Follow-up: batched q4 matmat now 0.80-0.90×
 vs the faster seq matvec → port the VNNI-matvec tricks into `q4_matmat_vnni_slice`.
 Recommended x86 defaults after this round: **0.6B → `--int4`** (new fastest), **1.7B → `--int8`**;
 bf16 mode always benefits from dpbf16 (default ON under `SIMD=avx512bf16`).

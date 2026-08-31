@@ -149,7 +149,6 @@ trigger); cry unsolved (needs FT).
 ### 🚦 Robustness gate — 5 new tags on VARIED natural sentences (2026-07-08, ear-decisive)
 Each 2026-07-07 tag was validated in ONE sweep carrier only. Re-tested on 3 varied natural sentences
 (c1/c2 EN + c3 IT) × with/without paired emotion, preset ryan + clone (ohenry). Trail:
-`samples/tests/2026-07-08_para-robustness-gate/`.
 | tag | verdict | why |
 |---|---|---|
 | **`[wow]`** | ✅ **SHIP** | TOP WIN all 3 carriers + noemo + clone |
@@ -176,7 +175,7 @@ disgust/surprise/sad-paired tags compose cleanly → **joy STEER is the aggressi
 
 ### Broad exploration net (2026-07-07, ryan, semi-autonomous CLAP/CNN14 screen → ear) — NEW WINS
 Wide onomatopoeia net across playful/disdain/surprise/exhale buckets; screener clustered, ear judged.
-Audio: `samples/tests/2026-07-07_para_broad_explore/WINS/`. **New candidate tags (ryan-validated, cross-voice
+**New candidate tags (ryan-validated, cross-voice
 + naming pending):**
 | proposed tag | onom | seed | ear verdict |
 |---|---|---|---|
@@ -319,7 +318,7 @@ signal; ear is decisive (verdicts below are the USER's ear, 2026-07-07).
 | cry | `呜呜` | ryan · EN/IT · s7/42/2024 | P(cry)=0.00, →yawn | ❌ consistent with hunt #1: `呜呜` performs yawn/sigh-ish, never a cry. |
 
 ⇒ **3 saves (user-validated):** `[yawn]`=`哈啊` s7 (tired, re-confirmed) · `[moan]`=`哈啊` s42 (NEW) ·
-`[throat]`=`嗯嗯` s42 IT (NEW, tsk throat-clear). Audio in `samples/tests/2026-07-07_{yawn,groan}_discovery/`.
+`[throat]`=`嗯嗯` s42 IT (NEW, tsk throat-clear).
 **Pending:** cross-voice (vivian/clone) seed check before wiring into `para_pick`; then confirm `[moan]`
 seed + whether `[throat]` needs its own preset/clone seed. Harness proved the discovery loop works.
 
@@ -332,14 +331,14 @@ Swept the 3 ryan wins on vivian + galatea to lock per-class seeds. They **do NOT
 ⇒ Like `haha` (ryan-EN-only laugh) and sigh needing `ahh` for vivian, **`[yawn]`/`[moan]`/`[throat]` are so far
 ryan-only**. NOT wired into `para_pick` (would ship a broken tag on vivian/clones). Options: (a) per-voice
 trigger discovery for vivian/clone (find their yawn/throat onom, as `ahh` was found for vivian sigh); (b) ship
-ryan-gated; (c) park as ryan candidates. Audio: `samples/tests/2026-07-07_{yawn_xvoice,groan_throat_xvoice}/`.
+ryan-gated; (c) park as ryan candidates.
 CLAP uncalibrated for these events → ear should confirm the vivian-laughs / clone-hums reads before finalizing.
 
 > ⚠️ **CORRECTION (2026-07-07): the yawn "KO" above is likely a CLAP artifact, not a real KO.** CLAP is
 > calibrated ONLY for laugh+sigh; a breathy YAWN is acoustically ≈ a breathy laugh, so CLAP labeling
 > vivian's `哈啊` "laugh 0.54" is probably a MISLABEL. **T3-val (2026-07-01) already ear-validated `哈啊`
 > yawn on vivian (s7/s42) AND galatea clone (s42).** ⇒ `[yawn]` `哈啊` is most likely ALREADY universal;
-> re-ear the existing `samples/tests/2026-07-07_yawn_xvoice/` clips to confirm, then wire. Lesson: do NOT
+> re-ear the existing cross-voice clips to confirm, then wire. Lesson: do NOT
 > trust the uncalibrated screener to REJECT an event it can't score — only to shortlist. Only `[throat]`
 > (`嗯嗯`→hum on vivian/clone) genuinely needs a per-voice trigger.
 
@@ -375,7 +374,7 @@ likely needs FT, same as cough/cry). Only the VOCAL family (laugh/sigh/yawn/moan
 
 Setup: `-d qwen3-tts-0.6b`, galatea clone (neutral 4 KB x-vector), Italian, T1.1, onomatopoeia passed
 **literally** via `--no-compose` — deliberately bypassing `para_pick`, whose constants are 1.7B-tuned.
-Files: `samples/tests/2026-08-05_06b_rtf_seeds/seeds/<tag>_s<seed>.wav`.
+
 
 | tag | onom | s7 | s42 | s2024 | s123 | verdict |
 |---|---|---|---|---|---|---|

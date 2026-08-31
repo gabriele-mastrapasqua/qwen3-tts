@@ -184,7 +184,6 @@ la generazione è veloce, il decoder emerge, e si vede tutto.
 - **leaks**: 137 leak / 420096 B, **identici a `main`**, nessuna traccia dei nuovi `cs_*` (debito preesistente).
 - **1.7B + emotion** (`--emotion sad|joy`): stream esatto == file == windowed, `mel_corr 1.00000`.
 - **inline `[joy]`/`[sad]`** e **`[laugh]`**: OK (prima del fix Makefile: SIGABRT).
-- Ascolto: `samples/tests/2026-07-10_pr17-review/` (17 file, README con cosa ascoltare per ognuno).
 
 ---
 
@@ -353,7 +352,7 @@ Compilati entrambi sulla N1, stesso testo/seed/flag (0.6B, `--int4 -j4`, min di 
 2. **Il pezzo grosso non è quello che pensava nessuno dei due.** Non lo spin-pool, non la snake, non il
    packing: è la **conv int8 del decoder**. `1.41 → 1.15` in stream (**−18%**), `1.31 → 1.11` in file,
    decoder 7735 → 5112 ms. È **l'unica cosa che avevo messo da parte per la qualità** (26 dB worst-segment).
-   → La decisione è **d'orecchio, non di benchmark**: audio in `samples/tests/2026-07-10_pr17-int8-conv/`.
+   → La decisione è **d'orecchio, non di benchmark**.
 
 3. **Lo spin-pool vale poco, isolato.** Sul suo stesso binario, `QWEN_POOL_SPIN=0` vs default:
    **1.43 → 1.39** (~3%). La sua *diagnosi* (~7300 futex/frame) era giusta e preziosa — il profilo la
@@ -407,7 +406,7 @@ M1 ha dotprod, quindi la conv int8 gira anche qui: la qualità si valida in loca
 > mostra regressione. Il costo della conv int8 sul TTFA va rimisurato appaiato — non è ancora fatto.
 
 Gate su M1: default OFF **bit-identico** al HEAD precedente · `--self-test` PASS · `make test-golden` PASS ·
-leaks invariati (137 / 420096 B, come `main`). Audio: `samples/tests/2026-07-10_pr17-int8-conv/audio_our_port/`.
+leaks invariati (137 / 420096 B, come `main`).
 
 ## 5.5 Debito aperto (nostro, creato oggi)
 

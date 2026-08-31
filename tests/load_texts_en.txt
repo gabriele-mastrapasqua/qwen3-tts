@@ -3,11 +3,10 @@
 # Format:  <class>\t<text>
 # Classes: short | medium | long | conversational | italian
 #
-# WHY THIS BANK EXISTS. On a rented box the engine runs open weights rather than any
-# particular finetune, because what is measured there — RTF, TTFA, throughput, the
+# WHY THIS BANK EXISTS. What a hardware benchmark measures — RTF, TTFA, throughput, the
 # concurrency ceiling, RSS — is a property of the engine and of the silicon, not of the
-# weights. So the bank must not depend on any finetune's language or on a quality metric
-# that only one checkpoint can be scored against.
+# weights. So the bank runs on open weights, and must not depend on one checkpoint's
+# language or on a quality metric only that checkpoint can be scored against.
 #
 # WHY MIXED LENGTHS: request batching behaves differently at different sequence
 # lengths — a bank of one sentence measures one corner of the space and calls it the

@@ -90,7 +90,7 @@ tooling — never part of the C engine):
    use as primary signal; Whisper-AT replaces it.
 
 **Mandatory calibration step (learned from the SER-judge failure)**: before trusting the judge, run it on
-the EXISTING ear-validated WIN/KO table (samples in `samples/tests/*para*`) — we have dozens of
+the EXISTING ear-validated WIN/KO table — we have dozens of
 ground-truth clips. Measure per-event precision/recall, pick per-event thresholds τ. If CNN14 agrees with
 the ear on the known table, it earns referee status for *screening*; the ear stays the final judge on
 promotions (same philosophy as mel-corr vs ear for emotion).

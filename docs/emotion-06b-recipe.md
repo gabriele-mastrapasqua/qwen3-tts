@@ -5,7 +5,7 @@
 > different*. Do not apply the 1.7B recipe here: on the 0.6B `--emotion` (steer/expr/COMBINE) is a
 > **no-op** — the engine gates it on `hidden_size >= 2048` and it fails silently.
 >
-> Ear-validated 2026-08-05. Trail: `samples/tests/2026-08-05_06b_*`.
+> Ear-validated by listening.
 
 ## The one idea
 
@@ -121,7 +121,7 @@ level, so it has no dependency on hidden size. `[sigh] [laugh] [wow] [yawn] [sco
 > It is *not* uniform across tags: `[laugh]` fires only at **s2024** here (the 1.7B wants s7), and
 > **seed 42 is a "yawn" attractor** on this model — the laugh, wow and yawn onomatopoeia all land on
 > a yawn there. So `[yawn]` uses s42 and `[laugh]` avoids it. The engine picks the right table per
-> model automatically; sweeps live in `samples/tests/2026-08-05_06b_rtf_seeds/seeds/`.
+> model automatically.
 
 **General rule for this model**: the constants in `para_pick` (onomatopoeia × seed × temperature) and
 all per-voice weights were tuned on the **1.7B**. The *method* transfers to the 0.6B; the *constants*

@@ -58,7 +58,7 @@ Notes:
 
 ## Blended emotions (dyads) — the shelf composes (2026-07-08)
 Emotion steering **directions ADD**: a 50/50 sum of two primary `ryan_<emo>.qlsteer` vectors renders a coherent
-NEW emotion (ear-validated ryan EN+IT, `samples/tests/2026-07-08_emotion-dyads/`). Seven ship as first-class
+NEW emotion (ear-validated, ryan EN+IT). Seven ship as first-class
 `--emotion` values — no new capture, no FT:
 
 | dyad | blend | mix |

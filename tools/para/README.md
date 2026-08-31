@@ -42,5 +42,5 @@ Verdicts: `WIN_CAND` (event fired, not read literally) · `KO_LITERAL` (onomatop
 Default device = `cpu` (keeps the M1 cool). `--device mps` to use the Apple GPU.
 
 **Screener, not judge**: it must pass the calibration gate against the ear-validated
-WIN/KO clips (`samples/tests/*para*`) before we trust its shortlists. The ear stays the
+WIN/KO clips before we trust its shortlists. The ear stays the
 final judge for promotions into `para_pick`.

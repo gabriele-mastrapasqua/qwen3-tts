@@ -1,4 +1,4 @@
-# E1.1 para-judge — offline screening tools (CPU-first, optional MPS on Apple Silicon).
+# para-judge — offline screening tools (CPU-first, optional MPS on Apple Silicon).
 # Heavy: pulls torch (~2-3 GB). Install into tools/para/.venv (gitignored). See README.md.
 torch>=2.1
 numpy>=1.24
