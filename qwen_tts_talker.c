@@ -208,7 +208,7 @@ static void bf16_to_f32_matrix(float *dst, const uint16_t *src, int64_t n) {
  * (bf16_to_f32_matrix). So the bf16 copies are not a load-time residue that a
  * madvise could drop — they are a live reader on the request path, and dropping
  * them would only buy a page-fault storm on the next request. Measured (PLAN 0.nonies
- * S3, see the design notes): 1.7B --int8 holds the mmapped bf16 (up to 3.6 GB) AND
+ * S3): the 1.7B at --int8 holds the mmapped bf16 (up to 3.6 GB) AND
  * the heap-fused gate_up bf16 (~1.4 GB) AND the quantized copies (~1.8 GB) at once —
  * which is what the OOM kill on this 16 GB Mac actually was.
  *
@@ -1590,8 +1590,9 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
          * pool, yet even at one thread matmat stays ahead.
          *
          * LANGUAGE IDENTITY VERIFIED BEFORE CHANGING THE DEFAULT, which is the debt 08-19
-         * left open: 5 voices of a finetune, MMS-LID, 97.8-99.3 % against 97.9-99.5 % for
-         * the BLAS path, 0.0-0.1 % drift to the base language, normal durations. It matters
+         * left open: 5 voices of a finetune, scored with an off-the-shelf language
+         * identification model — 97.8-99.3 % against 97.9-99.5 % for the BLAS path,
+         * 0.0-0.1 % drift to the base language, normal durations. It matters
          * because on a finetuned checkpoint this class of change loses the trained language
          * long before it produces audible damage -- the audio stays clean and the model
          * drifts, and no signal-level metric sees it.

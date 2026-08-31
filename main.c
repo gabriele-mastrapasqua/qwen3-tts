@@ -948,7 +948,7 @@ int main(int argc, char **argv) {
      * plastic, so the same push overshoots — and the excess does not become more
      * emotion, it becomes drift, which shows up as lost accent.
      * Measured: --emotion sad on a finetuned voice drops language identity from ~90%
-     * to ~8%. See the design notes. -1 = keep the recipe. */
+     * to ~8%. -1 = keep the recipe. */
     float emotion_weight = -1.0f;
     int   emotion_layers_l0 = -1, emotion_layers_l1 = -1;   /* --emotion-layers A-B */
     int ml_l0 = 21, ml_l1 = 25;        /* --ml-range "l0-l1" (identity layers) */
@@ -1117,7 +1117,7 @@ int main(int argc, char **argv) {
         {"batch-multi-test", required_argument, 0, 1042},
         {"onset-fade",    required_argument, 0, 1057},
         {"tail-trim",     no_argument,       0, 1058},
-        /* EOS strategy — see the design notes */
+        /* EOS strategy — see qwen_eos_strategy_t in qwen_tts.h */
         {"eos-strategy",  required_argument, 0, 1700},
         {"eos-suppress",  required_argument, 0, 1701},
         {"eos-fpt",       required_argument, 0, 1702},

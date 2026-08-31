@@ -262,7 +262,7 @@ help:
 	@echo "  make para-demo       - Shipped inline [tag]s ([wow]/[yawn]/[scoff]/[giggle]/[laugh]/[sigh]) on natural sentences (1.7B)"
 	@echo "  make test-emotion-ft - Emotion fine-tune (.expr graft) smoke: CSP Italian on 1.7B (preset+clone, seed 42)"
 	@echo "  make test-lora-it    - Emotion×voice×temp listening matrix (L16-26 LoRA; afplay links + full cmds)"
-	@echo "  make emotion-seeds   - Seed-finder palette → the design notes (recommended seeds/lang/voice/emo; SLOW)"
+	@echo "  make emotion-seeds   - Seed-finder palette → docs/emotion-seeds.md (recommended seeds/lang/voice/emo; SLOW)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
@@ -278,7 +278,7 @@ help:
 	@echo "  make server-batch-microbench - la curva B=1->2->4 e BatchEfficiency (~4 min, solo OSS)"
 	@echo "  make mini-bench-06b|-17b   - 1/2/4 richieste parallele su un modello OSS"
 	@echo "  make kernel-tune           - misura le soglie del dispatcher invece di indovinarle"
-	@echo "  make tune-archive BOX=<nome> - idem, e archivia il JSON the design notes per il confronto cross-ISA"
+	@echo "  make tune-archive BOX=<name> - the same, and archives the JSON for a cross-ISA comparison"
 	@echo "                               (tools/box_info.sh + tests/membw.c) + --caps + --self-test"
 	@echo "                               + --matmat-bench. Nessun modello richiesto. JSON in HW_JSON=."
 	@echo "                               (alias storico: make box-report)"
@@ -292,7 +292,7 @@ help:
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
 
-# ── benchmark workflow (the design notes ────────────────────────
+# ── benchmark workflow ──────────────────────────────────────────
 
 debug: CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include $(KAI_INC) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined
 debug: LDLIBS += -fsanitize=address -fsanitize=undefined
@@ -778,12 +778,12 @@ EXPR ?= presets/expr/italian_l1626_r64.expr
 test-lora-it: $(TARGET)
 	@bash tests/lora_matrix.sh Italian $(EXPR)
 
-# Emotion seed-finder → recommended-seeds palette doc (the design notes. For each
+# Emotion seed-finder → a recommended-seeds palette document. For each
 # (language × voice × emotion) renders N seeds with --seed-audition --audition-keep, records the
 # auto-pick (glitch+dur) + every take, and writes a usage doc with afplay links + full commands.
 # Opt-in + SLOW (full IT+ES+clone matrix on 1.7B). Override scope via env: LANGS/VOICES_IT/EMOS_IT/N.
 emotion-seeds: $(TARGET)
-	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),the design notes $(if $(N),$(N),5)
+	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),docs/emotion-seeds.md) $(if $(N),$(N),5)
 
 # The batching wiring under the two TRANSITIONS test-batch does not exercise: N->1 (one
 # request is left alone) and 1->N (one is admitted alongside a running one). Both of the
@@ -844,57 +844,58 @@ $(MEMBW_BIN): tests/membw.c
 
 
 
-# ── Le due corse corte e mirate: 1/2/4 paralleli, quant di default, solo OSS ──
-# Servono a rispondere subito a "2-4 richieste parallele sono decenti su questa
-# macchina?" con la tabella per livello (TTFA p50/p95, RTF p50/p95, Q, BEff, RSS)
-# e il verdetto contro le soglie dichiarate PRIMA (PLAN 0.nonies).
+# ── Two short, targeted runs: 1/2/4 in parallel, the default quantizations, open weights ──
+# They answer "are 2-4 parallel requests decent on this machine?" straight away, with a
+# table per level (first-audio p50/p95, RTF p50/p95, throughput, effective batch, RSS) and
+# a verdict against thresholds declared BEFORE the run.
 #
-# Il 0.6B risponde in fretta ed e' il primo da lanciare; il 1.7B e' la taglia del
-# prodotto (stessa architettura di un finetune reale, quindi gli stessi colli
-# di bottiglia) ed e' quello il cui numero conta.
-# I TRE QUANT, ognuno sul PROPRIO server pulito (lo script riavvia il server per
-# braccio: page cache, allocatore e pool ripartono da zero, altrimenti il secondo
-# quant erediterebbe lo stato del primo e il confronto non varrebbe).
+# The 0.6B answers quickly and is the one to start with; the 1.7B is the production size --
+# the same architecture as a real finetune, so the same bottlenecks -- and it is the one
+# whose number counts.
 #
-#   --int8                     il gold: e' la qualita' di riferimento
-#   --int4                     il piu' piccolo: meta' dei byte dell'int8
-#   --quant-mixed-int6=q4n14   la mappa mista del 17/08: 14 layer int8 + 14 q4_0,
-#                              -21,9% di traffico pesi contro l'all-int8, e sulla
-#                              language identity aveva tenuto il pari con l'int8 gold
+# THE THREE QUANTIZATIONS, each on its OWN clean server (the script restarts the server per
+# arm: page cache, allocator and thread pool start from zero, otherwise the second
+# quantization would inherit the first one's state and the comparison would not hold).
 #
-# La domanda a cui rispondono INSIEME: la mappa mista rende davvero, o e' solo un
-# int4 con un nome piu' lungo? Serve vederli sulla stessa macchina, stessi livelli,
-# stessi testi — e con il controllo che il quant chiesto sia DAVVERO quello caricato
-# (lo script lo legge dal log del server e lo dichiara: un flag che non si applica
-# non fallisce, degrada in silenzio).
+#   --int8                     the gold: the reference quality
+#   --int4                     the smallest: half the bytes of int8
+#   --quant-mixed-int6=q4n14   a mixed map, 14 layers int8 + 14 q4_0: -21.9 % weight
+#                              traffic against all-int8, and it had held parity with the
+#                              int8 gold on a language-identification score
+#
+# What they answer TOGETHER: does the mixed map actually pay, or is it int4 with a longer
+# name? That needs them on the same machine, the same levels, the same texts -- and with a
+# check that the quantization asked for is REALLY the one loaded (the script reads it from
+# the server log and declares it: a flag that does not apply does not fail, it degrades in
+# silence).
 MINI_ARMS ?= --int8 --int4 --quant-mixed-int6=q4n14
 
 
 
-# ── Decoder batchato fra slot: parita' contro il percorso per-slot ────────────
-# Stessi codici, stesso calendario ragged dei chunk (compresi i giri a 0 frame),
-# decodificati in ENTRAMBI i modi e confrontati campione per campione.
-# QWEN_PARITY_PAT=2 toglie i chunk da 1 frame, che isola l'ordine di riduzione
-# GEMV-contro-GEMM di Accelerate da questo motore: con M=1 la BLAS prende un kernel
-# diverso e l'ultimo bit si muove: e' una proprieta' della libreria, non del batching,
-# e il percorso per-slot ce l'ha gia'.
+# ── Cross-slot batched decoder: parity against the per-slot path ─────────────
+# The same codes, the same ragged chunk schedule (including the zero-frame rounds),
+# decoded BOTH ways and compared sample by sample.
+# QWEN_PARITY_PAT=2 drops the one-frame chunks, which isolates the BLAS library's
+# GEMV-versus-GEMM reduction order from this engine: at M=1 the library picks a different
+# kernel and the last bit moves. That is a property of the library, not of the batching,
+# and the per-slot path already has it.
 tests/decoder_batch_parity.o: tests/decoder_batch_parity.c
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-# $(INGOT_LIB) e' esplicito: il caricatore safetensors e' vendorizzato in una libreria
-# a parte, non negli OBJS, e senza di lei il link muore su _ingot_st_open_dir.
+# $(INGOT_LIB) is explicit: the safetensors loader is vendored as a separate library, not
+# in OBJS, and without it the link dies on an undefined loader symbol.
 test-decoder-batch-parity: $(filter-out main.o,$(OBJS)) tests/decoder_batch_parity.o $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o qwen_tts_batch_parity $^ $(LDLIBS)
-	@echo "--- calendario ragged CON chunk da 1 frame (percorso GEMV della BLAS in gioco) ---"
+	@echo "--- ragged schedule WITH one-frame chunks (the BLAS GEMV path is in play) ---"
 	@./qwen_tts_batch_parity $(MODEL_SMALL) 4 6
-	@echo "--- stesso calendario, senza chunk da 1 frame (atteso: bit-identico) ---"
+	@echo "--- same schedule, without one-frame chunks (expected: bit-identical) ---"
 	@QWEN_PARITY_PAT=2 ./qwen_tts_batch_parity $(MODEL_SMALL) 4 6
 
-# ── Costo di UNA decode call, contro (group x chunk) ────────────────────────
-# Il trace di serving registra la durata della chiamata e quanti SLOT c'erano
-# dentro, ma NON quanti frame: quindi la curva costo-per-frame non e' derivabile
-# dagli artifact, e ogni domanda su "spezzare il quantum" dipende proprio da
-# quella. Questo la misura sullo stesso entry point che usa il driver.
+# ── The cost of ONE decode call, against (group x chunk) ─────────────────────
+# The serving trace records how long a call took and how many SLOTS were inside it, but NOT
+# how many frames: so the cost-per-frame curve is not derivable from the artifacts, and
+# every question about splitting the decode quantum depends on exactly that. This measures
+# it on the same entry point the driver uses.
 tests/decode_quantum_bench.o: tests/decode_quantum_bench.c
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -902,20 +903,20 @@ test-decode-quantum: $(filter-out main.o,$(OBJS)) tests/decode_quantum_bench.o $
 	$(CC) $(CFLAGS) -o qwen_tts_decode_quantum $^ $(LDLIBS)
 	@echo "Built ./qwen_tts_decode_quantum  (usage: ./qwen_tts_decode_quantum <model_dir> [threads] [reps])"
 
-# ── Censimento kernel per shape: NOSTRI kernel vs KleidiAI, sulle shape VERE ──
-# Due sole slice verticali, nessun catalogo: INT8 per-row (i nostri stessi pesi,
-# stessa scala per riga) contro qsi8cxp, e il prefill BF16 contro bf16p. Il pack
-# dell'RHS e' in colonna separata perche' al load si paga una volta; il pack
-# dell'LHS e' dentro ns/call perche' in inferenza si paga a ogni chiamata.
+# ── Per-shape kernel census: our kernels against the vendored ones, on the REAL shapes ──
+# Two vertical slices, no catalogue: per-row INT8 (our own weights, our own per-row scale)
+# against the library's equivalent, and the BF16 prefill against its bf16 packing. The RHS
+# pack sits in its own column because it is paid once at load; the LHS pack is inside
+# ns/call because in inference it is paid on every call.
 kernel-census: $(filter-out main.o,$(OBJS)) tests/kernel_census_bench.o $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o qwen_kernel_census $^ $(LDLIBS)
 	@./qwen_kernel_census --model $(or $(CMODEL),1.7b) $(CENSUS_ARGS)
 
 
-# Le soglie misurate su QUESTA macchina, archiviate nel DB dei box (the design notes con lo
-# stesso nome del suo box_info, cosi' che un confronto cross-arch possa mettere x86 e
-# ARM nella stessa tabella. Le soglie NON si ereditano fra architetture, e nemmeno fra
-# due binari con micro-kernel diversi: un tune vale per il binario che l'ha prodotto.
+# The thresholds measured on THIS machine, archived under the same name as its box-info
+# record, so a cross-architecture comparison can put x86 and Arm in one table. Thresholds
+# are NOT inherited between architectures, nor between two binaries with different
+# micro-kernels: a tune is valid for the binary that produced it.
 #   make tune-archive BOX=2026-08-21_gcp-c4a-standard-16_axion MODEL=qwen3-tts-1.7b-base
 BOX ?= $(shell date +%Y-%m-%d)_$(shell uname -m)-$(shell hostname | tr -cd 'a-zA-Z0-9-')
 
@@ -926,7 +927,7 @@ server-hw-check: $(TARGET) $(MEMBW_BIN)
 # Alias storico: i doc e gli script che dicevano `box-report` continuano a funzionare.
 box-report: server-hw-check
 
-# La banda da sola, senza il resto del report (utile per un A/B rapido su un box).
+# Bandwidth on its own, without the rest of the report (useful for a quick A/B on a box).
 membw: $(MEMBW_BIN)
 	@$(MEMBW_BIN)
 
@@ -940,13 +941,13 @@ bench-matrix-full: $(TARGET)
 
 
 
-# ── PARITA' DEI GEMELLI BATCHED — check-isa dice che COMPILA, questo che e' GIUSTO ──
-# check-isa e' solo -fsyntax-only: garantisce che il percorso VNNI/SMMLA/AVX2 esista,
-# non che faccia l'aritmetica che dichiara. tests/matmat_parity.c confronta i gemelli
-# batched (int8, q4_0) contro un riferimento INTERO in C semplice che quantizza le
-# attivazioni esattamente come il motore. Dove il dispatcher ha un GEMM intero vero,
-# l'errore atteso e' ZERO — l'aritmetica intera non ha ordine di somma da discutere,
-# quindi un rel != 0 e' un bug, non "rumore in virgola mobile".
+# ── PARITY OF THE BATCHED TWINS — check-isa says it COMPILES, this says it is RIGHT ──
+# check-isa is only -fsyntax-only: it guarantees the VNNI/SMMLA/AVX2 path exists, not that
+# it does the arithmetic it claims. tests/matmat_parity.c compares the batched twins (int8,
+# q4_0) against a plain-C INTEGER reference that quantizes activations exactly as the engine
+# does. Where the dispatcher has a real integer GEMM the expected error is ZERO -- integer
+# arithmetic has no summation order to argue about -- so a non-zero relative error is a bug,
+# not "floating-point noise".
 PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c
 PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I.
 check-matmat-parity:
@@ -960,26 +961,26 @@ else
 endif
 	@/tmp/matmat_parity
 
-# ⭐ ESEGUE DAVVERO I KERNEL x86 AVX2 DAL MAC ARM. Rosetta 2 supporta AVX2 (verificato
-# su questa macchina il 2026-08-18), quindi il binario cross-compilato per x86-64-v3
-# non si limita a compilare: gira, e i suoi numeri valgono. E' il modo di validare il
-# kernel della classe di VPS piu' affittata (AVX2 senza VNNI) senza affittare nulla.
+# THIS REALLY EXECUTES THE x86 AVX2 KERNELS FROM AN ARM MAC. Rosetta 2 supports AVX2
+# (verified on this machine), so the binary cross-compiled for x86-64-v3 does not merely
+# compile: it runs, and its numbers count. It is how to validate the kernel of the most
+# commonly rented VPS class (AVX2 without VNNI) without renting anything.
 #
-# ⚠️ DUE COSE DA SAPERE, o si legge male l'output:
-#   1. Rosetta NON emula AVX-512. VNNI e AMX restano da validare SUL METALLO: qui
-#      passano solo i percorsi AVX2. Un PASS qui non dice niente su c3d/c3.
-#   2. Sotto Rosetta `--caps` riporta "runtime cpu: sse2" e stampa
-#      "WARNING: built with AVX2 but this CPU lacks it -> will SIGILL". E' un FALSO
-#      ALLARME dell'emulazione (CPUID non espone AVX2 mentre le istruzioni girano),
-#      non un difetto del binario: il test infatti passa. Non "aggiustare" nulla.
+# TWO THINGS TO KNOW, or the output reads wrong:
+#   1. Rosetta does NOT emulate AVX-512. VNNI and AMX still have to be validated ON METAL:
+#      only the AVX2 paths pass here. A PASS here says nothing about an AVX-512 host.
+#   2. Under Rosetta, `--caps` reports "runtime cpu: sse2" and prints
+#      "WARNING: built with AVX2 but this CPU lacks it -> will SIGILL". That is a FALSE
+#      ALARM from the emulation (CPUID does not expose AVX2 while the instructions run),
+#      not a defect in the binary -- the test passes. Do not "fix" anything.
 check-matmat-parity-x86:
 ifeq ($(UNAME_S)-$(UNAME_M),Darwin-arm64)
-	@echo "=== matmat parity — x86-64-v3 (AVX2) sotto Rosetta 2 ==="
+	@echo "=== matmat parity — x86-64-v3 (AVX2) under Rosetta 2 ==="
 	@clang -target x86_64-apple-macos13 $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK \
 	  -march=x86-64-v3 $(PARITY_SRC) -framework Accelerate -lm -o /tmp/matmat_parity_x86
 	@/tmp/matmat_parity_x86
 else
-	@echo "check-matmat-parity-x86: solo su Mac ARM (serve Rosetta 2). Su x86 usa check-matmat-parity."
+	@echo "check-matmat-parity-x86: Arm Mac only (needs Rosetta 2). On x86 use check-matmat-parity."
 endif
 
 test-compose: $(TARGET)
