@@ -32,6 +32,7 @@ REAL="tests/load_texts_en.txt"             # qualification: the whole bank
 FAST_CLASSES="short"
 REAL_CLASSES=""
 SKIP_IDLE=0
+IDENTITY=0          # the identity gate needs a traced pass of its own; see below
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) MODEL="$2"; shift 2;;
@@ -47,6 +48,7 @@ while [ $# -gt 0 ]; do
     --fast-classes) FAST_CLASSES="$2"; shift 2;;
     --real-classes) REAL_CLASSES="$2"; shift 2;;
     --skip-idle-gate) SKIP_IDLE=1; shift;;
+    --identity-gate) IDENTITY=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -86,8 +88,10 @@ done
 gate "forbidden env     = none present"
 
 # 4. nothing else is running that would share the cores
-STALE=$(pgrep -c -x qwen_tts 2>/dev/null || echo 0)
-[ "$STALE" = "0" ] || die "$STALE qwen_tts processes already running"
+# `pgrep -c` PRINTS 0 and EXITS 1 when nothing matches, so `|| echo 0` appended a second
+# zero and the comparison failed against a clean box. Count the lines instead.
+STALE=$(pgrep -x qwen_tts 2>/dev/null | wc -l | tr -d ' ')
+[ "${STALE:-0}" = "0" ] || die "$STALE qwen_tts processes already running"
 gate "stale engines     = 0"
 if [ "$SKIP_IDLE" = "0" ] && [ -r /proc/loadavg ]; then
   L1=$(cut -d' ' -f1 /proc/loadavg)
@@ -118,6 +122,7 @@ echo "########## RUNGS ##########"
 PORT=9400
 rung () {   # name bank conc waves [extra...]
   NAME="$1"; BANK="$2"; CONC="$3"; W="$4"; shift 4
+  # $@ now holds the extra arguments (e.g. --classes), reused by the identity pass below
   PORT=$((PORT + 10))
   echo "=== $NAME  bank=$(basename "$BANK")  conc=$CONC  waves=$W ==="
   CMD="python3 tests/serve_parallel_wave.py --model $MODEL --bin $BIN --speaker $SPK
@@ -126,11 +131,32 @@ rung () {   # name bank conc waves [extra...]
   echo "cmd: $(echo $CMD)" >> "$MAN"
   $CMD > "$OUT/$NAME.log" 2>&1
   RC=$?
-  if [ $RC -ne 0 ]; then echo "  rc=$RC  RUNG FAILED - see $OUT/$NAME.log"; FAILED=1; return; fi
+  if [ $RC -ne 0 ]; then
+    # Say WHY, on the line that reports the failure. "rc=2, see the log" sends a reader
+    # hunting through 70 lines for a sentence the script had already read.
+    WHY=$(grep -m1 -E 'REFUSING TO RUN|CROSS-CHECK FAILED|Traceback|GATE FAILED|Error' \
+          "$OUT/$NAME.log" 2>/dev/null | cut -c1-100)
+    echo "  rc=$RC  RUNG FAILED${WHY:+ — $WHY}"
+    echo "          full log: $OUT/$NAME.log"
+    FAILED=1; return
+  fi
   grep -E '^topo|^2x8|^4x4|^8x2|^1x16' "$OUT/$NAME.log" | head -20
-  if [ -f tests/serve_identity_gate.py ]; then
-    python3 tests/serve_identity_gate.py "$OUT/$NAME" >> "$OUT/$NAME.log" 2>&1 \
-      || { echo "  IDENTITY GATE FAILED for $NAME"; FAILED=1; }
+  # THE IDENTITY GATE NEEDS DATA THAT COSTS TIMING TO PRODUCE.
+  # It pairs every client-side record to a server-side one, and the server side only exists
+  # when the request trace is on -- which perturbs the very numbers this rung just measured.
+  # Running it anyway reported "NO PAIRS" and then "SUITE FAILED", which is a gate failing
+  # because its input was never produced: the worst kind of red, because it looks like the
+  # engine. So the rungs stay clean and the gate is a separate, explicitly traced pass.
+  if [ "$IDENTITY" = "1" ] && [ -f tests/serve_identity_gate.py ]; then
+    PORT=$((PORT + 1))
+    QWEN_LIFE_TRACE=1 QWEN_REQ_TRACE=1 python3 tests/serve_parallel_wave.py \
+        --model "$MODEL" --bin "$BIN" --speaker "$SPK" --language "$LANG_" --topo "$TOPO" \
+        --conc 1,4 --waves 2 --seed 42 --precision int8 --profile "$PROFILE" \
+        --text-file "$BANK" --out "$OUT/${NAME}_identity" --port $PORT \
+        --label "${NAME}_identity" "$@" > "$OUT/${NAME}_identity.log" 2>&1
+    if python3 tests/serve_identity_gate.py "$OUT/${NAME}_identity" >> "$OUT/${NAME}_identity.log" 2>&1
+    then echo "  identity gate: PASS (traced pass, C=1 and C=4)"
+    else echo "  IDENTITY GATE FAILED for $NAME"; FAILED=1; fi
   fi
 }
 

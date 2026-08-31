@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "profile": {
-    "id": "axion-16c-ttfa",
-    "description": "Recommended low-TTFA server configuration for a 16-core Google Axion host. Every value was read from the qualification harness and the engine source, not from memory.",
+    "id": "generic-16c-starting-point",
+    "description": "A STARTING POINT for a 16-core server, not a qualification. Every value here is either a property of the engine or a measured rule of thumb that held on more than one machine; the topology in particular must be re-measured on the target before any number from it is quoted.",
     "objective": {
       "primary": "ttfa",
       "secondary": "realtime_factor",
@@ -16,20 +16,14 @@
   },
   "hardware": {
     "architecture": "arm64",
-    "cpu_family": "Google Axion / Arm Neoverse-V2",
+    "cpu_family": "any 16-core Arm server class (Neoverse N1/V1/V2 and equivalents)",
     "logical_cpus": 16,
     "physical_cores": 16,
     "threads_per_core": 1,
     "numa_nodes": 1,
-    "l3_mib": 80,
-    "ram_gib": 62,
-    "isa_features_used": [
-      "asimd",
-      "asimddp",
-      "i8mm",
-      "bf16"
-    ],
-    "notes": "GCP c4a-standard-16, no SMT. SVE/SVE2 are present at 128-bit but the engine has no SVE kernel path today."
+    "l3_mib": 32,
+    "ram_gib": 32,
+    "notes": "16 physical cores without SMT is the shape this starting point assumes. On a cloud vCPU that is a HYPERTHREAD unless the instance was created with one thread per core, and with SMT on, eight threads means four real cores contending for the same FMA units -- which looks like the batching's fault and is not. Recreate the instance with one thread per core, or halve the thread split and re-measure."
   },
   "build": {
     "target": "blas",
@@ -37,12 +31,12 @@
       "command": "make blas GIT_REV=$(git rev-parse --short HEAD)",
       "variables": {
         "SIMD": "auto -> native",
-        "ARCH_FLAGS": "-march=native (resolves to -mcpu=neoverse-v2+crc+sve2-aes+sve2-sha3+sve2-sm4+nossbs)"
+        "ARCH_FLAGS": "-march=native (resolved by the build, per host)"
       }
     },
     "requirements": {
-      "blas": "OpenBLAS 0.3.32, pthread build (libopenblas0-pthread)",
-      "kleidiai": "vendored subset of ARM-software/kleidiai 495f652; SMMLA and BFMMLA both compiled and active",
+      "blas": "any OpenBLAS with a pthread build",
+      "kleidiai": "vendored; the Arm matrix-unit paths are compiled and gated at runtime",
       "note": "GIT_REV must be passed on the command line: a synced tree has no .git, so the binary cannot certify its own commit."
     }
   },
@@ -53,7 +47,7 @@
     "max_queue": 1,
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
-    "worker_affinity": "contiguous core slices, worker 0 -> CPU 0-7, worker 1 -> CPU 8-15"
+    "worker_affinity": "contiguous core slices, one per worker"
   },
   "streaming": {
     "first_chunk_ramp": [
@@ -97,26 +91,6 @@
         "value": null,
         "why": "diagnostics, as above",
         "revert": "QWEN_SD_PHASE=1"
-      },
-      "QWEN_KAI_NCHUNK": {
-        "value": "384",
-        "why": "sub-tile the GEMM's n dimension so the microkernel's second height pass finds the packed RHS in cache. Measured on this platform: prefill p50 45.02 -> 42.87 ms and first audio 72.20 -> 70.20 across three paired rounds, output bitwise identical. 192 and 96 both measured WORSE than either 384 or 0, so smaller is not better.",
-        "revert": "QWEN_KAI_NCHUNK=0 restores one kernel call per slice"
-      },
-      "QWEN_PREFILL_MATMAT": {
-        "value": "1",
-        "why": "route the prefill projections through the native bf16 matmat instead of BLAS. On this platform it wins at every thread budget (-j1 2014 -> 1439 ms, -j16 310 -> 167). It is already the default where the matrix unit is real; pinned here so a change of default elsewhere cannot silently move this configuration.",
-        "revert": "QWEN_PREFILL_MATMAT=0 returns to BLAS without a rebuild"
-      },
-      "QWEN_POOL_SPIN": {
-        "value": "65536",
-        "why": "generations a pool worker re-reads before parking on the condvar. 4096 was tuned on other hardware and costs 40 % of the Code Predictor here; 65536 measured CP 16.0 -> 9.6 ms/f and 491,320 -> 35,132 context switches. Higher buys nothing and 262144 at -j16 is worse.",
-        "revert": "QWEN_POOL_SPIN=4096 for the previous value, 0 to park immediately"
-      },
-      "QWEN_DECODER_BATCH": {
-        "value": "1",
-        "why": "batch the speech decoder across slots. Measured +8.1 % throughput with first-audio p50 -8.9 % and p95 -6.1 % at concurrency 4, and the audio moves by one LSB in 32768 on 81 samples of 161,280. The server enables it by default; pinned so the profile records what ran.",
-        "revert": "QWEN_DECODER_BATCH=0"
       }
     }
   },
@@ -126,11 +100,11 @@
     "server_env_serialization": "comma"
   },
   "qualification": {
-    "status": "qualified",
-    "workload": "REALISTIC - a mixed-length text bank, 21 texts, audio p50 3.84 s per request. Short-text banks are an engineering inner loop and never a production figure.",
+    "status": "unqualified",
+    "workload": "NONE. Nothing here was measured on the machine you are about to run it on.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b",
     "speaker": "ryan",
-    "notes": "preferred_concurrency is 4 because at C=6 the realtime factor measured ~1.1: first audio still good, sustained realtime not. The band claims nothing above C=8. Topology and thread split were qualified on this host; the model named here is the base checkpoint the profile is exercised against, and a profile makes no claim about any particular checkpoint's audio."
+    "notes": "Use this to START, then replace it. Two workers of eight threads is where a 16-core Arm host landed, and it rests on one measured fact that generalises -- a single request saturates at about eight threads and regresses at sixteen -- and one that does not: which topology wins depends on the concurrency you expect, because a worker only sees a batch at C >= 2W and the engine takes a different kernel above batch 2. Run the sweep in docs/serving-operations.md, then write your own profile with status 'qualified' and the numbers that earned it."
   }
 }

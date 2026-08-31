@@ -25,15 +25,24 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers);
  * jobs on the scheduler. */
 int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch);
 
-/* Limiti di ammissione del server batchato. Da chiamare PRIMA di qwen_tts_serve_batched.
- *   max_queue         tetto della coda; -1 = automatico (2x gli slot), 0 = illimitata
- *                     (il comportamento fino al 2026-08-20, in cui la quarta richiesta
- *                     aspettava all'infinito senza mai ricevere un errore)
- *   queue_timeout_ms  scadenza di attesa in coda; 0 = nessuna. Oltre la scadenza la
- *                     richiesta riceve 503: consegnare audio in ritardo e' peggio che
- *                     dire di no, perche' nel frattempo occupa uno slot.
- * Il rifiuto e' 503, non 429: 503 = IL SERVER e' senza capacita' (RFC 9110), 429 = QUESTO
- * CLIENT ha superato una quota (RFC 6585) — e quote per cliente non ne abbiamo. */
+/* Admission limits for the batched server. Call this BEFORE qwen_tts_serve_batched.
+ *   max_queue         queue cap; -1 = automatic (2x the slots), 0 = unbounded (the old
+ *                     behaviour, in which the fourth request waited forever without ever
+ *                     receiving an error)
+ *   queue_timeout_ms  wait deadline in the queue; 0 = none. Past the deadline the request
+ *                     gets a 503: delivering late audio is worse than saying no, because
+ *                     meanwhile it occupies a slot.
+ * The refusal is 503, not 429: 503 = THE SERVER has no capacity (RFC 9110), 429 = THIS
+ * CLIENT exceeded a quota (RFC 6585) — and there are no per-client quotas here. */
 void qwen_tts_server_set_limits(int max_queue, int queue_timeout_ms);
+/* Wall-clock ceiling on time IN SERVICE, per request, in ms. 0 disables.
+ * The token cap is not a safety limit: at 12.5 Hz it corresponds to roughly eleven
+ * minutes of audio, so one caller can hold a slot that long. Measured from admission,
+ * because queue time is bounded separately. QWEN_MAX_REQUEST_S (seconds) overrides. */
+void qwen_tts_server_set_max_request_ms(int ms);
+/* Maximum accepted text length. 0 = derive it from the generation cap, which is the
+ * relationship that matters: a caller must not be able to submit work the server
+ * cannot finish. QWEN_MAX_TEXT_CHARS overrides. */
+void qwen_tts_server_set_max_text_chars(int chars);
 
 #endif /* QWEN_TTS_SERVER_H */

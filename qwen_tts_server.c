@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -71,7 +72,34 @@
 /* Max accepted request text length (chars). Guards against a single huge body
  * blowing up the tokenizer / generation time / memory. ~1500 words of TTS is
  * already far beyond any reasonable single request. */
+/* Hard ceiling, independent of any other setting: nothing longer is ever read. */
 #define MAX_TTS_TEXT 8192
+#define QWEN_STR2(x) #x
+#define QWEN_STR(x) QWEN_STR2(x)
+
+/* ── The input limit is DERIVED from the generation limit ────────────────────────
+ * The two used to be unrelated, and the gap was most of the input space: 8192
+ * characters were accepted while the 60 s cap could complete roughly 1900, so every
+ * request between those two numbers was guaranteed to end in a timeout or an error.
+ * A limit that lets a caller submit work the server cannot finish is not a limit.
+ *
+ * ⚠️ THE RATE BELOW IS PROVISIONAL AND MUST BE RE-DERIVED PER DEPLOYMENT.
+ * It comes from a SINGLE observation -- 2000 characters produced 48 s of audio in 63.6 s
+ * of compute on a 0.6B at one concurrent stream, i.e. ~0.024 s of audio and ~0.032 s of
+ * compute per character, or ~31 characters per second of budget. A second measurement on
+ * the same machine then refused 1000 characters at the same 60 s, which is twice the cost
+ * per character, so the two disagree by 2x and the difference is almost certainly machine
+ * load rather than anything about the text. One point is not a rate.
+ *
+ * What IS settled is the SHAPE: the input limit must be derived from the generation cap
+ * rather than set beside it. Before, 8192 characters were accepted while the cap could
+ * finish far fewer, so most of the accepted input space was guaranteed to fail. A limit
+ * that lets a caller submit work the server cannot finish is not a limit.
+ *
+ * Until it is measured properly -- a length sweep on a quiet machine, at the concurrency
+ * the deployment actually runs -- treat 30 as a placeholder that errs towards refusing,
+ * and set --max-text-chars explicitly for anything that matters. */
+#define QWEN_CHARS_PER_CAP_SECOND 30
 
 /* Serializes synthesis on the shared ctx. The accept loop is single-threaded today
  * (one request at a time), so this is UNCONTENDED — it's the correctness foundation
@@ -138,7 +166,12 @@ static double json_extract_number(const char *json, const char *key, double def)
 /* ── HTTP helpers ────────────────────────────────────────────────────── */
 
 /* Read full HTTP request into buffer. Returns total bytes read, or -1. */
+/* Set by read_request when the declared body exceeded the buffer. Thread-local: one
+ * connection per reader thread, and a shared flag would blame the wrong request. */
+static _Thread_local int g_req_too_large;
+
 static int read_request(int fd, char *buf, int buf_size) {
+    g_req_too_large = 0;
     int total = 0;
     int content_length = -1;
     int header_end = -1;
@@ -163,7 +196,13 @@ static int read_request(int fd, char *buf, int buf_size) {
                  * slowloris-style hold); a negative/garbage value is treated as 0. A full fix would
                  * also set a socket read timeout (SO_RCVTIMEO) at accept time — follow-up. */
                 if (content_length < 0) content_length = 0;
-                if (content_length > buf_size - 1) content_length = buf_size - 1;
+                if (content_length > buf_size - 1) {
+                    /* Do not parse a truncated body as if it were the whole request: a JSON
+                     * object cut in half parses as "missing text" and the caller is told the
+                     * wrong thing. Flag it so the router can answer 413. */
+                    g_req_too_large = 1;
+                    content_length = buf_size - 1;
+                }
             }
         }
 
@@ -208,10 +247,56 @@ static void send_json(int fd, int status, const char *json) {
     send_response(fd, status, "application/json", json, (int)strlen(json));
 }
 
-static void send_error(int fd, int status, const char *msg) {
-    char json[512];
-    snprintf(json, sizeof(json), "{\"error\":\"%s\"}", msg);
+/* Escape a message for embedding in JSON. Without this a quote or a control byte from
+ * an echoed field name breaks the envelope, and a client parsing our error gets a parse
+ * failure instead of the reason -- which is also how a caller-controlled string turns
+ * into a response-splitting primitive. Everything outside printable ASCII is escaped. */
+static void json_escape(char *dst, size_t dstsz, const char *src) {
+    size_t j = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && j + 8 < dstsz; p++) {
+        switch (*p) {
+            case '"':  if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='"';  } break;
+            case '\\': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='\\'; } break;
+            case '\n': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='n';  } break;
+            case '\r': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='r';  } break;
+            case '\t': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='t';  } break;
+            default:
+                if (*p < 0x20 || *p > 0x7e) j += (size_t)snprintf(dst + j, dstsz - j, "\\u%04x", *p);
+                else dst[j++] = (char)*p;
+        }
+    }
+    dst[j < dstsz ? j : dstsz - 1] = '\0';
+}
+
+/* The OpenAI error envelope, which is an OBJECT and not a string. Their own clients read
+ * error.message, so a flat {"error":"..."} makes the official SDKs report undefined --
+ * vLLM shipped exactly that shape and had to fix it (vllm#12886). `param` names the
+ * offending field when we know it, which is what turns a rejection into a one-line fix. */
+static const char *api_error_type(int status) {
+    if (status == 404) return "not_found_error";
+    if (status == 429) return "rate_limit_error";
+    if (status >= 500) return "api_error";
+    return "invalid_request_error";
+}
+
+static void send_api_error(int fd, int status, const char *msg, const char *param) {
+    char emsg[768], eparam[128], json[1200];
+    json_escape(emsg, sizeof(emsg), msg ? msg : "");
+    if (param && *param) {
+        json_escape(eparam, sizeof(eparam), param);
+        snprintf(json, sizeof(json),
+                 "{\"error\":{\"message\":\"%s\",\"type\":\"%s\",\"param\":\"%s\",\"code\":null}}",
+                 emsg, api_error_type(status), eparam);
+    } else {
+        snprintf(json, sizeof(json),
+                 "{\"error\":{\"message\":\"%s\",\"type\":\"%s\",\"param\":null,\"code\":null}}",
+                 emsg, api_error_type(status));
+    }
     send_json(fd, status, json);
+}
+
+static void send_error(int fd, int status, const char *msg) {
+    send_api_error(fd, status, msg, NULL);
 }
 
 /* ── Streaming response (chunked transfer encoding) ──────────────── */
@@ -224,7 +309,7 @@ typedef struct {
 
 /* ── QWEN_CANCEL_ON_DISCONNECT — stop generating for a request whose client has gone.
  * DEFAULT OFF: both arms of the A/B are then the SAME binary, and the OFF arm reproduces
- * the historical behaviour exactly. the design notes carries the register entry. */
+ * the historical behaviour exactly. docs/feature-flags.md carries the register entry. */
 static int qwen_cancel_on_disconnect(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("QWEN_CANCEL_ON_DISCONNECT"); v = (e && e[0] == '1'); }
@@ -350,18 +435,19 @@ static void *build_wav(const float *samples, int n_samples, int *out_size) {
     return wav;
 }
 
-/* ── STATO DEL SERVIZIO, condiviso fra reader e scheduler ─────────────────────
+/* ── SERVICE STATE, shared between the readers and the scheduler ──────────────
  *
- * Esiste per una ragione sola: /v1/health deve dire la VERITA'. Prima rispondeva
- * `{"status":"ok"}` statico — 200 anche con lo scheduler morto e il server che drenava
- * 503. Un bilanciatore decide da li' dove mandare il traffico, quindi una salute che
- * mente non e' un dettaglio cosmetico: e' il fondamento sbagliato sotto qualunque
- * architettura a piu' processi, e peggiora le cose invece di migliorarle.
+ * It exists for one reason: /v1/health has to tell the TRUTH. It used to answer a static
+ * `{"status":"ok"}` — 200 even with the scheduler dead and the server draining 503s. A
+ * load balancer decides where to send traffic from that answer, so health that lies is not
+ * a cosmetic detail: it is the wrong foundation under any multi-process architecture, and
+ * it makes things worse rather than better.
  *
- * Gli stessi contatori sono anche il minimo per essere diagnosticabili in produzione:
- * oggi coda e in-volo esistono solo su stderr. I nomi seguono di proposito quelli che
- * vLLM ha reso lo standard di fatto (num_requests_running / num_requests_waiting), cosi'
- * un router LLM-aware o un Prometheus li trovano dove se li aspetta. */
+ * The same counters are also the minimum needed to be diagnosable in production, where
+ * queue depth and in-flight count otherwise exist only on stderr. The names deliberately
+ * follow the ones vLLM made the de facto standard (num_requests_running /
+ * num_requests_waiting), so an LLM-aware router or a Prometheus scrape finds them where it
+ * expects them. */
 typedef struct {
     atomic_int sched_alive;      /* 0 finche' lo scheduler non e' partito, 0 se e' morto */
     atomic_int running;          /* richieste attualmente in generazione */
@@ -369,9 +455,12 @@ typedef struct {
     atomic_int admitted, done;
     atomic_int rejected_full;    /* coda piena  -> 503 */
     atomic_int rejected_stale;   /* scaduta in coda -> 503 */
+    atomic_int timed_out;        /* exceeded the wall-clock cap while in service */
     int queue_max;               /* quante possono ASPETTARE oltre quelle in esecuzione */
     int slots;                   /* --batch-size: quante ne esegue insieme */
     int queue_timeout_ms;        /* 0 = nessuna scadenza */
+    int max_request_ms;          /* 0 = no cap; enforced in sink_cancelled */
+    int max_text_chars;          /* 0 = derive it from max_request_ms */
 } server_state_t;
 
 static server_state_t g_srv;
@@ -379,10 +468,337 @@ static server_state_t g_srv;
 /* -1 = automatico (2x gli slot). Impostati da main.c prima di partire. */
 static int g_cfg_max_queue = -1;
 static int g_cfg_queue_timeout_ms = 0;
+/* Default ON. A limit that ships disabled is not a limit -- the queue deadline shipped
+ * at 0 for weeks for exactly that reason, and it is listed as an open item in its own
+ * right. 60 s is chosen from measurement, not from taste: on the long bank (~24 s of
+ * audio) the p95 request takes 41.5 s at C=8 and 32.2 s at C=6, so 60 s clears the
+ * slowest legitimate traffic measured with ~45 % of headroom while cutting the worst
+ * case from the ~11 minutes the token ceiling allows down to one minute.
+ *
+ * Raise it for deployments that legitimately synthesise several minutes in one request;
+ * 0 disables it entirely. Both are one flag away, and the effective value is printed at
+ * startup so nobody has to infer it. */
+static int g_cfg_max_request_ms = 60000;
+static int g_cfg_max_text_chars = 0;   /* 0 = derived, see srv_max_text_chars */
+
+/* ── H4/H5: the strict serving profile ───────────────────────────────────────────
+ * The CLI operator and an untrusted HTTP caller want OPPOSITE defaults, and the
+ * forgiving behaviour is right for the CLI. Under --serve the default is strict:
+ * an input the server cannot honour is REFUSED rather than silently replaced by
+ * something else. Every rule stays switchable -- QWEN_SERVER_STRICT=0 or --no-strict
+ * restores the permissive behaviour -- because a deployment may have a caller that
+ * depends on it, and finding that out through a 400 in production is not the plan.
+ *
+ * The specific bug this exists to stop already happened once on this path: an
+ * unresolvable speaker fell back to the DEFAULT voice, and the only symptom was that
+ * the server rendered a different voice from the CLI for the same request. */
+/* One rejection reason per in-flight request. Thread-local: the single-request path
+ * runs one connection per thread, and a shared buffer would report another caller's
+ * error to this one. */
+static _Thread_local char g_req_err[256];
+static int g_cfg_strict = 1;
+void qwen_tts_server_set_strict(int on) { g_cfg_strict = on ? 1 : 0; }
+static int qwen_server_strict(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN_SERVER_STRICT");
+        v = (e && *e) ? (*e != '0') : g_cfg_strict;
+    }
+    return v;
+}
+
+/* ── Well-formedness, before anything reads a field ─────────────────────────────
+ * The field extractors scan for `"key"` and do not care what surrounds it, so a body
+ * like {"text":"hi","evil"key":1} -- which is not JSON at all -- was accepted and
+ * synthesised. Anything that reaches the extractors must first BE a JSON object.
+ *
+ * A full parser is not needed and not wanted here: this validates the grammar and
+ * builds nothing, so there is no allocation for a caller to grow. Depth is bounded
+ * because unbounded nesting is a stack-exhaustion primitive against anything that
+ * later walks the document, and no legitimate request for this API nests at all.
+ *
+ * Returns 0 if `body` is a single well-formed JSON object, -1 otherwise. */
+#define QWEN_JSON_MAX_DEPTH 16
+
+static const char *js_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+static const char *js_value(const char *p, int depth, const char **why);
+
+static const char *js_string(const char *p, const char **why) {
+    if (*p != '"') { *why = "expected a string"; return NULL; }
+    p++;
+    for (;;) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == '\0') { *why = "unterminated string"; return NULL; }
+        if (ch == '"')  return p + 1;
+        if (ch < 0x20)  { *why = "control character in string"; return NULL; }
+        if (ch == '\\') {
+            p++;
+            switch (*p) {
+                case '"': case '\\': case '/': case 'b': case 'f':
+                case 'n': case 'r': case 't': p++; break;
+                case 'u':
+                    p++;
+                    for (int i = 0; i < 4; i++, p++)
+                        if (!isxdigit((unsigned char)*p)) { *why = "bad \\u escape"; return NULL; }
+                    break;
+                default: *why = "bad escape in string"; return NULL;
+            }
+            continue;
+        }
+        p++;
+    }
+}
+
+static const char *js_number(const char *p, const char **why) {
+    const char *start = p;
+    if (*p == '-') p++;
+    if (*p == '0') p++;
+    else if (isdigit((unsigned char)*p)) { while (isdigit((unsigned char)*p)) p++; }
+    else { *why = "bad number"; return NULL; }
+    if (*p == '.') { p++; if (!isdigit((unsigned char)*p)) { *why = "bad number"; return NULL; }
+                     while (isdigit((unsigned char)*p)) p++; }
+    if (*p == 'e' || *p == 'E') {
+        p++; if (*p == '+' || *p == '-') p++;
+        if (!isdigit((unsigned char)*p)) { *why = "bad exponent"; return NULL; }
+        while (isdigit((unsigned char)*p)) p++;
+    }
+    /* Reject a number so long it cannot be a real parameter: it is never a legitimate
+     * request and it is a cheap way to make a downstream converter work hard. */
+    if (p - start > 40) { *why = "number too long"; return NULL; }
+    return p;
+}
+
+static const char *js_value(const char *p, int depth, const char **why) {
+    if (depth > QWEN_JSON_MAX_DEPTH) { *why = "nesting too deep"; return NULL; }
+    p = js_ws(p);
+    switch (*p) {
+        case '"': return js_string(p, why);
+        case '{': {
+            p = js_ws(p + 1);
+            if (*p == '}') return p + 1;
+            for (;;) {
+                p = js_ws(p);
+                p = js_string(p, why); if (!p) return NULL;
+                p = js_ws(p);
+                if (*p != ':') { *why = "expected ':' after a key"; return NULL; }
+                p = js_value(p + 1, depth + 1, why); if (!p) return NULL;
+                p = js_ws(p);
+                if (*p == ',') { p++; continue; }
+                if (*p == '}') return p + 1;
+                *why = "expected ',' or '}'"; return NULL;
+            }
+        }
+        case '[': {
+            p = js_ws(p + 1);
+            if (*p == ']') return p + 1;
+            for (;;) {
+                p = js_value(p, depth + 1, why); if (!p) return NULL;
+                p = js_ws(p);
+                if (*p == ',') { p++; continue; }
+                if (*p == ']') return p + 1;
+                *why = "expected ',' or ']'"; return NULL;
+            }
+        }
+        case 't': if (!strncmp(p, "true", 4))  return p + 4; break;
+        case 'f': if (!strncmp(p, "false", 5)) return p + 5; break;
+        case 'n': if (!strncmp(p, "null", 4))  return p + 4; break;
+        default:  return js_number(p, why);
+    }
+    *why = "unexpected token";
+    return NULL;
+}
+
+static int json_validate_object(const char *body, char *err, size_t errsz) {
+    const char *why = "malformed JSON";
+    const char *p = js_ws(body ? body : "");
+    if (*p != '{') {
+        snprintf(err, errsz, "body must be a JSON object");
+        return -1;
+    }
+    p = js_value(p, 0, &why);
+    if (!p) { snprintf(err, errsz, "malformed JSON: %s", why); return -1; }
+    p = js_ws(p);
+    if (*p) { snprintf(err, errsz, "malformed JSON: trailing data after the object"); return -1; }
+    return 0;
+}
+
+/* Name the limit that ACTUALLY bound. Two different ceilings can produce the same
+ * number, and telling a caller about the wrong one sends them to change the wrong knob. */
+static void srv_text_limit_reason(char *err, size_t errsz, size_t got, int lim) {
+    long by_prompt = (long)qwen_tts_batch_max_prompt() * 7 / 2;
+    long by_time   = (g_srv.max_request_ms > 0)
+                   ? (long)(g_srv.max_request_ms / 1000) * QWEN_CHARS_PER_CAP_SECOND : -1;
+    if (lim >= MAX_TTS_TEXT)
+        snprintf(err, errsz, "text too long: %zu characters, maximum %d", got, lim);
+    else if (by_time >= 0 && by_time < by_prompt)
+        snprintf(err, errsz, "text too long: %zu characters, maximum %d - that is what this "
+                             "server can finish within its %.0f s generation limit "
+                             "(--max-request-seconds)", got, lim, g_srv.max_request_ms / 1000.0);
+    else
+        snprintf(err, errsz, "text too long: %zu characters, maximum %d - a longer prompt does "
+                             "not fit a batch slot's %d-token budget (QWEN_BATCH_MAX_PROMPT)",
+                 got, lim, qwen_tts_batch_max_prompt());
+}
+
+/* ── H4: reject a request that names a field this server does not implement ──────
+ * A silently ignored field is a caller bug that never surfaces: the client believes it
+ * asked for something, the server never did it, and both sides think they agree. The
+ * list is derived from the fields the parsers actually read, so it cannot drift away
+ * from the implementation without this check failing first.
+ *
+ * Only the TOP LEVEL is walked, and only in strict mode. Nested objects belong to a
+ * schema this server does not define. */
+/* The OpenAI speech API's own fields come first, because a client written against it
+ * must work here unchanged: input, model, voice, response_format, speed, instructions,
+ * stream_format. The rest are this engine's extensions, and the two spellings of the
+ * same idea are both accepted rather than one of them silently ignored --
+ * speed/rate and instructions/instruct. */
+static const char *const g_known_fields[] = {
+    /* OpenAI speech API */
+    "input", "model", "voice", "response_format", "speed", "instructions",
+    "stream_format", "stream",
+    /* engine extensions */
+    "chunk_frames", "emotion", "instruct", "language", "max_new_tokens", "rate",
+    "rep_penalty", "seed", "speaker", "temperature", "text", "top_k", "top_p",
+    "voice_design", "volume", NULL
+};
+
+/* response_format: this engine emits PCM only. Accepting "mp3" and quietly returning a
+ * WAV would be the same silent substitution as the speaker fallback -- the caller would
+ * hand our bytes to an mp3 decoder and get noise. Refused by name, with the list. */
+static int check_response_format(const char *body, char *err, size_t errsz) {
+    char *f = json_extract_string(body, "response_format");
+    if (!f) return 0;
+    int ok = !strcasecmp(f, "wav") || !strcasecmp(f, "pcm");
+    if (!ok) snprintf(err, errsz, "response_format '%.16s' is not supported - this server "
+                                  "emits 'wav' (default) or 'pcm'", f);
+    free(f);
+    return ok ? 0 : -1;
+}
+
+static int reject_unknown_fields(const char *body, char *err, size_t errsz) {
+    if (!qwen_server_strict() || !body) return 0;
+    int depth = 0, in_str = 0, esc = 0;
+    const char *p = body;
+    for (; *p; p++) {
+        if (esc) { esc = 0; continue; }
+        if (in_str) {
+            if (*p == '\\') { esc = 1; continue; }
+            if (*p == '"') { in_str = 0; }
+            continue;
+        }
+        if (*p == '"') {
+            const char *k = p + 1;
+            in_str = 1;
+            if (depth != 1) continue;
+            /* a key is a string at depth 1 followed by ':' */
+            const char *q = k; int e2 = 0;
+            while (*q && (e2 || *q != '"')) { e2 = (!e2 && *q == '\\'); q++; }
+            if (*q != '"') continue;
+            const char *c = q + 1;
+            while (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') c++;
+            if (*c != ':') continue;
+            size_t klen = (size_t)(q - k);
+            int known = 0;
+            for (int i = 0; g_known_fields[i]; i++)
+                if (strlen(g_known_fields[i]) == klen && !strncmp(g_known_fields[i], k, klen)) { known = 1; break; }
+            if (!known) {
+                snprintf(err, errsz, "unknown field '%.*s' - this server implements: "
+                                     "text, speaker, language, seed, temperature, top_k, "
+                                     "top_p, rep_penalty, instruct, emotion, volume, rate",
+                         (int)(klen > 48 ? 48 : klen), k);
+                return -1;
+            }
+            p = q; in_str = 0;
+            continue;
+        }
+        if (*p == '{' || *p == '[') depth++;
+        else if (*p == '}' || *p == ']') depth--;
+    }
+    return 0;
+}
+
+/* Resolve a requested speaker. Returns 0 on success. On failure in strict mode it
+ * fills `err` with a message that tells the caller what to fix -- the valid names are
+ * already public on /v1/speakers, so naming them costs nothing and saves a round trip. */
+static int resolve_speaker_checked(qwen_tts_ctx_t *ctx, const char *name, int *out_id,
+                                   char *err, size_t errsz) {
+    int sid = qwen_tts_resolve_speaker(ctx, name);
+    if (sid >= 0) { *out_id = sid; return 0; }
+    if (qwen_server_strict()) {
+        snprintf(err, errsz, "unknown speaker '%.64s' for this model - see /v1/speakers "
+                             "for the names this checkpoint declares", name);
+        return -1;
+    }
+    fprintf(stderr, "[server] unknown speaker '%s' - falling back to the default voice "
+                    "(strict mode would refuse this)\n", name);
+    return 0;
+}
 
 void qwen_tts_server_set_limits(int max_queue, int queue_timeout_ms) {
     g_cfg_max_queue = max_queue;
     g_cfg_queue_timeout_ms = queue_timeout_ms;
+}
+
+/* ── H1: a wall-clock ceiling on time IN SERVICE, per request ────────────────────
+ * The only bound today is the token cap, and at 12.5 Hz that is ~11 minutes of audio.
+ * With 6-8 slots, one caller sending an enormous text holds a channel that far, which
+ * is a denial of service that needs no malice. This bounds it.
+ *
+ * It is deliberately measured from ADMISSION, not from arrival: queue time is already
+ * bounded separately by queue_timeout_ms, and charging a request for the queue it did
+ * not cause would make the two limits interact in a way nobody could reason about.
+ *
+ * 0 disables. Env QWEN_MAX_REQUEST_S overrides the CLI so a running deployment can be
+ * bounded without a rebuild. */
+void qwen_tts_server_set_max_request_ms(int ms) { g_cfg_max_request_ms = ms; }
+void qwen_tts_server_set_max_text_chars(int chars) { g_cfg_max_text_chars = chars; }
+
+/* Resolve the cap ONCE, for every serving mode. It used to be resolved inside the batched
+ * scheduler's setup, which meant `--serve` without a batch size ran with no cap at all and
+ * said nothing about it -- a safety limit that silently does not apply in one mode is the
+ * failure this project keeps meeting, so it is initialised where every mode passes. */
+/* Effective text ceiling: the smaller of the hard buffer limit and what the generation
+ * cap can actually finish. With the cap disabled only the hard limit applies. */
+static int srv_max_text_chars(void) {
+    if (g_srv.max_text_chars > 0) return g_srv.max_text_chars;
+    /* Structural first: a prompt longer than a batch slot's budget CANNOT be served, and
+     * that limit is a token count, not a rate. Measured on this tokenizer, 4000 characters
+     * of ordinary prose became 846 text tokens (~4.7 chars/token); 3.5 is used instead so
+     * the edge refuses slightly early rather than letting a request through to be rejected
+     * at admission. This replaces the earlier derivation from the generation cap, whose
+     * rate was never measured cleanly. */
+    long by_prompt = (long)qwen_tts_batch_max_prompt() * 7 / 2;
+    long lim = by_prompt;
+    /* Then the time budget, if it binds sooner. Kept deliberately generous because its
+     * rate is still unmeasured: it must not be the limit that fires in normal use. */
+    if (g_srv.max_request_ms > 0) {
+        long by_time = (long)(g_srv.max_request_ms / 1000) * QWEN_CHARS_PER_CAP_SECOND;
+        if (by_time < lim) lim = by_time;
+    }
+    if (lim < 200)          lim = 200;          /* never refuse a normal sentence */
+    if (lim > MAX_TTS_TEXT) lim = MAX_TTS_TEXT;
+    return (int)lim;
+}
+
+static void srv_init_request_cap(void) {
+    g_srv.max_request_ms = g_cfg_max_request_ms;
+    const char *e = getenv("QWEN_MAX_REQUEST_S");
+    if (e && *e) { double v = atof(e); if (v >= 0) g_srv.max_request_ms = (int)(v * 1000.0); }
+    g_srv.max_text_chars = g_cfg_max_text_chars;
+    { const char *e = getenv("QWEN_MAX_TEXT_CHARS");
+      if (e && *e) { int v = atoi(e); if (v > 0) g_srv.max_text_chars = v; } }
+    if (g_srv.max_request_ms > 0)
+        fprintf(stderr, "[serve] per-request generation cap: %.0f s -> text limit %d characters "
+                        "(--max-request-seconds N / --max-text-chars N; 0 disables the cap)\n",
+                g_srv.max_request_ms / 1000.0, srv_max_text_chars());
+    else
+        fprintf(stderr, "[serve] per-request generation cap: DISABLED - one caller can hold a "
+                        "slot for as long as the token ceiling allows; text limit %d characters\n",
+                srv_max_text_chars());
 }
 
 /* ── Request handlers ────────────────────────────────────────────────── */
@@ -396,16 +812,20 @@ static void handle_health(int fd) {
     snprintf(json, sizeof(json),
              "{\"status\":\"%s\",\"scheduler\":\"%s\","
              "\"num_requests_running\":%d,\"num_requests_waiting\":%d,"
-             "\"queue_max\":%d,\"queue_timeout_ms\":%d,"
+             "\"queue_max\":%d,\"queue_timeout_ms\":%d,\"max_request_ms\":%d,"
+             "\"max_text_chars\":%d,"
              "\"admitted\":%d,\"done\":%d,"
-             "\"rejected_queue_full\":%d,\"rejected_queue_timeout\":%d}",
+             "\"rejected_queue_full\":%d,\"rejected_queue_timeout\":%d,"
+             "\"timed_out\":%d}",
              alive ? "ok" : "unavailable", alive ? "running" : "down",
              atomic_load(&g_srv.running), waiting,
-             g_srv.queue_max, g_srv.queue_timeout_ms,
+             g_srv.queue_max, g_srv.queue_timeout_ms, g_srv.max_request_ms,
+             srv_max_text_chars(),
              atomic_load(&g_srv.admitted), atomic_load(&g_srv.done),
-             atomic_load(&g_srv.rejected_full), atomic_load(&g_srv.rejected_stale));
-    /* 503 quando lo scheduler non c'e': e' il segnale con cui un bilanciatore toglie
-     * questo backend dalla rotazione invece di continuare a mandargli chiamate. */
+             atomic_load(&g_srv.rejected_full), atomic_load(&g_srv.rejected_stale),
+             atomic_load(&g_srv.timed_out));
+    /* 503 when the scheduler is gone: that is the signal a load balancer uses to take
+     * this backend out of rotation instead of continuing to send it calls. */
     send_json(fd, alive ? 200 : 503, json);
 }
 
@@ -475,7 +895,18 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
         free(text);
         return NULL;
     }
-    if (strlen(text) > MAX_TTS_TEXT) {   /* reject oversized input (DoS / OOM guard) */
+    if (json_validate_object(body, g_req_err, sizeof(g_req_err))) { free(text); return NULL; }
+    if (reject_unknown_fields(body, g_req_err, sizeof(g_req_err))) { free(text); return NULL; }
+    if (check_response_format(body, g_req_err, sizeof(g_req_err))) { free(text); return NULL; }
+    { double sp = json_extract_number(body, "speed", 1.0);
+      if (sp < 0.25 || sp > 4.0) {
+          snprintf(g_req_err, sizeof(g_req_err),
+                   "speed %.3g out of range - allowed 0.25 to 4.0", sp);
+          free(text); return NULL;
+      } }
+    if ((int)strlen(text) > srv_max_text_chars()) {
+        int lim = srv_max_text_chars();
+        srv_text_limit_reason(g_req_err, sizeof(g_req_err), strlen(text), lim);
         free(text);
         return NULL;
     }
@@ -485,16 +916,16 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     if (speaker) {
         /* qwen_tts_resolve_speaker, NOT qwen_tts_speaker_id: the latter knows only the 9
          * hardcoded CustomVoice presets and returns -1 for every voice of a finetuned
-         * pool — and -1 was then silently dropped, so a request for "a pool voice" was
-         * served by the DEFAULT slot. Measured 2026-08-17: 98% language identity from the CLI vs
+         * pool — and -1 was then silently dropped, so a request for a pool voice was
+         * served by the DEFAULT slot. Measured: 98% language identity from the CLI vs
          * 14.5% from the server, same model/text/seed, because the server was rendering
          * a different voice. Same class of silent failure as PLAN fact F9, on the
          * serving path, where nobody had looked. */
-        int sid = qwen_tts_resolve_speaker(ctx, speaker);
-        if (sid >= 0) ctx->speaker_id = sid;
-        else fprintf(stderr, "[server] unknown speaker '%s' — falling back to the default "
-                             "voice (this is almost never what you want)\n", speaker);
+        int sid = ctx->speaker_id;
+        int bad = resolve_speaker_checked(ctx, speaker, &sid, g_req_err, sizeof(g_req_err));
         free(speaker);
+        if (bad) { free(text); return NULL; }
+        ctx->speaker_id = sid;
     }
 
     char *language = json_extract_string(body, "language");  /* kept for the emotion resolver below */
@@ -506,6 +937,8 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     /* Instruct (1.7B only) */
     free(ctx->instruct);
     ctx->instruct = json_extract_string(body, "instruct");
+    /* OpenAI calls it "instructions". Same field, both spellings honoured. */
+    if (!ctx->instruct) ctx->instruct = json_extract_string(body, "instructions");
 
     /* Voice design mode */
     char *vd = json_extract_string(body, "voice_design");
@@ -559,7 +992,11 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     int vol_present  = strstr(body, "\"volume\"") != NULL;
     int rate_present = strstr(body, "\"rate\"") != NULL;
     float req_vol  = (float)json_extract_number(body, "volume", 1.0);
-    float req_rate = (float)json_extract_number(body, "rate", 1.0);
+    /* OpenAI calls it "speed", range 0.25-4.0. Same meaning as our "rate": whichever
+     * the caller sent is used, and an out-of-range value is refused rather than clamped
+     * in silence, because a clamp makes the caller believe it got what it asked for. */
+    float req_rate = (float)json_extract_number(body, "rate",
+                          json_extract_number(body, "speed", 1.0));
     char *emotion = json_extract_string(body, "emotion");
     if (emotion && emotion[0]) {
         qwen_tts_apply_emotion(ctx, emotion, language,
@@ -585,9 +1022,12 @@ static double server_time_ms(void) {
 
 static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     float volume = 1.0f, rate = 1.0f;
+    g_req_err[0] = '\0';
     char *text = parse_tts_request(ctx, body, &volume, &rate);
     if (!text) {
-        send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)");
+        send_error(fd, 400, g_req_err[0] ? g_req_err
+                                         : "missing, empty, or oversized 'text' (max "
+                                           QWEN_STR(MAX_TTS_TEXT) " characters)");
         return;
     }
     if (ctx->voice_design && ctx->config.hidden_size < 2048) {
@@ -661,7 +1101,9 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     char *text = parse_tts_request(ctx, body, &volume, &rate);
     (void)rate;  /* pitch-preserving tempo isn't applied on the streaming path (needs full buffer) */
     if (!text) {
-        send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)");
+        send_error(fd, 400, g_req_err[0] ? g_req_err
+                                         : "missing, empty, or oversized 'text' (max "
+                                           QWEN_STR(MAX_TTS_TEXT) " characters)");
         return;
     }
     if (ctx->voice_design && ctx->config.hidden_size < 2048) {
@@ -737,6 +1179,68 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
  * independent clone, so there is no shared mutable state EXCEPT the kernel
  * thread pool: when that backend is not concurrent-safe, g_serialize_synth is
  * set and the synthesis dispatch is wrapped in g_synth_lock. */
+/* ── HTTP hygiene, shared by both routers ───────────────────────────────────────────
+ * This server does one thing: JSON in, audio out. Everything else is refused with the
+ * status that says WHY, because a caller that gets 404 for a wrong method, or "missing
+ * text" for a form upload, has been told nothing it can act on.
+ *
+ * Refused here: any method other than the one a path implements (405, with Allow), any
+ * body that is not JSON -- form encodings, multipart uploads, raw text -- (415), a body
+ * too large for the read buffer (413), and anything that is not a JSON object (400).
+ *
+ * Returns 1 when it has already answered and the caller must stop. */
+static int http_precheck(int fd, const char *method, const char *path,
+                         const char *headers, const char *body) {
+    struct { const char *path; const char *allow; } ROUTES[] = {
+        { "/v1/health",       "GET"  }, { "/v1/speakers",    "GET"  },
+        { "/v1/tts",          "POST" }, { "/v1/tts/stream",  "POST" },
+        { "/v1/audio/speech", "POST" },
+    };
+    const char *allow = NULL;
+    for (size_t i = 0; i < sizeof(ROUTES)/sizeof(ROUTES[0]); i++)
+        if (!strcmp(path, ROUTES[i].path)) { allow = ROUTES[i].allow; break; }
+    if (!allow) return 0;                       /* unknown path: the router answers 404 */
+    if (strcmp(method, allow) != 0) {
+        /* One response path, the one already proven to work. The Allow header is what
+         * makes 405 actionable, so it is stated in the message too rather than lost. */
+        char m[96];
+        snprintf(m, sizeof(m), "method not allowed - %s takes %s", path, allow);
+        send_error(fd, 405, m);
+        return 1;
+    }
+    if (strcmp(allow, "POST") != 0) return 0;   /* GET endpoints take no body */
+
+    if (g_req_too_large) {
+        send_error(fd, 413, "request body too large");
+        return 1;
+    }
+    /* Content-Type: only JSON. Naming the offending type is what turns a rejection into
+     * something the caller can fix in one edit. */
+    const char *ct = headers ? strcasestr(headers, "Content-Type:") : NULL;
+    if (ct) {
+        ct += strlen("Content-Type:");
+        while (*ct == ' ' || *ct == '\t') ct++;
+        if (!strcasestr(ct, "application/json") ||
+            (size_t)(strcspn(ct, "\r\n")) == 0) {
+            char m[200]; int n = (int)strcspn(ct, ";\r\n");
+            if (n > 80) n = 80;
+            snprintf(m, sizeof(m), "unsupported Content-Type '%.*s' - this endpoint takes "
+                                   "application/json only (no form data, no multipart, "
+                                   "no file upload)", n, ct);
+            send_error(fd, 415, m);
+            return 1;
+        }
+    }
+    const char *b = body ? body : "";
+    while (*b == ' ' || *b == '\t' || *b == '\r' || *b == '\n') b++;
+    if (*b != '{') {
+        send_error(fd, 400, *b ? "body is not a JSON object"
+                               : "empty body - expected a JSON object");
+        return 1;
+    }
+    return 0;
+}
+
 static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
                               struct sockaddr_in client_addr) {
     char *buf = (char *)malloc(1024 * 1024); /* 1MB max request */
@@ -759,6 +1263,10 @@ static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
     fprintf(stderr, "[HTTP] %s %s %s from %s\n", method, path,
             (strcmp(method, "POST") == 0 && body[0]) ? "(has body)" : "", client_ip);
+
+    if (strcmp(method, "OPTIONS") != 0 && http_precheck(client_fd, method, path, buf, body)) {
+        free(buf); srv_conn_close(client_fd); return;
+    }
 
     /* Handle CORS preflight */
     if (strcmp(method, "OPTIONS") == 0) {
@@ -996,9 +1504,9 @@ static void install_signal_handlers(void) {
 }
 
 static void print_banner(int port, int n_workers) {
-    /* Provenienza in cima al log del server: quando un banco raccoglie lo stderr, la
-     * prima riga dell'artefatto dice DA QUALE binario e con QUALI flag sono usciti i
-     * numeri. Senza, due corse non sono confrontabili e non c'e' modo di scoprirlo dopo. */
+    /* Provenance at the top of the server log: when a harness collects stderr, the first
+     * line of the artifact says WHICH binary and WHICH flags the numbers came from. Without
+     * it two runs are not comparable, and there is no way to find that out afterwards. */
     qwen_provenance_report(stderr);
     fprintf(stderr, "Server listening on http://0.0.0.0:%d", port);
     if (n_workers > 1)
@@ -1064,6 +1572,7 @@ typedef struct batch_job {
      * on_done() is the last thing the driver's finalisation does (qwen_tts.h:900-905). */
     int client_gone;              /* set once by the HTTP layer, read by sink_cancelled */
     int cancelled;                /* the driver dropped this slot: CANCELLED != COMPLETED */
+    int timed_out;                /* H1: exceeded the wall-clock cap while in service */
     double t_abort_detected;      /* when the server first observed the disconnect */
     double t_cancel_stop;         /* when the driver actually released the slot */
     struct batch_job *next;
@@ -1103,33 +1612,32 @@ static void jq_init(job_queue_t *q) {
     pthread_mutex_init(&q->mtx, NULL);
     pthread_cond_init(&q->not_empty, NULL);
 }
-/* Ritorna 1 se accodata, 0 se la coda e' PIENA (il chiamante deve rifiutare).
+/* Returns 1 if queued, 0 if the queue is FULL (the caller must refuse).
  *
- * ⚠️ PERCHE' UN TETTO. Prima questa coda era illimitata: la quarta richiesta veniva
- * accodata e il client aspettava all'infinito — nessun 503, nessuna scadenza. Non e' un
- * problema di prestazioni, e' un problema di CONTRATTO: il sovraccarico si manifestava
- * come silenzio, e un cliente sa gestire un rifiuto ma non sa gestire un servizio che non
- * risponde mai. E' anche lo stesso buco che vLLM ha ancora aperto (issue #18826: "la coda
- * puo' crescere indefinitamente... fino a OOM").
+ * WHY THERE IS A CAP. This queue used to be unbounded: the fourth request was queued and
+ * the client waited forever — no 503, no deadline. That is not a performance problem, it is
+ * a CONTRACT problem: overload showed up as silence, and a caller can handle a refusal but
+ * cannot handle a service that never answers. It is the same hole vLLM still has open
+ * (issue #18826: "the queue can grow indefinitely... until OOM").
  *
- * Il tetto NON e' pensato per rifiutare in condizioni normali: e' 2x gli slot, cioe' al
- * massimo due tempi di generazione di attesa. Una coda piu' lunga non "assorbe un picco",
- * accumula un arretrato che nessuno vuole piu' quando lo servi. */
+ * The cap is NOT meant to refuse under normal conditions: it is 2x the slots, that is, at
+ * most two generation times of waiting. A longer queue does not "absorb a spike", it
+ * accumulates a backlog nobody wants any more by the time you serve it. */
 static int jq_push(job_queue_t *q, batch_job_t *j) {
     j->next = NULL;
     j->enq_ms = srv_now_ms();
     if (getenv("QWEN_TTFA_TRACE"))
         qwen_admit_probe_read(&j->enq_adm_seq, &j->enq_adm_ts, &j->enq_last_iter_ms);
     pthread_mutex_lock(&q->mtx);
-    /* ⚠️ IL TETTO E' SUL TOTALE NEL SISTEMA, NON SULLA LUNGHEZZA DELLA CODA.
-     * `cap` e' quante possono ASPETTARE oltre quelle in esecuzione, quindi la condizione e'
-     *      in_esecuzione + in_attesa < slot + cap
-     * La prima versione confrontava solo `count >= cap` ed era rotta nel caso che contava di
-     * piu': la coda e' l'UNICA strada per entrare nello scheduler — anche a macchina scarica
-     * una richiesta ci passa e lo scheduler la preleva — quindi con cap=0 la condizione era
-     * sempre vera e NIENTE entrava mai. Misurato il 2026-08-20: `--max-queue 0` ha rifiutato
-     * 56 richieste su 56, zero servite. Il test l'ha preso al primo colpo, che e' esattamente
-     * perche' esiste. */
+    /* THE CAP IS ON THE TOTAL IN THE SYSTEM, NOT ON THE QUEUE LENGTH.
+     * `cap` is how many may WAIT beyond those running, so the condition is
+     *      running + waiting < slots + cap
+     * The first version compared only `count >= cap` and was broken in the case that
+     * mattered most: the queue is the ONLY way into the scheduler — even on an idle machine
+     * a request passes through it and the scheduler picks it up — so with cap=0 the
+     * condition was always true and NOTHING ever got in. Measured: `--max-queue 0` refused
+     * 56 requests out of 56 and served none. The test caught it on the first run, which is
+     * exactly why it exists. */
     if (q->cap >= 0 && atomic_load(&g_srv.running) + q->count >= g_srv.slots + q->cap) {
         pthread_mutex_unlock(&q->mtx); return 0;
     }
@@ -1182,11 +1690,29 @@ static void job_free(batch_job_t *j) {
  * malloc'd text or NULL on bad/oversized input. */
 static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_language_id,
                              const char *body,
-                             qwen_batch_req_t *req, int *needs_single) {
+                             qwen_batch_req_t *req, int *needs_single,
+                             char *err, size_t errsz) {
+    if (err && errsz) err[0] = '\0';
     *needs_single = 0;
     char *text = json_extract_string(body, "text");
     if (!text) text = json_extract_string(body, "input");
-    if (!text || text[0] == '\0' || strlen(text) > MAX_TTS_TEXT) { free(text); return NULL; }
+    if (json_validate_object(body, err, errsz)) { free(text); return NULL; }
+    if (reject_unknown_fields(body, err, errsz)) { free(text); return NULL; }
+    if (check_response_format(body, err, errsz)) { free(text); return NULL; }
+    { double sp = json_extract_number(body, "speed", 1.0);
+      if (sp < 0.25 || sp > 4.0) {
+          snprintf(err, errsz, "speed %.3g out of range - allowed 0.25 to 4.0", sp);
+          free(text); return NULL;
+      } }
+    if (!text || text[0] == '\0') {
+        snprintf(err, errsz, "missing or empty 'text'");
+        free(text); return NULL;
+    }
+    if ((int)strlen(text) > srv_max_text_chars()) {
+        int lim = srv_max_text_chars();
+        srv_text_limit_reason(err, errsz, strlen(text), lim);
+        free(text); return NULL;
+    }
 
     /* defaults (mirror reset_request_state). audit #5: use the start-of-server snapshot,
      * NOT live ctx->speaker_id/language_id which the scheduler mutates per admission. */
@@ -1203,11 +1729,11 @@ static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_la
      * voices through the model's own table, or every batched request is served by the
      * default slot without a word in the log. */
     if (speaker) {
-        int sid = qwen_tts_resolve_speaker(ctx, speaker);
-        if (sid >= 0) req->speaker_id = sid;
-        else fprintf(stderr, "[server] unknown speaker '%s' — falling back to the default "
-                             "voice (this is almost never what you want)\n", speaker);
+        int sid = req->speaker_id;
+        int bad = resolve_speaker_checked(ctx, speaker, &sid, err, errsz);
         free(speaker);
+        if (bad) { free(text); return NULL; }
+        req->speaker_id = sid;
     }
     char *language = json_extract_string(body, "language");
     if (language) { int lid = qwen_tts_language_id(language); if (lid >= 0) req->language_id = lid; free(language); }
@@ -1264,6 +1790,9 @@ static void *reader_main(void *arg) {
         const char *body = strstr(buf, "\r\n\r\n");
         body = body ? body + 4 : "";
 
+        if (strcmp(method, "OPTIONS") != 0 && http_precheck(fd, method, path, buf, body)) {
+            srv_conn_close(fd); free(buf); continue;
+        }
         if (strcmp(method, "OPTIONS") == 0) {
             const char *cors = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
                 "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
@@ -1281,8 +1810,14 @@ static void *reader_main(void *arg) {
             batch_job_t *j = (batch_job_t *)calloc(1, sizeof(batch_job_t));
             j->fd = fd;
             int needs_single = 0;
-            char *text = parse_batch_req(ra->ctx, ra->def_speaker_id, ra->def_language_id, body, &j->req, &needs_single);
-            if (!text) { send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)"); srv_conn_close(fd); free(j); free(buf); continue; }
+            char rerr[256] = {0};
+            char *text = parse_batch_req(ra->ctx, ra->def_speaker_id, ra->def_language_id, body, &j->req, &needs_single, rerr, sizeof(rerr));
+            if (!text) {
+                send_error(fd, 400, rerr[0] ? rerr
+                                            : "missing, empty, or oversized 'text' (max "
+                                              QWEN_STR(MAX_TTS_TEXT) " characters)");
+                srv_conn_close(fd); free(j); free(buf); continue;
+            }
             if (needs_single) {
                 /* instruct / voice_design can't batch → dedicated worker (clone ctx) */
                 j->kind = JOB_SINGLE; j->is_stream = is_stream;
@@ -1326,11 +1861,11 @@ typedef struct {
 static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block) {
     sink_ctx_t *sc = (sink_ctx_t *)ud;
     batch_job_t *j;
-    /* SCADENZA DI ATTESA. Una richiesta che ha aspettato oltre il budget non verra' mai
-     * servita in tempo: consegnarle audio in ritardo e' peggio che dirle di no, perche'
-     * intanto ha occupato uno slot che sarebbe servito a una richiesta ancora viva. E' la
-     * stessa idea della "viabilita' binaria" dello streaming applicata all'AMMISSIONE:
-     * sotto la soglia il servizio e' buono, sopra non serve a nessuno. */
+    /* WAIT DEADLINE. A request that has waited beyond the budget will never be served in
+     * time: delivering it late audio is worse than telling it no, because meanwhile it has
+     * occupied a slot that would have served a request still worth serving. It is the same
+     * binary-viability idea streaming uses, applied to ADMISSION: below the threshold the
+     * service is good, above it is of no use to anyone. */
     for (;;) {
         j = block ? jq_pop(sc->jq) : jq_trypop(sc->jq);
         if (!j) return 0;                 /* none / shutdown */
@@ -1400,7 +1935,21 @@ static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
 static int sink_cancelled(void *ud, void *tag) {
     (void)ud;
     batch_job_t *j = (batch_job_t *)tag;
-    if (!j || !qwen_cancel_on_disconnect()) return 0;
+    if (!j) return 0;
+    /* H1. Checked BEFORE the disconnect gate and independently of it: a client that
+     * waits patiently is exactly the case this bounds, and cancel-on-disconnect being
+     * off must not disable it. Stopping one slot is the same mechanism cancellation
+     * uses, whose K4 gate proves the other rows of the batch stay byte-identical. */
+    if (!j->timed_out && g_srv.max_request_ms > 0 && j->t_admit > 0.0 &&
+        srv_now_ms() - j->t_admit > (double)g_srv.max_request_ms) {
+        j->timed_out = 1;
+        if (j->t_cancel_stop == 0.0) j->t_cancel_stop = srv_now_ms();
+        atomic_fetch_add(&g_srv.timed_out, 1);
+        fprintf(stderr, "[server] request seed=%u exceeded the %d ms service cap - stopping it\n",
+                j->life_seed, g_srv.max_request_ms);
+    }
+    if (j->timed_out) return 1;
+    if (!qwen_cancel_on_disconnect()) return 0;
     if (!j->client_gone && j->fd >= 0 && peer_hung_up(j->fd)) {
         j->client_gone = 1; j->t_abort_detected = srv_now_ms();
     }
@@ -1454,7 +2003,33 @@ static void qwen_life_emit(batch_job_t *j) {
             j->t_first  - j->t_admit,    /* engine start to first audio byte        */
             d - j->t_admit,              /* service                                 */
             d - j->t_recv,               /* worker-side total                       */
+            j->timed_out ? " state=TIMEOUT" :
             j->client_gone ? " state=CANCELLED" : " state=COMPLETED");
+}
+
+/* on_reject: the driver could not admit this request. Previously this arrived as
+ * on_done(NULL,0) and the HTTP layer answered 500 "generation failed" -- a refusal
+ * reported as an internal error, with nothing the caller could act on. */
+static void sink_on_reject(void *ud, void *tag, const char *reason) {
+    sink_ctx_t *sc = (sink_ctx_t *)ud;
+    batch_job_t *j = (batch_job_t *)tag;
+    char m[220];
+    /* The character figure must come from the budget that REFUSED this request, not from
+     * whatever text limit happens to be configured -- quoting the latter told a caller
+     * "about 8192 characters" while refusing 4000. */
+    snprintf(m, sizeof(m),
+             "%s - this server accepts at most %d prompt tokens per request "
+             "(roughly %ld characters); split the text or raise QWEN_BATCH_MAX_PROMPT",
+             reason ? reason : "request rejected",
+             qwen_tts_batch_max_prompt(), (long)qwen_tts_batch_max_prompt() * 7 / 2);
+    if (j->is_stream && j->header_sent) send_chunked_end(j->fd);
+    else send_api_error(j->fd, 400, m, "text");
+    fprintf(stderr, "[server] rejected seed=%u: %s\n", j->life_seed, reason ? reason : "?");
+    srv_conn_close(j->fd);
+    job_free(j);
+    sc->done++;
+    atomic_fetch_add(&g_srv.done, 1);
+    atomic_fetch_sub(&g_srv.running, 1);
 }
 
 /* on_done: finish this request + close its connection. Streaming → chunked end;
@@ -1466,6 +2041,16 @@ static void sink_on_done(void *ud, void *tag, float *samples, int n_samples) {
     if (j->is_stream) {
         if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
         send_chunked_end(j->fd);
+    } else if (j->timed_out && (!samples || n_samples <= 0)) {
+        /* A timeout that produced nothing is not "generation failed": the caller can act
+         * on the difference. 503 rather than 5xx-generic, and the cap is named so the
+         * fix -- shorter text, or a longer cap agreed with the operator -- is obvious. */
+        char m[160];
+        snprintf(m, sizeof(m),
+                 "request exceeded the server's %d ms generation limit and was stopped",
+                 g_srv.max_request_ms);
+        send_error(j->fd, 503, m);
+        free(samples);
     } else {
         respond_wav(j->fd, samples, n_samples);
         free(samples);
@@ -1494,12 +2079,13 @@ static void *scheduler_main(void *arg) {
         .ud = &sc, .next_job = sink_next_job, .on_done = sink_on_done,
         .on_chunk = sink_on_chunk, .running = sink_running,
         .cancelled = sink_cancelled,
+        .on_reject = sink_on_reject,
     };
     atomic_store(&g_srv.sched_alive, 1);
     int rc = qwen_tts_serve_continuous(sa->ctx, sa->max_batch, &sink);
-    /* Da qui in poi /v1/health deve dire la verita': o e' uno spegnimento ordinato, o lo
-     * scheduler e' morto — in entrambi i casi questo backend non serve piu' richieste, e
-     * un bilanciatore lo deve sapere PRIMA di mandargliene un'altra. */
+    /* From here on /v1/health has to tell the truth: either this is an orderly shutdown or
+     * the scheduler is dead — in both cases this backend serves no more requests, and a load
+     * balancer needs to know BEFORE sending it another one. */
     atomic_store(&g_srv.sched_alive, 0);
     /* audit MED-1: if the batch driver died (alloc failure / no bf16 weights) while the
      * server is still up, readers keep queueing JOB_BATCH into an unbounded queue nobody
@@ -1572,7 +2158,7 @@ static void *single_worker_main(void *arg) {
  * WHY DEFAULT-ON HERE AND NOWHERE ELSE. Turning them on changes the generated audio —
  * the prompt's KV is computed with int8 weights, and that KV conditions everything
  * after it — so this is a product decision, not a build-time default. It was taken by
- * ear on 2026-08-18 ("audio perfetti") and it applies where the memory is money: a
+ * ear on 2026-08-18 (judged clean) and it applies where the memory is money: a
  * rented box, where RSS decides how many instances fit. The CLI keeps the old
  * behaviour so `make test-golden` stays a stable reference rather than becoming a
  * moving one.
@@ -1580,20 +2166,20 @@ static void *single_worker_main(void *arg) {
  * setenv with overwrite=0: an explicit QWEN_PREFILL_QUANT=0 from the operator still
  * wins. And it runs BEFORE the pre-warm, whose first prefill is what triggers the
  * release. */
-/* Il decoder batchato fra slot: acceso di default sul server, e SOLO lui.
+/* The cross-slot batched decoder: on by default on the server, and only there.
  *
- * Batchare il decoder ha migliorato entrambe le colonne insieme — a c=4 throughput
- * +8,1% e TTFA p50 -8,9%, p95 -6,1% — che nella giornata e' stata l'unica modifica
- * senza compromesso da dichiarare. E l'audio non si muove: 81 campioni su 161280
- * differiscono di UN LSB su 32768, correlazione 1.00000000, e l'ascolto dell'utente
- * (2026-08-18) ha promosso entrambi i bracci come indistinguibili.
+ * Batching the decoder improved both columns at once — at c=4, throughput +8.1 % and
+ * first-audio p50 -8.9 %, p95 -6.1 % — which made it the only change that day with no
+ * trade-off to declare. And the audio does not move: 81 samples out of 161,280 differ by
+ * ONE LSB in 32768, correlation 1.00000000, and a listening pass judged both arms
+ * indistinguishable.
  *
- * Sul server e basta, perche' con uno slot solo non c'e' niente da batchare: la CLI
- * non guadagnerebbe nulla e il golden resta un riferimento fermo.
+ * On the server only, because with a single slot there is nothing to batch: the CLI would
+ * gain nothing and the golden reference stays still.
  *
- * ⚠️ Il THREAD decoder (QWEN_DECODER_THREAD) NON viene acceso qui: quello toglie il
- * decode dal percorso critico ma contende i core, e sul nostro banco il TTFA non era
- * migliorato. Sono due leve diverse e vanno accese sulla base di due misure diverse. */
+ * The decoder THREAD (QWEN_DECODER_THREAD) is NOT enabled here: that one takes the decode
+ * off the critical path but contends for cores, and on our bench first-audio latency did
+ * not improve. They are two different levers and each needs its own measurement. */
 static void server_default_decoder_batch(qwen_tts_ctx_t *ctx) {
     (void)ctx;
     if (getenv("QWEN_SERVER_NO_DECODER_BATCH")) return;
@@ -1602,21 +2188,21 @@ static void server_default_decoder_batch(qwen_tts_ctx_t *ctx) {
                     "weights for all active slots) — QWEN_DECODER_BATCH=0 to opt out\n");
 }
 
-/* ⛔ QUANTIZED PREFILL IS **NOT** A DEFAULT — MEASURED 2026-08-18, on the customer's
- * finetune, and it is the reason this function no longer turns anything on.
+/* ⛔ QUANTIZED PREFILL IS **NOT** A DEFAULT — measured on a finetuned checkpoint, and it
+ * is the reason this function no longer turns anything on.
  *
- * WHAT HAPPENED. The lever was validated by ear on OSS models in English, where it is
+ * WHAT HAPPENED. The lever was validated by ear on base models in English, where it is
  * harmless: the audio is clean, the memory saving is real (4.0 GB on the 1.7B int8) and
- * the prefill gets faster. On a finetuned checkpoint with `--quant-mixed-int6=q4n14`,
- * one pool voice, same texts and same seeds, six clips per arm:
+ * the prefill gets faster. On a finetuned pool checkpoint with a mixed 4-bit map, one
+ * pool voice, same texts and same seeds, six clips per arm:
  *
  *     prefill quant OFF   language identity 96.3% mean, worst clip 86.1%
  *     prefill quant ON    language identity 38.0% mean, three clips at 0.0 / 1.4 / 11.7%
  *
  * The failure mode is the one this project keeps meeting: the audio stays clean, the
- * duration stays normal, nothing rasps — and the model DRIFTS INTO ENGLISH, losing the
- * the target language the finetune exists for. No signal-level metric sees it; only the language-identity check
- * does. The isolation was clean: an arm with the batched decoder off instead scored
+ * duration stays normal, nothing rasps — and the model DRIFTS TOWARDS THE BASE LANGUAGE,
+ * losing the accent the finetune exists for. No signal-level metric sees it; only a
+ * language-identity check does. The isolation was clean: an arm with the batched decoder off instead scored
  * identically to the all-on arm, clip by clip, so the decoder is exonerated and the
  * prefill is not.
  *
@@ -1644,10 +2230,10 @@ static void server_default_memory_levers(qwen_tts_ctx_t *ctx) {
         setenv("QWEN_FREE_BF16", "1", 0);              /* only meaningful together */
         fprintf(stderr, "[serve] quantized prefill ON (explicitly requested): frees the bf16 "
                         "(~4 GB on the 1.7B) but MEASURABLY COSTS THE ACCENT on a finetune — "
-                        "language identity 96%% -> 38%% on that finetune, 2026-08-18. Base/OSS models only.\n");
+                        "language identity 96%% -> 38%% when measured. Base models only.\n");
     } else {
-        fprintf(stderr, "[serve] quantized prefill OFF (default since 2026-08-18: it loses the "
-                        "language identity on finetunes) — QWEN_PREFILL_QUANT=1 to opt in on a base model\n");
+        fprintf(stderr, "[serve] quantized prefill OFF (default: it loses the accent on "
+                        "finetunes) — QWEN_PREFILL_QUANT=1 to opt in on a base model\n");
     }
 }
 
@@ -1674,6 +2260,10 @@ static void server_prewarm(qwen_tts_ctx_t *ctx) {
 
 /* Batched server entry: reader pool + continuous-batching scheduler + single worker. */
 int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
+    /* Third serving entry, and the one --batch-size >= 2 reaches. All three must declare:
+     * a driver cannot know which door main.c picked from the command line alone, and a
+     * path that stays silent looks exactly like a flag that never arrived. */
+    qwen_provenance_report(stderr);
     if (max_batch < 2) max_batch = 2;
     /* Under --prefork the PARENT owns the only listening socket and feeds us
      * descriptors, so binding here would be a second listener competing for the
@@ -1690,47 +2280,48 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
 
     conn_queue_t cq; cq_init(&cq);
     job_queue_t jq; jq_init(&jq);            /* batch jobs → continuous scheduler */
-    /* ── LA CODA SI TARA SUL BUDGET DI LATENZA, NON SUGLI SLOT ────────────────────
+    /* ── THE QUEUE IS SIZED BY THE LATENCY BUDGET, NOT BY THE SLOT COUNT ──────────
      *
-     * Il tetto era 2x gli slot. Misurato il 2026-08-20 con traffico realistico e raffiche
-     * da 10: con 3 slot e ~39 s di lavoro per slot sotto raffica, una coda profonda 6 vale
-     * fino a ~78 s di attesa — e infatti il TTFA p95 degli arrivi NORMALI e' schizzato a
-     * **28 secondi**, perche' una chiamata normale finiva in fila dietro cinque richieste
-     * della raffica. Il p50 restava 418 ms: il server non era lento, era la coda a essere
-     * piu' profonda del budget.
+     * The cap used to be 2x the slots. Measured with realistic traffic and bursts of 10:
+     * with 3 slots and ~39 s of work per slot under a burst, a queue 6 deep is worth up to
+     * ~78 s of waiting — and indeed the first-audio p95 of the NORMAL arrivals shot up to
+     * **28 seconds**, because an ordinary call ended up behind five requests from the
+     * burst. The p50 stayed at 418 ms: the server was not slow, the queue was deeper than
+     * the budget.
      *
-     * ⚠️ UNA CODA PIU' PROFONDA DEL BUDGET DI LATENZA NON ASSORBE UN PICCO: produce
-     * risposte che nessuno vuole piu'. E' la "viabilita' binaria" dello streaming (VoxServe)
-     * applicata all'ammissione: sotto la soglia il servizio e' buono, sopra non serve a
-     * nessuno, e servire tardi e' peggio che dire di no — perche' intanto quello slot
-     * sarebbe servito a una richiesta ancora viva.
+     * A QUEUE DEEPER THAN THE LATENCY BUDGET DOES NOT ABSORB A SPIKE: it produces answers
+     * nobody wants any more. It is streaming's binary-viability idea applied to admission:
+     * below the threshold the service is good, above it is of no use to anyone, and serving
+     * late is worse than saying no — because meanwhile that slot would have served a
+     * request still worth serving.
      *
-     * E c'e' una ragione di ARCHITETTURA piu' forte della latenza: se sopra c'e' un
-     * bilanciatore, la coda deve stare LI', non qui. Harchol-Balter (SIGMETRICS 2009)
-     * dimostra che una coda centrale condivisa E' un M/GI/n, mentre code per-server
-     * impegnano una richiesta su un worker prima di sapere quale si liberera' per primo.
-     * HAProxy e' costruito cosi': `maxconn` sul server dice quante ne puo' ESEGUIRE, la
-     * coda la tiene lui, e oltre `maxqueue` ridistribuisce ad altri server. Un worker che
-     * accoda ruba al bilanciatore l'unica informazione con cui potrebbe fare meglio.
+     * And there is an ARCHITECTURAL reason stronger than the latency one: if there is a
+     * load balancer above, the queue belongs THERE, not here. Harchol-Balter (SIGMETRICS
+     * 2009) shows that a shared central queue IS an M/GI/n, whereas per-server queues
+     * commit a request to a worker before knowing which one will free up first. HAProxy is
+     * built that way: `maxconn` on the server says how many it may RUN, the balancer holds
+     * the queue, and past `maxqueue` it redistributes to other servers. A worker that
+     * queues steals from the balancer the one piece of information it could do better with.
      *
-     * Quindi:  0 = NESSUNA CODA, 503 immediato quando gli slot sono pieni (dietro un
-     *              bilanciatore e' la configurazione giusta)
-     *          N = al massimo N in attesa
-     *         <0 = automatico: 1, una sola posizione di grazia per la richiesta che arriva
-     *              qualche centinaio di ms prima che uno slot si liberi
-     * Il vecchio comportamento illimitato — quello in cui la quarta richiesta aspettava per
-     * sempre senza risposta — resta raggiungibile SOLO con QWEN_QUEUE_UNBOUNDED=1, perche'
-     * e' il difetto, non una configurazione. */
+     * So:  0 = NO QUEUE, an immediate 503 when the slots are full (behind a load balancer
+     *          this is the right configuration)
+     *      N = at most N waiting
+     *     <0 = automatic: 1, a single grace position for the request that arrives a few
+     *          hundred ms before a slot frees up
+     * The old unbounded behaviour — the one where the fourth request waited forever without
+     * an answer — is reachable ONLY with QWEN_QUEUE_UNBOUNDED=1, because it is the defect,
+     * not a configuration. */
     jq.cap = (g_cfg_max_queue >= 0) ? g_cfg_max_queue : 1;
     if (getenv("QWEN_QUEUE_UNBOUNDED")) {
         jq.cap = -1;
-        fprintf(stderr, "[serve] ⚠️  QWEN_QUEUE_UNBOUNDED: coda ILLIMITATA — una richiesta in "
-                        "eccesso aspettera' senza limite e senza errore. E' il comportamento "
-                        "di prima del 2026-08-20, tenuto solo per A/B.\n");
+        fprintf(stderr, "[serve] WARNING QWEN_QUEUE_UNBOUNDED: the queue is UNBOUNDED — an "
+                        "excess request will wait without limit and without an error. This is "
+                        "the old behaviour, kept only for A/B comparison.\n");
     }
     g_srv.queue_max = jq.cap;
     g_srv.slots = max_batch;
     g_srv.queue_timeout_ms = g_cfg_queue_timeout_ms;
+    srv_init_request_cap();
     fprintf(stderr, "[serve] %d slot · possono attendere %d (totale nel sistema %d) · scadenza %s\n",
             max_batch, jq.cap, max_batch + jq.cap,
             g_srv.queue_timeout_ms > 0 ? "attiva" : "nessuna");
@@ -1819,6 +2410,13 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
 }
 
 int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
+    /* Declare build and flags at the TOP of the threaded path too. print_banner runs just
+     * before the accept loop -- after prewarm, after the socket exists -- so a driver that
+     * waits for the port could assert against a log the engine had not written yet. And
+     * --prefork 1 reaches this function, not the prefork one (main.c dispatches on > 1),
+     * which is how a one-worker topology looked like a missing flag. */
+    qwen_provenance_report(stderr);
+    srv_init_request_cap();
     if (n_workers < 1) n_workers = 1;
     int server_fd = setup_listen_socket(port);
     if (server_fd < 0) return -1;
@@ -1916,6 +2514,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
 }
 
 int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port) {
+    srv_init_request_cap();
     return qwen_tts_serve_ex(ctx, port, 1);
 }
 
@@ -2043,6 +2642,12 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
     if (threads_per < 1) threads_per = per;
     const int cap = max_batch >= 1 ? max_batch : 1;   /* hard in-flight cap per worker */
 
+    /* Provenance first, in the PREFORK path too, and BEFORE the listening socket
+     * exists: a driver that waits for the port can then trust that the declaration
+     * is already in the log. It used to be printed only by the two threaded accept
+     * loops, so every benchmark on the production topology carried a log with no
+     * build line and no record of the flags the numbers came from. */
+    qwen_provenance_report(stderr);
     int listen_fd = setup_listen_socket(port);
     if (listen_fd < 0) return -1;
 

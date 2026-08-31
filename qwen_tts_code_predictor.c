@@ -925,6 +925,21 @@ static void cp_mtp_project(qwen_tts_ctx_t *ctx, float *dst, const float *src) {
     }
 }
 
+/* Where one frame's fifteen passes actually go. The fifteen decisions are sequential by the
+ * model -- pass g reads out_codes[g-1] -- but that says nothing about the work INSIDE a pass,
+ * and a 0.1 ms serial operation there is 1.5 ms of first-audio time. Under the existing trace
+ * gate, no new flag. */
+static double cpx_embed, cpx_proj, cpx_step, cpx_norm, cpx_head;
+static int cpx_on(void) {
+    static int t = -1;
+    if (t < 0) { const char *e = getenv("QWEN_TTFA_TRACE"); t = (e && e[0] && e[0] != '0'); }
+    return t;
+}
+static double cpx_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes) {
     qwen_mm_component(QWEN_COMP_CP);   /* MAC audit: attribute this step's kernels */
     qwen_tts_config_t *c = &ctx->config;
@@ -1003,7 +1018,11 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     CPB_MARK(CPB_LMHEAD);
 
     /* Steps 2-15: generate codebooks 2-15. */
+    const int _cx = cpx_on();
+    double _cm = _cx ? cpx_now() : 0.0, _cf0 = _cm;
+    if (_cx) cpx_embed = cpx_proj = cpx_step = cpx_norm = cpx_head = 0.0;
     for (int g = 1; g < 15; g++) {
+        if (_cx) _cm = cpx_now();
         /* Teacher-forcing (quant-ladder): feed the REFERENCE prev code, not this
          * precision's own prediction, so step g sees identical inputs across all
          * precisions → its disagreement is pure step-g quant drift. */
@@ -1016,16 +1035,21 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
             float emb_buf[4096];
             const uint16_t *e = ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev_code * emb_dim;
             qwen_bf16_to_f32_vec(emb_buf, e, emb_dim);
+            if (_cx) { double _t = cpx_now(); cpx_embed += _t - _cm; _cm = _t; }
             cp_mtp_project(ctx, cp_x, emb_buf);
+            if (_cx) { double _t = cpx_now(); cpx_proj += _t - _cm; _cm = _t; }
         } else {
             memset(cp_x, 0, cp_h * sizeof(float));
         }
         CPB_MARK(CPB_EMBED);
 
+        if (_cx) _cm = cpx_now();
         cp_transformer_step(ctx, cp_x, x_norm, pos);
+        if (_cx) { double _t = cpx_now(); cpx_step += _t - _cm; _cm = _t; }
 
         /* Fused argmax+matvec (greedy) */
         qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
+        if (_cx) { double _t = cpx_now(); cpx_norm += _t - _cm; _cm = _t; }
         if (ctx->cp_lm_head_q4[g])
             out_codes[g] = qwen_argmax_matvec_q4_0(cp_normed, ctx->cp_lm_head_q4[g], cp_h, c->codebook_size);
         else if (ctx->cp_lm_head_int8[g])
@@ -1034,6 +1058,14 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
         else
             out_codes[g] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[g], cp_h, c->codebook_size);
         CPB_MARK(CPB_LMHEAD);
+        if (_cx) { double _t = cpx_now(); cpx_head += _t - _cm; _cm = _t; }
+    }
+    if (_cx) {
+        double _tot = cpx_now() - _cf0;
+        double _sum = cpx_embed + cpx_proj + cpx_step + cpx_norm + cpx_head;
+        fprintf(stderr, "[CPX] v=1 embed=%.4f proj=%.4f step=%.4f norm=%.4f head=%.4f "
+                "sum=%.4f total=%.4f unacc=%.4f\n",
+                cpx_embed, cpx_proj, cpx_step, cpx_norm, cpx_head, _sum, _tot, _tot - _sum);
     }
 
     /* Quant-ladder dump: the 16 codebook tokens for this frame (code0 from the

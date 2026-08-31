@@ -102,7 +102,12 @@ r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "perf_profile.py
                     "check-flags", "recommended", "--log", silent], capture_output=True, text=True)
 check("a log without a [FLAGS] declaration fails the check", r.returncode != 0, r.stdout)
 with open(silent, "a") as f:
-    f.write("[FLAGS] v=1 pid=1 QWEN_PREFIX_CACHE=1\n")
+    # Derived from the profile rather than restated: a hardcoded list means the test fails
+    # the day a lever is added to the profile, which is the day it is least useful.
+    _env = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "perf_profile.py"),
+                           "server-env", "recommended"], capture_output=True, text=True).stdout.strip()
+    _qwen = " ".join(kv for kv in _env.split(",") if kv.startswith("QWEN_"))
+    f.write(f"[FLAGS] v=1 pid=1 {_qwen}\n")
 r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "perf_profile.py"),
                     "check-flags", "recommended", "--log", silent], capture_output=True, text=True)
 check("a declaration matching the profile passes", r.returncode == 0, r.stdout)

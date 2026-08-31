@@ -54,12 +54,12 @@
 
 /* ── EOS strategies ─────────────────────────────────────────────────────────
  * There is no single upstream behaviour to conform to. Measured 2026-08-14 on
- * some downstream stacks: upstream Qwen has no EOS assist; their PyTorch path
+ * a downstream stack: upstream Qwen has no EOS assist; that PyTorch path
  * adds EosBoostLogitsProcessor (their own patch, commit 54447c3, described as
  * an "inference safety net" — and a no-op under greedy, since lifting EOS to
  * the top-k boundary can never make it the argmax); their PRODUCTION runtime
  * (nano-vllm) has none at all. So this is a switch, not a constant.
- * Full analysis: see the design notes. */
+ * Full analysis: the design notes. */
 typedef enum {
     QWEN_EOS_OFF  = 0,  /* no assist — matches nano-vllm, i.e. their production */
     QWEN_EOS_V1   = 1,  /* historic: ramp from start_mult * (tokens * fpt)      */
@@ -366,6 +366,15 @@ typedef struct {
     
     /* Decoder upsample blocks */
     qwen_sd_upsample_block_t upsample_blocks[4];
+
+    /* ConvTranspose weights, repacked ONCE at load from the checkpoint's
+     * [in_ch][out_ch][kernel] into the [kernel][in_ch][out_ch] the GEMM consumes.
+     * The conv_weight pointers above are repointed at these, so this REPLACES the
+     * runtime representation rather than caching a second copy: nothing reads the
+     * checkpoint layout after load, and its pages are file-backed and never touched
+     * again. Owned here so the frees have somewhere to look.
+     *   [0..1] ConvNeXt blocks, [2..5] the four upsample blocks. */
+    float *convt_packed[6];
     
     /* Final conv */
     const float *final_conv_weight;  /* [1, 96, 7] */
@@ -499,7 +508,7 @@ typedef struct qwen_tts_ctx {
     int cp_top_k;
     int greedy_warmup;  /* initial frames sampled greedily (temp=0) for cross-model stability */
 
-    /* EOS strategy — see qwen_eos_strategy_t above and the design notes. */
+    /* EOS strategy — see qwen_eos_strategy_t above and the design notes */
     int   eos_strategy;          /* qwen_eos_strategy_t                              */
     int   eos_suppress_frames;   /* leading frames where EOS is forbidden        (2) */
     float eos_frames_per_token;  /* assumed frames per BPE token               (3.0) */
@@ -834,7 +843,7 @@ int qwen_tts_speaker_id(const char *name);
 
 /* Resolve a speaker name against THIS model's own table, then the built-in presets.
  *
- * Checkpoints finetuned from Base — every such finetune — carry their speakers in
+ * Checkpoints finetuned from Base carry their speakers in
  * config.json `talker_config.spk_id`, and none of them are upstream presets. Returns
  * -1 when the name is unknown, which callers MUST treat as an error: falling back to
  * the default slot renders an identity that does not exist in those weights (the slot
@@ -929,7 +938,28 @@ typedef struct {
      * MUST read state owned by the JOB behind `tag`, never a raw fd: an fd can be closed
      * and recycled by another connection while this slot still exists. */
     int (*cancelled)(void *ud, void *tag);
+    /* OPTIONAL. The driver could not ADMIT this request -- its prompt does not fit the
+     * per-slot budget, or prefill failed. NULL (the default) reproduces the historical
+     * behaviour exactly: the rejection arrives as on_done(NULL,0), which a host cannot
+     * tell apart from a generation that produced nothing, and which the HTTP layer
+     * reported as 500 "generation failed". A refusal is not an internal error, and a
+     * caller that is told the wrong one cannot act on it.
+     *
+     * `reason` is a short static string safe to embed in a response. When this is set
+     * the driver calls it INSTEAD of on_done, and the host owns the tag afterwards. */
+    void (*on_reject)(void *ud, void *tag, const char *reason);
 } qwen_batch_sink_t;
+
+/* Effective per-slot limits of the continuous-batching driver, after the environment
+ * overrides below. Published so a server can refuse an oversized request up front, with
+ * the real number, instead of discovering it at admission.
+ *   QWEN_BATCH_MAX_PROMPT   prompt tokens per slot   (default 512)
+ *   QWEN_BATCH_MAX_FRAMES   generated frames per slot (default 600 = 48 s of audio)
+ * Both raise per-slot KV and scratch memory linearly, and both are batching-capacity
+ * decisions: raising them changes what the scheduler holds per slot, so a deployment
+ * that raises them should re-qualify capacity rather than assume it is unchanged. */
+int qwen_tts_batch_max_prompt(void);
+int qwen_tts_batch_max_frames(void);
 
 /* ── STEP 3A · admission-opportunity probe (diagnostic, no scheduling change) ──
  * The driver admits from the ready queue at ONE point per loop iteration. This publishes,

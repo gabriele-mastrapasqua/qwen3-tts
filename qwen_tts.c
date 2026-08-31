@@ -26,7 +26,7 @@ int qwen_verbose = 0;
 
 /* ── EOS strategy names ──────────────────────────────────────────────────────
  * Next to the parser so a new strategy cannot be added without a name.
- * Why this is a switch at all: the design notes. */
+ * Why this is a switch at all: see the design notes. */
 const char *qwen_tts_eos_strategy_name(int strategy) {
     switch (strategy) {
         case QWEN_EOS_OFF:  return "off";   /* = nano-vllm, i.e. their production */
@@ -118,16 +118,16 @@ int qwen_tts_resolve_speaker(const qwen_tts_ctx_t *ctx, const char *name) {
 /* dichiarata piu' sotto: il parser sta vicino al caricamento del modello */
 static void parse_spk_id_table(qwen_tts_ctx_t *ctx, const char *cfg_raw);
 
-/* Ricarica la tabella nomi->slot da un ALTRO modello (dir o config.json).
+/* Reload the name -> slot table from ANOTHER model (a directory or a config.json).
  *
- * Serve agli INNESTI. La mappa nomi->slot vive in config.json, non nei pesi:
- * un modello innestato (Base + delta) porta i pesi del finetune ma il config del
- * genitore, quindi a pool-voice name non risolve e l'unica via era passare lo slot
- * numerico a mano. Con --speaker-map si punta al finetune di provenienza e i nomi
- * tornano a funzionare ovunque.
+ * This exists for GRAFTS. The name -> slot map lives in config.json, not in the weights:
+ * a grafted model (base + delta) carries the finetune's weights but the parent's config,
+ * so a voice name does not resolve and the only way in was to pass the numeric slot by
+ * hand. With --speaker-map you point at the finetune the weights came from and names work
+ * again everywhere.
  *
- * Gli slot restano quelli del file passato: e' proprio il punto — sono i numeri con
- * cui quei pesi sono stati addestrati. */
+ * The slots stay those of the file passed in, and that is exactly the point: they are the
+ * numbers those weights were trained with. */
 int qwen_tts_load_speaker_map(qwen_tts_ctx_t *ctx, const char *path) {
     if (!ctx || !path) return -1;
     char cfg[4096];
@@ -727,26 +727,25 @@ static void *decoder_thread_fn(void *arg) {
 }
 
 /* Load model */
-/* ── QWEN_THP=1: chiedi le huge page sui pesi mmappati (2026-08-21, ARM epic A5) ──
+/* ── QWEN_THP=1: ask for huge pages on the mmapped weights (2026-08-21) ──
  *
- * Il carico e' memory-bound e il Code Predictor rilegge i suoi pesi 16 volte per frame.
- * A pagine da 4 KiB i 3.85 GB del 1.7B sono ~940 000 pagine contro le poche migliaia di
- * entry del TLB di secondo livello: una quota del tempo se ne va in page-table walk, e
- * nessun kernel SIMD la recupera.
+ * The workload is memory-bound and the Code Predictor re-reads its weights 16 times per
+ * frame. At 4 KiB pages the 1.7B model's 3.85 GB are ~940,000 pages against the few
+ * thousand entries of a second-level TLB: a share of the time goes into page-table walks,
+ * and no SIMD kernel gets it back.
  *
- * Su Linux le THP stanno in modalita' `madvise` su quasi tutte le VM cloud (verificato sul
- * c4a: `always [madvise] never`), quindi senza QUESTA chiamata non arrivano: non e' una
- * cosa che il kernel fa da solo.
+ * On Linux transparent huge pages sit in `madvise` mode on almost every cloud VM (verified:
+ * `always [madvise] never`), so without THIS call they never arrive — it is not something
+ * the kernel does on its own.
  *
- * Perche' dal nostro lato e non dentro ingot: la mappa la crea la libreria vendorizzata e
- * una modifica li' sparirebbe alla prossima ri-vendorizzazione. L'intervallo si ricostruisce
- * dai tensori che ingot espone gia' (ingot_st_at + ingot_st_data + nbytes), quindi qui basta
- * una madvise sull'estensione complessiva.
+ * Why on our side and not inside the vendored loader: that library creates the mapping, and
+ * a change there would disappear at the next re-vendoring. The range is reconstructed from
+ * the tensors the loader already exposes, so one madvise over the whole extent is enough.
  *
- * DEFAULT OFF: non cambia un bit del risultato, ma cambia come il kernel alloca la memoria
- * (una THP e' 2 MiB: su una macchina piena puo' costare RSS e latenza di fault). Si accende
- * per misurare e diventa default solo col numero in mano. Fuori da Linux, o su un kernel
- * senza MADV_HUGEPAGE, e' un no-op silenzioso. */
+ * DEFAULT OFF. It does not change a bit of the result, but it changes how the kernel
+ * allocates memory (a huge page is 2 MiB: on a full machine that can cost RSS and fault
+ * latency). It is turned on to measure, and becomes a default only with the number in hand.
+ * Outside Linux, or on a kernel without MADV_HUGEPAGE, it is a silent no-op. */
 static void qwen_weights_thp_advise(ingot_st *st, const char *what) {
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
     const char *e = getenv("QWEN_THP");
@@ -968,6 +967,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     /* codec_embedding_f32 removed — vectorized bf16→f32 conversion used instead */
     /* Free malloc'd codebooks (EMA-reconstructed, not from safetensors) */
     for (int i = 0; i < 16; i++) free(ctx->speech_dec.codebook[i]);
+    for (int i = 0; i < 6; i++) free(ctx->speech_dec.convt_packed[i]);
     free(ctx->speech_dec.pre_layers);
     free(ctx->speech_dec.rope_cos); free(ctx->speech_dec.rope_sin);
     /* Close safetensors (all get_bf16/get_f32 pointers point into this data) */
@@ -1859,6 +1859,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * the target voice while taking the fine cb1-15 articulation from a real cough -> cross-voice splice. */
     int    tf_cb_keep = 0;
     { const char *k = getenv("QWEN_TF_CB_KEEP"); if (k && *k) { tf_cb_keep = atoi(k); if (tf_cb_keep < 0) tf_cb_keep = 0; if (tf_cb_keep > 16) tf_cb_keep = 16; } }
+    int    tf_prefix_mode = 0;   /* QWEN_TF_PREFIX: forced frames are a prefix, keep generating after */
+    { const char *k = getenv("QWEN_TF_PREFIX"); tf_prefix_mode = (k && k[0] && k[0] != '0'); }
     FILE  *code0_fp = NULL;     /* QWEN_DUMP_CODE0: Talker's greedy code0 prediction per frame */
     {
         const char *c0p = getenv("QWEN_DUMP_CODE0");
@@ -1976,11 +1978,11 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         /* ── EOS assist, switchable ─────────────────────────────────────────
          * There is nothing to "conform" to: their PyTorch path and their
          * production runtime disagree with each other. Measurements behind V2:
-         * the design notes. */
+         * see the design notes. */
         if (ctx->eos_strategy == QWEN_EOS_V1 || ctx->eos_strategy == QWEN_EOS_V2) {
             /* V1 assumes the clip length scales with the token count. It does
              * not: onset and leading/trailing silence are FIXED cost. Measured
-             * on one finetuned checkpoint and voice, the real ratio is 5.75
+             * on a finetuned pool checkpoint, the real ratio is 5.75
              * frames per token on a 4-token text but 3.19 on a 62-token one, so
              * a purely proportional threshold sits right on top of short clips
              * — "Abeg wait." generated 23 frames against a V1 threshold of 24.
@@ -2047,7 +2049,20 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
         /* Teacher-forcing replay: ride the reference rails (code0 + CP feedback). */
         if (tf_codes) {
-            if (frame >= tf_nframes) break;
+            /* QWEN_TF_PREFIX=1: the file is a PREFIX, not the whole clip. The forced frames
+             * are replayed and generation then CONTINUES freely from the model's own state.
+             * This exists to test whether a first frame produced under one prompt can be
+             * carried into a generation running under a different (longer) prompt: the
+             * forced frames enter the KV exactly as generated ones would, so what follows
+             * is the model's own continuation of somebody else's opening. Without it the
+             * replay stops at the end of the file, which measures nothing about
+             * continuation. Default 0 = the historical behaviour. */
+            if (frame >= tf_nframes) {
+                if (!tf_prefix_mode) break;
+                free(tf_codes); tf_codes = NULL; ctx->tf_ref_codes = NULL;
+            }
+        }
+        if (tf_codes) {
             /* codec-VC: keep the model's own code0 (target-voice timbre) when tf_cb_keep>=1 */
             if (tf_cb_keep < 1) code0 = tf_codes[(int64_t)frame * 16 + 0];
             ctx->tf_ref_codes = tf_codes + (int64_t)frame * 16 + 1;
@@ -2255,6 +2270,35 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
  * then a quantized model still works here via its mmap-resident bf16 weights.
  * The output is a "valid alternative kernel" (fp-order differs like int8) → validate
  * by ear/mel-corr, not bit-match. Returns 0 on success. */
+/* ── Per-slot budgets of the batched driver ──────────────────────────────────────
+ * Both were hardcoded, undocumented and invisible, and both had user-visible effects
+ * that looked like defects rather than limits: a prompt over the budget was refused by
+ * handing the host zero samples (reported as 500 "generation failed"), and generation
+ * beyond the frame budget was truncated in silence at exactly 48 s.
+ *
+ * The DEFAULTS ARE UNCHANGED -- raising a capacity limit changes what the scheduler
+ * holds per slot, so it is a decision an operator makes deliberately and re-qualifies,
+ * not one this fix makes on their behalf. What changes is that the limits are now
+ * named, published and overridable. */
+int qwen_tts_batch_max_prompt(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN_BATCH_MAX_PROMPT");
+        v = (e && atoi(e) > 0) ? atoi(e) : 512;
+        if (v < 32) v = 32;
+    }
+    return v;
+}
+int qwen_tts_batch_max_frames(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN_BATCH_MAX_FRAMES");
+        v = (e && atoi(e) > 0) ? atoi(e) : 600;
+        if (v < 32) v = 32;
+    }
+    return v;
+}
+
 int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                             float chunk_pause, float **out_samples, int *out_n_samples) {
     if (nc <= 0) { *out_samples = NULL; *out_n_samples = 0; return 0; }
@@ -2266,7 +2310,9 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
     int cb = ctx->config.codebook_size;
     float eps = ctx->config.rms_norm_eps;
     const int GMAX = 8;
-    int GEN_CAP = ctx->max_tokens; if (GEN_CAP > 600) GEN_CAP = 600; if (GEN_CAP < 32) GEN_CAP = 32;
+    int GEN_CAP = ctx->max_tokens;
+    { int lim = qwen_tts_batch_max_frames(); if (GEN_CAP > lim) GEN_CAP = lim; }
+    if (GEN_CAP < 32) GEN_CAP = 32;
     const int SR = QWEN_TTS_SAMPLE_RATE;
 
     float *out = NULL; size_t out_n = 0, out_cap = 0;
@@ -2454,7 +2500,9 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
     int cb = ctx->config.codebook_size;
     float eps = ctx->config.rms_norm_eps;
     const int GMAX = 8;
-    int GEN_CAP = ctx->max_tokens; if (GEN_CAP > 600) GEN_CAP = 600; if (GEN_CAP < 32) GEN_CAP = 32;
+    int GEN_CAP = ctx->max_tokens;
+    { int lim = qwen_tts_batch_max_frames(); if (GEN_CAP > lim) GEN_CAP = lim; }
+    if (GEN_CAP < 32) GEN_CAP = 32;
 
     for (int i = 0; i < nc; i++) { out_samples[i] = NULL; out_n_samples[i] = 0; }
 
@@ -2640,6 +2688,7 @@ typedef struct prefilled_s {
     void *tag;
     qwen_batch_req_t req;
     int ok;                 /* 0 = prefill failed / rejected */
+    const char *reject_reason;   /* static string, why ok==0; NULL when ok */
     int pl;                 /* prefill length (frames) */
     int tcl;                /* bg_text_content_len */
     uint16_t *kv_k, *kv_v;  /* [num_layers * pl * kvd] snapshot from the clone */
@@ -2729,6 +2778,12 @@ static void *prefill_helper_main(void *arg) {
         prefilled_t *p = (prefilled_t *)calloc(1, sizeof(prefilled_t));
         if (!p) { a->sink->on_done(a->sink->ud, tag, NULL, 0); continue; }
         p->tag = tag; p->req = req;
+        /* Record WHY, here, where it is known. The driver sees only ok==0 and used to
+         * report every cause as a generation failure. */
+        p->reject_reason = (prc != 0) ? "prefill failed"
+                         : (pl <= 0)  ? "prefill produced nothing"
+                         : (pl > a->MAXPROMPT) ? "prompt too long for a batch slot"
+                         : NULL;
         p->ts_admitted = _t_admitted; p->ts_prefill_start = _t_pf_start;
         p->ts_prefill_done = _t_pf_done;
         if (prc == 0 && pl > 0 && pl <= a->MAXPROMPT) {
@@ -2773,7 +2828,7 @@ static void *prefill_helper_main(void *arg) {
  * The cost is not just throughput. The scheduler thread is the only thread that
  * advances every slot, so while it decodes ONE request's audio, every other user's
  * generation is stopped. That lands on THEIR time-to-first-audio and on their p95 —
- * the spike a listener notices — not on the latency of the request being decoded.
+ * the spike a customer notices — not on the latency of the request being decoded.
  * With TTFA as the product target, this is the largest remaining lever.
  *
  * WHAT THIS DOES. One worker thread with its OWN ctx clone (weights shared, scratch
@@ -2994,8 +3049,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int vocab = ctx->config.codec_vocab_size;
     int cb = ctx->config.codebook_size;
     float eps = ctx->config.rms_norm_eps;
-    int GEN_CAP = ctx->max_tokens; if (GEN_CAP > 600) GEN_CAP = 600; if (GEN_CAP < 32) GEN_CAP = 32;
-    const int MAXPROMPT = 512;                       /* per-slot prompt KV budget */
+    int GEN_CAP = ctx->max_tokens;
+    { int lim = qwen_tts_batch_max_frames(); if (GEN_CAP > lim) GEN_CAP = lim; }
+    if (GEN_CAP < 32) GEN_CAP = 32;
+    const int MAXPROMPT = qwen_tts_batch_max_prompt();   /* per-slot prompt KV budget */
     int kv_max = MAXPROMPT + GEN_CAP + 4;
     int force_matvec = getenv("QWEN_BATCH_FORCE_MATVEC") ? 1 : 0;
 
@@ -3184,11 +3241,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
      * owns the decode the batching happens inside the worker instead (see dec_worker_main). */
     int dec_batch = (getenv("QWEN_DECODER_BATCH") &&
                      atoi(getenv("QWEN_DECODER_BATCH")) != 0) ? 1 : 0;
-    /* S19 · TTFA decomposto PER RICHIESTA (QWEN_TTFA_TRACE=1).
-     * Il banco misura il TTFA da fuori e sa dire QUANTO, non DOVE. Questi quattro
-     * istanti dicono dove: quanto e' costato il prefill, quanto si e' aspettato il
-     * primo frame (contesa col resto del batch), quanto la prima decodifica. Senza
-     * questa riga qualunque lavoro sul TTFA e' una scommessa su quale terzo attaccare. */
+    /* First-audio latency decomposed PER REQUEST (QWEN_TTFA_TRACE=1).
+     * A harness measures it from outside and can say HOW MUCH, not WHERE. These four
+     * instants say where: what the prefill cost, how long the first frame waited
+     * (contention with the rest of the batch), what the first decode cost. Without this
+     * line any work on first audio is a bet on which third to attack. */
     int ttfa_trace = (getenv("QWEN_TTFA_TRACE") && atoi(getenv("QWEN_TTFA_TRACE")) != 0);
     /* ── M1 · EARLY FIRST-FRAME ADMISSION. OFF by default; `1` opts in.
      * The driver admits once per iteration, at the top, immediately upstream of the codec
@@ -3200,7 +3257,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
      * placed at the single boundary where the new slot's first chunk can still join the
      * batched decode call of the CURRENT iteration.
      * Diagnostic, one request per iteration, and it changes nothing when unset.
-     * See the design notes */
+     * See docs/bench/2026-08-26-NEXT2E-step3e-admission-point-design.md. */
     int admit_m1 = (getenv("QWEN_ADMIT_M1") && atoi(getenv("QWEN_ADMIT_M1")) != 0);
     long long m1_admitted = 0, m1_rejected = 0, m1_cancelled = 0, m1_first_audio = 0;
     /* Why M1 did NOT fire is as much an observation as why it did: a scan that found no
@@ -3296,12 +3353,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     /* The pool keeps the LARGEST budget any stage asks for and each stage narrows with a
      * soft set — off macOS resizing the pool means join+respawn, which at 12.5 frames/s
      * per stage would cost more than the policy can buy (see qwen_set_threads_soft). */
-    /* ⚠️ CAVEAT DICHIARATO: g_n_threads è globale al processo. Con il THREAD decoder
-     * acceso (QWEN_DECODER_THREAD=1) il worker gira in parallelo allo scheduler e vede
-     * il budget che lo scheduler ha impostato in quel momento — quindi lì "per stadio"
-     * diventa "l'ultimo che ha scritto", non una separazione vera. Le due leve non si
-     * compongono, e il thread decoder è spento di default: la combinazione va misurata
-     * prima di essere raccomandata, non dedotta. */
+    /* STATED CAVEAT: g_n_threads is process-global. With the decoder THREAD enabled
+     * (QWEN_DECODER_THREAD=1) that worker runs alongside the scheduler and sees whatever
+     * budget the scheduler set at that moment — so there "per stage" becomes "whoever
+     * wrote last", not a real separation. The two levers do not compose, and the decoder
+     * thread is off by default: the combination has to be measured before it is
+     * recommended, not deduced. */
     int st_th_base = qwen_get_threads();
     if (st_tt || st_td) {
         int hard = st_th_base;
@@ -3358,29 +3415,29 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
      * how WIDE the cross-slot decode batch gets, and the profile already prints the ratio
      * they move (slots per decoder call against mean active slots) — measured 1.33 of
      * 1.42 on the c3, so the headroom is small but the cost of finding out is one env. */
-    /* S17.E · IL BUDGET BLAS DEL SERVER, che finora non esisteva.
+    /* THE SERVER'S BLAS BUDGET, which until now did not exist.
      *
-     * `qwen_set_threads()` lega OpenBLAS a `-j` all'avvio e il percorso CLI lo restringe
-     * ancora in generazione (`gen_blas = nt-1`), ma questo loop non ha mai chiamato
-     * `qwen_blas_set_threads()`: il server eredita `-j` e basta, per ogni fase e per ogni
-     * carico. MISURATO sul c3 (0.6B, int8, -j2, match, REQS=8):
+     * `qwen_set_threads()` binds OpenBLAS to `-j` at startup and the CLI path narrows it
+     * again during generation (`gen_blas = nt-1`), but this loop never called
+     * `qwen_blas_set_threads()`: the server simply inherits `-j`, for every stage and
+     * every load. MEASURED on an x86 host (0.6B, int8, -j2, 8 requests):
      *
      *     BLAS      c=1              c=2              c=4
      *     1         RTF 1.18 Q 0.90  3.37 / 0.59      5.44 / 0.69
      *     2         RTF 1.03 Q 0.99  2.69 / 0.74      4.19 / 0.87
      *     4         RTF 2.44 Q 0.42  2.50 / 0.80      3.74 / 0.97
      *
-     * Il punto ottimo SI SPOSTA col carico: a richiesta singola vince 2, a c=4 vince 4, e
-     * scegliere male costa fino al 140% (da CLI: -j2 con BLAS 4 = RTF 2.34 contro 0.99).
-     * La regola che spiega la tabella e' che il totale dei thread richiesti deve restare
-     * vicino ai core: a uno slot il nostro pool e' quasi fermo e la BLAS puo' allargarsi,
-     * a quattro slot sono gli slot stessi a riempire la macchina.
+     * The optimum MOVES with the load: at a single request 2 wins, at c=4 4 wins, and
+     * choosing badly costs up to 140 % (from the CLI: -j2 with BLAS 4 = RTF 2.34 against
+     * 0.99). The rule behind the table is that the total number of threads asked for must
+     * stay near the core count: at one slot our own pool is nearly idle and BLAS can widen,
+     * at four slots the slots themselves fill the machine.
      *
-     * Default: NESSUNA chiamata, cioe' esattamente il comportamento con cui e' stato preso
-     * ogni numero precedente. QWEN_SERVE_BLAS = valore con un solo slot attivo,
-     * QWEN_SERVE_BLAS_BUSY = valore da due in su. OPENBLAS_NUM_THREADS nell'ambiente vince
-     * comunque su entrambi (qwen_blas_set_threads esce subito se e' impostata), perche' chi
-     * sta tarando a mano non va scavalcato. */
+     * Default: NO call at all, which is exactly the behaviour every previous number was
+     * taken under. QWEN_SERVE_BLAS = the value with a single active slot,
+     * QWEN_SERVE_BLAS_BUSY = the value from two upwards. OPENBLAS_NUM_THREADS in the
+     * environment still wins over both (qwen_blas_set_threads returns immediately when it
+     * is set), because somebody tuning by hand must not be overridden. */
     int blas_solo = 0, blas_busy = 0, blas_now = 0;
     { const char *e = getenv("QWEN_SERVE_BLAS");      if (e && atoi(e) > 0) blas_solo = atoi(e); }
     { const char *e = getenv("QWEN_SERVE_BLAS_BUSY"); if (e && atoi(e) > 0) blas_busy = atoi(e); }
@@ -3643,11 +3700,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     } while (0)
 
     /* ---- A1: spawn the async prefill helper (reentrant pool only) ---- */
-    /* A1 e' OPT-IN e di default SPENTO su Linux/Windows: qwen_parallel_is_reentrant()
-     * legge QWEN_PREFILL_HELPER. Misurato il 2026-08-18 sul c3 — accenderlo PEGGIORA il
-     * TTFA p95 del ~30% a c=2/c=4, perche' con un solo job slot l'helper e il frame loop
-     * si serializzano sul mutex del pool invece di sovrapporsi. La tabella e il perche'
-     * stanno in qwen_tts_thread.c sopra is_reentrant(). Su macOS (GCD) resta acceso. */
+    /* The async prefill helper is OPT-IN and OFF by default on Linux and Windows:
+     * qwen_parallel_is_reentrant() reads QWEN_PREFILL_HELPER. Measured — enabling it makes
+     * first-audio p95 ~30 % WORSE at c=2 and c=4, because with a single job slot the helper
+     * and the frame loop serialise on the pool's mutex instead of overlapping. The table
+     * and the reasoning are in qwen_tts_thread.c above is_reentrant(). On macOS (GCD) it
+     * stays on. */
     int use_helper = qwen_parallel_is_reentrant();
     qwen_tts_ctx_t *pf_ctx = use_helper ? qwen_tts_clone_for_worker(ctx) : NULL;
     prefill_q_t pfq; pthread_t pf_thr; prefill_helper_arg_t pf_arg;
@@ -3715,7 +3773,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             atomic_store_explicit(&g_admit_ts, _now, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_admit_seq, 1, memory_order_relaxed);
             _t2_prev_iter = _now;
-            /* ⚠️ The counters CANNOT be reported at shutdown: the load harness ends the
+            /* ⚠️ The counters CANNOT be reported at shutdown: serve_call_shaped.sh ends the
              * run with kill -9, so no teardown print in a prefork worker ever executes.
              * That is exactly how the first two attempts at an evidence line produced an
              * empty grep and a gate that passed on nothing. Emit them LIVE instead. */
@@ -3751,7 +3809,17 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 (void)_t_pop_pre;
                 if (prof_on) { double d = time_ms() - pf_w0; pf_wait += d; pf_mark += d; }
                 if (!p) break;                 /* nothing ready (or shutdown) this frame */
-                if (!p->ok) { sink->on_done(sink->ud, p->tag, NULL, 0); prefilled_free(p); continue; }
+                if (!p->ok) {
+                    /* A refusal is not an internal error. Reported through on_reject when
+                     * the host offers it, so the caller learns the limit rather than
+                     * receiving "generation failed". */
+                    if (sink->on_reject)
+                        sink->on_reject(sink->ud, p->tag,
+                                        p->reject_reason ? p->reject_reason : "could not admit the request");
+                    else
+                        sink->on_done(sink->ud, p->tag, NULL, 0);
+                    prefilled_free(p); continue;
+                }
                 for (int L = 0; L < num_layers; L++) {
                     size_t dst = ((size_t)b * num_layers + L) * kv_max * kvd;
                     memcpy(bb->kv_k + dst, p->kv_k + (size_t)L * p->pl * kvd, (size_t)p->pl * kvd * sizeof(uint16_t));
@@ -3804,7 +3872,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             int prc = 0, pl = 0;
             ADMIT_PREFILL(b, req, prc, pl);
             if (prc != 0 || pl <= 0 || pl > MAXPROMPT) {
-                sink->on_done(sink->ud, t, NULL, 0);   /* reject (prefill fail / too long) */
+                const char *why = (pl > MAXPROMPT) ? "prompt too long for a batch slot"
+                                                   : "prefill failed";
+                if (sink->on_reject) sink->on_reject(sink->ud, t, why);
+                else sink->on_done(sink->ud, t, NULL, 0);
                 continue;
             }
             ADMIT_INSTALL(b, req, t, pl);
@@ -3817,8 +3888,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 
         PF_END(pf_admit);
 
-        /* S17.E · la BLAS segue il carico. Si chiama solo quando il valore CAMBIA: la
-         * openblas_set_num_threads() non e' gratis e n_active si muove poco. */
+        /* BLAS follows the load. Called only when the value CHANGES:
+         * openblas_set_num_threads() is not free and n_active moves little. */
         if (blas_solo || blas_busy) {
             int want = (n_active > 1) ? blas_busy : blas_solo;
             if (want <= 0) want = qwen_get_threads();
@@ -3885,18 +3956,19 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
          * the same treatment as the layer projections: compute only the active columns,
          * through the map the Talker step just packed. Inactive slots keep stale logits
          * and are skipped by the loop below, exactly as before. */
-        /* act_idx/B_eff descrivono I SLOT DI QUESTO FRAME, e vanno scritti QUI — prima
-         * di usarli — non ereditati dal passo del Talker in fondo al ciclo.
+        /* act_idx/B_eff describe THE SLOTS OF THIS FRAME, and must be written HERE --
+         * before they are used -- not inherited from the Talker step at the bottom of the
+         * loop.
          *
-         * Perche' (orecchio, 2026-08-20): una richiesta ammessa a riga ~3262 diventa attiva
-         * DOPO l'ultimo passo del Talker, quindi al suo primo frame non e' ancora in
-         * act_idx e la sua colonna di logit non viene calcolata. Il campionatore legge
-         * valori stantii, il primo code0 esce sbagliato, e un solo token sbagliato in testa
-         * manda il modello a farfugliare qualche secondo prima di riallinearsi al testo:
-         * ~4 s di suoni che non sono neither the target language nor English, poi la frase giusta fino in
-         * fondo. Colpisce solo quando lo slot nuovo NON e' quello che act_idx gia' nomina —
-         * cioe' dopo una sovrapposizione — ed e' per questo che sfuggiva alla media del LID
-         * (67% invece di 0) mentre all'orecchio era ovvia. */
+         * Why (found by ear): a request admitted above becomes active AFTER the last Talker
+         * step, so on its first frame it is not yet in act_idx and its logit column is not
+         * computed. The sampler reads stale values, the first code0 comes out wrong, and a
+         * single wrong token at the head sends the model babbling for a few seconds before
+         * it realigns to the text: ~4 s of sounds that are neither the target language nor
+         * anything else, then the correct sentence to the end. It only strikes when the new
+         * slot is NOT one act_idx already names -- that is, after an overlap -- which is why
+         * it survived the language-identity average (67 % instead of 0) while being obvious
+         * to a listener. */
         qwen_batch_pack_active(bb, step_active);
         PF_START();
         qwen_batch_proj(logits, ctx->codec_head_bf16, last_hidden, vocab, h, h,
@@ -4017,7 +4089,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
          * sooner. Admitting AFTER the decode call (or anywhere else) buys nothing: the
          * first chunk would wait for the next iteration regardless, and the only thing
          * that moved would be the queue-time label. See §2-3 of
-         * the design notes
+         * docs/bench/2026-08-26-NEXT2E-step3e-admission-point-design.md.
          *
          * WHAT IT DELIBERATELY DOES NOT TOUCH. Decoder placement, decoder batching and the
          * gang policy, batch capacity, the prefill policy, cancellation, and the order the
@@ -4025,7 +4097,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
          * decode call that was going to happen anyway.
          *
          * THE COST, measured before this was written: the narrow pass is 9.53-9.63 ms p95
-         * and is 98.8 % Code Predictor (the design notes.
+         * and is 98.8 % Code Predictor (docs/bench/2026-08-26-NEXT2E-step3e0-killfirst.md).
          * Its time is charged to pf_m1 and handed back to the enclosing pf_decode mark, so
          * the decode line keeps meaning "decode".
          *
@@ -4053,7 +4125,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 ADMIT_PREFILL(b, req, prc, pl);
                 double _m_pf1 = ttfa_trace ? qwen_mono_ms() : 0;
                 if (prc != 0 || pl <= 0 || pl > MAXPROMPT) {
-                    sink->on_done(sink->ud, jt, NULL, 0);   /* reject, exactly as above */
+                    const char *why = (pl > MAXPROMPT) ? "prompt too long for a batch slot"
+                                                       : "prefill failed";
+                    if (sink->on_reject) sink->on_reject(sink->ud, jt, why);
+                    else sink->on_done(sink->ud, jt, NULL, 0);
                     m1_rejected++;
                     if (prof_on) { double _d = time_ms() - _mf0; pf_m1 += _d; pf_mark += _d; }
                     break;
@@ -4310,7 +4385,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     /* Stop the decoder thread FIRST and drain it: it still owns per-slot streaming
      * state and the client sockets of any request whose last chunks are queued.
      * Freeing that state before it drains would be a use-after-free, and closing the
-     * loop before it delivers would truncate audio a listener is hearing. */
+     * loop before it delivers would truncate an audio a customer is listening to. */
     if (dec_on) {
         pthread_mutex_lock(&dpool.m);
         dpool.running = 0;

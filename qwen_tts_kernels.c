@@ -154,7 +154,7 @@ void qwen_init_threads(void) {
  * registers are 8 KB of extended XSAVE state that Linux does NOT hand out by default —
  * a process must ask once with arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)
  * (kernel >= 5.16). Skip that and the very first _tile_loadd is SIGILL, i.e. a crash
- * on the user's box rather than a slow path. So: compiled-in is necessary and NOT
+ * on the deployment box rather than a slow path. So: compiled-in is necessary and NOT
  * sufficient, and the dispatcher must be able to fall back to VNNI at runtime.
  *
  * The request is per PROCESS (the kernel grants it for every thread, present and
@@ -262,18 +262,19 @@ int qwen_amx_bf16_available(void) {
 #endif
 }
 
-/* Il gemello ARM del predicato qui sopra: questa build ha un vero GEMM bf16
- * matrice-matrice (BFMMLA, i8mm/bf16 di Armv8.6 — Neoverse-V1/V2, Graviton3+, M2+)?
+/* The Arm twin of the predicate above: does this build have a real matrix-matrix bf16
+ * GEMM (BFMMLA, the Armv8.6 i8mm/bf16 set — Neoverse-V1/V2, Graviton3+, M2+)?
  *
- * Serve al prefill esattamente come l'AMX serve su x86, e la ragione per cui il default
- * puo' dipendere da questo e non da "siamo su ARM" e' che senza l'istruzione il gemello
- * batchato PERDE contro B x matvec (misurato su M1 e su M4: 0,72-0,91x).
+ * The prefill needs it exactly as it needs AMX on x86, and the reason the default may
+ * depend on THIS rather than on "we are on Arm" is that without the instruction the
+ * batched twin LOSES against B x matvec (measured on M1 and M4: 0.72-0.91x).
  *
- * ⚠️ Fino al 2026-08-21 questo predicato non sarebbe bastato lo stesso: il kernel BFMMLA
- * era un tile 2x2 con UN accumulatore e sull'Axion misurava 0,73-1,02x, cioe' perdeva pur
- * avendo l'istruzione. Con il blocco 4x4 misura 2,75-3,92x, e il prefill matmat batte BLAS
- * a OGNI budget di thread (j1..j16). Il predicato descrive il silicio; il kernel deve
- * essere all'altezza, e le due cose vanno verificate separatamente. */
+ * WARNING: until 2026-08-21 this predicate would not have been enough on its own. The
+ * BFMMLA kernel was a 2x2 tile with ONE accumulator and on Neoverse-V2 it measured
+ * 0.73-1.02x -- it lost while having the instruction. With the 4x4 block it measures
+ * 2.75-3.92x, and the matmat prefill beats BLAS at EVERY thread budget (j1..j16). The
+ * predicate describes the silicon; the kernel has to be equal to it, and the two things
+ * must be verified separately. */
 int qwen_arm_bf16_matmat_available(void) {
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) && !defined(__APPLE__)
     const char *e = getenv("QWEN_NO_BFMMLA");
@@ -294,7 +295,7 @@ int qwen_arm_bf16_matmat_available(void) {
 #endif
 
 /* Le variabili che cambiano i NUMERI o l'AUDIO, non ogni QWEN_* esistente: un elenco
- * che include il rumore non viene letto. Registro completo the design notes */
+ * che include il rumore non viene letto. Registro completo in docs/feature-flags.md. */
 static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
@@ -302,12 +303,20 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_TTFA_PRIORITY",
     "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_AMX_MIN_B", "QWEN_VNNI_MIN_B", "QWEN_BATCH_STATS", "QWEN_THP", "QWEN_POOL_SPIN",
-    "QWEN_ARM_BFDOT", NULL
+    "QWEN_ARM_BFDOT",
+    /* Added 2026-08-29: these change what is MEASURED rather than what is computed, and
+     * their absence from this list is how two A/B arms ran with the flag unset while the
+     * command line said otherwise. A flag a harness can set belongs here. */
+    "QWEN_TTFA_TRACE", "QWEN_PREFIX_CACHE", "QWEN_SD_PHASE", "QWEN_LIFE_TRACE",
+    "QWEN_REQ_TRACE", "QWEN_ADMIT_M1", "QWEN_KAI_OPS", "QWEN_SERVE_PROFILE",
+    "QWEN_CP_Q2_FFN", "QWEN_CP_PREC", "QWEN_ICL_FRAMES", "QWEN_KAI_NCHUNK",
+    "QWEN_KAI_REPEAT", "QWEN_TF_CODES", "QWEN_TF_PREFIX",
+    NULL
 };
 
-/* Stampa provenienza + flag attive. Sta in cima al report perche' e' la prima cosa da
- * incollare in un confronto: senza di essa due tabelle di numeri non sono confrontabili
- * e nessuno se ne accorge finche' non e' troppo tardi. */
+/* Prints provenance and the active flags. It sits at the top of the report because it is
+ * the first thing to paste into a comparison: without it two tables of numbers are not
+ * comparable, and nobody notices until it is too late. */
 void qwen_provenance_report(void *out) {
     FILE *f = out ? (FILE *)out : stderr;
     fprintf(f, "  build:            %s · SIMD=%s · %s %s\n",
@@ -316,13 +325,26 @@ void qwen_provenance_report(void *out) {
     for (int i = 0; g_qwen_reported_flags[i]; i++) {
         const char *v = getenv(g_qwen_reported_flags[i]);
         if (!v) continue;
-        if (n == 0) fprintf(f, "  flag attive:      ");
+        if (n == 0) fprintf(f, "  active flags:     ");
         else if (n % 3 == 0) fprintf(f, "\n                    ");
         fprintf(f, "%s=%s  ", g_qwen_reported_flags[i], v);
         n++;
     }
-    if (n == 0) fprintf(f, "  flag attive:      nessuna (tutti i default di questa build)\n");
+    if (n == 0) fprintf(f, "  active flags:     none (every default of this build)\n");
     else fprintf(f, "\n");
+
+    /* The same set again on ONE grep-able line, so a driver can assert that the flag it
+     * put on the command line actually reached this process before it spends a single
+     * benchmark request. The prose line above is for a human reading a log; this one is
+     * the contract. A flag is "on" when the process says so, never when the invocation
+     * intended it. */
+    fprintf(f, "[FLAGS] v=1 pid=%d", (int)getpid());
+    for (int i = 0; g_qwen_reported_flags[i]; i++) {
+        const char *v = getenv(g_qwen_reported_flags[i]);
+        if (v) fprintf(f, " %s=%s", g_qwen_reported_flags[i], v);
+    }
+    fprintf(f, "\n");
+    fflush(f);
 }
 
 void qwen_caps_report(void *out) {
@@ -1103,21 +1125,22 @@ static void bf16_matvec_dpbf16(float *y, const uint16_t *xb, const float *x,
 /* Fused bf16 matvec: processes 2 output rows at a time to amortize x vector loads.
  * On NEON: 32 elements/iter, 8 accumulators per row pair (from qwen-asr). */
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
-/* ── BFDOT: il dot bf16 nativo ARM per il matvec (2026-08-21, ARM epic A4) ──
+/* ── BFDOT: the native Arm bf16 dot product for the matvec (2026-08-21) ──
  *
- * Il gemello x86 di questo kernel esiste da mesi (bf16_matvec_dpbf16, VDPBF16PS). Su ARM
- * non c'era: `vbfdotq_f32` non compariva NEMMENO UNA VOLTA nel repo, e il matvec bf16
- * allargava bf16->f32 e poi faceva FMA su una CPU che il dot bf16 ce l'ha.
+ * The x86 twin of this kernel has existed for months (bf16_matvec_dpbf16, VDPBF16PS). On
+ * Arm there was none: `vbfdotq_f32` did not appear ONCE in the repository, and the bf16
+ * matvec widened bf16 -> f32 and then did FMA on a CPU that has the bf16 dot.
  *
- * Dove si vede: la TESTA CODEC (vocab x hidden, bf16 e NON quantizzata) attraversa questo
- * kernel una volta per frame per stream, piu' ogni matvec bf16 quando non si quantizza.
+ * Where it shows: the CODEC HEAD (vocab x hidden, bf16 and NOT quantized) goes through
+ * this kernel once per frame per stream, plus every bf16 matvec when not quantizing.
  *
- * ⚠️ NON e' identico numericamente, ed e' per questo che sta dietro una flag e sta OFF di
- * default: BFDOT tronca l'ATTIVAZIONE a bf16 (i pesi lo sono gia'). E' la stessa troncatura
- * che subiscono la KV cache e il gemello BFMMLA, quindi e' una perdita nota e gia' accettata
- * altrove — ma su un finetune l'unica prova che vale e' la language identity, non il self-test.
- * QWEN_ARM_BFDOT=1 turns it on. Before making it a default: run a language-identity
- * gate on finetuned checkpoints, where the numerics matter most. */
+ * WARNING: it is NOT numerically identical, which is why it sits behind a flag and is OFF
+ * by default. BFDOT truncates the ACTIVATION to bf16 (the weights already are). That is
+ * the same truncation the KV cache and the BFMMLA twin already take, so it is a known and
+ * accepted loss elsewhere -- but on a finetuned checkpoint the only proof that counts is a
+ * language-identity gate, not a self-test: this class of change loses the trained language
+ * long before it damages anything a signal metric can see.
+ * QWEN_ARM_BFDOT=1 enables it. Before making it a default: that gate, on real finetunes. */
 enum { QWEN_ARM_BFDOT_XMAX = 8192 };
 /* Troncatura, non arrotondamento: e' esattamente cio' che fa il gemello BFMMLA
  * ("truncate, like the KV") piu' sotto. Due percorsi bf16 che arrotondano in modo diverso
@@ -2359,19 +2382,19 @@ static void bf16_matmat_bfmmla_slice(float *Y, const uint16_t *W, const uint16_t
     MMSTAT(QWEN_MMK_BF16_BFMMLA, r1 - r0, cols, B);   /* batched-path audit: MACs by kernel */
     /* Xb: [B][cols] bf16 bits (pre-transposed + truncated).
      *
-     * ── 4x4, per la stessa ragione dell'int8 (2026-08-21) ────────────────────────
-     * Una BFMMLA e' un tile 2x2x4: con UN accumulatore il ciclo e' `acc -> acc` a ogni
-     * k += 4, cioe' legato alla latenza dell'istruzione. Sull'Axion questo gemello
-     * misurava 0,73-1,02x contro B x matvec — PERDEVA — e non perche' il bf16 non si
-     * presti: perche' il kernel teneva ferma l'unita'. Quattro catene indipendenti dagli
-     * stessi due carichi di pesi e due di attivazione.
+     * ── 4x4, for the same reason as the int8 twin (2026-08-21) ───────────────────
+     * A BFMMLA is a 2x2x4 tile: with ONE accumulator the loop is `acc -> acc` at every
+     * k += 4, that is, bound by the instruction's latency. On Neoverse-V2 this twin
+     * measured 0.73-1.02x against B x matvec -- it LOST -- and not because bf16 does not
+     * suit the shape: because the kernel was holding the unit still. Four independent
+     * chains from the same two weight loads and two activation loads.
      *
-     * Perche' conta oltre al banco: questo e' il kernel su cui poggia il PREFILL quando
-     * QWEN_PREFILL_MATMAT=1 (prefill_proj_matmat -> qwen_matmat_bf16), cioe' la leva che
-     * su AMX ha dimezzato il TTFA. Finche' il gemello perdeva, quella strada su ARM era
-     * chiusa in partenza.
-     * Numerica invariata: stessa aritmetica, stesso ordine di accumulo per (riga, colonna).
-     * Il ciclo 2x2 resta sotto per i resti di riga e di colonna. */
+     * Why it matters beyond a microbenchmark: this is the kernel the PREFILL rests on when
+     * QWEN_PREFILL_MATMAT=1 (prefill_proj_matmat -> qwen_matmat_bf16), the lever that
+     * halved first-audio latency on AMX. While the twin lost, that road was closed on Arm
+     * before it started.
+     * Numerics unchanged: same arithmetic, same accumulation order per (row, column). The
+     * 2x2 loop stays underneath for the row and column remainders. */
     int r = r0;
     for (; r + 3 < r1 && B >= 4; r += 4) {
         const bfloat16_t *w0 = (const bfloat16_t *)(W + (size_t)r * cols);
@@ -2659,23 +2682,23 @@ static void bf16_amx_task(size_t tid, size_t nt, void *vc) {
 }
 #endif /* __AMX_BF16__ && __AMX_TILE__ */
 
-/* ── Scratch per-thread al posto di malloc/free nel ciclo autoregressivo (2026-08-21) ──
+/* ── Per-thread scratch instead of malloc/free in the autoregressive loop (2026-08-21) ──
  *
- * Ogni via batchata (AMX / VNNI / SMMLA / AVX2 / SDOT / q4) allocava e liberava il suo
- * buffer DENTRO la chiamata: una coppia malloc+free per matmat, per layer, per frame,
- * per thread. Nel Code Predictor sono 15 passi per frame, quindi e' traffico d'allocatore
- * puro su un percorso che gira migliaia di volte al secondo — ed e' esattamente cio' che
- * aveva reso interessante la questione allocatore il 20/08 (the design notes.
+ * Every batched path (AMX / VNNI / SMMLA / AVX2 / SDOT / q4) allocated and freed its own
+ * buffer INSIDE the call: one malloc+free pair per matmat, per layer, per frame, per
+ * thread. In the Code Predictor that is 15 passes per frame, so it is pure allocator
+ * traffic on a path that runs thousands of times a second.
  *
- * I buffer sono piccoli e limitati per costruzione (B <= max_b = 16, cols <= dim del
- * modello), quindi un buffer per thread che cresce fino al massimo visto e poi non si
- * muove piu' e' la forma giusta: dopo i primi frame non c'e' piu' nessuna allocazione.
- * Stesso schema gia' usato dal prefill (pp_xT/pp_yT in qwen_tts_talker.c).
+ * The buffers are small and bounded by construction (B <= max_b = 16, cols <= the model's
+ * dimension), so one buffer per thread that grows to the largest size seen and then stops
+ * moving is the right shape: after the first few frames there is no allocation at all.
+ * Same pattern the prefill already uses (pp_xT/pp_yT in qwen_tts_talker.c).
  *
- * Proprieta' e vita: il buffer appartiene al thread CHIAMANTE, che e' quello che
- * quantizza; i worker di qwen_parallel lo leggono per la durata della chiamata, che e'
- * sincrona — la stessa proprieta' che rendeva corretto il malloc di prima.
- * NON cambia un bit del risultato: il gate e' che il WAV resti byte-identico. */
+ * Ownership and lifetime: the buffer belongs to the CALLING thread, which is the one that
+ * quantizes; qwen_parallel's workers read it for the duration of the call, which is
+ * synchronous -- the same property that made the previous malloc correct.
+ * It does NOT change a single bit of the result: the gate is that the WAV stays
+ * byte-identical. */
 #define QWEN_MM_SCRATCH(name, type)                                                      \
     static __thread type *g_mms_##name = NULL;                                           \
     static __thread size_t g_mms_cap_##name = 0;                                         \
@@ -4159,10 +4182,10 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                 } else {
                     q4_matmat_vnni_slice(Y, W, qXt, sx, corr, 0, rows, cols, B);
                 }
-                /* scratch per-thread: niente da liberare */ /* scratch per-thread: niente da liberare */
+                /* per-thread scratch: nothing to free */
                 return;
             }
-            /* scratch per-thread: niente da liberare */ /* scratch per-thread: niente da liberare */
+            /* per-thread scratch: nothing to free */
         }
     }
 #endif
@@ -4194,10 +4217,10 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                 } else {
                     q4_matmat_avx2_slice(Y, W, qXt, sx, corr, 0, rows, cols, B);
                 }
-                /* scratch per-thread: niente da liberare */ /* scratch per-thread: niente da liberare */
+                /* per-thread scratch: nothing to free */
                 return;
             }
-            /* scratch per-thread: niente da liberare */ /* scratch per-thread: niente da liberare */
+            /* per-thread scratch: nothing to free */
         }
     }
 #endif
@@ -4230,10 +4253,10 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                 } else {
                     q4_matmat_smmla_slice(Y, W, qXt, sx, corr, 0, rows, cols, B);
                 }
-                /* scratch per-thread: niente da liberare */ /* scratch per-thread: niente da liberare */
+                /* per-thread scratch: nothing to free */
                 return;
             }
-            /* scratch per-thread: niente da liberare */ /* scratch per-thread: niente da liberare */
+            /* per-thread scratch: nothing to free */
         }
     }
 #elif defined(__ARM_FEATURE_DOTPROD)
@@ -4822,7 +4845,7 @@ static void int8_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
     const int total = c->q_dim + 2 * c->kv_dim;
     int g0 = (int)(tid * (size_t)total / nt);
     int g1 = (int)((tid + 1) * (size_t)total / nt);
-    /* tre segmenti contigui nello spazio globale delle righe: q, poi k, poi v */
+    /* three contiguous segments in the global row space: q, then k, then v */
     const struct { float *y; const int8_t *W; const float *sc; int base, rows; } seg[3] = {
         { c->q, c->Wq, c->sq, 0,                        c->q_dim  },
         { c->k, c->Wk, c->sk, c->q_dim,                 c->kv_dim },
@@ -4921,10 +4944,10 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
      * even with FTZ set in-block; the per-projection fused matvec is robust.
      * qwen_matvec_int8 dispatches across threads and sets FTZ in each worker. */
 #if defined(__ARM_FEATURE_DOTPROD)
-    /* SDOT: quantizza x UNA volta e serve le tre proiezioni con un solo dispatch.
-     * Stesso qx, stessa sx e stesse righe di prima -> identico bit a bit; quello che
-     * sparisce e' due terzi della quantizzazione e due giri di thread su tre.
-     * QWEN_NO_SDOT=1 riporta tutto sul percorso precedente, senza ricompilare. */
+    /* SDOT: quantize x ONCE and serve all three projections from a single dispatch.
+     * Same qx, same sx and the same rows as before -> bit-for-bit identical; what
+     * disappears is two thirds of the quantization and two thread round-trips out of
+     * three. QWEN_NO_SDOT=1 returns to the previous path without a rebuild. */
     {
         enum { QX_MAX_QKV = 8192 };
         static atomic_int qkv_off = -1;
@@ -5880,7 +5903,7 @@ void qwen_quantize_bf16_to_q6_0(const uint16_t *src_bf16, int rows, int cols,
                      * where |x|+0.5 rounds up to the next integer in f32). The
                      * audio cannot tell, but the parity gate can — and the gate is
                      * only worth having if it is exact, so the kernel matches the
-                     * reference that the language-identity numbers were actually measured on.
+                     * reference the language-identity numbers were measured on.
                      * Changing this to true round-half-away-from-zero is a real
                      * (if tiny) format change and must be re-gated, not assumed. */
                     float a = fabsf(vals[i] / s);
@@ -6308,14 +6331,56 @@ void qwen_matvec_q6_0_qkv(float *q, float *k, float *v,
  * Attention
  * ======================================================================== */
 
-void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
-                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
-                           int head_dim, float scale, int q_offset) {
+/* Threaded causal attention for the PREFILL.
+ *
+ * The head loop below is a plain serial for: sixteen heads, twenty-eight layers, one thread,
+ * while the other seven wait. Nothing in the body is shared -- each (head, query) works on
+ * local scalars and writes o_row, and the heads own disjoint output columns -- so the
+ * serialisation is the loop's, not the mathematics'. Same operations in the same order per
+ * element, so the output is bitwise identical.
+ *
+ * A separate entry point on purpose: the decode path calls the same kernel with one query,
+ * where the work is far too small to be worth entering the pool. */
+typedef struct {
+    float *out; const float *Q, *K, *V;
+    int seq_q, seq_k, n_heads, n_kv_heads, head_dim, q_offset;
+    float scale;
+} qwen_attn_job_t;
+
+static void qwen_attn_task(size_t tid, size_t nt, void *ctx) {
+    const qwen_attn_job_t *j = (const qwen_attn_job_t *)ctx;
+    int per = (j->n_heads + (int)nt - 1) / (int)nt;
+    int h0 = (int)tid * per, h1 = h0 + per;
+    if (h0 >= j->n_heads) return;
+    if (h1 > j->n_heads) h1 = j->n_heads;
+    qwen_causal_attention_heads(j->out, j->Q, j->K, j->V, j->seq_q, j->seq_k,
+                                j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
+                                j->q_offset, h0, h1);
+}
+
+void qwen_causal_attention_prefill(float *out, const float *Q, const float *K, const float *V,
+                                   int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                   int head_dim, float scale, int q_offset) {
+    int nt = qwen_get_threads();
+    if (nt > n_heads) nt = n_heads;
+    if (nt > 1 && seq_q > 1) {
+        qwen_attn_job_t job = { out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads,
+                                head_dim, q_offset, scale };
+        qwen_parallel((size_t)nt, qwen_attn_task, &job);
+        return;
+    }
+    qwen_causal_attention(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads,
+                          head_dim, scale, q_offset);
+}
+
+void qwen_causal_attention_heads(float *out, const float *Q, const float *K, const float *V,
+                                 int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                 int head_dim, float scale, int q_offset, int h_lo, int h_hi) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
 
-    for (int h = 0; h < n_heads; h++) {
+    for (int h = h_lo; h < h_hi; h++) {
         int kv_h = h / heads_per_kv;
         
         for (int i = 0; i < seq_q; i++) {
@@ -6433,6 +6498,13 @@ void qwen_causal_attention(float *out, const float *Q, const float *K, const flo
 
 /* Causal GQA attention with sliding window support.
  * window <= 0 means no window (full causal). */
+void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
+                           int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                           int head_dim, float scale, int q_offset) {
+    qwen_causal_attention_heads(out, Q, K, V, seq_q, seq_k, n_heads, n_kv_heads,
+                                head_dim, scale, q_offset, 0, n_heads);
+}
+
 void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, const float *V,
                                      int seq_q, int seq_k, int n_heads, int n_kv_heads,
                                      int head_dim, float scale, int q_offset, int window) {
@@ -6709,6 +6781,49 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
 void qwen_silu(float *x, int n) {
     for (int i = 0; i < n; i++)
         x[i] = x[i] / (1.0f + expf(-x[i]));
+}
+
+/* Threaded SwiGLU for the PREFILL, where n is the full intermediate width and the same
+ * work is done for every token of every layer.
+ *
+ * The in-place form cannot be threaded as written: it writes gate_up[i] while reading
+ * gate_up[2*i], so a thread owning a later range would overwrite a source another thread
+ * has not read yet. Serially that is safe because the write index always trails the read
+ * index; in parallel it is a race, which is why this loop stayed single-threaded while
+ * eight cores were idle.
+ *
+ * Writing the result into `tmp` removes the dependency entirely -- each thread touches only
+ * tmp[lo,hi) and reads gate_up[2*lo, 2*hi), which nobody writes -- and the copy back after
+ * the barrier restores the caller's contract. Same operations in the same order per element,
+ * so the output is bitwise identical to the serial form.
+ *
+ * Deliberately a SEPARATE entry point: the other six call sites run at small n or from
+ * inside a worker, where a nested parallel region is both unprofitable and unsafe. */
+typedef struct { float *gate_up; float *tmp; int n; } qwen_swiglu_job_t;
+
+static void qwen_swiglu_task(size_t tid, size_t nt, void *ctx) {
+    qwen_swiglu_job_t *j = (qwen_swiglu_job_t *)ctx;
+    int per = (j->n + (int)nt - 1) / (int)nt;
+    per = (per + 3) & ~3;                       /* keep each slice vectorisable */
+    int lo = (int)tid * per, hi = lo + per;
+    if (lo >= j->n) return;
+    if (hi > j->n) hi = j->n;
+    float *tmp = j->tmp; const float *gu = j->gate_up;
+
+    for (int i = lo; i < hi; i++) tmp[i] = -gu[2 * i];
+    for (int i = lo; i < hi; i++) tmp[i] = expf(tmp[i]);
+    for (int i = lo; i < hi; i++) tmp[i] = gu[2 * i] / (1.0f + tmp[i]) * gu[2 * i + 1];
+}
+
+void qwen_swiglu_prefill(float *gate_up, float *tmp, int n) {
+    int nt = qwen_get_threads();
+    if (nt > 1 && n >= 2048) {
+        qwen_swiglu_job_t job = { gate_up, tmp, n };
+        qwen_parallel((size_t)nt, qwen_swiglu_task, &job);
+        memcpy(gate_up, tmp, (size_t)n * sizeof(float));
+        return;
+    }
+    qwen_swiglu_inplace(gate_up, tmp, n);
 }
 
 void qwen_swiglu_inplace(float *gate_up, float *tmp, int n) {
@@ -7467,14 +7582,27 @@ static inline __m256 qwen_vsin2_avx2(__m256 y) {
 /* One channel row of the snake: y = x + (1/beta)*sin^2(alpha*x). Rows are fully
  * independent; the only thing that stood between us and threading them was a
  * dispatcher callable from the decoder thread -- which sd_pool_run is. */
+/* Snake instrumentation, QWEN_SD_PHASE only. Two measurable questions, both from the shape
+ * of the code: expf(log_alpha) / expf(-log_beta) are pure functions of immutable weights yet
+ * are evaluated on every call, and the NEON polynomial has a range guard whose fallback is
+ * libm sinf per lane. Counters instead of a reading of the source. */
+static int sd_phase_on_kern(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_PHASE"); v = (e && *e && *e != '0'); }
+    return v;
+}
+long long qwen_snake_expf_calls = 0, qwen_snake_vec_poly = 0, qwen_snake_vec_libm = 0,
+          qwen_snake_scalar_tail = 0;
 static void snake_row(float *data, int c, int length,
                       const float *log_alpha, const float *log_beta) {
+    const int _snk = sd_phase_on_kern();
 #if (defined(__ARM_NEON) || defined(__AVX2__)) && !(defined(__APPLE__) && defined(USE_BLAS))
     const int sin_poly = !qwen_sin_poly_off();
 #endif
     {
         float a = expf(log_alpha[c]);
         float inv_b = expf(-log_beta[c]);
+        if (_snk) qwen_snake_expf_calls += 2;
         float *row = data + (int64_t)c * length;
 
 #if defined(__APPLE__) && defined(USE_BLAS)
@@ -7507,8 +7635,10 @@ static void snake_row(float *data, int c, int length,
                 float32x4_t ax = vmulq_f32(va, x);
                 float32x4_t s2;
                 if (sin_poly && vmaxvq_f32(vabsq_f32(ax)) <= QWEN_SIN_POLY_MAX) {
+                    if (_snk) qwen_snake_vec_poly++;
                     s2 = qwen_vsin2q_f32(ax);
                 } else {
+                    if (_snk) qwen_snake_vec_libm++;
                     /* Range reduction would lose too many bits here: fall back to libm. */
                     float ax_s[4];
                     vst1q_f32(ax_s, ax);
@@ -7521,6 +7651,7 @@ static void snake_row(float *data, int c, int length,
                 vst1q_f32(row + t, x);
             }
             for (; t < length; t++) {
+                if (_snk) qwen_snake_scalar_tail++;
                 float s = sinf(a * row[t]);
                 row[t] += inv_b * s * s;
             }

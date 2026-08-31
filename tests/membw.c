@@ -1,35 +1,35 @@
-/* membw.c — quanta banda di memoria ha DAVVERO questa macchina, e a quanti thread satura.
+/* membw.c — how much memory bandwidth this machine REALLY has, and where it saturates.
  *
- * PERCHE' ESISTE, e perche' non basta il numero di targa. Il collo di questo motore
- * non e' l'ALU: il Code Predictor rilegge i suoi pesi 16 VOLTE PER FRAME. Quindi la
- * domanda che decide il batching non e' "quanti GFLOP fa" ma:
+ * WHY IT EXISTS, and why the datasheet figure is not enough. This engine's bottleneck is
+ * not the ALU: the Code Predictor re-reads its weights 16 TIMES PER FRAME. So the question
+ * that decides batching is not "how many GFLOP/s" but:
  *
- *     a quanti thread la banda smette di salire?
+ *     at how many threads does bandwidth stop rising?
  *
- * Perche' e' quello il bivio: se la banda satura a 2 thread, dare 8 thread a UNA
- * richiesta e' sprecato e conviene dare 2 thread a QUATTRO richieste; se scala fino
- * a tutti i core, vale il contrario. Senza questo numero la matrice thread x batch
- * si esplora a tentoni, e su un box a ore i tentoni costano.
+ * Because that is the fork: if bandwidth saturates at 2 threads, giving 8 threads to ONE
+ * request is wasted and 2 threads to FOUR requests is better; if it scales to every core,
+ * the opposite holds. Without this number the thread x batch matrix is explored by
+ * guesswork, and on a machine rented by the hour guesswork is expensive.
  *
- * COS'E'. Uno STREAM ridotto all'osso: Copy (a=b) e Triad (a=b+s*c) su tre array di
- * double, con sweep di thread e best-of-N. Pochi secondi, non un benchmark da paper.
+ * WHAT IT IS. STREAM cut to the bone: Copy (a=b) and Triad (a=b+s*c) over three double
+ * arrays, with a thread sweep and best-of-N. A few seconds, not a paper benchmark.
  *
- * LE DUE COSE CHE LO RENDEREBBERO UNA BUGIA, ed entrambe sono gestite qui:
- *   1. ARRAY TROPPO PICCOLI -> si misura la cache, non la DRAM, e il numero esce 5-10x
- *      troppo alto. Gli array sono dimensionati ad almeno 4x la L3 (--l3-mb, passato
- *      da tools/box_info.sh che la L3 la legge davvero).
- *   2. FIRST-TOUCH SEQUENZIALE -> su una macchina NUMA tutte le pagine finiscono sul
- *      nodo di chi ha inizializzato, e il test misura sempre e solo quel nodo. Qui
- *      l'inizializzazione e' PARALLELA e con la stessa partizione della misura, cosi'
- *      le pagine cadono dove il thread che le legge sta girando.
+ * THE TWO THINGS THAT WOULD MAKE IT A LIE, both handled here:
+ *   1. ARRAYS TOO SMALL -> it measures cache rather than DRAM and the number comes out
+ *      5-10x too high. The arrays are sized to at least 4x the L3 (--l3-mb, passed by the
+ *      box-info script, which actually reads the L3).
+ *   2. SEQUENTIAL FIRST TOUCH -> on a NUMA machine every page lands on the initialising
+ *      thread's node, and the test then measures only that node forever. Here the
+ *      initialisation is PARALLEL and uses the same partition as the measurement, so pages
+ *      land where the thread that reads them is running.
  *
- * Uso:
- *   membw [--l3-mb N] [--threads LISTA] [--reps N] [--json] [--label TESTO]
- *     --l3-mb N     dimensiona gli array a max(4*N, 64) MiB ciascuno (default 32)
- *     --threads     "1,2,4,8" (default: 1,2,4,meta' dei core,tutti i core)
- *     --reps N      giri per cella, si tiene il MIGLIORE (default 5)
- *     --json        una riga JSON, per essere incorporata nel report della macchina
- *     --label TESTO etichetta libera (usata per le celle numactl: "numa-local"/"numa-cross")
+ * Use:
+ *   membw [--l3-mb N] [--threads LIST] [--reps N] [--json] [--label TEXT]
+ *     --l3-mb N     size the arrays to max(4*N, 64) MiB each (default 32)
+ *     --threads     "1,2,4,8" (default: 1, 2, 4, half the cores, all the cores)
+ *     --reps N      runs per cell, the BEST is kept (default 5)
+ *     --json        one JSON line, to be embedded in the machine's report
+ *     --label TEXT  free-form label (used for numactl cells: "numa-local"/"numa-cross")
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,8 +41,8 @@
 #include <sys/sysctl.h>
 #endif
 
-/* niente pthread_barrier su macOS: si creano i thread per ogni giro cronometrato e si
- * fanno abbastanza iterazioni interne perche' il costo di create/join sia rumore (<1%). */
+/* no pthread_barrier on macOS: threads are created per timed run, with enough inner
+ * iterations that the create/join cost is noise (<1 %). */
 #define INNER 4
 
 typedef struct {
@@ -118,8 +118,8 @@ int main(int argc, char **argv) {
 
     int ncpu = n_cpus();
 
-    /* sweep di default: 1, 2, 4, meta' dei core, tutti. Il ginocchio sta quasi sempre
-     * fra 2 e "meta'", ed e' esattamente il punto che decide thread-per-richiesta. */
+    /* default sweep: 1, 2, 4, half the cores, all of them. The knee is almost always
+     * between 2 and "half", which is exactly the point that decides threads per request. */
     int  ts[16], nts = 0;
     if (tlist) {
         char buf[256]; snprintf(buf, sizeof buf, "%s", tlist);

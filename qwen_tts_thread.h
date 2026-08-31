@@ -39,6 +39,13 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx);
  * pool of its own. */
 void qwen_threadpool_after_fork(void);
 
+/* Core-milliseconds spent INSIDE tasks, summed over every thread that ran one, plus the
+ * chunk and dispatch counts. Compared against wall x threads it gives the core-time that was
+ * available and unused during a phase. Process CPU time cannot answer that: a spinning idle
+ * worker consumes CPU without doing work. Off until armed. */
+void qwen_parallel_meter(int on);
+void qwen_parallel_meter_read(double *busy_ms, long long *chunks, long long *dispatches);
+
 /* A small integer that travels from the submitting thread into every worker for the
  * duration of one qwen_parallel call. It exists for the MAC audit: the kernels book
  * their counters from INSIDE the worker tasks, so without this the pool's slices are

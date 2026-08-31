@@ -7,7 +7,7 @@
  * per row, which throws away the only thing that makes Q8_0 better than our own int8.
  * ggml's ARM path instead has `q8_0_4x8_q8_0`, which keeps every fp16 scale and is a
  * pure byte shuffle. That is what this file ports - the layout and the instruction
- * strategy, not the ggml runtime. See the design notes
+ * strategy, not the ggml runtime. See docs/bench/2026-08-22-gguf-kleidiai/q8-backend-audit.md
  */
 #ifndef QWEN_TTS_Q8REPACK_H
 #define QWEN_TTS_Q8REPACK_H

@@ -28,6 +28,7 @@
  * the existing q4 kernels slice work. Note qwen_parallel is NOT reentrant off macOS,
  * so this must be called from a top-level step, never from inside another task.
  */
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,7 +58,7 @@
 #include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32p_f32.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm.h"
-/* INT8 per-channel: the census winner per B (the design notes.
+/* INT8 per-channel: the census winner per B (docs/bench/2026-08-23-axion-kernel-census).
  * kr=8 beat kr=4 in every cell, and the 16x4 GEMM tile at B=1 was 0.46-0.55x, so the
  * split is by B and not by dtype. */
 #include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
@@ -141,6 +142,11 @@ int qwen_kleidi_enabled(void) {
     return v;
 }
 
+/* Defined unconditionally: the trace consumer in the talker links on every
+ * build, while the bf16 producer below is guarded by the ISA. */
+double qwen_kbf_pack_ms = 0.0, qwen_kbf_gemm_ms = 0.0;
+
+double qwen_kbf_busy_mean_ms = 0.0, qwen_kbf_busy_max_ms = 0.0;
 #if QWEN_KLEIDI_BUILD
 
 /* ── the registry ─────────────────────────────────────────────────────────────── */
@@ -435,7 +441,7 @@ void qwen_kleidi_stats(int *n_packed, size_t *bytes) {
  * memory. What changes is the compute engine, and the activation quantizer that
  * KleidiAI fuses into its LHS pack. Measured on Neoverse V2, end-to-end with each
  * side paying only the conversions it actually needs, KleidiAI won 55 of 55 cells
- * at 16 threads (the design notes.
+ * at 16 threads (docs/bench/2026-08-23-axion-kernel-census).
  * ════════════════════════════════════════════════════════════════════════════════ */
 
 /* GEMV at B=1, GEMM at B>1. The census made this split, not a guess: the 16x4 GEMM
@@ -927,25 +933,79 @@ typedef struct {
     const kai_entry_t *e;
     const void *lhs_packed;
     float *dst;
-    size_t m, n, k, dst_stride_row;
+    size_t m, n, k, dst_stride_row, n_chunk;
     int gemm;
 } kai_bf_job_t;
 
+static int kbf_trace(void) {
+    static int t = -1;
+    if (t < 0) { const char *e = getenv("QWEN_TTFA_TRACE"); t = (e && e[0] && e[0] != '0'); }
+    return t;
+}
+static double kbf_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+/* CPU time consumed by THIS thread. Wall timestamps cannot tell a worker that computed for
+ * 40 us longer from one that was descheduled for part of them; this can. */
+static double kbf_cpu_ms(void) {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+#endif
+    return -1.0;
+}
+static double kbf_busy[64];
+/* Start and end of each worker's task, plus the tiles it actually owned. busy_spread alone
+ * cannot tell a late start from extra work: a worker that begins 80 us after the others and
+ * then does exactly their amount shows zero spread while the barrier still loses 80 us.
+ * Timestamps separate the two, and the tile count is recorded rather than inferred from n/8. */
+static double kbf_st[64], kbf_en[64], kbf_cpu[64];
+static int kbf_tiles[64], kbf_seen[64];
+
+/* Per-worker busy time for one parallel region. The region's wall time minus the MEAN
+ * busy time is overhead plus imbalance; minus the MAX busy time is the part no amount of
+ * rebalancing can remove (wake-up and join). Two numbers, two different fixes. */
+
 static void kai_bf_task(size_t tid, size_t nt, void *ctx) {
     kai_bf_job_t *j = (kai_bf_job_t *)ctx;
+    const int _tr = kbf_trace();
+    double _b0 = _tr ? kbf_now_ms() : 0.0;
+    double _c0 = _tr ? kbf_cpu_ms() : 0.0;
+    if (_tr && tid < 64) { kbf_st[tid] = _b0; kbf_seen[tid] = 1; kbf_tiles[tid] = 0; }
     const size_t n_step = j->gemm ? KBF_GEMM(get_n_step)() : KBF_GEMV(get_n_step)();
     size_t tiles = (j->n + n_step - 1) / n_step;
     size_t t0 = tiles * tid / nt, t1 = tiles * (tid + 1) / nt;
     size_t n0 = t0 * n_step;
     size_t n1 = (t1 * n_step < j->n) ? t1 * n_step : j->n;
-    if (n0 >= n1) return;
+    if (_tr && tid < 64) kbf_tiles[tid] = (int)(t1 - t0);
+    if (n0 >= n1) { if (_tr && tid < 64) { kbf_busy[tid] = 0.0; kbf_en[tid] = kbf_now_ms(); } return; }
     if (j->gemm) {
-        const size_t roff = KBF_GEMM(get_rhs_packed_offset)(n0, j->k);
-        const size_t doff = KBF_GEMM(get_dst_offset)(0, n0, j->dst_stride_row);
-        KBF_GEMM(run)(j->m, n1 - n0, j->k, j->lhs_packed,
-                      (const uint8_t *)j->e->rhs + roff,
-                      (float *)((uint8_t *)j->dst + doff),
-                      j->dst_stride_row, sizeof(float), -FLT_MAX, FLT_MAX);
+        /* The microkernel's outer loop is over M in steps of mr=8 ("Height loop" in its own
+         * assembly), and it restarts from the base of the packed RHS each time. So a prefill
+         * of m=9..16 sweeps this thread's whole n-slice TWICE, and the second sweep comes
+         * from DRAM because the slice is several megabytes. Measured: prefill wall steps by
+         * ~12 ms at exactly m = 8k+1, which is one full pass over the weights.
+         *
+         * Sub-tiling n keeps each sweep inside a slice small enough to stay in cache, so the
+         * second height pass reuses it instead of re-reading memory. Identical arithmetic:
+         * every output column is still produced by one kernel call over the same k. */
+        size_t chunk = n1 - n0;
+        if (j->n_chunk > 0) {
+            size_t c = j->n_chunk - (j->n_chunk % n_step);   /* whole tiles only */
+            if (c >= n_step) chunk = c;
+        }
+        for (size_t c0 = n0; c0 < n1; c0 += chunk) {
+            size_t c1 = c0 + chunk < n1 ? c0 + chunk : n1;
+            const size_t roff = KBF_GEMM(get_rhs_packed_offset)(c0, j->k);
+            const size_t doff = KBF_GEMM(get_dst_offset)(0, c0, j->dst_stride_row);
+            KBF_GEMM(run)(j->m, c1 - c0, j->k, j->lhs_packed,
+                          (const uint8_t *)j->e->rhs + roff,
+                          (float *)((uint8_t *)j->dst + doff),
+                          j->dst_stride_row, sizeof(float), -FLT_MAX, FLT_MAX);
+        }
     } else {
         const size_t roff = KBF_GEMV(get_rhs_packed_offset)(n0, j->k);
         const size_t doff = KBF_GEMV(get_dst_offset)(0, n0, j->dst_stride_row);
@@ -954,11 +1014,21 @@ static void kai_bf_task(size_t tid, size_t nt, void *ctx) {
                       (float *)((uint8_t *)j->dst + doff),
                       j->dst_stride_row, sizeof(float), -FLT_MAX, FLT_MAX);
     }
+    if (_tr && tid < 64) { double _e = kbf_now_ms(); kbf_busy[tid] = _e - _b0; kbf_en[tid] = _e;
+                           double _c1 = kbf_cpu_ms();
+                           kbf_cpu[tid] = (_c0 >= 0 && _c1 >= 0) ? _c1 - _c0 : -1.0; }
 }
 
 QWEN_KAI_SCRATCH(bflhs, uint8_t)
 QWEN_KAI_SCRATCH(bfxt,  float)
 QWEN_KAI_SCRATCH(bfyt,  float)
+
+/* The LHS pack runs on the calling thread, the GEMM runs across the pool. Three prefill
+ * matmuls stop scaling at the same 70 % efficiency while a decoder sgemm on the same box
+ * reaches 95 %, and neither the fork-join cost (~2 us x ~140 dispatches) nor DRAM bandwidth
+ * (linear to 16 threads) accounts for the gap. This splits the two so the serial half can be
+ * priced instead of assumed. Under the existing trace gate -- no new flag. */
+
 
 static int kai_bf_run(const kai_entry_t *e, float *dst, const float *lhs,
                       size_t lhs_stride, size_t dst_stride, int rows, int cols, int B) {
@@ -973,18 +1043,105 @@ static int kai_bf_run(const kai_entry_t *e, float *dst, const float *lhs,
         : kai_get_lhs_packed_size_lhs_quant_pack_bf16p1x4_f32_neon((size_t)B, (size_t)cols, mr, kr, sr);
     uint8_t *lhs_packed = kai_scratch_bflhs(lhs_sz);
     if (!lhs_packed) return 0;
+    const int tr = kbf_trace();
+    double t0 = tr ? kbf_now_ms() : 0.0;
     if (gemm) kai_run_lhs_quant_pack_bf16p8x4_f32_neon((size_t)B, (size_t)cols, mr, kr, sr, 0,
                                                        lhs, lhs_stride, lhs_packed);
     else      kai_run_lhs_quant_pack_bf16p1x4_f32_neon((size_t)B, (size_t)cols, mr, kr, sr, 0,
                                                        lhs, lhs_stride, lhs_packed);
+    if (tr) { qwen_kbf_pack_ms += kbf_now_ms() - t0; t0 = kbf_now_ms(); }
 
+    /* QWEN_KAI_NCHUNK: columns per kernel call inside a worker's slice. DEFAULT 384,
+     * measured on ARM Neoverse-V2: prefill p50 45.02 -> 42.87 and first-audio total
+     * 72.20 -> 70.20 across three paired rounds with disjoint ranges, output bitwise
+     * identical. 0 restores one call per slice (the pre-2026-08-29 behaviour); 192 and 96
+     * were both measured WORSE than either, so smaller is not better -- the per-call cost
+     * overtakes the reuse. */
+    static int nchunk = -1;
+    if (nchunk < 0) { const char *e2 = getenv("QWEN_KAI_NCHUNK"); nchunk = (e2 && *e2) ? atoi(e2) : 384; }
     kai_bf_job_t job = { e, lhs_packed, dst, (size_t)B, (size_t)rows, (size_t)cols,
-                         dst_stride, gemm };
+                         dst_stride, (size_t)(nchunk > 0 ? nchunk : 0), gemm };
     size_t nt = (size_t)qwen_get_threads();
     if (nt < 1) nt = 1;
     if ((size_t)rows < nt * 16) nt = 1;
+    /* QWEN_KAI_REPEAT=1: run the identical region a second time, on the identical packed
+     * RHS, and report both. The fitted per-panel fixed cost has been called a weight sweep
+     * once already and that reading was wrong; this separates the possibilities without
+     * naming them. If the repeat is much cheaper, the cost is cold traffic. If it costs the
+     * same, it is execution or setup, and no amount of locality work will remove it.
+     * Diagnostic only: it doubles the arithmetic, so never in a timing run. */
+    static int rep = -1;
+    if (rep < 0) { const char *e4 = getenv("QWEN_KAI_REPEAT"); rep = (e4 && *e4 && *e4 != '0'); }
+    double r_t0 = rep ? kbf_now_ms() : 0.0;
     if (nt == 1) kai_bf_task(0, 1, &job);
     else         qwen_parallel(nt, kai_bf_task, &job);
+    if (rep) {
+        double r_t1 = kbf_now_ms();
+        if (nt == 1) kai_bf_task(0, 1, &job);
+        else         qwen_parallel(nt, kai_bf_task, &job);
+        double r_t2 = kbf_now_ms();
+        fprintf(stderr, "[KAIREP] v=1 m=%d n=%d k=%d cold_ms=%.4f hot_ms=%.4f ratio=%.3f\n",
+                B, rows, cols, r_t1 - r_t0, r_t2 - r_t1,
+                (r_t1 - r_t0) > 0 ? (r_t2 - r_t1) / (r_t1 - r_t0) : 0.0);
+    }
+    if (tr) {
+        double _rend = kbf_now_ms();
+        qwen_kbf_gemm_ms += _rend - t0;
+        /* One line per GEMM invocation: who started when, who finished when, who owned what.
+         * Ranked later by wall-time tail before first audio, not by core-milliseconds. */
+        double smin = 1e300, smax = -1e300, emin = 1e300, emax = -1e300;
+        double bmin = 1e300, bmax = 0, bsum = 0; int tmin = 1 << 30, tmax = 0, nw = 0;
+        int last_start_tid = -1, last_end_tid = -1;
+        for (size_t i = 0; i < nt && i < 64; i++) {
+            if (!kbf_seen[i]) continue;
+            nw++;
+            if (kbf_st[i] < smin) smin = kbf_st[i];
+            if (kbf_st[i] > smax) { smax = kbf_st[i]; last_start_tid = (int)i; }
+            if (kbf_en[i] < emin) emin = kbf_en[i];
+            if (kbf_en[i] > emax) { emax = kbf_en[i]; last_end_tid = (int)i; }
+            if (kbf_busy[i] < bmin) bmin = kbf_busy[i];
+            if (kbf_busy[i] > bmax) bmax = kbf_busy[i];
+            bsum += kbf_busy[i];
+            if (kbf_tiles[i] < tmin) tmin = kbf_tiles[i];
+            if (kbf_tiles[i] > tmax) tmax = kbf_tiles[i];
+        }
+        /* Split the region into the three losses that need different fixes:
+         *   entry   dispatch -> the LAST worker actually begins
+         *   exec    once everyone has begun, the spread in what remains
+         *   exit    first worker done -> last worker done
+         * plus which worker was last, so "the same one every time" can be told from
+         * "it rotates". */
+        double cpu_sum = 0, cpu_max = 0, off_sum = 0; int cpu_n = 0;
+        for (size_t i = 0; i < nt && i < 64; i++) {
+            if (!kbf_seen[i] || kbf_cpu[i] < 0) continue;
+            cpu_n++; cpu_sum += kbf_cpu[i];
+            if (kbf_cpu[i] > cpu_max) cpu_max = kbf_cpu[i];
+            double off = kbf_busy[i] - kbf_cpu[i];
+            off_sum += off > 0 ? off : 0.0;
+        }
+        double _entry = (nw > 0) ? smax - t0 : 0.0;
+        double _first = (nw > 0) ? smin - t0 : 0.0;
+        double _exec  = (nw > 0) ? (emax - smax) - (emin > smax ? emin - smax : 0.0) : 0.0;
+        double _exit  = (nw > 0) ? emax - emin : 0.0;
+        if (nw > 0)
+            fprintf(stderr, "[GEMMT] v=1 m=%d n=%d k=%d workers=%d region_ms=%.4f "
+                    "start_skew_ms=%.4f finish_tail_ms=%.4f busy_min=%.4f busy_mean=%.4f "
+                    "busy_max=%.4f tiles_min=%d tiles_max=%d util=%.3f "
+                    "first_start_ms=%.4f entry_ms=%.4f exec_ms=%.4f exit_ms=%.4f "
+                    "last_start_tid=%d last_end_tid=%d cpu_n=%d cpu_sum=%.4f "
+                    "cpu_max=%.4f offcpu_sum=%.4f\n",
+                    (int)B, rows, cols, nw, _rend - t0, smax - smin, emax - emin,
+                    bmin, bsum / nw, bmax, tmin, tmax,
+                    (_rend - t0) > 0 ? bsum / ((double)nw * (_rend - t0)) : 0.0,
+                    _first, _entry, _exec, _exit, last_start_tid, last_end_tid,
+                    cpu_n, cpu_sum, cpu_max, off_sum);
+        for (size_t i = 0; i < nt && i < 64; i++) kbf_seen[i] = 0;
+        double sum = 0, mx = 0;
+        size_t cnt = nt < 64 ? nt : 64;
+        for (size_t i = 0; i < cnt; i++) { sum += kbf_busy[i]; if (kbf_busy[i] > mx) mx = kbf_busy[i]; }
+        qwen_kbf_busy_mean_ms += cnt ? sum / (double)cnt : 0.0;
+        qwen_kbf_busy_max_ms  += mx;
+    }
     return 1;
 }
 

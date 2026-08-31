@@ -161,6 +161,11 @@ def semantic(prof, path, engine=None):
         if not re.match(r"^[A-Z][A-Z0-9_]*$", k):
             errs.append(f"environment key {k!r} is not a shell variable name")
         v = spec["value"]
+        # The streaming block holds integers and they are turned into environment values by
+        # environ(); here the schema has already established that a declared value is a
+        # string or null, so a non-string is a schema failure and not this check's business.
+        if v is not None and not isinstance(v, str):
+            continue
         if v is not None and (v != v.strip() or " " in v or "\t" in v):
             errs.append(f"{k}={v!r} has whitespace; --server-env splits on COMMAS, and a "
                         f"space folds every later variable into this one's value")
@@ -207,9 +212,24 @@ def argv(prof, model, port):
     return a + prof["launch"].get("extra_arguments", [])
 
 
+# Fields that are declared elsewhere in the profile but reach the engine as environment
+# variables. Without this mapping a value could sit in the file, be read by a human, and
+# never be applied -- which is the same failure as forgetting the value entirely, except
+# harder to notice because the file says the right thing.
+STREAMING_ENV = {"decode_chunk": "QWEN_STREAM_DECODE_CHUNK",
+                 "decode_chunk_busy": "QWEN_STREAM_DECODE_CHUNK_BUSY"}
+
+
 def environ(prof):
-    return {k: s["value"] for k, s in prof["runtime"]["environment"].items()
-            if s["value"] is not None}
+    env = {k: s["value"] for k, s in prof["runtime"]["environment"].items()
+           if s["value"] is not None}
+    for key, var in STREAMING_ENV.items():
+        v = prof.get("streaming", {}).get(key)
+        if isinstance(v, int):
+            # str(): the engine reports its flags as text, and comparing 8 against "8" made
+            # check-flags disagree with a process that was configured exactly as asked.
+            env.setdefault(var, str(v))  # an explicit runtime.environment entry still wins
+    return env
 
 
 def server_env(prof):
@@ -272,6 +292,49 @@ def cmd_server_env(a):
     return 0
 
 
+def cmd_new(a):
+    """Emit a skeleton for a new deployment, with everything unmeasured marked as such.
+
+    Copying an existing profile is how a value from another machine becomes a claim about
+    this one: the fields are all filled in, they all look deliberate, and nothing says which
+    of them anybody actually measured. A skeleton starts from "unspecified" and makes filling
+    a field a decision.
+    """
+    ref, _ = load(a.like)
+    out = json.loads(json.dumps(ref))          # deep copy, then blank what is not portable
+    out["profile"]["id"] = a.name
+    out["profile"]["description"] = ("FILL IN: what this deployment is, and note that every value "
+                                     "here must come from a measurement on it.")
+    hw = out["hardware"]
+    for k in ("cpu_family", "notes"):
+        hw[k] = "unspecified"
+    # The counts keep the reference's shape rather than becoming zero: a skeleton that fails
+    # `validate` cannot sit in the tree while someone fills it in, and the honesty lives in
+    # qualification.status rather than in an invalid number. The description says to replace
+    # them, and the sweep is what replaces them.
+    hw["notes"] = ("PLACEHOLDER counts, copied from the reference profile for shape only. Replace "
+                   "them with what this machine reports before anything here is quoted.")
+    out["qualification"] = {
+        "status": "unqualified",
+        "workload": "NONE YET — nothing here has been measured on this machine.",
+        "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+        "model": "unspecified", "speaker": "unspecified",
+        "notes": ("Run the break-in sweep in docs/serving-operations.md, then replace the topology, "
+                  "the thread split and the environment with what it measured, and set status to "
+                  "'qualified' with the numbers that earned it. Until then this file is a starting "
+                  "point and says so."),
+    }
+    dest = os.path.join(PERF, a.name + ".json")
+    if os.path.exists(dest) and not a.force:
+        print(f"{dest} exists; pass --force to overwrite", file=sys.stderr)
+        return 2
+    with open(dest, "w") as f:
+        f.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    print(f"wrote {dest}")
+    print("next: edit it, then `tools/perf_profile.py validate`")
+    return 0
+
+
 def cmd_forbidden_env(a):
     """Print the variables that must not be present in the environment of a qualifying run."""
     for k in forbidden_env(load(a.name)[0]):
@@ -314,6 +377,10 @@ def main():
     c.add_argument("name"); c.add_argument("--model", required=True); c.add_argument("--port", default=8000)
     c.set_defaults(fn=cmd_command)
     e = sub.add_parser("server-env"); e.add_argument("name"); e.set_defaults(fn=cmd_server_env)
+    nw = sub.add_parser("new"); nw.add_argument("name")
+    nw.add_argument("--like", default="axion-16c-ttfa",
+                    help="profile to take the STRUCTURE from; every measured value is blanked")
+    nw.add_argument("--force", action="store_true"); nw.set_defaults(fn=cmd_new)
     fb = sub.add_parser("forbidden-env"); fb.add_argument("name")
     fb.set_defaults(fn=cmd_forbidden_env)
     k = sub.add_parser("check-flags")

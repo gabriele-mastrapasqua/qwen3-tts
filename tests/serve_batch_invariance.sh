@@ -56,8 +56,9 @@
 #
 # Campionamento greedy e seed fisso in entrambe: nessuna lotteria da mediare.
 #
-# ⚠️ OSS MODEL on purpose: the defect is in the server's wiring, not in the weights, and a
-# gate that only runs with a private finetune runs neither in CI nor on a rented box.
+# OPEN WEIGHTS on purpose: the defect this gate looks for is in the server's wiring, not
+# in the weights, and a gate that only runs against a checkpoint nobody else has runs
+# neither in CI nor on a rented box.
 #
 # Uso:
 #   tests/serve_batch_invariance.sh

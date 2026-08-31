@@ -27,6 +27,7 @@
 #include <unistd.h>   /* getpid() for the QWEN_SD_PHASE line: glibc does not pull it in transitively the way macOS does */
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_thread.h"
 #include "ingot/safetensors.h"
 
 #include <stdio.h>
@@ -74,6 +75,27 @@ static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float 
 }
 #endif
 #endif
+
+/* Repack a ConvTranspose kernel from the checkpoint layout [in_ch][out_ch][kernel] into
+ * [kernel][in_ch][out_ch] — one contiguous W_k slice per kernel position, which is exactly
+ * what every consumer of these weights asks for.
+ *
+ * Measured 2026-08-28: building those slices on the fly cost 41.8 ms of the 49.7 ms the four
+ * upsample ConvTranspose operations spent on a first-audio call, recurring on every decode
+ * call and independent of the input length, because the cost is O(in_ch*out_ch*kernel) and
+ * the source stride is `kernel` floats — one cache line per element at the widest block.
+ * The weights never change, so the work does not belong on the decode path at all. */
+static float *sd_pack_convt(const float *w, int in_ch, int out_ch, int kernel) {
+    if (!w) return NULL;
+    float *p = (float *)aligned_malloc((size_t)kernel * in_ch * out_ch * sizeof(float));
+    if (!p) return NULL;
+    for (int k = 0; k < kernel; k++)
+        for (int ic = 0; ic < in_ch; ic++)
+            for (int oc = 0; oc < out_ch; oc++)
+                p[((size_t)k * in_ch + ic) * out_ch + oc] =
+                    w[((size_t)ic * out_ch + oc) * kernel + k];
+    return p;
+}
 
 static const float *get_f32(void *ms, const char *name) {
     const ingot_st_tensor *t = ingot_st_find((ingot_st *)ms, name);
@@ -136,9 +158,9 @@ static void causal_conv_transpose1d_naive(float *out, const float *in,
             for (int k = 0; k < kernel; k++) {
                 int out_pos = t * stride + k;
                 if (out_pos < out_len) {
+                    const float *wk = weight + ((int64_t)k * in_ch + ic) * out_ch;
                     for (int oc = 0; oc < out_ch; oc++) {
-                        out[(int64_t)oc * out_len + out_pos] +=
-                            x * weight[((int64_t)ic * out_ch + oc) * kernel + k];
+                        out[(int64_t)oc * out_len + out_pos] += x * wk[oc];
                     }
                 }
             }
@@ -214,6 +236,61 @@ static double sd_ph_now(void) {
 /* step-6 sub-split, filled by conv_decoder_forward_streaming[_batch] */
 static double sd_p6a, sd_p6b, sd_p6c;
 
+/* ── conv_up sub-split ───────────────────────────────────────────────────────────
+ * conv_up is ~89 % of a decode call, which makes it the single largest term in the
+ * engine and, until now, one undecomposed box. A label is not an explanation: these
+ * accumulators force it to name the work it is doing. Same QWEN_SD_PHASE gate, and
+ * `unacc` is printed rather than folded into the last category, so a scheme that does
+ * not reconcile says so.
+ *   convt   4 transposed convolutions (the upsamplers themselves)
+ *   res1    12 dilated k=7 residual convolutions
+ *   res2    12 k=1 residual convolutions
+ *   snake   snake activations
+ *   resadd  the residual copy and add
+ *   alloc   scratch allocation and free
+ *   final   final snake + 96->1 conv + clamp
+ */
+static int sd_up_warm;
+static double sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake,
+              sd_up_resadd, sd_up_alloc, sd_up_final;
+/* Gated on sd_phase_on() rather than on a local `_ph`, so the same macro compiles in
+ * every decoder variant. The accumulators are reset at the top of each emitting call,
+ * which makes them per-call: a non-emitting variant cannot contaminate a later line. */
+/* The mark is file-scope, like the sub-split accumulators above and for the same reason:
+ * the decoder is called inline from the driver loop, one thread per worker process, so
+ * these are not shared. The macro pairs never nest -- every UP_T0 is closed by its UP_ACC
+ * before the next one opens -- so a single mark is sufficient. */
+static double sd_up_t0;
+/* res1 sub-split: the twelve dilated k=7 residual convolutions are 61 % of conv_up after the
+ * ConvTranspose prepack. The warm path builds ext=[tail|chunk], convolves ALL of it and then
+ * discards the first tail_cols outputs, so "how much of this is discarded work" is a
+ * measurable question, not a reading of the source. */
+extern long long qwen_snake_expf_calls, qwen_snake_vec_poly, qwen_snake_vec_libm,
+                 qwen_snake_scalar_tail;
+/* Inside the convolution: the im2col materialises in_ch*kernel rows, a 7x expansion of the
+ * input for k=7, before a single sgemm. "conv" is not an explanation, so it is split into the
+ * packing, the arithmetic and the epilogue, with the bytes written by the packing counted. */
+static double sd_im2col, sd_gemm, sd_cbias;
+/* The three above accumulate over EVERY convolution of one decoder call -- res1 and res2
+ * and the ConvNeXt and init and final convs alike -- while sd_up_res1 counts only the res1
+ * category. Printing them side by side made a 12.63 ms total look like a 12.47 ms part, and
+ * a sum of per-call times that could not match it. Split by kernel so the invariant is
+ * checkable, and stamp every line with the invocation it belongs to so a single call can be
+ * reconciled without aggregating across requests. */
+static double sd_gemm_k7, sd_gemm_other;
+static long long sd_k7_calls, sd_other_calls, sd_call_seq;
+static long long sd_im2col_bytes, sd_gemm_macs;
+static double sd_cv_t0;
+#define CV_T0()      (sd_cv_t0 = sd_phase_on() ? sd_ph_now() : 0.0)
+#define CV_ACC(a_)   do { if (sd_phase_on() && sd_cv_t0 > 0.0) (a_) += sd_ph_now() - sd_cv_t0; } while (0)
+static double sd_c1_ext, sd_c1_conv, sd_c1_cut, sd_c1_tail;
+static long long sd_c1_calls, sd_c1_cols_kept, sd_c1_cols_conv;
+static double sd_c1_t0;
+#define C1_T0()      (sd_c1_t0 = sd_phase_on() ? sd_ph_now() : 0.0)
+#define C1_ACC(a_)   do { if (sd_phase_on() && sd_c1_t0 > 0.0) (a_) += sd_ph_now() - sd_c1_t0; } while (0)
+#define UP_T0()      (sd_up_t0 = sd_phase_on() ? sd_ph_now() : 0.0)
+#define UP_ACC(acc_) do { if (sd_phase_on()) (acc_) += sd_ph_now() - sd_up_t0; } while (0)
+
 
 /* One line per decode call. `unacc` is total minus the six phases: it is the part
  * the phase scheme does NOT explain, and it is printed rather than hidden. */
@@ -222,15 +299,60 @@ static double sd_p6a, sd_p6b, sd_p6c;
         _ph_p[5] += sd_ph_now() - _ph_mark;                                          \
         double _tot = sd_ph_now() - _ph_call0;                                       \
         double _sum = _ph_p[0]+_ph_p[1]+_ph_p[2]+_ph_p[3]+_ph_p[4]+_ph_p[5];         \
-        fprintf(stderr, "[SDPHASE] v=1 pid=%d path=%s group=%d frames=%d "           \
+        fprintf(stderr, "[SDPHASE] v=2 pid=%d seq=%lld path=%s group=%d frames=%d "           \
                 "clock=CLOCK_MONOTONIC domain=S vq=%.3f preconv=%.3f inproj=%.3f "   \
                 "pretf=%.3f outproj=%.3f conv=%.3f conv_cnext=%.3f conv_init=%.3f "  \
                 "conv_up=%.3f sum=%.3f total=%.3f unacc=%.3f\n",                     \
-                (int)getpid(), (path_), (group_), (frames_),                         \
+                (int)getpid(), sd_call_seq, (path_), (group_), (frames_),         \
                 _ph_p[0], _ph_p[1], _ph_p[2], _ph_p[3], _ph_p[4], _ph_p[5],          \
                 sd_p6a, sd_p6b, sd_p6c, _sum, _tot, _tot - _sum);                    \
+        { double _us = sd_up_convt + sd_up_res1 + sd_up_res2 + sd_up_snake +          \
+                       sd_up_resadd + sd_up_alloc + sd_up_final;                      \
+          fprintf(stderr, "[SDUP] v=2 pid=%d seq=%lld path=%s group=%d frames=%d warm=%d "     \
+                  "convt=%.3f res1=%.3f res2=%.3f snake=%.3f resadd=%.3f "            \
+                  "alloc=%.3f final=%.3f sum=%.3f conv_up=%.3f unacc=%.3f\n",         \
+                  (int)getpid(), sd_call_seq, (path_), (group_), (frames_), sd_up_warm,            \
+                  sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake, sd_up_resadd,     \
+                  sd_up_alloc, sd_up_final, _us, sd_p6c, sd_p6c - _us);                 \
+          fprintf(stderr, "[SDRES1] v=1 pid=%d group=%d frames=%d calls=%lld "             \
+                  "ext=%.3f conv=%.3f cut=%.3f sum=%.3f res1=%.3f "                        \
+                  "cols_kept=%lld cols_convolved=%lld discarded=%.1f%%\n",                 \
+                  (int)getpid(), (group_), (frames_), sd_c1_calls,                         \
+                  sd_c1_ext, sd_c1_conv, sd_c1_cut,                                        \
+                  sd_c1_ext + sd_c1_conv + sd_c1_cut, sd_up_res1,                          \
+                  sd_c1_cols_kept, sd_c1_cols_conv,                                        \
+                  sd_c1_cols_conv ? 100.0 * (double)(sd_c1_cols_conv - sd_c1_cols_kept)    \
+                                    / (double)sd_c1_cols_conv : 0.0);                     \
+          fprintf(stderr, "[SDCONV] v=2 pid=%d seq=%lld frames=%d im2col=%.3f gemm=%.3f "  \
+                  "gemm_k7=%.3f gemm_other=%.3f k7_calls=%lld other_calls=%lld "           \
+                  "bias=%.3f sum=%.3f res1_cat=%.3f im2col_MB=%.1f gemm_GMAC=%.2f\n",      \
+                  (int)getpid(), sd_call_seq, (frames_), sd_im2col, sd_gemm,               \
+                  sd_gemm_k7, sd_gemm_other, sd_k7_calls, sd_other_calls,                  \
+                  sd_cbias, sd_im2col + sd_gemm + sd_cbias, sd_up_res1,                    \
+                  (double)sd_im2col_bytes / 1e6, (double)sd_gemm_macs / 1e9);              \
+          fprintf(stderr, "[SDSNAKE] v=1 pid=%d frames=%d snake_ms=%.3f expf=%lld "         \
+                  "vec_poly=%lld vec_libm=%lld scalar_tail=%lld libm_share=%.1f%%\n",       \
+                  (int)getpid(), (frames_), sd_up_snake, qwen_snake_expf_calls,             \
+                  qwen_snake_vec_poly, qwen_snake_vec_libm, qwen_snake_scalar_tail,         \
+                  (qwen_snake_vec_poly + qwen_snake_vec_libm)                               \
+                    ? 100.0 * (double)qwen_snake_vec_libm                                   \
+                      / (double)(qwen_snake_vec_poly + qwen_snake_vec_libm) : 0.0); }       \
     }                                                                                \
 } while (0)
+
+/* One line per convolution of the upsample stack, under the SAME QWEN_SD_PHASE gate (no
+ * new flag). It exists so a shape used in a microbenchmark can be traced back to an op
+ * the engine actually executed, in order, at a known group and frame count -- rather than
+ * asserted to be "the real shape". M/N/K are the GEMM the conv becomes: M = out_ch,
+ * N = the flattened ragged length, K = in_ch * kernel. */
+static void sd_shape_emit(const char *op, const char *path, int group, int frames,
+                          int in_ch, int out_ch, long n, int kernel, int dilation) {
+    if (!sd_phase_on()) return;
+    fprintf(stderr, "[SDSHAPE] v=1 pid=%d path=%s group=%d frames=%d op=%s "
+            "M=%d N=%ld K=%d in_ch=%d out_ch=%d kernel=%d dilation=%d\n",
+            (int)getpid(), path, group, frames, op,
+            out_ch, n, in_ch * kernel, in_ch, out_ch, kernel, dilation);
+}
 
 /* Scale-block size along K (multiple of 16). Smaller = more accurate, slightly
  * slower; the author measured 64 as the sweet spot on N1 (same RTF as 128,
@@ -324,6 +446,47 @@ static void conv_add_bias(float *out, const float *bias, int channels, int lengt
     }
 }
 
+/* im2col for a causal Conv1d, threaded over input channels.
+ *
+ * For a fixed (channel, kernel tap) the source positions are consecutive, so the row is a
+ * contiguous run of the input clipped at both ends by the causal padding. Writing it as a
+ * clipped memcpy plus two memsets removes the two bounds tests the element-wise form paid on
+ * every one of the tens of millions of copies, and makes the copy vectorizable. The channel
+ * rows are disjoint, so the loop parallelises with no synchronisation.
+ *
+ * This moves data only: the buffer handed to sgemm is identical to the one the element-wise
+ * loop produced. */
+typedef struct {
+    float *col;
+    const float *in;
+    int in_ch, length, kernel, dilation, tile, ts, pad_left;
+} sd_im2col_job_t;
+
+static void sd_im2col_task(size_t tid, size_t nt, void *ctx) {
+    const sd_im2col_job_t *j = (const sd_im2col_job_t *)ctx;
+    int per = ((int)j->in_ch + (int)nt - 1) / (int)nt;
+    int ic0 = (int)tid * per;
+    int ic1 = ic0 + per < j->in_ch ? ic0 + per : j->in_ch;
+
+    for (int ic = ic0; ic < ic1; ic++) {
+        const float *src = j->in + (int64_t)ic * j->length;
+        for (int k = 0; k < j->kernel; k++) {
+            float *col_row = j->col + ((int64_t)ic * j->kernel + k) * j->tile;
+            /* in_pos = t + off, valid while in_pos is inside [0, length) */
+            int off = j->ts - j->pad_left + k * j->dilation;
+            int t0 = -off, t1 = j->length - off;
+            if (t0 < 0) t0 = 0;
+            if (t1 > j->tile) t1 = j->tile;
+            if (t1 < t0) t1 = t0;
+            if (t0 > 0) memset(col_row, 0, (size_t)t0 * sizeof(float));
+            if (t1 > t0) memcpy(col_row + t0, src + off + t0,
+                                (size_t)(t1 - t0) * sizeof(float));
+            if (t1 < j->tile) memset(col_row + t1, 0,
+                                     (size_t)(j->tile - t1) * sizeof(float));
+        }
+    }
+}
+
 /* BLAS causal Conv1d: im2col + sgemm (k>1), direct sgemm (k=1) */
 static void causal_conv1d_blas(float *out, const float *in,
                                const float *weight, const float *bias,
@@ -354,6 +517,7 @@ static void causal_conv1d_blas(float *out, const float *in,
     }
 
     /* im2col + sgemm for k>1 */
+    const double _cv_i0 = sd_im2col, _cv_g0 = sd_gemm, _cv_b0 = sd_cbias;
     int pad_left = (kernel - 1) * dilation;
     int64_t col_rows = (int64_t)in_ch * kernel;
 
@@ -368,28 +532,71 @@ static void causal_conv1d_blas(float *out, const float *in,
         int tile = ((int64_t)ts + max_tile > length) ? length - ts : (int)max_tile;
 
         /* Build im2col: col[in_ch*kernel, tile] */
-        memset(col, 0, col_rows * tile * sizeof(float));
-        for (int ic = 0; ic < in_ch; ic++) {
-            for (int k = 0; k < kernel; k++) {
-                float *col_row = col + ((int64_t)ic * kernel + k) * tile;
-                for (int t = 0; t < tile; t++) {
-                    int in_pos = (t + ts) - pad_left + k * dilation;
-                    if (in_pos >= 0 && in_pos < length)
-                        col_row[t] = in[(int64_t)ic * length + in_pos];
-                }
-            }
+        CV_T0();
+        {
+            sd_im2col_job_t job = { col, in, in_ch, length, kernel, dilation,
+                                    tile, ts, pad_left };
+            int nt = qwen_get_threads();
+            if (nt > in_ch) nt = in_ch;
+            if (nt < 1) nt = 1;
+            qwen_parallel((size_t)nt, sd_im2col_task, &job);
         }
 
+        CV_ACC(sd_im2col);
+        if (sd_phase_on()) sd_im2col_bytes += col_rows * tile * (long long)sizeof(float);
+
         /* sgemm: out_tile = weight[out_ch, col_rows] × col[col_rows, tile] */
+        CV_T0();
         SD_GEMM(CblasNoTrans, CblasNoTrans,
                     out_ch, tile, (int)col_rows,
                     1.0f, weight, (int)col_rows,
                     col, tile,
                     0.0f, out + ts, length);
+        CV_ACC(sd_gemm);
+        if (sd_phase_on()) sd_gemm_macs += (long long)out_ch * tile * col_rows;
     }
 
     free(col);
+    CV_T0();
     conv_add_bias(out, bias, out_ch, length);
+    CV_ACC(sd_cbias);
+
+    /* One line per convolution CALL, with its own shape and its own three times. The
+     * aggregate [SDCONV] answers "where does res1 go"; it cannot answer "which of the four
+     * upsample blocks is slow", and the blocks differ by two orders of magnitude in N --
+     * 32 at the first block against 3200 at the last on a one-frame call. A GEMM that is
+     * efficient at N=3200 says nothing about the same kernel at N=32. */
+    if (sd_phase_on()) {
+        double _i = sd_im2col - _cv_i0, _g = sd_gemm - _cv_g0, _b = sd_cbias - _cv_b0;
+        /* How much of this convolution multiplied by zero. On a COLD first call there is no
+         * history, so every tap whose source position falls before 0 contributes a zero from
+         * the causal padding -- and the GEMM still pays for it, because im2col has already
+         * materialised those zeros as ordinary columns. Counted analytically here rather
+         * than in the threaded fill: same number, no atomics, no cost. */
+        long long _zc = 0;
+        for (int _ts = 0; _ts < length; _ts += (int)max_tile) {
+            int _tile = ((int64_t)_ts + max_tile > length) ? length - _ts : (int)max_tile;
+            for (int _k = 0; _k < kernel; _k++) {
+                int _off = _ts - pad_left + _k * dilation;
+                int _lo = -_off, _hi = length - _off;          /* valid t window */
+                if (_lo < 0) _lo = 0;
+                if (_hi > _tile) _hi = _tile;
+                if (_hi < _lo) _hi = _lo;
+                _zc += (long long)in_ch * (_tile - (_hi - _lo));
+            }
+        }
+        long long _elems = (long long)col_rows * length;
+        if (kernel == 7) { sd_gemm_k7 += _g; sd_k7_calls++; }
+        else             { sd_gemm_other += _g; sd_other_calls++; }
+        fprintf(stderr, "[SDCONV1] v=3 pid=%d seq=%lld in_ch=%d out_ch=%d kernel=%d dilation=%d "
+                "length=%d M=%d N=%d K=%d im2col=%.3f gemm=%.3f bias=%.3f sum=%.3f "
+                "gmac=%.4f zero_elems=%lld col_elems=%lld zero_frac=%.4f dead_gmac=%.4f\n",
+                (int)getpid(), sd_call_seq, in_ch, out_ch, kernel, dilation, length,
+                out_ch, length, in_ch * kernel, _i, _g, _b, _i + _g + _b,
+                (double)out_ch * length * in_ch * kernel / 1e9,
+                _zc, _elems, _elems ? (double)_zc / (double)_elems : 0.0,
+                (double)out_ch * _zc / 1e9);
+    }
 }
 
 /* BLAS causal ConvTranspose1d: per-kernel sgemm + scatter */
@@ -400,16 +607,19 @@ static void causal_conv_transpose1d_blas(float *out, const float *in,
     memset(out, 0, (int64_t)out_ch * out_len * sizeof(float));
     /* Right trim is carried by out_len alone — see causal_conv_transpose1d_naive. */
 
-    /* Per-kernel-position: extract weight slice, sgemm, scatter */
-    float *wk = (float *)aligned_malloc((int64_t)in_ch * out_ch * sizeof(float));
+    /* Per-kernel-position: extract weight slice, sgemm, scatter.
+     * Under QWEN_SD_PHASE the three parts are timed separately: the whole point of the
+     * question is WHICH of them owns the call-fixed cost, and a total cannot answer it. */
+    const int _cph = sd_phase_on();
+    double _cg = 0, _cm = 0, _cs = 0, _cb = 0, _ct0 = _cph ? sd_ph_now() : 0.0, _cx;
     float *rk = (float *)aligned_malloc((int64_t)out_ch * in_len * sizeof(float));
 
     for (int k = 0; k < kernel; k++) {
-        /* Extract W_k[in_ch, out_ch] from weight[in_ch, out_ch, kernel] */
-        for (int ic = 0; ic < in_ch; ic++)
-            for (int oc = 0; oc < out_ch; oc++)
-                wk[(int64_t)ic * out_ch + oc] =
-                    weight[((int64_t)ic * out_ch + oc) * kernel + k];
+        /* W_k[in_ch, out_ch] is already contiguous: the weights were packed into
+         * [kernel][in_ch][out_ch] at load. This used to be rebuilt here, per call. */
+        if (_cph) _cx = sd_ph_now();
+        const float *wk = weight + (int64_t)k * in_ch * out_ch;
+        if (_cph) { double _n = sd_ph_now(); _cg += _n - _cx; _cx = _n; }
 
         /* rk[out_ch, in_len] = W_k^T[out_ch, in_ch] × in[in_ch, in_len] */
         SD_GEMM(CblasTrans, CblasNoTrans,
@@ -417,6 +627,7 @@ static void causal_conv_transpose1d_blas(float *out, const float *in,
                     1.0f, wk, out_ch,
                     in, in_len,
                     0.0f, rk, in_len);
+        if (_cph) { double _n = sd_ph_now(); _cm += _n - _cx; _cx = _n; }
 
         /* Scatter to strided output positions */
         for (int oc = 0; oc < out_ch; oc++) {
@@ -428,11 +639,22 @@ static void causal_conv_transpose1d_blas(float *out, const float *in,
                     dst[out_pos] += src[t];
             }
         }
+        if (_cph) _cs += sd_ph_now() - _cx;
     }
 
-    free(wk);
     free(rk);
+    if (_cph) _cx = sd_ph_now();
     conv_add_bias(out, bias, out_ch, out_len);
+    if (_cph) {
+        _cb = sd_ph_now() - _cx;
+        double _tot = sd_ph_now() - _ct0, _sum = _cg + _cm + _cs + _cb;
+        fprintf(stderr, "[SDCONVT] v=1 pid=%d in_ch=%d out_ch=%d kernel=%d stride=%d "
+                "in_len=%d out_len=%d gather=%.3f gemm=%.3f scatter=%.3f bias=%.3f "
+                "sum=%.3f total=%.3f unacc=%.3f gather_elems=%lld\n",
+                (int)getpid(), in_ch, out_ch, kernel, stride, in_len, out_len,
+                _cg, _cm, _cs, _cb, _sum, _tot, _tot - _sum,
+                (long long)kernel * in_ch * out_ch);
+    }
 }
 #endif /* USE_BLAS */
 
@@ -643,6 +865,38 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
                 sd->pre_conv_bias[0], sd->pre_conv_bias[1], sd->pre_conv_bias[2]);
     } else {
         fprintf(stderr, "  [LOAD] pre_conv_weight is NULL!\n");
+    }
+
+    /* ── Repack the ConvTranspose weights, once, here ────────────────────────────────
+     * Before the server forks its workers, so the packed pages are shared copy-on-write
+     * rather than rebuilt per worker. The conv_weight pointers are repointed at the packed
+     * form: the checkpoint layout has no reader left afterwards. */
+    {
+        static const int cn_ch = 1024, cn_k = 2;
+        static const int up_in[4]  = {1536, 768, 384, 192};
+        static const int up_out[4] = {768, 384, 192, 96};
+        static const int up_k[4]   = {16, 10, 8, 6};
+        size_t packed_bytes = 0;
+        for (int b = 0; b < 2; b++) {
+            if (!sd->convnext[b].conv_weight) continue;
+            float *p = sd_pack_convt(sd->convnext[b].conv_weight, cn_ch, cn_ch, cn_k);
+            if (!p) { fprintf(stderr, "Error: out of memory packing ConvNeXt %d\n", b); return -1; }
+            sd->convt_packed[b] = p;
+            sd->convnext[b].conv_weight = p;
+            packed_bytes += (size_t)cn_k * cn_ch * cn_ch * sizeof(float);
+        }
+        for (int b = 0; b < 4; b++) {
+            if (!sd->upsample_blocks[b].upsample.conv_weight) continue;
+            float *p = sd_pack_convt(sd->upsample_blocks[b].upsample.conv_weight,
+                                     up_in[b], up_out[b], up_k[b]);
+            if (!p) { fprintf(stderr, "Error: out of memory packing upsample %d\n", b); return -1; }
+            sd->convt_packed[2 + b] = p;
+            sd->upsample_blocks[b].upsample.conv_weight = p;
+            packed_bytes += (size_t)up_k[b] * up_in[b] * up_out[b] * sizeof(float);
+        }
+        if (!ctx->silent)
+            fprintf(stderr, "  ConvTranspose weights: repacked once (%.1f MB, shared after fork)\n",
+                    (double)packed_bytes / 1e6);
     }
 
     if (!ctx->silent) {
@@ -1599,13 +1853,16 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
                                   ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
 
             float *c2_out = (float *)aligned_calloc((int64_t)cur_ch * cur_len, sizeof(float));
+            UP_T0();
             causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias,
                           cur_ch, cur_ch, cur_len, 1, 1);
+            UP_ACC(sd_up_res2);
 
-            for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
-                signal[i] = res[i] + c2_out[i];
-            free(c2_out);
-            free(res);
+            { UP_T0();
+              for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
+                  signal[i] = res[i] + c2_out[i];
+              UP_ACC(sd_up_resadd); }
+            { UP_T0(); free(c2_out); free(res); UP_ACC(sd_up_alloc); }
         }
     }
 
@@ -1695,6 +1952,7 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
     }
 
     int ext_len = tail_cols + len;
+    C1_T0();
     float *ext = (float *)aligned_malloc((int64_t)in_ch * ext_len * sizeof(float));
     if (!ext) return NULL;
     for (int ic = 0; ic < in_ch; ic++) {
@@ -1709,10 +1967,15 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
         memcpy(tail + (int64_t)ic * tail_cols, ext + (int64_t)ic * ext_len + len,
                (size_t)tail_cols * sizeof(float));
 
+    C1_ACC(sd_c1_ext);
+    C1_T0();
     float *full = (float *)aligned_calloc((int64_t)out_ch * ext_len, sizeof(float));
     if (!full) { free(ext); return NULL; }
     causal_conv1d(full, ext, w, b, in_ch, out_ch, ext_len, kernel, dilation);
     free(ext);
+    C1_ACC(sd_c1_conv);
+    if (sd_phase_on()) { sd_c1_calls++; sd_c1_cols_kept += len; sd_c1_cols_conv += ext_len; }
+    C1_T0();
 
     /* Drop the first tail_cols outputs: those re-pad with zeros (wrong) and were
      * already emitted by earlier chunks. */
@@ -1721,6 +1984,7 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
     for (int oc = 0; oc < out_ch; oc++)
         memcpy(out + (int64_t)oc * len, full + (int64_t)oc * ext_len + tail_cols,
                (size_t)len * sizeof(float));
+    C1_ACC(sd_c1_cut);
     free(full);
     return out;
 }
@@ -1908,12 +2172,16 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         int out_ch = out_channels[b];
         if (!ub->upsample.conv_weight) { free(signal); return -1; }
 
-        if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
-            snake_activation(signal, cur_ch, cur_len, ub->upsample.snake_alpha, ub->upsample.snake_beta);
+        { UP_T0();
+          if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
+              snake_activation(signal, cur_ch, cur_len, ub->upsample.snake_alpha, ub->upsample.snake_beta);
+          UP_ACC(sd_up_snake); }
 
+        UP_T0();
         float *up_out = cs_convt(signal, cur_ch, out_ch, cur_len, kernel, rate,
                                  ub->upsample.conv_weight, ub->upsample.conv_bias,
                                  st->cs_up_carry[b]);
+        UP_ACC(sd_up_convt);
         free(signal);
         if (!up_out) return -1;
         signal = up_out; cur_ch = out_ch; cur_len *= rate;
@@ -1921,40 +2189,62 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         int dilations[3] = {1, 3, 9};
         for (int r = 0; r < 3; r++) {
             int dil = dilations[r];
+            UP_T0();
             float *res = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
             if (!res) { free(signal); return -1; }
             memcpy(res, signal, (int64_t)cur_ch * cur_len * sizeof(float));
+            UP_ACC(sd_up_resadd);
 
-            if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
-                snake_activation(signal, cur_ch, cur_len,
-                                 ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+            { UP_T0();
+              if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
+                  snake_activation(signal, cur_ch, cur_len,
+                                   ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+              UP_ACC(sd_up_snake); }
 
+            {
+                char _nm[32]; snprintf(_nm, sizeof _nm, "blk%d_res%d_conv1", b, r);
+                sd_shape_emit(_nm, "per-slot", 1, m, cur_ch, cur_ch, (long)cur_len, 7, dil);
+            }
+            UP_T0();
             float *c1_out = cs_conv1d(signal, cur_ch, cur_ch, cur_len, 7, dil,
                                       ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias,
                                       st->cs_res_tail[b][r], st->cs_warm);
+            UP_ACC(sd_up_res1);
             free(signal);
             if (!c1_out) { free(res); return -1; }
             signal = c1_out;
 
-            if (ub->res_blocks[r].snake2_alpha && ub->res_blocks[r].snake2_beta)
-                snake_activation(signal, cur_ch, cur_len,
-                                 ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
+            { UP_T0();
+              if (ub->res_blocks[r].snake2_alpha && ub->res_blocks[r].snake2_beta)
+                  snake_activation(signal, cur_ch, cur_len,
+                                   ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
+              UP_ACC(sd_up_snake); }
 
             /* conv2 is k=1: stateless */
+            UP_T0();
             float *c2_out = (float *)aligned_calloc((int64_t)cur_ch * cur_len, sizeof(float));
             if (!c2_out) { free(res); free(signal); return -1; }
+            UP_ACC(sd_up_alloc);
+            {
+                char _nm[32]; snprintf(_nm, sizeof _nm, "blk%d_res%d_conv2", b, r);
+                sd_shape_emit(_nm, "per-slot", 1, m, cur_ch, cur_ch, (long)cur_len, 1, 1);
+            }
+            UP_T0();
             causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias,
                           cur_ch, cur_ch, cur_len, 1, 1);
+            UP_ACC(sd_up_res2);
 
-            for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
-                signal[i] = res[i] + c2_out[i];
-            free(c2_out);
-            free(res);
+            { UP_T0();
+              for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
+                  signal[i] = res[i] + c2_out[i];
+              UP_ACC(sd_up_resadd); }
+            { UP_T0(); free(c2_out); free(res); UP_ACC(sd_up_alloc); }
         }
     }
 
     /* Final Snake + Conv (96→1, k=7) with a 6-column input tail */
     if (!sd->final_snake.alpha || !sd->final_conv_weight) { free(signal); return -1; }
+    UP_T0();
     snake_activation(signal, cur_ch, cur_len, sd->final_snake.alpha, sd->final_snake.beta);
 
     float *audio = (float *)aligned_calloc(cur_len, sizeof(float));
@@ -1967,6 +2257,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         if (audio[i] < -1.0f) audio[i] = -1.0f;
         if (audio[i] > 1.0f) audio[i] = 1.0f;
     }
+    UP_ACC(sd_up_final);
 
     st->cs_warm = 1;   /* tails now hold real context; later chunks must prepend them */
 
@@ -2001,7 +2292,18 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     const int  _ph    = sd_phase_on();
     const double _ph_call0 = _ph ? sd_ph_now() : 0.0;
     double _ph_p[6] = {0,0,0,0,0,0}, _ph_mark = 0.0;
-    if (_ph) { sd_p6a = sd_p6b = sd_p6c = 0.0; }
+    if (_ph) { sd_p6a = sd_p6b = sd_p6c = 0.0;
+               sd_up_convt = sd_up_res1 = sd_up_res2 = sd_up_snake =
+               sd_up_resadd = sd_up_alloc = sd_up_final = 0.0;
+               sd_up_warm = st->cs_warm;
+               sd_c1_ext = sd_c1_conv = sd_c1_cut = sd_c1_tail = 0.0;
+               sd_c1_calls = sd_c1_cols_kept = sd_c1_cols_conv = 0; sd_c1_t0 = 0.0;
+               qwen_snake_expf_calls = qwen_snake_vec_poly = qwen_snake_vec_libm =
+               qwen_snake_scalar_tail = 0;
+               sd_im2col = sd_gemm = sd_cbias = 0.0;
+               sd_gemm_k7 = sd_gemm_other = 0.0;
+               sd_k7_calls = sd_other_calls = 0; sd_call_seq++;
+               sd_im2col_bytes = sd_gemm_macs = 0; sd_cv_t0 = 0.0; }
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
     qwen_tts_config_t *c = &ctx->config;
 
@@ -2747,17 +3049,15 @@ static float *rag_convt(const float *in, int in_ch, int out_ch,
     rag_recompute(&rfull);
 
     float *full = (float *)aligned_calloc((int64_t)out_ch * rfull.total, sizeof(float));
-    float *wk   = (float *)aligned_malloc((int64_t)in_ch * out_ch * sizeof(float));
     float *rk   = (float *)aligned_malloc((int64_t)out_ch * rin->total * sizeof(float));
     float *out  = (float *)aligned_malloc((int64_t)out_ch * rout->total * sizeof(float));
-    if (!full || !wk || !rk || !out) {
-        free(full); free(wk); free(rk); free(out); rag_free(&rfull); return NULL;
+    if (!full || !rk || !out) {
+        free(full); free(rk); free(out); rag_free(&rfull); return NULL;
     }
 
     for (int k = 0; k < kernel; k++) {
-        for (int ic = 0; ic < in_ch; ic++)
-            for (int oc = 0; oc < out_ch; oc++)
-                wk[(int64_t)ic * out_ch + oc] = w[((int64_t)ic * out_ch + oc) * kernel + k];
+        /* already contiguous, packed at load — see sd_pack_convt() */
+        const float *wk = w + (int64_t)k * in_ch * out_ch;
 
         SD_GEMM(CblasTrans, CblasNoTrans, out_ch, (int)rin->total, in_ch,
                 1.0f, wk, out_ch, in, (int)rin->total, 0.0f, rk, (int)rin->total);
@@ -2792,7 +3092,7 @@ static float *rag_convt(const float *in, int in_ch, int out_ch,
             }
         }
     }
-    free(full); free(wk); free(rk);
+    free(full); free(rk);
     rag_free(&rfull);
     return out;
 }
@@ -2848,6 +3148,9 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
     int rc = -1;
     int cur_ch = 1024;
+    /* Captured before rg is rewritten stage by stage: the INPUT frame count of item 0,
+     * which is what a shape must be traced back to. */
+    const int frames_in = (rg->n > 0) ? rg->len[0] : 0;
     sd_rag_t rnext;
     float **tails = (float **)calloc((size_t)nb, sizeof(float *));
     if (rag_alloc(&rnext, nb) != 0 || !tails) { rag_free(&rnext); free(tails); free(signal); return -1; }
@@ -2905,14 +3208,18 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
             int rate = up_rates[blk], kernel = rate * 2, out_ch = out_channels[blk];
             if (!ub->upsample.conv_weight) goto done;
 
-            if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
-                snake_activation(signal, cur_ch, (int)rg->total,
-                                 ub->upsample.snake_alpha, ub->upsample.snake_beta);
+            { UP_T0();
+              if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
+                  snake_activation(signal, cur_ch, (int)rg->total,
+                                   ub->upsample.snake_alpha, ub->upsample.snake_beta);
+              UP_ACC(sd_up_snake); }
 
             for (int b = 0; b < nb; b++) tails[b] = sts[b]->cs_up_carry[blk];
+            UP_T0();
             float *up_out = rag_convt(signal, cur_ch, out_ch, rg, kernel, rate,
                                       ub->upsample.conv_weight, ub->upsample.conv_bias,
                                       tails, &rnext);
+            UP_ACC(sd_up_convt);
             free(signal); signal = NULL;
             if (!up_out) goto done;
             for (int b = 0; b < nb; b++) rg->len[b] = rnext.len[b];
@@ -2922,19 +3229,30 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
             for (int r = 0; r < 3; r++) {
                 int dil = dilations[r];
                 int64_t nel = (int64_t)cur_ch * rg->total;
+                UP_T0();
                 float *res = (float *)aligned_malloc(nel * sizeof(float));
                 if (!res) goto done;
                 memcpy(res, signal, nel * sizeof(float));
+                UP_ACC(sd_up_resadd);
 
+                UP_T0();
                 if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
                     snake_activation(signal, cur_ch, (int)rg->total,
                                      ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+                UP_ACC(sd_up_snake);
 
+                UP_T0();
                 float *c1_out = (float *)aligned_malloc(nel * sizeof(float));
                 if (!c1_out) { free(res); goto done; }
                 for (int b = 0; b < nb; b++) tails[b] = sts[b]->cs_res_tail[blk][r];
+                {
+                    char _nm[32]; snprintf(_nm, sizeof _nm, "blk%d_res%d_conv1", blk, r);
+                    sd_shape_emit(_nm, "ragged", nb, frames_in, cur_ch, cur_ch,
+                                  (long)rg->total, 7, dil);
+                }
                 int crc = rag_conv1d(c1_out, signal, cur_ch, cur_ch, rg, 7, dil,
                                      ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias, tails);
+                UP_ACC(sd_up_res1);
                 free(signal); signal = c1_out;
                 if (crc != 0) { free(res); goto done; }
 
@@ -2944,11 +3262,20 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
 
                 float *c2_out = (float *)aligned_calloc(nel, sizeof(float));
                 if (!c2_out) { free(res); goto done; }
+                {
+                    char _nm[32]; snprintf(_nm, sizeof _nm, "blk%d_res%d_conv2", blk, r);
+                    sd_shape_emit(_nm, "ragged", nb, frames_in, cur_ch, cur_ch,
+                                  (long)rg->total, 1, 1);
+                }
+                UP_T0();
                 rag_conv1d(c2_out, signal, cur_ch, cur_ch, rg, 1, 1,
                            ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias, NULL);
+                UP_ACC(sd_up_res2);
 
-                for (int64_t i = 0; i < nel; i++) signal[i] = res[i] + c2_out[i];
-                free(c2_out); free(res);
+                { UP_T0();
+                  for (int64_t i = 0; i < nel; i++) signal[i] = res[i] + c2_out[i];
+                  UP_ACC(sd_up_resadd); }
+                { UP_T0(); free(c2_out); free(res); UP_ACC(sd_up_alloc); }
             }
         }
     }

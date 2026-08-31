@@ -15,29 +15,29 @@ CC = gcc
 #   - Linux ARM:  -march=native (NEON; M1-class and up)
 SIMD ?= auto
 
-# ── SIMD=auto: scegli il profilo PIU' ALTO che questa macchina e questo compilatore
-# reggono, invece di ricadere in silenzio sull'AVX2 portabile.
+# ── SIMD=auto: pick the HIGHEST profile this machine and this compiler support, instead
+# of silently falling back to portable AVX2.
 #
-# PERCHE' ESISTE (successo il 2026-08-20, ed e' costata mezz'ora di caccia al colpevole
-# sbagliato): su una Emerald Rapids un `make blas` liscio compilava il default portabile,
-# quindi niente AMX, niente VNNI, niente AVX-512-BF16 — tutti gli speedup spenti. Non
-# fallisce, non avverte, passa il self-test: l'unico sintomo e' "~1.5x piu' lento", che si
-# scambia per la macchina, per il vicino rumoroso o per il proprio ultimo commit. Un
-# default che perde silenziosamente il 40% e' un default sbagliato.
+# WHY IT EXISTS, and it cost half an hour of hunting the wrong suspect: on an Emerald
+# Rapids host a plain `make blas` compiled the portable default — no AMX, no VNNI, no
+# AVX-512-BF16, every speedup off. It does not fail, it does not warn, it passes the
+# self-test: the only symptom is "~1.5x slower", which gets blamed on the machine, on a
+# noisy neighbour, or on one's own last commit. A default that silently loses 40 % is a
+# wrong default.
 #
-# DUE CONDIZIONI, entrambe necessarie: la CPU dichiara l'estensione in /proc/cpuinfo E il
-# compilatore accetta il flag. Un gcc vecchio su una Sapphire non sa cosa sia -mamx-int8,
-# e senza la seconda prova la build fallirebbe invece di scendere di un gradino.
+# TWO CONDITIONS, both necessary: the CPU declares the extension in /proc/cpuinfo AND the
+# compiler accepts the flag. An old gcc on a Sapphire host does not know -mamx-int8,
+# and without the second test the build would fail instead of stepping down one level.
 #
-# ⚠️ IL BINARIO RESTA LEGATO ALL'HOST. E' il motivo per cui il default era portabile: con
-# -mavx512f il compilatore emette AVX-512 anche fuori dai nostri kernel, e quel binario va
-# in SIGILL su una CPU piu' vecchia. I percorsi AMX/VNNI nostri sono anche gated a runtime,
-# il codice auto-vettorizzato no. Per un binario da distribuire:  make blas SIMD=portable
+# THE BINARY STAYS TIED TO THIS HOST. That is why the default used to be portable: with
+# -mavx512f the compiler emits AVX-512 outside our kernels too, and that binary SIGILLs on
+# an older CPU. Our own AMX/VNNI paths are gated at runtime as well; auto-vectorised code
+# is not. For a binary meant to be distributed:  make blas SIMD=portable
 ifeq ($(SIMD),auto)
     ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
         ifeq ($(UNAME_S),Linux)
-            # ⚠️ niente `case` qui dentro: $(shell ...) di Make conta le parentesi, e il
-            # `*)` di un ramo case chiude $( in anticipo e tronca il comando. Solo grep.
+            # No `case` in here: Make's $(shell ...) counts parentheses, and the `*)` of
+            # a case branch closes $( early and truncates the command. grep only.
             SIMD := $(shell \
                 F=$$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null); \
                 cc_ok() { $(CC) $$1 -E -x c /dev/null >/dev/null 2>&1; }; \
@@ -53,8 +53,8 @@ ifeq ($(SIMD),auto)
             SIMD := portable
         endif
     else
-        # macOS e Linux ARM restano su -march=native: l'etichetta serve solo perche' il
-        # binario sappia dire di che build e' fatto (finisce in --caps).
+        # macOS and Arm Linux stay on -march=native: the label exists only so the binary
+        # can say what build it is (it ends up in --caps).
         SIMD := native
     endif
 endif
@@ -95,17 +95,17 @@ else
     ARCH_FLAGS = -march=native
 endif
 
-# ── PROVENIENZA INCISA NEL BINARIO ────────────────────────────────────────────
-# Un report deve dire QUALE binario ha prodotto i numeri, non quale checkout c'era
-# nella cartella quando lo hai letto. Su un box affittato le due cose divergono
-# continuamente: si copiano sorgenti a mano, si ricompila, si dimentica. Il 2026-08-20
-# ci sono volute mezz'ora e un braccio di controllo per scoprire che il binario in prova
-# era compilato senza AMX — e la domanda "che versione sta girando?" non aveva risposta.
-# `-dirty` compare se l'albero ha modifiche non committate: un numero preso da un albero
-# sporco non e' riproducibile e deve dirlo da solo.
-# Si puo' SCAVALCARE dalla riga di comando, ed e' il modo giusto di costruire su un box
-# sincronizzato con scp: li' il checkout git e' quello vecchio della macchina e i sorgenti
-# arrivano da fuori, quindi lo sha locale descriverebbe il codice sbagliato. Da usare:
+# ── PROVENANCE STAMPED INTO THE BINARY ────────────────────────────────────────
+# A report has to say WHICH binary produced the numbers, not which checkout happened to be
+# in the directory when you read them. On a rented box the two diverge constantly: sources
+# get copied by hand, rebuilt, forgotten. It once took half an hour and a control arm to
+# discover that the binary under test had been compiled without AMX — and the question
+# "which version is running?" had no answer.
+# `-dirty` appears when the tree has uncommitted changes: a number taken from a dirty tree
+# is not reproducible and has to say so itself.
+# It can be OVERRIDDEN from the command line, which is the right way to build on a box
+# synchronised with scp: there the git checkout is the machine's old one and the sources
+# arrive from outside, so the local sha would describe the wrong codiato. Da usare:
 #     make blas GIT_REV=$(git -C <repo locale> rev-parse --short HEAD)
 GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
 CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -ffast-math \
@@ -785,11 +785,11 @@ test-lora-it: $(TARGET)
 emotion-seeds: $(TARGET)
 	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),the design notes $(if $(N),$(N),5)
 
-# Il cablaggio del batching sotto le due TRANSIZIONI che test-batch non esercita:
-# N->1 (una richiesta resta sola) e 1->N (una viene ammessa accanto a una in corso).
-# Entrambi i bug del 2026-08-20 vivevano li' e passavano test-batch senza un graffio.
-# Aritmetica fissata (QWEN_BATCH_NOMATMUL=1) + greedy + seed fisso -> si pretende
-# l'identita' bit a bit, quindi niente soglie da tarare.
+# The batching wiring under the two TRANSITIONS test-batch does not exercise: N->1 (one
+# request is left alone) and 1->N (one is admitted alongside a running one). Both of the
+# bugs found on 2026-08-20 lived there and passed test-batch without a scratch.
+# Fixed arithmetic (QWEN_BATCH_NOMATMUL=1) + greedy + a fixed seed -> bit-for-bit identity
+# is demanded, so there are no thresholds to tune.
 test-batch-invariance: $(TARGET)
 	@echo "=== 1/2 cablaggio: percorsi pinnati, identita' bit a bit dovuta ==="
 	@MODEL=$(MODEL_SMALL) EP=/v1/tts PIN_ENV="env QWEN_BATCH_NO_SOLO=1 QWEN_BATCH_NOMATMUL=1" CRITERION=byte \
@@ -809,33 +809,33 @@ batching-bench:
 	$(CC) $(CFLAGS_BASE) -o /tmp/batching_bench tests/batching_bench.c -lm
 	@/tmp/batching_bench
 
-# ── LA VERITA' SUL SILICIO — si esegue PER PRIMA su un box appena affittato ──
-# box-report = inventario hardware (tools/box_info.sh) + --caps + --self-test
-# (nativo e fallback) + --matmat-bench (a pieni thread e a -j1).
+# ── THE TRUTH ABOUT THE SILICON — run this FIRST on a freshly rented box ──
+# box-report = hardware inventory (tools/box_info.sh) + --caps + --self-test (native and
+# fallback) + --matmat-bench (at full threads and at -j1).
 #
-# PERCHE' PRIMA DI TUTTO, e non "quando c'e' tempo". Un numero di server preso su
-# una macchina di cui non sai (a) quanti core VERI ha, (b) se il governor scala la
-# frequenza, (c) se sei su due nodi NUMA, (d) se il binario sta davvero eseguendo
-# la primitiva che credi, non e' una misura: e' un aneddoto. Ed e' gia' successo —
-# il q6 AVX-512 e' compilato da giugno e non l'abbiamo MAI visto girare: finche'
-# --caps non lo dichiara attivo SU QUEL BOX, quel percorso non esiste.
+# WHY BEFORE EVERYTHING, and not "when there is time". A serving number taken on a machine
+# where you do not know (a) how many REAL cores it has, (b) whether the governor scales
+# frequency, (c) whether you are across two NUMA nodes, (d) whether the binary is actually
+# executing the primitive you think, is not a measurement: it is an anecdote. And it has
+# already happened — the AVX-512 q6 path was compiled for months and never once observed
+# running: until --caps declares it active ON THAT BOX, that path does not exist.
 #
-# Se --self-test e' rosso, o --caps non nomina la primitiva attesa, FERMATI: la
-# matrice che seguirebbe misura un fallback, e la si scoprirebbe dopo aver pagato.
+# If --self-test is red, or --caps does not name the expected primitive, STOP: the matrix
+# that would follow measures a fallback, and you would find out after paying for it.
 #
-# LA BANDA DI MEMORIA fa parte del report, e non e' un contorno: il Code Predictor
-# rilegge i suoi pesi 16 VOLTE PER FRAME, quindi il carico e' memory-bound. Il numero
-# che decide il batching non e' "quanti GFLOP" ma A QUANTI THREAD LA BANDA SATURA:
-# se satura a 2, dare 8 thread a UNA richiesta e' sprecato e conviene dare 2 thread a
-# QUATTRO richieste. tests/membw.c misura quel ginocchio (Copy+Triad, sweep di thread,
-# array >= 4x L3 per non misurare la cache), e su piu' nodi NUMA aggiunge le celle
-# local-vs-cross. Accanto resta la banda TEORICA, sempre etichettata come STIMA.
+# MEMORY BANDWIDTH is part of the report, not a garnish: the Code Predictor re-reads its
+# weights 16 TIMES PER FRAME, so the workload is memory-bound. The number that decides
+# batching is not "how many GFLOP" but AT HOW MANY THREADS BANDWIDTH SATURATES: if it
+# saturates at 2, giving 8 threads to ONE request is wasted and 2 threads to FOUR requests
+# is better. tests/membw.c measures that knee (Copy+Triad, thread sweep, arrays >= 4x L3 so
+# it does not measure cache), and on multiple NUMA nodes it adds the local-vs-cross cells.
+# The THEORETICAL bandwidth stays alongside, always labelled as an ESTIMATE.
 #
-# Non richiede il modello scaricato: gira su un box vergine, prima di download_model.sh.
+# It does not need the model downloaded: it runs on a bare box, before download_model.sh.
 #
-# HW_JSON=<path> cambia dove finisce l'artefatto JSON (default /tmp/tts/box_info.json).
-# Quel JSON e' la fonte da INCORPORARE nel report del microbench di batching: chiavi
-# stabili, autoesplicativo. Non riscrivere quella logica altrove — leggila da qui.
+# HW_JSON=<path> changes where the JSON artifact lands (default /tmp/tts/box_info.json).
+# That JSON is the source to EMBED in a batching microbenchmark report: stable keys,
+# self-describing. Do not reimplement that logic elsewhere — read it from here.
 HW_JSON ?= /tmp/tts/box_info.json
 MEMBW_BIN ?= /tmp/qwen_membw
 

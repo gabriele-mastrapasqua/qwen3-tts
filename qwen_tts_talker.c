@@ -9,6 +9,7 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_thread.h"
 #include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
 #include "qwen_tts_kleidi.h"
@@ -207,7 +208,7 @@ static void bf16_to_f32_matrix(float *dst, const uint16_t *src, int64_t n) {
  * (bf16_to_f32_matrix). So the bf16 copies are not a load-time residue that a
  * madvise could drop — they are a live reader on the request path, and dropping
  * them would only buy a page-fault storm on the next request. Measured (PLAN 0.nonies
- * S3): 1.7B --int8 holds the mmapped bf16 (up to 3.6 GB) AND
+ * S3, see the design notes): 1.7B --int8 holds the mmapped bf16 (up to 3.6 GB) AND
  * the heap-fused gate_up bf16 (~1.4 GB) AND the quantized copies (~1.8 GB) at once —
  * which is what the OOM kill on this 16 GB Mac actually was.
  *
@@ -426,7 +427,7 @@ void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx) {
  * The dynamic (imatrix-style) bit allocation, but scored on LANGUAGE IDENTITY instead of on
  * perplexity — which is the whole point. llama.cpp's mixed K-quants allocate bits by
  * looking at a proxy loss; here they are allocated by looking at the thing the
- * listener actually hears. The layer set comes from the MEASURED sensitivity profile
+ * customer actually hears. The layer set comes from the MEASURED sensitivity profile
  * (28 layers x "int6 everywhere EXCEPT L", scored at the breaking point), NOT from
  * the accent-delta prior — that prior was falsified three separate times: the
  * critical layers sit in the middle and high (L13 L26 L12 L24 L20 L11), while L00/L03,
@@ -444,11 +445,11 @@ void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx) {
  * Returns the number of layers left at int8, or -1 if the spec cannot be parsed. */
 /* Per-layer format plan: 8 = int8 (per-row, today's gold), 6 = q6_0, 4 = q4_0.
  * THREE levels, not two, and that is the point of the whole track: the answer to
- * "int4 loses the language identity" is not "never use int4", it is "use it ONLY on the layers
+ * "int4 loses the language" is not "never use int4", it is "use it ONLY on the layers
  * the profile says are insensitive, and buy back the bits elsewhere". Quantizing
  * everything to int4 was measured and it drops the language ~1 seed in 5; spending
  * those same average bits unevenly is a different proposition, and it has to be
- * measured on the language identity layer by layer rather than assumed.
+ * measured on language identity layer by layer rather than assumed.
  *
  * Traffic per weight: int8 1.0, q6_0 0.8125, q4_0 0.5625.
  *   top6           (6x int8, 22x q6)                  0.8527  -14.7%
@@ -468,7 +469,7 @@ enum { TK_FMT_Q6 = 6, TK_FMT_INT8 = 8, TK_FMT_Q4 = 4 };
  *
  * ⚠️ READ THIS BEFORE TRUSTING THE ORDER. The 10-seed campaign (PLAN T2.topn)
  * FALSIFIED the idea that this ranking is usable: protecting the 7 LEAST critical
- * layers scored 97.1% language identity against 96.9% for the 7 most critical — indistinguishable,
+ * layers scored 97.1% lang-id against 96.9% for the 7 most critical — indistinguishable,
  * with the seed-to-seed spread larger than the gap between maps. What matters is HOW
  * MANY layers stay at int8, not WHICH. The order is kept because it makes "top-N" a
  * reproducible, documented choice of N layers — NOT because it is optimal. Anyone
@@ -1486,11 +1487,45 @@ static double pfx_now_ms(void) {
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
+/* Per-phase split of the prefill, under the SAME QWEN_TTFA_TRACE gate. Prefill is 61 % of the
+ * single-request first-audio budget and shows a ~12 ms discontinuity whenever the count of NEW
+ * positions crosses a multiple of 8 -- present with KleidiAI, with the q8-repack path and with
+ * BLAS, so it is not the GEMM backend. These accumulators say which phase acquires it. */
+/* Filled by the bf16 KleidiAI path: the LHS pack is serial, the GEMM is not. */
+extern double qwen_kbf_pack_ms, qwen_kbf_gemm_ms;
+/* Inside the ffn phase, but outside kai_bf_run: the SwiGLU itself, the compaction copy
+ * that exists only because the fused gate/up projection writes interleaved at stride
+ * 2*inter while the down projection reads at stride inter, and the residual add. Timed
+ * separately because "4.16 ms outside the GEMM" is a quantity to explain, and a total
+ * cannot say which of the three it is. */
+static double ffn_silu_ms, ffn_compact_ms, ffn_resid_ms;
+/* The QKV phase is three separate projections of the SAME normalised input, and the O
+ * projection is a fourth. Timed apart because they differ in N by 2x and a phase total
+ * cannot show whether the two narrow ones cost more than their arithmetic. */
+static double pj_q_ms, pj_k_ms, pj_v_ms, pj_o_ms;
+static long long pj_calls;
+static long long ffn_silu_calls, ffn_compact_calls, ffn_compact_bytes;
+extern double qwen_kbf_busy_mean_ms, qwen_kbf_busy_max_ms;
+
+static double pf_ph[9];
+#define PF_T0()      (pf_mark = trace ? pfx_now_ms() : 0.0)
+/* pf_mark is 0 on the first layer, where there is no previous phase to close: without the
+ * guard that closure records the absolute monotonic clock instead of an interval. */
+#define PF_ACC(i_)   do { if (trace && pf_mark > 0.0) pf_ph[(i_)] += pfx_now_ms() - pf_mark; } while (0)
+
 int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
+    double pf_mark = 0.0;
     qwen_mm_component(QWEN_COMP_TALKER);   /* MAC audit: attribute this step's kernels */
     static int trace = -1;
     if (trace < 0) { const char *e = getenv("QWEN_TTFA_TRACE"); trace = (e && e[0] && e[0] != '0'); }
     double pfx_t0 = trace ? pfx_now_ms() : 0.0;
+    if (trace) qwen_parallel_meter(1);
+    if (trace) { qwen_kbf_pack_ms = 0.0; qwen_kbf_gemm_ms = 0.0;
+                 qwen_kbf_busy_mean_ms = 0.0; qwen_kbf_busy_max_ms = 0.0;
+                 ffn_silu_ms = ffn_compact_ms = ffn_resid_ms = 0.0;
+                 ffn_silu_calls = ffn_compact_calls = ffn_compact_bytes = 0;
+                 pj_q_ms = pj_k_ms = pj_v_ms = pj_o_ms = 0.0; pj_calls = 0; }
+    if (trace) { for (int _i = 0; _i < 9; _i++) pf_ph[_i] = 0.0; pf_mark = 0.0; }
     qwen_tts_config_t *c = &ctx->config;
     int h = c->hidden_size;
     int q_dim = c->num_heads * c->head_dim;
@@ -1539,25 +1574,31 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
          * So the default stays tied to the TILE, where the win is large enough to survive
          * both thread budgets. Same weights either way: arithmetic order, not precision.
          * ⚠️ Ear-validated on OSS presets only (samples/tests/2026-08-19_prefill-matmat-amx);
-         * the language-identity check on the real finetune is still owed - see PLAN S19. */
-        /* ARM (2026-08-21, GCP c4a / Axion Neoverse-V2): stessa mossa dell'AMX, e qui
-         * it passes the check that had rejected it on x86. Measured on a finetuned
-         * checkpoint, --int8, a 21-token prefill, BLAS -> matmat:
+         * the language-identity check on a real finetune is still owed. */
+        /* ARM (2026-08-21, Arm Neoverse-V2, 16 vCPU): the same move as the AMX one above,
+         * and here it passes the check that rejected it on x86. Measured on a 1.7B
+         * finetune, --int8, a 21-token prefill, BLAS -> matmat:
          *
          *   -j 1   2014 -> 1439 ms      -j 8    434 -> 244 ms
          *   -j 2   1207 ->  754 ms      -j 16   310 -> 167 ms
          *   -j 4    679 ->  413 ms
          *
-         * Vince a OGNI budget di thread, ed e' la differenza con la vicenda x86 del 19/08:
-         * la' il default fu legato al TILE perche' sulla build VNNI-only il banco a -j2
-         * (il budget del prodotto) peggiorava, mentre il trace a -j4 migliorava. Qui non
-         * c'e' quel bivio: OpenBLAS parallelizza il suo sgemm e matmat cavalca il pool del
-         * chiamante, ma anche a un thread solo il matmat resta davanti.
-         * Language identity verified BEFORE changing the default: five voices,
-         * language-identity scoring, 97.8-99.3% against 97.9-99.5% for the BLAS path, off-target
-         * language 0.0-0.1%, durations normal.
-         * ⚠️ Cambia l'ordine aritmetico (attivazioni troncate a bf16), quindi l'audio non e'
-         * bit-identico: QWEN_PREFILL_MATMAT=0 riporta a BLAS senza ricompilare. */
+         * It wins at EVERY thread budget, and that is the difference from the x86 episode
+         * of 08-19: there the default was tied to the TILE because on the VNNI-only build
+         * the product bench at -j2 got worse while the -j4 trace got better. Here there is
+         * no such fork -- OpenBLAS parallelises its own sgemm and matmat rides the caller's
+         * pool, yet even at one thread matmat stays ahead.
+         *
+         * LANGUAGE IDENTITY VERIFIED BEFORE CHANGING THE DEFAULT, which is the debt 08-19
+         * left open: 5 voices of a finetune, MMS-LID, 97.8-99.3 % against 97.9-99.5 % for
+         * the BLAS path, 0.0-0.1 % drift to the base language, normal durations. It matters
+         * because on a finetuned checkpoint this class of change loses the trained language
+         * long before it produces audible damage -- the audio stays clean and the model
+         * drifts, and no signal-level metric sees it.
+         *
+         * WARNING: it changes the arithmetic order (activations truncated to bf16), so the
+         * audio is NOT bit-identical. QWEN_PREFILL_MATMAT=0 returns to BLAS without a
+         * rebuild. */
         else mm_env = qwen_amx_bf16_available() || qwen_arm_bf16_matmat_available();
 #else
         else mm_env = 1;   /* no BLAS: matmat_bf16 >> scalar, and skips the convert */
@@ -1715,14 +1756,18 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                                   l->down_q4, l->down_q6, h, inter, pref_quant);
         }
 
-        /* 1. Input RMSNorm for all positions */
+        PF_ACC(8); PF_T0(); /* 1. Input RMSNorm for all positions */
         qwen_rms_norm(pref_x_norm, residual, l->input_norm, n_new, h, eps);
 
-        /* 2. QKV projections */
+        PF_ACC(0); PF_T0(); /* 2. QKV projections */
         if (use_matmat) {
+            double _p = trace ? pfx_now_ms() : 0.0;
             prefill_proj_matmat(pref_q, PREFW(l, wq), pref_x_norm, n_new, h, q_dim,  pp_xT, pp_yT);
+            if (trace) { pj_q_ms += pfx_now_ms() - _p; _p = pfx_now_ms(); }
             prefill_proj_matmat(pref_kn, PREFW(l, wk), pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
+            if (trace) { pj_k_ms += pfx_now_ms() - _p; _p = pfx_now_ms(); }
             prefill_proj_matmat(pref_vn, PREFW(l, wv), pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
+            if (trace) { pj_v_ms += pfx_now_ms() - _p; pj_calls++; }
         } else {
 #ifdef USE_BLAS
         /* x_norm[n_new, h] × W^T[h, out_dim] = out[n_new, out_dim] */
@@ -1763,11 +1808,11 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
-        /* 3. Q/K RMSNorm per-head */
+        PF_ACC(1); PF_T0(); /* 3. Q/K RMSNorm per-head */
         qwen_rms_norm_per_head(pref_q, l->q_norm, n_new, c->num_heads, c->head_dim, eps);
         qwen_rms_norm_per_head(pref_kn, l->k_norm, n_new, c->num_kv_heads, c->head_dim, eps);
 
-        /* 4. NeoX split-half RoPE for all positions */
+        PF_ACC(2); PF_T0(); /* 4. NeoX split-half RoPE for all positions */
         for (int s = 0; s < n_new; s++) {
             /* ABSOLUTE position s+pos0: with a warm prefix the first computed row is not
              * position 0, and RoPE is the one place where that has to be said out loud. */
@@ -1786,7 +1831,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             memcpy(fill->v + off, pref_v, nb);
         }
 
-        /* 5. Store KV into cache (convert f32→bf16) */
+        PF_ACC(3); PF_T0(); /* 5. Store KV into cache (convert f32→bf16) */
         int64_t cache_base = (int64_t)layer * ctx->kv_max * kv_dim;
         /* The whole [0, n_new) goes to the cache: with a warm prefix, rows [0,pos0)
          * were memcpy'd back into pref_k/pref_v above, so this stays one call and the
@@ -1794,16 +1839,18 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         f32_to_bf16_vec(ctx->kv_cache_k + cache_base, pref_k, (int64_t)seq_len * kv_dim);
         f32_to_bf16_vec(ctx->kv_cache_v + cache_base, pref_v, (int64_t)seq_len * kv_dim);
 
-        /* 6. Causal GQA attention — prefill uses f32 Q/K/V directly (not from cache)
+        PF_ACC(4); PF_T0(); /* 6. Causal GQA attention — prefill uses f32 Q/K/V directly (not from cache)
          * since we just computed them. This avoids bf16 roundtrip during prefill. */
         float scale = 1.0f / sqrtf((float)c->head_dim);
-        qwen_causal_attention(pref_attn_out, pref_q, pref_k, pref_v,
+        qwen_causal_attention_prefill(pref_attn_out, pref_q, pref_k, pref_v,
                               n_new, seq_len, c->num_heads, c->num_kv_heads,
                               c->head_dim, scale, pos0);
 
-        /* 7. Output projection + residual */
+        PF_ACC(5); PF_T0(); /* 7. Output projection + residual */
         if (use_matmat) {
+            double _p = trace ? pfx_now_ms() : 0.0;
             prefill_proj_matmat(pref_proj, PREFW(l, wo), pref_attn_out, n_new, q_dim, h, pp_xT, pp_yT);
+            if (trace) pj_o_ms += pfx_now_ms() - _p;
             for (int64_t i = 0; i < (int64_t)n_new * h; i++)
                 residual[i] += pref_proj[i];
         } else {
@@ -1827,10 +1874,10 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
-        /* 8. Post-attention RMSNorm */
+        PF_ACC(6); PF_T0(); /* 8. Post-attention RMSNorm */
         qwen_rms_norm(pref_x_norm, residual, l->post_attn_norm, n_new, h, eps);
 
-        /* 9. SwiGLU FFN (fused gate+up: interleaved [g0,u0,g1,u1,...]) */
+        PF_ACC(7); PF_T0(); /* 9. SwiGLU FFN (fused gate+up: interleaved [g0,u0,g1,u1,...]) */
         if (use_matmat) {
             prefill_proj_matmat(pref_gate, PREFW(l, gate_up_fused), pref_x_norm, n_new, h, 2 * inter, pp_xT, pp_yT);
         } else {
@@ -1858,17 +1905,25 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         for (int s = 0; s < n_new; s++) {
             float *src = pref_gate + (int64_t)s * 2 * inter;
             float *dst = pref_gate + (int64_t)s * inter;
-            qwen_swiglu_inplace(src, ctx->swiglu_tmp, inter);
+            double _t = trace ? pfx_now_ms() : 0.0;
+            qwen_swiglu_prefill(src, ctx->swiglu_tmp, inter);
+            if (trace) { ffn_silu_ms += pfx_now_ms() - _t; ffn_silu_calls++; _t = pfx_now_ms(); }
             /* swiglu_inplace writes result to src[0..inter-1], copy to compacted dst */
             if (dst != src)
                 memcpy(dst, src, inter * sizeof(float));
+            if (trace && dst != src) {
+                ffn_compact_ms += pfx_now_ms() - _t; ffn_compact_calls++;
+                ffn_compact_bytes += (long long)inter * sizeof(float);
+            }
         }
 
         /* Down projection + residual (compacted: lda=inter) */
         if (use_matmat) {
             prefill_proj_matmat(pref_proj, l->down_bf16, pref_gate, n_new, inter, h, pp_xT, pp_yT);
-            for (int64_t i = 0; i < (int64_t)n_new * h; i++)
-                residual[i] += pref_proj[i];
+            { double _t = trace ? pfx_now_ms() : 0.0;
+              for (int64_t i = 0; i < (int64_t)n_new * h; i++)
+                  residual[i] += pref_proj[i];
+              if (trace) ffn_resid_ms += pfx_now_ms() - _t; }
         } else {
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -1935,9 +1990,40 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     /* Buffers persist in ctx for reuse across generations (server mode) */
 
     if (!ctx->silent) fprintf(stderr, "  Prefill complete (%d tokens in KV cache)\n", seq_len);
-    if (trace)
+    if (trace) {
+        PF_ACC(8);
+        double _sum = 0; for (int _i = 0; _i < 9; _i++) _sum += pf_ph[_i];
+        double _tot = pfx_now_ms() - pfx_t0;
         fprintf(stderr, "PREFILLMS %.1f positions=%d computed=%d reused=%d\n",
-                pfx_now_ms() - pfx_t0, seq_len, n_new, pos0);
+                _tot, seq_len, n_new, pos0);
+        { double _busy = 0; long long _ch = 0, _dp = 0;
+          qwen_parallel_meter_read(&_busy, &_ch, &_dp);
+          int _nt = qwen_get_threads();
+          double _avail = _tot * (double)_nt;
+          fprintf(stderr, "[COREMS] v=1 computed=%d wall=%.3f threads=%d avail_core_ms=%.2f "
+                  "busy_core_ms=%.2f idle_core_ms=%.2f util=%.1f%% chunks=%lld dispatches=%lld\n",
+                  n_new, _tot, _nt, _avail, _busy, _avail - _busy,
+                  _avail > 0 ? 100.0 * _busy / _avail : 0.0, _ch, _dp);
+          qwen_parallel_meter(0); }
+        fprintf(stderr, "[PROJX] v=1 computed=%d layers=%lld q=%.3f k=%.3f v=%.3f o=%.3f "
+                "qkv_sum=%.3f\n", n_new, pj_calls, pj_q_ms, pj_k_ms, pj_v_ms, pj_o_ms,
+                pj_q_ms + pj_k_ms + pj_v_ms);
+        fprintf(stderr, "[FFNX] v=1 computed=%d silu=%.3f silu_calls=%lld compact=%.3f "
+                "compact_calls=%lld compact_MB=%.2f resid=%.3f outside_kai_sum=%.3f\n",
+                n_new, ffn_silu_ms, ffn_silu_calls, ffn_compact_ms, ffn_compact_calls,
+                (double)ffn_compact_bytes / 1e6, ffn_resid_ms,
+                ffn_silu_ms + ffn_compact_ms + ffn_resid_ms);
+        fprintf(stderr, "[KBF] v=1 computed=%d lhs_pack=%.3f gemm=%.3f busy_mean=%.3f "
+                "busy_max=%.3f imbalance=%.3f fixed=%.3f\n",
+                n_new, qwen_kbf_pack_ms, qwen_kbf_gemm_ms,
+                qwen_kbf_busy_mean_ms, qwen_kbf_busy_max_ms,
+                qwen_kbf_busy_max_ms - qwen_kbf_busy_mean_ms,
+                qwen_kbf_gemm_ms - qwen_kbf_busy_max_ms);
+                fprintf(stderr, "[PFPHASE] v=1 computed=%d norm1=%.3f qkv=%.3f qknorm=%.3f rope=%.3f "
+                "kvstore=%.3f attn=%.3f oproj=%.3f norm2=%.3f ffn=%.3f sum=%.3f total=%.3f "
+                "unacc=%.3f\n", n_new, pf_ph[0],pf_ph[1],pf_ph[2],pf_ph[3],pf_ph[4],
+                pf_ph[5],pf_ph[6],pf_ph[7],pf_ph[8], _sum, _tot, _tot-_sum);
+    }
     return 0;
 }
 
@@ -2118,7 +2204,7 @@ void qwen_batch_proj_q(float *dst,
 /* ── One QKV, one pack, one barrier — the B>=2 twin of qwen_kleidi_matmul_i8_qkv ──
  * Q, K and V read the SAME activation. Called through qwen_batch_proj_q they pack it
  * three times and pay three fork-join barriers; measured on the batched server that is
- * 26.0% of all dispatches (the design notes.
+ * 26.0% of all dispatches (docs/bench/2026-08-24-arm-vllm-audit/todo1-idle-workers.md).
  *
  * Declines - and falls back to exactly the three calls it replaces - unless every
  * condition the fused kernel needs holds: int8 weights, no q4, batching actually on,

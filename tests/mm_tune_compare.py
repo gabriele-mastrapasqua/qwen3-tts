@@ -22,14 +22,14 @@ COSA STAMPA
   3. le righe `recommend` pronte da esportare, per box
 
 USO
-  tests/mm_tune_compare.py                             # tutti i *_tune.json the design notes
+  tests/mm_tune_compare.py                             # tutti i *_tune.json in docs/boxes/
   tests/mm_tune_compare.py a_tune.json b_tune.json     # due box specifici
   tests/mm_tune_compare.py --format int8               # solo un formato
   tests/mm_tune_compare.py --json                      # aggregato, per farci altro
 
 COME SI PRODUCE UN NUOVO FILE (sul box, dopo aver costruito):
   ./qwen_tts --matmat-tune -d <modello> > /tmp/tune.json
-  scp <box>:/tmp/tune.json the design notes<data>_<machine-type>_<nome>_tune.json
+  scp <box>:/tmp/tune.json docs/boxes/<data>_<machine-type>_<nome>_tune.json
 
 ⚠️ Un tune vale per il BINARIO con cui e' stato preso. Dopo un cambio di micro-kernel le
 soglie vecchie sono obsolete per costruzione — sul c4a le soglie pre-2026-08-21 erano
@@ -94,7 +94,7 @@ def short(kernel):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("files", nargs="*", help="tune JSON (default: the design notes*_tune.json)")
+    ap.add_argument("files", nargs="*", help="tune JSON (default: docs/boxes/*_tune.json)")
     ap.add_argument("--format", dest="fmt", help="solo questo formato (int8/q4/bf16)")
     ap.add_argument("--threads", type=int, help="solo questo numero di thread")
     ap.add_argument("--json", action="store_true", help="aggregato in JSON")

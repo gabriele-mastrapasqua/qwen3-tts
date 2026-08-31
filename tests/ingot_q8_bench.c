@@ -1,26 +1,25 @@
-/* ingot_q8_bench.c — vale la pena cablare Q8_0 di ingot nel Talker? (task T2)
+/* ingot_q8_bench.c — is it worth wiring the vendored Q8_0 into the Talker?
  *
- * LA DOMANDA CORTA CHE PRECEDE QUELLA LUNGA. Il matvec int8 del motore converte ogni
- * peso a f32 e fa una FMA in virgola mobile (qwen_tts_kernels.c:2270-2310:
- * vcvtq_f32_s32 + vfmaq_f32) — cioe' butta via il vantaggio dell'int8. ingot ha un
- * Q8_0 con kernel NEON/AVX2/SDOT/SMMLA/VNNI verificati contro llama.cpp. Prima di
- * riscrivere il caricamento e il dispatch del Talker, si misura il kernel da solo:
- * se non e' piu' veloce, il cablaggio e' lavoro buttato.
+ * THE SHORT QUESTION THAT COMES BEFORE THE LONG ONE. The engine's int8 matvec converts
+ * every weight to f32 and does a floating-point FMA (vcvtq_f32_s32 + vfmaq_f32) — that is,
+ * it throws away the advantage of int8. The vendored library has a Q8_0 with
+ * NEON/AVX2/SDOT/SMMLA/VNNI kernels verified against llama.cpp. Before rewriting the
+ * Talker's loading and dispatch, measure the kernel on its own: if it is not faster, the
+ * wiring is wasted work.
  *
- * DUE ASSI, non uno. La velocita' da sola non basta: i due formati non hanno la stessa
- * granularita' di scala, quindi vanno confrontati anche in ERRORE contro la stessa
- * reference f32.
+ * TWO AXES, not one. Speed alone is not enough: the two formats do not have the same scale
+ * granularity, so they must also be compared in ERROR against the same f32 reference.
  *
- *   motore int8   una scala per RIGA         (max|W_row|/127)      1,00 byte/peso
- *   ingot Q8_0    una scala ogni 32 pesi     (blocchi da 34 byte)  1,0625 byte/peso
+ *   engine int8   one scale per ROW          (max|W_row|/127)      1.00 bytes/weight
+ *   vendored Q8_0 one scale every 32 weights (34-byte blocks)      1.0625 bytes/weight
  *
- * Q8_0 costa il 6% di byte in piu' e ha una granularita' di scala 64x piu' fine. Se e'
- * anche piu' veloce, non c'e' motivo di tenersi quello a righe.
+ * Q8_0 costs 6 % more bytes and has a 64x finer scale granularity. If it is also faster,
+ * there is no reason to keep the per-row one.
  *
- * Shape reali del Talker 1.7B (hidden 2048): la proiezione quadrata e la FFN, che sono
- * i due regimi diversi (la seconda e' quella che domina la banda).
+ * Real Talker shapes at hidden 2048: the square projection and the FFN, which are the two
+ * different regimes (the second is the one that dominates bandwidth).
  *
- * Build:  make ingot-q8-bench     (oppure la riga in fondo a questo commento)
+ * Build:  make ingot-q8-bench     (or the line at the end of this comment)
  *   cc -O3 -march=native -Ithird_party/ingot/include -I. tests/ingot_q8_bench.c \
  *      qwen_tts_kernels.o qwen_tts_kernels_neon.o qwen_tts_kernels_generic.o \
  *      qwen_tts_kernels_avx.o qwen_tts_thread.o third_party/ingot/libingot.a \

@@ -77,7 +77,8 @@ So three things now enforce it, and each exits non-zero:
   every override is printed as `profile_override=`.
 - **`tools/perf_profile.py forbidden-env`** lists the variables whose profile value is `null`.
   They must be **absent from the environment**, not merely unset by us: the engine sizes
-  OpenBLAS per worker with `openblas_set_num_threads()` and backs off entirely when
+  OpenBLAS to the thread budget at startup with `openblas_set_num_threads()`, and
+  `qwen_blas_set_threads()` returns immediately when
   `OPENBLAS_NUM_THREADS` is present, so somebody else's export silently replaces the
   qualified topology.
 - **`make bench-suite`** is the single entry point for numbers that leave this repo. It owns
@@ -85,3 +86,74 @@ So three things now enforce it, and each exits non-zero:
   gates and writes a manifest containing the exact commands.
 
 Individual rungs remain available for investigation. The suite is the gate for a report.
+
+## Which profiles ship, and why there are not more
+
+| profile | status | what it is |
+|---|---|---|
+| `axion-16c-ttfa` | **qualified** | a 16-core Arm host, measured end to end: topology, thread split, batch width, runtime environment and the concurrency band the claim covers |
+| `generic-16c-starting-point` | **unqualified** | a place to START on a 16-core Arm server. Nothing in it was measured on your machine, and it says so in its own `qualification.notes` |
+| `recommended` | alias | resolves to the qualified one; carries no values of its own |
+
+There is deliberately no profile per machine type we have ever touched. A profile claims
+that a configuration was **measured** on that hardware, and a file that looks like a
+qualification while carrying guesses is worse than no file: it is a wrong default that
+nobody re-measures, which is the same failure the runtime-environment gate above exists to
+prevent.
+
+The way to add one is the break-in sweep in
+[`../../docs/serving-operations.md`](../../docs/serving-operations.md) §2, then a profile
+with `status: qualified` and the numbers that earned it.
+
+### The one rule that generalises, and the one that does not
+
+**Generalises:** a single request saturates at about eight threads and regresses at sixteen.
+That is a property of the work, not of a particular chip.
+
+**Does not:** which `W x K` topology wins. It depends on the concurrency you expect, because
+a worker only sees a batch at `C >= 2W` and the engine takes a different kernel above batch
+2 — so four workers can win at high concurrency and lose at the concurrency you actually
+care about. That one is measured per box, every time.
+
+## Adding a machine
+
+More of these are expected: a profile per deployment that has actually been measured, not per
+machine type anyone has touched.
+
+```bash
+tools/perf_profile.py new <id> [--like axion-16c-ttfa]   # a skeleton, marked unqualified
+$EDITOR configs/perf/<id>.json
+tools/perf_profile.py validate
+```
+
+`new` starts from an existing profile's STRUCTURE and blanks everything that was measured:
+the cpu family, the hardware notes and the whole qualification block. Copying a profile by
+hand is how a value from another machine becomes a claim about this one — every field is
+filled in, every field looks deliberate, and nothing says which of them anybody measured.
+A skeleton starts at `unqualified` and makes filling a field a decision.
+
+Then run the break-in sweep in
+[`../../docs/serving-operations.md`](../../docs/serving-operations.md) §2, put what it
+measured into the file, and set `qualification.status` to `qualified` with the numbers that
+earned it.
+
+### Naming
+
+`<platform>-<cores>c-<objective>` — `axion-16c-ttfa`, `graviton4-32c-throughput`. The
+platform is what a reader would recognise, the core count is the shape the topology was
+qualified at, and the objective is what the profile optimises, because the same machine has
+a different answer for first-audio latency than for throughput.
+
+### The `recommended` alias
+
+`recommended.json` carries a pointer and **no values of its own** — a second copy is a copy
+that drifts. It resolves to whichever profile is currently the default recommendation, and
+changing that is editing one field:
+
+```json
+{ "profile": { "id": "recommended", "alias_of": "<the qualified profile>" } }
+```
+
+It must point at a profile whose status is `qualified`. Pointing it at a starting point would
+make an unmeasured configuration the default answer to "what should I run", which is the
+failure this whole directory exists to prevent.

@@ -938,6 +938,8 @@ int main(int argc, char **argv) {
     int serve_prefork_threads = 0; /* --prefork-threads K: threads per worker (0 = cpus/N) */
     int serve_max_queue = -1;      /* --max-queue: -1 = auto (1), 0 = nessuna coda */
     int serve_queue_timeout = 0;   /* --queue-timeout-ms: 0 = nessuna scadenza */
+    int serve_max_request_s = -1;  /* --max-request-seconds: <0 = keep the built-in default */
+    int serve_max_text_chars = 0;  /* --max-text-chars: 0 = derive from the generation cap */
     const char *ml_steer_path = NULL;  /* --ml-steer: multi-layer Talker emotion steer (.qlsteer) */
     float ml_steer_weight = 8.0f;      /* --ml-weight */
     /* --emotion-weight: doses the steer that --emotion applies. The w12 in the
@@ -945,8 +947,8 @@ int main(int argc, char **argv) {
      * without a strong push. A full finetune with baked speakers is already
      * plastic, so the same push overshoots — and the excess does not become more
      * emotion, it becomes drift, which shows up as lost accent.
-     * Measured 2026-08-14: --emotion sad on a finetuned voice drops language identity from ~90% to
-     * ~8%. See the design notes. -1 = keep the recipe. */
+     * Measured: --emotion sad on a finetuned voice drops language identity from ~90%
+     * to ~8%. See the design notes. -1 = keep the recipe. */
     float emotion_weight = -1.0f;
     int   emotion_layers_l0 = -1, emotion_layers_l1 = -1;   /* --emotion-layers A-B */
     int ml_l0 = 21, ml_l1 = 25;        /* --ml-range "l0-l1" (identity layers) */
@@ -1080,6 +1082,8 @@ int main(int argc, char **argv) {
         {"target-cv",     required_argument, 0, 1024},
         {"max-queue",     required_argument, 0, 1090},
         {"queue-timeout-ms", required_argument, 0, 1091},
+        {"max-request-seconds", required_argument, 0, 1092},
+        {"max-text-chars", required_argument, 0, 1093},
         {"caps",          no_argument,       0, 1025},
         {"workers",       required_argument, 0, 1026},
         {"batch-size",    required_argument, 0, 1043},
@@ -1113,7 +1117,7 @@ int main(int argc, char **argv) {
         {"batch-multi-test", required_argument, 0, 1042},
         {"onset-fade",    required_argument, 0, 1057},
         {"tail-trim",     no_argument,       0, 1058},
-        /* EOS strategy — the design notes. */
+        /* EOS strategy — see the design notes */
         {"eos-strategy",  required_argument, 0, 1700},
         {"eos-suppress",  required_argument, 0, 1701},
         {"eos-fpt",       required_argument, 0, 1702},
@@ -1212,9 +1216,9 @@ int main(int argc, char **argv) {
             case 1073: use_int4 = 1; setenv("QWEN_CP_PREC", "int8", 1); break;  /* --quant-mixed: int4 Talker + int8 CP (best CUDA quant) */
             /* --quant-mixed-cpu: the MIRROR of the line above, and the mirror IS the point.
              * On CPU the Talker is what must stay at int8. At int4 it drops the language
-             * identity outright: a low-resource-language clip comes out classified as a
-             * different language at 89% confidence, reproducibly, on roughly 1 seed in 5. Measured
-             * 2026-08-16, 4 configs x 5 seeds on one finetuned checkpoint and voice: both
+             * identity outright: a target-language clip comes out classified as another
+             * language at 89% (0.6% target), reproducibly, on roughly 1 seed in 5. Measured
+             * over 4 configs x 5 seeds on a finetuned pool checkpoint: both
              * int8-Talker configs collapsed 0/5, both int4-Talker configs collapsed 1/5.
              * The CP tolerates int4 and is where the bandwidth is bought back.
              * Net on 1.7B / M1: RTF ~0.90 (sub-realtime) with the HIGHEST language-identity floor of
@@ -1235,6 +1239,8 @@ int main(int argc, char **argv) {
             case 1024: target_cv_dir = optarg; break;
             case 1090: serve_max_queue = atoi(optarg); break;
             case 1091: serve_queue_timeout = atoi(optarg); break;
+            case 1092: serve_max_request_s = atoi(optarg); break;
+            case 1093: serve_max_text_chars = atoi(optarg); break;
             case 1025: show_caps = 1; break;
             case 1026: serve_workers = atoi(optarg); break;
             case 1043: serve_batch = atoi(optarg); if (serve_batch < 1) serve_batch = 1; break;
@@ -1366,7 +1372,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "                             matter -- HOW MANY does. So q4nN is a ladder on N, not a pick.\n");
                 fprintf(stderr, "                             int4 EVERYWHERE drops the language ~1 seed in 5; int4 only on the\n");
                 fprintf(stderr, "                             layers the profile calls insensitive is a different question, and\n");
-                fprintf(stderr, "                             it gets measured, not assumed. Beat --int8 on BOTH axes: language identity AND\n");
+                fprintf(stderr, "                             it gets measured, not assumed. Beat --int8 on BOTH axes: language AND\n");
                 fprintf(stderr, "                             speed. EXPERIMENTAL -- see PLAN.md T2.kernel\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
                 fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B). Primaries: sad/joy/anger/fear/disgust/surprise.\n");
@@ -1388,6 +1394,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "                             default 1, one grace slot. A queue deeper than the\n");
                 fprintf(stderr, "                             latency budget yields answers nobody still wants\n");
                 fprintf(stderr, "  --queue-timeout-ms <ms>    Server: drop a request that waited this long -> 503\n");
+                fprintf(stderr, "  --max-request-seconds <s>  Server: stop a request generating this long (default 60, 0=off)\n");
+                fprintf(stderr, "  --max-text-chars <n>       Server: max input length (default: derived from the cap)\n");
                 fprintf(stderr, "                             (0 = off). Late audio is worse than an honest refusal\n");
                 fprintf(stderr, "  --caps                     Print compiled SIMD/threading capabilities and exit\n");
                 fprintf(stderr, "  --self-test                Run kernel numeric self-test (matvec vs f32 ref) and exit\n");
@@ -1967,7 +1975,7 @@ int main(int argc, char **argv) {
      * default slot 3061 (ryan): on a Base-derived finetune that slot holds untrained
      * initialisation noise, so the run produced audio for an identity that does not
      * exist — with no warning, and no way to notice except by listening. */
-    /* --speaker-map prima di tutto: deve valere sia per --list-speakers sia per -s */
+    /* --speaker-map first of all: it has to apply to --list-speakers as well as to -s */
     if (speaker_map) {
         int n = qwen_tts_load_speaker_map(ctx, speaker_map);
         if (n < 0) { qwen_tts_unload(ctx); return 1; }
@@ -3329,6 +3337,10 @@ int main(int argc, char **argv) {
             return 1;
         }
         qwen_tts_server_set_limits(serve_max_queue, serve_queue_timeout);
+        if (serve_max_request_s >= 0)
+            qwen_tts_server_set_max_request_ms(serve_max_request_s * 1000);
+        if (serve_max_text_chars > 0)
+            qwen_tts_server_set_max_text_chars(serve_max_text_chars);
         if (serve_prefork > 1) {
             /* Pack once, then fork: the workers share the packed weights through
              * copy-on-write instead of each loading its own copy. */

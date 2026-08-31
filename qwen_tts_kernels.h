@@ -74,9 +74,9 @@ void qwen_check_runtime_isa(void);
  * visible + testable so a "we thought AVX existed" gap can't hide behind docs.
  * `out` may be NULL -> stderr. */
 void qwen_caps_report(void *out);
-/* Revisione git incisa nel binario + profilo SIMD + le flag QWEN_* attive adesso.
- * Va in cima a ogni report: due tabelle di numeri senza questa riga non sono
- * confrontabili, e non c'e' modo di accorgersene dopo. */
+/* The git revision stamped into the binary, the SIMD profile, and the QWEN_* flags that
+ * are active right now. It goes at the top of every report: two tables of numbers without
+ * this line are not comparable, and there is no way to notice that afterwards. */
 void qwen_provenance_report(void *out);
 
 /* ── Batched-path audit (PLAN 0.nonies S10) ─────────────────────────────────
@@ -368,20 +368,20 @@ void qwen_matvec_q2_0(float *y, const q2_0_block_t *W, const float *x,
 /* ── Q6_0: 6 bits, one fp16 scale every 32 weights (PLAN T2 / T2.next) ──
  *
  * WHY THIS FORMAT EXISTS. The Talker cannot go to int4 — it drops the language
- * outright (a low-resource-language clip classified FRENCH at 89%, ~1 seed in 5; PLAN 0.septies).
+ * outright (a target-language clip classified as another language at 89%, ~1 seed in 5).
  * But that wall was measured on FLAT per-row scales. With a scale every 32 weights
  * the same bit budget carries far more information, and the fakequant sweep (error
  * baked into a bf16 copy, no kernel) scored it on LANGUAGE IDENTITY, not on perplexity:
  *
- *     int8r (= what ships today)   language identity 98.0% mean / 96.3% min   control
- *     int7b            -6% band    language identity 97.6% / 93.0%            holds
- *     int6b           -19% band    language identity 78.3% / 26.3%            collapses ALONE
+ *     int8r (= what ships today)   lang-id 98.0% mean / 96.3% min   control
+ *     int7b            -6% band    lang-id 97.6% / 93.0%            holds
+ *     int6b           -19% band    lang-id 78.3% / 26.3%            collapses ALONE
  *     int8+int6 mixed, 7 of 28 layers at int8:  -14% band, 96.2% / 91.0%
  *
  * So int6 is NOT usable uniformly; it is usable as the CHEAP HALF of a per-layer
  * mixed map. This type is that cheap half. `qwen_quantize_bf16_to_q6_0` reproduces
  * tools/quant/fakequant_cp.py `int6b` EXACTLY (fp16 absmax/31 scale, C roundf,
- * clamp +-31) — that bit-exactness is what carries the measured language-identity numbers over
+ * clamp +-31) — that bit-exactness is what carries the measured lang-id numbers over
  * from the fakequant to the real kernel. tests/quant_q6_kernel_bench.c gates it.
  *
  * LAYOUT — 26 bytes per 32 weights = 0.8125 B/weight (vs int8's 1.0 -> -18.75%).
@@ -432,6 +432,15 @@ void qwen_dequant_row_q6_0(float *dst, const q6_0_block_t *row, int cols);
  * ======================================================================== */
 
 /* Causal GQA attention (f32 KV cache) */
+/* Heads [h_lo, h_hi) only -- the range form the threaded prefill entry point splits over. */
+void qwen_causal_attention_heads(float *out, const float *Q, const float *K, const float *V,
+                                 int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                 int head_dim, float scale, int q_offset, int h_lo, int h_hi);
+/* Prefill-only threaded twin: heads are independent and own disjoint output columns, so this
+ * is bitwise identical to the serial form. */
+void qwen_causal_attention_prefill(float *out, const float *Q, const float *K, const float *V,
+                                   int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                   int head_dim, float scale, int q_offset);
 void qwen_causal_attention(float *out, const float *Q, const float *K, const float *V,
                            int seq_q, int seq_k, int n_heads, int n_kv_heads,
                            int head_dim, float scale, int q_offset);
@@ -470,6 +479,10 @@ void qwen_silu(float *x, int n);
  * Uses vvexpf (Accelerate) on macOS for batch exp, scalar loop elsewhere.
  * tmp must have space for n floats (used for batch exp). */
 void qwen_swiglu_inplace(float *gate_up, float *tmp, int n);
+/* Prefill-only threaded twin. Same arithmetic per element and bitwise-identical output;
+ * separate because the in-place form's write/read overlap makes it unsafe to thread and
+ * because the other call sites are either small or already inside a worker. */
+void qwen_swiglu_prefill(float *gate_up, float *tmp, int n);
 
 /* Add: y += x */
 void qwen_add_inplace(float *y, const float *x, int n);

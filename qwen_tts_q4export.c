@@ -2,10 +2,10 @@
  *
  * WHY
  * `llama-quantize`'s Q4_0 is plain absmax RTN. Ours (qwen_quantize_bf16_to_q4_0) is a
- * weighted least-squares fit. On this customer finetune the difference is not academic:
+ * weighted least-squares fit. On a finetuned checkpoint the difference is not academic:
  * measured 2026-08-22, same speaker, same seed, same text —
- *     our 4-bit (LSQ)          94.6 % language identity,  0.4 % English
- *     GGUF Q4_0 (llama.cpp RTN) 0.0 % language identity, 96.8 % English   (same kernel!)
+ *     our 4-bit (LSQ)           94.6 % target language,  0.4 % base language
+ *     GGUF Q4_0 (llama.cpp RTN)  0.0 % target language, 96.8 % base language  (same kernel!)
  * while their AVERAGE weight error differs by 0.03 percentage points (8.786 vs 8.820).
  * The finetune's delta from base is at most ~0.002 per weight and the 4-bit step is
  * ~absmax/8 ≈ 0.006: the finetune lives BELOW the quantization step, so how the scale

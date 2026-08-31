@@ -1,27 +1,25 @@
-/* matmat_parity.c — il gemello batched fa la STESSA aritmetica del riferimento intero?
+/* matmat_parity.c — does the batched twin do the SAME arithmetic as the integer reference?
  *
- * PERCHE' ESISTE. I GEMM quantizzati sono per-ISA: VNNI su AVX-512, SMMLA su i8mm,
- * il nuovo maddubs su AVX2 puro, il twin f32 altrove. Ogni percorso e' codice diverso
- * per lo stesso formato, e finora l'unico modo di verificarne uno era affittare la
- * macchina che lo esegue. Cosi' i kernel AVX-512 sono stati scritti a giugno e mai
- * eseguiti da noi.
+ * WHY IT EXISTS. Quantized GEMMs are per-ISA: VNNI on AVX-512, SMMLA on i8mm, maddubs on
+ * plain AVX2, the f32 twin everywhere else. Each path is different code for the same
+ * format, and until now the only way to verify one was to rent the machine that runs it.
+ * That is how the AVX-512 kernels came to be written and never executed by us.
  *
- * ⭐ SU M1 SI PUO' ESEGUIRE LO STESSO IL PERCORSO x86: Rosetta 2 supporta AVX2 (misurato
- * su questa macchina, 2026-08-18). Quindi questo test, compilato per x86_64 con
- * -march=x86-64-v3, ESEGUE davvero il kernel AVX2 e ne verifica i numeri — sul portatile,
- * prima di pagare un'ora di cloud. (Rosetta NON emula AVX-512: VNNI e AMX restano da
- * validare sul metallo.)
+ * AN ARM MAC CAN STILL RUN THE x86 PATH: Rosetta 2 supports AVX2 (measured on this
+ * machine). So this test, compiled for x86_64 with -march=x86-64-v3, really EXECUTES the
+ * AVX2 kernel and checks its numbers — on the laptop, before paying for an hour of cloud.
+ * (Rosetta does NOT emulate AVX-512: VNNI and AMX still have to be validated on metal.)
  *
- * L'ORACOLO, e perche' e' questo. Non si confronta il matmat contro il matvec: quello e'
- * un percorso f32 con un'altra quantizzazione delle attivazioni, quindi una differenza
- * non direbbe se il kernel e' sbagliato o solo diversamente arrotondato. Si confronta
- * contro un riferimento INTERO in C semplice che quantizza le attivazioni esattamente
- * come il motore e somma in int32. Il kernel deve dare lo STESSO numero: l'aritmetica
- * intera non ha ordine di somma da discutere. Atteso: errore relativo 0.
+ * THE ORACLE, and why it is this one. The matmat is not compared against the matvec: that
+ * is an f32 path with a different activation quantization, so a difference would not say
+ * whether the kernel is wrong or merely rounded differently. It is compared against a
+ * plain-C INTEGER reference that quantizes activations exactly as the engine does and sums
+ * in int32. The kernel must produce the SAME number: integer arithmetic has no summation
+ * order to argue about. Expected: relative error 0.
  *
- * Uso:
- *   make check-matmat-parity        # ISA nativa
- *   make check-matmat-parity-x86    # x86-64-v3 sotto Rosetta, dal Mac ARM
+ * Use:
+ *   make check-matmat-parity        # native ISA
+ *   make check-matmat-parity-x86    # x86-64-v3 under Rosetta, from an Arm Mac
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,12 +44,12 @@ static float qcol(int8_t *qb, const float *X, int cols, int B, int b) {
     return amax / 127.0f;
 }
 
-/* DUE SOGLIE, perche' non tutte le ISA prendono il percorso intero. Dove il
- * dispatcher ha un GEMM intero vero (AVX2/maddubs, AVX-512/VNNI, i8mm/SMMLA) il
- * risultato deve coincidere col riferimento intero a meno del solo arrotondamento
- * finale: rel ~ 0. Dove invece cade sul twin f32 (M1 senza i8mm, o QWEN_NO_*=1) le
- * attivazioni restano in f32 e la differenza e' l'errore di quantizzazione, non un
- * bug: si dichiara, non si nasconde. Un FAIL e' solo oltre la seconda soglia. */
+/* TWO THRESHOLDS, because not every ISA takes the integer path. Where the dispatcher has
+ * a real integer GEMM (AVX2/maddubs, AVX-512/VNNI, i8mm/SMMLA) the result must match the
+ * integer reference up to the final rounding alone: rel ~ 0. Where it falls back to the
+ * f32 twin (no i8mm, or QWEN_NO_*=1) the activations stay in f32 and the difference is
+ * quantization error, not a bug: it is declared rather than hidden. A FAIL is only past
+ * the second threshold. */
 static int check(const char *what, const float *got, const float *ref, int n) {
     double mx = 0.0, den = 0.0;
     int worst = -1;

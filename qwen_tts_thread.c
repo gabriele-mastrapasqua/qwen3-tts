@@ -23,6 +23,34 @@ void qwen_tls_tag_set(int tag) { g_qwen_tls_tag = tag; }
 /* -------------------------------------------------------------------------
  * macOS / GCD
  * ------------------------------------------------------------------------- */
+#include <stdatomic.h>
+#include <time.h>
+
+/* Core-microseconds actually spent INSIDE a task, summed over every thread that ran one.
+ *
+ * The question this answers cannot be answered by process CPU time: with QWEN_POOL_SPIN set,
+ * an idle worker burns cycles waiting, so CPU time reads as utilisation even when the machine
+ * is doing nothing useful. Comparing this against wall x threads gives the core-milliseconds
+ * that were available and unused during a phase -- the serial gaps between parallel regions,
+ * which is where the SwiGLU was hiding. Off unless the caller arms it. */
+static _Atomic long long g_qp_busy_us, g_qp_chunks, g_qp_dispatches;
+static int g_qp_meter;
+
+void qwen_parallel_meter(int on) {
+    g_qp_meter = on;
+    if (on) { atomic_store(&g_qp_busy_us, 0); atomic_store(&g_qp_chunks, 0);
+              atomic_store(&g_qp_dispatches, 0); }
+}
+void qwen_parallel_meter_read(double *busy_ms, long long *chunks, long long *dispatches) {
+    if (busy_ms)   *busy_ms   = (double)atomic_load(&g_qp_busy_us) / 1e3;
+    if (chunks)    *chunks    = atomic_load(&g_qp_chunks);
+    if (dispatches)*dispatches= atomic_load(&g_qp_dispatches);
+}
+static inline long long qp_now_us(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000000LL + t.tv_nsec / 1000;
+}
+
 #if defined(__APPLE__) && defined(__BLOCKS__) && !defined(QWEN_FORCE_PTHREAD)
 
 #include <dispatch/dispatch.h>
@@ -261,28 +289,29 @@ static int g_inited = 0;
  * every frame boundary. QWEN_POOL_SPIN overrides; 0 = never spin (park at once).
  * Lower it when synthesis overlaps other CPU-heavy work so idle spin does not
  * steal those cores. */
-/* ── Il valore, e perche' e' diverso per piattaforma (2026-08-21) ──────────────
- * 4096 era tarato altrove e su ARM Linux costa il 40% del Code Predictor. Misurato sul
- * GCP c4a-standard-16 (Axion, Neoverse-V2), 1.7B --int8, richiesta singola:
+/* ── The value, and why it differs per platform (2026-08-21) ───────────────────
+ * 4096 was tuned on other hardware and on Arm Linux it costs 40 % of the Code Predictor.
+ * Measured on a 16 vCPU Arm Neoverse-V2 host, 1.7B --int8, a single request:
  *
- *   -j8   SPIN=4096   CP 16,0 ms/f · RTF 0,45 · 491 320 context switch
- *   -j8   SPIN=16384  CP 11,7      · RTF 0,39 · 193 387
- *   -j8   SPIN=65536  CP  9,6      · RTF 0,35 ·  35 132   <- scelto
- *   -j8   SPIN=262144 CP  9,6      · RTF 0,35 ·   5 977   (nessun guadagno in piu')
+ *   -j8   SPIN=4096   CP 16.0 ms/f · RTF 0.45 · 491,320 context switches
+ *   -j8   SPIN=16384  CP 11.7      · RTF 0.39 · 193,387
+ *   -j8   SPIN=65536  CP  9.6      · RTF 0.35 ·  35,132   <- chosen
+ *   -j8   SPIN=262144 CP  9.6      · RTF 0.35 ·   5,977   (nothing further to gain)
  *
- * A livello server (-j16, c=4) porta Q da 1,94 a 2,43 e il p95 da 720 a 692 ms, e fa
- * tornare -j16 migliore di -j8: il tetto "un server non usa 16 core" era QUESTO.
+ * At the server level (-j16, c=4) it takes the effective batch from 1.94 to 2.43 and the
+ * p95 from 720 to 692 ms, and makes -j16 beat -j8 again: the ceiling behind "a server does
+ * not use 16 cores" was THIS.
  *
- * ⚠️ Perche' non si alza ovunque. Filare costa CPU mentre i worker aspettano: e' gratis
- * se quel core sarebbe rimasto inattivo, ed e' una tassa se serviva a qualcun altro.
- * Misurato che NON danneggia la topologia a piu' processi a carico basso (4 server:
- * p95 448 contro 439 ms), ma sotto saturazione con piu' processi non e' stato misurato.
- * E 262144 su -j16 PEGGIORA (31,4 ms/f contro 22,8): oltre un certo punto sedici thread
- * che filano si mangiano i core che servono al lavoro rimasto.
+ * WARNING -- why it is not raised everywhere. Spinning burns CPU while workers wait: free
+ * if that core would have idled, a tax if somebody else needed it. Measured NOT to harm a
+ * multi-process topology at low load (4 servers: p95 448 against 439 ms), but under
+ * saturation with several processes it has not been measured. And 262144 at -j16 is WORSE
+ * (31.4 ms/f against 22.8): past some point sixteen spinning threads eat the cores the
+ * remaining work needs.
  *
- * x86 Linux paga lo stesso futex per dispatch e quasi certamente vuole lo stesso valore,
- * ma qui NON e' stato misurato: resta a 4096 finche' non gira su una scatola x86.
- * QWEN_POOL_SPIN scavalca sempre; 0 = parcheggia subito. */
+ * x86 Linux pays the same futex per dispatch and almost certainly wants the same value,
+ * but that has NOT been measured here: it stays at 4096 until it runs on an x86 box.
+ * QWEN_POOL_SPIN always overrides; 0 parks immediately. */
 #if defined(__linux__) && defined(__aarch64__)
 #define QWEN_POOL_SPIN_DEFAULT 65536
 #else
@@ -325,7 +354,7 @@ static int qwen_pool_spin(void) {
  * not worse - and there is none in any shipping configuration. It becomes interesting
  * where the freed cores have a beneficiary (multi-process topologies, co-tenancy), which
  * is not measured. QWEN_POOL_NARROW=1 turns it on.
- * Numbers: the design notes */
+ * Numbers: docs/bench/2026-08-24-arm-vllm-audit/todo1-idle-workers.md */
 static int qwen_pool_narrow(void) {
     static int v = -1;
     if (v < 0) {
@@ -385,7 +414,12 @@ static void run_chunks(qwen_job_t *job) {
     qwen_tls_tag_set(job->tag);   /* once per job, not per chunk */
     while ((i = atomic_fetch_add(&job->next, 1)) < job->nt)
     {   PS_INC(ps_chunks);
-        job->fn(i, job->nt, job->ctx); }
+        if (g_qp_meter) {
+            long long t0 = qp_now_us();
+            job->fn(i, job->nt, job->ctx);
+            atomic_fetch_add(&g_qp_busy_us, qp_now_us() - t0);
+            atomic_fetch_add(&g_qp_chunks, 1);
+        } else job->fn(i, job->nt, job->ctx); }
 }
 
 /* Correctness note (lost-wakeup avoidance). generation is bumped by the
@@ -558,6 +592,7 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
         return;
     }
     PS_INC(ps_dispatch);
+    if (g_qp_meter) atomic_fetch_add(&g_qp_dispatches, 1);
     qwen_job_t job;
     job.fn = fn; job.ctx = ctx; job.nt = nt; job.tag = g_qwen_tls_tag;
     atomic_init(&job.next, 0);
@@ -624,59 +659,60 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     pthread_mutex_unlock(&P.submit_mtx);
 }
 
-/* ── Reentranza: SÌ da un altro thread, NO annidata dentro un task ────────────────
+/* ── Reentrancy: YES from another thread, NO nested inside a task ─────────────────
  *
- * Diceva 0 "perche' c'e' un solo job slot globale". Il job slot e' uno, ma `submit_mtx`
- * serializza l'INTERO submit→run→wait: il secondo sottomettitore si blocca, non corrompe
- * niente. E quando il primo rilascia il mutex ha gia' fatto `P.job = NULL` DOPO aver
- * atteso `completed == nworkers`, quindi ogni worker ha finito il suo `run_chunks` — non
- * c'e' nessuna finestra in cui un worker legge il job del sottomettitore sbagliato. Un
- * worker lento che deve ancora tornare in cima al loop ha `seen` alla generazione vecchia,
- * vede quella nuova e prende il job nuovo: corretto.
+ * This used to return 0 "because there is a single global job slot". There is one job
+ * slot, but `submit_mtx` serialises the ENTIRE submit -> run -> wait: a second submitter
+ * blocks, it does not corrupt anything. And by the time the first releases the mutex it
+ * has already set `P.job = NULL`, AFTER waiting for `completed == nworkers`, so every
+ * worker has finished its `run_chunks` -- there is no window in which a worker reads the
+ * wrong submitter's job. A slow worker still on its way back to the top of the loop has
+ * `seen` at the old generation, observes the new one and takes the new job: correct.
  *
- * ⚠️ Quello che resta VIETATO e' la sottomissione ANNIDATA: `qwen_parallel` chiamata da
- * dentro una task function girerebbe su un worker che poi si blocca su `submit_mtx`,
- * mentre il main tiene il mutex aspettando `completed == nworkers` → deadlock. Era vero
- * anche prima; questo flag non lo copriva e non lo copre. La regola e': chiamare
- * qwen_parallel da un THREAD, mai da un TASK.
+ * WHAT REMAINS FORBIDDEN is NESTED submission: `qwen_parallel` called from inside a task
+ * function would run on a worker that then blocks on `submit_mtx`, while the main thread
+ * holds that mutex waiting for `completed == nworkers` -> deadlock. That was true before
+ * as well; this flag did not cover it and does not cover it. The rule is: call
+ * qwen_parallel from a THREAD, never from a TASK.
  *
- * Verificato il 2026-08-18 prima di cambiare il flag, non dato per scontato: estratte le
- * 28 funzioni `*_task` di qwen_tts_kernels.c col brace matching e cercata `qwen_parallel(`
- * nei loro corpi → zero occorrenze. Tutti i call site stanno nei DISPATCHER (qwen_matvec_*
- * / qwen_matmat_*), che girano sul thread chiamante. Se un giorno un task deve
- * parallelizzare al suo interno, questo flag va rimesso a 0 O il pool deve diventare una
- * coda: e' quello il vincolo, non "quanti thread chiamano".
+ * Verified before changing the flag rather than assumed: the 28 `*_task` functions in
+ * qwen_tts_kernels.c were extracted by brace matching and searched for `qwen_parallel(`
+ * in their bodies -> zero occurrences. Every call site is in a DISPATCHER (qwen_matvec_* /
+ * qwen_matmat_*), which runs on the calling thread. If a task ever needs to parallelise
+ * internally, this flag goes back to 0 OR the pool becomes a queue: that is the
+ * constraint, not "how many threads call in".
  *
- * PERCHE' CAMBIARLO ORA (misurato il 2026-08-18 sul c3). `is_reentrant()` e' il gate di
- * A1, l'helper di prefill asincrono in qwen_tts.c:3148. Tornando 0, su Linux/Windows
- * l'helper non parte MAI e si prende il ramo `inline fallback (non-reentrant pool):
- * prefill blocks the batch`: quattro arrivi simultanei = quattro prefill in fila DENTRO il
- * frame loop, e il TTFA del quarto se li porta tutti. Sul c3 questo vale `admission +
- * prefill` 23-30% del loop e un degrado TTFA di 13.9x da c=1 a c=4. In pratica A1 era
- * un'ottimizzazione attiva solo su macOS, cioe' ovunque tranne in produzione.
+ * WHY IT WAS RECONSIDERED. `is_reentrant()` gates the asynchronous prefill helper. While
+ * it returned 0, on Linux and Windows the helper never started and the inline fallback ran
+ * instead -- `prefill blocks the batch`: four simultaneous arrivals meant four prefills
+ * queued INSIDE the frame loop, and the fourth request's first-audio latency carried all
+ * of them. On the reference x86 host that was 23-30 % of the loop and a 13.9x first-audio
+ * degradation from c=1 to c=4. In practice the helper was an optimisation active only on
+ * macOS -- that is, everywhere except production.
  *
- * 🚨 E LA MISURA HA DETTO DI NO — torna 0, ma per il motivo GIUSTO.
- * Provato ad accenderlo (c3, 1.7B base, -j4, int8, REQS=16, testi misti, celle 'match',
- * A/B con lo stesso binario via QWEN_PREFILL_HELPER):
+ * AND THE MEASUREMENT SAID NO. It returns 0, but now for the right reason. Turning it on
+ * (x86 host, 1.7B open weights, -j4, int8, 16 requests, mixed texts, A/B with the same
+ * binary via QWEN_PREFILL_HELPER):
  *
- *     c    TTFA p95 helper ON    TTFA p95 helper OFF     Q ON / OFF
- *     1        3053 ms               3087 ms            0.59 / 0.59   <- controllo: uguale
+ *     c    TTFA p95 helper ON    TTFA p95 helper OFF     batch ON / OFF
+ *     1        3053 ms               3087 ms            0.59 / 0.59   <- control: equal
  *     2        4338 ms               2625 ms            0.63 / 0.67
  *     4        7110 ms               5477 ms            0.78 / 0.81
  *
- * Accenderlo PEGGIORA il TTFA del ~30% e il throughput del ~4%. La cella c=1 e' identica
- * nei due bracci (li' l'helper non entra in gioco), quindi non e' deriva della macchina.
+ * Enabling it makes first audio ~30 % WORSE and throughput ~4 % worse. The c=1 cell is
+ * identical in both arms -- the helper does not come into play there -- so this is not
+ * machine drift.
  *
- * Perche': con UN SOLO job slot le sezioni parallele dell'helper e quelle del frame loop
- * si serializzano su `submit_mtx` invece di sovrapporsi. Si aggiunge contesa sul mutex e
- * cambi di contesto su 4 core gia' saturi, e non si guadagna parallelismo — il prefill
- * esce dal percorso critico del frame loop solo per rientrarci dalla porta del lock.
+ * Why: with a SINGLE job slot the helper's parallel regions and the frame loop's serialise
+ * on `submit_mtx` instead of overlapping. That adds mutex contention and context switches
+ * on four already-saturated cores and buys no parallelism -- the prefill leaves the frame
+ * loop's critical path only to re-enter it through the lock.
  *
- * QUINDI: la reentranza NON e' il pezzo mancante; il pezzo mancante e' che il pool
- * diventi una CODA (piu' job in volo, worker che pescano il primo disponibile). Finche'
- * il pool ha un job slot, A1 su Linux e' una pessimizzazione e questo torna 0.
- * QWEN_PREFILL_HELPER=1 resta come braccio sperimentale: e' la manopola con cui
- * rimisurare il giorno in cui il pool cambia, senza rimettere mano a questo file. */
+ * SO: reentrancy is NOT the missing piece. The missing piece is the pool becoming a QUEUE
+ * (several jobs in flight, workers taking the first available). While the pool has one job
+ * slot, the helper is a pessimisation on Linux and this returns 0.
+ * QWEN_PREFILL_HELPER=1 remains as the experimental arm: the knob to re-measure with on
+ * the day the pool changes, without touching this file again. */
 int qwen_parallel_is_reentrant(void) {
     const char *e = getenv("QWEN_PREFILL_HELPER");
     return (e && e[0] == '1') ? 1 : 0;
