@@ -296,6 +296,14 @@ def canonical_ttfa(port, requests, speaker, language, seed, text_file, classes, 
 
 
 def pct(v, q):
+    """NEAREST RANK, deliberately, and NOT the same definition tests/load_test.py uses.
+
+    That one interpolates between the two neighbouring values. On an even, small sample the
+    two disagree by a whole rank -- 88 against 103 ms on four requests of a mixed-length
+    bank -- so the cross-check below widens its tolerance rather than pretending the
+    statistics are comparable. Changing this function would move every number this harness
+    has ever produced, which is a bigger price than the confusion it saves.
+    """
     if not v: return float("nan")
     v = sorted(v)
     return v[min(len(v) - 1, int(round(q / 100.0 * (len(v) - 1))))]
@@ -757,10 +765,29 @@ def main():
                               flush=True)
                     else:
                         d = abs(row["ttfa_p50"] - orc) / orc if orc > 0 else 1.0
-                        ok_ = d <= a.crosscheck_tol
+                        # THE TOLERANCE DEPENDS ON THE SAMPLE, because the median does.
+                        #
+                        # This gate exists to catch a harness measuring something else
+                        # entirely: it was born the day one reported 1156 ms where the
+                        # oracle reported 187 on the same server with no contention -- a 6x
+                        # error, because read(65536) blocks until it HAS 65536 bytes and was
+                        # timing 1.365 s of buffered audio.
+                        #
+                        # It is NOT sensitive enough to arbitrate a rank. The two harnesses
+                        # compute p50 differently -- this one takes the nearest rank, the
+                        # oracle interpolates -- and on four requests of a mixed-length bank
+                        # those are 88 and 103 ms for the same set: 17 % apart, and neither
+                        # is wrong. Failing on that is failing for a reason that is not the
+                        # engine, which is how a gate teaches people to pass --no-crosscheck.
+                        n_req = row.get("ok") or row.get("requests") or 0
+                        tol = a.crosscheck_tol if n_req >= 8 else max(a.crosscheck_tol, 0.40)
+                        ok_ = d <= tol
                         print(f"  {'✅' if ok_ else '❌'} cross-check C=1: this harness "
                               f"{row['ttfa_p50']:.0f} ms vs tests/load_test.py {orc:.0f} ms "
-                              f"({d*100:.0f}% apart, tolerance {a.crosscheck_tol*100:.0f}%)",
+                              f"({d*100:.0f}% apart, tolerance {tol*100:.0f}% at n={n_req})"
+                              + ("" if n_req >= 8 else
+                                 "  [widened: at n<8 the median moves by a whole rank, and the "
+                                 "two harnesses round percentiles differently]"),
                               flush=True)
                         if not ok_:
                             print("  ❌ the two disagree with NO contention to explain it: "

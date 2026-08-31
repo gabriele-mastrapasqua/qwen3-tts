@@ -424,7 +424,7 @@ void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx) {
 
 /* ── Per-layer MIXED map: int8 where the profile says it matters, q6_0 elsewhere ──
  *
- * The dynamic (imatrix-style) bit allocation, but scored on LANGUAGE IDENTITY instead of on
+ * The dynamic (imatrix-style) bit allocation, but scored on LANGUAGE IDENTIFICATION ACCURACY instead of on
  * perplexity — which is the whole point. llama.cpp's mixed K-quants allocate bits by
  * looking at a proxy loss; here they are allocated by looking at the thing the
  * customer actually hears. The layer set comes from the MEASURED sensitivity profile
@@ -449,7 +449,7 @@ void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx) {
  * the profile says are insensitive, and buy back the bits elsewhere". Quantizing
  * everything to int4 was measured and it drops the language ~1 seed in 5; spending
  * those same average bits unevenly is a different proposition, and it has to be
- * measured on language identity layer by layer rather than assumed.
+ * measured on language identification accuracy layer by layer rather than assumed.
  *
  * Traffic per weight: int8 1.0, q6_0 0.8125, q4_0 0.5625.
  *   top6           (6x int8, 22x q6)                  0.8527  -14.7%
@@ -483,7 +483,7 @@ static int tk_parse_layer_plan(const char *spec, int n_layers, unsigned char *fm
     /* "rest=4" / "rest=6" sets what the UNLISTED layers get. Default q6_0.
      * rest=4 is the interesting one: int8 where it matters + q4_0 everywhere else is
      * -34.4% weight traffic at N=6, and BOTH halves already have fast, validated
-     * kernels on every ISA — so if language identity holds, no new kernel is needed at all. */
+     * kernels on every ISA — so if language identification accuracy holds, no new kernel is needed at all. */
     int fill = TK_FMT_Q6;
     if (spec && strstr(spec, "rest=4")) fill = TK_FMT_Q4;
     else if (spec && strstr(spec, "rest=8")) fill = TK_FMT_INT8;
@@ -1574,7 +1574,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
          * So the default stays tied to the TILE, where the win is large enough to survive
          * both thread budgets. Same weights either way: arithmetic order, not precision.
          * ⚠️ Ear-validated on OSS presets only (samples/tests/2026-08-19_prefill-matmat-amx);
-         * the language-identity check on a real finetune is still owed. */
+         * the language-identification accuracy check on a real finetune is still owed. */
         /* ARM (2026-08-21, Arm Neoverse-V2, 16 vCPU): the same move as the AMX one above,
          * and here it passes the check that rejected it on x86. Measured on a 1.7B
          * finetune, --int8, a 21-token prefill, BLAS -> matmat:
@@ -1589,7 +1589,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
          * no such fork -- OpenBLAS parallelises its own sgemm and matmat rides the caller's
          * pool, yet even at one thread matmat stays ahead.
          *
-         * LANGUAGE IDENTITY VERIFIED BEFORE CHANGING THE DEFAULT, which is the debt 08-19
+         * LANGUAGE IDENTIFICATION ACCURACY VERIFIED BEFORE CHANGING THE DEFAULT, which is the debt 08-19
          * left open: 5 voices of a finetune, scored with an off-the-shelf language
          * identification model — 97.8-99.3 % against 97.9-99.5 % for the BLAS path,
          * 0.0-0.1 % drift to the base language, normal durations. It matters

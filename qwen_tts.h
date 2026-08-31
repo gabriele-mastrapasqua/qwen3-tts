@@ -209,7 +209,7 @@ typedef struct {
      * On ARM the prefill takes the BFMMLA matmat path and reads bf16 directly, so when
      * a quantized GGUF replaced the bf16 pointers the PROMPT - speaker token, language,
      * text - was built at 4 bits and every later frame inherited a corrupted
-     * conditioning: measured 0.0 % language identity against 99.7 % with the originals.
+     * conditioning: measured 0.0 % language identification accuracy against 99.7 % with the originals.
      * These always alias the ORIGINAL checkpoint weights. Decode may be quantized;
      * prefill is where the conditioning is decided and stays at full precision. */
     const uint16_t *wq_bf16_pref, *wk_bf16_pref, *wv_bf16_pref, *wo_bf16_pref;

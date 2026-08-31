@@ -917,7 +917,7 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
         /* qwen_tts_resolve_speaker, NOT qwen_tts_speaker_id: the latter knows only the 9
          * hardcoded CustomVoice presets and returns -1 for every voice of a finetuned
          * pool — and -1 was then silently dropped, so a request for a pool voice was
-         * served by the DEFAULT slot. Measured: 98% language identity from the CLI vs
+         * served by the DEFAULT slot. Measured: 98% language identification accuracy from the CLI vs
          * 14.5% from the server, same model/text/seed, because the server was rendering
          * a different voice. Same class of silent failure as PLAN fact F9, on the
          * serving path, where nobody had looked. */
@@ -2196,13 +2196,13 @@ static void server_default_decoder_batch(qwen_tts_ctx_t *ctx) {
  * the prefill gets faster. On a finetuned pool checkpoint with a mixed 4-bit map, one
  * pool voice, same texts and same seeds, six clips per arm:
  *
- *     prefill quant OFF   language identity 96.3% mean, worst clip 86.1%
- *     prefill quant ON    language identity 38.0% mean, three clips at 0.0 / 1.4 / 11.7%
+ *     prefill quant OFF   language identification accuracy 96.3% mean, worst clip 86.1%
+ *     prefill quant ON    language identification accuracy 38.0% mean, three clips at 0.0 / 1.4 / 11.7%
  *
  * The failure mode is the one this project keeps meeting: the audio stays clean, the
  * duration stays normal, nothing rasps — and the model DRIFTS TOWARDS THE BASE LANGUAGE,
  * losing the accent the finetune exists for. No signal-level metric sees it; only a
- * language-identity check does. The isolation was clean: an arm with the batched decoder off instead scored
+ * language-identification accuracy check does. The isolation was clean: an arm with the batched decoder off instead scored
  * identically to the all-on arm, clip by clip, so the decoder is exonerated and the
  * prefill is not.
  *
@@ -2230,7 +2230,7 @@ static void server_default_memory_levers(qwen_tts_ctx_t *ctx) {
         setenv("QWEN_FREE_BF16", "1", 0);              /* only meaningful together */
         fprintf(stderr, "[serve] quantized prefill ON (explicitly requested): frees the bf16 "
                         "(~4 GB on the 1.7B) but MEASURABLY COSTS THE ACCENT on a finetune — "
-                        "language identity 96%% -> 38%% when measured. Base models only.\n");
+                        "language identification accuracy 96%% -> 38%% when measured. Base models only.\n");
     } else {
         fprintf(stderr, "[serve] quantized prefill OFF (default: it loses the accent on "
                         "finetunes) — QWEN_PREFILL_QUANT=1 to opt in on a base model\n");
