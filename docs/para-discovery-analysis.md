@@ -161,7 +161,7 @@ decoder-ceiling hypothesis, don't burn sweeps there.
 ## 5. If the para FT is ever revisited (long-term note)
 
 The FT was exhausted because bracket tags tokenize as sub-words with no gradient anchor (memory
-`project_para_recipe`). The literature suggests the viable variant is different: **CosyVoice-style
+the shipped recipe). The literature suggests the viable variant is different: **CosyVoice-style
 plain-text-marker data** — transcripts that contain the *native interjection chars* aligned with real
 events, no new tokens at all. **SynParaSpeech** ([arXiv 2509.14946](https://arxiv.org/html/2509.14946v2),
 [repo](https://github.com/ShawnPi233/SynParaSpeech)) is an automated pipeline that mined 118.75 h of

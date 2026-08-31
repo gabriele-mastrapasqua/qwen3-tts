@@ -142,7 +142,7 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 | **`[scoff]`** | `切` (CN) | **42** | disdain/scoff · **T1.0** (per-tag; 1.1 over-drives pitch) · pair with `--emotion disgust` |
 | ~~`[phew]`~~ | ~~`呼`~~ | — | **PARKED 2026-07-08** — TOP on IT but metallic/literal on EN, no seed fixes it (see gate below) |
 
-`[yawn]` added 2026-07-07 (discovered + ear-validated via the E1 harness; wired w/ a preset-vs-clone
+`[yawn]` added (discovered + ear-validated via the discovery harness; wired w/ a preset-vs-clone
 `voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized
 trigger); cry unsolved (needs FT).
 
@@ -303,7 +303,7 @@ Cry needs its own sweep — it's the hardest (acoustically ≈ laugh/yawn, and l
 
 ---
 
-## 2026-07-07 — first AUTOMATED discovery pass (harness E1: `tools/para/para_sweep.sh` + CLAP judge)
+## First AUTOMATED discovery pass (`tools/para/para_sweep.sh` + CLAP judge)
 Method change: generated a trigger×seed×lang grid and **auto-screened with CLAP** (`para_judge.py`, τ0.20),
 so the ear only judged the shortlist (4 clips out of 24) instead of every clip. Voice: ryan, 1.7B, T1.1.
 The CLAP screener is calibrated only for laugh/sigh → for new events its probs are RELATIVE shortlisting

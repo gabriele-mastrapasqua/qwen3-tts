@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E1.1 — para_judge: offline no-ear screening for paralinguistic [tag] candidates."""
+"""Offline, no-ear screening for paralinguistic [tag] candidates."""
 import argparse
 import glob
 import json
@@ -160,7 +160,7 @@ def tau_for(backend, args):
     return args.tau_clap if backend == "clap" else args.tau
 
 def main():
-    ap = argparse.ArgumentParser(description="E1.1 para-judge — offline paralinguistic screener")
+    ap = argparse.ArgumentParser(description="para-judge - offline paralinguistic screener")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--wavs", help="directory of wavs (recursive)")
     src.add_argument("--manifest", help="JSON list of clips w/ per-clip tag/onom/expected")
@@ -169,7 +169,7 @@ def main():
     ap.add_argument("--tagger", default="cnn14", choices=["cnn14", "clap", "both"])
     ap.add_argument("--tau", type=float, default=0.15, help="cnn14 event-prob threshold (default 0.15)")
     ap.add_argument("--tau-clap", dest="tau_clap", type=float, default=0.20,
-                    help="clap softmax threshold (default 0.20, from E1.2 laugh calibration)")
+                    help="clap softmax threshold (default 0.20, from the laugh calibration)")
     ap.add_argument("--asr-model", default="tiny", help="whisper model tiny/base/small")
     ap.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"])
     ap.add_argument("--out", help="write markdown table here (else stdout)")
@@ -226,7 +226,7 @@ def main():
             prec = tp / (tp + fp) if (tp + fp) else float("nan")
             rec = tp / (tp + fn) if (tp + fn) else float("nan")
             return tp, fp, fn, tn, prec, rec
-        md += "\n\n### Calibration (E1.2)\n| set | TP | FP | FN | TN | precision | recall |\n|---|---|---|---|---|---|---|"
+        md += "\n\n### Calibration\n| set | TP | FP | FN | TN | precision | recall |\n|---|---|---|---|---|---|---|"
         tags = sorted({r.get("tag") for r in rows if r.get("tag")})
         for label, subset in [("ALL", rows)] + [(t, [r for r in rows if r.get("tag") == t]) for t in tags]:
             tp, fp, fn, tn, prec, rec = score(subset)

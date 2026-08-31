@@ -8,14 +8,14 @@ see .gitignore note). Apply with `--expr <file> --expr-weight W`. All 1.7B unles
 ## ✅ VALIDATED WINS (keep + host)
 | file | what | recipe / verdict |
 |---|---|---|
-| `italian_csp_topk6.expr` | IT emotion CSP-FT, blocks 22-27 (k6), 10ep | **THE IT default** (cleaner than k4 on clones; §8) |
-| `german_csp_k6.expr` | native German emotion CSP-FT (emodb) | first native DE FT (§8) |
-| `french_csp_k6.expr` | native French emotion CSP-FT (cafe) | first native FR FT (§8) |
+| `italian_csp_topk6.expr` | IT emotion CSP-FT, blocks 22-27 (k6), 10ep | **THE IT default** (cleaner than k4 on clones) |
+| `german_csp_k6.expr` | native German emotion CSP-FT (emodb) | first native DE FT |
+| `french_csp_k6.expr` | native French emotion CSP-FT (cafe) | first native FR FT |
 | `italian_l1626_dense.expr` | IT dense 11-layer L16-26 FT ("WOW" 06-15) | moves clones more than CSP on some emotions; CV-intact loads only |
 
 ## ❌ DEAD / SUPERSEDED experiments (candidates to DELETE/ARCHIVE — pending user OK)
-- Para CSP-FT (all FAILED, plan §8.7): `paraling_csp_*` (k4/k6/k8, ep5/8, no0_mid/wide).
-- Para LoRA (all FAILED, §8.12-9.12): `para_nonverbal_b*`, `para_exp2a_*`, `para_smoke_lang`.
+- Para CSP-FT (all FAILED): `paraling_csp_*` (k4/k6/k8, ep5/8, no0_mid/wide).
+- Para LoRA (all FAILED): `para_nonverbal_b*`, `para_exp2a_*`, `para_smoke_lang`.
 - Old para LoRA (weak): `paralinguistic_{ep0,ep1,ep2,ep8,v2,aug}`.
 - Emotion-vector experiments (partial/superseded by CSP): `italian_emovec_{float,tau,wide}`, `italian_l0_27_dense`,
   `italian_multi_l1626_dense`, `italian_multitag_l1626_dense`, `italian_csp.expr` (pre-k4), `italian_l1626_r{32,64}`,

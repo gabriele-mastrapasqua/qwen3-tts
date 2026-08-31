@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""measure_prosody.py — objective prosody metrics for the structured-instruct test (§8.8)."""
+"""Objective prosody metrics for the structured-instruct test."""
 import sys, os
 import numpy as np
 

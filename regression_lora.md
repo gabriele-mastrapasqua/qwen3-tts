@@ -81,7 +81,7 @@ timbre-drifted, pace-distorted. Same defect on every language because every `bb0
   mis-claims L0-27 "beats emotion-only L16-26" — contradicted by §2). The trainer itself is fine; only the
   invocation was broad-band.
 - Export: `expr-lora/export_expr.py ADAPTER_DIR OUT.expr --lang Italian --hidden 2048` → QEXP factored (dtype 5).
-- A single r32 run = ~9 min / 8 epochs on the GB10.
+- A single r32 run = ~9 min / 8 epochs on the training GPU.
 
 ## 6. Fix
 

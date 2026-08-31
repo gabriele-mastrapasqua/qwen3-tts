@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fakequant_cp.py — offline quantize→dequantize of the Code Predictor weights (E7.2)."""
+"""Offline quantize/dequantize of the Code Predictor weights."""
 import argparse, json, os, re, shutil, struct, subprocess, sys, time
 import numpy as np
 

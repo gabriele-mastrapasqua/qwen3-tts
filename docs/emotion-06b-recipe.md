@@ -12,7 +12,7 @@
 > **On the 0.6B, emotion is not an inference-time lever — it is a property of the VOICE.**
 
 The small model has no steerable emotion subspace (measured: emotion identity sits early, at L0-6,
-tangled with language; late layers are 0.59-collinear across emotions — see `plan_06b_emo.md` §1.3,
+tangled with language; late layers are 0.59-collinear across emotions,
 and the archived 2026-06-30 failures of steer / CSP-FT / COMBINE). Every attempt to *inject* a
 direction failed.
 
@@ -176,6 +176,6 @@ voice**: clone + emotion + paralinguistics together at **RTF ≈ 0.78**.
 - **`--emo-ref` (ICL codec prefix from an emotional reference)** — implemented and it does transfer
   emotion, but the ref_codes carry the **donor's identity too** and override the loaded voice
   (`qwen_tts.c:1111`: *"ref_codes are BOTH the identity carrier AND the prosody template"*). It is
-  usable only when the reference is already in the target voice — and then E6 above beats it on both
+  usable only when the reference is already in the target voice — and then the option above beats it on both
   fidelity and speed (RTF 0.73 vs 6.8-11.4). Timbre is not separable from the codes
   (`QWEN_TF_CB_KEEP` experiment).

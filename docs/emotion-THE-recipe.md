@@ -118,7 +118,7 @@ the steering vector; `[huff]`/`[ugh]`/`[hmm]`/`[mmm]`/`[phew]`/… are soft onom
 > ⚠️ **STILL UNSTABLE — much better than before, but not solid across all langs/voices.**
 > Clearest on `[laugh]`/`[sigh]` with `ryan`/`vivian`. Known rough edge: on a CLONE the laugh span (a separate
 > cold-prefill span) can sound slightly detached/off-timbre (the seam, not audio-splice). Provenance of the
-> per-voice weights + the "anchor + vector" rule: memory `project_paralinguistic_steering_vector` (ear 2026-06-25/28).
+> per-voice weights, plus the "anchor + vector" rule.
 
 **🔊 Emotion + paralinguistics showcase** (a `[tag]` inside an emotional sentence; moved here from the README):
 

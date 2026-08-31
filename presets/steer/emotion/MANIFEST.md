@@ -7,7 +7,7 @@ Built for the **1.7B** model (hidden 2048; NOT compatible with 0.6B). Ear-valida
 
 | file | voice captured | emotion | recommended weight | notes |
 |---|---|---|---|---|
-| `ryan_ang.qlsteer`      | ryan (preset) | anger    | — (ryan anger: prefer EXPR, steer goes metallic) | §8.2 |
+| `ryan_ang.qlsteer`      | ryan (preset) | anger    | — (ryan anger: prefer EXPR, steer goes metallic) | |
 | `ryan_sad.qlsteer`      | ryan | sadness  | w8 | TOP |
 | `ryan_joy.qlsteer`      | ryan | joy      | w8 | |
 | `ryan_fear.qlsteer`     | ryan | fear     | w4 (w8 starts metallic) | |
