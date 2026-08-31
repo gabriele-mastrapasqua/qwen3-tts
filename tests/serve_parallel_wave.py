@@ -314,24 +314,31 @@ def pct(v, q):
 # kai, par and real may exist as internal aliases, never in human-facing output.
 ARRIVAL_TRUE_WAVE = "TRUE_SIMULTANEOUS_WAVE"
 
-WORKLOAD_BY_BANK = {
-    "load_texts_fast.txt":     "FAST_ENGINEERING",
-    "load_texts_long.txt":     "REALISTIC_QUALIFICATION",
-}
-
+# Matched by SUFFIX, not by a list of bank filenames: a hardcoded list has to be edited
+# every time a deployment brings its own corpus, and a bank it does not know silently
+# falls through to the wrong class. The suffix is the part that actually carries the
+# meaning -- "*_fast" is the inner-loop bank, anything else is the qualification bank.
 def workload_class(text_file, classes=""):
     """The workload is a property of the CORPUS and the class filter, never of the name a
     campaign happened to use."""
     base = os.path.basename(text_file)
-    if base in WORKLOAD_BY_BANK and not classes:
-        return WORKLOAD_BY_BANK[base]
+    if not classes:
+        stem = base[:-4] if base.endswith(".txt") else base
+        if stem.endswith("_fast"):
+            return "FAST_ENGINEERING"
+        if stem.startswith("load_texts"):
+            return "REALISTIC_QUALIFICATION"
     cl = {c.strip() for c in classes.split(",") if c.strip()}
     if cl == {"short"}:  return "PARALLEL_SHORT_DIVERSE"
     if cl == {"long"}:   return "PARALLEL_LONG_DIVERSE"
     if cl == {"medium"}: return "PARALLEL_MEDIUM_DIVERSE"
     if "diverse" in base or "corpus" in text_file:
         return "MIXED_PRODUCTION"
-    return WORKLOAD_BY_BANK.get(base, "UNSPECIFIED_WORKLOAD")
+    # A bank the classifier does not recognise is UNSPECIFIED, and says so in the header.
+    # It used to reference a lookup table that no longer exists, so an unknown bank raised
+    # NameError inside the header builder -- a run refused for a reason that had nothing
+    # to do with its validity.
+    return "UNSPECIFIED_WORKLOAD"
 
 
 def result_slug(workload, arrival, topo, conc, model_label, precision):
@@ -346,7 +353,7 @@ def result_slug(workload, arrival, topo, conc, model_label, precision):
 
 # ── THE HEADER IS NOT DECORATION ───────────────────────────────────────────────
 # A result whose configuration has to be reconstructed from memory the next morning is
-# anonymous (the design notes. Every run prints the whole
+# anonymous (docs/bench/AXION-PRODUCTION-CONTRACT.md). Every run prints the whole
 # identity, read from the machine and from the binary - never from a constant in here.
 def result_header(a, model_path, extra_env):
     def sh(cmd, default="UNKNOWN"):
@@ -415,6 +422,95 @@ def result_header(a, model_path, extra_env):
     }
 
 
+PROFILE_DIR  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "configs", "perf")
+PROFILE_TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "perf_profile.py")
+
+
+def resolve_profile(a):
+    """Compose the server environment from the named profile, then apply explicit overrides.
+
+    Refuses to run with neither. The alternative -- a silent default -- is how a table gets
+    printed for a configuration nobody chose: the profile's own values had already been
+    written down days before the run that ignored them.
+    """
+    if a.profile and a.no_profile:
+        raise SystemExit("REFUSING TO RUN: --profile and --no-profile are mutually exclusive.")
+    if not a.profile and not a.no_profile:
+        try:
+            avail = ", ".join(sorted(f[:-5] for f in os.listdir(PROFILE_DIR)
+                                     if f.endswith(".json") and f != "schema.json"))
+        except OSError:
+            avail = "(configs/perf not found)"
+        raise SystemExit(
+            "REFUSING TO RUN: no --profile and no --no-profile.\n"
+            "  A serving result is identified by its runtime configuration, and a flag left\n"
+            "  at a default nobody chose is an invisible variable. Pass one of:\n"
+            "     --profile <name>          the platform's declared profile\n"
+            "     --no-profile '<reason>'   compiled defaults, on purpose\n"
+            "  Available profiles: " + avail)
+    explicit = dict(kv.split("=", 1) for kv in (a.server_env or "").split(",") if "=" in kv)
+    if a.no_profile:
+        print("### profile=           NONE - " + a.no_profile)
+        a.profile_argv = []
+        return a.server_env
+    out = subprocess.run([sys.executable, PROFILE_TOOL, "server-env", a.profile],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit("REFUSING TO RUN: profile %r did not resolve:\n%s"
+                         % (a.profile, out.stderr or out.stdout))
+    from_profile = dict(kv.split("=", 1) for kv in out.stdout.strip().split(",") if "=" in kv)
+    merged = dict(from_profile)
+    for k, v in explicit.items():
+        if k in from_profile and from_profile[k] != v:
+            print("### profile_override=  %s: %r -> %r (explicit)" % (k, from_profile[k], v))
+        merged[k] = v
+    print("### profile=           " + a.profile)
+    a.profile_argv = profile_server_argv(a)
+    if a.profile_argv:
+        print("### profile_args=      " + " ".join(a.profile_argv))
+    return ",".join("%s=%s" % (k, v) for k, v in sorted(merged.items()))
+
+
+# The harness OWNS the topology axis: --topo is the thing a topology sweep varies, so
+# --prefork/--prefork-threads/--batch-size are derived from it and the profile must not
+# fight it. Everything else in the profile's launch line is a production setting the
+# harness has no opinion about -- queue depth, timeouts, request cap -- and leaving those
+# at whatever the binary compiles in is how a run measures a different server from the one
+# the profile qualified.
+HARNESS_OWNED = {"--serve", "--batch-size", "--prefork", "--prefork-threads",
+                 "--prefork-elastic", "-d", "--int8"}
+
+
+def profile_server_argv(a):
+    if not a.profile:
+        return []
+    out = subprocess.run([sys.executable, PROFILE_TOOL, "command", a.profile,
+                          "--model", "MODEL", "--port", "0"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return []
+    toks = out.stdout.split()
+    try:
+        toks = toks[toks.index("MODEL") + 1:]          # drop env prefix, binary, -d MODEL
+    except ValueError:
+        return []
+    keep, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if not t.startswith("-"):
+            i += 1
+            continue
+        val = toks[i + 1] if i + 1 < len(toks) and not toks[i + 1].startswith("-") else None
+        if t not in HARNESS_OWNED:
+            keep.append(t)
+            if val is not None:
+                keep.append(val)
+        i += 2 if val is not None else 1
+    return keep
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -437,13 +533,26 @@ def main():
                          "tests/load_test.py, o il run e' dichiarato NON VALIDO")
     ap.add_argument("--no-crosscheck", action="store_true")
     ap.add_argument("--server-env", default="", metavar="K=V,K=V",
-                    help="env applied to the SERVER process only (A/B arms)")
+                    help="env applied to the SERVER process only (A/B arms). Merged ON TOP "
+                         "of --profile, and every override is announced.")
+    # ── The profile is a GATE, not a document ────────────────────────────────────────
+    # A deployment profile that has to be remembered is a profile that will be forgotten,
+    # and the run that forgets it still prints a table. Measured 2026-08-31: same binary,
+    # same bank, same box, C=1 FAST -> 108 ms without the platform's declared
+    # OPENBLAS_THREAD_TIMEOUT=1 and 66 ms with it, the bare arm bimodal between the two.
+    # Nothing in the output said which one had been measured. So: name a profile, or say
+    # out loud that you are deliberately running without one.
+    ap.add_argument("--profile", default="", metavar="NAME",
+                    help="deployment profile from configs/perf; supplies the server env")
+    ap.add_argument("--no-profile", default="", metavar="REASON",
+                    help="run with compiled defaults instead of a profile, stating why")
     # ⚠️ QUALITY GATE ONLY. Keeping every chunk and writing a WAV per request adds memory
     # and I/O to the measured path: a run with this on is NOT a timing run and its p95 must
     # not be quoted. Off by default precisely so nobody quotes one by accident.
     ap.add_argument("--save-audio", default="", metavar="DIR",
                     help="write one WAV per request into DIR (quality gate; perturbs timing)")
     a = ap.parse_args()
+    a.server_env = resolve_profile(a)
     global TEXTS
     TEXTS = load_texts(a.text_file,
                        set(x.strip() for x in a.classes.split(",") if x.strip()) or None)
@@ -481,18 +590,69 @@ def main():
         cmd += ["--prefork", str(W), "--prefork-threads", str(8 if elastic else K)]
         if elastic:
             cmd += ["--prefork-elastic"]
+        cmd += getattr(a, "profile_argv", [])
         log = os.path.join(a.out, f"{label}_{topo}.log")
         f = open(log, "wb")
         senv = dict(os.environ)
+        want = {}
         for kv in (a.server_env or "").split(","):
             if "=" in kv:
-                k, v = kv.split("=", 1); senv[k.strip()] = v.strip()
+                k, v = kv.split("=", 1)
+                if v.strip() and (" " in v.strip() or "\t" in v.strip()):
+                    # "A=1 B=1" splits on commas into ONE token that still contains '=',
+                    # so everything after the space lands inside A's VALUE and never
+                    # reaches the engine as its own variable.
+                    sys.exit(f"--server-env: value of {k.strip()} is {v.strip()!r}, which "
+                             f"contains whitespace — the separator is a COMMA, not a space. "
+                             f"Got: {a.server_env!r}")
+                senv[k.strip()] = v.strip(); want[k.strip()] = v.strip()
+            elif kv.strip():
+                # --server-env is K=V,K=V. A bare token here means someone separated with
+                # spaces, in which case everything after the first space landed inside the
+                # PREVIOUS value and never reached the engine. That has already produced a
+                # benchmark whose two arms both ran with the flag unset.
+                sys.exit(f"--server-env: '{kv.strip()}' has no '=' — the list separator is a "
+                         f"COMMA, not a space. Got: {a.server_env!r}")
         p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=senv)
         print(f"=== {label} {topo} (cap {cap}/worker, port {port}) ===", flush=True)
         try:
             if not wait_port(port):
                 print("  server did not come up"); continue
             time.sleep(5)
+            # Wait for the engine's own declaration rather than assuming a fixed delay is
+            # enough: the listening socket can exist before the line is flushed, and a
+            # timing race here reads as "the flag never arrived".
+            if want:
+                for _ in range(120):
+                    try:
+                        if "[FLAGS]" in open(log, "rb").read().decode("utf-8", "replace"):
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.5)
+            # The engine prints one [FLAGS] line naming every registered variable it
+            # actually read. Assert the requested ones are there BEFORE spending a request:
+            # a flag is on when the process says so, not when the command line intended it.
+            if want:
+                seen, txt = {}, ""
+                try:
+                    txt = open(log, "rb").read().decode("utf-8", "replace")
+                except OSError:
+                    pass
+                for line in txt.splitlines():
+                    if line.startswith("[FLAGS]"):
+                        for tok in line.split()[2:]:
+                            if "=" in tok:
+                                k, v = tok.split("=", 1); seen[k] = v
+                missing = {k: v for k, v in want.items()
+                           if k.startswith("QWEN_") and seen.get(k) != v}
+                if missing:
+                    p.kill()
+                    sys.exit(f"server did not receive {missing} (engine reported {seen}) — "
+                             f"refusing to benchmark a configuration that is not running")
+                print(f"  flags verified in the engine: "
+                      f"{' '.join(f'{k}={v}' for k, v in sorted(seen.items())) or '(none)'}",
+                      flush=True)
             pids = tree_pids(p.pid)
             res, lock = [], threading.Lock()
             for wi in range(min(4, W * 2)):       # warm every worker

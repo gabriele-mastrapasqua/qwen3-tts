@@ -17,6 +17,12 @@ tools/para/.venv/
 !tools/para/*.py
 # tools/quant (E7): fake-quant harness for offline quant-format quality gates
 !tools/quant/*.py
+# Benchmark and audio-inspection tooling. Listed one by one rather than with a directory
+# wildcard: '*.py' is ignored by default here, and a tool that lands in tools/ without an
+# entry is silently absent from the repository while looking present on disk.
+!tools/perf_profile.py
+!tools/wav_qc.py
+!tools/onset_report.py
 # NB: no trailing slash — these may be symlinks to the NAS copy, not real dirs
 qwen3-tts-0.6b
 qwen3-tts-1.7b
@@ -76,3 +82,15 @@ bench_out/
 # Compiler-generated dependency files (Makefile -MMD -MP)
 *.d
 tests/test_ingot_parity
+
+# Local working material, never published. Contents are deliberately unspecified.
+/private/
+
+# Working notes for whoever is driving the work: agent instructions, roadmaps, plans.
+# They are kept locally and are deliberately NOT part of the published repository -- they
+# describe how the work is organised, which is not the same thing as the work.
+/CLAUDE.md
+/AGENTS.md
+/PLAN.md
+/plan_*.md
+/TODO.md

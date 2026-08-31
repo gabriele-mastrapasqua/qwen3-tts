@@ -1,0 +1,365 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "qwen-tts/configs/perf/schema.json",
+  "title": "Server performance profile",
+  "description": "Answers one question: given this hardware and this objective, how should the engine be run? A profile is a recommended DEPLOYMENT configuration. It deliberately carries no measurement provenance - no commit, no binary hash, no corpus hash, no seed, no timestamp, no host address - because those belong to a run manifest, which references a profile by id. That separation is what lets a recommended configuration survive new binaries and new benchmark campaigns. A profile is either COMPLETE (every section present) or an ALIAS (profile.alias_of set and no other section). The loader enforces that split, because a schema-level conditional is harder to read than the rule it encodes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "description",
+        "objective"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "description": {
+          "type": "string"
+        },
+        "alias_of": {
+          "type": "string",
+          "description": "When present, this profile is a pointer. Every other section must be absent: an alias that repeats values is a second copy that will drift."
+        },
+        "objective": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "primary",
+            "concurrency_range",
+            "quality_changes_allowed"
+          ],
+          "properties": {
+            "primary": {
+              "enum": [
+                "ttfa",
+                "throughput",
+                "realtime_factor",
+                "memory"
+              ],
+              "description": "ttfa = time to first audio. realtime_factor = generation time divided by audio duration after the first chunk, per request; below 1 means the stream keeps ahead of playback."
+            },
+            "secondary": {
+              "enum": [
+                "ttfa",
+                "throughput",
+                "realtime_factor",
+                "memory",
+                "none"
+              ]
+            },
+            "concurrency_range": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "The client-concurrency band this configuration was qualified over. Outside it the profile makes no claim."
+            },
+            "preferred_concurrency": {
+              "description": "Only set when a measurement supports it; otherwise \"unspecified\".",
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "const": "unspecified"
+                }
+              ]
+            },
+            "quality_changes_allowed": {
+              "type": "boolean",
+              "description": "Whether this profile is permitted to alter the audio relative to the reference precision."
+            }
+          }
+        }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "cpu_family",
+        "logical_cpus",
+        "physical_cores"
+      ],
+      "properties": {
+        "architecture": {
+          "enum": [
+            "arm64",
+            "x86_64"
+          ]
+        },
+        "cpu_family": {
+          "type": "string"
+        },
+        "logical_cpus": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "physical_cores": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "threads_per_core": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "numa_nodes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "l3_mib": {
+          "type": "number"
+        },
+        "ram_gib": {
+          "type": "number"
+        },
+        "isa_features_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "target": {
+          "type": "string"
+        },
+        "make": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "variables": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "requirements": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prefork_workers",
+        "threads_per_worker",
+        "batch_size"
+      ],
+      "properties": {
+        "prefork_workers": {
+          "$ref": "#/definitions/intOrUnspecified"
+        },
+        "threads_per_worker": {
+          "$ref": "#/definitions/intOrUnspecified"
+        },
+        "batch_size": {
+          "$ref": "#/definitions/intOrUnspecified",
+          "description": "In-flight cap per worker. client_concurrency is NOT engine batch: with W workers a worker sees B>=2 only when C>=2W."
+        },
+        "max_queue": {
+          "$ref": "#/definitions/intOrUnspecified"
+        },
+        "queue_timeout_ms": {
+          "$ref": "#/definitions/intOrUnspecified"
+        },
+        "max_request_seconds": {
+          "$ref": "#/definitions/intOrUnspecified"
+        },
+        "worker_affinity": {
+          "type": "string"
+        }
+      }
+    },
+    "streaming": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "first_chunk_ramp": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "Frames per decode call for the leading chunks, in order."
+        },
+        "decode_chunk": {
+          "$ref": "#/definitions/intOrUnspecified"
+        },
+        "decode_chunk_busy": {
+          "$ref": "#/definitions/intOrUnspecified"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "precision",
+        "environment"
+      ],
+      "properties": {
+        "precision": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Per component, because \"int8\" names completely different paths in the talker, the speech decoder and the code predictor.",
+          "properties": {
+            "talker_weights": {
+              "type": "string"
+            },
+            "code_predictor_weights": {
+              "type": "string"
+            },
+            "speech_decoder_weights": {
+              "type": "string"
+            },
+            "activations": {
+              "type": "string"
+            },
+            "gemm_backend": {
+              "type": "string"
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "value",
+              "why"
+            ],
+            "properties": {
+              "value": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "null means deliberately NOT set; the compiled default applies."
+              },
+              "why": {
+                "type": "string"
+              },
+              "revert": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executable",
+        "server_env_serialization"
+      ],
+      "properties": {
+        "executable": {
+          "type": "string"
+        },
+        "extra_arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "server_env_serialization": {
+          "enum": [
+            "comma"
+          ],
+          "description": "How the environment is handed to a harness --server-env argument. Comma: a space-separated list silently folds every later variable into the previous VALUE."
+        }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "workload",
+        "benchmark_family"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "qualified",
+            "provisional",
+            "unqualified"
+          ]
+        },
+        "workload": {
+          "type": "string"
+        },
+        "benchmark_family": {
+          "enum": [
+            "TRUE_SIMULTANEOUS_WAVE",
+            "POISSON_OPEN_LOOP",
+            "CLOSED_LOOP_SATURATION"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "speaker": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "intOrUnspecified": {
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "const": "unspecified",
+          "description": "The qualification did not fix this value. Never invent one."
+        }
+      ]
+    }
+  }
+}

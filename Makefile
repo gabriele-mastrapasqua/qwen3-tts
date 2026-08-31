@@ -289,8 +289,6 @@ help:
 	@echo "  make check-isa             - compile-check dei percorsi ISA che questa macchina non ha"
 	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
 	@echo ""
-	@echo "  Variabili: SPK (def. $(AX_SPK)) · TEXT · SEED ($(AX_SEED)) · Q ($(AX_Q))"
-	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
 
