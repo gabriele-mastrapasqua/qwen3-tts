@@ -1,14 +1,8 @@
 /*
  * qwen_tts_cuda_kernels.cu - CUDA compute kernels, built by `make cuda` (nvcc).
- *
- * Mirrors the Metal kernels in qwen_tts_metal.m one to one (same math), which are validated
- * against the CPU references via --gpu-selftest. cuBLAS handles the GEMMs (matmat/matvec) in
- * qwen_tts_cuda.c; these kernels cover what it cannot: norm, rope, swiglu, silu, elementwise,
- * snake, attention, conv1d and transpose. The extern "C" host launchers mirror the Metal host
- * API so a self-test can reuse the same CPU references.
- *
- * These launchers upload, run and download per call: they are the correctness harness. The
- * resident fused paths (weights on device, one graph per step) live in the other CUDA files.
+ * Mirrors the Metal kernels in qwen_tts_metal.m one to one. cuBLAS handles the GEMMs in
+ * qwen_tts_cuda.c; these cover norm, rope, swiglu, silu, elementwise, snake, attention,
+ * conv1d and transpose, and upload/run/download per call. Fused paths: the other CUDA files.
  */
 
 #include <cuda_runtime.h>

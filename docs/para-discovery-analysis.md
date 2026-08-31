@@ -181,4 +181,3 @@ from the emotion plugin per the design contract. Not scheduled; recorded so we d
 3. Embedding-similarity trigger mining over the vocab (weights-only, one script).
 4. T4 variants grid (laugh ×10, sigh ×5) judged at scale; ear only on the shortlist.
 5. Optional `--debug` steering-projection trace for mechanism insight (§3.3).
-

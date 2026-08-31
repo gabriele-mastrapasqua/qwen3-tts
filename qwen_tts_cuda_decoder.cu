@@ -1,10 +1,8 @@
 /*
  * qwen_tts_cuda_decoder.cu - GPU-resident ConvNet speech decoder.
- *
- * Keeps the activation resident: upload the short latent `signal` ([ch x len]) once, run the
- * whole conv stack (ConvNeXt x2 + initial conv + 4 upsample blocks + final) as device kernels
- * on resident buffers, download the audio once. Weights are cached resident by pointer.
- * Mirrors conv_decoder_forward() in qwen_tts_speech_decoder.c.
+ * Uploads the short latent once, runs the whole conv stack as device kernels on resident
+ * buffers, downloads the audio once. Weights cached resident by pointer. Mirrors
+ * conv_decoder_forward() in qwen_tts_speech_decoder.c.
  */
 #include <cuda_runtime.h>
 #include <cublas_v2.h>

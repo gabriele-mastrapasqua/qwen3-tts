@@ -9,4 +9,3 @@
   {"file": "../../samples/tests/2026-07-01_para_validate_voices/laugh_ryanIT_CN3_s42.wav", "tag": "laugh", "onom": "哈哈哈", "voice": "ryan",   "lang": "IT", "seed": 42, "expected": "KO"},
   {"file": "../../samples/tests/2026-07-01_laugh_hunt/ryanEN_hahaha_joy_s42.wav",          "tag": "laugh", "onom": "hahaha", "voice": "ryan",   "lang": "EN", "seed": 42, "expected": "KO"}
 ]
-

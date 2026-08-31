@@ -1,13 +1,8 @@
 /*
  * qwen_tts_metal.m - Apple Metal backend. Objective-C, clang -fobjc-arc.
- *
- * Weights are resident (uploaded once, cached by pointer) and IO buffers are pooled and
- * reused, so the steady state allocates nothing per call. All quantized dequant happens
- * in-shader, matching the CPU kernels bit for bit.
- *
- * On a shared-memory Apple GPU, single-stream matvec is bandwidth-bound and lands at rough
- * parity with the tuned NEON CPU path; the wins are batched matmat (compute-bound) and
- * decoder offload with CPU/GPU overlap. See qwen_tts_metal.h for the interface.
+ * Weights resident (cached by pointer) and IO buffers pooled, so the steady state allocates
+ * nothing per call; quantized dequant happens in-shader, matching the CPU kernels bit for bit.
+ * Single-stream matvec is bandwidth-bound here: the wins are batched matmat and decoder offload.
  */
 
 #import <Metal/Metal.h>
@@ -1074,16 +1069,11 @@ void qwen_metal_conv_transpose1d(void *ctx, float *out, const float *in, const f
     }
 }
 
-/* ---- FUSED RESIDENT FFN: the heavy block, entirely on GPU -----------------
- * rms_norm → gate_up matvec → SwiGLU → down matvec → residual, encoded as ONE
- * command buffer. All intermediates (xn, gate_up, h) stay in DEVICE buffers —
- * never copied to the CPU. On-GPU memoryBarriers order the dependent dispatches;
- * a single commit+wait at the end. Only `out` comes back. This is the resident-
- * decode pattern (llama.cpp/mlx): the win comes from the heavy matmuls running
- * back-to-back on the GPU with zero per-op CPU<->GPU round-trips.
- *
- * Layouts (match the CPU path): gate_up [2*inter, H] interleaved rows
- * (row 2i=gate_i, 2i+1=up_i); down [H, inter]; residual out += x. */
+/* ---- FUSED RESIDENT FFN: rms_norm -> gate_up matvec -> SwiGLU -> down matvec -> residual,
+ * encoded as ONE command buffer. Intermediates stay in device buffers; memoryBarriers order
+ * the dispatches and a single commit+wait ends it, so only `out` comes back. Same resident-
+ * decode pattern as llama.cpp/mlx. Layouts match the CPU path: gate_up [2*inter, H] with
+ * interleaved rows (2i = gate_i, 2i+1 = up_i); down [H, inter]; residual out += x. */
 void qwen_metal_ffn_swiglu(void *ctx, float *out, const float *x, const float *norm_w,
                            const uint16_t *Wgu, const uint16_t *Wd,
                            int H, int inter, float eps) {
@@ -1737,13 +1727,10 @@ void qwen_metal_talker_free(void *st) {
     free(s);
 }
 
-/* ======================================================================== *
- *  BATCHED fused Talker step (Metal) - mirrors qwen_cuda_talker_batch_*.
- *  Shares the single state's resident weights (via ctx->layers + weight_buf cache); activations
- *  [B][dim], KV [L][B][kv_max][kvd], d_pos[B] per slot. Every dispatch is barrier-serialized.
- *  B <= QMB_MAX. bf16/int8/q4 via mv_b_* (weight read once, s[B] accumulator = the win).
- *  Validate B=1 against the single-stream path before trusting B>1.
- * ======================================================================== */
+/* BATCHED fused Talker step (Metal), mirroring qwen_cuda_talker_batch_*. Shares the single
+ * state's resident weights; activations [B][dim], KV [L][B][kv_max][kvd], d_pos[B] per slot.
+ * Dispatches are barrier-serialized. B <= QMB_MAX. Validate B=1 against the single-stream
+ * path before trusting B>1. */
 #define QMB_MAX 8
 typedef struct {
     qwen_metal_ctx *mc; qwen_tts_ctx_t *ctx;

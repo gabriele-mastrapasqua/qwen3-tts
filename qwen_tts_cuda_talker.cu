@@ -1,12 +1,7 @@
 /*
  * qwen_tts_cuda_talker.cu - GPU-resident fused Talker step.
- *
- * Keeps weights, KV and activations resident on the device and runs the whole Talker step as
- * a chain of kernels with a single sync at the end: only the input embedding goes in and the
- * hidden state comes out.
- *
- * Single-token decode is bandwidth-bound on the weight reads (1.7B is about 3.4 GB of bf16
- * per step), so fp32-resident weights would read twice the bytes for no gain. Weights stay
+ * Weights, KV and activations stay resident; the whole step runs as a chain of kernels with a
+ * single sync. Single-token decode is bandwidth-bound on the weight reads, so weights stay
  * bf16 on the device and a custom bf16 matvec reads them directly.
  */
 
@@ -420,13 +415,10 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
     free(hk); free(hv);
 }
 
-/* ======================================================================== *
- *  BATCHED fused Talker/CP steps. B sequences share the resident weights (uploaded once);
- *  activations are [B][dim], KV is [B][kv_max][kvd]. The matvec->matmat kernels read each
- *  weight row once and apply it to all B activation columns (register accumulator s[B]), so
- *  weight DRAM traffic is amortized over B. Lockstep (all B at the same pos); d_pos[B] is
- *  per-sequence so it generalizes to ragged batching. B is capped at QB_MAX.
- * ======================================================================== */
+/* BATCHED fused Talker/CP steps. B sequences share the resident weights; activations are
+ * [B][dim], KV is [B][kv_max][kvd]. The matmat kernels read each weight row once and apply it
+ * to all B columns (accumulator s[B]), amortizing weight DRAM traffic over B. Lockstep, but
+ * d_pos[B] is per-sequence so it generalizes to ragged batching. B capped at QB_MAX. */
 #define QB_MAX 8
 
 /* batched matmat: X[B][cols], Y[B][rows]; warp per output row reads W[row,:] once → B dots. */
