@@ -42,7 +42,7 @@
     },
     "requirements": {
       "blas": "OpenBLAS 0.3.32, pthread build (libopenblas0-pthread)",
-      "kleidiai": "vendored subset of ARM-software/kleidiai 495f652; SMMLA and BFMMLA both compiled and active",
+      "kleidiai": "vendored subset of ARM-software/kleidiai; SMMLA and BFMMLA both compiled and active",
       "note": "GIT_REV must be passed on the command line: a synced tree has no .git, so the binary cannot certify its own commit."
     }
   },

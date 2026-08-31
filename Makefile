@@ -178,7 +178,7 @@ help:
 	@echo "  make bench-full      - Full benchmark (+ server, qvoice, instruct, INT8)"
 	@echo "  make cp-microbench   - Build qwen_tts_cpbench (per-op Code Predictor breakdown)"
 	@echo ""
-	@echo "A freshly rented box (IN THIS ORDER — see docs/hardware-testing.md):"
+	@echo "A newly provisioned box (IN THIS ORDER — see docs/hardware-testing.md):"
 	@echo "  make server-hw-check       - the truth about the silicon: hardware + memory bandwidth"
 	@echo "  make server-batch-microbench - the B=1->2->4 curve and batch efficiency (~4 min, open weights)"
 	@echo "  make mini-bench-06b|-17b   - 1/2/4 parallel requests on an OSS model"

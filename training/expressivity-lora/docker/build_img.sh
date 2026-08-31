@@ -3,7 +3,7 @@ set -uo pipefail
 cd ~/qwen-ft/docker
 echo "### building qwen-ft image..."
 docker build -t qwen-ft:latest . 2>&1 | tail -15
-echo "### smoke: torch+torchaudio+qwen-tts on GB10"
+echo "### smoke: torch+torchaudio+qwen-tts"
 docker run --rm --gpus all qwen-ft:latest python3 -c "
 import torch, torchaudio
 print(\"torch\", torch.__version__, \"ta\", torchaudio.__version__)

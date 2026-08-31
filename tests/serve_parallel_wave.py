@@ -190,15 +190,13 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
         out.append(rec)
 
 def canonical_ttfa(port, requests, speaker, language, seed, text_file, classes, out, tag):
-    """The ORACLE: tests/load_test.py at c=1, which decodes the chunk framing by hand
-    and stamps TTFA on the first chunk. Returns its ttfa_p50 in ms, or None.
+    """Cross-check TTFA against tests/load_test.py at c=1, which decodes the chunk framing
+    by hand and stamps TTFA on the first chunk. Returns its ttfa_p50 in ms, or None.
 
-    This exists because on 2026-08-23 this harness reported 1156 ms where the oracle
-    reported 187 ms on the same server, the same text and zero contention: urllib's
-    read(65536) blocks until it HAS 65536 bytes, so it was timing 1.365 s of buffered
-    audio and calling it TTFA. A harness that claims to measure TTFA must be checked
-    against the one we trust, automatically, or the same class of bug comes back
-    wearing a different number."""
+    A client that reads with a fixed-size read() blocks until it HAS that many bytes, so it
+    times buffered audio rather than the first chunk. Any harness claiming to measure TTFA
+    has to be checked against one that decodes the framing.
+    """
     js = os.path.join(out, f"{tag}_oracle.json")
     cmd = ["python3", "tests/load_test.py", "--url", f"http://127.0.0.1:{port}",
            "--concurrency", "1", "--requests", str(requests),
@@ -218,13 +216,9 @@ def canonical_ttfa(port, requests, speaker, language, seed, text_file, classes, 
         return None
 
 def pct(v, q):
-    """NEAREST RANK, deliberately, and NOT the same definition tests/load_test.py uses.
-
-    That one interpolates between the two neighbouring values. On an even, small sample the
-    two disagree by a whole rank -- 88 against 103 ms on four requests of a mixed-length
-    bank -- so the cross-check below widens its tolerance rather than pretending the
-    statistics are comparable. Changing this function would move every number this harness
-    has ever produced, which is a bigger price than the confusion it saves.
+    """Percentile by NEAREST RANK, and deliberately not the interpolating definition
+    tests/load_test.py uses. On a small even sample the two differ by a whole rank, so the
+    cross-check below widens its tolerance instead of pretending they are comparable.
     """
     if not v: return float("nan")
     v = sorted(v)
@@ -233,8 +227,7 @@ def pct(v, q):
 ARRIVAL_TRUE_WAVE = "TRUE_SIMULTANEOUS_WAVE"
 
 def workload_class(text_file, classes=""):
-    """The workload is a property of the CORPUS and the class filter, never of the name a
-    campaign happened to use."""
+    """The workload is a property of the corpus and the class filter, never of a run's name."""
     base = os.path.basename(text_file)
     if not classes:
         stem = base[:-4] if base.endswith(".txt") else base
@@ -251,9 +244,9 @@ def workload_class(text_file, classes=""):
     return "UNSPECIFIED_WORKLOAD"
 
 def result_slug(workload, arrival, topo, conc, model_label, precision):
-    """A result filename has to be readable without opening it.
-        2026-08-25_true-wave_short-diverse_ft-int8_2x8_c6.json
-    beats b1_c6_on_r2.log, which needs a person who remembers the campaign."""
+    """A result filename has to be readable without opening it, e.g.
+        2026-01-31_true-wave_short-diverse_int8_2x8_c6.json
+    """
     a = {"TRUE_SIMULTANEOUS_WAVE": "true-wave", "POISSON_OPEN_LOOP": "poisson",
          "CLOSED_LOOP_PARALLEL_SOAK": "closed-loop-soak"}.get(arrival, arrival.lower())
     w = workload.lower().replace("_", "-").replace("parallel-", "")
@@ -328,9 +321,8 @@ PROFILE_TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 def resolve_profile(a):
     """Compose the server environment from the named profile, then apply explicit overrides.
 
-    Refuses to run with neither. The alternative -- a silent default -- is how a table gets
-    printed for a configuration nobody chose: the profile's own values had already been
-    written down days before the run that ignored them.
+    Refuses to run with neither: a silent default is how a table gets printed for a
+    configuration nobody chose.
     """
     if a.profile and a.no_profile:
         raise SystemExit("REFUSING TO RUN: --profile and --no-profile are mutually exclusive.")

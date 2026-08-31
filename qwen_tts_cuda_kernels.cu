@@ -1,17 +1,14 @@
 /*
- * qwen_tts_cuda_kernels.cu — CUDA compute kernels (G3), nvcc.
+ * qwen_tts_cuda_kernels.cu - CUDA compute kernels, built by `make cuda` (nvcc).
  *
- * Compiled only by `make cuda` (nvcc). Mirrors the M1-VALIDATED Metal kernels in
- * qwen_tts_metal.m 1:1 (same math, validated there via --gpu-selftest rel<5e-3),
- * so numerical correctness is high-confidence; only nvcc compilation is verified
- * on the DGX (no CUDA on the M1 dev box). cuBLAS handles the GEMM (matmat/matvec)
- * in qwen_tts_cuda.c; these kernels cover the ops cuBLAS can't: norm/rope/swiglu/
- * silu/elementwise/snake/attention/conv1d/transpose. Host-array launchers
- * (extern "C") mirror the Metal host API so a DGX selftest can reuse the CPU refs.
+ * Mirrors the Metal kernels in qwen_tts_metal.m one to one (same math), which are validated
+ * against the CPU references via --gpu-selftest. cuBLAS handles the GEMMs (matmat/matvec) in
+ * qwen_tts_cuda.c; these kernels cover what it cannot: norm, rope, swiglu, silu, elementwise,
+ * snake, attention, conv1d and transpose. The extern "C" host launchers mirror the Metal host
+ * API so a self-test can reuse the same CPU references.
  *
- * PERF NOTE: these launchers upload/run/download per call (correctness harness).
- * The resident/fused versions (weights on device, one CUDA-graph per step) are
- * the perf follow-up — same as the Metal per-op → fused progression.
+ * These launchers upload, run and download per call: they are the correctness harness. The
+ * resident fused paths (weights on device, one graph per step) live in the other CUDA files.
  */
 
 #include <cuda_runtime.h>

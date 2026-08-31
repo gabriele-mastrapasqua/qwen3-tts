@@ -1,15 +1,13 @@
 /*
- * qwen_tts_metal.m — Apple Metal backend (G2). Objective-C, clang -fobjc-arc.
+ * qwen_tts_metal.m - Apple Metal backend. Objective-C, clang -fobjc-arc.
  *
- * Design (see qwen_tts_metal.h): weights RESIDENT (uploaded once, cached by
- * pointer), IO buffers pooled+reused — zero per-call allocation in steady state.
- * All quant dequant happens in-shader, matching the CPU kernels bit-for-bit.
+ * Weights are resident (uploaded once, cached by pointer) and IO buffers are pooled and
+ * reused, so the steady state allocates nothing per call. All quantized dequant happens
+ * in-shader, matching the CPU kernels bit for bit.
  *
- * Honest M1 framing (plan_v4 §E4.ter): single-stream matvec on the shared-memory
- * M1 GPU is bandwidth-bound → ~parity-or-worse vs the tuned NEON CPU path; the
- * real wins are batched matmat (compute-bound) and decoder offload + CPU/GPU
- * overlap. This file provides the correct primitives + a per-op selftest so we
- * can MEASURE where the GPU actually helps and optimize from real numbers.
+ * On a shared-memory Apple GPU, single-stream matvec is bandwidth-bound and lands at rough
+ * parity with the tuned NEON CPU path; the wins are batched matmat (compute-bound) and
+ * decoder offload with CPU/GPU overlap. See qwen_tts_metal.h for the interface.
  */
 
 #import <Metal/Metal.h>
@@ -28,8 +26,8 @@ static const char *QWEN_METAL_SRC =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "inline float bf16_to_f32(ushort b) { return as_type<float>(uint(b) << 16); }\n"
-/* MUST match qwen_tts_kernels.h q4_0_block_t exactly (fp16 scale, 18 B/block since
- * perf item 2). MSL `half` is IEEE binary16; reads auto-convert to float in exprs. */
+/* MUST match q4_0_block_t in qwen_tts_kernels.h exactly (fp16 scale, 18 B/block).
+ * MSL `half` is IEEE binary16; reads auto-convert to float in expressions. */
 "struct q4blk { half scale; uchar qs[16]; };\n"
 "\n"
 /* simdgroup matvec: one output row per simdgroup; 32 lanes stride the cols with
@@ -108,11 +106,10 @@ static const char *QWEN_METAL_SRC =
 "    acc = simd_sum(acc); if (tiisg == 0) y[row] = acc;\n"
 "}\n"
 "\n"
-/* Vectorized q4_0 twin (opt-in QWEN_METAL_Q4_VEC=1): float4 dot over coalesced x,
- * scale factored out per block — the direct analog of the CPU SDOT int4 kernel.
- * MEASURED SLOWER on M1 (bandwidth/dispatch-bound → adding ALU hurts); kept for
- * M2+/real-NVIDIA-class compute-bound GPUs where it may flip int4 ahead of int8.
- * See plan_v4 E4.speedup. Default OFF; the scalar matvec_q4_0 above is the M1 default. */
+/* Vectorized q4_0 twin (opt-in QWEN_METAL_Q4_VEC=1): float4 dot over coalesced x, scale
+ * factored out per block - the direct analog of the CPU SDOT int4 kernel. Measured slower
+ * on a bandwidth-bound GPU (adding ALU hurts); kept for compute-bound parts where it may
+ * put int4 ahead of int8. Default off; the scalar matvec_q4_0 above is the default. */
 "kernel void matvec_q4_0_vec(device const q4blk *W [[buffer(0)]],\n"
 "    device const float *x [[buffer(1)]], device float *y [[buffer(2)]],\n"
 "    constant uint &cols [[buffer(3)]], constant uint &rows [[buffer(4)]],\n"
@@ -394,8 +391,8 @@ static const char *QWEN_METAL_SRC =
 "    for (uint st=tc/2;st>0;st>>=1){ if(tid<st){ if(mv[tid+st]>mv[tid]){mv[tid]=mv[tid+st];mi[tid]=mi[tid+st];} } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
 "    if (tid==0) code[cslot] = mi[0];\n"
 "}\n"
-/* ===== BATCHED fused-step kernels (throughput epic) — direct port of the CUDA k_*_b path.
- * Layout [B][dim] (B-major, like CUDA); KV [B][kv_max][kvd]; d_pos[B] per-slot. mv_b_* = one
+/* ===== BATCHED fused-step kernels - direct port of the CUDA k_*_b path.
+ * Layout [B][dim] (B-major, like CUDA); KV [B][kv_max][kvd]; d_pos[B] per slot. mv_b_* = one
  * simdgroup per output row, reads W[row,:] ONCE, accumulates s[B] (weight DRAM amortized over B). */
 "kernel void mv_b_bf16(device const ushort *W [[buffer(0)]],\n"
 "    device const float *X [[buffer(1)]], device float *Y [[buffer(2)]],\n"
@@ -531,7 +528,7 @@ typedef struct {
     void *pso_rope_neox, *pso_rms_ph, *pso_kv_store, *pso_attn_res, *pso_eadd_ip;
     void *pso_embed_gather, *pso_copy_vec, *pso_argmax;   /* device-frame CP */
     void *pso_qnorm_rope, *pso_knorm_rope_store, *pso_add_rms;   /* fused attention preamble + add+norm */
-    /* batched-step pipelines (throughput epic) */
+    /* batched-step pipelines */
     void *pso_mvb_bf16, *pso_mvb_int8, *pso_mvb_q4, *pso_rmsf_b, *pso_rmsph_b;
     void *pso_ropeneox_b, *pso_trunc_b, *pso_kvstore_b, *pso_attnb, *pso_swiglu_ilb;
     void *pso_mmab_bf16;   /* opt-in MMA batched matvec (QWEN_METAL_BATCH_MMA) */
@@ -574,10 +571,9 @@ void *qwen_metal_init(void) {
         c->pso_matvec_bf16 = make_pso(dev, lib, "matvec_bf16");
         c->pso_matmat_bf16 = make_pso(dev, lib, "matmat_bf16");
         c->pso_matvec_int8 = make_pso(dev, lib, "matvec_int8");
-        /* q4_0 matvec: default = scalar (fastest on M1, bandwidth-bound). Opt-in the
-         * vectorized twin with QWEN_METAL_Q4_VEC=1 for M2+/compute-bound GPUs (untested there;
-         * measured a regression on M1 — see plan_v4 E4.speedup). Swapping the pso here covers
-         * both the standalone matvec and the fused Talker/CP enc_mv path. */
+        /* q4_0 matvec: default = scalar (bandwidth-bound, fastest here). Opt in to the vectorized
+         * twin with QWEN_METAL_Q4_VEC=1 on compute-bound GPUs. Swapping the pso here covers both
+         * the standalone matvec and the fused Talker/CP enc_mv path. */
         const char *q4vec = getenv("QWEN_METAL_Q4_VEC");
         int use_q4vec = (q4vec && q4vec[0] == '1');
         c->pso_matvec_q4_0 = make_pso(dev, lib, use_q4vec ? "matvec_q4_0_vec" : "matvec_q4_0");
@@ -1505,11 +1501,10 @@ int qwen_metal_selftest(void *out) {
 }
 
 /* ======================================================================== *
- *  GPU-RESIDENT FUSED TALKER STEP (Metal, G2) — mirrors qwen_cuda_talker_step.
+ *  GPU-RESIDENT FUSED TALKER STEP (Metal) - mirrors qwen_cuda_talker_step.
  *  Weights + KV + activations stay in MTLBuffers; the whole 28-layer step is
  *  encoded into ONE command buffer (dispatches ordered by buffer barriers),
- *  one commit/wait per step. Base = M1 and up (simdgroup matvec, threadgroup
- *  reductions, unified shared buffers). Precision picked per weight (bf16/int8/q4).
+ *  one commit/wait per step. Precision picked per weight (bf16/int8/q4).
  * ======================================================================== */
 #define MTB(x) ((__bridge id<MTLBuffer>)(x))
 typedef struct {
@@ -1706,8 +1701,8 @@ void qwen_metal_talker_step(void *st, const float *embed, float *hidden_out, int
 
 /* Last stepped token's pre-final-norm residual (xb, stable after waitUntilCompleted).
  * qwen_talker_step uses it to refresh ctx->dec_x, which the fused step otherwise never
- * touches (the delta-reuse server path would seed the first frame from a stale dec_x —
- * issue #19). Shared buffer → plain memcpy from .contents. */
+ * touches: without it the delta-reuse server path would seed the first frame from a stale
+ * dec_x. Shared buffer, so a plain memcpy from .contents. */
 void qwen_metal_talker_get_dec_x(void *st, float *out) {
     qwen_metal_talker_t *s = st; if (!s || !out) return;
     @autoreleasepool {
@@ -1743,11 +1738,11 @@ void qwen_metal_talker_free(void *st) {
 }
 
 /* ======================================================================== *
- *  BATCHED fused Talker step (Metal, throughput epic) — mirrors qwen_cuda_talker_batch_*.
+ *  BATCHED fused Talker step (Metal) - mirrors qwen_cuda_talker_batch_*.
  *  Shares the single state's resident weights (via ctx->layers + weight_buf cache); activations
- *  [B][dim], KV [L][B][kv_max][kvd], d_pos[B] per-slot. Every dispatch is barrier-serialized
- *  (correctness-first; overlap tuning later). B<=QMB_MAX. bf16/int8/q4 via mv_b_* (weight read
- *  once, s[B] accumulator = the amortization win). Validate B=1==single before trusting B>1.
+ *  [B][dim], KV [L][B][kv_max][kvd], d_pos[B] per slot. Every dispatch is barrier-serialized.
+ *  B <= QMB_MAX. bf16/int8/q4 via mv_b_* (weight read once, s[B] accumulator = the win).
+ *  Validate B=1 against the single-stream path before trusting B>1.
  * ======================================================================== */
 #define QMB_MAX 8
 typedef struct {
@@ -2038,10 +2033,10 @@ void qwen_metal_cp_batch_step(void *st, float *x, const int *pos_arr) {
 void qwen_metal_cp_batch_free(void *st) { qwen_metal_talker_batch_free(st); }
 
 /* ======================================================================== *
- *  GPU-RESIDENT FUSED CODE PREDICTOR STEP (Metal, G2). Same machinery as the
- *  Talker (reuses enc_mv/enc_rms/enc_rms_ph/enc_rope + the resident kernels).
+ *  GPU-RESIDENT FUSED CODE PREDICTOR STEP (Metal). Same machinery as the Talker
+ *  (reuses enc_mv/enc_rms/enc_rms_ph/enc_rope + the resident kernels).
  *  CP: hidden=1024, 5 layers, per-frame KV (pos 0..15, overwritten each frame),
- *  NO final norm (caller applies cp_norm before the lm-head). Reuses qwen_metal_talker_t. */
+ *  no final norm (caller applies cp_norm before the lm-head). Reuses qwen_metal_talker_t. */
 void *qwen_metal_cp_init(void *metal_ctx, qwen_tts_ctx_t *ctx) {
     if (!ctx || !metal_ctx) return NULL;
     @autoreleasepool {
@@ -2173,8 +2168,8 @@ void qwen_metal_cp_free(void *st) { qwen_metal_talker_free(st); }
 
 /* ======================================================================== *
  *  DEVICE-FRAME CP (Metal): the whole 16-pass RVQ loop + argmax + embed on GPU,
- *  ONE command buffer / ONE wait per frame (vs 16 commit+wait). The M1 win — the
- *  CP was sync-round-trip-bound (measured: 16 waits ≈ 30 ms/f). Mirrors qwen_cp_predict. */
+ *  ONE command buffer and ONE wait per frame instead of 16 commit+wait pairs. The CP is
+ *  sync-round-trip-bound, so this is the win. Mirrors qwen_cp_predict. */
 typedef struct {
     qwen_metal_talker_t *cp; qwen_tts_ctx_t *ctx; qwen_metal_ctx *mc;
     int cp_h, emb_dim, h, codebook, cvocab, has_proj, lm_prec;

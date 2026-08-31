@@ -207,10 +207,10 @@ def server_env(prof):
 
 def forbidden_env(prof):
     """Variables the profile declares with a null value: they must be ABSENT, not merely unset
-    by us. OPENBLAS_NUM_THREADS is the case that matters -- the engine sizes OpenBLAS per
-    worker with openblas_set_num_threads(), and backs off entirely when that variable is in
-    the environment. Someone else's export therefore silently replaces the topology the
-    profile qualified, and no table would show it."""
+    here. OPENBLAS_NUM_THREADS is the case that matters - the engine sizes OpenBLAS per
+    worker with openblas_set_num_threads() and backs off entirely when that variable is in
+    the environment, so an unrelated export silently replaces the qualified topology.
+    """
     return sorted(k for k, s in prof["runtime"]["environment"].items() if s["value"] is None)
 
 def cmd_validate(a):
@@ -258,10 +258,8 @@ def cmd_server_env(a):
 def cmd_new(a):
     """Emit a skeleton for a new deployment, with everything unmeasured marked as such.
 
-    Copying an existing profile is how a value from another machine becomes a claim about
-    this one: the fields are all filled in, they all look deliberate, and nothing says which
-    of them anybody actually measured. A skeleton starts from "unspecified" and makes filling
-    a field a decision.
+    Copying an existing profile turns a value measured on another machine into a claim about
+    this one. A skeleton starts from 'unspecified' so filling a field is a decision.
     """
     ref, _ = load(a.like)
     out = json.loads(json.dumps(ref))

@@ -1,24 +1,13 @@
 /*
- * qwen_tts_cuda_talker.cu — GPU-RESIDENT fused Talker step (CUDA fused-forward epic, M1).
+ * qwen_tts_cuda_talker.cu - GPU-resident fused Talker step.
  *
- * The per-op matvec hook (qwen_tts_cuda.c) uploads/computes/downloads PER matvec → a device
- * sync every op. This TU keeps WEIGHTS + KV + activations RESIDENT on the device and runs the
- * WHOLE Talker step as a chain of kernels with a SINGLE sync at the end. Only the input embed
- * goes in and the hidden comes out.
+ * Keeps weights, KV and activations resident on the device and runs the whole Talker step as
+ * a chain of kernels with a single sync at the end: only the input embedding goes in and the
+ * hidden state comes out.
  *
- * KEY perf insight (measured on GB10): single-token decode is BANDWIDTH-BOUND on the weight
- * reads (1.7B ≈ 3.4 GB bf16 / step). fp32-resident weights read 2× the bytes → no speedup vs the
- * per-op path. So weights stay **bf16** on the device and a custom bf16 matvec reads them at 2
- * bytes/elem while keeping the ACTIVATION in fp32 — exactly the CPU's bf16-weight × f32-act
- * semantics (no extra precision loss, unlike cublasGemmEx which needs bf16 activations too).
- *
- * Kernels match the CPU semantics EXACTLY (qwen_tts_talker.c / qwen_tts_kernels.c):
- *   - matvec: bf16 weight (row-major [rows,cols]) × f32 activation, f32 accumulate  [k_matvec_bf16]
- *   - SwiGLU: interleaved gate/up (gate_up[2i], gate_up[2i+1])                        [k_swiglu_il]
- *   - RoPE: NeoX SPLIT-HALF (xh[i],xh[i+half]), NOT interleaved                       [k_rope_neox]
- *   - per-head RMSNorm on Q/K with a shared [head_dim] weight                         [k_rmsnorm_ph]
- *   - causal GQA attention, online softmax (flash-style)                             [k_attn]
- *   - bf16-TRUNCATED KV cache (CPU f32_to_bf16 = bits>>16 = truncation)              [k_trunc_bf16]
+ * Single-token decode is bandwidth-bound on the weight reads (1.7B is about 3.4 GB of bf16
+ * per step), so fp32-resident weights would read twice the bytes for no gain. Weights stay
+ * bf16 on the device and a custom bf16 matvec reads them directly.
  */
 
 #include <cuda_runtime.h>
@@ -55,8 +44,8 @@ __global__ void k_matvec_bf16(const __nv_bfloat16 *W, const float *x, float *y, 
     if (lane == 0) y[row] = s;
 }
 
-/* q4_0 block: 32 weights = fp16 scale + 16 bytes (low nibble=even idx, high=odd), val=(nib-8)*scale.
- * MUST match qwen_tts_kernels.h q4_0_block_t exactly (fp16 scale, 18 B/block since perf item 2). */
+/* q4_0 block: 32 weights = fp16 scale + 16 bytes (low nibble = even index, high = odd),
+ * value = (nibble - 8) * scale. MUST match q4_0_block_t in qwen_tts_kernels.h exactly. */
 typedef struct { __half scale; unsigned char qs[16]; } q4blk;
 /* warp-per-row q4_0 matvec: int4 weight (0.5 byte) × f32 activation. Half the bytes of int8. */
 __global__ void k_matvec_q4_0(const q4blk *W, const float *x, float *y, int rows, int cols) {
@@ -77,15 +66,11 @@ __global__ void k_matvec_q4_0(const q4blk *W, const float *x, float *y, int rows
     if (lane == 0) y[row] = s;
 }
 
-/* ── dp4a q4×q8 twin (rental-prep 2026-07-11, OPT-IN QWEN_CUDA_DP4A=1) ─────────
- * The gpu-accel-status "⏳ dp4a q4→q8_1" item: quantize the activation once per
- * matvec into per-32-block int8 (DEINTERLEAVED even/odd to match q4_0's within-
- * byte packing) + per-block scale/sum, then integer __dp4a dots with the -8
- * offset corrected via the block sum. NOTE qs sits at byte offset 2 of the
- * 18-byte block → words are built from BYTE loads (no misaligned uint32 reads).
- * ⚠ COMPILE-UNTESTED here (no nvcc on the M1 dev box) — default-off so the
- * proven f32-act kernel above stays the path; first build/validate on the
- * rented NVIDIA box (--gpu-selftest), then A/B with the env flag. */
+/* dp4a q4xq8 twin (opt-in QWEN_CUDA_DP4A=1): quantize the activation once per matvec into
+ * per-32-block int8 (deinterleaved even/odd to match q4_0's within-byte packing) plus a
+ * per-block scale and sum, then integer __dp4a dots with the -8 offset corrected via the
+ * block sum. `qs` sits at byte offset 2 of the 18-byte block, so words are built from BYTE
+ * loads - a uint32 read there would be misaligned. */
 __global__ void k_quant_act_q4dp(const float *x, int nb, signed char *qe, signed char *qo,
                                  float *sxb, int *sumb) {
     int b = blockIdx.x*blockDim.x + threadIdx.x; if (b >= nb) return;
@@ -273,8 +258,7 @@ static float *g_qdp_sx = NULL; static int *g_qdp_sum = NULL;
 static int qdp_enabled(void) {
     static int on = -1;
     if (on < 0) {
-        /* DEFAULT ON since the A100 validation (2026-07-11: Talker −33% ms/f on 1.7B
-         * quant-mixed, RTF 0.55→0.50, ear-validated). QWEN_CUDA_DP4A=0 opts out. */
+        /* Default on. QWEN_CUDA_DP4A=0 opts out. */
         const char *e = getenv("QWEN_CUDA_DP4A");
         on = !(e && e[0]=='0');
         if (on) {
@@ -312,9 +296,9 @@ static inline void mv(int prec, const void *W, const float *scale, const float *
 
 extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c=&ctx->config;
-    /* dp4a scratch MUST be allocated here, before any CUDA-graph capture: cudaMalloc
-     * inside a capturing stream fails (A100 box finding 2026-07-11 — the lazy alloc
-     * in mv() always failed AND perturbed the capture). qdp_enabled() is idempotent. */
+    /* The dp4a scratch MUST be allocated here, before any CUDA-graph capture: cudaMalloc
+     * inside a capturing stream fails, and a lazy allocation inside mv() both fails and
+     * perturbs the capture. qdp_enabled() is idempotent. */
     (void)qdp_enabled();
     cuda_talker_t *s=(cuda_talker_t*)calloc(1,sizeof(*s));
     s->hidden=c->hidden_size; s->n_heads=c->num_heads; s->n_kv=c->num_kv_heads;
@@ -414,8 +398,7 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
 /* Last stepped token's pre-final-norm residual (s->x, stable after the step's sync).
  * qwen_talker_step uses it to refresh ctx->dec_x, which the fused step otherwise never
  * touches: the generation loop seeds last_hidden = rms_norm(dec_x, talker_norm) after
- * prefill, and a stale dec_x from the previous request corrupts the first frame in the
- * server delta-reuse path (issue #19). */
+ * prefill, and a stale dec_x from a previous request would corrupt the first frame. */
 extern "C" void qwen_cuda_talker_get_dec_x(void *state, float *out) {
     cuda_talker_t *s=(cuda_talker_t*)state;
     if (s && out) CK(cudaMemcpy(out, s->x, (size_t)s->hidden*sizeof(float), cudaMemcpyDeviceToHost));
@@ -438,13 +421,11 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
 }
 
 /* ======================================================================== *
- *  BATCHED fused Talker/CP steps (throughput epic). B sequences share the
- *  resident weights (uploaded ONCE); activations are [B][dim], KV is [B][kv_max][kvd].
- *  The matvec→MATMAT kernels read each weight row ONCE and apply it to all B activation
- *  columns (register accumulator s[B]) → weight DRAM traffic amortized over B = the win.
- *  Single-stream gen is idle/sync-bound; B rides that idle capacity for near-free until
- *  compute-bound. Lockstep (all B at same pos) first cut; d_pos[B] is per-sequence so it
- *  generalizes to ragged/continuous batching. B capped at QB_MAX.
+ *  BATCHED fused Talker/CP steps. B sequences share the resident weights (uploaded once);
+ *  activations are [B][dim], KV is [B][kv_max][kvd]. The matvec->matmat kernels read each
+ *  weight row once and apply it to all B activation columns (register accumulator s[B]), so
+ *  weight DRAM traffic is amortized over B. Lockstep (all B at the same pos); d_pos[B] is
+ *  per-sequence so it generalizes to ragged batching. B is capped at QB_MAX.
  * ======================================================================== */
 #define QB_MAX 8
 
@@ -730,11 +711,10 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
 }
 
 /* ======================================================================== *
- *  GPU-RESIDENT fused Code Predictor step (M2). Same layer structure as the
- *  Talker (reuses ALL the kernels above); differences: CP dims (hidden 1024, 5
- *  layers), the CP KV is per-frame (built fresh each frame, no prefill upload),
- *  and there is NO final norm (the caller applies cp_norm before the lm-head).
- *  Emotion steer is a pre-step input add on the CPU → the fused step is emo-safe.
+ *  GPU-resident fused Code Predictor step. Same layer structure as the Talker
+ *  (reuses all the kernels above); differences: CP dims (hidden 1024, 5 layers),
+ *  the CP KV is per-frame (built fresh each frame, no prefill upload), and there
+ *  is no final norm (the caller applies cp_norm before the lm-head).
  * ======================================================================== */
 typedef struct {
     int hidden, q_dim, kv_dim, inter, n_heads, n_kv, head_dim, n_layers, kv_max;

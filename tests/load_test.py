@@ -66,18 +66,12 @@ def load_texts(path, only_classes=None):
     return mixed
 
 class ServerLogTail:
-    """Read the server's stderr WHILE it runs and stamp each line as it appears.
+    """Read the server's stderr while it runs and stamp each line as it appears.
 
-    Needed because the engine prints `[BATCH] done #N` without a clock: the only way to
-    know WHEN it happened, without touching the C, is to watch the file live. stderr in C
-    is unbuffered, so the line appears at the instant of the event and the delay we add is
-    the sampling period (20 ms), not a library buffer. Stated plainly: this is a
-    correlation at tens of milliseconds, not tracing. It is enough to answer "did another
-    request finish while this one waited".
-
-    What the tail CANNOT see: ADMISSIONS. `sink_next_job` increments the counter without
-    printing, so `admitted=K` is only readable attached to a `done`. For arrivals the
-    exact source is the client, which generates them itself.
+    The engine prints `[BATCH] done #N` without a clock, so the only way to know when it
+    happened is to watch the file live. stderr in C is unbuffered, so the added delay is the
+    sampling period (20 ms), not a library buffer. This is a correlation at tens of
+    milliseconds, not tracing.
     """
 
     def __init__(self, path, poll_s=0.02):
