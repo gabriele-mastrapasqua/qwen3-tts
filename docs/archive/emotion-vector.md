@@ -104,5 +104,4 @@ warnings are a red herring — the mod-2¹⁶ wrap is lossless; ignore the count
 
 ## Links
 - Deep history + reproduce: [`../training/expressivity-lora/MULTISPEAKER_PIPELINE.md`]
-- Roadmap / decisions: `PLAN.md` (local-only) — "SESSION 2026-06-16" block.
 - Builder: [`../tests/tau_arith.py`]; FT: [`../training/expressivity-lora/gpu_sft_expr_lang.py`].

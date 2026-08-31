@@ -2,7 +2,7 @@
 
 *Analysis only (no code changed). Companion docs: `docs/hardware-testing.md` (ISA workflow + rented-box
 matrix), `docs/gpu-accel-analysis.md` (optional GPU backends), `docs/audit_engine-health-2026-07.md`
-(correctness/leak audit). TODOs tracked in `plan_v4.md` §E3.*
+(correctness/leak audit).*
 
 ---
 

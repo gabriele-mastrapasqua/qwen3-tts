@@ -1,4 +1,4 @@
-# tools/para — paralinguistic discovery automation (plan_v4 E1)
+# tools/para — paralinguistic discovery automation
 
 Offline, **CPU-first** tooling to screen `[tag]` paralinguistic candidates without ear-sweeping.
 Runs entirely on the M1 — **no DGX / CUDA needed** (E1 is inference + screening, not training).
@@ -11,7 +11,7 @@ Runs entirely on the M1 — **no DGX / CUDA needed** (E1 is inference + screenin
 | CNN14 AudioSet checkpoint | `~/panns_data/` | ~330 MB | outside repo |
 | Whisper tiny/base weights | `~/.cache/whisper/` | ~75–140 MB | outside repo |
 
-**Cleanup once the E1 loop is done** (tracked as a TODO in `plan_v4.md` E1):
+**Cleanup once the discovery loop is done:**
 ```bash
 rm -rf tools/para/.venv ~/panns_data ~/.cache/whisper
 ```

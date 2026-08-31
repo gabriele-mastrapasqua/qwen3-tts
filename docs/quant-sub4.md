@@ -9,7 +9,7 @@ record, including a possible NO verdict (so nobody re-attempts sub-4 naïvely in
 
 ## 1. Why re-open a closed question
 
-PLAN.md §21.1 (2026-06-04) closed sub-int4 with: *"int2/int1 = research only; with simple
+Sub-int4 was closed with: *"int2/int1 = research only; with simple
 absmax/group scales quality dies; realistic floor = int4-CP / int8-Talker"*. The quant-ladder
 measured it: teacher-forced per-codebook agreement vs bf16 on the 0.6B CP was **int8 78%,
 int4 46% (collapsing to 23-27% on late codebooks c11-c15), q2 9%**.

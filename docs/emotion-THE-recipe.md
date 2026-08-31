@@ -115,7 +115,7 @@ Engine: `compose_from_text` + `text_has_para_event()` + `para_active` in `main.c
 the global emotion steer/expr on spoken spans; each `[tag]` span swaps in its para vector). `[laugh]`/`[sigh]` use
 the steering vector; `[huff]`/`[ugh]`/`[hmm]`/`[mmm]`/`[phew]`/… are soft onomatopoeia macros.
 
-> ⚠️ **STILL UNSTABLE (TODO, plan_emo_v3) — much better than before, but not solid across all langs/voices.**
+> ⚠️ **STILL UNSTABLE — much better than before, but not solid across all langs/voices.**
 > Clearest on `[laugh]`/`[sigh]` with `ryan`/`vivian`. Known rough edge: on a CLONE the laugh span (a separate
 > cold-prefill span) can sound slightly detached/off-timbre (the seam, not audio-splice). Provenance of the
 > per-voice weights + the "anchor + vector" rule: memory `project_paralinguistic_steering_vector` (ear 2026-06-25/28).

@@ -67,4 +67,3 @@ echo
 echo "apply without rebuilding:"
 echo "  set -a; . $ENVF; set +a"
 exit $RC
-

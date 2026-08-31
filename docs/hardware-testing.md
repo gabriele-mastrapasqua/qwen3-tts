@@ -181,7 +181,7 @@ wired yet; a future twin). Zen3 (AVX2-only) is where **int4 + batching** already
 
 ## 5. The benchmark matrix (fill this in per box)
 
-Run all four delivery modes with **identical explicit params** (per CLAUDE.md testing rules), at the
+Run all four delivery modes with **identical explicit params**, at the
 default thread count and `-j1`, for bf16 / int8 / int4. Text = one paragraph (~6–8 sentences) so
 `--batch` has something to split.
 
@@ -318,7 +318,7 @@ Headline: **int8 is the x86 wall-clock winner** (0.6B sub-RT 0.95). q4-VNNI v3 m
 per-frame than int8 (row above), but int4/int8 fork the greedy trajectory so wall RTF isn't cross-quant
 comparable.
 
-**⭐ Re-validation round (2026-07-11, same instance type, `perf/rental-prep` branch):**
+**Re-validation round (same instance type):**
 - ⚠️ **Build gotcha (bit us again):** `make blas` on x86 defaults to PORTABLE AVX2 — VNNI needs
   **`make blas SIMD=avx512vnni`**. `--caps` says which one you got ("int8 dot: VNNI" vs "widen->FMA");
   READ IT before trusting any number.
@@ -415,7 +415,7 @@ diverge from the M1 dev box — record these so we don't assume M1 behavior carr
    = ~37% SLOWER** — the *opposite* of M1, where int4-SDOT beats int8. Even the legacy f32-dequant q4 (2.31)
    beats int4-VNNI. Cause: the v1 kernel is correctness-first (per-block 2× `_mm512_reduce`, 32-wide block
    zero-extended into a 512-bit `dpbusd` = half the lane width wasted) → compute overhead eats the
-   half-the-bytes bandwidth win. The plan_v4 C7 throughput TODOs (2-blocks-per-512b full-width, drop the
+   half-the-bytes bandwidth win. The throughput follow-ups (2-blocks-per-512b full-width, drop the
    per-block reduce, 2-row fusion) are **REQUIRED, not optional**, before int4 can win on x86.
 2. **int4 < int8 on Zen5 single-stream** (int8 is the fastest quant here), vs **int4 > int8 on M1**. Do NOT
    port the M1 "int4 is the fast default" conclusion to x86 until C7 is optimized + re-measured.

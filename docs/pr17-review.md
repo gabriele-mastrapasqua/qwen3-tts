@@ -65,7 +65,7 @@ x86 VNNI (`5095e31`/`9a53787`/`fc49db3`) che noi abbiamo. Ma contiene due miglio
   `qwen_tts_cuda_talker.cu`, che la loro base non conosceva: mergiarlo lascerebbe i decoder GPU a
   leggere il layout vecchio su byte nuovi → **audio GPU sbagliato, in silenzio**. E non risolve il vero
   collo di bottiglia x86 (il q4-VNNI è compute-bound sulla reduce per blocco + datapath 512-bit
-  mezzo vuoto — vedi `project_x86_epyc_vnni_validation`). Da rivalutare **dopo** aver misurato se la
+  mezzo vuoto). Da rivalutare **dopo** aver misurato se la
   `vzipq` è ancora sul percorso critico una volta applicato l'accumulo.
 
 **Misura M1** (0.6B, `--int4 -j4`, A/B interleaved ×5, talker+CP, mediana):
@@ -508,7 +508,7 @@ nostro pool ha sezioni seriali in cui i core devono poter andare al decoder.
 La PR dichiarava int4 > int8 su N1, e **sul suo albero era vero**: lì il decoder era lentissimo e il Talker
 dominava. Ora che il decoder è sceso del 57%, **il collo si è spostato**: il vantaggio dell'int4 sul Talker
 non è più sul percorso critico, mentre il decoder è identico nei due casi.
-→ La regola "int4 batte int8 su ARM" ([[project_quant_ladder_findings]]) resta vera **per il Talker isolato**,
+→ La regola "int4 batte int8 su ARM" resta vera **per il Talker isolato**,
 non end-to-end. Ottimizzare una parte riordina la classifica di tutte le altre.
 
 ## 5.10 Snake threading + leva BLAS per fase (`8ea26fc`) — le due leve del profilo
@@ -615,7 +615,7 @@ v2, per l'A/B on-box senza rebuild.
 
   v3 è **−9% vs v2** su Talker E CP (traiettoria appaiata: v3 95 frame, v2 96 → confronto pulito), e il
   **kernel int4-v3 batte quello int8 per-frame** (22.9 vs 25.3; 63.5 vs 69.6). Sulla STESSA box dove la v2
-  era il 37% più lenta di int8 ([[project_x86_epyc_vnni_validation]]), il throughput-packing (2 blocchi/512b
+  era il 37% più lenta di int8, il throughput-packing (2 blocchi/512b
   + 4-row unroll) risolve il collo compute della v2. **Il TODO "il kernel q4-VNNI è compute-bound" è chiuso.**
 
   ⚠️ **Attenzione a NON sovra-affermare.** Questo è un fatto **sul kernel** (ms/frame). Al **wall RTF**

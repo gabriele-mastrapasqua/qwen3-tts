@@ -1,8 +1,7 @@
 # Optional GPU acceleration — backends, dependency weight, realistic gains (2026-07-02)
 
 *Analysis only. Ground rule: the project is and stays **CPU-first, minimal, plain-Makefile**. GPU
-backends live on experimental branches, are opt-in build targets, and must not change `make blas` at all.
-TODOs in `plan_v4.md` §E4.*
+backends live on experimental branches, are opt-in build targets, and must not change `make blas` at all.*
 
 ---
 

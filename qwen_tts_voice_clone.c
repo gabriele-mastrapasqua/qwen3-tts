@@ -823,4 +823,3 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
 
     return 0;
 }
-

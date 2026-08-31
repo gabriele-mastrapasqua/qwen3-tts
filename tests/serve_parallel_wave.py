@@ -245,7 +245,7 @@ def workload_class(text_file, classes=""):
 
 def result_slug(workload, arrival, topo, conc, model_label, precision):
     """A result filename has to be readable without opening it, e.g.
-        2026-01-31_true-wave_short-diverse_int8_2x8_c6.json
+        <date>_true-wave_short-diverse_int8_2x8_c6.json
     """
     a = {"TRUE_SIMULTANEOUS_WAVE": "true-wave", "POISSON_OPEN_LOOP": "poisson",
          "CLOSED_LOOP_PARALLEL_SOAK": "closed-loop-soak"}.get(arrival, arrival.lower())

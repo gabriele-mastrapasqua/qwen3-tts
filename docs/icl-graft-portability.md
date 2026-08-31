@@ -31,7 +31,7 @@ galatea_17b.qvoice (1.7B) + galatea_06b.qvoice (0.6B).
 > (`galatea_icl.qvoice`) carried the reference room's **metallic reverb** and is **retired**;
 > the graft has NO ref_codes so it is clean. Tool: `tests/qvoice_to_graft.py`. Emotion levers:
 > `--expr presets/expr/italian_csp_topk6.expr` + `--ml-steer` (CLEAN, w~8) — see
-> `docs/csp-ft-emotion.md` and `plan_emo_v3.md §8`.
+> `docs/csp-ft-emotion.md`.
 
 ## 1. What a `.qvoice` actually contains (byte breakdown)
 

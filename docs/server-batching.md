@@ -99,7 +99,7 @@ All wired into `make test-serve-all`.
 the rigorous correctness gate. The default matmul path forks the greedy trajectory benignly at temp>0
 (fp-order, like int8) → compare by ear / mel-corr, not md5.
 
-> Server-test hygiene (see CLAUDE.md): always `timeout` curls and kill the server **by name**
+> Server-test hygiene: always `timeout` curls and kill the server **by name**
 > (`pkill -9 -f "qwen_tts.*--serve"`); `wait` only on curl PIDs — never on the never-exiting server.
 
 ## Performance — measured on rented silicon (2026-07-11)

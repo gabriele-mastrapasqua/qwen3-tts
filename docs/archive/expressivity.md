@@ -79,7 +79,7 @@
 >
 > **Older clone levers (kept, default-off, for experiments):** CP control-vectors, `--voice-strength`
 > (targeted WDELTA scaling via `--vs-layers`), multi-layer `--ml-steer`. The `--icl-only` graft above is the
-> recommended way to emote a clone. NEXT (PLAN.md "official models re-analysis"): graft directly on a fresh
+> recommended way to emote a clone. NEXT: graft directly on a fresh
 > `--ref-audio` clone, on the VoiceDesign model, and whether CV/VD can ingest ref-audio natively.
 
 Qwen3-TTS's built-in `--instruct` at the default temp barely changes delivery (see the recipe above to

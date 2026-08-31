@@ -132,7 +132,7 @@ we own the forward pass:
    `sigh_vs_laugh` L21-25 vectors. Dot-product hidden states against them during generation → a per-frame
    "event-direction activation" trace. Cheap to add behind `--debug`; correlating the trace with WIN/KO
    seeds tells us whether the event decision is visible mid-network (it should be — act-map already showed
-   L23-26 carries laugh identity, PROJECT-COMPASS §act-map).
+   L23-26 carries laugh identity).
 
 These three feed each other: (1) proposes triggers, §2's judge screens them at scale, (2)/(3) explain the
 seed classes and might eventually let us *pick* good seeds by probing instead of sampling.
@@ -182,4 +182,3 @@ from the emotion plugin per the design contract. Not scheduled; recorded so we d
 4. T4 variants grid (laugh ×10, sigh ×5) judged at scale; ear only on the shortlist.
 5. Optional `--debug` steering-projection trace for mechanism insight (§3.3).
 
-Tracked in `plan_v4.md` §E1.

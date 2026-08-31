@@ -3,7 +3,7 @@
 Multi-layer activation-steering directions injected with `--ml-steer <file> --ml-range 21-25 --ml-weight W`.
 All are the **CLEAN** canonical palette (`tests/act_map_steer.py --clean` = mean-center + project-out the
 neutral/energy axis → emotion-only, stops correctly, no word-lengthening). `--ml-decay 0.985` is on by default.
-Built for the **1.7B** model (hidden 2048; NOT compatible with 0.6B). Ear-validated 2026-06-22 → 24 (plan_emo_v3 §7-8).
+Built for the **1.7B** model (hidden 2048; NOT compatible with 0.6B). Ear-validated by listening.
 
 | file | voice captured | emotion | recommended weight | notes |
 |---|---|---|---|---|
