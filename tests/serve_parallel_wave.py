@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """serve_parallel_wave.py — SYNCHRONIZED PARALLEL CAPACITY."""
-import argparse, datetime, json, os, re, signal, socket, subprocess, sys, threading, time
+import argparse, datetime, json, os, platform, re, signal, socket, subprocess, sys, threading, time
 
 RUN_DATE = datetime.date.today().isoformat()
 import urllib.request
@@ -271,9 +271,16 @@ def result_header(a, model_path, extra_env):
     commit = os.environ.get("QWEN_SOURCE_COMMIT") or sh("git rev-parse --short HEAD 2>/dev/null")
     dirty = os.environ.get("QWEN_SOURCE_DIRTY") or \
         sh("git diff --quiet HEAD 2>/dev/null && echo no || echo yes", "UNKNOWN")
+    # The levers worth recording differ by ISA: an x86 run that reports QWEN_NO_BFMMLA and stays
+    # silent about AMX has recorded nothing about the kernel that actually ran.
     watched = ["OPENBLAS_THREAD_TIMEOUT", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
-               "QWEN_KAI_QKV_FUSED", "QWEN_POOL_NARROW", "QWEN_POOL_SPIN",
-               "QWEN_PREFIX_CACHE", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA"]
+               "QWEN_POOL_NARROW", "QWEN_POOL_SPIN", "QWEN_PREFIX_CACHE"]
+    if platform.machine() in ("x86_64", "amd64"):
+        watched += ["QWEN_NO_AMX", "QWEN_AMX_MIN_B", "QWEN_AMX_NCHUNK",
+                    "QWEN_NO_VNNI", "QWEN_NO_VNNI_TILE", "QWEN_VNNI_NCHUNK",
+                    "QWEN_NO_BF16_MATMUL", "QWEN_X86_NCHUNK"]
+    else:
+        watched += ["QWEN_KAI_QKV_FUSED", "QWEN_KAI_NCHUNK", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA"]
     env = dict(os.environ); env.update(extra_env)
     flags = " ".join(f"{k}={env.get(k, '(default)')}" for k in watched)
     print("### ─────────── RESULT IDENTITY ───────────")
@@ -399,6 +406,9 @@ def main():
     ap.add_argument("--topo", default="2x8,4x4,8x2")
     ap.add_argument("--conc", default="1,2,3,4,5,6,8")
     ap.add_argument("--waves", type=int, default=3)
+    ap.add_argument("--batch-cap", type=int, default=0, metavar="N",
+                    help="in-flight requests per worker (default: 16 split across the "
+                         "workers of the topology)")
     ap.add_argument("--precision", default="int8")
     ap.add_argument("--bin", default="./qwen_tts")
     ap.add_argument("--port", type=int, default=9300)
@@ -450,7 +460,10 @@ def main():
     for topo in a.topo.split(","):
         elastic = topo.endswith("e")
         W, K = (int(x) for x in topo.rstrip("e").split("x"))
-        cap = max(1, 16 // W)
+        # In-flight requests a worker may hold. The default splits a box-wide budget of 16
+        # across the workers; it is NOT the core count, and --batch-cap overrides it when a
+        # deployment pins a different admission width.
+        cap = a.batch_cap if a.batch_cap > 0 else max(1, 16 // W)
         cmd = [a.bin, "-d", a.model, "--serve", str(port), "--batch-size", str(cap)]
         if a.precision == "int8":
             cmd.insert(3, "--int8")

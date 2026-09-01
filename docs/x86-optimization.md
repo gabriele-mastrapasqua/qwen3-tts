@@ -34,11 +34,19 @@ where it doesn't), the measured numbers, and copy-paste commands to benchmark it
 Build levels:
 
 ```bash
-make blas                    # x86 default: portable AVX2 + FMA (any Haswell 2013+)
-make blas SIMD=avx512         # + AVX-512 (__m512 16-wide bf16 matvec)
+make blas                    # SIMD=auto on Linux/x86: reads /proc/cpuinfo, probes the compiler,
+                             # and picks the highest level BOTH support (announced as "[simd] auto -> …")
+make blas SIMD=amx           # + AMX tiles, int8 and bf16 (Sapphire Rapids / Emerald Rapids, GCP c4)
+make blas SIMD=avx512bf16    # + native bf16 dot VDPBF16PS (Zen4/5, Cooper Lake+)
 make blas SIMD=avx512vnni    # + AVX-512-VNNI native int8 dot (Zen4+/Intel Ice Lake+)
+make blas SIMD=avx512        # AVX-512 without VNNI (__m512 16-wide bf16 matvec)
+make blas SIMD=portable      # AVX2 + FMA, any Haswell 2013+ — the level to ship a binary at
 make blas SIMD=scalar        # no AVX2 (pre-2013 / portable fallback)
 ```
+
+`auto` is a *host* decision, not a portable one: the binary it produces will fault on an older
+CPU. Build `SIMD=portable` for anything you distribute, and pin the level explicitly in a
+deployment profile so the box that reproduces your numbers compiles the same kernels.
 
 `./qwen_tts --caps` prints what the binary actually compiled and the CPU it's running on.
 

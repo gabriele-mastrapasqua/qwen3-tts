@@ -108,7 +108,9 @@ rung () {   # name bank conc waves [extra...]
     echo "          full log: $OUT/$NAME.log"
     FAILED=1; return
   fi
-  grep -E '^topo|^2x8|^4x4|^8x2|^1x16' "$OUT/$NAME.log" | head -20
+  # one row per topology cell: the label is WxK, so match the shape, not a fixed list of
+  # 16-core names. On an 8-core box the cells are 1x8/2x4/4x2 and the old list printed nothing.
+  grep -E '^(topo|[0-9]+x[0-9]+e?)[[:space:]]' "$OUT/$NAME.log" | head -20
   if [ "$IDENTITY" = "1" ] && [ -f tests/serve_identity_gate.py ]; then
     PORT=$((PORT + 1))
     QWEN_LIFE_TRACE=1 QWEN_REQ_TRACE=1 python3 tests/serve_parallel_wave.py \

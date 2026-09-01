@@ -172,8 +172,25 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_BF16DOT` | x86 | unset | `=1` drops the AVX-512 bf16 dot path |
 | `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once |
 | `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
+| `QWEN_NO_BF16_MATMUL` | x86 | unset | `=1` drops the AVX-512 bf16 matmat, leaving the per-row twin. Only reachable where AMX is absent or declined |
+| `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
 | `QWEN_AMX_MIN_B` · `QWEN_VNNI_MIN_B` · `QWEN_AVX2MM_MIN_B` | x86 | 4 · 2 · 2 | smallest batch width that may take that matmat |
+| `QWEN_AMX_BF16_MIN_B` · `QWEN_AMX_INT8_MIN_B` | x86 | fall back to `QWEN_AMX_MIN_B` | split the AMX gate when one threshold does not suit both datatypes; each overrides the shared one for its type only |
 | `QWEN_BFMMLA_MIN_B` · `QWEN_SMMLA_MIN_B` · `QWEN_KLEIDI_MIN_B` | ARM | 2 · 2 · 1 | the same thresholds on the ARM kernels |
+
+The batch gates say *when* a kernel is allowed; these say *how it tiles the output rows* once it is:
+
+| flag | ISA | default | effect |
+|---|---|---|---|
+| `QWEN_X86_NCHUNK` | x86 | 0 (off) | output-row chunk for every x86 matmat that has no family value set |
+| `QWEN_AMX_NCHUNK` · `QWEN_VNNI_NCHUNK` · `QWEN_AVX512_NCHUNK` | x86 | 0 (off) | the same, per family: AMX int8/bf16, VNNI int8, AVX-512 bf16. A family value overrides `QWEN_X86_NCHUNK` |
+| `QWEN_KAI_NCHUNK` | ARM | 384 | the KleidiAI equivalent, on by default because it was measured to win there |
+
+Zero, unset or a value below one row tile means "one call per thread slice", which is the shape
+the kernels had before the knob existed — so leaving these alone reproduces the old numbers
+exactly. Values are rounded **down** to the kernel's row tile (16 for AMX, 4 or 2 for the
+AVX-512 families depending on batch width), and a value that rounds to less than one tile is
+ignored rather than honoured as "no chunking at all".
 
 A gate for a kernel the build does not contain is simply inert, so an invocation can carry
 both families — but only the ones for this ISA will appear in the `[FLAGS]` line, and only if
@@ -277,18 +294,18 @@ when the toolchain reports `__ARM_FEATURE_MATMUL_INT8` or `__ARM_FEATURE_BF16`; 
 their `*_MIN_B` thresholds. `QWEN_PREFILL_MATMAT` exists on both, but what it selects differs:
 the KleidiAI bf16 matmat on ARM, the AMX one on x86.
 
-**x86 only** — `QWEN_NO_VNNI`, `QWEN_NO_AMX`, `QWEN_NO_AVX2MM`, `QWEN_NO_BF16DOT`,
-`QWEN_SD_INT8` (on by default only where AVX-512 VNNI exists), and the AMX/VNNI/AVX2
-thresholds.
+**x86 only** — `QWEN_NO_VNNI`, `QWEN_NO_VNNI_TILE`, `QWEN_NO_AMX`, `QWEN_NO_AVX2MM`,
+`QWEN_NO_BF16DOT`, `QWEN_NO_BF16_MATMUL`, `QWEN_SD_INT8` (on by default only where AVX-512 VNNI
+exists), the AMX/VNNI/AVX2 batch thresholds, and the `*_NCHUNK` row-chunk family.
 
-**The gap worth naming:** there is no x86 counterpart to `QWEN_KAI_NCHUNK` today. On ARM that
-lever exists because the GEMM's n dimension is sub-tiled so the microkernel's second pass finds
-the packed right-hand side still in cache; on x86 the AMX and VNNI matmats are entered through
-the gate table's batch/rows/cols thresholds and have no cache sub-tiling knob at all. So an
-x86 deployment profile can pin *when* those kernels are used, but not how they tile — if a
-future x86 host shows the same second-pass cache miss, the knob has to be written, not
-configured. Say so in the profile's `qualification.notes` rather than silently copying the ARM
-value into a file where it does nothing.
+**The two sides are not symmetric, and the asymmetry is the point.** `QWEN_KAI_NCHUNK` is on by
+default at 384 because sub-tiling the KleidiAI GEMM was measured to win on ARM. The x86
+`*_NCHUNK` knobs exist but default to **off**: the kernels they tile are entered through the gate
+table's batch/rows/cols thresholds, and no x86 host has yet shown the second-pass cache miss that
+makes chunking pay. Treat them as instrumentation for a new box — measure, and only then pin a
+value in that box's profile. A value copied across architectures means nothing: the ARM number is
+an n-dimension tile inside a packed GEMM, the x86 ones are output-row chunks in a different
+kernel, and neither reads the other's units.
 
 ---
 
