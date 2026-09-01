@@ -292,7 +292,9 @@ which is the honest answer on a build whose dispatcher sends everything to a mat
 exists because a kernel improvement is worth exactly what the dispatcher lets it be worth: the
 fixed-width kernels added for bf16 B=9..15 and int8 B=1/5/7/9..15 are a 5-10x improvement on
 builds that reach them, and **zero** on an AMX or AVX-512 host, where these counters stay at
-zero on real prefill shapes. Measure the dispatch before claiming the speedup.
+zero on real prefill shapes, while at `SIMD=portable`, where `--caps` shows
+`bf16 -> fixed-B twin`, the same widths move 11.87 -> 2.25 ms (B=9) and 10.03 -> 1.32 ms (int8
+B=1). Measure the dispatch before claiming the speedup.
 
 ### Is a flag even declarable?
 

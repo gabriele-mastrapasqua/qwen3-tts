@@ -157,59 +157,59 @@
     "workload": "Three synchronized waves at client concurrency 1, 2, 4, 6 and 8 on the short class of the mixed bank; two workers, each pinned to four physical cores.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b base checkpoint, open weights",
-    "notes": "TTFA p50/p95 and stream RTF: C=1 134/135 ms at 1.02, C=2 138/223 at 1.05, C=4 245/259 at 1.49, C=6 318/374 at 1.88, C=8 440/500 at 2.34. Throughput 0.52, 1.01, 1.39, 1.61, 1.74 req/s. This topology has the best measured throughput at every level from C=4 up and the best p95 at C=4 and C=6, which is why it is the recommended one. SCOPE, STATED PLAINLY: first audio holds under 400 ms p95 out to C=6, but SUSTAINED STREAM RTF IS ABOVE 1 FROM C=2 ONWARDS - this host serves several concurrent requests with a good time to first audio and keeps ONE of them realtime. That is a memory bandwidth result, not a kernel one. Effective batch is not client concurrency: at C=4 the measured in-flight batch is 3.10 in the system, about 1.55 per worker. Measured with the environment block above, verified in each server's [FLAGS] line, on an 8-core Intel Emerald Rapids with SMT disabled, one NUMA node, 260 MiB shared L3 and a measured Triad of 82 GB/s. 1.7B open weights at int8, three synchronized waves per level, short class of the mixed bank, zero errors and zero rejections at every level. QWEN_DECODER_BATCH is pinned to 0 and the reason is measured at BOTH ends of this profile's range, because the C=4 result does not license a C=8 conclusion. At C=4 the gang barely forms - 'decoder batch: calls / mean 42 1.40, max slots 2' - and off is 12% better at TTFA p95. At C=8 it DOES form, 'calls / mean 42 2.24, max slots 4' with 2.16 and 3.56 mean active slots across the two workers, and off is STILL better: TTFA p50 443 vs 498 ms and p95 546 vs 580 ms over three interleaved repeats, for about 1% of throughput and RTF, which is inside this box's noise. So the finding is not 'the batch never forms' - at C=8 it does. It is that a gang 2.24 slots deep buys nothing measurable here and costs first audio. ON THE 500 ms BUDGET, from unrounded percentiles rather than the printed table: C=6 meets it with room (p95 373.8 and 380.1 ms in two runs), while C=8 measured 500.180 ms in one run and 495.415 ms in another - it straddles the threshold, so this topology does NOT reliably meet a 500 ms p95 at C=8 and the supported claim stops at C=6. The four-worker tail-latency profile is the one that holds C=8 under 500 (472.4 ms), at lower throughput.",
-    "source_commit": "5084f94",
-    "binary_sha256": "9d159d181ef6b1a9deff1d3656b98bb65679ccaa269ee2199432cc26ef802126",
+    "notes": "TTFA p50/p95 and stream RTF: C=1 128.0/128.7 ms at 0.98, C=2 132.9/210.6 at 1.03, C=4 239.2/252.0 at 1.43, C=6 317.2/364.8 at 1.87, C=8 421.7/483.6 at 2.28. Throughput 0.54, 1.04, 1.40, 1.66, 1.77 req/s. This topology has the best measured throughput at every level from C=4 up and the best p95 at C=4 and C=6, which is why it is the recommended one. SCOPE, STATED PLAINLY: first audio holds under 400 ms p95 out to C=6, but SUSTAINED STREAM RTF IS ABOVE 1 FROM C=2 ONWARDS - this host serves several concurrent requests with a good time to first audio and keeps ONE of them realtime. That is a memory bandwidth result, not a kernel one. Effective batch is not client concurrency: at C=4 the measured in-flight batch is 3.06 in the system, about 1.53 per worker. Numbers in `measured` come from the final qualifying run, identified by the `source_commit` and `binary_sha256` fields below; earlier revisions of this file quoted a pre-fix binary and are replaced, not kept alongside. Measured with the environment block above, verified in each server's [FLAGS] line, on an 8-core Intel Emerald Rapids with SMT disabled, one NUMA node, 260 MiB shared L3 and a measured Triad of 82 GB/s. 1.7B open weights at int8, three synchronized waves per level, short class of the mixed bank, zero errors and zero rejections at every level. QWEN_DECODER_BATCH is pinned to 0 and the reason is measured at BOTH ends of this profile's range, because the C=4 result does not license a C=8 conclusion. At C=4 the gang barely forms - 'decoder batch: calls / mean 42 1.40, max slots 2' - and off is 12% better at TTFA p95. At C=8 it DOES form, 'calls / mean 42 2.24, max slots 4' with 2.16 and 3.56 mean active slots across the two workers, and off is STILL better: TTFA p50 443 vs 498 ms and p95 546 vs 580 ms over three interleaved repeats, for about 1% of throughput and RTF, which is inside this box's noise. So the finding is not 'the batch never forms' - at C=8 it does. It is that a gang 2.24 slots deep buys nothing measurable here and costs first audio. ON THE 500 ms BUDGET, from unrounded percentiles across three separate runs: C=6 meets it with room (365-380 ms), while C=8 measured 483.6, 495.4 and 500.2 ms - it sits ON the threshold rather than under it, so the supported claim stops at C=6. The four-worker tail-latency profile is the one that holds C=8 below 500 ms (444.7 ms in the same final run), at lower throughput.",
+    "source_commit": "266f706",
+    "binary_sha256": "f1105dcd395765f101e62b76efd89942ac06a73411b2f59596e7e298d0bac6bd",
     "measured": {
       "c1": {
-        "ttfa_p50_ms": 133.195,
-        "ttfa_p95_ms": 135.611,
-        "stream_rtf_p50": 1.0439,
-        "req_per_s": 0.5096,
+        "ttfa_p50_ms": 128.048,
+        "ttfa_p95_ms": 128.73,
+        "stream_rtf_p50": 0.9831,
+        "req_per_s": 0.543,
         "errors": 0,
         "rejections": 0,
         "batch_in_system": 0.79,
         "batch_per_worker": 0.4
       },
       "c2": {
-        "ttfa_p50_ms": 134.256,
-        "ttfa_p95_ms": 266.101,
-        "stream_rtf_p50": 1.0627,
-        "req_per_s": 0.9813,
+        "ttfa_p50_ms": 132.929,
+        "ttfa_p95_ms": 210.606,
+        "stream_rtf_p50": 1.0271,
+        "req_per_s": 1.0361,
         "errors": 0,
         "rejections": 0,
-        "batch_in_system": 1.49,
-        "batch_per_worker": 0.74
+        "batch_in_system": 1.5,
+        "batch_per_worker": 0.75
       },
       "c4": {
-        "ttfa_p50_ms": 246.82,
-        "ttfa_p95_ms": 258.4,
-        "stream_rtf_p50": 1.4889,
-        "req_per_s": 1.3562,
+        "ttfa_p50_ms": 239.237,
+        "ttfa_p95_ms": 252.004,
+        "stream_rtf_p50": 1.4271,
+        "req_per_s": 1.3992,
         "errors": 0,
         "rejections": 0,
         "batch_in_system": 3.06,
         "batch_per_worker": 1.53
       },
       "c6": {
-        "ttfa_p50_ms": 331.034,
-        "ttfa_p95_ms": 380.128,
-        "stream_rtf_p50": 1.9103,
-        "req_per_s": 1.5888,
+        "ttfa_p50_ms": 317.152,
+        "ttfa_p95_ms": 364.819,
+        "stream_rtf_p50": 1.8658,
+        "req_per_s": 1.6599,
         "errors": 0,
         "rejections": 0,
-        "batch_in_system": 4.81,
-        "batch_per_worker": 2.4
+        "batch_in_system": 4.83,
+        "batch_per_worker": 2.42
       },
       "c8": {
-        "ttfa_p50_ms": 439.195,
-        "ttfa_p95_ms": 495.415,
-        "stream_rtf_p50": 2.3561,
-        "req_per_s": 1.7312,
+        "ttfa_p50_ms": 421.725,
+        "ttfa_p95_ms": 483.636,
+        "stream_rtf_p50": 2.2784,
+        "req_per_s": 1.7662,
         "errors": 0,
         "rejections": 0,
-        "batch_in_system": 6.52,
-        "batch_per_worker": 3.26
+        "batch_in_system": 6.47,
+        "batch_per_worker": 3.23
       }
     }
   }

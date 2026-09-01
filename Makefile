@@ -736,6 +736,9 @@ endif
 PB_ROWS    ?= 2048
 PB_COLS    ?= 2048
 PB_THREADS ?= 1
+# NOTE: this target compiles its own binary, so it uses SIMD as given on ITS command line.
+# make prefill-bench SIMD=portable measures the portable kernels, not whatever SIMD=auto
+# picks for this host. The harness prints its own dispatcher table so a mismatch is visible.
 
 test-all: test-small test-large test-regression test-errors test-emotion test-emotion-ft test-compose test-caps check-flag-registry test-selftest test-golden test-serve-repro
 	@echo ""

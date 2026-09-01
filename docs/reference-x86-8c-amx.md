@@ -14,7 +14,7 @@ are not.
 |---|---|
 | CPU | 8 cores, Intel Xeon Platinum 8581C (Emerald Rapids), **SMT disabled** (`Thread(s) per core: 1`), 1 NUMA node |
 | cache / bandwidth | 260 MiB shared L3 · measured Triad **82 GB/s**, knee at 8 threads |
-| build | `make blas SIMD=amx`, OpenBLAS pthread, `--caps` reports AMX INT8 and AMX BF16 both ACTIVE, `--self-test` PASSED |
+| build | `make blas SIMD=amx`, OpenBLAS pthread, `--caps` reports AMX INT8 and AMX BF16 both ACTIVE, `--self-test` PASSED with and without AMX |
 | model | open weights, 1.7B, `--int8` |
 | profile | [`x86-8c-amx-multiclient-ttfa`](../configs/perf/x86-8c-amx-multiclient-ttfa.json), verified in every server's `[FLAGS]` line |
 | topology | `2x4` — two pre-forked workers, four threads each |
@@ -32,18 +32,22 @@ errors and zero rejections in all fifteen cells:
 
 | topology | C | TTFA p50 | TTFA p95 | stream RTF | req/s | in-flight batch |
 |---|---:|---:|---:|---:|---:|---:|
-| `1x8` | 1 | **98 ms** | **99 ms** | **0.68** | 0.78 | — |
-| `1x8` | 2 | 157 ms | 195 ms | 1.10 | 0.98 | — |
-| `1x8` | 4 | 308 ms | 357 ms | 1.82 | 1.15 | — |
-| `1x8` | 8 | 553 ms | 702 ms | 3.22 | 1.30 | — |
-| `2x4` | 1 | 134 ms | 135 ms | 1.02 | 0.52 | 0.78 |
-| `2x4` | 2 | 138 ms | 223 ms | 1.05 | 1.01 | 1.50 |
-| `2x4` | 4 | 245 ms | **259 ms** | 1.49 | **1.39** | 3.10 |
-| `2x4` | 6 | 318 ms | **374 ms** | 1.88 | **1.61** | 4.81 |
-| `2x4` | 8 | 440 ms | **500 ms** | 2.34 | **1.74** | 6.52 |
-| `4x2` | 1 | 201 ms | 204 ms | 1.69 | 0.31 | 0.85 |
-| `4x2` | 4 | **236 ms** | 285 ms | 1.84 | 1.10 | 3.06 |
-| `4x2` | 8 | 442 ms | 458 ms | 2.42 | 1.67 | 6.40 |
+| `1x8` | 1 | **93.4 ms** | **94.7 ms** | **0.65** | 0.82 | — |
+| `1x8` | 2 | 137.6 ms | 178.6 ms | 1.07 | 1.02 | — |
+| `1x8` | 4 | 304.0 ms | 353.5 ms | 1.75 | 1.19 | — |
+| `1x8` | 6 | 391.2 ms | 495.4 ms | 2.36 | 1.30 | — |
+| `1x8` | 8 | 539.9 ms | 655.8 ms | 3.07 | 1.35 | — |
+| `2x4` | 1 | 128.0 ms | 128.7 ms | 0.98 | 0.54 | 0.79 |
+| `2x4` | 2 | 132.9 ms | 210.6 ms | 1.03 | 1.04 | 1.50 |
+| `2x4` | 4 | 239.2 ms | **252.0 ms** | 1.43 | **1.40** | 3.06 |
+| `2x4` | 6 | 317.2 ms | **364.8 ms** | 1.87 | **1.66** | 4.83 |
+| `2x4` | 8 | 421.7 ms | 483.6 ms | 2.28 | **1.77** | 6.47 |
+| `4x2` | 1 | 196.8 ms | 197.6 ms | 1.65 | 0.32 | 0.85 |
+| `4x2` | 4 | **224.5 ms** | 281.1 ms | 1.77 | 1.14 | 3.07 |
+| `4x2` | 8 | 427.2 ms | **444.7 ms** | 2.32 | 1.73 | 6.37 |
+
+Commit `266f706`, binary `f1105dcd…`, three waves per level, **zero errors and zero rejections in
+all fifteen cells**.
 
 Everything on one request wins C=1 outright and collapses fastest; four two-thread workers are
 too narrow for a 1.7B (RTF 1.69 even alone); `2x4` holds both ends and takes throughput at every
@@ -194,8 +198,23 @@ Every batched call on this host is taken by a wider matmat: `bf16 AMX tiles` and
 tiles`, or with AMX disabled `bf16 AVX-512 dpbf16` and `int8 VNNI vpdpbusd` — the same GMAC
 moving between named kernels. The twin is only reached by builds without AVX-512, which on x86
 means the AVX2 / `SIMD=portable` level, and on Arm by a build with no BF16 matrix unit, which is
-where the 5-10x was measured. **A kernel fix is worth what the dispatcher lets it be worth**, and
-on this machine that is nothing.
+where the 5-10x was measured.
+
+It is not nothing on *every* x86 build. At `SIMD=portable` the dispatcher does reach the twin for
+bf16 — `--caps` shows `bf16 -> fixed-B twin` at every batch width — and the same harness compiled
+against both trees measures, on this host's AVX2 kernels:
+
+| width | bf16 before → after | int8 before → after |
+|---|---|---|
+| B=9 | **11.87 → 2.25 ms** | unchanged |
+| B=13 | **10.80 → 7.97 ms** | unchanged |
+| B=1 | 1.44 → 1.30 ms | **10.03 → 1.32 ms** |
+| B=5, 7, 16 | unchanged | unchanged |
+
+int8 moves only at B=1 because this build sends B=2..16 to `int8 AVX2 maddubs`, which the caps
+table says and the counters confirm. **A kernel fix is worth what the dispatcher lets it be
+worth**: 5-10x at the portable level and on an Arm build with no BF16 unit, and zero on the AMX
+or AVX-512 builds this page is otherwise about.
 
 ## 6. What this class of machine is for
 

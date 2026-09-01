@@ -115,6 +115,10 @@ int main(int argc, char **argv) {
     qwen_set_threads(nt);
     printf("prefill-bench  W=%dx%d (%.1f MB bf16)  threads=%d  AMX prototype=%s\n",
            rows, cols, rows * (double)cols * 2 / 1e6, nt, HAVE_AMX ? "yes" : "no (not an AMX build)");
+    /* This harness is built by its own make target, which picks its own SIMD level. Print what
+       the dispatcher in THIS binary will do, or the table below describes a different ISA from
+       the engine you think you are measuring. */
+    qwen_kernel_selection_report(stdout, rows, cols);
 
     uint16_t *W = (uint16_t *)aligned_alloc(64, (size_t)rows * cols * sizeof(uint16_t));
     for (size_t i = 0; i < (size_t)rows * cols; i++) W[i] = f2b((float)(rnd() * 0.05));
