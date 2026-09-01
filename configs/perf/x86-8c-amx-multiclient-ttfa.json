@@ -6,7 +6,10 @@
     "objective": {
       "primary": "ttfa",
       "secondary": "throughput",
-      "concurrency_range": [2, 8],
+      "concurrency_range": [
+        2,
+        8
+      ],
       "preferred_concurrency": 2,
       "quality_changes_allowed": false
     }
@@ -55,7 +58,11 @@
     "worker_affinity": "worker 0 -> CPUs 0-3; worker 1 -> CPUs 4-7, after SMT is disabled"
   },
   "streaming": {
-    "first_chunk_ramp": [1, 2, 4],
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
     "decode_chunk": 8,
     "decode_chunk_busy": 0
   },
@@ -70,7 +77,7 @@
     "environment": {
       "OPENBLAS_NUM_THREADS": {
         "value": null,
-        "why": "Must be absent so the engine sizes OpenBLAS from each worker's phase thread budget.",
+        "why": "Must be ABSENT so the engine sizes OpenBLAS from each worker's phase thread budget. The profile lists it under forbidden env and tests/bench_suite.sh refuses to start if it is set.",
         "revert": "set it explicitly only for a measured override"
       },
       "OPENBLAS_THREAD_TIMEOUT": {
@@ -78,20 +85,65 @@
         "why": "Prevents idle OpenBLAS workers from spinning against the engine pool.",
         "revert": "unset"
       },
-      "QWEN_AMX_MIN_B": {
-        "value": "2",
-        "why": "Enables AMX INT8 matmat from the first batched regime.",
-        "revert": "use the compiled default"
-      },
       "QWEN_PREFIX_CACHE": {
         "value": "1",
-        "why": "Enables reuse of request-independent prefix work.",
+        "why": "Reuses the request-independent prompt head across requests. Verified hitting on this host, not merely enabled: the server log shows 'Prefix cache HIT: 9/20 positions reused'.",
         "revert": "QWEN_PREFIX_CACHE=0"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "Pinned for deterministic dispatch, not for speed. The engine already picks the native bf16 matmat when it detects AMX, and the kernel audit confirms that is what runs here (Talker, 39.5 GMAC on 'bf16 AMX tiles'; with QWEN_NO_AMX=1 the identical GMAC moves to AVX-512 dpbf16). On an x86 host WITHOUT AMX the same autodetect falls back to BLAS silently, so a profile that intends to use the matmat has to say so rather than inherit it.",
+        "revert": "QWEN_PREFILL_MATMAT=0 routes the prefill projections through BLAS"
+      },
+      "QWEN_PREFILL_QUANT": {
+        "value": null,
+        "why": "Deliberately absent. It frees the bf16 copy but costs the accent on a finetune (measured language identification 96% -> 38%). The server prints 'quantized prefill OFF' so a log can be audited after the fact.",
+        "revert": "QWEN_PREFILL_QUANT=1, on base models only"
+      },
+      "QWEN_CP_PREFILL2": {
+        "value": "1",
+        "why": "Two-position first pass in the Code Predictor. It is already ON by default for any AVX-512-VNNI build, so pinning it changes no behaviour and makes it VISIBLE in [FLAGS]: before this branch it was read but never declared, which is the one combination a deployment cannot audit. With QWEN_CP_PREFILL2=0 the CP's batched rows leave the kernel audit entirely.",
+        "revert": "QWEN_CP_PREFILL2=0"
+      },
+      "QWEN_AMX_MIN_B": {
+        "value": "2",
+        "why": "Lets the AMX int8 matmat take the call from the first batched width instead of the compiled default of 4. Measured on this host: C=4 stream RTF 1.47 vs 1.63 and 1.43 vs 1.32 req/s.",
+        "revert": "use the compiled default of 4"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "4096",
+        "why": "Generations a pool worker re-reads before parking on the condvar. This is the x86 COMPILED DEFAULT, pinned so the value is recorded rather than inherited; it is not the off value. Measured on this host: 0 costs +13% stream RTF at C=1 (1.12 vs 0.99) and 16x the context switches, 1024 is in between, and the ARM profile's 65536 is worse on the other side (C=4 p95 358 vs 339 ms). 4096 is a real optimum here, not an inherited number.",
+        "revert": "unset to take the same value implicitly"
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "0",
+        "why": "OFF on this host, against the engine's own server default. The server sets it to 1 itself with setenv(..., overwrite=0), so a profile that stays silent gets batching; this pin is what turns it off. Measured, interleaved, three repeats: off is 12% better at C=4 TTFA p95 (290 vs 331 ms mean) with identical RTF and throughput. The attribution explains it - the batch never forms: 'decoder batch: calls / mean 60 1.00, max slots 1' at C=1 and '42 1.40, max slots 2' at C=4, because 8 cores split into narrow workers mean each worker sees about 1.4 active slots. The gang wait costs tail latency and has nothing to amortise. EXPECT THIS TO FLIP on a box wide enough to give one worker several slots.",
+        "revert": "QWEN_DECODER_BATCH=1, or QWEN_SERVER_NO_DECODER_BATCH to stop the server setting it at all"
       },
       "QWEN_NO_VNNI_TILE": {
         "value": null,
-        "why": "Must remain absent so the shape-aware AVX-512 VNNI fallback remains available.",
-        "revert": "set QWEN_NO_VNNI_TILE=1 only for a control run"
+        "why": "Must remain ABSENT so the shape-aware AVX-512 VNNI matmat keeps its tiled form. It is the path that matters on an x86 host without AMX: with AMX disabled, turning the tile off as well cost a further 10% of throughput here (1.12 vs 1.23 req/s) and 7% of stream RTF.",
+        "revert": "set to 1 only for a control run"
+      },
+      "QWEN_X86_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for every x86 matmat that has no family value is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
+      },
+      "QWEN_AMX_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for the AMX int8 and bf16 kernels is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
+      },
+      "QWEN_VNNI_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for the VNNI int8 kernel is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
+      },
+      "QWEN_AVX512_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for the AVX-512 bf16 kernel is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
       }
     }
   },
@@ -101,10 +153,10 @@
     "server_env_serialization": "comma"
   },
   "qualification": {
-    "status": "qualified",
+    "status": "provisional",
     "workload": "Three synchronized waves at client concurrency 2, 4, 6 and 8 on the mixed 21-text qualification bank; SMT was disabled and each worker was pinned to a physical-core slice.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b base checkpoint",
-    "notes": "Latest SMT-off measurements gave TTFA p50/p95: C=2 176/421 ms, C=4 549/684 ms, C=6 655/1093 ms, C=8 890/1327 ms. This topology was the balanced concurrent choice: it gave the best measured request throughput at C=4, C=6 and C=8 among the tested topologies, while C=2 is the strict low-TTFA operating point."
+    "notes": "REQUALIFICATION IN PROGRESS on this branch: the environment above changed (POOL_SPIN and DECODER_BATCH are now pinned from measurement) so the previous numbers do not describe it."
   }
 }
