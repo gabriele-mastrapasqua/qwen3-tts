@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
     q4_0_block_t *Wq4 = (q4_0_block_t *)malloc((size_t)rows * (cols / 32) * sizeof(q4_0_block_t));
     qwen_quantize_bf16_to_q4_0(Wb, rows, cols, Wq4);
 
-    for (int B = 2; B <= 8; B++) {
+    for (int B = 1; B <= 16; B++) {   /* every width the fixed-B dispatchers claim */
         printf("\nB = %d\n", B);
         float *X = (float *)malloc((size_t)cols * B * sizeof(float));
         for (int i = 0; i < cols * B; i++) X[i] = (float)(rnd() * 0.5);

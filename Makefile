@@ -649,14 +649,14 @@ bench-suite: $(TARGET)
 PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c \
              qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I. -I$(INGOT_DIR)/include $(KAI_INC)
-check-matmat-parity:
-	@echo "=== matmat parity — ISA nativa ==="
+check-matmat-parity: $(INGOT_LIB)
+	@echo "=== matmat parity — native ISA ==="
 ifeq ($(UNAME_S),Darwin)
 	@clang $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -march=native \
-	  $(PARITY_SRC) -framework Accelerate -lm -o /tmp/matmat_parity
+	  $(PARITY_SRC) $(INGOT_LIB) -framework Accelerate -lm -o /tmp/matmat_parity
 else
 	@$(CC) $(PARITY_CF) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas $(ARCH_FLAGS) \
-	  $(PARITY_SRC) -lopenblas -lm -lpthread -o /tmp/matmat_parity
+	  $(PARITY_SRC) $(INGOT_LIB) -lopenblas -lm -lpthread -o /tmp/matmat_parity
 endif
 	@/tmp/matmat_parity
 
@@ -722,14 +722,14 @@ check-flag-registry:
 
 PREFILL_BENCH_SRC = tests/prefill_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
                     qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
-prefill-bench:
+prefill-bench: $(INGOT_LIB)
 	@echo "=== prefill cost: what the per-call fixed cost actually is ==="
 ifeq ($(UNAME_S),Darwin)
 	@clang $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -march=native \
-	  $(PREFILL_BENCH_SRC) -framework Accelerate -lm -o /tmp/prefill_bench
+	  $(PREFILL_BENCH_SRC) $(INGOT_LIB) -framework Accelerate -lm -o /tmp/prefill_bench
 else
 	@$(CC) $(PARITY_CF) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas $(ARCH_FLAGS) \
-	  $(PREFILL_BENCH_SRC) -lopenblas -lm -lpthread -o /tmp/prefill_bench
+	  $(PREFILL_BENCH_SRC) $(INGOT_LIB) -lopenblas -lm -lpthread -o /tmp/prefill_bench
 endif
 	@/tmp/prefill_bench $(PB_ROWS) $(PB_COLS) $(PB_THREADS)
 

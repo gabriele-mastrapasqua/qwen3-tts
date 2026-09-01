@@ -2063,6 +2063,17 @@ DEFINE_MATMAT_FIXED_B(5)
 DEFINE_MATMAT_FIXED_B(6)
 DEFINE_MATMAT_FIXED_B(7)
 DEFINE_MATMAT_FIXED_B(8)
+/* 9..15 existed only as the generic fallback, and it costs about 10x the fixed-width kernel:
+   measured on an M1, one 2048x2048 call is 2.6 ms at B=8 and B=16 but 21-26 ms at B=9..15.
+   A prefill's last chunk is B = positions mod 16, so seven input lengths in every sixteen were
+   paying that. */
+DEFINE_MATMAT_FIXED_B(9)
+DEFINE_MATMAT_FIXED_B(10)
+DEFINE_MATMAT_FIXED_B(11)
+DEFINE_MATMAT_FIXED_B(12)
+DEFINE_MATMAT_FIXED_B(13)
+DEFINE_MATMAT_FIXED_B(14)
+DEFINE_MATMAT_FIXED_B(15)
 DEFINE_MATMAT_FIXED_B(16)
 #undef DEFINE_MATMAT_FIXED_B
 
@@ -2078,6 +2089,13 @@ static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
         case 6:  bf16_matmat_b6 (Y, W, X, r0, r1, cols); return;
         case 7:  bf16_matmat_b7 (Y, W, X, r0, r1, cols); return;
         case 8:  bf16_matmat_b8 (Y, W, X, r0, r1, cols); return;
+        case 9:  bf16_matmat_b9 (Y, W, X, r0, r1, cols); return;
+        case 10: bf16_matmat_b10(Y, W, X, r0, r1, cols); return;
+        case 11: bf16_matmat_b11(Y, W, X, r0, r1, cols); return;
+        case 12: bf16_matmat_b12(Y, W, X, r0, r1, cols); return;
+        case 13: bf16_matmat_b13(Y, W, X, r0, r1, cols); return;
+        case 14: bf16_matmat_b14(Y, W, X, r0, r1, cols); return;
+        case 15: bf16_matmat_b15(Y, W, X, r0, r1, cols); return;
         case 16: bf16_matmat_b16(Y, W, X, r0, r1, cols); return;
         default: bf16_matmat_generic(Y, W, X, r0, r1, cols, B); return;
     }
@@ -2486,6 +2504,20 @@ DEFINE_MATMAT_INT8_FIXED_B(3)
 DEFINE_MATMAT_INT8_FIXED_B(4)
 DEFINE_MATMAT_INT8_FIXED_B(6)
 DEFINE_MATMAT_INT8_FIXED_B(8)
+/* 1, 5, 7 and 9..15 were reaching int8_matmat_generic, which measures 5-10x the fixed-width
+   kernel on the same shape: 2.6 ms at B=8 against 14.5 at B=5, 25.4 at B=7 and 20-26 across
+   9..15. This is the fallback twin, so it is what runs wherever no VNNI, AMX, SDOT or SMMLA
+   matmat takes the call - and the widths it was missing are ordinary ones. */
+DEFINE_MATMAT_INT8_FIXED_B(1)
+DEFINE_MATMAT_INT8_FIXED_B(5)
+DEFINE_MATMAT_INT8_FIXED_B(7)
+DEFINE_MATMAT_INT8_FIXED_B(9)
+DEFINE_MATMAT_INT8_FIXED_B(10)
+DEFINE_MATMAT_INT8_FIXED_B(11)
+DEFINE_MATMAT_INT8_FIXED_B(12)
+DEFINE_MATMAT_INT8_FIXED_B(13)
+DEFINE_MATMAT_INT8_FIXED_B(14)
+DEFINE_MATMAT_INT8_FIXED_B(15)
 DEFINE_MATMAT_INT8_FIXED_B(16)
 #undef DEFINE_MATMAT_INT8_FIXED_B
 static void int8_matmat_slice(float *Y, const int8_t *W, const float *scale,
@@ -2497,7 +2529,17 @@ static void int8_matmat_slice(float *Y, const int8_t *W, const float *scale,
         case 3:  int8_matmat_b3 (Y, W, scale, X, r0, r1, cols); return;
         case 4:  int8_matmat_b4 (Y, W, scale, X, r0, r1, cols); return;
         case 6:  int8_matmat_b6 (Y, W, scale, X, r0, r1, cols); return;
+        case 1:  int8_matmat_b1 (Y, W, scale, X, r0, r1, cols); return;
+        case 5:  int8_matmat_b5 (Y, W, scale, X, r0, r1, cols); return;
+        case 7:  int8_matmat_b7 (Y, W, scale, X, r0, r1, cols); return;
         case 8:  int8_matmat_b8 (Y, W, scale, X, r0, r1, cols); return;
+        case 9:  int8_matmat_b9 (Y, W, scale, X, r0, r1, cols); return;
+        case 10: int8_matmat_b10(Y, W, scale, X, r0, r1, cols); return;
+        case 11: int8_matmat_b11(Y, W, scale, X, r0, r1, cols); return;
+        case 12: int8_matmat_b12(Y, W, scale, X, r0, r1, cols); return;
+        case 13: int8_matmat_b13(Y, W, scale, X, r0, r1, cols); return;
+        case 14: int8_matmat_b14(Y, W, scale, X, r0, r1, cols); return;
+        case 15: int8_matmat_b15(Y, W, scale, X, r0, r1, cols); return;
         case 16: int8_matmat_b16(Y, W, scale, X, r0, r1, cols); return;
         default: int8_matmat_generic(Y, W, scale, X, r0, r1, cols, B); return;
     }

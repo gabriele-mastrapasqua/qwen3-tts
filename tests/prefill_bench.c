@@ -108,6 +108,7 @@ static void amx_b32(float *Y, const uint16_t *W, const uint16_t *pA, const uint1
 #endif
 
 int main(int argc, char **argv) {
+    int fail = 0;
     int rows = argc > 1 ? atoi(argv[1]) : 2048;
     int cols = argc > 2 ? atoi(argv[2]) : 2048;
     int nt   = argc > 3 ? atoi(argv[3]) : 1;
@@ -124,16 +125,92 @@ int main(int argc, char **argv) {
     float *xT = (float *)malloc((size_t)cols * 16 * sizeof(float));
     float *yT = (float *)malloc((size_t)rows * 16 * sizeof(float));
 
+    /* First touch of an 8 MB weight matrix is a page-fault benchmark, not a kernel one. */
+    { double a = 0, b = 0; for (int w = 0; w < 3; w++)
+        path_current(Y, W, Xn, 32, cols, rows, xT, yT, &a, &b); }
+
     printf("\n  %4s %6s %10s %10s %10s   %s\n", "n", "calls", "total ms", "pack ms", "matmat ms",
            "ms per 16-position call");
     const int NS[] = { 14, 21, 29, 37, 53, 64, 128 };
+    const int REP = 5;
     for (unsigned i = 0; i < sizeof NS / sizeof *NS; i++) {
-        int n = NS[i];
-        double pk = 0, mm = 0, t0 = now_ms();
-        path_current(Y, W, Xn, n, cols, rows, xT, yT, &pk, &mm);
-        double tot = now_ms() - t0;
-        int calls = (n + 15) / 16;
-        printf("  %4d %6d %10.2f %10.2f %10.2f   %.2f\n", n, calls, tot, pk, mm, mm / calls);
+        int n = NS[i], calls = (n + 15) / 16;
+        double best = 1e30, bpk = 0, bmm = 0;
+        for (int r = 0; r < REP; r++) {
+            double pk = 0, mm = 0, t0 = now_ms();
+            path_current(Y, W, Xn, n, cols, rows, xT, yT, &pk, &mm);
+            double tot = now_ms() - t0;
+            if (tot < best) { best = tot; bpk = pk; bmm = mm; }
+        }
+        printf("  %4d %6d %10.2f %10.2f %10.2f   %.2f\n", n, calls, best, bpk, bmm, bmm / calls);
+    }
+    printf("  (best of %d after warm-up; packing is the pack column, everything else is the "
+           "call itself)\n", REP);
+
+    /* The decomposition the table above cannot give: cost as a function of B. A prefill of n
+       positions is one full call per 16 plus one partial call, so if cost(B) is flat the
+       partial call is as expensive as a full one and the only lever is fewer calls. If instead
+       cost(B) has steps, some widths are falling off a kernel gate and the lever is the gate. */
+    printf("\n  cost of ONE matmat call against batch width\n");
+    printf("  %4s %10s %10s   %s\n", "B", "ms", "ms/pos", "vs B x matvec");
+    float *yref = (float *)malloc((size_t)rows * sizeof(float));
+    for (int B = 1; B <= 16; B++) {
+        for (int b = 0; b < B; b++) {
+            const float *xr = Xn + (int64_t)b * cols;
+            for (int k = 0; k < cols; k++) xT[(int64_t)k * B + b] = xr[k];
+        }
+        qwen_matmat_bf16(yT, W, xT, rows, cols, B);          /* warm */
+        /* correctness at THIS width: the batched kernel must agree with the matvec it replaces */
+        double worst = 0;
+        for (int b = 0; b < B; b++) {
+            qwen_matvec_bf16(yref, W, Xn + (int64_t)b * cols, rows, cols);
+            for (int r = 0; r < rows; r++) {
+                double d = fabs(yT[(size_t)r * B + b] - yref[r]) / (fabs(yref[r]) + 1e-3);
+                if (d > worst) worst = d;
+            }
+        }
+        double best = 1e30;
+        for (int r = 0; r < 5; r++) {
+            double t0 = now_ms();
+            qwen_matmat_bf16(yT, W, xT, rows, cols, B);
+            double d = now_ms() - t0;
+            if (d < best) best = d;
+        }
+        printf("  %4d %10.2f %10.3f   %s (%.1e)\n", B, best, best / B,
+               worst < 2e-2 ? "OK" : "MISMATCH", worst);
+        if (worst >= 2e-2) fail = 1;
+    }
+    free(yref);
+    printf("  %s\n", fail ? "FAIL: a batch width disagrees with the matvec reference"
+                           : "PASS: every batch width agrees with the matvec reference");
+
+    /* Same question for int8, which is the precision deployments actually run. */
+    {
+        int8_t *Wq = (int8_t *)malloc((size_t)rows * cols);
+        float *sc = (float *)malloc((size_t)rows * sizeof(float));
+        for (int r = 0; r < rows; r++) {
+            sc[r] = (float)(0.002 + 0.001 * fabs(rnd()));
+            for (int k = 0; k < cols; k++) Wq[(size_t)r * cols + k] = (int8_t)(rnd() * 127.0);
+        }
+        printf("\n  the same, int8 (correctness for int8 lives in make check-matmat-parity and\n"
+               "  --self-test, which compare against an integer reference; this is timing only)\n");
+        printf("  %4s %10s %10s\n", "B", "ms", "ms/pos");
+        for (int B = 1; B <= 16; B++) {
+            for (int b = 0; b < B; b++) {
+                const float *xr = Xn + (int64_t)b * cols;
+                for (int k = 0; k < cols; k++) xT[(int64_t)k * B + b] = xr[k];
+            }
+            qwen_matmat_int8(yT, Wq, sc, xT, rows, cols, B);
+            double best = 1e30;
+            for (int r = 0; r < 5; r++) {
+                double t0 = now_ms();
+                qwen_matmat_int8(yT, Wq, sc, xT, rows, cols, B);
+                double d = now_ms() - t0;
+                if (d < best) best = d;
+            }
+            printf("  %4d %10.2f %10.3f\n", B, best, best / B);
+        }
+        free(Wq); free(sc);
     }
 
 #if HAVE_AMX
@@ -146,18 +223,21 @@ int main(int argc, char **argv) {
         float *Y32 = (float *)malloc((size_t)rows * 32 * sizeof(float));
         for (int b = 0; b < 32; b++)
             for (int k = 0; k < cols; k++) Xb[(size_t)b * cols + k] = f2b(Xn[(int64_t)b * cols + k]);
-        double p0 = now_ms();
-        pack_act(pA, Xb, cols, kfull, 16);
-        pack_act(pB, Xb + (size_t)16 * cols, cols, kfull, 16);
-        double pack32 = now_ms() - p0;
-        double k0 = now_ms();
-        amx_b32(Y32, W, pA, pB, rows, cols, 32);
-        double kern32 = now_ms() - k0;
-
-        /* same 32 positions the shipped way: two calls of B=16 */
-        double pk = 0, mm = 0, t0 = now_ms();
-        path_current(Y, W, Xn, 32, cols, rows, xT, yT, &pk, &mm);
-        double cur32 = now_ms() - t0;
+        double pack32 = 1e30, kern32 = 1e30, cur32 = 1e30, pk = 0, mm = 0;
+        for (int r = 0; r < 5; r++) {
+            double p0 = now_ms();
+            pack_act(pA, Xb, cols, kfull, 16);
+            pack_act(pB, Xb + (size_t)16 * cols, cols, kfull, 16);
+            double p1 = now_ms();
+            amx_b32(Y32, W, pA, pB, rows, cols, 32);
+            double p2 = now_ms();
+            if (p1 - p0 < pack32) pack32 = p1 - p0;
+            if (p2 - p1 < kern32) kern32 = p2 - p1;
+            double a = 0, b = 0, t0 = now_ms();
+            path_current(Y, W, Xn, 32, cols, rows, xT, yT, &a, &b);
+            double t1 = now_ms() - t0;
+            if (t1 < cur32) { cur32 = t1; pk = a; mm = b; }
+        }
 
         /* correctness before speed: the prototype must agree with the shipped path */
         double worst = 0;
@@ -176,5 +256,5 @@ int main(int argc, char **argv) {
                100.0 * ((pack32 + kern32) - cur32) / cur32);
     }
 #endif
-    return 0;
+    return fail;
 }
