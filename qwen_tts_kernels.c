@@ -207,7 +207,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
     "QWEN_NO_AMX", "QWEN_NO_VNNI", "QWEN_NO_SDOT", "QWEN_NO_BF16DOT",
-    "QWEN_NO_VNNI_TILE",
+    "QWEN_NO_VNNI_TILE", "QWEN_NO_BF16_MATMUL",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_TTFA_PRIORITY",
     "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_AMX_MIN_B", "QWEN_VNNI_MIN_B", "QWEN_BATCH_STATS", "QWEN_THP", "QWEN_POOL_SPIN",
@@ -278,6 +278,7 @@ void qwen_caps_report(void *out) {
 #endif
 #if defined(__AVX512BF16__)
     fprintf(f, "  bf16 dot:         VDPBF16PS _mm512_dpbf16_ps (native; QWEN_NO_BF16DOT=1 disables)\n");
+    fprintf(f, "  bf16 matmat:      AVX-512 BF16 tiles (QWEN_NO_BF16_MATMUL=1 disables)\n");
 #elif defined(__x86_64__)
     fprintf(f, "  bf16 dot:         widen->FMA (no AVX-512-BF16)\n");
 #endif
@@ -962,6 +963,115 @@ static void bf16_matvec_dpbf16(float *y, const uint16_t *xb, const float *x,
 }
 #endif
 
+#if defined(__AVX512BF16__)
+static inline uint16_t qwen_f32_to_bf16_scalar(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof bits);
+    return (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+}
+
+static void bf16_matmat_avx512_m4(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                  int r, int cols, int B) {
+    __m512 acc[4][4];
+    for (int m = 0; m < 4; m++)
+        for (int b = 0; b < B; b++) acc[m][b] = _mm512_setzero_ps();
+    int k = 0, kfull = cols & ~31;
+    for (; k < kfull; k += 32) {
+        __m512bh w0 = qwen_loadu_pbh(W + (size_t)(r + 0) * cols + k);
+        __m512bh w1 = qwen_loadu_pbh(W + (size_t)(r + 1) * cols + k);
+        __m512bh w2 = qwen_loadu_pbh(W + (size_t)(r + 2) * cols + k);
+        __m512bh w3 = qwen_loadu_pbh(W + (size_t)(r + 3) * cols + k);
+        for (int b = 0; b < B; b++) {
+            __m512bh x = qwen_loadu_pbh(Xb + (size_t)b * cols + k);
+            acc[0][b] = _mm512_dpbf16_ps(acc[0][b], w0, x);
+            acc[1][b] = _mm512_dpbf16_ps(acc[1][b], w1, x);
+            acc[2][b] = _mm512_dpbf16_ps(acc[2][b], w2, x);
+            acc[3][b] = _mm512_dpbf16_ps(acc[3][b], w3, x);
+        }
+    }
+    for (int m = 0; m < 4; m++) {
+        const uint16_t *w = W + (size_t)(r + m) * cols;
+        float *y = Y + (size_t)(r + m) * B;
+        for (int b = 0; b < B; b++) {
+            float s = _mm512_reduce_add_ps(acc[m][b]);
+            const uint16_t *x = Xb + (size_t)b * cols;
+            for (int i = kfull; i < cols; i++) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+            y[b] = s;
+        }
+    }
+}
+
+static void bf16_matmat_avx512_m2(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                  int r, int cols, int B) {
+    __m512 acc[2][8];
+    for (int m = 0; m < 2; m++)
+        for (int b = 0; b < B; b++) acc[m][b] = _mm512_setzero_ps();
+    int k = 0, kfull = cols & ~31;
+    for (; k < kfull; k += 32) {
+        __m512bh w0 = qwen_loadu_pbh(W + (size_t)(r + 0) * cols + k);
+        __m512bh w1 = qwen_loadu_pbh(W + (size_t)(r + 1) * cols + k);
+        for (int b = 0; b < B; b++) {
+            __m512bh x = qwen_loadu_pbh(Xb + (size_t)b * cols + k);
+            acc[0][b] = _mm512_dpbf16_ps(acc[0][b], w0, x);
+            acc[1][b] = _mm512_dpbf16_ps(acc[1][b], w1, x);
+        }
+    }
+    for (int m = 0; m < 2; m++) {
+        const uint16_t *w = W + (size_t)(r + m) * cols;
+        float *y = Y + (size_t)(r + m) * B;
+        for (int b = 0; b < B; b++) {
+            float s = _mm512_reduce_add_ps(acc[m][b]);
+            const uint16_t *x = Xb + (size_t)b * cols;
+            for (int i = kfull; i < cols; i++) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+            y[b] = s;
+        }
+    }
+}
+
+static void bf16_matmat_avx512_m1(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                  int r, int cols, int B) {
+    __m512 acc[16];
+    for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_ps();
+    const uint16_t *w = W + (size_t)r * cols;
+    int k = 0, kfull = cols & ~31;
+    for (; k < kfull; k += 32) {
+        __m512bh wv = qwen_loadu_pbh(w + k);
+        for (int b = 0; b < B; b++)
+            acc[b] = _mm512_dpbf16_ps(acc[b], wv,
+                                      qwen_loadu_pbh(Xb + (size_t)b * cols + k));
+    }
+    float *y = Y + (size_t)r * B;
+    for (int b = 0; b < B; b++) {
+        float s = _mm512_reduce_add_ps(acc[b]);
+        const uint16_t *x = Xb + (size_t)b * cols;
+        for (int i = kfull; i < cols; i++) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+        y[b] = s;
+    }
+}
+
+static void bf16_matmat_avx512_slice(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                     int r0, int r1, int cols, int B) {
+    MMSTAT(QWEN_MMK_BF16_AVX512, r1 - r0, cols, B);
+    int r = r0;
+    if (B <= 4) {
+        for (; r + 3 < r1; r += 4) bf16_matmat_avx512_m4(Y, W, Xb, r, cols, B);
+    } else if (B <= 8) {
+        for (; r + 1 < r1; r += 2) bf16_matmat_avx512_m2(Y, W, Xb, r, cols, B);
+    }
+    for (; r < r1; r++) bf16_matmat_avx512_m1(Y, W, Xb, r, cols, B);
+}
+
+typedef struct {
+    float *Y; const uint16_t *W; const uint16_t *Xb; int rows, cols, B;
+} bf16_avx512_ctx;
+static void bf16_avx512_task(size_t tid, size_t nt, void *vc) {
+    bf16_avx512_ctx *c = (bf16_avx512_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    bf16_matmat_avx512_slice(c->Y, c->W, c->Xb, r0, r1, c->cols, c->B);
+}
+#endif
+
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
 enum { QWEN_ARM_BFDOT_XMAX = 8192 };
 static void qwen_arm_f32_to_bf16_row(uint16_t *dst, const float *src, int n) {
@@ -1310,6 +1420,7 @@ enum { MMC_GEMM = 0, MMC_TWIN, MMC_MATVEC, MMC_SOLO, MMC_GEMV, MMC_NCLS };
 static const struct { const char *name; int cls; } g_mmk_info[QWEN_MMK_COUNT] = {
     { "(none)",                 MMC_TWIN   },
     { "bf16 BFMMLA (arm)",      MMC_GEMM   },
+    { "bf16 AVX-512 dpbf16",    MMC_GEMM   },
     { "bf16 fixed-B twin",      MMC_TWIN   },
     { "bf16 generic twin",      MMC_TWIN   },
     { "int8 AMX tiles",         MMC_GEMM   },
@@ -1610,6 +1721,7 @@ static int qwen_mm_env_int(const char *name, int dflt, int lo, int hi) {
 
 static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_BF16_BFMMLA] = { "QWEN_NO_BFMMLA",   NULL,                "QWEN_BFMMLA_MIN_B",  NULL,                NULL,                     2, 64,  0,  0, 0, 1 },
+    [QWEN_MMK_BF16_AVX512] = { "QWEN_NO_BF16_MATMUL", NULL,              "QWEN_BF16_MATMUL_MIN_B", NULL,             NULL,                     1, 16,  0,  0, 0, 0 },
     [QWEN_MMK_BF16_AMX]    = { "QWEN_NO_AMX_BF16", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_BF16_MIN_COLS", 4, 16, 32, 32, 1, 0 },
     [QWEN_MMK_INT8_AMX]    = { "QWEN_NO_AMX_INT8", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_INT8_MIN_COLS", 4, 16, 32, 64, 1, 0 },
     [QWEN_MMK_INT8_VNNI]   = { "QWEN_NO_VNNI",     NULL,                "QWEN_VNNI_MIN_B",    NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
@@ -1677,13 +1789,16 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
     if (rows <= 0) rows = 2048;
     if (cols <= 0) cols = 2048;
 
-    int bf16_c[4], int8_c[6], q4_c[6];
+    int bf16_c[5], int8_c[6], q4_c[6];
     int nbf = 0, nint8 = 0, nq4 = 0;
 #if defined(__AMX_BF16__) && defined(__AMX_TILE__)
     if (qwen_amx_bf16_ready()) bf16_c[nbf++] = QWEN_MMK_BF16_AMX;
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
     bf16_c[nbf++] = QWEN_MMK_BF16_BFMMLA;
+#endif
+#if defined(__AVX512BF16__)
+    bf16_c[nbf++] = QWEN_MMK_BF16_AVX512;
 #endif
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     if (qwen_amx_int8_ready()) { int8_c[nint8++] = QWEN_MMK_INT8_AMX; q4_c[nq4++] = QWEN_MMK_Q4_AMX; }
@@ -2151,6 +2266,25 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
             return;
         }
           free(Xb);
+    }
+#endif
+#if defined(__AVX512BF16__)
+    if (B <= 16 && cols >= 32 && !qwen_bf16dot_disabled() &&
+        qwen_mm_use(QWEN_MMK_BF16_AVX512, B, rows, cols)) {
+        uint16_t *Xb = mm_scratch_packb((size_t)B * cols);
+        if (Xb) {
+            for (int b = 0; b < B; b++)
+                for (int k = 0; k < cols; k++)
+                    Xb[(size_t)b * cols + k] =
+                        qwen_f32_to_bf16_scalar(X[(size_t)k * B + b]);
+            if (nt > 1 && rows >= 256) {
+                bf16_avx512_ctx c = { Y, W, Xb, rows, cols, B };
+                qwen_parallel((size_t)nt, bf16_avx512_task, &c);
+            } else {
+                bf16_matmat_avx512_slice(Y, W, Xb, 0, rows, cols, B);
+            }
+            return;
+        }
     }
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
@@ -7112,6 +7246,9 @@ static int qtune_kernels(int fmt, qtune_kres_t *out) {
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
         PUSHK(QWEN_MMK_BF16_BFMMLA);
+#endif
+#if defined(__AVX512BF16__)
+        PUSHK(QWEN_MMK_BF16_AVX512);
 #endif
     } else if (fmt == 1) {
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)

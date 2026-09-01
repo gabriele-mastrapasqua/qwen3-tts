@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
   "profile": {
-    "id": "x86-8c-amx-multiclient-ttfa",
-    "description": "Balanced low-TTFA profile for concurrent streaming requests on an 8-core Intel AMX host with SMT disabled.",
+    "id": "x86-8c-amx-c4-latency-ttfa",
+    "description": "Fixed-C=4 latency-first profile for an 8-core Intel AMX host with SMT disabled; use only when four simultaneous clients are the explicit target.",
     "objective": {
       "primary": "ttfa",
       "secondary": "throughput",
-      "concurrency_range": [2, 8],
-      "preferred_concurrency": 2,
+      "concurrency_range": [4, 4],
+      "preferred_concurrency": 4,
       "quality_changes_allowed": false
     }
   },
@@ -30,7 +30,7 @@
       "amx_int8",
       "amx_bf16"
     ],
-    "notes": "Disable SMT before launch. The qualified workers use CPUs 0-3 and 4-7, one thread per physical core. The host has one NUMA node and a 260 MiB shared L3."
+    "notes": "Disable SMT before launch. Four workers use CPU pairs 0-1, 2-3, 4-5 and 6-7. This profile is latency-first and has lower measured throughput than the 2x4 profile."
   },
   "build": {
     "target": "blas",
@@ -46,13 +46,13 @@
     }
   },
   "server": {
-    "prefork_workers": 2,
-    "threads_per_worker": 4,
-    "batch_size": 8,
+    "prefork_workers": 4,
+    "threads_per_worker": 2,
+    "batch_size": 4,
     "max_queue": 1,
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
-    "worker_affinity": "worker 0 -> CPUs 0-3; worker 1 -> CPUs 4-7, after SMT is disabled"
+    "worker_affinity": "worker 0 -> CPU 0-1; worker 1 -> 2-3; worker 2 -> 4-5; worker 3 -> 6-7, after SMT is disabled"
   },
   "streaming": {
     "first_chunk_ramp": [1, 2, 4],
@@ -102,10 +102,10 @@
   },
   "qualification": {
     "status": "qualified",
-    "workload": "Three synchronized waves at client concurrency 2, 4, 6 and 8 on the mixed 21-text qualification bank; SMT was disabled and each worker was pinned to a physical-core slice.",
+    "workload": "Three synchronized waves at client concurrency 4 on the mixed 21-text qualification bank; SMT was disabled and all four worker pairs were pinned to physical-core slices.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b base checkpoint",
     "speaker": "ryan",
-    "notes": "Latest SMT-off measurements gave TTFA p50/p95: C=2 176/421 ms, C=4 549/684 ms, C=6 655/1093 ms, C=8 890/1327 ms. This topology was the balanced concurrent choice: it gave the best measured request throughput at C=4, C=6 and C=8 among the tested topologies, while C=2 is the strict low-TTFA operating point."
+    "notes": "Measured TTFA was approximately 372 ms p50 / 735 ms p95 with RTF 1.67. It reduced C=4 median TTFA versus 1x8 and 2x4, but measured request throughput was lower; choose it only for a fixed C=4 latency objective."
   }
 }

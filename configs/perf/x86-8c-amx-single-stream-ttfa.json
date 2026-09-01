@@ -2,11 +2,11 @@
   "schema_version": 1,
   "profile": {
     "id": "x86-8c-amx-single-stream-ttfa",
-    "description": "Measured low-TTFA starting profile for one streaming request on an 8-core Intel AMX host.",
+    "description": "Low-TTFA profile for one AMX worker on an 8-core Intel host with SMT disabled; measured for one and two concurrent requests.",
     "objective": {
       "primary": "ttfa",
       "secondary": "realtime_factor",
-      "concurrency_range": [1, 1],
+      "concurrency_range": [1, 2],
       "preferred_concurrency": 1,
       "quality_changes_allowed": false
     }
@@ -18,6 +18,7 @@
     "physical_cores": 8,
     "threads_per_core": 2,
     "numa_nodes": 1,
+    "l3_mib": 260,
     "isa_features_used": [
       "avx512f",
       "avx512bw",
@@ -29,7 +30,7 @@
       "amx_int8",
       "amx_bf16"
     ],
-    "notes": "The host exposes 16 logical CPUs for 8 physical cores. The qualified single worker is pinned to CPUs 0-7, one sibling per physical core; SMT remains enabled and CPUs 8-15 are outside its affinity. Verify topology before launch."
+    "notes": "The host exposes 16 hardware threads and 8 physical cores. Disable SMT before launch; the qualified process uses online CPUs 0-7, one thread per physical core. Do not apply this profile with SMT enabled without requalification."
   },
   "build": {
     "target": "blas",
@@ -51,7 +52,7 @@
     "max_queue": 1,
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
-    "worker_affinity": "one process on CPUs 0-7, one logical sibling per physical core"
+    "worker_affinity": "one worker pinned to online CPUs 0-7 after SMT is disabled"
   },
   "streaming": {
     "first_chunk_ramp": [1, 2, 4],
@@ -64,22 +65,22 @@
       "code_predictor_weights": "int8 per output row",
       "speech_decoder_weights": "fp32",
       "activations": "fp32 at the API boundary; int8 packing is internal to matmat",
-      "gemm_backend": "AMX INT8 GEMM where the gate is met; shape-aware AVX-512 VNNI GEMM fallback; scalar/vector fallback otherwise"
+      "gemm_backend": "AMX INT8/BF16 GEMM where the shape gate is met; AVX-512 VNNI and AVX-512 BF16 fallbacks otherwise"
     },
     "environment": {
       "OPENBLAS_NUM_THREADS": {
         "value": null,
-        "why": "Must be absent so the engine can size OpenBLAS per phase from the worker thread budget.",
+        "why": "Must be absent so the engine sizes OpenBLAS from its phase thread budget.",
         "revert": "set it explicitly only for a measured override"
       },
       "OPENBLAS_THREAD_TIMEOUT": {
         "value": "1",
-        "why": "Avoids idle OpenBLAS workers spinning against the engine pool.",
+        "why": "Prevents idle OpenBLAS workers from spinning against the engine pool.",
         "revert": "unset"
       },
       "QWEN_AMX_MIN_B": {
         "value": "2",
-        "why": "Allows AMX INT8 matmat from the first batched regime qualified by the engine.",
+        "why": "Keeps AMX INT8 matmat available from the first batched regime.",
         "revert": "use the compiled default"
       },
       "QWEN_PREFIX_CACHE": {
@@ -89,8 +90,8 @@
       },
       "QWEN_NO_VNNI_TILE": {
         "value": null,
-        "why": "Must remain absent so the shape-aware AVX-512 VNNI tile path is available when AMX is bypassed.",
-        "revert": "set QWEN_NO_VNNI_TILE=1 only for a VNNI row-kernel control run"
+        "why": "Must remain absent so the shape-aware AVX-512 VNNI fallback remains available.",
+        "revert": "set QWEN_NO_VNNI_TILE=1 only for a control run"
       }
     }
   },
@@ -100,10 +101,11 @@
     "server_env_serialization": "comma"
   },
   "qualification": {
-    "status": "provisional",
-    "workload": "One streaming request at client concurrency 1, with the same warmup and mixed-length text bank used for the single-stream thread sweep.",
-    "benchmark_family": "CLOSED_LOOP_SATURATION",
-    "model": "Qwen3-TTS 1.7B base checkpoint",
-    "notes": "This is a latency-first candidate, not a sustained-throughput recommendation. Requalify after the clean OSS VNNI tile path is included."
+    "status": "qualified",
+    "workload": "Three synchronized waves on the mixed 21-text qualification bank; client concurrency 1 and 2 were measured with SMT disabled.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-1.7b base checkpoint",
+    "speaker": "ryan",
+    "notes": "In the latest SMT-off confirmation, C=1 measured 112 ms p50 / 322 ms p95 with RTF 0.64; C=2 measured 228 ms p50 / 403 ms p95 with RTF 0.84. This is the latency-first profile; use the multi-client profile for a balanced worker split."
   }
 }

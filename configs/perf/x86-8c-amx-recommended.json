@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "x86-8c-amx-recommended",
+    "description": "Alias for the measured balanced concurrent profile on an 8-core Intel AMX host with SMT disabled.",
+    "alias_of": "x86-8c-amx-multiclient-ttfa",
+    "objective": {
+      "primary": "ttfa",
+      "secondary": "throughput",
+      "concurrency_range": [2, 8],
+      "preferred_concurrency": 2,
+      "quality_changes_allowed": false
+    }
+  }
+}

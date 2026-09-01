@@ -6,6 +6,7 @@
 configs/perf/schema.json          the format, architecture-neutral
 configs/perf/axion-16c-ttfa.json  recommended low-TTFA config for a 16-core Google Axion host
 configs/perf/recommended.json     stable entry point; POINTS at the current recommendation
+configs/perf/x86-8c-amx-recommended.json  x86-specific alias for the measured AMX profile
 ```
 
 ```bash
@@ -93,8 +94,10 @@ Individual rungs remain available for investigation. The suite is the gate for a
 |---|---|---|
 | `axion-16c-ttfa` | **qualified** | a 16-core Arm host, measured end to end: topology, thread split, batch width, runtime environment and the concurrency band the claim covers |
 | `generic-16c-starting-point` | **unqualified** | a place to START on a 16-core Arm server. Nothing in it was measured on your machine, and it says so in its own `qualification.notes` |
-| `x86-8c-amx-single-stream-ttfa` | **provisional** | an 8-core Intel AMX host, latency-first single-stream topology |
-| `x86-8c-amx-multiclient-ttfa` | **provisional** | the same host, a four-worker concurrent low-TTFA topology |
+| `x86-8c-amx-single-stream-ttfa` | **qualified** | an 8-core Intel AMX host, one worker with eight physical-core threads; C=1-2 latency |
+| `x86-8c-amx-multiclient-ttfa` | **qualified** | the same host, two workers x four physical-core threads; balanced C=2-8 operation |
+| `x86-8c-amx-c4-latency-ttfa` | **qualified** | fixed C=4 latency-first topology, four workers x two threads; lower throughput |
+| `x86-8c-amx-recommended` | alias | resolves to the balanced x86 AMX profile; carries no values of its own |
 | `recommended` | alias | resolves to the qualified one; carries no values of its own |
 
 There is deliberately no profile per machine type we have ever touched. A profile claims
