@@ -186,13 +186,19 @@ help:
 	@echo "  make tune-archive BOX=<name> - the same, and archives the JSON for a cross-ISA comparison"
 	@echo "                               (tools/box_info.sh + tests/membw.c) + --caps + --self-test"
 	@echo "                               + --matmat-bench. No model needed. JSON in HW_JSON=."
-	@echo "                               (alias storico: make box-report)"
+	@echo "                               (historical alias: make box-report)"
 	@echo "  make membw                 - bandwidth only: Copy/Triad with a thread sweep, and the knee"
-	@echo "  make bench-matrix[-full]   - poi la matrice RTF (richiede un modello scaricato)"
-	@echo "  make check-matmat-parity   - i gemelli batched fanno l'aritmetica che dichiarano? (ISA nativa)"
+	@echo "  make bench-matrix[-full]   - then the RTF matrix (needs a downloaded model)"
+	@echo "  make check-matmat-parity   - do the batched twins do the arithmetic they claim? (native ISA)"
 	@echo "  make check-matmat-parity-x86 - the same on the x86 AVX2 kernels, run under Rosetta 2 from an Arm Mac"
 	@echo "  make check-isa             - compile-check the ISA paths this machine does not have"
 	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
+	@echo ""
+	@echo "Serving qualification (docs/serving-operations.md):"
+	@echo "  make bench-fingerprint     - what this machine actually is: cpu, cores, SMT, cache, NUMA, measured bandwidth"
+	@echo "  make bench-topo            - sweep prefork topologies to find W x K (BENCH_TOPO=1x16,2x8,4x4)"
+	@echo "  make bench-suite           - the qualification suite: preflight gates, rungs, audio length, manifest"
+	@echo "                               (BENCH_MODEL= BENCH_PROFILE= BENCH_TOPO= BENCH_RUNG=fast BENCH_OUT=)"
 	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
@@ -610,6 +616,33 @@ bench-matrix: $(TARGET)
 	@bash tests/bench_matrix.sh $(MODEL_SMALL)
 bench-matrix-full: $(TARGET)
 	@bash tests/bench_matrix.sh $(MODEL_SMALL) --full
+
+BENCH_MODEL   ?= $(MODEL_LARGE)
+BENCH_PROFILE ?= recommended
+BENCH_TOPO    ?= 2x8
+BENCH_SPEAKER ?= ryan
+BENCH_BANK    ?= tests/load_texts_en.txt
+BENCH_CONC    ?= 1,4
+BENCH_WAVES   ?= 3
+BENCH_OUT     ?= /tmp/bench_suite
+BENCH_RUNG    ?=
+BENCH_ARGS    ?=
+
+bench-fingerprint: $(MEMBW_BIN)
+	@MEMBW_BIN=$(MEMBW_BIN) bash tools/box_info.sh
+
+bench-topo: $(TARGET)
+	@python3 tests/serve_parallel_wave.py --model $(BENCH_MODEL) --bin ./$(TARGET) \
+	  --speaker $(BENCH_SPEAKER) --topo $(BENCH_TOPO) --conc $(BENCH_CONC) \
+	  --waves $(BENCH_WAVES) --seed 42 --precision int8 --profile $(BENCH_PROFILE) \
+	  --text-file $(BENCH_BANK) --classes short --out $(BENCH_OUT)/topo \
+	  --port 9500 --label topo $(BENCH_ARGS)
+
+bench-suite: $(TARGET)
+	@bash tests/bench_suite.sh --model $(BENCH_MODEL) --profile $(BENCH_PROFILE) \
+	  --topo $(BENCH_TOPO) --speaker $(BENCH_SPEAKER) --bank-fast $(BENCH_BANK) \
+	  --bank-real $(BENCH_BANK) --out $(BENCH_OUT) \
+	  $(if $(BENCH_RUNG),--only $(BENCH_RUNG),) $(BENCH_ARGS)
 
 PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c
 PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I.
@@ -1040,6 +1073,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
+.PHONY: bench-fingerprint bench-topo bench-suite
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak

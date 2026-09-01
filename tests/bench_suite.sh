@@ -10,6 +10,7 @@ REAL="tests/load_texts_en.txt"             # qualification: the whole bank
 FAST_CLASSES="short"
 REAL_CLASSES=""
 SKIP_IDLE=0
+ONLY=""                                    # comma list: run only these rungs
 IDENTITY=0          # the identity gate needs a traced pass of its own; see below
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,6 +26,7 @@ while [ $# -gt 0 ]; do
     --bank-real) REAL="$2"; shift 2;;
     --fast-classes) FAST_CLASSES="$2"; shift 2;;
     --real-classes) REAL_CLASSES="$2"; shift 2;;
+    --only) ONLY="$2"; shift 2;;
     --skip-idle-gate) SKIP_IDLE=1; shift;;
     --identity-gate) IDENTITY=1; shift;;
     *) echo "unknown argument: $1" >&2; exit 2;;
@@ -121,16 +123,18 @@ rung () {   # name bank conc waves [extra...]
 }
 
 cls_arg () { [ -n "$1" ] && printf -- "--classes %s" "$1"; }
+want () { case ",$ONLY," in ,,) return 0;; *",$1,"*) return 0;; *) echo "=== $1: SKIPPED, not in --only $ONLY ==="; return 1;; esac; }
 
-rung realistic "$REAL" 1,2,4,6,8 4 $(cls_arg "$REAL_CLASSES")
-rung fast      "$FAST" 1,4       5 $(cls_arg "$FAST_CLASSES")
+echo "rungs=${ONLY:-realistic,fast,short-diverse,long-diverse}" >> "$MAN"
+want realistic && rung realistic "$REAL" 1,2,4,6,8 4 $(cls_arg "$REAL_CLASSES")
+want fast      && rung fast      "$FAST" 1,4       5 $(cls_arg "$FAST_CLASSES")
 
 if [ -n "$CORPUS" ] && [ -f "$CORPUS" ]; then
-  rung short-diverse "$CORPUS" 4,6   3 --classes short
-  rung long-diverse  "$CORPUS" 1,4,6 3 --classes long
+  want short-diverse && rung short-diverse "$CORPUS" 4,6   3 --classes short
+  want long-diverse  && rung long-diverse  "$CORPUS" 1,4,6 3 --classes long
 else
   echo "=== short-diverse / long-diverse: SKIPPED, no --corpus given ==="
-  echo "    (build one with 'make corpus-calibrate'; classes must come from measured audio)"
+  echo "    (pass --corpus FILE with a duration-calibrated bank; the classes must come from measured audio)"
   echo "skipped_rungs=short-diverse,long-diverse (no corpus)" >> "$MAN"
 fi
 

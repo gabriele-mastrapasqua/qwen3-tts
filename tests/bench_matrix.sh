@@ -51,7 +51,7 @@ if [ -r tools/box_info.sh ]; then
     bash tools/box_info.sh --out "$HW_JSON"
     [ -s "$HW_JSON" ] && echo "  (JSON confrontabile fra box: $HW_JSON)"
 else
-    echo "  tools/box_info.sh mancante — inventario hardware saltato"
+    echo "  tools/box_info.sh missing — hardware inventory skipped"
 fi
 echo
 
