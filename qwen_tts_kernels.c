@@ -1457,6 +1457,12 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
 
 static atomic_int g_mm_stats = -1;
 static atomic_llong g_mm_macs[QWEN_MMK_COUNT];
+/* Which arm of the fixed-width switch a twin actually took. A dispatcher that never
+   reaches the twin at all leaves both at zero, which is the answer to "does this kernel
+   change anything on this build" - and it is not visible from the per-kernel MAC table,
+   because that is recorded before the width switch. */
+static atomic_llong g_mm_fixedw[2];   /* [0] bf16, [1] int8 */
+static atomic_llong g_mm_generic[2];
 static atomic_llong g_mm_calls[QWEN_MMK_COUNT];
 static atomic_llong g_mm_wbytes;
 static _Atomic double g_mm_wb_t0, g_mm_wb_t1;
@@ -1717,6 +1723,18 @@ void qwen_matmat_stats_report(void *out) {
         }
     }
     fprintf(f, "  ---\n");
+    {
+        long long bf = atomic_load_explicit(&g_mm_fixedw[0], memory_order_relaxed);
+        long long bg = atomic_load_explicit(&g_mm_generic[0], memory_order_relaxed);
+        long long qf = atomic_load_explicit(&g_mm_fixedw[1], memory_order_relaxed);
+        long long qg = atomic_load_explicit(&g_mm_generic[1], memory_order_relaxed);
+        if (bf || bg || qf || qg)
+            fprintf(f, "  fallback twin dispatch: bf16 %lld fixed-width / %lld generic  ·  "
+                       "int8 %lld fixed-width / %lld generic\n", bf, bg, qf, qg);
+        else
+            fprintf(f, "  fallback twin dispatch: never reached (a wider matmat took every "
+                       "batched call on this build)\n");
+    }
     fprintf(f, "  matrix-matrix %5.1f%%  ·  batched twin %5.1f%%  ·  B x matvec %5.1f%%  ·  single-slot %5.1f%%  ·  GEMV %5.1f%%\n",
             100.0 * (double)by_cls[MMC_GEMM]   / (double)tot,
             100.0 * (double)by_cls[MMC_TWIN]   / (double)tot,
@@ -2080,6 +2098,11 @@ DEFINE_MATMAT_FIXED_B(16)
 static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
                               int r0, int r1, int cols, int B) {
     MMSTAT(QWEN_MMK_BF16_FIXEDB, r1 - r0, cols, B);
+    if (qwen_matmat_stats_enabled() || qwen_census_enabled()) {
+        int fixed = (B >= 1 && B <= 16);
+        atomic_fetch_add_explicit(&g_mm_fixedw[0], fixed, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mm_generic[0], !fixed, memory_order_relaxed);
+    }
     switch (B) {
         case 1:  bf16_matmat_b1 (Y, W, X, r0, r1, cols); return;
         case 2:  bf16_matmat_b2 (Y, W, X, r0, r1, cols); return;
@@ -2523,6 +2546,11 @@ DEFINE_MATMAT_INT8_FIXED_B(16)
 static void int8_matmat_slice(float *Y, const int8_t *W, const float *scale,
                               const float *X, int r0, int r1, int cols, int B) {
     MMSTAT(QWEN_MMK_INT8_F32TWIN, r1 - r0, cols, B);
+    if (qwen_matmat_stats_enabled() || qwen_census_enabled()) {
+        int fixed = (B >= 1 && B <= 16);
+        atomic_fetch_add_explicit(&g_mm_fixedw[1], fixed, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mm_generic[1], !fixed, memory_order_relaxed);
+    }
     qwen_ftz_on();
     switch (B) {
         case 2:  int8_matmat_b2 (Y, W, scale, X, r0, r1, cols); return;
