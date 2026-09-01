@@ -1138,12 +1138,29 @@ static int setup_listen_socket(int port) {
     return server_fd;
 }
 
+static volatile sig_atomic_t g_srv_dump = 0;
+static void srv_dump_sig(int sig) { (void)sig; g_srv_dump = 1; }
+
+/* SIGUSR1 asks for counters. Without a handler its default action is to KILL the process,
+   so a stats signal to a non-prefork server would end it. */
+static void srv_dump_counters_if_asked(void) {
+    if (!g_srv_dump) return;
+    g_srv_dump = 0;
+    qwen_pool_stats_report();
+    if (qwen_census_enabled()) qwen_census_report(NULL);
+    if (qwen_matmat_stats_enabled()) qwen_matmat_stats_report(NULL);
+    fflush(stderr);
+}
+
 static void install_signal_handlers(void) {
     struct sigaction sa = { .sa_handler = sigint_handler };
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    struct sigaction su = { .sa_handler = srv_dump_sig };
+    sigemptyset(&su.sa_mask); su.sa_flags = 0;
+    sigaction(SIGUSR1, &su, NULL);
     signal(SIGPIPE, SIG_IGN);
 }
 
@@ -1711,7 +1728,7 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     g_srv.slots = max_batch;
     g_srv.queue_timeout_ms = g_cfg_queue_timeout_ms;
     srv_init_request_cap();
-    fprintf(stderr, "[serve] %d slot · possono attendere %d (totale nel sistema %d) · scadenza %s\n",
+    fprintf(stderr, "[serve] %d slots · %d may wait (%d in the system) · queue deadline %s\n",
             max_batch, jq.cap, max_batch + jq.cap,
             g_srv.queue_timeout_ms > 0 ? "on" : "none");
     job_queue_t jq_single; jq_init(&jq_single);
@@ -1762,7 +1779,10 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
         } else {
             struct sockaddr_in client_addr; socklen_t client_len = sizeof(client_addr);
             client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-            if (client_fd < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
+            if (client_fd < 0) {
+                if (errno == EINTR) { srv_dump_counters_if_asked(); continue; }
+                perror("accept"); continue;
+            }
         }
         set_client_timeout(client_fd);
         cq_push(&cq, client_fd);
@@ -1801,7 +1821,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
             socklen_t client_len = sizeof(client_addr);
             int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
             if (client_fd < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR) { srv_dump_counters_if_asked(); continue; }
                 perror("accept");
                 continue;
             }
@@ -1849,7 +1869,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) { srv_dump_counters_if_asked(); continue; }
             perror("accept");
             continue;
         }

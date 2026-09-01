@@ -1103,7 +1103,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --workers <n>              Concurrent synthesis workers (server; default 1)\n");
                 fprintf(stderr, "  --batch-size <n>           Request-batching: step up to n concurrent users together (server; n>=2)\n");
                 fprintf(stderr, "  --prefork <n>              n pinned worker PROCESSES; weights packed once and shared via COW\n");
-                fprintf(stderr, "  --prefork-threads <k>      threads per prefork worker (default: cpus/n)\n");
+                fprintf(stderr, "  --prefork-threads <k>      threads per prefork worker (default: cpus/n); with --prefork 1 it sizes the single server's pool\n");
                 fprintf(stderr, "  --prefork-elastic          move cores between workers with the load (1->8, 2->8+8, 3->8+4+4, 4+->4 each)\n");
                 fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
                 fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
@@ -1338,6 +1338,10 @@ int main(int argc, char **argv) {
 
     qwen_check_runtime_isa();
 
+    /* --prefork 1 runs a single server, which never reaches the prefork path: without this
+       its pool would silently keep the default size while the invocation asked for K. */
+    if (threads <= 0 && serve_port > 0 && serve_prefork <= 1 && serve_prefork_threads > 0)
+        threads = serve_prefork_threads;
     if (threads > 0) qwen_set_threads(threads);
     else qwen_init_threads();
 
