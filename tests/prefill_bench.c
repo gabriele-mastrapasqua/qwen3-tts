@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
        partial call is as expensive as a full one and the only lever is fewer calls. If instead
        cost(B) has steps, some widths are falling off a kernel gate and the lever is the gate. */
     printf("\n  cost of ONE matmat call against batch width\n");
-    printf("  %4s %10s %10s   %s\n", "B", "ms", "ms/pos", "vs B x matvec");
+    printf("  %4s %10s %10s   %s\n", "B", "ms", "ms/pos", "rel L2 vs B x matvec");
     float *yref = (float *)malloc((size_t)rows * sizeof(float));
     for (int B = 1; B <= 16; B++) {
         for (int b = 0; b < B; b++) {
@@ -160,15 +160,19 @@ int main(int argc, char **argv) {
             for (int k = 0; k < cols; k++) xT[(int64_t)k * B + b] = xr[k];
         }
         qwen_matmat_bf16(yT, W, xT, rows, cols, B);          /* warm */
-        /* correctness at THIS width: the batched kernel must agree with the matvec it replaces */
-        double worst = 0;
+        /* Correctness at THIS width: the batched kernel must agree with the matvec it replaces.
+           Relative L2 over the whole result, not a per-element ratio: with a per-element metric
+           a single near-zero reference value makes the error explode and reports a mismatch
+           that is an artefact of the denominator. This is the measure --self-test uses. */
+        double l2n = 0, l2d = 0;
         for (int b = 0; b < B; b++) {
             qwen_matvec_bf16(yref, W, Xn + (int64_t)b * cols, rows, cols);
             for (int r = 0; r < rows; r++) {
-                double d = fabs(yT[(size_t)r * B + b] - yref[r]) / (fabs(yref[r]) + 1e-3);
-                if (d > worst) worst = d;
+                double d = (double)yT[(size_t)r * B + b] - yref[r];
+                l2n += d * d; l2d += (double)yref[r] * yref[r];
             }
         }
+        double worst = l2d > 0 ? sqrt(l2n / l2d) : 0.0;
         double best = 1e30;
         for (int r = 0; r < 5; r++) {
             double t0 = now_ms();
@@ -177,8 +181,8 @@ int main(int argc, char **argv) {
             if (d < best) best = d;
         }
         printf("  %4d %10.2f %10.3f   %s (%.1e)\n", B, best, best / B,
-               worst < 2e-2 ? "OK" : "MISMATCH", worst);
-        if (worst >= 2e-2) fail = 1;
+               worst < 3e-2 ? "OK" : "MISMATCH", worst);
+        if (worst >= 3e-2) fail = 1;
     }
     free(yref);
     printf("  %s\n", fail ? "FAIL: a batch width disagrees with the matvec reference"

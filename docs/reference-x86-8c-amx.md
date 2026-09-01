@@ -59,6 +59,29 @@ level from C=4 up. Each topology has one scope and it is worth stating them sepa
 p95 stays under 400 ms out to C=6 on `2x4`, while stream RTF passes 1 between C=1 and C=2. Four
 or six concurrent requests get their first audio quickly; they are not realtime while they run.
 
+**Read the percentiles unrounded.** The printed table gives `2x4` a p95 of `500` at C=8, which a
+500 ms budget would call a pass. The unrounded value was 500.180 ms in one run and 495.415 ms in
+another: it straddles the threshold, so the honest claim stops at C=6, and the topology that
+actually holds C=8 under 500 ms is `4x2`, at 472.4 ms.
+
+## 1b. The 0.6B, which is where this box gets a realtime story
+
+Same profile, same procedure, three waves:
+
+| topology | C | TTFA p50 / p95 | stream RTF | req/s |
+|---|---:|---:|---:|---:|
+| `1x8` | 1 | 74 / 77 ms | **0.50** | 1.00 |
+| `1x8` | 2 | 101 / 141 ms | **0.87** | 1.12 |
+| `1x8` | 4 | 215 / 260 ms | 1.52 | 1.25 |
+| `2x4` | 1 | 97 / 99 ms | **0.72** | 0.69 |
+| `2x4` | 2 | 98 / **123 ms** | **0.72** | 1.36 |
+| `2x4` | 4 | 164 / 171 ms | 1.14 | 1.66 |
+| `2x4` | 8 | 272 / 327 ms | 1.95 | 1.94 |
+
+**Two concurrent realtime streams**, at 123 ms p95 first audio, on `2x4` — and C=4 misses by 14%
+rather than by a lot. The 1.7B never gets there on this hardware. If the requirement is realtime
+under any concurrency at all, this box runs the 0.6B; the 1.7B is a one-stream model here.
+
 **Client concurrency is not batch width.** At C=4 on `2x4` the measured in-flight batch is 3.10
 *in the system*, about 1.55 per worker. That single fact explains the decoder result in §3.
 
@@ -91,19 +114,24 @@ throughput and 7% of stream RTF here.
 | lever | Arm profile | here | why |
 |---|---|---|---|
 | `QWEN_POOL_SPIN` | 65536 | **4096** (the x86 compiled default) | 0 costs +13% stream RTF at C=1 and 31k vs 2k context switches; 1024 is in between; 65536 costs p95 358 vs 339 ms. A spinning worker needs a core to spin on, and on 8 cores it takes one from a worker that has work |
-| `QWEN_DECODER_BATCH` | 1 | **0** | measured over three interleaved repeats, off is 12% better at C=4 TTFA p95 (290 vs 331 ms mean) with identical RTF and throughput |
+| `QWEN_DECODER_BATCH` | 1 | **0** | three interleaved repeats at each end of the range: off is 12% better at C=4 TTFA p95 (290 vs 331 ms) and 11% better at C=8 TTFA p50 (443 vs 498 ms), with RTF and throughput inside noise |
 
-The decoder result has a mechanism, not just a number. `QWEN_SERVE_PROFILE=1` reports:
+The decoder result has a mechanism, and it is worth reporting precisely because the obvious
+explanation is only half right. `QWEN_SERVE_PROFILE=1` reports:
 
 ```
 C=1:  decoder batch: calls / mean   60   1.00     max slots 1
-C=4:  decoder batch: calls / mean   42   1.40     max slots 2
-      [serve-profile] mean 1.38 active slots
+C=4:  decoder batch: calls / mean   42   1.40     max slots 2    (mean 1.38 active slots)
+C=8:  decoder batch: calls / mean   42   2.24     max slots 4    (mean 2.16 and 3.56 per worker)
 ```
 
-The gang never forms. With ~1.55 slots per worker there is nothing to amortise over, so the
-batch pays the wait and collects the tail. **Expect this to flip on a box wide enough to give
-one worker several slots** — which is exactly what the Arm host does.
+At C=1 and C=4 the gang barely forms: with ~1.55 slots per worker there is nothing to amortise,
+so the batch pays the wait and collects the tail. **At C=8 it does form** — 2.24 slots deep, up
+to 4 — and turning it off is *still* better: TTFA p50 443 vs 498 ms and p95 546 vs 580 ms over
+three interleaved repeats, for about 1% of throughput, which is inside this box's noise. So the
+finding is not "batching never happens"; it is that a gang this deep buys nothing measurable
+here and costs first audio. The C=4 result did not license the C=8 conclusion and both were
+measured.
 
 Note that the server enables decoder batching *itself* with `setenv(..., overwrite=0)`. A
 profile that stays silent gets it on; only an explicit `0` turns it off. An A/B that sets the
