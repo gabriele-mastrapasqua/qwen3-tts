@@ -161,15 +161,22 @@ order is expected and benign, a different *result* is not.
 The default is always "use the widest primitive this build has, at the batch width where it
 wins". These exist to take one away and measure what it was worth.
 
-| flag | default | effect |
-|---|---|---|
-| `QWEN_NO_SDOT` | unset | `=1` drops the ARM dotprod int8 path back to f32 accumulation |
-| `QWEN_NO_VNNI` | unset | `=1` drops the x86 VNNI int8 path (matvec and matmat) |
-| `QWEN_NO_BF16DOT` | unset | `=1` drops the AVX-512 bf16 dot path |
-| `QWEN_NO_AMX` | unset | `=1` disables every AMX matmat kernel at once |
-| `QWEN_ARM_BFDOT` | unset (off) | `=1` opts *into* BFDOT for the bf16 matvec on ARM |
-| `QWEN_AMX_MIN_B` | 4 | smallest batch width that may take an AMX matmat |
-| `QWEN_VNNI_MIN_B` | 2 | smallest batch width that may take the VNNI matmat |
+| flag | ISA | default | effect |
+|---|---|---|---|
+| `QWEN_NO_SDOT` | ARM | unset | `=1` drops the dotprod int8 path back to f32 accumulation |
+| `QWEN_NO_SMMLA` / `QWEN_NO_BFMMLA` | ARM | unset | `=1` drops the i8mm / bf16 matmat kernels |
+| `QWEN_ARM_BFDOT` | ARM | unset (off) | `=1` opts *into* BFDOT for the bf16 matvec |
+| `QWEN_APPLE_MMLA` | Apple | unset (off) | MMLA is opt-in on Apple silicon; `=1` enables it |
+| `QWEN_NO_VNNI` | x86 | unset | `=1` drops the VNNI int8 path (matvec and matmat) |
+| `QWEN_NO_BF16DOT` | x86 | unset | `=1` drops the AVX-512 bf16 dot path |
+| `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once |
+| `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
+| `QWEN_AMX_MIN_B` · `QWEN_VNNI_MIN_B` · `QWEN_AVX2MM_MIN_B` | x86 | 4 · 2 · 2 | smallest batch width that may take that matmat |
+| `QWEN_BFMMLA_MIN_B` · `QWEN_SMMLA_MIN_B` · `QWEN_KLEIDI_MIN_B` | ARM | 2 · 2 · 1 | the same thresholds on the ARM kernels |
+
+A gate for a kernel the build does not contain is simply inert, so an invocation can carry
+both families — but only the ones for this ISA will appear in the `[FLAGS]` line, and only if
+you set them.
 
 `--caps` answers what the binary *would* pick, per batch width, and `--self-test` is the
 cross-ISA correctness oracle for the kernel you just enabled or disabled. Both are cheap and
@@ -181,9 +188,9 @@ both belong before any number.
 |---|---|---|
 | `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit (AMX or ARM BF16), else BLAS | `=0` routes prefill projections back through BLAS, `=1` forces the native matmat |
 | `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably costs the accent on a finetune** — measured language identification 96% → 38%. Base models only, and the server says so when you turn it on |
-| `QWEN_KAI_NCHUNK` | 384 | sub-tiles the KleidiAI GEMM's n dimension so the second height pass finds the packed RHS in cache. `=0` restores one kernel call per slice |
-| `QWEN_KAI_OPS` | all families on | comma list restricting which KleidiAI families may be used; empty means every one |
-| `QWEN_KAI_REPEAT` | off | `=1` times a second identical call — a microbenchmark, not a serving flag |
+| `QWEN_KAI_NCHUNK` **(ARM only)** | 384 | sub-tiles the KleidiAI GEMM's n dimension so the second height pass finds the packed RHS in cache. `=0` restores one kernel call per slice |
+| `QWEN_KAI_OPS` **(ARM only)** | all families on | comma list restricting which KleidiAI families may be used; empty means every one |
+| `QWEN_KAI_REPEAT` **(ARM only)** | off | `=1` times a second identical call — a microbenchmark, not a serving flag |
 
 ## 4. Server, admission and first audio
 
@@ -249,6 +256,38 @@ for A/B only), `QWEN_SERVER_STRICT`, `QWEN_CANCEL_ON_DISCONNECT`, `QWEN_TTFA_FRE
 
 Where a CLI flag exists for the same thing, the CLI flag is the one to use: it lands in the
 process arguments, which a `ps` can read months later.
+
+---
+
+## 9. What applies on which ISA, and what x86 does not have yet
+
+A profile written on one architecture does not port by copying. Three groups:
+
+**Everywhere** — `QWEN_PREFIX_CACHE`, `QWEN_POOL_SPIN`, `QWEN_DECODER_BATCH`,
+`QWEN_DECODER_THREAD`, `QWEN_STREAM_DECODE_CHUNK*`, `QWEN_DECODER_GANG_*`, `QWEN_TTFA_*`,
+`QWEN_ADMIT_M1`, `QWEN_SERVE_BLAS*`, `QWEN_CP_PREC`, `QWEN_TALKER_PREC`, `QWEN_PREFILL_QUANT`,
+every diagnostic, and `OPENBLAS_THREAD_TIMEOUT` / `OPENBLAS_NUM_THREADS` wherever OpenBLAS is
+the BLAS. `QWEN_THP` is Linux-only in effect, whatever the CPU. These are the ones a profile
+carries across a port unchanged.
+
+**ARM only** — every `QWEN_KAI_*` and `QWEN_NO_KLEIDI`, because KleidiAI is compiled in only
+when the toolchain reports `__ARM_FEATURE_MATMUL_INT8` or `__ARM_FEATURE_BF16`; plus
+`QWEN_NO_SDOT`, `QWEN_NO_SMMLA`, `QWEN_NO_BFMMLA`, `QWEN_ARM_BFDOT`, `QWEN_APPLE_MMLA` and
+their `*_MIN_B` thresholds. `QWEN_PREFILL_MATMAT` exists on both, but what it selects differs:
+the KleidiAI bf16 matmat on ARM, the AMX one on x86.
+
+**x86 only** — `QWEN_NO_VNNI`, `QWEN_NO_AMX`, `QWEN_NO_AVX2MM`, `QWEN_NO_BF16DOT`,
+`QWEN_SD_INT8` (on by default only where AVX-512 VNNI exists), and the AMX/VNNI/AVX2
+thresholds.
+
+**The gap worth naming:** there is no x86 counterpart to `QWEN_KAI_NCHUNK` today. On ARM that
+lever exists because the GEMM's n dimension is sub-tiled so the microkernel's second pass finds
+the packed right-hand side still in cache; on x86 the AMX and VNNI matmats are entered through
+the gate table's batch/rows/cols thresholds and have no cache sub-tiling knob at all. So an
+x86 deployment profile can pin *when* those kernels are used, but not how they tile — if a
+future x86 host shows the same second-pass cache miss, the knob has to be written, not
+configured. Say so in the profile's `qualification.notes` rather than silently copying the ARM
+value into a file where it does nothing.
 
 ---
 
