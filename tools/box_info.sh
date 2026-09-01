@@ -2,8 +2,8 @@
 set -u
 
 JSON=0
-MEMBW_BIN="${MEMBW_BIN:-}"      # binario di tests/membw.c; se assente la banda MISURATA si salta
-OUT="${OUT:-}"                  # se valorizzato, ci scrive il JSON (oltre al report leggibile)
+MEMBW_BIN="${MEMBW_BIN:-}"      # binary from tests/membw.c; without it the MEASURED bandwidth is skipped
+OUT="${OUT:-}"                  # when set, the JSON is written there too (besides the readable report)
 MEMBW_REPS="${MEMBW_REPS:-5}"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -11,14 +11,14 @@ while [ $# -gt 0 ]; do
         --membw)  MEMBW_BIN="${2:-}"; shift ;;
         --out)    OUT="${2:-}"; shift ;;
         -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "opzione sconosciuta: $1 (usa --json | --membw BIN | --out FILE)" >&2; exit 2 ;;
+        *) echo "unknown option: $1 (use --json | --membw BIN | --out FILE)" >&2; exit 2 ;;
     esac
     shift
 done
 
 have() { command -v "$1" >/dev/null 2>&1; }
-rd()   { [ -r "$1" ] && tr -d '\n' < "$1" 2>/dev/null; }        # file di /sys, una riga
-rdm()  { [ -r "$1" ] && cat "$1" 2>/dev/null; }                 # file multi-riga
+rd()   { [ -r "$1" ] && tr -d '\n' < "$1" 2>/dev/null; }        # a /sys file, one line
+rdm()  { [ -r "$1" ] && cat "$1" 2>/dev/null; }                 # multi-line file
 
 DEGRADED=""
 degraded() { DEGRADED="$DEGRADED$1
@@ -34,8 +34,8 @@ sz_to_mb() {
         if (u=="K"||u=="k")      n = n/1024;
         else if (u=="M"||u=="m") n = n;
         else if (u=="G"||u=="g") n = n*1024;
-        else                     n = n/1048576;   # senza suffisso = byte
-        printf "%.4f", n;                          # 2 decimali arrotondano via le L1
+        else                     n = n/1048576;   # no suffix = bytes
+        printf "%.4f", n;                          # 2 decimals would round the L1 caches away
     }'
 }
 mb_h() {
@@ -111,7 +111,7 @@ B_MEMBW_JSON=""; B_MEMBW_TXT=""; B_MEMBW_NUMA=""
 X86_FLAGS="avx avx2 fma f16c avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni avx512_bf16 amx_tile amx_int8 amx_bf16"
 ARM_FLAGS="asimd asimdhp asimddp i8mm bf16 sve sve2 svei8mm svebf16 sme sme2"
 
-flag_probe() {   # $1 = haystack normalizzato (spazi ai bordi), $2 = elenco flag
+flag_probe() {   # $1 = normalized haystack (spaces at the edges), $2 = flag list
     local hay="$1" f
     for f in $2; do
         case "$hay" in
@@ -139,7 +139,7 @@ collect_linux() {
         B_FREQ_BASE=$(printf '%s\n'  "$_ls" | awk -F: '/^CPU min MHz/    {printf "%.0f", $2; exit}')
         [ -n "${_cps:-}" ] && [ -n "${B_SOCKETS:-}" ] && B_CORES_PHYS=$((_cps * B_SOCKETS))
     else
-        degraded "lscpu assente -> identita' CPU letta da /proc/cpuinfo (meno campi)"
+        degraded "lscpu absent -> CPU identity read from /proc/cpuinfo (fewer fields)"
     fi
     [ -z "$B_CPU_MODEL" ] && B_CPU_MODEL=$(awk -F: '/^model name|^Model|^CPU implementer/{sub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
     [ -z "$B_CPUS_LOG" ]  && B_CPUS_LOG=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
@@ -154,15 +154,15 @@ collect_linux() {
         case "$_smtctl" in
             on)                 B_SMT="on" ;;
             off|forceoff)       B_SMT="off ($_smtctl)" ;;
-            notsupported|notimplemented) B_SMT="non supportato" ;;
+            notsupported|notimplemented) B_SMT="not supported" ;;
             *)                  B_SMT="$_smtctl" ;;
         esac
     elif [ -n "$_smtact" ]; then
         [ "$_smtact" = "1" ] && B_SMT="on" || B_SMT="off"
     elif [ -n "${B_TPC:-}" ]; then
-        [ "$B_TPC" -gt 1 ] 2>/dev/null && B_SMT="on (da thread-per-core)" || B_SMT="off (da thread-per-core)"
+        [ "$B_TPC" -gt 1 ] 2>/dev/null && B_SMT="on (from threads-per-core)" || B_SMT="off (from threads-per-core)"
     else
-        B_SMT="ignoto"; degraded "/sys/devices/system/cpu/smt assente -> stato SMT dedotto o ignoto"
+        B_SMT="unknown"; degraded "/sys/devices/system/cpu/smt absent -> SMT state inferred or unknown"
     fi
     [ -z "$B_TPC" ] && [ -n "$B_CORES_PHYS" ] && [ -n "$B_CPUS_LOG" ] && [ "$B_CORES_PHYS" -gt 0 ] 2>/dev/null \
         && B_TPC=$((B_CPUS_LOG / B_CORES_PHYS))
@@ -177,7 +177,7 @@ collect_linux() {
     case "$B_ARCH" in
         x86_64|amd64) flag_probe "$_hay" "$X86_FLAGS" ;;
         aarch64|arm64) flag_probe "$_hay" "$ARM_FLAGS" ;;
-        *) degraded "arch $B_ARCH non prevista -> nessun elenco flag di riferimento" ;;
+        *) degraded "arch $B_ARCH not covered -> no reference flag list" ;;
     esac
 
     for d in /sys/devices/system/cpu/cpu0/cache/index*; do
@@ -197,7 +197,7 @@ collect_linux() {
            done | sort -u)
     if [ -n "$_l3u" ]; then
         B_L3_INSTANCES=$(printf '%s\n' "$_l3u" | wc -l | tr -d ' ')
-        B_L3_SHARED=$(printf '%s\n' "$_l3u" | awk -F'|' '{printf "%s condivisa da cpu %s\n", $1, $2}')
+        B_L3_SHARED=$(printf '%s\n' "$_l3u" | awk -F'|' '{printf "%s shared by cpu %s\n", $1, $2}')
         B_L3_TOTAL_MB=$(printf '%s\n' "$_l3u" | awk -F'|' -v OFS='' '
             { s=$1; u=substr(s,length(s),1); n=s+0;
               if (u=="K"||u=="k") n=n/1024; else if (u=="G"||u=="g") n=n*1024;
@@ -205,11 +205,11 @@ collect_linux() {
               t+=n } END{ printf "%.2f", t }')
         [ -z "$B_L3" ] && B_L3=$(printf '%s\n' "$_l3u" | head -1 | cut -d'|' -f1)
         B_LLC_MB="$B_L3_TOTAL_MB"
-        B_LLC_WHAT="L3, somma di $B_L3_INSTANCES istanz$([ "$B_L3_INSTANCES" = 1 ] && echo a || echo e)"
+        B_LLC_WHAT="L3, sum of $B_L3_INSTANCES instance$([ "$B_L3_INSTANCES" = 1 ] && echo "" || echo s)"
     else
-        [ -d /sys/devices/system/cpu/cpu0/cache ] && degraded "nessuna L3 esposta in sysfs (VM che non pubblica la topologia di cache?)"
+        [ -d /sys/devices/system/cpu/cpu0/cache ] && degraded "no L3 exposed in sysfs (a VM that does not publish the cache topology?)"
         B_LLC_MB=$(sz_to_mb "$B_L2")
-        B_LLC_WHAT="L2; nessuna L3 esposta, quindi il confronto col working set e' ottimistico"
+        B_LLC_WHAT="L2; no L3 exposed, so the comparison against the working set is optimistic"
     fi
 
     if have numactl; then
@@ -218,7 +218,7 @@ collect_linux() {
         B_NUMA_DIST=$(printf '%s\n' "$B_NUMA_DETAIL" | sed -n '/node distances/,$p')
     fi
     if [ -z "$B_NUMA_NODES" ] && [ -d /sys/devices/system/node ]; then
-        degraded "numactl assente -> NUMA letta da /sys/devices/system/node (e senza numactl non si puo' nemmeno PINNARE)"
+        degraded "numactl absent -> NUMA read from /sys/devices/system/node (and without numactl you cannot PIN either)"
         B_NUMA_NODES=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l | tr -d ' ')
         B_NUMA_DETAIL=$(for n in /sys/devices/system/node/node[0-9]*; do
                             printf 'node %s  cpus: %s  mem: %s\n' "${n##*/node}" \
@@ -250,8 +250,8 @@ collect_linux() {
     B_GOVERNOR=$(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
     B_SCALING_DRIVER=$(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver)
     if [ -z "$B_GOVERNOR" ]; then
-        B_GOVERNOR="non esposto"
-        degraded "nessun cpufreq in sysfs: la frequenza la decide l'hypervisor, non tu (normale su molte VM cloud)"
+        B_GOVERNOR="not exposed"
+        degraded "no cpufreq in sysfs: the hypervisor decides the frequency, not you (normal on many cloud VMs)"
     fi
 }
 
@@ -265,16 +265,16 @@ collect_macos() {
     B_CORES_PHYS=$(sysctl -n hw.physicalcpu 2>/dev/null)
     if [ -n "$B_CORES_PHYS" ] && [ -n "$B_CPUS_LOG" ] && [ "$B_CORES_PHYS" -gt 0 ] 2>/dev/null; then
         B_TPC=$((B_CPUS_LOG / B_CORES_PHYS))
-        [ "$B_TPC" -gt 1 ] && B_SMT="on" || B_SMT="off (Apple Silicon non ha SMT)"
+        [ "$B_TPC" -gt 1 ] && B_SMT="on" || B_SMT="off (Apple Silicon has no SMT)"
     fi
     B_FREQ_MAX=$(awk -v h="$(sysctl -n hw.cpufrequency_max 2>/dev/null)" 'BEGIN{ if (h!="" && h+0>0) printf "%.0f", h/1000000 }')
-    [ -z "$B_FREQ_MAX" ] && degraded "Apple Silicon non pubblica hw.cpufrequency: frequenza base/max ignota (non e' un problema: qui non si confrontano MHz fra macchine)"
+    [ -z "$B_FREQ_MAX" ] && degraded "Apple Silicon does not publish hw.cpufrequency: base/max frequency unknown (not a problem: MHz are not compared across machines here)"
 
     _np=$(sysctl -n hw.nperflevels 2>/dev/null)
     if [ -n "$_np" ]; then
         _i=0
         while [ "$_i" -lt "$_np" ]; do
-            B_PERFLEVELS="$B_PERFLEVELS$(printf '%s: %s core fisici, L1d %s, L2 %s (condivisa da %s core)' \
+            B_PERFLEVELS="$B_PERFLEVELS$(printf '%s: %s physical cores, L1d %s, L2 %s (shared by %s cores)' \
                 "$(sysctl -n hw.perflevel$_i.name 2>/dev/null)" \
                 "$(sysctl -n hw.perflevel$_i.physicalcpu 2>/dev/null)" \
                 "$(mb_h "$(sz_to_mb "$(sysctl -n hw.perflevel$_i.l1dcachesize 2>/dev/null)")")" \
@@ -295,7 +295,7 @@ collect_macos() {
         B_LLC_MB="$B_L3_TOTAL_MB"
         B_LLC_WHAT="L3 (Mac Intel)"
     else
-        B_L3_SHARED="Apple Silicon non espone una L3 (SLC condivisa con la GPU, non leggibile da sysctl); il livello utile e' la L2 per cluster."
+        B_L3_SHARED="Apple Silicon exposes no L3 (the SLC is shared with the GPU and not readable from sysctl); the useful level is the per-cluster L2."
         _l2max=0; _i=0
         while [ "$_i" -lt "${_np:-0}" ]; do
             _v=$(sysctl -n hw.perflevel$_i.l2cachesize 2>/dev/null)
@@ -304,7 +304,7 @@ collect_macos() {
         done
         [ "$_l2max" = "0" ] && _l2max="$B_L2"
         B_LLC_MB=$(sz_to_mb "$_l2max")
-        B_LLC_WHAT="L2 del cluster Performance; Apple Silicon non ha L3"
+        B_LLC_WHAT="Performance-cluster L2; Apple Silicon has no L3"
     fi
 
     case "$B_ARCH" in
@@ -322,7 +322,7 @@ collect_macos() {
             done
             B_FLAGS_MISS="${B_FLAGS_MISS}sve
 "
-            degraded "SVE non e' esposto da Apple in nessuna forma: e' assente per progetto, non 'non rilevato'"
+            degraded "SVE is not exposed by Apple in any form: it is absent by design, not 'not detected'"
             B_FLAGS_RAW="hw.optional.arm.FEAT_*"
             ;;
         x86_64)
@@ -344,10 +344,10 @@ collect_macos() {
     B_SWAP_MB=$(sysctl -n vm.swapusage 2>/dev/null | awk '{ s=$3; sub(/M$/,"",s); printf "%.0f", s+0 }')
 
     B_NUMA_NODES="1"
-    B_NUMA_DETAIL="NUMA non applicabile su macOS (memoria unificata, un solo dominio)"
-    B_NUMA_RECO="nessun pinning: memoria unificata, un solo dominio"
-    B_GOVERNOR="n/a (macOS non espone un governor; la frequenza la gestisce il SoC)"
-    B_THP="n/a (macOS non ha THP configurabile)"
+    B_NUMA_DETAIL="NUMA not applicable on macOS (unified memory, a single domain)"
+    B_NUMA_RECO="no pinning: unified memory, a single domain"
+    B_GOVERNOR="n/a (macOS exposes no governor; the SoC manages the frequency)"
+    B_THP="n/a (macOS has no configurable THP)"
 }
 
 collect_bw_theoretical() {
@@ -372,28 +372,28 @@ collect_bw_theoretical() {
                     END { if (d && sz!="" && mts>0) tot += mts*dw/8/1000
                           if (tot>0) printf "%.0f", tot }')
                 B_BW_THEO_SRC="smbios"
-                B_BW_THEO_HOW="da dmidecode: $(printf '%s\n' "$B_DIMMS" | wc -l | tr -d ' ') moduli popolati (canali x MT/s x larghezza)"
+                B_BW_THEO_HOW="from dmidecode: $(printf '%s\n' "$B_DIMMS" | wc -l | tr -d ' ') populated modules (channels x MT/s x width)"
             fi
         else
-            degraded "dmidecode presente ma non leggibile (serve root): banda teorica dedotta, non letta"
+            degraded "dmidecode present but not readable (needs root): theoretical bandwidth inferred, not read"
         fi
     fi
     if [ -z "$B_BW_THEO" ] && [ -d /sys/devices/system/edac/mc ]; then
         _nch=$(ls -d /sys/devices/system/edac/mc/mc*/dimm* 2>/dev/null | wc -l | tr -d ' ')
-        [ "${_nch:-0}" -gt 0 ] && B_BW_THEO_HOW="EDAC vede $_nch DIMM popolati, ma non ne pubblica la velocita'"
+        [ "${_nch:-0}" -gt 0 ] && B_BW_THEO_HOW="EDAC sees $_nch populated DIMMs but does not publish their speed"
     fi
     if [ -z "$B_BW_THEO" ] && [ -n "$B_GCP_MT" ]; then
         case "$B_GCP_MT" in
-            c4a-*)        B_BW_THEO="";    B_BW_THEO_HOW="c4a (Axion/Neoverse-V2): DDR5, canali non pubblicati da Google -> nessuna stima onesta" ;;
+            c4a-*)        B_BW_THEO="";    B_BW_THEO_HOW="c4a (Axion/Neoverse-V2): DDR5, channel count not published by Google -> no honest estimate" ;;
             c4-*)         B_BW_THEO="358"; B_BW_THEO_HOW="c4 (Emerald Rapids): DDR5-5600 x 8 canali per socket" ;;
             c3d-*)        B_BW_THEO="460"; B_BW_THEO_HOW="c3d (Genoa/Zen4): DDR5-4800 x 12 canali per socket" ;;
             c3-*)         B_BW_THEO="307"; B_BW_THEO_HOW="c3 (Sapphire Rapids): DDR5-4800 x 8 canali per socket" ;;
             n2d-*|c2d-*)  B_BW_THEO="204"; B_BW_THEO_HOW="n2d/c2d (Milan/Zen3): DDR4-3200 x 8 canali per socket" ;;
             t2a-*)        B_BW_THEO="204"; B_BW_THEO_HOW="t2a (Ampere Altra): DDR4-3200 x 8 canali per socket" ;;
             n2-*|c2-*)    B_BW_THEO="205"; B_BW_THEO_HOW="n2/c2 (Cascade/Ice Lake): DDR4-3200 x ~8 canali per socket" ;;
-            *)            B_BW_THEO_HOW="famiglia '$B_GCP_MT' senza configurazione di memoria pubblicata -> nessuna stima" ;;
+            *)            B_BW_THEO_HOW="family '$B_GCP_MT' has no published memory configuration -> no estimate" ;;
         esac
-        [ -n "$B_BW_THEO" ] && B_BW_THEO_SRC="famiglia-cloud"
+        [ -n "$B_BW_THEO" ] && B_BW_THEO_SRC="cloud-family"
     fi
     if [ -z "$B_BW_THEO" ] && [ "$B_OS" = "Darwin" ]; then
         case "$B_CPU_MODEL" in
@@ -402,15 +402,15 @@ collect_bw_theoretical() {
             *"M3 Ultra"*) B_BW_THEO="800" ;; *"M3 Max"*) B_BW_THEO="400" ;; *"M3 Pro"*) B_BW_THEO="150" ;; *"M3"*) B_BW_THEO="100" ;;
             *"M4 Max"*)   B_BW_THEO="546" ;; *"M4 Pro"*) B_BW_THEO="273" ;; *"M4"*) B_BW_THEO="120" ;;
         esac
-        [ -n "$B_BW_THEO" ] && { B_BW_THEO_SRC="tabella-soc"; B_BW_THEO_HOW="tabella dei SoC Apple ($B_CPU_MODEL): Apple non espone la banda via sysctl"; }
+        [ -n "$B_BW_THEO" ] && { B_BW_THEO_SRC="soc-table"; B_BW_THEO_HOW="Apple SoC table ($B_CPU_MODEL): Apple does not expose the bandwidth through sysctl"; }
     fi
-    [ -z "$B_BW_THEO_SRC" ] && B_BW_THEO_SRC="ignota"
-    [ -z "$B_BW_THEO_HOW" ] && B_BW_THEO_HOW="nessuna fonte leggibile (ne' SMBIOS, ne' famiglia cloud nota)"
+    [ -z "$B_BW_THEO_SRC" ] && B_BW_THEO_SRC="unknown"
+    [ -z "$B_BW_THEO_HOW" ] && B_BW_THEO_HOW="no readable source (neither SMBIOS nor a known cloud family)"
 }
 
 collect_membw() {
     [ -n "$MEMBW_BIN" ] && [ -x "$MEMBW_BIN" ] || {
-        B_MEMBW_TXT="non misurata (passa --membw <binario di tests/membw.c>, oppure usa 'make server-hw-check' che lo compila)"
+        B_MEMBW_TXT="not measured (pass --membw <binary from tests/membw.c>, or use 'make server-hw-check', which builds it)"
         return
     }
     _l3arg=$(awk -v m="${B_LLC_MB:-32}" 'BEGIN{ printf "%d", (m<1?32:m) }')
@@ -421,10 +421,10 @@ import json, sys
 d = json.load(sys.stdin)
 out = ["array %d MiB x3 (>= 4x L3), best of %d, %d cpu viste"
        % (d["array_mib_per_buffer"], d["reps"], d["cpus_seen"]),
-       "  %-8s %12s %12s" % ("thread", "Copy GB/s", "Triad GB/s")]
+       "  %-8s %12s %12s" % ("threads", "Copy GB/s", "Triad GB/s")]
 for r in d["sweep"]:
     out.append("  %-8d %12.1f %12.1f" % (r["threads"], r["copy_gbs"], r["triad_gbs"]))
-out.append("  picco Triad %.1f GB/s a %d thread; GINOCCHIO a %d thread (95%% del picco)"
+out.append("  peak Triad %.1f GB/s at %d threads; KNEE at %d threads (95%% of the peak)"
            % (d["peak_triad_gbs"], d["peak_triad_threads"], d["knee_threads"]))
 print("\n".join(out))' 2>/dev/null)
     fi
@@ -437,14 +437,14 @@ print("\n".join(out))' 2>/dev/null)
 $_rem"
     elif [ "${B_NUMA_NODES:-1}" -gt 1 ] 2>/dev/null; then
         B_MEMBW_NUMA=""
-        degraded "piu' nodi NUMA ma numactl assente: local-vs-cross non misurabile (installa numactl: e' anche l'unico modo di pinnare)"
+        degraded "several NUMA nodes but numactl is absent: local-vs-cross cannot be measured (install numactl: it is also the only way to pin)"
     fi
 }
 
 case "$B_OS" in
     Linux)  collect_linux ;;
     Darwin) collect_macos ;;
-    *)      degraded "OS '$B_OS' non gestito: raccolta minima"; B_CPUS_LOG=$(getconf _NPROCESSORS_ONLN 2>/dev/null) ;;
+    *)      degraded "OS '$B_OS' not handled: minimal collection"; B_CPUS_LOG=$(getconf _NPROCESSORS_ONLN 2>/dev/null) ;;
 esac
 collect_bw_theoretical
 collect_membw
@@ -454,34 +454,34 @@ WS_CP_17B_MB=120
 
 REC_THREADS="$B_CORES_PHYS"
 if [ "$B_OS" = "Darwin" ] && [ -n "$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null)" ]; then
-    REC_THREADS=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null)   # solo i P-core
+    REC_THREADS=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null)   # P-cores only
 fi
 [ -z "$REC_THREADS" ] && REC_THREADS="$B_CPUS_LOG"
 
 GATE_SMT="PASS"; GATE_GOV="PASS"; GATE_CG="PASS"; GATE_ALL="PASS"
 case "${B_SMT:-}" in on*) GATE_SMT="FAIL" ;; esac
-case "${B_GOVERNOR:-}" in performance|n/a*|"non esposto") : ;; *) GATE_GOV="FAIL" ;; esac
+case "${B_GOVERNOR:-}" in performance|n/a*|"not exposed") : ;; *) GATE_GOV="FAIL" ;; esac
 if [ -n "${B_CG_CPU:-}" ] && [ "${B_CG_CPU%% *}" != "max" ] && [ "${B_CG_CPU%% *}" != "-1" ]; then GATE_CG="FAIL"; fi
 [ "$GATE_SMT$GATE_GOV$GATE_CG" = "PASSPASSPASS" ] || GATE_ALL="FAIL"
 
 case "${B_SMT:-}" in
-    on*) warn "SMT ACCESO: $B_CPUS_LOG vCPU = ${B_CORES_PHYS:-?} core veri. Su GCP ricrea il box con --threads-per-core=1, oppure usa -j${REC_THREADS} e dichiaralo — altrimenti la misura descrive due hyperthread che si contendono una FMA." ;;
+    on*) warn "SMT IS ON: $B_CPUS_LOG vCPU = ${B_CORES_PHYS:-?} real cores. On GCP recreate the box with --threads-per-core=1, or use -j${REC_THREADS} and declare it — otherwise the measurement describes two hyperthreads contending for one FMA." ;;
 esac
 case "${B_GOVERNOR:-}" in
-    performance|n/a*|"non esposto") : ;;
-    *) warn "governor = '$B_GOVERNOR' (non 'performance'): la frequenza scala sotto carico e i tempi ballano. sudo cpupower frequency-set -g performance, oppure dichiara che i numeri hanno quel rumore dentro." ;;
+    performance|n/a*|"not exposed") : ;;
+    *) warn "governor = '$B_GOVERNOR' (not 'performance'): the frequency scales under load and the timings wander. sudo cpupower frequency-set -g performance, or declare that the numbers carry that noise." ;;
 esac
 if [ -n "${B_NUMA_NODES:-}" ] && [ "$B_NUMA_NODES" -gt 1 ] 2>/dev/null; then
-    B_NUMA_RECO="$B_NUMA_NODES nodi: PINNA il processo a un nodo — numactl --cpunodebind=0 --membind=0 ./qwen_tts ... — altrimenti meta' degli accessi ai pesi attraversa l'interconnessione e la varianza mangia l'effetto che stai misurando."
-    warn "NUMA a $B_NUMA_NODES nodi: senza pinning ogni cella della matrice ha dentro un rumore che non controlli."
+    B_NUMA_RECO="$B_NUMA_NODES nodes: PIN the process to one node — numactl --cpunodebind=0 --membind=0 ./qwen_tts ... — otherwise half the weight accesses cross the interconnect and the variance eats the effect you are measuring."
+    warn "NUMA with $B_NUMA_NODES nodes: without pinning every cell of the matrix carries noise you do not control."
 elif [ -z "$B_NUMA_RECO" ]; then
-    B_NUMA_RECO="1 nodo: nessun pinning necessario."
+    B_NUMA_RECO="1 node: no pinning needed."
 fi
 if [ -n "${B_CG_CPU:-}" ] && [ "${B_CG_CPU%% *}" != "max" ] && [ "${B_CG_CPU%% *}" != "-1" ]; then
-    warn "quota CPU cgroup attiva ('$B_CG_CPU'): stai misurando la QUOTA, non la macchina. Su un box dedicato non dovrebbe esserci."
+    warn "a cgroup CPU quota is active ('$B_CG_CPU'): you are measuring the QUOTA, not the machine. On a dedicated box it should not be there."
 fi
 if [ -n "${B_SWAP_MB:-}" ] && [ "$B_SWAP_MB" -gt 0 ] 2>/dev/null; then
-    warn "swap attiva (${B_SWAP_MB} MiB): se l'RSS del server sfiora la RAM, una cella lenta puo' essere paging e non il kernel sotto test."
+    warn "swap is on (${B_SWAP_MB} MiB): if the server RSS approaches RAM, a slow cell can be paging rather than the kernel under test."
 fi
 
 if [ -n "$B_LLC_MB" ] && [ -n "${B_CORES_PHYS:-}" ] && [ "$B_CORES_PHYS" -gt 0 ] 2>/dev/null; then
@@ -495,13 +495,13 @@ fi
 if [ -n "$BW_PEAK" ] && [ -n "$B_BW_THEO" ]; then
     _ratio=$(awk -v m="$BW_PEAK" -v t="$B_BW_THEO" 'BEGIN{ if (t>0) printf "%.0f", 100*m/t }')
     [ -n "$_ratio" ] && [ "$_ratio" -lt 60 ] 2>/dev/null && \
-        warn "banda misurata ${BW_PEAK} GB/s = ${_ratio}% della stima teorica ($B_BW_THEO GB/s): normale su una VM che vede una fetta del socket, ma da qui in avanti usa il MISURATO — la stima e' il tetto del server fisico, non della tua istanza."
+        warn "measured bandwidth ${BW_PEAK} GB/s = ${_ratio}% of the theoretical estimate ($B_BW_THEO GB/s): normal on a VM that sees a slice of the socket, but from here on use the MEASURED one — the estimate is the ceiling of the physical server, not of your instance."
 fi
 
-FIT_06B="ignoto"; FIT_17B="ignoto"
+FIT_06B="unknown"; FIT_17B="unknown"
 if [ -n "$B_LLC_MB" ]; then
-    FIT_06B=$(awk -v l="$B_LLC_MB" -v w="$WS_CP_06B_MB" 'BEGIN{print (l>=w) ? "CI STA" : "NON ci sta"}')
-    FIT_17B=$(awk -v l="$B_LLC_MB" -v w="$WS_CP_17B_MB" 'BEGIN{print (l>=w) ? "CI STA" : "NON ci sta"}')
+    FIT_06B=$(awk -v l="$B_LLC_MB" -v w="$WS_CP_06B_MB" 'BEGIN{print (l>=w) ? "FITS" : "does NOT fit"}')
+    FIT_17B=$(awk -v l="$B_LLC_MB" -v w="$WS_CP_17B_MB" 'BEGIN{print (l>=w) ? "FITS" : "does NOT fit"}')
 fi
 
 JOUT=$(jobj \
@@ -539,7 +539,7 @@ JOUT=$(jobj \
                               numa_cells "[$(printf '%s' "$B_MEMBW_NUMA" | awk 'NF{ printf "%s%s", (n++?",":""), $0 }')]")" \
         gates         "$(jobj smt_off "$(jstr "$GATE_SMT")" governor_performance "$(jstr "$GATE_GOV")" \
                               no_cgroup_quota "$(jstr "$GATE_CG")" all "$(jstr "$GATE_ALL")" \
-                              note "$(jstr 'se uno di questi e FAIL, ogni numero di server/batching preso dopo descrive unaltra macchina')")" \
+                              note "$(jstr 'if any of these is FAIL, every server/batching number taken afterwards describes a different machine')")" \
         bench_advice  "$(jobj threads "$(jnum "$REC_THREADS")" numa "$(jstr "$B_NUMA_RECO")" \
                               membw_knee_threads "$(jnum "$BW_KNEE")" \
                               membw_peak_triad_gbs "$(jnum "$BW_PEAK")" \
@@ -561,24 +561,24 @@ fi
 
 hr()  { printf '%.0s─' $(seq 1 76); echo; }
 sec() { echo; printf '── %s\n' "$1"; }
-kv()  { printf '   %-22s %s\n' "$1" "${2:-n/d}"; }
+kv()  { printf '   %-22s %s\n' "$1" "${2:-n/a}"; }
 
 hr
 printf '  BOX INFO   %s   %s %s (%s)   %s\n' "${B_HOST:-?}" "$B_OS" "$B_KERNEL" "$B_ARCH" "$B_DATE"
 hr
 
 echo
-printf '   GATE  SMT spento .............. %s   %s\n' "$GATE_SMT" \
-    "$([ "$GATE_SMT" = PASS ] && echo 'vCPU = core: -j si legge direttamente' || echo "$B_CPUS_LOG vCPU = ${B_CORES_PHYS:-?} core -> ricrea con --threads-per-core=1")"
+printf '   GATE  SMT off ................. %s   %s\n' "$GATE_SMT" \
+    "$([ "$GATE_SMT" = PASS ] && echo 'vCPU = core: -j reads directly' || echo "$B_CPUS_LOG vCPU = ${B_CORES_PHYS:-?} cores -> recreate the box with --threads-per-core=1")"
 printf '   GATE  governor performance .... %s   %s\n' "$GATE_GOV" \
-    "$([ "$GATE_GOV" = PASS ] && echo 'frequenza stabile sotto carico' || echo "e '$B_GOVERNOR': la frequenza scala e i tempi ballano")"
-printf '   GATE  nessuna quota cgroup .... %s   %s\n' "$GATE_CG" \
-    "$([ "$GATE_CG" = PASS ] && echo 'stai misurando la macchina' || echo "cpu.max='$B_CG_CPU': stai misurando la QUOTA")"
+    "$([ "$GATE_GOV" = PASS ] && echo 'frequency stays put under load' || echo "it is '$B_GOVERNOR': the frequency scales and the timings wander")"
+printf '   GATE  no cgroup quota ......... %s   %s\n' "$GATE_CG" \
+    "$([ "$GATE_CG" = PASS ] && echo 'you are measuring the machine' || echo "cpu.max='$B_CG_CPU': you are measuring the QUOTA")"
 if [ "$GATE_ALL" = "PASS" ]; then
-    echo "   → i tre invalidanti sono a posto: i numeri che seguono descrivono QUESTA macchina."
+    echo "   → the three invalidating conditions are clear: what follows describes THIS machine."
 else
-    echo "   → ⛔ almeno un invalidante e' rosso. Sistemalo PRIMA di misurare batching o server:"
-    echo "        un numero preso adesso non e' sbagliato per poco, descrive un'altra macchina."
+    echo "   → ⛔ at least one invalidating condition is red. Fix it BEFORE measuring batching or a server:"
+    echo "        a number taken now is not slightly wrong, it describes a different machine."
 fi
 
 if [ -n "$WARN" ]; then
@@ -586,64 +586,64 @@ if [ -n "$WARN" ]; then
     printf '%s\n' "$WARN" | while IFS= read -r l; do [ -n "$l" ] && printf '   ⚠️  %s\n' "$l"; done
 else
     echo
-    echo "   ✅ nessun avviso: SMT, governor, NUMA e quote sono nello stato che rende la misura leggibile."
+    echo "   ✅ no warnings: SMT, governor, NUMA and quotas are in the state that makes a measurement readable."
 fi
 
 if [ -n "$B_GCP_MT" ]; then
     sec "GCP"
     kv "machine-type" "$B_GCP_MT"
-    kv "zona"         "$B_GCP_ZONE"
-    kv "preemptible"  "${B_GCP_PREEMPT:-false}  (spot = OK per capacita', NON per il soak)"
+    kv "zone"         "$B_GCP_ZONE"
+    kv "preemptible"  "${B_GCP_PREEMPT:-false}  (spot = fine for capacity, NOT for a soak)"
 fi
 
 sec "CPU"
-kv "modello"        "$B_CPU_MODEL"
+kv "model"          "$B_CPU_MODEL"
 kv "vendor"         "$B_CPU_VENDOR"
-kv "family/model"   "${B_CPU_FAMILY:-n/d}/${B_CPU_MODELID:-n/d}  stepping ${B_CPU_STEPPING:-n/d}"
-kv "socket"         "$B_SOCKETS"
-kv "core FISICI"    "${B_CORES_PHYS:-n/d}          <-- questo e' il numero da usare per -j"
-kv "cpu logiche"    "${B_CPUS_LOG:-n/d}          (nproc; su GCP un vCPU e' un hyperthread)"
-kv "thread/core"    "$B_TPC"
+kv "family/model"   "${B_CPU_FAMILY:-n/a}/${B_CPU_MODELID:-n/a}  stepping ${B_CPU_STEPPING:-n/a}"
+kv "sockets"        "$B_SOCKETS"
+kv "PHYSICAL cores" "${B_CORES_PHYS:-n/a}          <-- this is the number to use for -j"
+kv "logical cpus"   "${B_CPUS_LOG:-n/a}          (nproc; on GCP a vCPU is a hyperthread)"
+kv "threads/core"   "$B_TPC"
 kv "SMT"            "$B_SMT"
-kv "freq base/max"  "${B_FREQ_BASE:-n/d} / ${B_FREQ_MAX:-n/d} MHz"
+kv "freq base/max"  "${B_FREQ_BASE:-n/a} / ${B_FREQ_MAX:-n/a} MHz"
 if [ -n "$B_PERFLEVELS" ]; then
     printf '%s\n' "$B_PERFLEVELS" | while IFS= read -r l; do [ -n "$l" ] && printf '   %-22s %s\n' "" "$l"; done
 fi
 
-sec "ISA — le estensioni che decidono QUALE GEMM gira"
-printf '   presenti:  %s\n' "$(printf '%s' "$B_FLAGS_HAVE" | tr '\n' ' ')"
-printf '   assenti:   %s\n' "$(printf '%s' "$B_FLAGS_MISS" | tr '\n' ' ')"
-echo   "   (nota: in /proc/cpuinfo VNNI e BF16 hanno l'underscore — avx512_vnni, avx512_bf16 —"
-echo   "    mentre avx512f/bw/vl/dq no. I flag di gcc sono l'opposto. Non confonderli.)"
-echo   "   → la conferma che il BINARIO li usa davvero la da' ./qwen_tts --caps, non questo elenco."
+sec "ISA — the extensions that decide WHICH GEMM runs"
+printf '   present:   %s\n' "$(printf '%s' "$B_FLAGS_HAVE" | tr '\n' ' ')"
+printf '   absent:    %s\n' "$(printf '%s' "$B_FLAGS_MISS" | tr '\n' ' ')"
+echo   "   (note: in /proc/cpuinfo VNNI and BF16 carry the underscore — avx512_vnni, avx512_bf16 —"
+echo   "    while avx512f/bw/vl/dq do not. The gcc flags are the opposite. Do not mix them up.)"
+echo   "   → whether the BINARY actually uses them is answered by ./qwen_tts --caps, not by this list."
 
-sec "Cache — il collo e' il Code Predictor che rilegge i pesi 16x per frame"
+sec "Cache — the bottleneck is the Code Predictor re-reading the weights 16x per frame"
 kv "L1d / L1i" "$(mb_h "$(sz_to_mb "$B_L1D")") / $(mb_h "$(sz_to_mb "$B_L1I")")"
 kv "L2"        "$(mb_h "$(sz_to_mb "$B_L2")")"
 [ -n "$B_L3" ] && kv "L3" "$(mb_h "$(sz_to_mb "$B_L3")")${B_L3_INSTANCES:+  x $B_L3_INSTANCES}"
-kv "LLC utile"   "$(mb_h "$B_LLC_MB")  (${B_LLC_WHAT:-n/d})"
-[ -n "$B_L3_PER_CORE" ] && kv "LLC per core" "$(mb_h "$B_L3_PER_CORE") per core fisico"
+kv "usable LLC"  "$(mb_h "$B_LLC_MB")  (${B_LLC_WHAT:-n/a})"
+[ -n "$B_L3_PER_CORE" ] && kv "LLC per core" "$(mb_h "$B_L3_PER_CORE") per physical core"
 if [ -n "$B_L3_SHARED" ]; then
     printf '%s\n' "$B_L3_SHARED" | while IFS= read -r l; do [ -n "$l" ] && printf '   %-22s %s\n' "" "$l"; done
 fi
 
 sec "NUMA"
-printf '%s' "${B_NUMA_DETAIL:-n/d}" | sed 's/^/   /'
+printf '%s' "${B_NUMA_DETAIL:-n/a}" | sed 's/^/   /'
 echo
 [ -n "$B_NUMA_DIST" ] && { printf '%s' "$B_NUMA_DIST" | sed 's/^/   /'; echo; }
 printf '   → %s\n' "$B_NUMA_RECO"
 
-sec "Memoria"
-kv "totale"      "$(mb_h "$B_MEM_TOTAL_MB")"
-kv "disponibile" "$(mb_h "$B_MEM_AVAIL_MB")"
-kv "swap"        "$(mb_h "$B_SWAP_MB")"
-kv "THP"         "$B_THP"
-kv "hugepages"   "$B_HUGEPAGES"
+sec "Memory"
+kv "total"      "$(mb_h "$B_MEM_TOTAL_MB")"
+kv "available"  "$(mb_h "$B_MEM_AVAIL_MB")"
+kv "swap"       "$(mb_h "$B_SWAP_MB")"
+kv "THP"        "$B_THP"
+kv "hugepages"  "$B_HUGEPAGES"
 
-sec "Banda di memoria — il carico e' memory-bound, quindi e' QUESTO il numero"
-kv "teorica (STIMA)" "${B_BW_THEO:-n/d}${B_BW_THEO:+ GB/s}"
-printf '   %-22s %s\n' "" "fonte: $B_BW_THEO_HOW"
-printf '   %-22s %s\n' "" "⚠️ e' un TETTO del server fisico, non una misura della tua istanza."
+sec "Memory bandwidth — the workload is memory-bound, so THIS is the number"
+kv "theoretical (ESTIMATE)" "${B_BW_THEO:-n/a}${B_BW_THEO:+ GB/s}"
+printf '   %-22s %s\n' "" "source: $B_BW_THEO_HOW"
+printf '   %-22s %s\n' "" "⚠️ it is a CEILING of the physical server, not a measurement of your instance."
 if [ -n "$B_DIMMS" ]; then
     printf '%s\n' "$B_DIMMS" | while IFS= read -r l; do [ -n "$l" ] && printf '   %-22s %s\n' "" "$l"; done
 fi
@@ -653,68 +653,68 @@ if [ -n "$B_MEMBW_TXT" ]; then
     echo
 fi
 if [ -n "$B_MEMBW_NUMA" ] && have python3; then
-    echo "   NUMA-local contro cross-NUMA (la differenza E' il costo dell'interconnessione):"
+    echo "   NUMA-local against cross-NUMA (the difference IS the cost of the interconnect):"
     printf '%s\n' "$B_MEMBW_NUMA" | while IFS= read -r l; do
         [ -z "$l" ] && continue
         printf '%s' "$l" | python3 -c '
 import json,sys
 d = json.load(sys.stdin)
-print("     %-12s picco Triad %6.1f GB/s a %d thread (ginocchio %d)" %
+print("     %-12s peak Triad %6.1f GB/s at %d threads (knee %d)" %
       (d["label"], d["peak_triad_gbs"], d["peak_triad_threads"], d["knee_threads"]))' 2>/dev/null
     done
 elif [ "${B_NUMA_NODES:-1}" -le 1 ] 2>/dev/null; then
-    echo "   NUMA-local vs cross-NUMA: non applicabile, c'e' un solo nodo."
+    echo "   NUMA-local vs cross-NUMA: not applicable, there is a single node."
 fi
 
-sec "Limiti (container / VM) e frequenza"
-kv "cgroup cpu.max"    "${B_CG_CPU:-nessuno}"
-kv "cgroup memory.max" "${B_CG_MEM:-nessuno}"
+sec "Limits (container / VM) and frequency"
+kv "cgroup cpu.max"    "${B_CG_CPU:-none}"
+kv "cgroup memory.max" "${B_CG_MEM:-none}"
 kv "governor"          "$B_GOVERNOR"
 kv "scaling driver"    "$B_SCALING_DRIVER"
 
 if [ -n "$DEGRADED" ]; then
-    sec "Degradato (comandi/file assenti — campo mancante, non inventato)"
+    sec "Degraded (missing commands/files — a field left empty, not invented)"
     printf '%s\n' "$DEGRADED" | while IFS= read -r l; do [ -n "$l" ] && printf '   · %s\n' "$l"; done
 fi
 
-sec "COSA SIGNIFICA PER IL BENCH"
+sec "WHAT THIS MEANS FOR THE BENCH"
 case "${B_SMT:-}" in
-    on*) ADV_SMT="ACCESO -> $B_CPUS_LOG vCPU sono ${B_CORES_PHYS:-?} core. Ricrea il box con --threads-per-core=1: e la differenza fra misurare la macchina e misurare l hyperthreading." ;;
-    *)   ADV_SMT="spento/assente -> vCPU = core, i numeri di -j si leggono direttamente." ;;
+    on*) ADV_SMT="ON -> $B_CPUS_LOG vCPU are ${B_CORES_PHYS:-?} cores. Recreate the box with --threads-per-core=1: that is the difference between measuring the machine and measuring hyperthreading." ;;
+    *)   ADV_SMT="off/absent -> vCPU = core, the -j numbers read directly." ;;
 esac
 case "${B_GOVERNOR:-}" in
-    performance|n/a*|"non esposto") ADV_FREQ="governor $B_GOVERNOR -> tempi stabili." ;;
-    *) ADV_FREQ="governor $B_GOVERNOR -> NON e performance: cambialo (cpupower frequency-set -g performance) o dichiara il rumore." ;;
+    performance|n/a*|"not exposed") ADV_FREQ="governor $B_GOVERNOR -> stable timings." ;;
+    *) ADV_FREQ="governor $B_GOVERNOR -> NOT performance: change it (cpupower frequency-set -g performance) or declare the noise." ;;
 esac
-ADV_CORE="core FISICI"
-[ "$B_OS" = "Darwin" ] && ADV_CORE="core Performance (gli E-core sono ~3x piu lenti e diventano loro il tempo del frame)"
+ADV_CORE="PHYSICAL cores"
+[ "$B_OS" = "Darwin" ] && ADV_CORE="Performance cores (the E-cores are ~3x slower and become the frame time themselves)"
 
 if [ -n "$BW_KNEE" ]; then
-    ADV_BW="banda misurata: picco ${BW_PEAK} GB/s, GINOCCHIO a ${BW_KNEE} thread.
-               Oltre ${BW_KNEE} thread la banda non sale: su un carico che rilegge i pesi
-               16x per frame conviene dare ~${BW_KNEE} thread a PIU' richieste (B=2..8)
-               piuttosto che tutti i core a una sola. E' la scelta -j x --batch-size."
+    ADV_BW="measured bandwidth: peak ${BW_PEAK} GB/s, KNEE at ${BW_KNEE} threads.
+               Past ${BW_KNEE} threads the bandwidth stops rising: on a workload that re-reads
+               the weights 16x per frame, give ~${BW_KNEE} threads to MORE requests (B=2..8)
+               rather than every core to one. That is the -j x --batch-size choice."
 else
-    ADV_BW="banda NON misurata (passa --membw, o usa make server-hw-check): senza il
-               ginocchio, la scelta fra -j alto e batch alto resta a tentoni."
+    ADV_BW="bandwidth NOT measured (pass --membw, or use make server-hw-check): without the
+               knee, the choice between a high -j and a high batch stays guesswork."
 fi
 
 cat <<ADVICE
-   1. thread   usa -j$REC_THREADS = i $ADV_CORE.
-               Oltre, due thread si contendono la stessa FMA: il throughput per
-               richiesta scende senza che Q salga, e sembra un difetto del batching.
-   1.bis banda $ADV_BW
+   1. threads  use -j$REC_THREADS = the $ADV_CORE.
+               Beyond that, two threads contend for the same FMA: per-request throughput
+               drops without Q rising, and it looks like a defect in the batching.
+   1.bis bw    $ADV_BW
    2. SMT      $ADV_SMT
    3. NUMA     $B_NUMA_RECO
    4. cache    LLC $(mb_h "$B_LLC_MB") ($B_LLC_WHAT), $(mb_h "$B_L3_PER_CORE") per core.
-               Il Code Predictor a int8 rilegge ~$WS_CP_06B_MB MB per frame sul 0.6B ($FIT_06B)
-               e ~$WS_CP_17B_MB MB sul 1.7B ($FIT_17B). Dove NON ci sta, il limite e la banda:
-               aspettati che il batching renda piu dell ISA, e che int4 paghi piu di AVX-512.
+               The int8 Code Predictor re-reads ~$WS_CP_06B_MB MB per frame on the 0.6B ($FIT_06B)
+               and ~$WS_CP_17B_MB MB on the 1.7B ($FIT_17B). Where it does NOT fit, bandwidth is
+               the limit: expect batching to pay more than the ISA, and int4 to cost more than AVX-512.
    5. freq     $ADV_FREQ
-   6. ordine   questo report, poi ./qwen_tts --caps e --self-test (make server-hw-check), e SOLO
-               dopo qualunque numero di server. Un --caps che non dichiara attiva la
-               primitiva attesa significa che tutto cio che segue misura un fallback,
-               non questa macchina. E un --self-test rosso invalida la matrice intera.
+   6. order    this report, then ./qwen_tts --caps and --self-test (make server-hw-check), and ONLY
+               then any server number. A --caps that does not declare the expected primitive
+               active means everything after it measures a fallback, not this machine. And a
+               red --self-test invalidates the whole matrix.
 ADVICE
 echo
 hr

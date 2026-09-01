@@ -433,6 +433,10 @@ curl -s http://localhost:8080/v1/audio/speech \
 ```
 
 > Full guide: all endpoints, request body, performance → [docs/server.md](docs/server.md)
+> · running it in production — pre-forked pinned workers, finding `W x K` on your box,
+> deployment profiles and the benchmark suite → [docs/serving-operations.md](docs/serving-operations.md)
+> · every runtime flag, its default and why they travel together → [docs/feature-flags.md](docs/feature-flags.md)
+> · a 16-core Arm box measured across every rung → [docs/reference-arm-16c.md](docs/reference-arm-16c.md)
 
 ### Streaming
 

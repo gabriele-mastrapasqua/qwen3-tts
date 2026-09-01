@@ -14,6 +14,13 @@ skip all loading overhead and go straight to inference.
 > **together** through the model (vLLM-style request batching: weights read once,
 > continuous scheduling, per-request streaming). See
 > [server-batching.md](server-batching.md). This page covers the single-request server.
+>
+> **Running it in production?** `--prefork W --prefork-threads K` (Linux) forks *W* workers
+> after the weights are loaded and pins each to its own slice of cores, sharing the weights
+> copy-on-write. Note that `--batch-size` is then also the **per-worker in-flight cap**, and
+> that it defaults to 1: with `--prefork 12` and no `--batch-size`, twelve requests run at
+> once and the rest wait in the listen backlog. How to choose *W x K* on your box, and how to
+> measure it: [serving-operations.md](serving-operations.md).
 
 ## Starting the Server
 

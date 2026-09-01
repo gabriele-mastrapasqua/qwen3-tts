@@ -466,3 +466,7 @@ int qwen_parallel_is_reentrant(void) {
 }
 
 #endif
+
+#if defined(__APPLE__) && defined(__BLOCKS__) && !defined(QWEN_FORCE_PTHREAD)
+void qwen_pool_stats_report(void) { }
+#endif

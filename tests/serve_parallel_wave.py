@@ -404,7 +404,7 @@ def main():
     ap.add_argument("--port", type=int, default=9300)
     ap.add_argument("--text-file", default=os.path.join(os.path.dirname(
         os.path.abspath(__file__)), "load_texts_en.txt"))
-    ap.add_argument("--classes", default="", help="es. short,medium — filtra il banco")
+    ap.add_argument("--classes", default="", help="e.g. short,medium — filter the text bank")
     ap.add_argument("--speaker", default="ryan")
     ap.add_argument("--language", default="English")
     ap.add_argument("--seed", type=int, default=42)

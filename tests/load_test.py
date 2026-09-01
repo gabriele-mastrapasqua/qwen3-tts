@@ -488,7 +488,7 @@ def print_table(rows, budget_ms):
     base = next((s for s in rows if s["concurrency"] == 1), None)
     b95 = base["ttfa_p95"] if base else None
     print()
-    print("=============== TTFA — LA METRICA DI PRIMA CLASSE")
+    print("=============== TTFA — THE FIRST-CLASS METRIC")
     hdr = (f"{'conc':>5}{'req':>5}{'err':>4} | {'TTFA p50':>9}{'p95':>8}{'p99':>8}{'max':>8}"
            f" | {'degrad':>8}{'stab':>6}{'>budget':>9} | {'inflight':>9}{'Q':>7}"
            f"{'RTF p50':>9}{'p95':>7}")
@@ -611,11 +611,11 @@ def main():
     env = os.environ.get
     ap.add_argument("--url", default="http://localhost:8900")
     ap.add_argument("--path", default="/v1/tts/stream")
-    ap.add_argument("--concurrency", default="1,2,4,8", help="sweep separato da virgole, es. 1,2,4,8")
+    ap.add_argument("--concurrency", default="1,2,4,8", help="comma-separated sweep, e.g. 1,2,4,8")
     ap.add_argument("--requests", type=int, default=16, help="requests per concurrency level")
-    ap.add_argument("--duration", type=float, default=0.0, help="secondi; scavalca --requests (soak)")
+    ap.add_argument("--duration", type=float, default=0.0, help="seconds; overrides --requests (soak)")
     ap.add_argument("--text-file", default=DEFAULT_TEXTS)
-    ap.add_argument("--classes", default="", help="filtro sulle classi di testo, es. short,long")
+    ap.add_argument("--classes", default="", help="filter on the text classes, e.g. short,long")
     ap.add_argument("--speaker", default="ryan")
     ap.add_argument("--language", default="english")
     ap.add_argument("--temperature", type=float, default=0.0)
@@ -656,8 +656,8 @@ def main():
     levels = [int(c) for c in args.concurrency.split(",") if c.strip()]
 
     print(f"target   {args.url}{args.path}")
-    print(f"speaker  {args.speaker} · lingua {args.language} · temp {args.temperature}")
-    print(f"testi    {len(texts)} da {os.path.basename(args.text_file)}"
+    print(f"speaker  {args.speaker} · language {args.language} · temp {args.temperature}")
+    print(f"texts    {len(texts)} from {os.path.basename(args.text_file)}"
           f"{' (' + ','.join(classes) + ')' if classes else ''}")
     mode = f"soak {args.duration:.0f}s" if args.duration else f"{args.requests} requests"
     print(f"sweep    concurrency {levels} · {mode} per level")
@@ -672,21 +672,21 @@ def main():
                   f"TTFA {probe['ttfa_ms']:.0f} ms)")
         else:
             service_s = 10.0
-            print(f"FALLITA ({probe['error']}) -> assumo S = {service_s:.0f} s")
+            print(f"FAILED ({probe['error']}) -> assuming S = {service_s:.0f} s")
     service_s = service_s or 10.0
     if args.arrival == "all-at-once":
-        print("arrivi   all-at-once — tutte a t=0 (caso peggiore sincronizzato)")
+        print("arrivals all-at-once — every request at t=0 (the synchronized worst case)")
     else:
         if args.arrival == "poisson":
             pace = (f"rate {args.rate:.3f} req/s (declared)" if args.rate
-                     else f"rate = c/S = c/{service_s:.2f}s (calibrato)")
+                     else f"rate = c/S = c/{service_s:.2f}s (calibrated)")
         else:
             pace = (f"interval {args.interval:.2f} s (declared)" if args.interval
-                     else f"intervallo = S/c = {service_s:.2f}s/c (calibrato)")
-        print(f"arrivi   {args.arrival} · {ritmo} · seme {args.arrival_seed} (FISSO: due corse "
-              f"vedono gli stessi arrivi)")
+                     else f"interval = S/c = {service_s:.2f}s/c (calibrated)")
+        print(f"arrivals {args.arrival} · {pace} · seed {args.arrival_seed} (FIXED: two runs "
+              f"see the same arrivals)")
     if args.server_log:
-        print(f"log srv  {args.server_log}  (tail in diretta per l'attribuzione)")
+        print(f"srv log  {args.server_log}  (tailed live, for the attribution)")
 
     all_records, summaries = [], []
     for conc in levels:

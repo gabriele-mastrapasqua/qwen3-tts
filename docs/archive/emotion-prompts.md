@@ -19,7 +19,7 @@ knobs (those only add arousal — see `docs/emotion-THE-recipe.md`).
   has more force headroom. Make the `.bin` with `python3 tests/qvoice_to_xvec.py voices/X.qvoice`.
   *Alternative*: load a `.qvoice` with `--icl-only` (the ICL graft) for max timbre mimicry from a
   clean ref — emotion works but is capped at *moderate* (no screaming/sobbing). See
-  [`docs/csp-ft-emotion.md`](csp-ft-emotion.md) and [`docs/icl-graft-portability.md`](icl-graft-portability.md).
+  [`docs/csp-ft-emotion.md`](../csp-ft-emotion.md) and [`docs/icl-graft-portability.md`](../icl-graft-portability.md).
 - **English instruct even for non-English speech** — the model's instruct-following is EN/ZH-centric.
 - **Temperature 1.1–1.3** (never `-T 0` = flat). **Seed-audition**: re-run with several `--seed`
   values and keep the best take — spontaneous paralinguistics (sighs, "ehhh…") emerge on *some* seeds.
