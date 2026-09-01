@@ -144,8 +144,8 @@ int8, profile `axion-16c-ttfa`, short bank, three waves:
 One worker with every core wins first audio at C=1 and then gives it back at C=4, where its
 realtime factor climbs to 0.91; two workers is the shape that holds both. That trade is the
 whole point of running the sweep instead of picking a shape. The measured-batch column is empty
-for `1x16` because it comes from the pre-fork parent's counters, and a single server has no
-parent — it answers `SIGUSR1` with its pool counters instead.
+for `1x16` because that number comes from the pre-fork parent's counters, and a single server
+has no parent to keep them.
 
 ---
 
