@@ -105,7 +105,6 @@
     "workload": "Three synchronized waves at client concurrency 2, 4, 6 and 8 on the mixed 21-text qualification bank; SMT was disabled and each worker was pinned to a physical-core slice.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b base checkpoint",
-    "speaker": "ryan",
     "notes": "Latest SMT-off measurements gave TTFA p50/p95: C=2 176/421 ms, C=4 549/684 ms, C=6 655/1093 ms, C=8 890/1327 ms. This topology was the balanced concurrent choice: it gave the best measured request throughput at C=4, C=6 and C=8 among the tested topologies, while C=2 is the strict low-TTFA operating point."
   }
 }

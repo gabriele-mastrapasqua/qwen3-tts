@@ -105,7 +105,6 @@
     "workload": "Three synchronized waves at client concurrency 4 on the mixed 21-text qualification bank; SMT was disabled and all four worker pairs were pinned to physical-core slices.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b base checkpoint",
-    "speaker": "ryan",
     "notes": "Measured TTFA was approximately 372 ms p50 / 735 ms p95 with RTF 1.67. It reduced C=4 median TTFA versus 1x8 and 2x4, but measured request throughput was lower; choose it only for a fixed C=4 latency objective."
   }
 }
