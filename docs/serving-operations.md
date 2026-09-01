@@ -428,6 +428,9 @@ eval "$(tools/perf_profile.py command my-host --model MODEL_DIR --port 8080)"
 
 ## See also
 
+- [`reference-arm-16c.md`](reference-arm-16c.md) — every rung of this suite, measured on one
+  16-core Arm box: topology sweep, qualification curve for both models, input-length effect,
+  the three arrival models, the profile A/B
 - [`server.md`](server.md) — the HTTP API
 - [`feature-flags.md`](feature-flags.md) — every runtime flag and its default
 - [`configs/perf/README.md`](../configs/perf/README.md) — the profile format

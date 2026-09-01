@@ -113,7 +113,33 @@ environment was applied ([`feature-flags.md`](feature-flags.md) §0 explains eac
 | profile | 4 | **109 ms** | **0.72** | 30,153 |
 | compiled defaults | 4 | 133 ms | 0.81 | 68,984 |
 
-## 6. Correctness and audio, not only the clock
+## 6. The three arrival models, on the same box
+
+A threshold from one arrival pattern does not transfer to another, so the same machine was
+asked all three questions. 1.7B, `2x8`, profile applied:
+
+| question | harness | shape | result |
+|---|---|---|---|
+| **parallel capacity** | `serve_parallel_wave.py` | C requests at t=0, wait for all, repeat | §2 above: realtime holds to C=6 |
+| **saturation** | `load_test.py --arrival all-at-once --duration 300` | C=4 kept in flight for 5 minutes | **234 requests, 0 errors, TTFA p50 121 ms · p95 264 ms · max 390 ms**, 0/234 over a 500 ms budget, in-flight 3.93, stream RTF p50 0.78 |
+| **load** | `load_test.py --arrival poisson --rate 2` | independent arrivals at 2 req/s | 12 requests in 9.4 s per level, **TTFA p50 90–96 ms · p95 185–203 ms**, 0 over budget at every level |
+
+Two things are worth reading carefully there.
+
+**The three numbers for the same question are not a sweep.** With `--rate` declared, the
+arrival schedule is fixed by the rate and the seed, so `--concurrency 1,2,4` replays the *same*
+offered load three times and only caps how many may be in flight; at 2 req/s nothing ever
+queues, which is why the three rows agree. To make Poisson a sweep, move the rate, not the
+concurrency.
+
+**The closed-loop soak is the friendlier of the two four-request numbers.** Waves at t=0 put
+every request into prefill simultaneously, while a closed loop refills one slot at a time, so
+p95 first audio lands at 264 ms against 335 ms for the wave at the same C — and Poisson at a
+rate this machine absorbs is friendlier still, at 203 ms. Same machine, same configuration,
+three questions, three answers: quoting one of them as "TTFA at concurrency 4" is how a table
+stops meaning anything.
+
+## 7. Correctness and audio, not only the clock
 
 - `--self-test`: PASSED, 0 failing cases (the cross-ISA kernel oracle).
 - **identity gate: PASS on all four rungs** of the 1.7B — a traced pass at C=1 and C=4

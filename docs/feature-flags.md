@@ -295,5 +295,6 @@ value into a file where it does nothing.
 ## See also
 
 - [`serving-operations.md`](serving-operations.md) — how to run and measure the server
+- [`reference-arm-16c.md`](reference-arm-16c.md) — one box with all of this applied, measured
 - [`configs/perf/README.md`](../configs/perf/README.md) — the profile format that pins these values
 - [`performance.md`](performance.md) — what the numbers mean once they are taken
