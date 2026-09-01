@@ -22,8 +22,9 @@ Two rules that have each cost a day:
 - a flag that changes a default is added to the register **in the same change that introduces
   it**, because the symptom shows up days later and the first question is always "what is on
   by default now that was not on for the last good measurement?";
-- flags in the table below are *declared*; the ones in [§7](#7-levers-outside-the-register)
-  are not, so no log can prove their state. Prefer a declared lever when both exist.
+- the flags in the tables below are *declared*; the ones in
+  [§8](#8-levers-outside-the-register) are not, so no log can prove their state. Prefer a
+  declared lever when both exist.
 
 ---
 
@@ -36,7 +37,7 @@ The reference 16-core Arm deployment (`configs/perf/axion-16c-ttfa.json`) pins e
 
 | variable | value | what it buys, measured |
 |---|---|---|
-| `OPENBLAS_THREAD_TIMEOUT` | `1` | without it OpenBLAS idles by **spinning** and contends with the engine's own pool: first audio at C=1 measured 108 ms without against 66 ms with, and the bare arm was *bimodal* — 42,500 context switches per second against 12,000. At C=4 it is worth nothing, because busy workers leave no idle time to spin through |
+| `OPENBLAS_THREAD_TIMEOUT` | `1` | without it OpenBLAS idles by **spinning** and contends with the engine's own pool: first audio at C=1 measured 108 ms without against 66 ms with, and the bare arm was *bimodal* — 42,500 context switches per second against 12,000. That was measured when it was worth nothing at C=4; the re-measurement below found the scope reversed, so read both |
 | `OPENBLAS_NUM_THREADS` | **absent** | the engine sizes BLAS per worker at startup and backs off entirely when this is already set, so a stray `export` silently replaces a qualified thread split |
 | `QWEN_PREFIX_CACHE` | `1` | reuses the request-independent prompt head; on production prompts that is 9 of 13–79 prompt positions never computed again |
 | `QWEN_PREFILL_MATMAT` | `1` | routes prefill projections through the native bf16 matmat instead of BLAS: −29% prefill at `-j1` and −46% at `-j16` on that host. It is already the default where a matrix unit exists; pinning it means a change of default elsewhere cannot move this deployment quietly |
