@@ -123,6 +123,33 @@ The remaining AVX2-only hot paths got true AVX-512 twins, plus two new levers
 
 ---
 
+### x86 shape controls
+
+The x86 matrix paths expose the same kind of measured, runtime-selectable tiling control used by the ARM backend, without changing the default path:
+
+```bash
+# Optional output-row chunks; 0 or an unset variable keeps the original call shape.
+QWEN_X86_NCHUNK=256
+QWEN_AMX_NCHUNK=256
+QWEN_VNNI_NCHUNK=128
+QWEN_AVX512_NCHUNK=128
+```
+
+`QWEN_AMX_NCHUNK` applies to AMX INT8/BF16, `QWEN_VNNI_NCHUNK` to INT8 VNNI, and
+`QWEN_AVX512_NCHUNK` to the AVX-512 BF16 fallback. A family-specific value overrides
+`QWEN_X86_NCHUNK`; values are rounded down to the kernel row tile and invalid values are ignored.
+The controls are experimental and should be qualified per CPU, shape, and objective.
+
+AMX batch gates can also be separated when one threshold is not suitable for every datatype:
+
+```bash
+QWEN_AMX_BF16_MIN_B=4
+QWEN_AMX_INT8_MIN_B=8
+```
+
+If these are absent, both continue to use the existing `QWEN_AMX_MIN_B` fallback. Use
+`QWEN_NO_AMX=1` for a VNNI-only control and `QWEN_NO_VNNI=1` for an AMX-only control.
+
 ## Why a 3D V-cache chip (Zen4/Zen5 X3D) is the best case
 
 The single thing that gets you toward/under RTF 1.0 on x86 is **a cache that fits the CP working

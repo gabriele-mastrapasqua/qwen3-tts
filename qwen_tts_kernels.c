@@ -38,6 +38,10 @@
 #include <sys/syscall.h>
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
+static int qwen_x86_nchunk(int mmk, int B);
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -208,6 +212,8 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_DECODER_THREAD", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
     "QWEN_NO_AMX", "QWEN_NO_VNNI", "QWEN_NO_SDOT", "QWEN_NO_BF16DOT",
     "QWEN_NO_VNNI_TILE", "QWEN_NO_BF16_MATMUL",
+    "QWEN_X86_NCHUNK", "QWEN_AMX_NCHUNK", "QWEN_VNNI_NCHUNK", "QWEN_AVX512_NCHUNK",
+    "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_TTFA_PRIORITY",
     "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_AMX_MIN_B", "QWEN_VNNI_MIN_B", "QWEN_BATCH_STATS", "QWEN_THP", "QWEN_POOL_SPIN",
@@ -1068,7 +1074,15 @@ static void bf16_avx512_task(size_t tid, size_t nt, void *vc) {
     bf16_avx512_ctx *c = (bf16_avx512_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
-    bf16_matmat_avx512_slice(c->Y, c->W, c->Xb, r0, r1, c->cols, c->B);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_BF16_AVX512, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            bf16_matmat_avx512_slice(c->Y, c->W, c->Xb, r, e, c->cols, c->B);
+        }
+    } else {
+        bf16_matmat_avx512_slice(c->Y, c->W, c->Xb, r0, r1, c->cols, c->B);
+    }
 }
 #endif
 
@@ -1719,6 +1733,23 @@ static int qwen_mm_env_int(const char *name, int dflt, int lo, int hi) {
     return (v >= lo && v <= hi) ? v : dflt;
 }
 
+static const char *qwen_mm_specific_minb_env(int mmk) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (mmk == QWEN_MMK_BF16_AMX) return "QWEN_AMX_BF16_MIN_B";
+    if (mmk == QWEN_MMK_INT8_AMX) return "QWEN_AMX_INT8_MIN_B";
+#else
+    (void)mmk;
+#endif
+    return NULL;
+}
+
+static int qwen_mm_minb_value(int mmk, const qwen_mm_gate_t *g) {
+    int v = qwen_mm_env_int(g->minb_env, g->min_b, 1, 64);
+    const char *specific = qwen_mm_specific_minb_env(mmk);
+    if (specific) v = qwen_mm_env_int(specific, v, 1, 64);
+    return v;
+}
+
 static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_BF16_BFMMLA] = { "QWEN_NO_BFMMLA",   NULL,                "QWEN_BFMMLA_MIN_B",  NULL,                NULL,                     2, 64,  0,  0, 0, 1 },
     [QWEN_MMK_BF16_AVX512] = { "QWEN_NO_BF16_MATMUL", NULL,              "QWEN_BF16_MATMUL_MIN_B", NULL,             NULL,                     1, 16,  0,  0, 0, 0 },
@@ -1768,7 +1799,7 @@ static int qwen_mm_use(int mmk, int B, int rows, int cols) {
     if (st != 1) return 0;
     int minb = atomic_load_explicit(&g_mm_gate_minb[mmk], memory_order_relaxed);
     if (minb == 0) {
-        minb = qwen_mm_env_int(g->minb_env, g->min_b, 1, 64);
+        minb = qwen_mm_minb_value(mmk, g);
         atomic_store_explicit(&g_mm_gate_minb[mmk], minb, memory_order_relaxed);
     }
     int minr = atomic_load_explicit(&g_mm_gate_minrows[mmk], memory_order_relaxed);
@@ -1783,6 +1814,45 @@ static int qwen_mm_use(int mmk, int B, int rows, int cols) {
     }
     return B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1;
 }
+
+#if defined(__x86_64__) || defined(_M_X64)
+static atomic_int g_x86_nchunk = -1;
+static atomic_int g_amx_nchunk = -1;
+static atomic_int g_vnni_nchunk = -1;
+static atomic_int g_avx512_nchunk = -1;
+
+static int qwen_x86_nchunk_value(const char *specific, atomic_int *cache) {
+    int v = atomic_load_explicit(cache, memory_order_relaxed);
+    if (v >= 0) return v;
+    v = qwen_mm_env_int(specific, -1, 0, 1 << 20);
+    if (v < 0) v = qwen_mm_env_int("QWEN_X86_NCHUNK", 0, 0, 1 << 20);
+    atomic_store_explicit(cache, v, memory_order_relaxed);
+    return v;
+}
+
+static int qwen_x86_nchunk(int mmk, int B) {
+    const char *specific = NULL;
+    atomic_int *cache = &g_x86_nchunk;
+    int align = 16;
+    if (mmk == QWEN_MMK_INT8_AMX || mmk == QWEN_MMK_BF16_AMX) {
+        specific = "QWEN_AMX_NCHUNK";
+        cache = &g_amx_nchunk;
+    } else if (mmk == QWEN_MMK_INT8_VNNI) {
+        specific = "QWEN_VNNI_NCHUNK";
+        cache = &g_vnni_nchunk;
+        align = B <= 4 ? 4 : 2;
+    } else if (mmk == QWEN_MMK_BF16_AVX512) {
+        specific = "QWEN_AVX512_NCHUNK";
+        cache = &g_avx512_nchunk;
+        align = B <= 4 ? 4 : 2;
+    } else {
+        return 0;
+    }
+    int v = qwen_x86_nchunk_value(specific, cache);
+    v = (v / align) * align;
+    return v >= align ? v : 0;
+}
+#endif
 
 void qwen_kernel_selection_report(void *out, int rows, int cols) {
     FILE *f = out ? (FILE *)out : stderr;
@@ -2207,7 +2277,15 @@ static void bf16_amx_task(size_t tid, size_t nt, void *vc) {
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     r0 &= ~15; if (tid + 1 < nt) r1 &= ~15;
-    bf16_matmat_amx_slice(c->Y, c->W, c->pXb, c->Xb, r0, r1, c->cols, c->B);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_BF16_AMX, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            bf16_matmat_amx_slice(c->Y, c->W, c->pXb, c->Xb, r, e, c->cols, c->B);
+        }
+    } else {
+        bf16_matmat_amx_slice(c->Y, c->W, c->pXb, c->Xb, r0, r1, c->cols, c->B);
+    }
 }
 #endif
 
@@ -2256,11 +2334,11 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
                     Xb[(size_t)b * cols + k] = (uint16_t)(u >> 16);
                 }
             amx_pack_act_bf16(pXb, Xb, cols, (int)kfull, B);
+            bf16_amx_ctx c = { Y, W, pXb, Xb, rows, cols, B };
             if (nt > 1 && rows >= 256) {
-                bf16_amx_ctx c = { Y, W, pXb, Xb, rows, cols, B };
                 qwen_parallel((size_t)nt, bf16_amx_task, &c);
             } else {
-                bf16_matmat_amx_slice(Y, W, pXb, Xb, 0, rows, cols, B);
+                bf16_amx_task(0, 1, &c);
             }
               free(Xb);
             return;
@@ -2277,11 +2355,11 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
                 for (int k = 0; k < cols; k++)
                     Xb[(size_t)b * cols + k] =
                         qwen_f32_to_bf16_scalar(X[(size_t)k * B + b]);
+            bf16_avx512_ctx c = { Y, W, Xb, rows, cols, B };
             if (nt > 1 && rows >= 256) {
-                bf16_avx512_ctx c = { Y, W, Xb, rows, cols, B };
                 qwen_parallel((size_t)nt, bf16_avx512_task, &c);
             } else {
-                bf16_matmat_avx512_slice(Y, W, Xb, 0, rows, cols, B);
+                bf16_avx512_task(0, 1, &c);
             }
             return;
         }
@@ -2544,7 +2622,17 @@ static void int8_amx_task(size_t tid, size_t nt, void *vc) {
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     r0 &= ~15; if (tid + 1 < nt) r1 &= ~15;
-    int8_matmat_amx_slice(c->Y, c->W, c->scale, c->pXt, c->qXt, c->sx, r0, r1, c->cols, c->B);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_INT8_AMX, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            int8_matmat_amx_slice(c->Y, c->W, c->scale, c->pXt, c->qXt, c->sx,
+                                  r, e, c->cols, c->B);
+        }
+    } else {
+        int8_matmat_amx_slice(c->Y, c->W, c->scale, c->pXt, c->qXt, c->sx,
+                              r0, r1, c->cols, c->B);
+    }
 }
 
 static inline void amx_q4_unpack16(int8_t *stage, const q4_0_block_t *W,
@@ -2872,8 +2960,17 @@ static void int8_vmm_task(size_t tid, size_t nt, void *vc) {
     int8_vmm_ctx *c = (int8_vmm_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
-    int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx,
-                           r0, r1, c->rows, c->cols, c->B);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_INT8_VNNI, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx,
+                                   r, e, c->rows, c->cols, c->B);
+        }
+    } else {
+        int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx,
+                               r0, r1, c->rows, c->cols, c->B);
+    }
 }
 #undef QWEN_VNNI_NOINLINE
 #endif
@@ -3074,11 +3171,11 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                     sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
                 amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
                 int nt = g_n_threads;
+                int8_amx_ctx c = { Y, W, scale, pXt, qXt, sx, rows, cols, B };
                 if (nt > 1 && rows >= 256) {
-                    int8_amx_ctx c = { Y, W, scale, pXt, qXt, sx, rows, cols, B };
                     qwen_parallel((size_t)nt, int8_amx_task, &c);
                 } else {
-                    int8_matmat_amx_slice(Y, W, scale, pXt, qXt, sx, 0, rows, cols, B);
+                    int8_amx_task(0, 1, &c);
                 }
                 return;
             }
@@ -3094,11 +3191,11 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 for (int b = 0; b < B; b++)
                     sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
                 int nt = g_n_threads;
+                int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
                 if (nt > 1 && rows >= 256) {
-                    int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
                     qwen_parallel((size_t)nt, int8_vmm_task, &c);
                 } else {
-                    int8_matmat_vnni_slice(Y, W, scale, qXt, sx, 0, rows, rows, cols, B);
+                    int8_vmm_task(0, 1, &c);
                 }
                 return;
             }
@@ -7602,6 +7699,8 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
     for (int mmk = 1; mmk < QWEN_MMK_COUNT; mmk++) {
         const qwen_mm_gate_t *g = &g_mm_gate[mmk];
         if (g->max_b == 0) continue;
+        const char *minb_env = qwen_mm_specific_minb_env(mmk);
+        if (!minb_env) minb_env = g->minb_env;
         int fmt = -1, slot = -1;
         for (int fq = 0; fq < 3 && fmt < 0; fq++)
             for (int k = 0; k < agg_n[fq]; k++)
@@ -7624,17 +7723,17 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
                 snprintf(why, sizeof(why), "%s never beats B x matvec on any measured shape",
                          agg_name[fmt][slot]);
             }
-        } else if (g->on_env && g->minb_env) {
-            snprintf(line, sizeof(line), "export %s=1 %s=%d", g->on_env, g->minb_env, wf);
+        } else if (g->on_env && minb_env) {
+            snprintf(line, sizeof(line), "export %s=1 %s=%d", g->on_env, minb_env, wf);
             snprintf(why, sizeof(why), "%s is opt-in and DOES win from B>=%d here%s",
                      agg_name[fmt][slot], wf,
                      (w1 <= 0) ? "; POOL-ONLY WIN, see the warning above" : "");
-        } else if (!g->minb_env) {
+        } else if (!minb_env) {
             snprintf(line, sizeof(line), "# %s: wins from B>=%d but has NO min_b env",
                      agg_name[fmt][slot], wf);
             snprintf(why, sizeof(why), "missing minb_env in g_mm_gate[]");
         } else {
-            snprintf(line, sizeof(line), "export %s=%d", g->minb_env, wf);
+            snprintf(line, sizeof(line), "export %s=%d", minb_env, wf);
             snprintf(why, sizeof(why), "%s wins from B>=%d (compiled default %d)%s",
                      agg_name[fmt][slot], wf, g->min_b,
                      (w1 <= 0) ? "; POOL-ONLY WIN, see the warning above" : "");
@@ -7657,6 +7756,8 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
     for (int mmk = 1; mmk < QWEN_MMK_COUNT; mmk++) {
         const qwen_mm_gate_t *g = &g_mm_gate[mmk];
         if (g->max_b == 0) continue;
+        const char *minb_env = qwen_mm_specific_minb_env(mmk);
+        if (!minb_env) minb_env = g->minb_env;
         int avail = 0;
         for (int fq = 0; fq < 3 && !avail; fq++)
             for (int k = 0; k < agg_n[fq]; k++) if (agg_mmk[fq][k] == mmk) { avail = 1; break; }
@@ -7664,7 +7765,7 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
             char df0[24];
             snprintf(df0, sizeof(df0), "%d/%d/%d", g->min_b, g->min_rows, g->min_cols);
             fprintf(f, "   %-24s %-24s %-22s %-8s %s\n", g_mmk_info[mmk].name,
-                    g->minb_env ? g->minb_env : "MISSING",
+                    minb_env ? minb_env : "MISSING",
                     g->min_rows || g->min_cols ? "(see AMX rows below)" : "-", df0,
                     "NOT DISPATCHABLE HERE (ISA / kernel permission) — the box will answer");
             continue;
@@ -7676,7 +7777,7 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
         char df[24];
         snprintf(df, sizeof(df), "%d/%d/%d", g->min_b, g->min_rows, g->min_cols);
         fprintf(f, "   %-24s %-24s %-22s %-8s %s\n", g_mmk_info[mmk].name,
-                g->minb_env ? g->minb_env : "MISSING", rc, df,
+                minb_env ? minb_env : "MISSING", rc, df,
                 g->off_env ? g->off_env : (g->on_env ? g->on_env : "-"));
     }
     fprintf(f,
