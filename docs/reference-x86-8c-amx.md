@@ -8,6 +8,10 @@ without carrying a table per cell, and so a second x86 box has something to be c
 pays for, where realtime is lost, why a lever measured on Arm is wrong here. The milliseconds
 are not.
 
+**What this page is and is not.** It is a validation of the AMX and VNNI paths and an honest
+account of what this class of machine does. It is *not* a report of a new AMX or VNNI kernel
+optimisation: the batch-width fix described in §5 does not reach either of those dispatchers.
+
 ## The setup
 
 | | |
@@ -68,26 +72,30 @@ or six concurrent requests get their first audio quickly; they are not realtime 
 another: it straddles the threshold, so the honest claim stops at C=6, and the topology that
 actually holds C=8 under 500 ms is `4x2`, at 472.4 ms.
 
-## 1b. The 0.6B, which is where this box gets a realtime story
+## 1b. The 0.6B — a different model, measured separately
 
-Same profile, same procedure, three waves:
+Same host, same profile, same binary as every table above. **This section is about the 0.6B and
+nothing else**: it is not evidence about the 1.7B's latency, quality or production readiness, and
+the two should never be quoted as one result.
 
 | topology | C | TTFA p50 / p95 | stream RTF | req/s |
 |---|---:|---:|---:|---:|
-| `1x8` | 1 | 74 / 77 ms | **0.50** | 1.00 |
-| `1x8` | 2 | 101 / 141 ms | **0.87** | 1.12 |
-| `1x8` | 4 | 215 / 260 ms | 1.52 | 1.25 |
-| `2x4` | 1 | 97 / 99 ms | **0.72** | 0.69 |
-| `2x4` | 2 | 98 / **123 ms** | **0.72** | 1.36 |
-| `2x4` | 4 | 164 / 171 ms | 1.14 | 1.66 |
-| `2x4` | 8 | 272 / 327 ms | 1.95 | 1.94 |
+| `1x8` | 1 | 72.8 / 76.0 ms | **0.49** | 1.01 |
+| `1x8` | 2 | 94.2 / 165.0 ms | **0.88** | 1.12 |
+| `1x8` | 4 | 211.8 / 265.9 ms | 1.50 | 1.28 |
+| `2x4` | 1 | 93.2 / 93.9 ms | **0.69** | 0.72 |
+| `2x4` | 2 | 94.3 / **117.1 ms** | **0.70** | 1.40 |
+| `2x4` | 4 | 163.7 / 172.0 ms | 1.13 | 1.71 |
+| `2x4` | 6 | 193.3 / 242.8 ms | 1.51 | 1.87 |
+| `2x4` | 8 | 271.3 / 324.0 ms | 1.90 | 1.98 |
 
-**Two concurrent realtime streams**, at 123 ms p95 first audio, on `2x4` — and C=4 misses by 14%
-rather than by a lot. The 1.7B never gets there on this hardware. If the requirement is realtime
-under any concurrency at all, this box runs the 0.6B; the 1.7B is a one-stream model here.
+**Two concurrent realtime streams** on `2x4` — RTF 0.70 at C=2 with 117 ms p95 first audio — and
+C=4 misses by 13% rather than by a lot. `1x8` also holds C=2 (0.88) but with a worse tail
+(165 ms p95), so `2x4` is the better realtime pair here as well.
 
-**Client concurrency is not batch width.** At C=4 on `2x4` the measured in-flight batch is 3.10
-*in the system*, about 1.55 per worker. That single fact explains the decoder result in §3.
+The 1.7B never reaches this on this hardware. If a deployment needs realtime under any
+concurrency at all, that is an argument for running the 0.6B on this box — it is not an argument
+about how the 1.7B sounds, which no timing table can settle.
 
 ## 2. What AMX is worth, per stage
 

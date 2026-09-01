@@ -460,10 +460,11 @@ Note the topology names: on an 8-core box the cells are `1x8`, `2x4` and `4x2`, 
 `2x8`/`4x4`. Pick them from `make bench-fingerprint`, never by copying another host's profile.
 
 **What that box can and cannot do**, measured and written up in
-[`reference-x86-8c-amx.md`](reference-x86-8c-amx.md): first audio is competitive — C=4 TTFA p95
-stays under 350 ms — while **sustained stream RTF at C=4 is still above 1**, so it serves four
-concurrent requests with a good time to first audio but does not keep four of them realtime.
-That is a bandwidth result, not a kernel one: 82 GB/s against the Arm host's 336.
+[`reference-x86-8c-amx.md`](reference-x86-8c-amx.md): on the 1.7B, first audio is competitive —
+C=4 TTFA p95 252 ms — while **sustained stream RTF at C=4 is 1.43**, so it serves four concurrent
+requests with a good time to first audio and keeps one of them realtime. That is a bandwidth
+result, not a kernel one: 82 GB/s against the Arm host's 336. The 0.6B, measured separately on
+the same box, holds two concurrent realtime streams.
 
 ---
 
