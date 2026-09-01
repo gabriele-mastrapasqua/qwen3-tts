@@ -276,6 +276,24 @@ Used for **attribution** rather than timing, two of them answer questions the wa
   `decoder batch: calls / mean` with `max slots`. A mean of 1.00 means the batch never formed,
   whatever the flag says.
 
+### Which kernel actually ran, and whether a fix can reach it
+
+`[batch-audit]` names the kernel per component, and one line under it answers a question the MAC
+table cannot:
+
+```
+fallback twin dispatch: bf16 222 fixed-width / 0 generic  ·  int8 96 fixed-width / 0 generic
+fallback twin dispatch: never reached (a wider matmat took every batched call on this build)
+```
+
+The twins are what run when no VNNI, AMX, SDOT, SMMLA or KleidiAI matmat takes the call, and
+the counters record which arm of their fixed-width switch was used — including "never reached",
+which is the honest answer on a build whose dispatcher sends everything to a matrix unit. It
+exists because a kernel improvement is worth exactly what the dispatcher lets it be worth: the
+fixed-width kernels added for bf16 B=9..15 and int8 B=1/5/7/9..15 are a 5-10x improvement on
+builds that reach them, and **zero** on an AMX or AVX-512 host, where these counters stay at
+zero on real prefill shapes. Measure the dispatch before claiming the speedup.
+
 ### Is a flag even declarable?
 
 `[FLAGS]` can only report what `g_qwen_reported_flags[]` lists, so a flag the engine reads but

@@ -178,6 +178,25 @@ measured and **rejected**: 57 positions cost 214 ms unblocked against 967 / 584 
 260 MiB L3 across the chunks of one layer, so there was nothing to amortise and the extra
 dispatches and packing were pure cost.
 
+### A fix that does NOT apply to this machine
+
+The same microbenchmark found that the fallback matmat twins were missing fixed-width kernels —
+bf16 for B=9..15, int8 for B=1, 5, 7 and 9..15 — and paid 5-10x for them. That is a real defect
+and it is fixed, but **it changes nothing here**, and the dispatch counters say so rather than
+leaving it to be assumed. On real 1.7B prefill shapes at C=4:
+
+```
+SIMD=amx           fallback twin dispatch: never reached
+QWEN_NO_AMX=1      fallback twin dispatch: never reached
+```
+
+Every batched call on this host is taken by a wider matmat: `bf16 AMX tiles` and `int8 AMX
+tiles`, or with AMX disabled `bf16 AVX-512 dpbf16` and `int8 VNNI vpdpbusd` — the same GMAC
+moving between named kernels. The twin is only reached by builds without AVX-512, which on x86
+means the AVX2 / `SIMD=portable` level, and on Arm by a build with no BF16 matrix unit, which is
+where the 5-10x was measured. **A kernel fix is worth what the dispatcher lets it be worth**, and
+on this machine that is nothing.
+
 ## 6. What this class of machine is for
 
 - **One realtime stream.** `1x8` at C=1 is RTF 0.68. Everything else on this box is above 1.
