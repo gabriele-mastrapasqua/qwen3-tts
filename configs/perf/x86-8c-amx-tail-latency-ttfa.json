@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
   "profile": {
-    "id": "x86-8c-amx-c4-latency-ttfa",
-    "description": "Fixed-C=4 latency-first profile for an 8-core Intel AMX host with SMT disabled; use only when four simultaneous clients are the explicit target.",
+    "id": "x86-8c-amx-tail-latency-ttfa",
+    "description": "Tail-latency profile for a SATURATED 8-core Intel AMX host with SMT disabled: four narrow workers give the best measured TTFA p95 at C=8, at slightly lower throughput than the two-worker profile. It is not the profile for a lightly loaded box.",
     "objective": {
       "primary": "ttfa",
       "secondary": "throughput",
       "concurrency_range": [
-        4,
-        4
+        6,
+        8
       ],
-      "preferred_concurrency": 4,
+      "preferred_concurrency": 8,
       "quality_changes_allowed": false
     }
   },
@@ -33,7 +33,7 @@
       "amx_int8",
       "amx_bf16"
     ],
-    "notes": "Disable SMT before launch. Four workers use CPU pairs 0-1, 2-3, 4-5 and 6-7. This profile is latency-first and has lower measured throughput than the 2x4 profile."
+    "notes": "Disable SMT before launch. Four workers use physical-core pairs 0-1, 2-3, 4-5 and 6-7. Two threads per worker is deliberately narrow: it costs single-stream latency badly (C=1 stream RTF 1.69 against 1.02 on the two-worker profile) and buys tail stability when every worker is busy."
   },
   "build": {
     "target": "blas",
@@ -157,6 +157,6 @@
     "workload": "Three synchronized waves at client concurrency 1, 2, 4, 6 and 8 on the short class of the mixed bank; four workers, each pinned to two physical cores.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b base checkpoint, open weights",
-    "notes": "C=4 TTFA 236 ms p50 / 285 ms p95 with stream RTF 1.84 and 1.10 req/s. READ THIS BEFORE CHOOSING IT: on the current build it wins ONLY the C=4 median, by 9 ms (236 vs 245 ms), and loses everything else to the two-worker profile - p95 285 vs 259 ms, throughput 1.10 vs 1.39 req/s, stream RTF 1.84 vs 1.49. Two threads are not enough for a 1.7B worker: even at C=1 it measures RTF 1.69 against 1.02. It is kept because a fixed-C=4 median IS a legitimate objective for some deployments, but it is no longer the better choice at C=4 in general, and it should not be picked by default. Measured with the environment block above, verified in each server's [FLAGS] line, on an 8-core Intel Emerald Rapids with SMT disabled, one NUMA node, 260 MiB shared L3 and a measured Triad of 82 GB/s. 1.7B open weights at int8, three synchronized waves per level, short class of the mixed bank, zero errors and zero rejections at every level."
+    "notes": "Chosen for the C=8 TAIL, which is the only place it wins: TTFA p50/p95 442/458 ms against 440/500 ms on the two-worker profile, an 8% better p95, for 1.67 req/s against 1.74 and stream RTF 2.42 against 2.34. Everywhere else it loses, and at low concurrency it loses badly - C=1 is 201/204 ms at RTF 1.69 against 134/135 ms at 1.02, because two threads are not enough for a 1.7B worker. An earlier revision of this file presented it as a fixed-C=4 latency profile; the requalification does not support that. At C=4 it takes only the median (236 vs 245 ms) and loses the p95 (285 vs 259 ms) and the throughput (1.10 vs 1.39 req/s). TTFA AND SUSTAINED RTF ARE SEPARATE CLAIMS: nothing here is realtime - stream RTF is 1.84 at C=4 and 2.42 at C=8. This profile is about the shape of the TTFA distribution when the box is already saturated, not about keeping streams realtime."
   }
 }

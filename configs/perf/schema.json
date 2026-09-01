@@ -345,6 +345,48 @@
         },
         "notes": {
           "type": "string"
+        },
+        "source_commit": {
+          "type": "string",
+          "description": "Short git revision of the tree the qualifying run was built from. A qualification that cannot name its commit is a claim about no particular code."
+        },
+        "binary_sha256": {
+          "type": "string",
+          "description": "sha256 of the engine binary that produced the numbers, or its first 32 hex characters. The build tag alone does not pin the compiler or the SIMD level."
+        },
+        "measured": {
+          "type": "object",
+          "description": "Per-concurrency measurements behind the claim, unrounded. Percentiles are taken over requests, never as a ratio of percentiles.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "ttfa_p50_ms": {
+                "type": "number"
+              },
+              "ttfa_p95_ms": {
+                "type": "number"
+              },
+              "stream_rtf_p50": {
+                "type": "number"
+              },
+              "req_per_s": {
+                "type": "number"
+              },
+              "batch_in_system": {
+                "type": "number"
+              },
+              "batch_per_worker": {
+                "type": "number"
+              },
+              "errors": {
+                "type": "integer"
+              },
+              "rejections": {
+                "type": "integer"
+              }
+            }
+          }
         }
       }
     }

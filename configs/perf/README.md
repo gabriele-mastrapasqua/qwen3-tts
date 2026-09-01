@@ -96,7 +96,7 @@ Individual rungs remain available for investigation. The suite is the gate for a
 | `generic-16c-starting-point` | **unqualified** | a place to START on a 16-core Arm server. Nothing in it was measured on your machine, and it says so in its own `qualification.notes` |
 | `x86-8c-amx-single-stream-ttfa` | see the file | an 8-core Intel AMX host, one worker with eight physical-core threads; C=1-2 latency |
 | `x86-8c-amx-multiclient-ttfa` | see the file | the same host, two workers x four physical-core threads; balanced C=2-8 operation |
-| `x86-8c-amx-c4-latency-ttfa` | see the file | fixed C=4 latency-first topology, four workers x two threads; lower throughput |
+| `x86-8c-amx-tail-latency-ttfa` | see the file | four workers x two threads: the best measured TTFA p95 at C=8 on a saturated box, and worse than the two-worker profile everywhere else |
 | `x86-8c-amx-recommended` | alias | resolves to the balanced x86 AMX profile; carries no values of its own |
 | `recommended` | alias | resolves to the qualified one; carries no values of its own |
 

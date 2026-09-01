@@ -191,6 +191,7 @@ help:
 	@echo "  make bench-matrix[-full]   - then the RTF matrix (needs a downloaded model)"
 	@echo "  make check-matmat-parity   - do the batched twins do the arithmetic they claim? (native ISA)"
 	@echo "  make check-flag-registry   - every runtime flag the engine reads is one it declares in [FLAGS]"
+	@echo "  make prefill-bench         - where prefill time goes: packing, per-call cost, weight stream"
 	@echo "  make check-matmat-parity-x86 - the same on the x86 AVX2 kernels, run under Rosetta 2 from an Arm Mac"
 	@echo "  make check-isa             - compile-check the ISA paths this machine does not have"
 	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
@@ -719,6 +720,23 @@ test-regression:
 check-flag-registry:
 	@python3 tools/check_flag_registry.py
 
+PREFILL_BENCH_SRC = tests/prefill_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
+                    qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+prefill-bench:
+	@echo "=== prefill cost: what the per-call fixed cost actually is ==="
+ifeq ($(UNAME_S),Darwin)
+	@clang $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -march=native \
+	  $(PREFILL_BENCH_SRC) -framework Accelerate -lm -o /tmp/prefill_bench
+else
+	@$(CC) $(PARITY_CF) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas $(ARCH_FLAGS) \
+	  $(PREFILL_BENCH_SRC) -lopenblas -lm -lpthread -o /tmp/prefill_bench
+endif
+	@/tmp/prefill_bench $(PB_ROWS) $(PB_COLS) $(PB_THREADS)
+
+PB_ROWS    ?= 2048
+PB_COLS    ?= 2048
+PB_THREADS ?= 1
+
 test-all: test-small test-large test-regression test-errors test-emotion test-emotion-ft test-compose test-caps check-flag-registry test-selftest test-golden test-serve-repro
 	@echo ""
 	@echo "========================================="
@@ -1078,7 +1096,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: bench-fingerprint bench-topo bench-suite check-flag-registry
+.PHONY: bench-fingerprint bench-topo bench-suite check-flag-registry prefill-bench
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak

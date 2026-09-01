@@ -47,7 +47,17 @@ errors and zero rejections in all fifteen cells:
 
 Everything on one request wins C=1 outright and collapses fastest; four two-thread workers are
 too narrow for a 1.7B (RTF 1.69 even alone); `2x4` holds both ends and takes throughput at every
-level from C=4 up. Use `1x8` when single-stream latency is the objective, `2x4` otherwise.
+level from C=4 up. Each topology has one scope and it is worth stating them separately:
+
+- **`1x8` — single-stream latency.** 98 ms first audio and the only RTF below 1 on this box.
+- **`2x4` — the general profile.** Best p95 at C=4 and C=6 and best throughput from C=4 up.
+- **`4x2` — the C=8 tail, and nothing else.** At C=8 it has the better p95 (458 vs 500 ms) for
+  slightly less throughput; at C=4 it takes only the median and loses p95, RTF and throughput;
+  at C=1 it is twice the latency of `2x4`. It is a saturated-box profile.
+
+**TTFA and sustained RTF are separate claims and this box separates them sharply.** First audio
+p95 stays under 400 ms out to C=6 on `2x4`, while stream RTF passes 1 between C=1 and C=2. Four
+or six concurrent requests get their first audio quickly; they are not realtime while they run.
 
 **Client concurrency is not batch width.** At C=4 on `2x4` the measured in-flight batch is 3.10
 *in the system*, about 1.55 per worker. That single fact explains the decoder result in §3.

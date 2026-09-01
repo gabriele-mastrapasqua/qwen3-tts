@@ -71,8 +71,15 @@ if [ "$SKIP_IDLE" = "0" ] && [ -r /proc/loadavg ]; then
   gate "loadavg           = $L1"
 fi
 
-COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo UNKNOWN)
-DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo yes || echo no)
+# A run off a shipped tree has no .git, and "UNKNOWN" in a manifest makes the whole result
+# unattributable. QWEN_SOURCE_COMMIT lets the caller state it, exactly as serve_parallel_wave.py
+# already accepts; git stays the source of truth when it is there.
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "${QWEN_SOURCE_COMMIT:-UNKNOWN}")
+if git rev-parse HEAD >/dev/null 2>&1; then
+  DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo yes || echo no)
+else
+  DIRTY="${QWEN_SOURCE_DIRTY:-unknown (no git in this tree)}"
+fi
 gate "source_commit     = $COMMIT   dirty= $DIRTY"
 [ "$DIRTY" = "no" ] || echo "  WARNING: dirty tree. Final numbers require dirty=no (commit first)."
 
