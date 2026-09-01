@@ -1659,10 +1659,20 @@ static void *single_worker_main(void *arg) {
 
 static void server_default_decoder_batch(qwen_tts_ctx_t *ctx) {
     (void)ctx;
-    if (getenv("QWEN_SERVER_NO_DECODER_BATCH")) return;
+    if (getenv("QWEN_SERVER_NO_DECODER_BATCH")) {
+        fprintf(stderr, "[serve] batched speech decoder OFF (QWEN_SERVER_NO_DECODER_BATCH)\n");
+        return;
+    }
+    /* setenv() with overwrite=0 leaves an explicit QWEN_DECODER_BATCH=0 alone, so read the
+       value back before announcing: saying "ON by default" to someone who just asked for it to
+       be off is how an A/B ends up comparing a configuration against itself. */
     setenv("QWEN_DECODER_BATCH", "1", 0);
-    fprintf(stderr, "[serve] batched speech decoder ON by default (one pass over the decoder "
-                    "weights for all active slots) — QWEN_DECODER_BATCH=0 to opt out\n");
+    const char *v = getenv("QWEN_DECODER_BATCH");
+    if (v && atoi(v) != 0)
+        fprintf(stderr, "[serve] batched speech decoder ON (one pass over the decoder "
+                        "weights for all active slots) — QWEN_DECODER_BATCH=0 to opt out\n");
+    else
+        fprintf(stderr, "[serve] batched speech decoder OFF (QWEN_DECODER_BATCH=%s)\n", v);
 }
 
 static void server_default_memory_levers(qwen_tts_ctx_t *ctx) {

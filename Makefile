@@ -190,6 +190,7 @@ help:
 	@echo "  make membw                 - bandwidth only: Copy/Triad with a thread sweep, and the knee"
 	@echo "  make bench-matrix[-full]   - then the RTF matrix (needs a downloaded model)"
 	@echo "  make check-matmat-parity   - do the batched twins do the arithmetic they claim? (native ISA)"
+	@echo "  make check-flag-registry   - every runtime flag the engine reads is one it declares in [FLAGS]"
 	@echo "  make check-matmat-parity-x86 - the same on the x86 AVX2 kernels, run under Rosetta 2 from an Arm Mac"
 	@echo "  make check-isa             - compile-check the ISA paths this machine does not have"
 	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
@@ -715,7 +716,10 @@ test-regression:
 	@echo ""
 	@echo "=== All regression tests passed ==="
 
-test-all: test-small test-large test-regression test-errors test-emotion test-emotion-ft test-compose test-caps test-selftest test-golden test-serve-repro
+check-flag-registry:
+	@python3 tools/check_flag_registry.py
+
+test-all: test-small test-large test-regression test-errors test-emotion test-emotion-ft test-compose test-caps check-flag-registry test-selftest test-golden test-serve-repro
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
@@ -731,7 +735,7 @@ test-caps: $(TARGET)
 	@if grep -q "arch:.*arm64" $(TEST_DIR)/caps.txt; then \
 	   grep -q "matvec + attn:    NEON" $(TEST_DIR)/caps.txt || { echo "FAIL: arm64 build must report NEON matvec"; exit 1; }; \
 	 elif grep -q "arch:.*x86-64" $(TEST_DIR)/caps.txt; then \
-	   grep -qE "matvec \+ attn:    (AVX2|scalar)" $(TEST_DIR)/caps.txt || { echo "FAIL: x86 must report AVX2 (default) or scalar (SIMD=scalar) matvec"; exit 1; }; \
+	   grep -qE "matvec \+ attn:    (AVX-512|AVX2|scalar)" $(TEST_DIR)/caps.txt || { echo "FAIL: x86 must report AVX-512 (SIMD=avx512/avx512vnni/avx512bf16/amx), AVX2 (portable) or scalar"; exit 1; }; \
 	   if grep -q "WARNING: built with AVX2 but this CPU lacks it" $(TEST_DIR)/caps.txt; then echo "FAIL: AVX2 build on a non-AVX2 CPU"; exit 1; fi; \
 	 fi
 	@grep -q "matvec threads:" $(TEST_DIR)/caps.txt && ! grep -q "SINGLE-THREAD" $(TEST_DIR)/caps.txt || { echo "FAIL: threads must report an active pool (GCD/pthread/Win32), not SINGLE-THREAD"; exit 1; }
@@ -1074,7 +1078,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: bench-fingerprint bench-topo bench-suite
+.PHONY: bench-fingerprint bench-topo bench-suite check-flag-registry
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak
