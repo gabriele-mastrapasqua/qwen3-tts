@@ -201,6 +201,9 @@ help:
 	@echo "  make bench-topo            - sweep prefork topologies to find W x K (BENCH_TOPO=1x16,2x8,4x4)"
 	@echo "  make bench-suite           - the qualification suite: preflight gates, rungs, audio length, manifest"
 	@echo "                               (BENCH_MODEL= BENCH_PROFILE= BENCH_TOPO= BENCH_RUNG=fast BENCH_OUT=)"
+	@echo "  make bench-soak            - closed-loop soak with rolling/per-class KPI analysis"
+	@echo "                               (SOAK_MODEL= SOAK_PROFILE= SOAK_CONCURRENCY= SOAK_MINUTES= SOAK_MIN_PER_CLASS_P95= SOAK_OUT=)"
+	@echo "  make bench-suite-full      - qualification suite followed by the closed-loop soak"
 	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
@@ -645,6 +648,34 @@ bench-suite: $(TARGET)
 	  --topo $(BENCH_TOPO) --speaker $(BENCH_SPEAKER) --bank-fast $(BENCH_BANK) \
 	  --bank-real $(BENCH_BANK) --out $(BENCH_OUT) \
 	  $(if $(BENCH_RUNG),--only $(BENCH_RUNG),) $(BENCH_ARGS)
+
+SOAK_MODEL        ?= $(BENCH_MODEL)
+SOAK_PROFILE      ?= $(BENCH_PROFILE)
+SOAK_NO_PROFILE   ?= exploratory soak with compiled defaults
+SOAK_BANK        ?= $(BENCH_BANK)
+SOAK_SPEAKER     ?= $(BENCH_SPEAKER)
+SOAK_LANGUAGE    ?= English
+SOAK_CONCURRENCY ?= 2
+SOAK_MINUTES     ?= 10
+SOAK_TEMP        ?= 0.9
+SOAK_PRECISION   ?= int8
+SOAK_MIN_PER_CLASS_P95 ?= 20
+SOAK_OUT         ?= $(BENCH_OUT)/soak
+SOAK_ARGS        ?=
+
+bench-soak: $(TARGET)
+	@python3 tests/serve_soak.py --model "$(SOAK_MODEL)" --bin "./$(TARGET)" \
+	  --bank "$(SOAK_BANK)" --speaker "$(SOAK_SPEAKER)" --language "$(SOAK_LANGUAGE)" \
+	  --concurrency "$(SOAK_CONCURRENCY)" --minutes "$(SOAK_MINUTES)" \
+	  --min-per-class-p95 "$(SOAK_MIN_PER_CLASS_P95)" \
+	  --temperature "$(SOAK_TEMP)" --precision "$(SOAK_PRECISION)" --out "$(SOAK_OUT)" \
+	  $(if $(SOAK_PROFILE),--profile "$(SOAK_PROFILE)",--no-profile "$(SOAK_NO_PROFILE)") \
+	  $(SOAK_ARGS)
+
+server-soak: bench-soak
+
+bench-suite-full: bench-suite
+	@$(MAKE) bench-soak
 
 PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c \
              qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
@@ -1099,7 +1130,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: bench-fingerprint bench-topo bench-suite check-flag-registry prefill-bench
+.PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak

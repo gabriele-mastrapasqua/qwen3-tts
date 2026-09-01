@@ -313,6 +313,70 @@ Never call any of them simply "concurrency N".
 A threshold from one does not transfer to another. The wave is the hardest and the one
 comparable to firing N streams at an accelerator.
 
+### Closed-loop soak: stability over time
+
+The soak is a separate, deliberately longer test. It keeps `C` streaming conversations open
+in a closed loop: each conversation sends its next request only after the previous response
+finishes. The default schedule is seeded and stratified across the text-bank classes, so a
+length-heavy class cannot silently take over the end of the run. Every five minutes it also
+saves a fixed probe response for listening; probe requests are excluded from latency KPIs.
+
+Run it after the qualification suite, with the same open model and deployment profile:
+
+```bash
+make bench-soak SOAK_MODEL=qwen3-tts-1.7b-base \
+                 SOAK_PROFILE=<measured-profile> \
+                 SOAK_CONCURRENCY=2 SOAK_MINUTES=30 \
+                 SOAK_OUT=/tmp/qwen_tts_soak
+
+# Run both the qualification suite and the soak as two identifiable artifacts.
+# The Make target passes the BENCH_* model/profile/bank defaults to the soak and
+# starts it only after the qualification suite completes.
+make bench-suite-full BENCH_MODEL=qwen3-tts-1.7b-base \
+                      BENCH_PROFILE=<measured-profile> \
+                      SOAK_MINUTES=30
+```
+
+The runner refuses an unknown model name: public examples are limited to
+`qwen3-tts-0.6b`, `qwen3-tts-0.6b-base`, `qwen3-tts-1.7b` and `qwen3-tts-1.7b-base`.
+Use `--no-profile "reason"` only for an explicitly exploratory run. The output directory
+contains `manifest.json`, `server.log`, `requests.csv`, `resources.csv`, `soak_summary.json`
+and a small set of probe WAVs.
+
+The analyzer reports three separate decisions:
+
+| result | meaning |
+|---|---|
+| `LATENCY KPI: PASS` | comparable rolling windows stayed within the declared TTFA/RTF limits |
+| `LATENCY KPI: NOT_ASSESSED` | the run completed, but there were too few windows or the completed-text mix changed too much; use the per-class rows, not a pooled drift claim |
+| `RESOURCE STABILITY: PASS` / `FAIL` | the server process tree did or did not show memory, thread or descriptor growth |
+
+`SOAK RESULT: PARTIAL` is intentional: it means the run is useful for stability, but latency
+drift was not scientifically assessable. The default command does not fail for that case;
+add `--strict-kpi` through `SOAK_ARGS` when a pipeline must reject an unassessed latency KPI.
+Queue-full/queue-timeout counters and server-side request timeouts are also recorded and fail
+the run. The analyzer fails only on request errors, resource growth, those timeout/rejection
+counters, or a measured KPI regression.
+
+Per-class p95 has a separate evidence threshold (`--min-per-class-p95`, default 20) because
+with four or five observations the p95 is effectively the maximum and one scheduling or text
+outlier can look like a regression. A short soak may therefore show
+`PER-CLASS KPI: <class>=PARTIAL` while pooled latency and resource checks pass. That is not a
+model failure. To assess per-class tails, use larger comparison windows and a longer run, for
+example `--window-s 300 --min-per-class 5 --min-per-class-p95 15` for a 15–30 minute soak.
+`--strict-kpi` makes an unassessed per-class result fail the command; normal mode keeps it
+diagnostic while still failing on an assessed regression.
+The full table remains in `soak_summary.json`, while the console output is short enough to
+scan during a long run.
+
+When the binary was transferred without its `.git` directory, pass the revision that produced
+it explicitly so the manifest remains attributable:
+
+```bash
+QWEN_SOURCE_COMMIT=<revision-or-build-id> make bench-soak \
+  SOAK_MODEL=qwen3-tts-1.7b-base SOAK_PROFILE=<measured-profile>
+```
+
 ---
 
 ## 5. The three numbers, and the many that are not

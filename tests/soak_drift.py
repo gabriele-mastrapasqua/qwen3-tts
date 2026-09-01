@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Analyze a closed-loop soak without confusing text mix with latency drift."""
+import argparse
+import csv
+import json
+import math
+import os
+import statistics
+import sys
+
+
+def percentile(values, quantile):
+    values = sorted(value for value in values if math.isfinite(value))
+    if not values:
+        return None
+    index = min(len(values) - 1, int(round(quantile / 100.0 * (len(values) - 1))))
+    return values[index]
+
+
+def median(values):
+    values = [value for value in values if value is not None and math.isfinite(value)]
+    return statistics.median(values) if values else None
+
+
+def display(value, digits=1):
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def metric(rows, key):
+    values = [row[key] for row in rows
+              if row.get(key) is not None and math.isfinite(row[key])]
+    return {
+        "n": len(values),
+        "p50": percentile(values, 50),
+        "p95": percentile(values, 95),
+    }
+
+
+def drift_percent(first, last):
+    if first is None or last is None or first == 0:
+        return None
+    return 100.0 * (last - first) / first
+
+
+def read_requests(path):
+    rows = []
+    errors = []
+    with open(path, newline="", encoding="utf-8", errors="replace") as handle:
+        for raw in csv.DictReader(handle):
+            try:
+                end = float(raw["t_end_s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            error = raw.get("error", "").strip()
+            if error:
+                errors.append({"t": end, "error": error})
+                continue
+            try:
+                ttfa = float(raw["ttfa_ms"])
+                stream = float(raw["stream_rtf"])
+                audio_s = float(raw.get("audio_s") or 0.0)
+            except (KeyError, TypeError, ValueError):
+                errors.append({"t": end, "error": "invalid metric row"})
+                continue
+            rows.append({
+                "t": end,
+                "class": raw.get("class", "unknown") or "unknown",
+                "ttfa": ttfa,
+                "stream": stream,
+                "audio_s": audio_s,
+                "probe": raw.get("is_probe") == "1",
+            })
+    return rows, errors
+
+
+def read_resources(path, warmup):
+    if not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path, newline="", encoding="utf-8", errors="replace") as handle:
+        for raw in csv.DictReader(handle):
+            try:
+                if float(raw["elapsed_s"]) < warmup:
+                    continue
+                row = {key: float(value) for key, value in raw.items()
+                       if key and value not in (None, "")}
+                rows.append(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+    return rows
+
+
+def proportions(rows):
+    counts = {}
+    for row in rows:
+        counts[row["class"]] = counts.get(row["class"], 0) + 1
+    total = sum(counts.values())
+    return {key: value / total for key, value in counts.items()} if total else {}
+
+
+def mix_distance(left, right):
+    keys = set(left) | set(right)
+    return 0.5 * sum(abs(left.get(key, 0.0) - right.get(key, 0.0)) for key in keys)
+
+
+def resource_verdict(rows):
+    if not rows:
+        return {"status": "NOT_AVAILABLE", "reason": "no resource samples"}
+
+    result = {"status": "PASS", "samples": len(rows), "metrics": {}}
+    for key, label, growth_limit in (
+        ("anon_kb", "anonymous_memory_kb", 10.0),
+        ("pss_kb", "pss_kb", 10.0),
+        ("rss_kb", "rss_kb", 15.0),
+    ):
+        values = [row[key] for row in rows if key in row and row[key] > 0]
+        if len(values) < 3:
+            continue
+        split = max(1, len(values) // 5)
+        first = median(values[:split])
+        last = median(values[-split:])
+        growth = drift_percent(first, last)
+        result["metrics"][label] = {
+            "first": first,
+            "last": last,
+            "growth_pct": growth,
+            "minimum": min(values),
+            "maximum": max(values),
+        }
+        if growth is not None and growth > growth_limit:
+            result["status"] = "FAIL"
+            result.setdefault("failures", []).append(label)
+
+    for key, label, allowance in (("threads", "threads", 2), ("fds", "open_fds", 4)):
+        values = [int(row[key]) for row in rows if key in row]
+        if not values:
+            continue
+        split = max(1, len(values) // 5)
+        first = median(values[:split])
+        last = median(values[-split:])
+        result["metrics"][label] = {
+            "first": first,
+            "last": last,
+            "minimum": min(values),
+            "maximum": max(values),
+            "range": max(values) - min(values),
+        }
+        if last is not None and first is not None and last > first + allowance:
+            result["status"] = "FAIL"
+            result.setdefault("failures", []).append(label)
+    return result
+
+
+def analyze(directory, args):
+    request_path = os.path.join(directory, "requests.csv")
+    if not os.path.isfile(request_path):
+        print(f"FAIL: missing {request_path}")
+        return 1
+
+    rows, errors = read_requests(request_path)
+    usable_all = [row for row in rows if row["t"] >= args.warmup_s]
+    usable = [row for row in usable_all if not row["probe"]]
+    if not usable:
+        print("FAIL: no completed requests after warm-up")
+        return 1
+
+    end = max(row["t"] for row in usable_all)
+    window_map = {}
+    for row in usable:
+        index = int((row["t"] - args.warmup_s) // args.window_s)
+        window_map.setdefault(index, []).append(row)
+    windows = []
+    for index in sorted(window_map):
+        group = window_map[index]
+        if len(group) < args.min_per_window:
+            continue
+        windows.append({
+            "start_s": args.warmup_s + index * args.window_s,
+            "end_s": args.warmup_s + (index + 1) * args.window_s,
+            "n": len(group),
+            "mix": proportions(group),
+            "ttfa": metric(group, "ttfa"),
+            "stream": metric(group, "stream"),
+            "rows": group,
+        })
+
+    print("### CLOSED-LOOP SOAK")
+    print(f"completed={len(usable_all)} kpi_samples={len(usable)} "
+          f"audio_probes={len(usable_all) - len(usable)} errors={len(errors)} duration_s={end:.1f} "
+          f"warmup_s={args.warmup_s:.0f}")
+    print(f"windows={len(windows)} window_s={args.window_s:.0f} "
+          f"min_per_window={args.min_per_window}")
+    print()
+    print(f"{'window':>13} {'n':>5} {'TTFA p50':>10} {'TTFA p95':>10} "
+          f"{'RTF p50':>9} {'RTF p95':>9} {'classes':>10}")
+    for window in windows:
+        ttfa = window["ttfa"]
+        stream = window["stream"]
+        print(f"{window['start_s']:>6.0f}-{window['end_s']:<6.0f} {window['n']:>5} "
+              f"{display(ttfa['p50']):>10} {display(ttfa['p95']):>10} "
+              f"{display(stream['p50'], 3):>9} {display(stream['p95'], 3):>9} "
+              f"{len(window['mix']):>10}")
+
+    hard_failures = ["request errors"] if errors else []
+    kpi = {"status": "NOT_ASSESSED", "reason": "insufficient comparable windows"}
+    if len(windows) >= args.min_windows:
+        first, last = windows[0], windows[-1]
+        distance = mix_distance(first["mix"], last["mix"])
+        kpi["mix_distance"] = distance
+        if distance > args.max_mix_distance:
+            kpi["reason"] = (f"completed-request class mix changed by {distance:.3f}; "
+                              "use per-class rows instead of a pooled drift claim")
+        else:
+            failures = []
+            comparisons = []
+            for name, key, limit in (
+                ("TTFA p50", "ttfa", args.max_ttfa_drift),
+                ("TTFA p95", "ttfa", args.max_ttfa_drift),
+                ("stream RTF p50", "stream", args.max_stream_drift),
+            ):
+                quantile = 50 if "p50" in name else 95
+                before = first[key][f"p{quantile}"]
+                after = last[key][f"p{quantile}"]
+                change = drift_percent(before, after)
+                comparisons.append({"metric": name, "first": before,
+                                    "last": after, "drift_pct": change,
+                                    "limit_pct": limit})
+                if before is None or after is None:
+                    failures.append(name + " unavailable")
+                elif change is not None and change > limit:
+                    failures.append(name)
+            unavailable = any(name.endswith(" unavailable") for name in failures)
+            kpi = {"status": "NOT_ASSESSED" if unavailable else ("FAIL" if failures else "PASS"),
+                   "reason": ("a required metric was unavailable" if unavailable
+                              else "pooled class mix is comparable"),
+                   "comparisons": comparisons}
+            if failures:
+                kpi["failures"] = failures
+
+    class_results = {}
+    classes = sorted({row["class"] for row in usable})
+    min_per_class_p95 = getattr(args, "min_per_class_p95", args.min_per_class)
+    for cls in classes:
+        class_windows = []
+        for window in windows:
+            group = [row for row in window["rows"] if row["class"] == cls]
+            if len(group) >= args.min_per_class:
+                class_windows.append((window, group))
+        result = {"status": "NOT_ASSESSED", "samples": sum(
+            row["class"] == cls for row in usable)}
+        if len(class_windows) >= args.min_windows:
+            first_group = class_windows[0][1]
+            last_group = class_windows[-1][1]
+            comparisons = []
+            failures = []
+            unassessed = []
+            for name, key, limit in (
+                ("TTFA p50", "ttfa", args.max_ttfa_drift),
+                ("TTFA p95", "ttfa", args.max_ttfa_drift),
+                ("stream RTF p50", "stream", args.max_stream_drift),
+            ):
+                quantile = 50 if "p50" in name else 95
+                required = min_per_class_p95 if quantile == 95 else args.min_per_class
+                if len(first_group) < required or len(last_group) < required:
+                    unassessed.append(name)
+                    comparisons.append({
+                        "metric": name,
+                        "first": None,
+                        "last": None,
+                        "drift_pct": None,
+                        "limit_pct": limit,
+                        "status": "NOT_ASSESSED",
+                        "reason": (
+                            f"requires {required} samples in both comparison windows; "
+                            f"got {len(first_group)} and {len(last_group)}"
+                        ),
+                    })
+                    continue
+                before = percentile([row[key] for row in first_group], quantile)
+                after = percentile([row[key] for row in last_group], quantile)
+                if before is None or after is None:
+                    unassessed.append(name)
+                    comparisons.append({
+                        "metric": name,
+                        "first": before,
+                        "last": after,
+                        "drift_pct": None,
+                        "limit_pct": limit,
+                        "status": "NOT_ASSESSED",
+                        "reason": "metric unavailable",
+                    })
+                    continue
+                change = drift_percent(before, after)
+                comparisons.append({"metric": name, "first": before,
+                                    "last": after, "drift_pct": change,
+                                    "limit_pct": limit, "status": "ASSESSED"})
+                if change is not None and change > limit:
+                    failures.append(name)
+            status = "FAIL" if failures else ("PARTIAL" if unassessed else "PASS")
+            result = {"status": status,
+                      "first_n": len(first_group), "last_n": len(last_group),
+                      "comparisons": comparisons}
+            if failures:
+                result["failures"] = failures
+            if unassessed:
+                result["unassessed"] = unassessed
+        class_results[cls] = result
+
+    resource_rows = read_resources(os.path.join(directory, "resources.csv"), args.warmup_s)
+    resources = resource_verdict(resource_rows)
+    if resources["status"] == "FAIL":
+        hard_failures.extend(resources.get("failures", ["resource growth"]))
+    rejected = max((row.get("queue_rejected", 0) for row in resource_rows), default=0)
+    queue_timeouts = max((row.get("queue_timeout", 0) for row in resource_rows), default=0)
+    request_timeouts = max((row.get("request_timeout", 0) for row in resource_rows), default=0)
+    if rejected > 0:
+        hard_failures.append("queue rejections")
+    if queue_timeouts > 0:
+        hard_failures.append("queue timeouts")
+    if request_timeouts > 0:
+        hard_failures.append("server request timeouts")
+
+    sustained = {
+        "n": len(usable),
+        "ttfa": metric(usable, "ttfa"),
+        "stream": metric(usable, "stream"),
+        "mix": proportions(usable),
+    }
+    if kpi["status"] == "FAIL":
+        hard_failures.extend(kpi.get("failures", ["pooled KPI drift"]))
+    if any(result["status"] == "FAIL" for result in class_results.values()):
+        hard_failures.append("per-class KPI drift")
+
+    overall = "FAIL" if hard_failures else ("PASS" if kpi["status"] == "PASS" else "PARTIAL")
+    print()
+    print(f"LATENCY KPI: {kpi['status']} — {kpi['reason']}")
+    print(f"RESOURCE STABILITY: {resources['status']}")
+    print(f"QUEUE REJECTIONS: {rejected:.0f} full / {queue_timeouts:.0f} timeout; "
+          f"SERVER TIMEOUTS: {request_timeouts:.0f}")
+    class_status = ", ".join(
+        f"{key}={value['status']}" for key, value in class_results.items()
+    ) or "none"
+    print(f"PER-CLASS KPI: {class_status}")
+    print(f"SOAK RESULT: {overall}" + (f" — {', '.join(hard_failures)}" if hard_failures else ""))
+
+    summary = {
+        "schema_version": 1,
+        "status": overall,
+        "completed": len(usable_all),
+        "kpi_samples": len(usable),
+        "audio_probes": len(usable_all) - len(usable),
+        "errors": len(errors),
+        "error_examples": errors[:5],
+        "queue_rejected": rejected,
+        "queue_timeout": queue_timeouts,
+        "request_timeout": request_timeouts,
+        "duration_s": end,
+        "warmup_s": args.warmup_s,
+        "windows": [{key: value for key, value in window.items() if key != "rows"}
+                     for window in windows],
+        "latency_kpi": kpi,
+        "per_class": class_results,
+        "sustained": sustained,
+        "resources": resources,
+        "failures": hard_failures,
+    }
+    with open(os.path.join(directory, "soak_summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+    strict_failure = args.strict_kpi and (
+        kpi["status"] != "PASS" or
+        any(result["status"] != "PASS" for result in class_results.values())
+    )
+    return 1 if overall == "FAIL" or strict_failure else 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("directory")
+    parser.add_argument("--window-s", type=float, default=60.0)
+    parser.add_argument("--warmup-s", type=float, default=60.0)
+    parser.add_argument("--min-per-window", type=int, default=5)
+    parser.add_argument("--min-per-class", type=int, default=3)
+    parser.add_argument("--min-per-class-p95", type=int, default=20)
+    parser.add_argument("--min-windows", type=int, default=3)
+    parser.add_argument("--max-mix-distance", type=float, default=0.20)
+    parser.add_argument("--max-ttfa-drift", type=float, default=30.0)
+    parser.add_argument("--max-stream-drift", type=float, default=20.0)
+    parser.add_argument("--strict-kpi", action="store_true")
+    args = parser.parse_args()
+    if args.window_s <= 0 or args.warmup_s < 0:
+        parser.error("window and warm-up must be non-negative, with a positive window")
+    return analyze(args.directory, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
