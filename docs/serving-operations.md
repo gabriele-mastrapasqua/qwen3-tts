@@ -28,6 +28,50 @@ server rather than pretending.
 **The parent does not synthesize.** It accepts connections and hands the file descriptor to a
 worker, so a slow request occupies one worker and not the accept loop.
 
+### What `--prefork` and `--batch-size` actually control
+
+Three mechanics decide how many requests run at once, and each one has surprised somebody:
+
+**`--batch-size` is also the per-worker in-flight cap.** The parent hands a worker at most
+`--batch-size` connections at a time, and the default is **1**. With `--prefork 12` and no
+`--batch-size`, twelve requests run and the rest wait — they are not rejected, they sit in the
+listen backlog until a worker frees a slot. The startup line says which it is:
+
+```
+prefork: 12 workers x 2 threads, 24 cpus (2 per worker), cap 1 in flight each, port 8080
+```
+
+`--batch-size` also selects the scheduler inside each worker: at `1` a worker serves one
+request at a time, from `2` up it runs the continuous-batching scheduler. So `W x cap` is the
+number of requests in flight, and the backlog (16) is what queues behind it.
+
+**Core slices come from `--prefork`, not from `--prefork-threads`.** Worker *w* is pinned to
+the contiguous logical CPUs `[w * (nproc / W), …]`; `--prefork-threads` then sizes the pool
+*inside* that slice. More threads than the slice is oversubscription, fewer leaves cores idle,
+and when *W* does not divide `nproc` the remainder is unused. There is no CLI way to exclude
+SMT siblings: the slices are contiguous *logical* ids, so read `lscpu -e` to see which id is a
+sibling of which core, and which socket each belongs to.
+
+**On more than one socket, the weights are loaded before the fork** and shared copy-on-write,
+so workers pinned to the second socket read them across the interconnect. That is measurable,
+and it is worth one `numactl` arm before accepting a topology on a two-socket box.
+
+`kill -USR1 <parent pid>` prints a per-worker line — assigned, completed, in flight, mean batch
+— which is the cheapest way to see whether the work actually spread:
+
+```
+[prefork-stats] mean_inflight 3.940 dispatched 24 rejected 0 · w0[asg=6 done=6 act=2 B=1.97] ...
+```
+
+A single server (`--prefork 1`, or any non-Linux platform) has no parent holding those
+per-worker counters. It handles the signal anyway and prints whatever counters the build
+carries (the pool counters need a `QWEN_POOL_STATS` build, the kernel census needs
+`QWEN_BATCH_STATS`) — the point being that `SIGUSR1` is safe to send to any server: a process
+without a handler for it is *terminated* by default, which is how a stats signal once ended a
+benchmark arm. `--prefork 1` also sizes the single server's pool from
+`--prefork-threads`, so `1xK` is a real arm of a topology sweep rather than a default-threaded
+one wearing its name.
+
 ---
 
 ## 2. Break-in: find `W x K` before you quote anything
@@ -53,23 +97,55 @@ slower path at exactly the concurrency you care about.
 **Threads do not add up.** Each worker's pool is `K` threads, and the BLAS inside it has its own
 pool. Oversubscribing turns latency into context switches — see §4, where that costs 40 ms.
 
+### Turn SMT off before any of this
+
+The engine pins workers to contiguous **logical** CPU ids, so with SMT on a two-thread slice is
+one physical core wearing two hats, and a topology sweep compares configurations that are not
+what their names say. `make bench-fingerprint` gates on it and prints `GATE SMT off … FAIL`
+with the count when it is on.
+
+Cloud instances differ: an Arm host such as Google Axion (c4a) reports `Thread(s) per core: 1`
+and there is nothing to do, while the x86 families (c4, c3, and their AMD equivalents) ship SMT
+enabled. On GCP it is an instance property — recreate the VM with `--threads-per-core=1` — and
+on hardware you own it is a BIOS setting or `echo off > /sys/devices/system/cpu/smt/control`.
+If you cannot turn it off, halve the thread budget deliberately (`-j` = physical cores) and say
+so beside the numbers; what you must not do is let a `2x8` slice quietly mean four cores.
+
 ### The procedure
 
 ```bash
 # 1. what does this machine actually have?
-make bench-fingerprint            # cpu, cores, SMT, cache, kernel, BLAS, ISA extensions
+make bench-fingerprint            # cpu, cores, SMT, cache, NUMA, measured memory bandwidth
 ./qwen_tts --caps                 # which kernels the binary would pick, per batch width
 ./qwen_tts --self-test            # cross-ISA correctness oracle
 
 # 2. sweep the topologies at the concurrency you expect
-make bench-fast   TOPO=1x16,2x8,4x4   # short bank, the fast inner loop
-make bench-realistic                  # a mixed-length bank, the one that can be quoted
+make bench-topo BENCH_MODEL=<dir> BENCH_TOPO=1x16,2x8,4x4 BENCH_CONC=1,4
 
 # 3. write the winner into a profile, and stop retyping it
 $EDITOR configs/perf/<your-host>.json
 ```
 
 Steps 1 and 2 are cheap. Step 3 is what makes the result last: see §3.
+
+`bench-topo` starts one server per topology, fires true simultaneous waves at each concurrency
+and prints one row per cell. Measured on the 16-core Axion reference host, 1.7B open weights at
+int8, profile `axion-16c-ttfa`, short bank, three waves:
+
+| topology | C | TTFA p50 | TTFA p95 | RTF p50 | measured batch | errors |
+|---|---:|---:|---:|---:|---:|---:|
+| `1x16` | 1 | **46 ms** | 54 ms | 0.35 | — | 0 |
+| `1x16` | 4 | 141 ms | 142 ms | 0.91 | — | 0 |
+| `2x8` | 1 | 54 ms | 72 ms | 0.43 | 0.64 | 0 |
+| `2x8` | 4 | **124 ms** | 138 ms | 0.72 | 2.73 | 0 |
+| `4x4` | 1 | 87 ms | 110 ms | 0.72 | 0.73 | 0 |
+| `4x4` | 4 | 136 ms | 160 ms | 0.80 | 2.77 | 0 |
+
+One worker with every core wins first audio at C=1 and then gives it back at C=4, where its
+realtime factor climbs to 0.91; two workers is the shape that holds both. That trade is the
+whole point of running the sweep instead of picking a shape. The measured-batch column is empty
+for `1x16` because it comes from the pre-fork parent's counters, and a single server has no
+parent — it answers `SIGUSR1` with its pool counters instead.
 
 ---
 
@@ -111,9 +187,33 @@ single run looks equally definitive whichever it lands on. The mechanism is visi
 BLAS library idles by spinning and contends with the engine's own pool. Nothing in the output
 said which configuration had been measured.
 
-Its scope is measured too, not assumed: at concurrency 4 on the same host the difference is 173
-against 169 ms, i.e. nothing. When every worker is busy there is no idle time for a spinning
-thread to waste. **So the profile matters most exactly where first-audio latency is measured.**
+Its scope was measured too, not assumed: at concurrency 4 on the same host the difference was
+173 against 169 ms, i.e. nothing — when every worker is busy there is no idle time for a
+spinning thread to waste.
+
+**That scope has since moved, and the re-measurement says so.** Same host, current build,
+`2x8`, four waves of the short bank, the two arms differing only in whether the profile
+environment was applied:
+
+| arm | C | TTFA p50 | TTFA p95 | stream RTF p50 | context switches/s |
+|---|---:|---:|---:|---:|---:|
+| profile `axion-16c-ttfa` | 1 | 57 ms | 69 ms | 0.44 | 11,910 |
+| compiled defaults | 1 | 51 ms | 67 ms | 0.45 | 7,880 |
+| profile `axion-16c-ttfa` | 4 | **109 ms** | 160 ms | **0.72** | 30,153 |
+| compiled defaults | 4 | 133 ms | 157 ms | 0.81 | 68,984 |
+
+At concurrency 1 the two arms are now within noise of each other, because most of that set
+became the **compiled default** in the meantime: the native prefill matmat, the prompt-prefix
+cache, the 65536-generation pool spin and the batched decoder are all on without anyone asking.
+At concurrency 4 the profiled arm is ahead by 18% on first audio and 11% on realtime factor,
+and the mechanism is in the last column — 69,000 context switches per second against 30,000 is
+a spinning BLAS competing with busy workers.
+
+So the current claim is the opposite of the earlier one, and it is the reason both are written
+here rather than only the flattering one: **a profile earns its keep where the machine is
+loaded, and the defaults have absorbed most of what it used to buy at C=1.** A single 4-wave
+arm at C=1 is also exactly the shape of run that the bimodality above can flatter, which is why
+nothing in this paragraph rests on those two rows.
 
 ### Variables that must be ABSENT, not merely unset
 
@@ -129,13 +229,52 @@ it. `forbidden-env` lists them and the suite refuses to run when one is present.
 
 ```bash
 make bench-suite                                   # open weights, preset voice, neutral bank
-make bench-suite MODEL=<dir> SPEAKER=<voice> \
-                 BANK_FAST=<file> BANK_REAL=<file> CORPUS_ARG=<file>
+make bench-suite BENCH_MODEL=<dir> BENCH_PROFILE=<name> BENCH_TOPO=2x8 \
+                 BENCH_SPEAKER=<voice> BENCH_BANK=<file> BENCH_OUT=<dir>
+make bench-suite BENCH_RUNG=fast                   # one rung only, the engineering inner loop
+make bench-suite BENCH_ARGS="--corpus <file>"      # adds the two duration-diverse rungs
 ```
 
 With no variables it runs a generic configuration end to end, which is also the fastest way to
 check that a new box works at all. Everything deployment-specific arrives on the command line
 and lands in that run's manifest rather than in a tracked file.
+
+A complete inner-loop run on the reference host, from a shell in the repository:
+
+```bash
+make blas GIT_REV=$(git rev-parse --short HEAD)
+make bench-suite BENCH_MODEL=qwen3-tts-1.7b-base BENCH_PROFILE=axion-16c-ttfa \
+                 BENCH_RUNG=fast BENCH_TOPO=2x8 BENCH_OUT=/tmp/bench_fast
+```
+
+which prints its preflight (binary sha256, model, profile, resolved server env, forbidden
+variables absent, no stale engines, loadavg, source commit), then the rung, then the audio
+length per cell, then the manifest. `SUITE PASSED` is the only line that means it ran:
+
+```
+topo    C  TTFA50  TTFA95  TTFAmax  RTF50  RTF95  ttc50  ttc95  req/s     B   ...  rej  err
+2x8     1      51      71       71   0.43   0.44    0.8    0.8   1.31  0.73   ...    0    0
+2x8     4     101     140      140   0.73   0.75    1.4    1.4   2.81  3.00   ...    0    0
+SUITE PASSED — artifacts in /tmp/bench_fast, manifest in /tmp/bench_fast/manifest.txt
+```
+
+**The idle gate is not advisory.** The suite refuses to start at `loadavg >= 2.0`, which
+includes the decay from the run you just finished — wait for the box to settle rather than
+chaining two suites back to back.
+
+The same rung on the same host, both models at int8, profile `axion-16c-ttfa`, topology `2x8`,
+five waves of a short bank — the shape to expect when a box is set up correctly:
+
+| model | C | TTFA p50 | TTFA p95 | stream RTF p50 | audio p50 | errors |
+|---|---:|---:|---:|---:|---:|---:|
+| 1.7B | 1 | 51 ms | 71 ms | 0.43 | 1.84 s | 0 |
+| 1.7B | 4 | 101 ms | 140 ms | 0.73 | 1.84 s | 0 |
+| 0.6B | 1 | 40 ms | 44 ms | 0.33 | 2.48 s | 0 |
+| 0.6B | 4 | 69 ms | 89 ms | 0.62 | 2.48 s | 0 |
+
+The audio-length column is why the two models are not compared row against row: they drew
+different amounts of speech from the same bank, so only the within-model columns carry a
+comparison.
 
 The suite owns the whole invocation, and every preflight check exits non-zero:
 
@@ -147,11 +286,19 @@ The suite owns the whole invocation, and every preflight check exits non-zero:
 - **each cell's audio length is printed**, so comparability can be read instead of assumed
 - a manifest repeats the exact commands
 
-| rung | what it answers |
-|---|---|
-| `realistic` | the quotable curve: first audio and sustained realtime against concurrency |
-| `fast` | the engineering inner loop — short texts, fast iteration, never a production figure |
-| `short-diverse` / `long-diverse` | how input length moves first audio, which it does a lot |
+| rung | selected with | what it answers |
+|---|---|---|
+| `realistic` | `BENCH_RUNG=realistic` | the quotable curve: first audio and sustained realtime against concurrency |
+| `fast` | `BENCH_RUNG=fast` | the engineering inner loop — short texts, fast iteration, never a production figure |
+| `short-diverse` / `long-diverse` | `BENCH_ARGS="--corpus <file>"` | how input length moves first audio, which it does a lot |
+
+**The default bank is bilingual, and the fast rung does not use all of it.**
+`tests/load_texts_en.txt` carries five classes — `short`, `medium`, `long`,
+`conversational` and `italian` — so the `realistic` rung exercises English *and* Italian, while
+`fast` filters to `short` and is therefore English-only and short-prompt-only. That is
+deliberate (an inner loop wants one variable), but it means a `fast` number says nothing about
+what a different language or a longer prompt does to first audio. `BENCH_BANK=<file>` swaps the
+bank; the same `<class>\t<text>` format is all it needs.
 
 ### Arrival models are three different questions
 
@@ -248,16 +395,27 @@ Two rules that have each cost a day:
 ## 9. A worked example: a 16-core Arm host
 
 ```bash
-make blas
+make blas GIT_REV=$(git rev-parse --short HEAD)
 ./qwen_tts --caps                      # confirm the matrix-unit paths are live
-make bench-fingerprint                 # the machine describes itself
+./qwen_tts --self-test                 # and that they compute the right thing
+make bench-fingerprint                 # the machine describes itself, and gates on SMT
 
-make bench-fast TOPO=1x16,2x8,4x4      # → 2x8 wins at the target concurrency
+make bench-topo BENCH_MODEL=qwen3-tts-1.7b-base \
+                BENCH_TOPO=1x16,2x8,4x4        # one row per cell; 1x16 wins C=1, 2x8 holds both
 $EDITOR configs/perf/my-host.json      # topology 2x8, threads 8, batch 8, env from the sweep
-tools/perf_profile.py validate
+python3 tools/perf_profile.py validate --engine ./qwen_tts
 
-make bench-suite PROFILE=my-host       # the numbers, with their provenance and a manifest
-python3 tools/wav_qc.py /tmp/bench_suite/audio
+make bench-suite BENCH_PROFILE=my-host BENCH_MODEL=qwen3-tts-1.7b-base
+```
+
+and the quality gate is its own run, because saving the audio perturbs the timing:
+
+```bash
+python3 tests/serve_parallel_wave.py --model qwen3-tts-1.7b-base --bin ./qwen_tts \
+    --speaker ryan --topo 2x8 --conc 2 --waves 1 --seed 42 --precision int8 \
+    --profile my-host --classes short --out /tmp/qc --port 9600 --label qc \
+    --save-audio /tmp/qc/audio
+python3 tools/wav_qc.py /tmp/qc/audio      # then listen: no script scores speech
 ```
 
 Then serve it with the same profile, so what runs is what was measured:

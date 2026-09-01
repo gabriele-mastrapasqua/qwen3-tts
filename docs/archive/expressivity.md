@@ -95,7 +95,7 @@ cross-model (incl. 0.6B, no instruct); prefer the recipe on 1.7B presets.
 >
 > **Writing long-form (audiobooks/podcasts)?** Use **inline markup** — one text with
 > `[sad]`/`[excited]` mid-text emotion switches, `[pause:400ms]` pauses and `[sigh]`/`[huff]`
-> fillers, rendered in one pass: see [markup.md](markup.md).
+> fillers, rendered in one pass: see [markup.md](../markup.md).
 
 ## `--emotion <name>` — delivery presets
 
