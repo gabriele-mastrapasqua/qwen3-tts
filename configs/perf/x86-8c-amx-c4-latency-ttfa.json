@@ -153,10 +153,10 @@
     "server_env_serialization": "comma"
   },
   "qualification": {
-    "status": "provisional",
-    "workload": "Three synchronized waves at client concurrency 4 on the mixed 21-text qualification bank; SMT was disabled and all four worker pairs were pinned to physical-core slices.",
+    "status": "qualified",
+    "workload": "Three synchronized waves at client concurrency 1, 2, 4, 6 and 8 on the short class of the mixed bank; four workers, each pinned to two physical cores.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
-    "model": "qwen3-tts-1.7b base checkpoint",
-    "notes": "REQUALIFICATION IN PROGRESS on this branch: the environment above changed (POOL_SPIN and DECODER_BATCH are now pinned from measurement) so the previous numbers do not describe it."
+    "model": "qwen3-tts-1.7b base checkpoint, open weights",
+    "notes": "C=4 TTFA 236 ms p50 / 285 ms p95 with stream RTF 1.84 and 1.10 req/s. READ THIS BEFORE CHOOSING IT: on the current build it wins ONLY the C=4 median, by 9 ms (236 vs 245 ms), and loses everything else to the two-worker profile - p95 285 vs 259 ms, throughput 1.10 vs 1.39 req/s, stream RTF 1.84 vs 1.49. Two threads are not enough for a 1.7B worker: even at C=1 it measures RTF 1.69 against 1.02. It is kept because a fixed-C=4 median IS a legitimate objective for some deployments, but it is no longer the better choice at C=4 in general, and it should not be picked by default. Measured with the environment block above, verified in each server's [FLAGS] line, on an 8-core Intel Emerald Rapids with SMT disabled, one NUMA node, 260 MiB shared L3 and a measured Triad of 82 GB/s. 1.7B open weights at int8, three synchronized waves per level, short class of the mixed bank, zero errors and zero rejections at every level."
   }
 }

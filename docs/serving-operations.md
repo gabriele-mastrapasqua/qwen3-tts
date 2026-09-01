@@ -426,11 +426,55 @@ eval "$(tools/perf_profile.py command my-host --model MODEL_DIR --port 8080)"
 
 ---
 
+## The same procedure on x86
+
+Nothing above is Arm-specific: `bench-fingerprint`, `bench-topo` and `bench-suite` read the
+machine and take the topology names from it. Three things differ in practice.
+
+**SMT is usually on, and you have to turn it off** (see the section above) — the Arm instance
+families report `Thread(s) per core: 1` on their own, the x86 ones do not.
+
+**Build level is a decision.** `make blas` on Linux/x86 runs `SIMD=auto`, which reads
+`/proc/cpuinfo`, probes the compiler and picks the highest level both support — `amx` on
+Sapphire/Emerald Rapids, `avx512bf16` on Zen4/5, down to `portable`. It announces itself as
+`[simd] auto -> …`, and the resulting binary is **not portable to an older CPU**. Pin the level
+in the profile so the box that reproduces your numbers compiles the same kernels.
+
+**The flags are not the same flags.** `QWEN_KAI_*` exists only where KleidiAI compiled in, so
+it is inert on x86; the x86 side has the AMX and VNNI gates instead. Two values in particular
+do not travel: `QWEN_POOL_SPIN`, where the Arm profile's 65536 is measurably wrong on 8 cores,
+and `QWEN_DECODER_BATCH`, which pays only when a worker really holds several slots. Both are
+covered in [`feature-flags.md`](feature-flags.md) with the measurement on each side.
+
+An x86 run of the same inner loop, with the profile that ships for an 8-core AMX host:
+
+```bash
+make blas SIMD=amx GIT_REV=$(git rev-parse --short HEAD)
+make bench-topo  BENCH_MODEL=qwen3-tts-1.7b-base BENCH_PROFILE=x86-8c-amx-recommended \
+                 BENCH_TOPO=1x8,2x4,4x2 BENCH_CONC=1,4
+make bench-suite BENCH_MODEL=qwen3-tts-1.7b-base BENCH_PROFILE=x86-8c-amx-recommended \
+                 BENCH_RUNG=fast BENCH_TOPO=2x4 BENCH_OUT=/tmp/bench_x86
+```
+
+Note the topology names: on an 8-core box the cells are `1x8`, `2x4` and `4x2`, not the 16-core
+`2x8`/`4x4`. Pick them from `make bench-fingerprint`, never by copying another host's profile.
+
+**What that box can and cannot do**, measured and written up in
+[`reference-x86-8c-amx.md`](reference-x86-8c-amx.md): first audio is competitive — C=4 TTFA p95
+stays under 350 ms — while **sustained stream RTF at C=4 is still above 1**, so it serves four
+concurrent requests with a good time to first audio but does not keep four of them realtime.
+That is a bandwidth result, not a kernel one: 82 GB/s against the Arm host's 336.
+
+---
+
 ## See also
 
 - [`reference-arm-16c.md`](reference-arm-16c.md) — every rung of this suite, measured on one
   16-core Arm box: topology sweep, qualification curve for both models, input-length effect,
   the three arrival models, the profile A/B
+- [`reference-x86-8c-amx.md`](reference-x86-8c-amx.md) — the same procedure on an 8-core Intel
+  AMX box: what AMX buys per stage, and where this class of machine stops
+- [`x86-optimization.md`](x86-optimization.md) — the x86 kernel work behind those numbers
 - [`server.md`](server.md) — the HTTP API
 - [`feature-flags.md`](feature-flags.md) — every runtime flag and its default
 - [`configs/perf/README.md`](../configs/perf/README.md) — the profile format

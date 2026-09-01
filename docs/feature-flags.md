@@ -170,7 +170,8 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_APPLE_MMLA` | Apple | unset (off) | MMLA is opt-in on Apple silicon; `=1` enables it |
 | `QWEN_NO_VNNI` | x86 | unset | `=1` drops the VNNI int8 path (matvec and matmat) |
 | `QWEN_NO_BF16DOT` | x86 | unset | `=1` drops the AVX-512 bf16 dot path |
-| `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once |
+| `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once. Use it to answer "is AMX doing anything", never to attribute a result — it removes two unrelated consumers |
+| `QWEN_NO_AMX_BF16` · `QWEN_NO_AMX_INT8` · `QWEN_NO_AMX_Q4` | x86 | unset | one AMX consumer each, which is what a measurement needs. On an 8-core Emerald Rapids the two do disjoint jobs: dropping **bf16** costs C=1 TTFA +39% and C=4 p95 +72% while stream RTF barely moves (it is the *prefill*), and dropping **int8** leaves TTFA alone while costing 9% of RTF and 10% of throughput (it is the *decode*) |
 | `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
 | `QWEN_NO_BF16_MATMUL` | x86 | unset | `=1` drops the AVX-512 bf16 matmat, leaving the per-row twin. Only reachable where AMX is absent or declined |
 | `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
@@ -215,7 +216,7 @@ both belong before any number.
 | flag | default | effect |
 |---|---|---|
 | `QWEN_PREFIX_CACHE` | **on** | reuses the request-independent prompt head across requests; `=0` disables it |
-| `QWEN_POOL_SPIN` | 65536 on Linux/arm64, 4096 elsewhere | generations a pool worker re-reads before parking on the condvar. On a 16-core Arm host 4096 cost 40% of the Code Predictor: 65536 measured CP 16.0 → 9.6 ms/frame and 491,320 → 35,132 context switches. `=0` parks immediately |
+| `QWEN_POOL_SPIN` | 65536 on Linux/arm64, 4096 elsewhere | generations a pool worker re-reads before parking on the condvar. On a 16-core Arm host 4096 cost 40% of the Code Predictor: 65536 measured CP 16.0 → 9.6 ms/frame and 491,320 → 35,132 context switches. `=0` parks immediately. **The two defaults are both right.** On an 8-core x86 host the Arm value is worse (C=4 p95 358 vs 339 ms) and so is 0 (+13% stream RTF at C=1, 31k vs 2k context switches): a spinning worker needs a core to spin on, and on 8 cores it is stealing from the worker that has work. Pin the measured value per box; do not port this one |
 | `QWEN_SERVE_BLAS` | 0 (the engine's own thread budget) | BLAS threads while a single slot is busy |
 | `QWEN_SERVE_BLAS_BUSY` | 0 (same) | BLAS threads from two busy slots up |
 | `QWEN_TTFA_PRIORITY` | 0 (off) | N > 0 lets N prefilling requests take priority over decoding ones, clamped to 8 |
@@ -232,7 +233,7 @@ not be present, and the benchmark suite refuses to run when one is.
 
 | flag | default | effect |
 |---|---|---|
-| `QWEN_DECODER_BATCH` | **on in the server** (`[serve]` says so), off in the CLI | one pass over the decoder weights for every active slot. `=0` opts out |
+| `QWEN_DECODER_BATCH` | **on in the server** (`[serve]` says so), off in the CLI | one pass over the decoder weights for every active slot. `=0` opts out. It pays only where a worker actually holds several slots: on an 8-core host split `2x4`, C=4 gives each worker ~1.4 active slots, the gang never exceeds 2, and turning it **off** measured 12% better at C=4 TTFA p95 with identical RTF. Read `decoder batch: calls / mean` before believing either direction |
 | `QWEN_SERVER_NO_DECODER_BATCH` | unset | present = the server does not turn the above on for you |
 | `QWEN_DECODER_THREAD` | off | runs the decoder on its own thread beside the Talker |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
@@ -246,6 +247,8 @@ not be present, and the benchmark suite refuses to run when one is.
 | flag | default | effect |
 |---|---|---|
 | `QWEN_CP_PREC` | follows `--int8` / `--int4` | `int8` or `int4` for the Code Predictor alone — the lever behind the mixed-precision configurations |
+| `QWEN_CP_LAYER_PREC` · `QWEN_CP_LMHEAD_PREC` | follow `QWEN_CP_PREC` | the same choice for the CP's layers and its lm_heads separately |
+| `QWEN_CP_PREFILL2` | **on** for an AVX-512-VNNI build, off elsewhere | runs the CP's first pass two positions at a time so it reaches a batched kernel. `=0` opts out, and the kernel audit then shows the CP's batched rows disappearing entirely |
 | `QWEN_TALKER_PREC` | follows `--int8` / `--int4` | the same for the Talker |
 | `QWEN_CP_Q2_FFN` | off | `gateup`, `down` or `both` push those Code Predictor projections to 2 bits. Quality gate first |
 | `QWEN_ICL_FRAMES` | the context's own cap | caps the reference frames an in-context voice keeps (anchor dilution) |
@@ -259,6 +262,26 @@ not be present, and the benchmark suite refuses to run when one is.
 They print phase tables, per-request lifecycles and kernel censuses, and every one of them
 costs time inside the region being timed. A deployment profile declares them `null` for that
 reason: counters and timing do not share a binary in a run that produces a published figure.
+
+Used for **attribution** rather than timing, two of them answer questions the wall clock cannot:
+
+- `QWEN_BATCH_STATS=1` prints `[batch-audit]`, which names the kernel that did each batched
+  projection and splits it by Talker / Code Predictor / speech decoder. This is how you prove a
+  flag did what it claims: with `QWEN_PREFILL_MATMAT=1` on an AMX host the Talker's 39.5 GMAC
+  sit on `bf16 AMX tiles`, and adding `QWEN_NO_AMX=1` moves the *same* GMAC to
+  `bf16 AVX-512 dpbf16`. A number that does not move under its own control was not measuring
+  what you thought.
+- `QWEN_SERVE_PROFILE=1` prints `[serve-profile]`: per-stage milliseconds, the mean number of
+  active slots, and — the line to read before trusting anything about batching —
+  `decoder batch: calls / mean` with `max slots`. A mean of 1.00 means the batch never formed,
+  whatever the flag says.
+
+### Is a flag even declarable?
+
+`[FLAGS]` can only report what `g_qwen_reported_flags[]` lists, so a flag the engine reads but
+never declares is one a deployment cannot audit — `check-flags` will happily pass while the
+process runs a configuration nobody asked for. `make check-flag-registry` compares the two sets
+in both directions and fails if they differ; it runs inside `make test-all`.
 
 ## 8. Levers outside the register
 
@@ -277,7 +300,7 @@ process arguments, which a `ps` can read months later.
 
 ---
 
-## 9. What applies on which ISA, and what x86 does not have yet
+## 9. What applies on which ISA, and what does not port
 
 A profile written on one architecture does not port by copying. Three groups:
 

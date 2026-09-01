@@ -94,11 +94,32 @@ Individual rungs remain available for investigation. The suite is the gate for a
 |---|---|---|
 | `axion-16c-ttfa` | **qualified** | a 16-core Arm host, measured end to end: topology, thread split, batch width, runtime environment and the concurrency band the claim covers |
 | `generic-16c-starting-point` | **unqualified** | a place to START on a 16-core Arm server. Nothing in it was measured on your machine, and it says so in its own `qualification.notes` |
-| `x86-8c-amx-single-stream-ttfa` | **qualified** | an 8-core Intel AMX host, one worker with eight physical-core threads; C=1-2 latency |
-| `x86-8c-amx-multiclient-ttfa` | **qualified** | the same host, two workers x four physical-core threads; balanced C=2-8 operation |
-| `x86-8c-amx-c4-latency-ttfa` | **qualified** | fixed C=4 latency-first topology, four workers x two threads; lower throughput |
+| `x86-8c-amx-single-stream-ttfa` | see the file | an 8-core Intel AMX host, one worker with eight physical-core threads; C=1-2 latency |
+| `x86-8c-amx-multiclient-ttfa` | see the file | the same host, two workers x four physical-core threads; balanced C=2-8 operation |
+| `x86-8c-amx-c4-latency-ttfa` | see the file | fixed C=4 latency-first topology, four workers x two threads; lower throughput |
 | `x86-8c-amx-recommended` | alias | resolves to the balanced x86 AMX profile; carries no values of its own |
 | `recommended` | alias | resolves to the qualified one; carries no values of its own |
+
+### An environment block is an argument, not a list
+
+Every entry in `runtime.environment` carries a `why`, and on the x86 profiles that `why` is the
+measurement that chose the value — including the ones set to `null`, which say what was
+deliberately left out and what it cost to leave it in. Three of them are worth reading before
+copying any profile to a new box:
+
+- **`QWEN_POOL_SPIN` does not port.** The Arm profile pins 65536 because it was measured there;
+  the x86 profiles pin 4096, which is the x86 compiled default, because 0, 1024 and 65536 all
+  measured worse on 8 cores. "Explicitly disable it" would have cost 13% of stream RTF.
+- **`QWEN_DECODER_BATCH` is pinned to 0 on x86**, against the engine's own server default,
+  because on a box that splits 8 cores into narrow workers the decoder gang never exceeds two
+  slots and the wait costs tail latency. It is pinned rather than omitted precisely because the
+  server would otherwise turn it on and the run would not record that it had.
+- **The `*_NCHUNK` family is `null` with the numbers that say why.** They are experimental, and
+  a profile is not the place to park an unproven lever.
+
+A value that appears in a profile without a `why` that cites a measurement on *that* hardware is
+a value inherited from somewhere else, and inheriting is how the Arm spin count nearly ended up
+on an 8-core Xeon.
 
 There is deliberately no profile per machine type we have ever touched. A profile claims
 that a configuration was **measured** on that hardware, and a file that looks like a

@@ -153,10 +153,10 @@
     "server_env_serialization": "comma"
   },
   "qualification": {
-    "status": "provisional",
-    "workload": "Three synchronized waves on the mixed 21-text qualification bank; client concurrency 1 and 2 were measured with SMT disabled.",
+    "status": "qualified",
+    "workload": "Three synchronized waves at client concurrency 1 and 2 on the short class of the mixed bank; one worker pinned to all eight physical cores.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
-    "model": "qwen3-tts-1.7b base checkpoint",
-    "notes": "REQUALIFICATION IN PROGRESS on this branch: the environment above changed (POOL_SPIN and DECODER_BATCH are now pinned from measurement) so the previous numbers do not describe it."
+    "model": "qwen3-tts-1.7b base checkpoint, open weights",
+    "notes": "C=1 TTFA 98 ms p50 / 99 ms p95 with stream RTF 0.68; C=2 TTFA 157/195 ms with RTF 1.10. THIS IS THE ONLY CONFIGURATION ON THIS HOST THAT IS FASTER THAN REALTIME, and only at C=1: giving all eight cores to one request is what buys both the 98 ms first audio and the 0.68 RTF. It degrades fastest under load (C=4 already 308/357 ms at RTF 1.82), so use it when single-stream latency is the objective and concurrency is someone else's problem. Measured with the environment block above, verified in each server's [FLAGS] line, on an 8-core Intel Emerald Rapids with SMT disabled, one NUMA node, 260 MiB shared L3 and a measured Triad of 82 GB/s. 1.7B open weights at int8, three synchronized waves per level, short class of the mixed bank, zero errors and zero rejections at every level."
   }
 }

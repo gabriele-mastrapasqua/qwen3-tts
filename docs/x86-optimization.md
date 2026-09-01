@@ -131,6 +131,53 @@ The remaining AVX2-only hot paths got true AVX-512 twins, plus two new levers
 
 ---
 
+### AMX: two consumers, two different jobs
+
+On Sapphire Rapids and Emerald Rapids (GCP `c4`, AWS `m7i`, bare-metal Xeon 4th/5th gen) the
+build picks up `amx_tile`, `amx_int8` and `amx_bf16`, and `--caps` says so:
+
+```
+  x86 amx int8:     AMX ACTIVE (tile 16x64 int8 GEMM for batched matmat; QWEN_NO_AMX=1 disables)
+  x86 amx bf16:     AMX ACTIVE (tile 16x32 bf16 GEMM for batched matmat; QWEN_NO_AMX=1 disables)
+```
+
+The two are used by different parts of the engine, and a benchmark that turns *both* off
+measures a sum of two unrelated things. Measured on an 8-core Emerald Rapids with SMT off,
+1.7B open weights at int8, two pre-forked workers of four threads, three waves:
+
+| control | C=1 TTFA | C=4 TTFA p50 / p95 | C=4 stream RTF | req/s |
+|---|---:|---:|---:|---:|
+| AMX fully on | 135 ms | 251 / 324 ms | 1.50 | 1.38 |
+| `QWEN_NO_AMX_BF16=1` | **188 ms** | **374 / 556 ms** | 1.54 | 1.34 |
+| `QWEN_NO_AMX_INT8=1` | 134 ms | 258 / 337 ms | **1.64** | **1.24** |
+| `QWEN_NO_AMX=1` | 196 ms | 370 / 601 ms | 1.72 | 1.20 |
+
+- **AMX BF16 is first audio.** It runs the prefill projections (`QWEN_PREFILL_MATMAT`), and
+  removing it costs 39% of C=1 TTFA and 72% of C=4 p95 while leaving stream RTF alone.
+- **AMX INT8 is sustained throughput.** It runs the batched decode GEMM, and removing it costs
+  9% of RTF and 10% of throughput while leaving TTFA alone.
+- They compose: disabling both gives the TTFA of the first row and the RTF of the second.
+
+So on a machine with AMX the honest summary is *not* "AMX is worth 30%". It is: AMX BF16 pays
+for the prefill, which is what a listener experiences as responsiveness, and AMX INT8 pays for
+the decode, which is what decides how many concurrent streams the box carries.
+
+**Where AMX is absent** — Zen4/Zen5, Ice Lake, anything before Sapphire Rapids — the same work
+falls to the shape-aware AVX-512 paths, and the VNNI tiling is what matters there: with AMX
+disabled, additionally setting `QWEN_NO_VNNI_TILE=1` cost a further 10% of throughput and 7% of
+stream RTF on the same host.
+
+### A bandwidth-poor box does not become fast because it has AMX
+
+The same 8-core Emerald Rapids measures **82 GB/s** of Triad against 336 GB/s on a 16-core
+Arm Neoverse-V2 host, and it shows: at C=4 it sustains stream RTF ~1.45 while the Arm box holds
+0.72. First audio is competitive (C=4 p95 under 350 ms), sustained realtime past one stream is
+not. AMX buys the compute-bound half of the problem; it cannot buy memory bandwidth, and this
+workload re-reads the Code Predictor weights 16 times per frame. Choose an AMX box for TTFA
+under concurrency, and count cores and GB/s for the number of realtime streams.
+
+---
+
 ### x86 shape controls
 
 The x86 matrix paths expose the same kind of measured, runtime-selectable tiling control used by the ARM backend, without changing the default path:

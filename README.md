@@ -437,6 +437,7 @@ curl -s http://localhost:8080/v1/audio/speech \
 > deployment profiles and the benchmark suite → [docs/serving-operations.md](docs/serving-operations.md)
 > · every runtime flag, its default and why they travel together → [docs/feature-flags.md](docs/feature-flags.md)
 > · a 16-core Arm box measured across every rung → [docs/reference-arm-16c.md](docs/reference-arm-16c.md)
+> · an 8-core Intel AMX box, and what AMX buys per stage → [docs/reference-x86-8c-amx.md](docs/reference-x86-8c-amx.md)
 
 ### Streaming
 

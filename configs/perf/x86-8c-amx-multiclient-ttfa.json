@@ -153,10 +153,10 @@
     "server_env_serialization": "comma"
   },
   "qualification": {
-    "status": "provisional",
-    "workload": "Three synchronized waves at client concurrency 2, 4, 6 and 8 on the mixed 21-text qualification bank; SMT was disabled and each worker was pinned to a physical-core slice.",
+    "status": "qualified",
+    "workload": "Three synchronized waves at client concurrency 1, 2, 4, 6 and 8 on the short class of the mixed bank; two workers, each pinned to four physical cores.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
-    "model": "qwen3-tts-1.7b base checkpoint",
-    "notes": "REQUALIFICATION IN PROGRESS on this branch: the environment above changed (POOL_SPIN and DECODER_BATCH are now pinned from measurement) so the previous numbers do not describe it."
+    "model": "qwen3-tts-1.7b base checkpoint, open weights",
+    "notes": "TTFA p50/p95 and stream RTF: C=1 134/135 ms at 1.02, C=2 138/223 at 1.05, C=4 245/259 at 1.49, C=6 318/374 at 1.88, C=8 440/500 at 2.34. Throughput 0.52, 1.01, 1.39, 1.61, 1.74 req/s. This topology has the best measured throughput at every level from C=4 up and the best p95 at C=4 and C=6, which is why it is the recommended one. SCOPE, STATED PLAINLY: first audio holds under 400 ms p95 out to C=6, but SUSTAINED STREAM RTF IS ABOVE 1 FROM C=2 ONWARDS - this host serves several concurrent requests with a good time to first audio and keeps ONE of them realtime. That is a memory bandwidth result, not a kernel one. Effective batch is not client concurrency: at C=4 the measured in-flight batch is 3.10 in the system, about 1.55 per worker. Measured with the environment block above, verified in each server's [FLAGS] line, on an 8-core Intel Emerald Rapids with SMT disabled, one NUMA node, 260 MiB shared L3 and a measured Triad of 82 GB/s. 1.7B open weights at int8, three synchronized waves per level, short class of the mixed bank, zero errors and zero rejections at every level."
   }
 }
