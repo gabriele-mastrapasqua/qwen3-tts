@@ -218,8 +218,11 @@ static int run_matmat_case(const char *name, int in_dim, int q_dim, int kv_dim,
     qwen_matmat_int8(q_ref, wq, sq, x, q_dim, in_dim, B);
     qwen_matmat_int8(k_ref, wk, sk, x, kv_dim, in_dim, B);
     qwen_matmat_int8(v_ref, wv, sv, x, kv_dim, in_dim, B);
+    qwen_amx_weight_cache_reset();
+    double cold_t0 = now_ns();
     qwen_matmat_int8_qkv(q, k, v, wq, sq, wk, sk, wv, sv,
                          x, in_dim, q_dim, kv_dim, B);
+    double cold_ns = now_ns() - cold_t0;
     double direct_samples[64], combined_samples[64];
     if (reps > (int)(sizeof direct_samples / sizeof direct_samples[0])) reps = 64;
     for (int r = 0; r < reps; r++) {
@@ -235,8 +238,9 @@ static int run_matmat_case(const char *name, int in_dim, int q_dim, int kv_dim,
     }
     double direct_ns = median(direct_samples, reps);
     double combined_ns = median(combined_samples, reps);
-    printf("%s B=%d direct_ns=%.0f qkv_ns=%.0f speedup=%.3fx max_abs=%.3e/%.3e/%.3e\n",
-           name, B, direct_ns, combined_ns, direct_ns / combined_ns,
+    printf("%s B=%d cold_ns=%.0f direct_ns=%.0f qkv_ns=%.0f speedup=%.3fx "
+           "max_abs=%.3e/%.3e/%.3e\n",
+           name, B, cold_ns, direct_ns, combined_ns, direct_ns / combined_ns,
            err, err_k, err_v);
 
     free(wq); free(wk); free(wv); free(sq); free(sk); free(sv); free(x);
