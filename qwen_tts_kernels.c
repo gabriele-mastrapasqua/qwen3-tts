@@ -2439,10 +2439,12 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint8_t *pW
         _tile_zero(0); _tile_zero(1);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXb + (size_t)kc * 32 * (size_t)B, cstride);
-            const void *w0 = pW ? pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024 :
-                                 W + (size_t)r * cols + (size_t)kc * 32;
-            const void *w1 = pW ? pW + ((size_t)((r >> 4) + 1) * wblocks + (size_t)kc) * 1024 :
-                                 W + (size_t)(r + 16) * cols + (size_t)kc * 32;
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 32);
+            const void *w1 = pW
+                ? (const void *)(pW + ((size_t)((r >> 4) + 1) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)(r + 16) * cols + (size_t)kc * 32);
             _tile_loadd(2, w0, pW ? 64 : wstride);
             _tile_loadd(3, w1, pW ? 64 : wstride);
             _tile_dpbf16ps(0, 2, 4);
@@ -2467,8 +2469,9 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint8_t *pW
         _tile_zero(0);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXb + (size_t)kc * 32 * (size_t)B, cstride);
-            const void *w0 = pW ? pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024 :
-                                 W + (size_t)r * cols + (size_t)kc * 32;
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 32);
             _tile_loadd(2, w0, pW ? 64 : wstride);
             _tile_dpbf16ps(0, 2, 4);
         }
@@ -2826,10 +2829,12 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const uint8_t *pW,
         _tile_zero(0); _tile_zero(1);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXt + (size_t)kc * 64 * (size_t)B, cstride);
-            const void *w0 = pW ? pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024 :
-                                 W + (size_t)r * cols + (size_t)kc * 64;
-            const void *w1 = pW ? pW + ((size_t)((r >> 4) + 1) * wblocks + (size_t)kc) * 1024 :
-                                 W + (size_t)(r + 16) * cols + (size_t)kc * 64;
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 64);
+            const void *w1 = pW
+                ? (const void *)(pW + ((size_t)((r >> 4) + 1) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)(r + 16) * cols + (size_t)kc * 64);
             _tile_loadd(2, w0, pW ? 64 : cols);
             _tile_loadd(3, w1, pW ? 64 : cols);
             _tile_dpbssd(0, 2, 4);
@@ -2854,8 +2859,9 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const uint8_t *pW,
         _tile_zero(0);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXt + (size_t)kc * 64 * (size_t)B, cstride);
-            const void *w0 = pW ? pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024 :
-                                 W + (size_t)r * cols + (size_t)kc * 64;
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 64);
             _tile_loadd(2, w0, pW ? 64 : cols);
             _tile_dpbssd(0, 2, 4);
         }
