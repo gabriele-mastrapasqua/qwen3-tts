@@ -206,7 +206,7 @@ both belong before any number.
 | flag | default | effect |
 |---|---|---|
 | `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit (AMX or ARM BF16), else BLAS | `=0` routes prefill projections back through BLAS, `=1` forces the native matmat |
-| `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably costs the accent on a finetune** — measured language identification 96% → 38%. Base models only, and the server says so when you turn it on |
+| `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably degrades output quality on some models.** Base models only, and the server says so when you turn it on |
 | `QWEN_KAI_NCHUNK` **(ARM only)** | 384 | sub-tiles the KleidiAI GEMM's n dimension so the second height pass finds the packed RHS in cache. `=0` restores one kernel call per slice |
 | `QWEN_KAI_OPS` **(ARM only)** | all families on | comma list restricting which KleidiAI families may be used; empty means every one |
 | `QWEN_KAI_REPEAT` **(ARM only)** | off | `=1` times a second identical call — a microbenchmark, not a serving flag |

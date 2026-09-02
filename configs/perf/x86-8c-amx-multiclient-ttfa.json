@@ -97,7 +97,7 @@
       },
       "QWEN_PREFILL_QUANT": {
         "value": null,
-        "why": "Deliberately absent. It frees the bf16 copy but costs the accent on a finetune (measured language identification 96% -> 38%). The server prints 'quantized prefill OFF' so a log can be audited after the fact.",
+        "why": "Deliberately absent. It frees the bf16 copy but measurably degrades output quality on some models. The server prints 'quantized prefill OFF' so a log can be audited after the fact.",
         "revert": "QWEN_PREFILL_QUANT=1, on base models only"
       },
       "QWEN_CP_PREFILL2": {

@@ -1090,8 +1090,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --eos-topk <n>             topk only: rank to lift EOS to (50)\n");
                 fprintf(stderr, "  --emotion-weight <w>       dose the steer --emotion applies (recipe: 12).\n");
                 fprintf(stderr, "                             w12 was calibrated on CLONES, which resist emoting.\n");
-                fprintf(stderr, "                             A full finetune is already plastic, so w12 can\n");
-                fprintf(stderr, "                             overshoot — and the excess shows up as lost accent.\n");
+                fprintf(stderr, "                             A model that emotes easily can overshoot at w12,\n");
+                fprintf(stderr, "                             and the excess shows up as degraded output.\n");
                 fprintf(stderr, "  --emotion-layers <A-B>     steer band for --emotion (recipe: 21-25)\n");
                 fprintf(stderr, "  -j, --threads <int>        Number of threads (0=auto)\n");
                 fprintf(stderr, "  -I, --instruct <text>      Style instruction (1.7B only)\n");
@@ -1112,9 +1112,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
                 fprintf(stderr, "  --list-speakers            List the speakers this model declares, then exit\n");
                 fprintf(stderr, "  --speaker-map <dir|json>   Take the name->slot table from ANOTHER model.\n");
-                fprintf(stderr, "                             For GRAFTS: a grafted model has the finetune's\n");
+                fprintf(stderr, "                             For GRAFTS: a grafted model has the donor model's\n");
                 fprintf(stderr, "                             weights but the parent's config, so -s <name>\n");
-                fprintf(stderr, "                             cannot resolve. Point this at the source finetune\n");
+                fprintf(stderr, "                             cannot resolve. Point this at the source model\n");
                 fprintf(stderr, "                             and names work again (slots come from that file).\n");
                 fprintf(stderr, "  --speaker-id <n>           Select a codec slot directly (bypasses name lookup;\n");
                 fprintf(stderr, "                             pool slots are not contiguous — read voices.json)\n");
@@ -1139,7 +1139,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --quant-mixed              int4 Talker + int8 CP (best CUDA quant: q4 Talker win, no CP degradation)\n");
-                fprintf(stderr, "  --quant-mixed-cpu          int8 Talker + int4 CP (best CPU quant: sub-realtime AND keeps the accent;\n");
+                fprintf(stderr, "  --quant-mixed-cpu          int8 Talker + int4 CP (best CPU quant: sub-realtime AND keeps output quality;\n");
                 fprintf(stderr, "                             an int4 Talker drops the language ~1 seed in 5)\n");
                 fprintf(stderr, "  --quant-mixed-int6[=SPEC]  PER-LAYER Talker map: int8 on the layers the sensitivity profile\n");
                 fprintf(stderr, "                             marked critical, q6_0 (6-bit, fp16 scale/32) on the rest.\n");

@@ -1683,11 +1683,11 @@ static void server_default_memory_levers(qwen_tts_ctx_t *ctx) {
     if (on) {
         setenv("QWEN_FREE_BF16", "1", 0);
         fprintf(stderr, "[serve] quantized prefill ON (explicitly requested): frees the bf16 "
-                        "(~4 GB on the 1.7B) but MEASURABLY COSTS THE ACCENT on a finetune — "
-                        "language identification accuracy 96%% -> 38%% when measured. Base models only.\n");
+                        "(~4 GB on the 1.7B) but MEASURABLY DEGRADES OUTPUT QUALITY on some "
+                        "models. Base models only.\n");
     } else {
-        fprintf(stderr, "[serve] quantized prefill OFF (default: it loses the accent on "
-                        "finetunes) — QWEN_PREFILL_QUANT=1 to opt in on a base model\n");
+        fprintf(stderr, "[serve] quantized prefill OFF (default: it can degrade output "
+                        "quality) — QWEN_PREFILL_QUANT=1 to opt in on a base model\n");
     }
 }
 
