@@ -103,6 +103,17 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B);
 
+/* Return non-zero when the native x86 batched QKV path ran. */
+int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
+                         const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
+                         const float *X, int in_dim, int q_dim, int kv_dim, int B);
+
+int qwen_matmat_int8_qkv(float *q, float *k, float *v,
+                         const int8_t *Wq, const float *sq,
+                         const int8_t *Wk, const float *sk,
+                         const int8_t *Wv, const float *sv,
+                         const float *X, int in_dim, int q_dim, int kv_dim, int B);
+
 void qwen_matvec_bf16_qkv(float *q, float *k, float *v,
                            const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
                            const float *x, int in_dim, int q_dim, int kv_dim);

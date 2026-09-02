@@ -1644,6 +1644,38 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
             }
             return;
         }
+        batch_gather(Xt, src, B, cols, srcstride, idx);
+        if (qwen_matmat_int8_qkv(Yt, Yt + (size_t)q_rows * B,
+                                 Yt + (size_t)(q_rows + kv_rows) * B,
+                                 Wqi, Wqs, Wki, Wks, Wvi, Wvs,
+                                 Xt, cols, q_rows, kv_rows, B)) {
+            batch_scatter(dq, Yt, B, q_rows, NULL);
+            batch_scatter(dk, Yt + (size_t)q_rows * B, B, kv_rows, NULL);
+            batch_scatter(dv, Yt + (size_t)(q_rows + kv_rows) * B, B, kv_rows, NULL);
+            if (qwen_matmat_stats_enabled())
+                qwen_matmat_stats_note_bytes(
+                    qwen_proj_weight_bytes(Wqb, Wqi, Wqq, q_rows, cols) +
+                    qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
+                    qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
+            return;
+        }
+    }
+    if (B > 1 && contig && !force_matvec && !g_batch_nomatmul &&
+        Wqb && Wkb && Wvb && !Wqq && !Wkq && !Wvq) {
+        batch_gather(Xt, src, B, cols, srcstride, idx);
+        if (qwen_matmat_bf16_qkv(Yt, Yt + (size_t)q_rows * B,
+                                 Yt + (size_t)(q_rows + kv_rows) * B,
+                                 Wqb, Wkb, Wvb, Xt, cols, q_rows, kv_rows, B)) {
+            batch_scatter(dq, Yt, B, q_rows, NULL);
+            batch_scatter(dk, Yt + (size_t)q_rows * B, B, kv_rows, NULL);
+            batch_scatter(dv, Yt + (size_t)(q_rows + kv_rows) * B, B, kv_rows, NULL);
+            if (qwen_matmat_stats_enabled())
+                qwen_matmat_stats_note_bytes(
+                    qwen_proj_weight_bytes(Wqb, Wqi, Wqq, q_rows, cols) +
+                    qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
+                    qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
+            return;
+        }
     }
     qwen_batch_proj_q(dq, Wqb, Wqi, Wqs, Wqq, src, q_rows,  cols, srcstride, B, idx,
                       force_matvec, Xt, Yt);
