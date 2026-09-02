@@ -619,6 +619,18 @@ else
 endif
 	@/tmp/x86_qkv_bench $(X86_QKV_THREADS) $(X86_QKV_REPS)
 
+X86_AMX_B32_BENCH_SRC = tests/x86_amx_b32_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
+                        qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+x86-amx-b32-bench: $(INGOT_LIB)
+ifeq ($(UNAME_S),Darwin)
+	@clang $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK -march=native \
+	  $(X86_AMX_B32_BENCH_SRC) $(INGOT_LIB) -framework Accelerate -lm -o /tmp/x86_amx_b32_bench
+else
+	@$(CC) $(PARITY_CF) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas $(ARCH_FLAGS) \
+	  $(X86_AMX_B32_BENCH_SRC) $(INGOT_LIB) -lopenblas -lm -lpthread -o /tmp/x86_amx_b32_bench
+endif
+	@QWEN_AMX_B32=1 /tmp/x86_amx_b32_bench
+
 BOX ?= $(shell date +%Y-%m-%d)_$(shell uname -m)-$(shell hostname | tr -cd 'a-zA-Z0-9-')
 
 server-hw-check: $(TARGET) $(MEMBW_BIN)
@@ -1145,7 +1157,7 @@ test-it-ryan: test-small-it
 .PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
-	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench
+	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
         emotion-para-demo para-demo \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all \

@@ -211,7 +211,7 @@ static const char *const g_qwen_reported_flags[] = {
     /* kernel dispatch — which GEMM, dot or conv actually runs */
     "QWEN_NO_AMX", "QWEN_NO_AMX_BF16", "QWEN_NO_AMX_INT8", "QWEN_NO_AMX_Q4", "QWEN_NO_VNNI",
     "QWEN_NO_VNNI_TILE", "QWEN_NO_VNNI_QKV", "QWEN_NO_X86_QKV", "QWEN_NO_VNNI_ROWSUM",
-    "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
+    "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_AMX_B32", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
     "QWEN_NO_BF16_MATMUL", "QWEN_NO_SDOT", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA", "QWEN_ARM_BFDOT",
     "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
     "QWEN_Q6_SCALAR", "QWEN_Q8_SCALAR_ACT", "QWEN_NO_Q8REPACK", "QWEN_NO_SIN_POLY",
@@ -2066,6 +2066,11 @@ static int qwen_amx_prepack_enabled(void) {
     return v;
 }
 
+static int qwen_amx_b32_enabled(void) {
+    const char *e = getenv("QWEN_AMX_B32");
+    return e && e[0] == '1';
+}
+
 static void *qwen_amx_pack_weights(const void *source, int rows, int cols, int kind) {
     if (!qwen_amx_prepack_enabled() || !source || rows < 16 || cols <= 0) return NULL;
     const int kstep = kind == QWEN_AMX_WEIGHT_BF16 ? 32 : 64;
@@ -2500,6 +2505,7 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint8_t *pW
         }
     }
 }
+
 typedef struct {
     float *Y; const uint16_t *W; const uint8_t *pW;
     const uint16_t *pXb; const uint16_t *Xb;
@@ -2891,6 +2897,83 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const uint8_t *pW,
         }
     }
 }
+
+static int int8_matmat_amx_b32_run(float *Y, const int8_t *W, const float *scale,
+                                   const float *X, int rows, int cols) {
+    if (!Y || !W || !scale || !X || rows < 16 || (rows & 15) != 0 || cols < 64)
+        return 0;
+
+    const int B = 32;
+    const int kfull = cols & ~63;
+    const int nchunk = kfull >> 6;
+    if (nchunk <= 0) return 0;
+
+    int8_t *qXt = mm_scratch_qx((size_t)B * cols);
+    int8_t *pXt = mm_scratch_pack((size_t)kfull * B);
+    if (!qXt || !pXt) return 0;
+    float sx[32];
+    for (int b = 0; b < B; b++)
+        sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+    amx_pack_act_int8(pXt, qXt, cols, kfull, 16);
+    amx_pack_act_int8(pXt + (size_t)kfull * 16,
+                      qXt + (size_t)16 * cols, cols, kfull, 16);
+
+    const uint8_t *pW = (const uint8_t *)qwen_amx_pack_weights(
+        W, rows, cols, QWEN_AMX_WEIGHT_INT8);
+    const int wblocks = cols >> 6;
+    qwen_amx_tilecfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.palette_id = 1;
+    cfg.rows[0] = 16; cfg.colsb[0] = 64;
+    cfg.rows[1] = 16; cfg.colsb[1] = 64;
+    cfg.rows[2] = 16; cfg.colsb[2] = 64;
+    cfg.rows[4] = 16; cfg.colsb[4] = 64;
+    cfg.rows[5] = 16; cfg.colsb[5] = 64;
+    qwen_amx_prepare_config(&cfg, 0x40000u);
+
+    int32_t cbuf0[16 * 16] __attribute__((aligned(64)));
+    int32_t cbuf1[16 * 16] __attribute__((aligned(64)));
+    for (int r = 0; r < rows; r += 16) {
+        _tile_zero(0);
+        _tile_zero(1);
+        for (int kc = 0; kc < nchunk; kc++) {
+            const size_t act_offset = (size_t)kc * 64 * 16;
+            _tile_loadd(4, pXt + act_offset, 64);
+            _tile_loadd(5, pXt + (size_t)kfull * 16 + act_offset, 64);
+            const void *w = pW
+                ? (const void *)((const uint8_t *)pW +
+                                 ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 64);
+            _tile_loadd(2, w, pW ? 64 : cols);
+            _tile_dpbssd(0, 2, 4);
+            _tile_dpbssd(1, 2, 5);
+        }
+        _tile_stored(0, cbuf0, 64);
+        _tile_stored(1, cbuf1, 64);
+        for (int m = 0; m < 16; m++) {
+            const int rr = r + m;
+            const int8_t *w = W + (size_t)rr * cols;
+            const float s = scale[rr];
+            for (int b = 0; b < B; b++) {
+                int32_t sum = b < 16 ? cbuf0[m * 16 + b] : cbuf1[m * 16 + b - 16];
+                const int8_t *qb = qXt + (size_t)b * cols;
+                for (int kk = kfull; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
+                Y[(size_t)rr * B + b] = (float)sum * s * sx[b];
+            }
+        }
+    }
+    qwen_amx_finish_config();
+    return 1;
+}
+
+int qwen_matmat_int8_amx_b32(float *Y, const int8_t *W, const float *scale,
+                             const float *X, int rows, int cols) {
+    if (qwen_amx_b32_enabled() && qwen_amx_int8_ready() &&
+        int8_matmat_amx_b32_run(Y, W, scale, X, rows, cols)) return 1;
+    qwen_matmat_int8(Y, W, scale, X, rows, cols, 32);
+    return 0;
+}
+
 typedef struct {
     float *Y; const int8_t *W; const uint8_t *pW; const float *scale;
     const int8_t *pXt; const int8_t *qXt; const float *sx;
@@ -3023,6 +3106,14 @@ static void q4_amx_task(size_t tid, size_t nt, void *vc) {
     q4_matmat_amx_slice(c->Y, c->W, c->pXt, c->qXt, c->sx, c->corr, r0, r1, c->cols, c->B);
 }
 
+#endif
+
+#if !defined(__AMX_INT8__) || !defined(__AMX_TILE__)
+int qwen_matmat_int8_amx_b32(float *Y, const int8_t *W, const float *scale,
+                             const float *X, int rows, int cols) {
+    qwen_matmat_int8(Y, W, scale, X, rows, cols, 32);
+    return 0;
+}
 #endif
 
 #if defined(__AVX512VNNI__)

@@ -103,6 +103,10 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B);
 
+/* Run the opt-in x86 AMX B=32 kernel when QWEN_AMX_B32=1. */
+int qwen_matmat_int8_amx_b32(float *Y, const int8_t *W, const float *scale,
+                             const float *X, int rows, int cols);
+
 /* Return non-zero when the native x86 batched QKV path ran. */
 int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
                          const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
