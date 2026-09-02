@@ -127,6 +127,9 @@ void qwen_linear(float *y, const float *x, const float *W, const float *bias,
 void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
                       const float *x, int rows, int cols);
 
+/* Drop cached x86 VNNI weight row sums before unloading a model. */
+void qwen_vnni_row_sums_reset(void);
+
 void qwen_matvec_int8_qkv(float *q, float *k, float *v,
                            const int8_t *Wq, const float *sq,
                            const int8_t *Wk, const float *sk,

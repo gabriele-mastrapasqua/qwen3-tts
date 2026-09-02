@@ -68,6 +68,7 @@ static double median(double *values, int count) {
 
 static int run_case(const char *name, int in_dim, int q_dim, int kv_dim,
                     int reps) {
+    qwen_vnni_row_sums_reset();
     const size_t q_count = (size_t)q_dim * in_dim;
     const size_t kv_count = (size_t)kv_dim * in_dim;
     int8_t *wq = (int8_t *)aligned_zero(q_count);
@@ -155,6 +156,7 @@ static int run_case(const char *name, int in_dim, int q_dim, int kv_dim,
 
 static int run_matmat_case(const char *name, int in_dim, int q_dim, int kv_dim,
                            int B, int reps) {
+    qwen_vnni_row_sums_reset();
     const size_t q_count = (size_t)q_dim * in_dim;
     const size_t kv_count = (size_t)kv_dim * in_dim;
     const size_t q_out = (size_t)q_dim * B;

@@ -809,6 +809,7 @@ void qwen_track_override(qwen_tts_ctx_t *ctx, void *ptr) {
 
 void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     if (!ctx) return;
+    qwen_vnni_row_sums_reset();
     for (int i = 0; i < ctx->n_owned_overrides; i++) free(ctx->owned_overrides[i]);
     free(ctx->owned_overrides);
     for (int i = 0; i < ctx->config.num_layers; i++) free(ctx->layers[i].gate_up_fused_bf16);

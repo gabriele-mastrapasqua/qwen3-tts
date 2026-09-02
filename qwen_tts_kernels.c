@@ -210,7 +210,8 @@ int qwen_arm_bf16_matmat_available(void) {
 static const char *const g_qwen_reported_flags[] = {
     /* kernel dispatch — which GEMM, dot or conv actually runs */
     "QWEN_NO_AMX", "QWEN_NO_AMX_BF16", "QWEN_NO_AMX_INT8", "QWEN_NO_AMX_Q4", "QWEN_NO_VNNI",
-    "QWEN_NO_VNNI_TILE", "QWEN_NO_VNNI_QKV", "QWEN_NO_X86_QKV", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
+    "QWEN_NO_VNNI_TILE", "QWEN_NO_VNNI_QKV", "QWEN_NO_X86_QKV", "QWEN_NO_VNNI_ROWSUM",
+    "QWEN_AMX_PERSIST_CFG", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
     "QWEN_NO_BF16_MATMUL", "QWEN_NO_SDOT", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA", "QWEN_ARM_BFDOT",
     "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
     "QWEN_Q6_SCALAR", "QWEN_Q8_SCALAR_ACT", "QWEN_NO_Q8REPACK", "QWEN_NO_SIN_POLY",
@@ -2003,6 +2004,38 @@ typedef struct {
     uint8_t  rows[8];
     uint8_t  reserved2[8];
 } qwen_amx_tilecfg;
+
+static int qwen_amx_persistent_config(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AMX_PERSIST_CFG");
+        v = !(e && e[0] == '0');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static _Thread_local unsigned qwen_amx_cfg_key;
+static _Thread_local int qwen_amx_cfg_valid;
+
+static void qwen_amx_prepare_config(const qwen_amx_tilecfg *cfg, unsigned key) {
+    if (!qwen_amx_persistent_config() || !qwen_amx_cfg_valid ||
+        qwen_amx_cfg_key != key) {
+        _tile_loadconfig(cfg);
+        if (qwen_amx_persistent_config()) {
+            qwen_amx_cfg_key = key;
+            qwen_amx_cfg_valid = 1;
+        }
+    }
+}
+
+static void qwen_amx_finish_config(void) {
+    if (!qwen_amx_persistent_config()) {
+        _tile_release();
+        qwen_amx_cfg_valid = 0;
+    }
+}
 #endif
 
 static void bf16_matmat_generic(float *Y, const uint16_t *W, const float *X,
@@ -2283,7 +2316,7 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *p
     cfg.rows[2] = 16; cfg.colsb[2] = 64;
     cfg.rows[3] = 16; cfg.colsb[3] = 64;
     cfg.rows[4] = 16; cfg.colsb[4] = (uint16_t)cstride;
-    _tile_loadconfig(&cfg);
+    qwen_amx_prepare_config(&cfg, 0x10000u | (unsigned)cstride);
 
     float cbuf[2][16 * 16] __attribute__((aligned(64)));
 
@@ -2332,7 +2365,7 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *p
             }
         }
     }
-    _tile_release();
+    qwen_amx_finish_config();
 
     for (; r < r1; r++) {
         const uint16_t *w = W + (size_t)r * cols;
@@ -2657,7 +2690,7 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
     cfg.rows[2] = 16; cfg.colsb[2] = 64;
     cfg.rows[3] = 16; cfg.colsb[3] = 64;
     cfg.rows[4] = 16; cfg.colsb[4] = (uint16_t)cstride;
-    _tile_loadconfig(&cfg);
+    qwen_amx_prepare_config(&cfg, 0x20000u | (unsigned)cstride);
 
     int32_t cbuf[2][16 * 16] __attribute__((aligned(64)));
 
@@ -2706,7 +2739,7 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
             }
         }
     }
-    _tile_release();
+    qwen_amx_finish_config();
 
     for (; r < r1; r++) {
         const int8_t *w = W + (size_t)r * cols;
@@ -2771,7 +2804,7 @@ static void q4_matmat_amx_slice(float *Y, const q4_0_block_t *W, const int8_t *p
     cfg.rows[3] = 16; cfg.colsb[3] = 32;
     cfg.rows[4] =  8; cfg.colsb[4] = (uint16_t)cstride;
     cfg.rows[5] =  8; cfg.colsb[5] = (uint16_t)cstride;
-    _tile_loadconfig(&cfg);
+    qwen_amx_prepare_config(&cfg, 0x30000u | (unsigned)cstride);
 
     int8_t  stage[2][16 * 32] __attribute__((aligned(64)));
     int32_t cbuf[2][16 * 16]  __attribute__((aligned(64)));
@@ -2820,7 +2853,7 @@ static void q4_matmat_amx_slice(float *Y, const q4_0_block_t *W, const int8_t *p
             for (int b = 0; b < B; b++)
                 Y[(size_t)(r + m) * B + b] = acc[m * B + b] * sx[b];
     }
-    _tile_release();
+    qwen_amx_finish_config();
 
     for (; r < r1; r++) {
         const q4_0_block_t *wr = W + (size_t)r * nb;
@@ -4527,6 +4560,87 @@ static void int8_matvec_sdot(float *y, const int8_t *qx, float sx,
 
 #if defined(__AVX512VNNI__)
 
+enum { QWEN_VNNI_ROWSUM_MAX = 512 };
+typedef struct {
+    const int8_t *weights;
+    int rows;
+    int cols;
+    int32_t *sums;
+} qwen_vnni_rowsum_entry_t;
+
+static qwen_vnni_rowsum_entry_t g_vnni_rowsums[QWEN_VNNI_ROWSUM_MAX];
+static atomic_int g_vnni_rowsum_count;
+static pthread_mutex_t g_vnni_rowsum_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int qwen_vnni_rowsum_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_VNNI_ROWSUM");
+        v = !(e && e[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static const int32_t *qwen_vnni_row_sums(const int8_t *W, int rows, int cols) {
+    if (!qwen_vnni_rowsum_enabled() || !W || rows <= 0 || cols <= 0) return NULL;
+    const int full_cols = cols & ~63;
+    if (full_cols == 0) return NULL;
+    int n = atomic_load_explicit(&g_vnni_rowsum_count, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        const qwen_vnni_rowsum_entry_t *e = &g_vnni_rowsums[i];
+        if (e->weights == W && e->rows == rows && e->cols == cols) return e->sums;
+    }
+
+    pthread_mutex_lock(&g_vnni_rowsum_mu);
+    n = atomic_load_explicit(&g_vnni_rowsum_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        qwen_vnni_rowsum_entry_t *e = &g_vnni_rowsums[i];
+        if (e->weights == W && e->rows == rows && e->cols == cols) {
+            const int32_t *sums = e->sums;
+            pthread_mutex_unlock(&g_vnni_rowsum_mu);
+            return sums;
+        }
+    }
+    if (n >= QWEN_VNNI_ROWSUM_MAX) {
+        pthread_mutex_unlock(&g_vnni_rowsum_mu);
+        return NULL;
+    }
+    int32_t *sums = (int32_t *)malloc((size_t)rows * sizeof(*sums));
+    if (!sums) {
+        pthread_mutex_unlock(&g_vnni_rowsum_mu);
+        return NULL;
+    }
+    for (int r = 0; r < rows; r++) {
+        const int8_t *row = W + (size_t)r * cols;
+        int32_t sum = 0;
+        for (int k = 0; k < full_cols; k++) sum += (int32_t)row[k];
+        sums[r] = sum;
+    }
+    g_vnni_rowsums[n].weights = W;
+    g_vnni_rowsums[n].rows = rows;
+    g_vnni_rowsums[n].cols = cols;
+    g_vnni_rowsums[n].sums = sums;
+    atomic_store_explicit(&g_vnni_rowsum_count, n + 1, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_rowsum_mu);
+    return sums;
+}
+
+void qwen_vnni_row_sums_reset(void) {
+    pthread_mutex_lock(&g_vnni_rowsum_mu);
+    int n = atomic_load_explicit(&g_vnni_rowsum_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        free(g_vnni_rowsums[i].sums);
+        g_vnni_rowsums[i].weights = NULL;
+        g_vnni_rowsums[i].rows = 0;
+        g_vnni_rowsums[i].cols = 0;
+        g_vnni_rowsums[i].sums = NULL;
+    }
+    atomic_store_explicit(&g_vnni_rowsum_count, 0, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_rowsum_mu);
+}
+
 static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
     float amax = 0.0f;
     for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
@@ -4539,9 +4653,9 @@ static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
     return amax / 127.0f;
 }
 
-static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
-                             const int8_t *W, const float *scale,
-                             int in_dim, int out_dim) {
+static void int8_matvec_vnni_legacy(float *y, const int8_t *qx, float sx,
+                                    const int8_t *W, const float *scale,
+                                    int in_dim, int out_dim) {
     const __m512i v128 = _mm512_set1_epi8((char)128);
     const __m512i ones = _mm512_set1_epi8(1);
     int o = 0;
@@ -4582,15 +4696,67 @@ static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
     }
 }
 
+static void int8_matvec_vnni_rowsum(float *y, const int8_t *qx, float sx,
+                                    const int8_t *W, const float *scale,
+                                    const int32_t *row_sums,
+                                    int in_dim, int out_dim) {
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            __m512i wv1 = _mm512_loadu_si512((const void *)(w1 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+            acc1 = _mm512_dpbusd_epi32(acc1, ua, wv1);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        for (; k < in_dim; k++) { s0 += (int)w0[k] * qx[k]; s1 += (int)w1[k] * qx[k]; }
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+    }
+    if (o < out_dim) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        __m512i acc0 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        for (; k < in_dim; k++) s0 += (int)w0[k] * qx[k];
+        y[o] = (float)s0 * scale[o] * sx;
+    }
+}
+
+static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
+                             const int8_t *W, const float *scale,
+                             const int32_t *row_sums,
+                             int in_dim, int out_dim) {
+    if (row_sums) {
+        int8_matvec_vnni_rowsum(y, qx, sx, W, scale, row_sums, in_dim, out_dim);
+        return;
+    }
+    int8_matvec_vnni_legacy(y, qx, sx, W, scale, in_dim, out_dim);
+}
+
 typedef struct {
-    float *y; const int8_t *qx; float sx; const int8_t *W; const float *scale; int rows, cols;
+    float *y; const int8_t *qx; float sx; const int8_t *W; const float *scale;
+    const int32_t *row_sums; int rows, cols;
 } int8_vnni_ctx;
 static void int8_vnni_task(size_t tid, size_t nt, void *vc) {
     int8_vnni_ctx *c = (int8_vnni_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     int8_matvec_vnni(c->y + r0, c->qx, c->sx, c->W + (size_t)r0 * c->cols,
-                     c->scale + r0, c->cols, r1 - r0);
+                     c->scale + r0, c->row_sums ? c->row_sums + r0 : NULL,
+                     c->cols, r1 - r0);
 }
 
 typedef struct {
@@ -4598,6 +4764,7 @@ typedef struct {
     const int8_t *qx; float sx;
     const int8_t *Wq, *Wk, *Wv;
     const float *sq, *sk, *sv;
+    const int32_t *row_sums_q, *row_sums_k, *row_sums_v;
     int in_dim, q_dim, kv_dim;
 } int8_qkv_vnni_ctx;
 
@@ -4617,8 +4784,11 @@ static void int8_qkv_vnni_task(size_t tid, size_t nt, void *vc) {
         const int hi = hi0 < g1 ? hi0 : g1;
         if (hi <= lo) continue;
         const int r0 = lo - seg[i].base;
+        const int32_t *row_sums = i == 0 ? c->row_sums_q :
+                                   (i == 1 ? c->row_sums_k : c->row_sums_v);
         int8_matvec_vnni(seg[i].y + r0, c->qx, c->sx,
                          seg[i].W + (size_t)r0 * c->in_dim, seg[i].scale + r0,
+                         row_sums ? row_sums + r0 : NULL,
                          c->in_dim, hi - lo);
     }
 }
@@ -4634,6 +4804,10 @@ static int qwen_vnni_qkv_disabled(void) {
     }
     return v;
 }
+#endif
+
+#if !defined(__AVX512VNNI__)
+void qwen_vnni_row_sums_reset(void) {}
 #endif
 
 typedef struct {
@@ -4704,13 +4878,14 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
     if (!vnni_o && cols <= QXV_MAX) {
         int8_t qx_buf[QXV_MAX];
         float sx = quantize_act_int8_x86(qx_buf, x, cols);
+        const int32_t *row_sums = qwen_vnni_row_sums(W, rows, cols);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
-            int8_vnni_ctx c = { y, qx_buf, sx, W, scale, rows, cols };
+            int8_vnni_ctx c = { y, qx_buf, sx, W, scale, row_sums, rows, cols };
             qwen_parallel((size_t)nt, int8_vnni_task, &c);
             return;
         }
-        int8_matvec_vnni(y, qx_buf, sx, W, scale, cols, rows);
+        int8_matvec_vnni(y, qx_buf, sx, W, scale, row_sums, cols, rows);
         return;
     }
 #endif
@@ -4779,8 +4954,12 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
             int8_t qx_buf[QX_MAX_QKV];
             const float sx = quantize_act_int8_x86(qx_buf, x, in_dim);
             const int nt = g_n_threads;
+            const int32_t *row_sums_q = qwen_vnni_row_sums(Wq, q_dim, in_dim);
+            const int32_t *row_sums_k = qwen_vnni_row_sums(Wk, kv_dim, in_dim);
+            const int32_t *row_sums_v = qwen_vnni_row_sums(Wv, kv_dim, in_dim);
             int8_qkv_vnni_ctx c = { q, k, v, qx_buf, sx, Wq, Wk, Wv,
-                                    sq, sk, sv, in_dim, q_dim, kv_dim };
+                                    sq, sk, sv, row_sums_q, row_sums_k, row_sums_v,
+                                    in_dim, q_dim, kv_dim };
             if (nt > 1 && total >= 256) {
                 qwen_parallel((size_t)nt, int8_qkv_vnni_task, &c);
             } else {
