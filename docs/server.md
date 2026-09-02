@@ -172,6 +172,69 @@ top-k/p, rep-penalty, seed) **and clears any prior emotion steering**, so nothin
 > partial-match delta-prefill optimization is preserved). Regression-guarded by `make test-serve-repro`
 > (3 identical requests, bit-identical) and `make test-serve-concurrent` (per-worker clones, corr=1.0).
 
+## Limits, validation and errors
+
+Every POST goes through the same two functions — one precheck on the HTTP envelope, one parse of
+the JSON body — so `/v1/tts`, `/v1/tts/stream` and `/v1/audio/speech` answer identically, and so
+do the plain server and the batched one (`--batch-size`, `--prefork`). A client can be written
+against one table.
+
+| status | when |
+|---|---|
+| `400` | body is not a JSON object, malformed JSON, nesting deeper than 16, a number longer than 40 characters, an **unknown field**, `text` missing or empty, `text` over the length limit, `speed` outside 0.25–4.0, an unknown speaker, `voice_design` on a model that has none |
+| `405` | right path, wrong method — `GET /v1/tts` |
+| `413` | request body larger than the read buffer, refused from the `Content-Length` before the body is read |
+| `415` | a `Content-Type` other than `application/json`: no form data, no multipart, no file upload |
+| `503` | queue full at admission, or a queued request that waited past `--queue-timeout-ms` |
+
+Errors carry an OpenAI-shaped body, and the message says which bound was hit rather than that one
+was:
+
+```json
+{"error":{"message":"unknown field 'voise' - this server implements: text, speaker, language, seed, temperature, top_k, top_p, rep_penalty, instruct, emotion, volume, rate","type":"invalid_request_error","param":null,"code":null}}
+```
+
+An unknown field is **rejected, not ignored**: a typo'd `"voise"` that is silently dropped
+produces a perfectly successful request in the wrong voice, and nothing in the response says so.
+Parameters that have a sensible range are clamped instead of refused — `temperature` to 0–2,
+`top_p` to 0–1, `top_k` to the codec vocabulary, `rep_penalty` to 0.5–2 — because a value out of
+range there has an obvious intent, while an unknown key does not.
+
+### The input-length limit is derived, not a constant
+
+`8192` characters is the compiled ceiling, not the answer. The effective limit is the smaller of
+what a batch slot's prompt budget holds (`QWEN_BATCH_MAX_PROMPT × 3.5` characters, so 1792 at the
+default 512) and what the server can finish inside its per-request cap
+(`--max-request-seconds × 30` characters per second, so 1800 at the default 60 s), floored at 200
+so a tight cap cannot make the server refuse ordinary sentences. A request that could not have
+finished is refused at the door, with a message naming the bound it hit, instead of being killed
+at minute two with a slot already spent:
+
+```json
+{"error":{"message":"text too long: 2000 characters, maximum 1792 - a longer prompt does not fit a batch slot's 512-token budget (QWEN_BATCH_MAX_PROMPT)","type":"invalid_request_error","param":null,"code":null}}
+```
+
+Both ends are configurable — `--max-request-seconds N` / `QWEN_MAX_REQUEST_S` (default 60, `0`
+disables the cap) and `--max-text-chars N` / `QWEN_MAX_TEXT_CHARS` — and the server prints the
+effective pair at startup, so a log can be audited after the fact:
+
+```
+[serve] per-request generation cap: 60 s -> text limit 1792 characters (--max-request-seconds N / --max-text-chars N; 0 disables the cap)
+```
+
+`GET /v1/health` reports the same numbers live, which is how a client discovers the limits it is
+subject to instead of hard-coding them:
+
+```json
+{"status":"ok","scheduler":"running","num_requests_running":0,"num_requests_waiting":0,
+ "queue_max":1,"queue_timeout_ms":0,"max_request_ms":60000,"max_text_chars":1792,
+ "admitted":12,"done":12,"rejected_queue_full":0,"rejected_queue_timeout":0,"timed_out":0}
+```
+
+A deployment profile records the same two knobs, so what a machine was qualified with travels
+with it: see [`configs/perf/README.md`](../configs/perf/README.md) and
+[`serving-operations.md`](serving-operations.md).
+
 ## Performance
 
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads, same text + seed (`--seed 42`). bf16 below;

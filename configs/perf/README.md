@@ -53,6 +53,20 @@ in the talker, the code predictor and the speech decoder.
 **These are deployment recommendations, not engine defaults.** Nothing here is compiled in;
 `recommended.json` does not claim 2x8 is right on every CPU.
 
+### The limits a profile records, and the one that is derived
+
+Four keys in the `server` block are admission and validation rather than throughput, and they are
+in the profile for the same reason the topology is: a deployment that has to remember them will
+forget them. `max_queue` and `queue_timeout_ms` decide who is answered `503` instead of held open,
+`max_request_seconds` caps one request's generation, and `max_text_chars` caps the input.
+
+`max_text_chars` is normally `"unspecified"`, and that does **not** mean unlimited. The server
+then derives the limit from `max_request_seconds` and the batch prompt budget, floors it at 200,
+caps it at the compiled 8192, and reports what it settled on in `GET /v1/health`. It is written
+here anyway, unset, so the shape of the safety envelope is visible in the profile rather than
+discoverable only by reading the engine. Give it a number only when a deployment needs a limit
+**tighter** than the derived one — a larger one is not honoured beyond the ceiling.
+
 ## The profile is a gate, not a document (2026-08-31)
 
 A profile that has to be remembered is a profile that will be forgotten, and the run that

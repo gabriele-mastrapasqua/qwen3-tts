@@ -412,6 +412,31 @@ a 16-core Arm host at concurrency 1, the same three texts truncated to word pref
 first chunk. That is the expected shape and it is worth knowing before promising a latency
 figure for a workload whose text length you have not seen.
 
+### What the server refuses, and where that limit comes from
+
+The same fact has a serving side: a request whose text cannot be finished inside the per-request
+cap is refused at admission rather than started. The input limit is not a constant, it is derived
+from two things the profile already fixes — a batch slot's prompt budget
+(`QWEN_BATCH_MAX_PROMPT x 3.5` characters, 1792 at the default) and the generation cap
+(`--max-request-seconds x 30` characters per second, 1800 at the default 60 s) — and the smaller
+one wins, floored at 200. On a stock server that is 1792 characters, and the startup line says so:
+
+```
+[serve] per-request generation cap: 60 s -> text limit 1792 characters (--max-request-seconds N / --max-text-chars N; 0 disables the cap)
+```
+
+Two consequences worth having in mind before a deployment quotes anything. Lowering
+`max_request_seconds` **tightens the accepted input length** with it, silently, because one is
+computed from the other: a 10 s cap accepts 300 characters. And a profile that leaves
+`max_text_chars` unspecified is not an unlimited server — it is a server that derives its limit,
+reports it in `GET /v1/health` as `max_text_chars`, and refuses anything longer with a `400` that
+names which of the two bounds it hit. Fix a number in the profile only to go *tighter* than the
+derived one.
+
+The rest of the envelope — `405`, `413`, `415`, unknown-field rejection, the `503` at queue full
+or queue timeout, the parameter clamps — is one table in [`server.md`](server.md#limits-validation-and-errors),
+and it is identical on all three POST endpoints and in both server modes.
+
 ---
 
 ## 7. Checking the audio, not only the clock

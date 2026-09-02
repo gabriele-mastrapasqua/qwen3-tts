@@ -195,13 +195,20 @@
           "description": "In-flight cap per worker. client_concurrency is NOT engine batch: with W workers a worker sees B>=2 only when C>=2W."
         },
         "max_queue": {
-          "$ref": "#/definitions/intOrUnspecified"
+          "$ref": "#/definitions/intOrUnspecified",
+          "description": "Requests allowed to WAIT for a slot. A full queue is answered 503 at admission rather than held open."
         },
         "queue_timeout_ms": {
-          "$ref": "#/definitions/intOrUnspecified"
+          "$ref": "#/definitions/intOrUnspecified",
+          "description": "How long a waiting request may sit before it is answered 503. 0 means no deadline on the wait itself."
         },
         "max_request_seconds": {
-          "$ref": "#/definitions/intOrUnspecified"
+          "$ref": "#/definitions/intOrUnspecified",
+          "description": "Per-request generation cap, in seconds. It is also what DERIVES the input-length limit, so it is an availability knob and a validation knob at once. 0 disables the cap and lets one caller hold a slot for as long as the token ceiling allows."
+        },
+        "max_text_chars": {
+          "$ref": "#/definitions/intOrUnspecified",
+          "description": "Input-length limit in characters, passed as --max-text-chars. 'unspecified' does NOT mean unlimited: the server then derives the limit from max_request_seconds and the batch prompt budget, floors it at 200, caps it at the compiled 8192, and reports the effective number in /v1/health. Fix a value here only when a deployment needs a limit tighter than the derived one."
         },
         "worker_affinity": {
           "type": "string"

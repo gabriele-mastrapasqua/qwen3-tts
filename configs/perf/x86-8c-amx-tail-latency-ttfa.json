@@ -55,6 +55,7 @@
     "max_queue": 1,
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
     "worker_affinity": "worker 0 -> CPU 0-1; worker 1 -> 2-3; worker 2 -> 4-5; worker 3 -> 6-7, after SMT is disabled"
   },
   "streaming": {

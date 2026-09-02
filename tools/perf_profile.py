@@ -187,7 +187,8 @@ def argv(prof, model, port):
         a += ["-j", str(sv["threads_per_worker"])]
     for key, flag in (("max_queue", "--max-queue"),
                       ("queue_timeout_ms", "--queue-timeout-ms"),
-                      ("max_request_seconds", "--max-request-seconds")):
+                      ("max_request_seconds", "--max-request-seconds"),
+                      ("max_text_chars", "--max-text-chars")):
         v = sv.get(key)
         if isinstance(v, int):
             a += [flag, str(v)]
