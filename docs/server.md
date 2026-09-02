@@ -131,6 +131,18 @@ curl -s http://localhost:8080/v1/speakers | python3 -m json.tool
 curl -s http://localhost:8080/v1/health
 ```
 
+`200` with `"status":"ok"` means the server can take work; `503` with
+`"status":"unavailable"` means it cannot, and only a **batched** server can say so — its
+scheduler thread is the part that can die under it. `mode` says which server answered:
+
+| mode | `scheduler` | when |
+|---|---|---|
+| `single` | `none` | the plain server (`--serve` without `--batch-size`). There is no scheduler to report, and its absence is not a fault |
+| `batched` | `running` / `down` | `--batch-size N`. `down` before the scheduler has come up, and after it has failed — the one case where health answers `503` |
+
+The counters (`admitted`, `done`, `rejected_queue_full`, `rejected_queue_timeout`, `timed_out`)
+are cumulative for the life of the process, and with `--prefork` each worker keeps its own.
+
 ## Request Body
 
 ```json
@@ -226,9 +238,10 @@ effective pair at startup, so a log can be audited after the fact:
 subject to instead of hard-coding them:
 
 ```json
-{"status":"ok","scheduler":"running","num_requests_running":0,"num_requests_waiting":0,
- "queue_max":1,"queue_timeout_ms":0,"max_request_ms":60000,"max_text_chars":1792,
- "admitted":12,"done":12,"rejected_queue_full":0,"rejected_queue_timeout":0,"timed_out":0}
+{"status":"ok","mode":"batched","scheduler":"running","num_requests_running":0,
+ "num_requests_waiting":0,"queue_max":1,"queue_timeout_ms":0,"max_request_ms":60000,
+ "max_text_chars":1792,"admitted":12,"done":12,"rejected_queue_full":0,
+ "rejected_queue_timeout":0,"timed_out":0}
 ```
 
 A deployment profile records the same two knobs, so what a machine was qualified with travels

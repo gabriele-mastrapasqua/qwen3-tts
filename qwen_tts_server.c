@@ -316,6 +316,7 @@ static void *build_wav(const float *samples, int n_samples, int *out_size) {
 
 typedef struct {
     atomic_int sched_alive;
+    int batched;                /* 1 only when the continuous scheduler thread exists */
     atomic_int running;
     atomic_int waiting;
     atomic_int admitted, done;
@@ -583,23 +584,31 @@ static void srv_init_request_cap(void) {
 static void handle_health(int fd) {
     int alive = atomic_load(&g_srv.sched_alive);
     int waiting = atomic_load(&g_srv.waiting);
-    char json[512];
+    /* The plain server has no scheduler thread, so there is nothing for sched_alive to
+       report and 0 is its resting value. Reading that as "down" made a perfectly healthy
+       single-worker server answer 503 to every health probe -- which is precisely what a
+       load balancer reads as "take this host out of rotation". Only a server that HAS a
+       scheduler can be unavailable for want of one. */
+    int ready = g_srv.batched ? alive : 1;
+    const char *sched = g_srv.batched ? (alive ? "running" : "down") : "none";
+    const char *mode  = g_srv.batched ? "batched" : "single";
+    char json[640];
     snprintf(json, sizeof(json),
-             "{\"status\":\"%s\",\"scheduler\":\"%s\","
+             "{\"status\":\"%s\",\"mode\":\"%s\",\"scheduler\":\"%s\","
              "\"num_requests_running\":%d,\"num_requests_waiting\":%d,"
              "\"queue_max\":%d,\"queue_timeout_ms\":%d,\"max_request_ms\":%d,"
              "\"max_text_chars\":%d,"
              "\"admitted\":%d,\"done\":%d,"
              "\"rejected_queue_full\":%d,\"rejected_queue_timeout\":%d,"
              "\"timed_out\":%d}",
-             alive ? "ok" : "unavailable", alive ? "running" : "down",
+             ready ? "ok" : "unavailable", mode, sched,
              atomic_load(&g_srv.running), waiting,
              g_srv.queue_max, g_srv.queue_timeout_ms, g_srv.max_request_ms,
              srv_max_text_chars(),
              atomic_load(&g_srv.admitted), atomic_load(&g_srv.done),
              atomic_load(&g_srv.rejected_full), atomic_load(&g_srv.rejected_stale),
              atomic_load(&g_srv.timed_out));
-    send_json(fd, alive ? 200 : 503, json);
+    send_json(fd, ready ? 200 : 503, json);
 }
 
 static void handle_speakers(int fd) {
@@ -1734,6 +1743,7 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
                         "excess request will wait without limit and without an error. This is "
                         "the old behaviour, kept only for A/B comparison.\n");
     }
+    g_srv.batched = 1;          /* from here on, health may report the scheduler's state */
     g_srv.queue_max = jq.cap;
     g_srv.slots = max_batch;
     g_srv.queue_timeout_ms = g_cfg_queue_timeout_ms;
