@@ -76,6 +76,7 @@ void qwen_census_report(void *out);
 
 void qwen_matmat_stats_reset(void);
 void qwen_matmat_stats_report(void *out);
+void qwen_kernel_timing_report(void *out);
 void qwen_kernel_selection_report(void *out, int rows, int cols);
 
 int qwen_kernel_selftest(void *out);
@@ -133,7 +134,18 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
 
 /* Drop cached x86 VNNI weight row sums before unloading a model. */
 void qwen_vnni_row_sums_reset(void);
+/* Optional parent-side x86 VNNI weight packing for B>1 matmat. */
+int qwen_vnni_prepack_weight(const int8_t *source, int rows, int cols);
+void qwen_vnni_prepack_stats(int *n_packed, size_t *bytes);
+void qwen_vnni_weight_cache_reset(void);
 void qwen_amx_weight_cache_reset(void);
+
+enum {
+    QWEN_AMX_WEIGHT_BF16 = 1,
+    QWEN_AMX_WEIGHT_INT8 = 2,
+};
+int qwen_amx_prepack_weight(const void *source, int rows, int cols, int kind);
+void qwen_amx_prepack_stats(int *n_packed, size_t *bytes);
 
 void qwen_matvec_int8_qkv(float *q, float *k, float *v,
                            const int8_t *Wq, const float *sq,
@@ -300,6 +312,7 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
 
 int qwen_amx_bf16_available(void);
 int qwen_arm_bf16_matmat_available(void);
+int qwen_avx512_bf16_matmat_available(void);
 
 void qwen_conv1d_int8(float *out, const float *in,
                       const int8_t *Wq, const float *sw, const int32_t *wsum,

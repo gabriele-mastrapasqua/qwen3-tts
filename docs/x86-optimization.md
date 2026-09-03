@@ -178,6 +178,44 @@ under concurrency, and count cores and GB/s for the number of realtime streams.
 
 ---
 
+### A 16-core VNNI-only reference
+
+The Scaleway reference host has 16 physical Zen 5 cores, AVX-512 VNNI/BF16 and no AMX. With
+two workers of eight threads, the short-bank wave reaches TTFA 185/221 ms and stream RTF 1.11
+at C=4. The full mixed-length bank reaches 640/1017 ms and RTF 1.20 at the same concurrency.
+The 10-minute closed-loop soak is stable (`PASS`, 267 completed requests, zero errors), but its
+pooled C=4 RTF is about 1.08 and its TTFA p95 is about 815 ms after warm-up. The complete tables,
+Poisson checks and dispatch census are in
+[`reference-scaleway-16c-vnni.md`](reference-scaleway-16c-vnni.md).
+
+The C=4 census is the important part: 35.6% of counted work is INT8 GEMV and another 18.6% is
+solo/single-slot work; only 32.9% is INT8 VNNI matrix-matrix. This is why a stronger VNNI GEMM
+alone cannot close the gap to RTF 1.0. The profile keeps activation quantization, row-sum reuse,
+GEMV MR=2 and the measured pool/decoder settings, while leaving NCHUNK and MR=4 as candidates.
+
+### oneDNN as a bounded VNNI oracle
+
+The same Scaleway host was measured with a small oneDNN harness using the dominant CP shapes.
+oneDNN selected `brg_matmul:avx512_core_vnni` and reordered weights to `BA16a64b4a`. At B=1,
+the engine was within roughly ten percent on the tested cells, so there is no general GEMV
+instruction deficit large enough to explain the server gap. At B>1, oneDNN was often faster,
+which makes its persistent RHS layout and blocking worth studying.
+
+The comparison is intentionally not presented as an end-to-end speedup: oneDNN receives
+pre-quantized activations and pays neither the engine's dynamic quantization nor its serving
+wrapper. The full cells and the decision are in [`x86-oracle.md`](x86-oracle.md). The conclusion
+so far is to transfer ideas selectively, not to add oneDNN or another runtime to the engine.
+
+### VNNI parent prepack: reusable candidate, not a profile default
+
+`QWEN_VNNI_PREPACK=1`/`all` builds an eligible INT8 RHS layout before prefork; `cp` and `talker`
+limit the work to one component. The current layout is 16 output rows interleaved in groups of
+four K values and is used by batched VNNI matmat, not by GEMV. On the correct AVX-512 BF16 + VNNI
+Scaleway build, CP-only prepack created 41 matrices (about 102 MB) and produced byte-identical
+audio. It left C=1 at 66/73 ms TTFA p50/p95; at C=4 it changed 167/318 ms to 178/319 ms and
+total RTF 1.10 to 1.13. It is therefore kept opt-in for other hosts/shapes, but remains null in
+the deployment profile.
+
 ### x86 shape controls
 
 The x86 matrix paths expose the same kind of measured, runtime-selectable tiling control used by the ARM backend, without changing the default path:
@@ -195,6 +233,13 @@ QWEN_AVX512_NCHUNK=128
 `QWEN_X86_NCHUNK`; values are rounded down to the kernel row tile and invalid values are ignored.
 The controls are experimental and should be qualified per CPU, shape, and objective.
 
+For the small-batch boundary, `QWEN_VNNI_TILE_M4N2=1` selects an opt-in fixed `M4xN2`
+implementation for observed `B=2` calls. It follows the ARM SMMLA principle of sharing the
+activation loads across a small cross-product tile, but uses AVX-512 VNNI and the existing
+row-sum correction. It is not enabled by the x86 profile: on the AWS screening campaign it
+improved isolated B2 cells but did not establish an end-to-end RTF win. Do not infer that an
+`M8xN2` tile is better; its register pressure and server coverage need separate evidence.
+
 AMX batch gates can also be separated when one threshold is not suitable for every datatype:
 
 ```bash
@@ -204,6 +249,17 @@ QWEN_AMX_INT8_MIN_B=8
 
 If these are absent, both continue to use the existing `QWEN_AMX_MIN_B` fallback. Use
 `QWEN_NO_AMX=1` for a VNNI-only control and `QWEN_NO_VNNI=1` for an AMX-only control.
+
+The fused INT8 QKV path can use a stricter, independent lower bound when its
+three-output working set makes `B=2` unattractive:
+
+```bash
+QWEN_AMX_INT8_QKV_MIN_B=4
+```
+
+This affects only fused QKV; other INT8 projections retain the normal AMX gate.
+It is an experimental shape-specific control and is not enabled by the measured
+profiles.
 
 ## Why a 3D V-cache chip (Zen4/Zen5 X3D) is the best case
 

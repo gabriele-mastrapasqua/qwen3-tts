@@ -810,6 +810,7 @@ void qwen_track_override(qwen_tts_ctx_t *ctx, void *ptr) {
 void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     if (!ctx) return;
     qwen_vnni_row_sums_reset();
+    qwen_vnni_weight_cache_reset();
     qwen_amx_weight_cache_reset();
     for (int i = 0; i < ctx->n_owned_overrides; i++) free(ctx->owned_overrides[i]);
     free(ctx->owned_overrides);
@@ -2650,6 +2651,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     double *rq_t0 = (double *)calloc((size_t)B, sizeof(double));
     double pf_t0_loop = time_ms(), pf_mark = 0;
     long long pf_frames = 0, pf_slotframes = 0, pf_stepframes = 0;
+    /* Decode-occupancy census: how often the batch actually holds >1 slot, and
+     * when it does not, whether that is because the worker's queue was empty. */
+    long long occ_hist[9] = { 0 };
+    long long occ_free_empty = 0, occ_free_decbusy = 0, occ_admits = 0;
     #define PF_START() do { if (prof_on) pf_mark = time_ms(); } while (0)
     #define PF_END(acc) do { if (prof_on) (acc) += time_ms() - pf_mark; } while (0)
 
@@ -2888,7 +2893,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         PF_START();
         for (int b = 0; b < B; b++) {
             if (active[b]) continue;
-            if (dec_on && atomic_load(&dec_busy[b]) != 0) continue;
+            if (dec_on && atomic_load(&dec_busy[b]) != 0) { if (prof_on) occ_free_decbusy++; continue; }
             if (use_helper) {
                 if (!sink->running(sink->ud) && n_active > 0) break;
                 int block = (n_active == 0);
@@ -2950,6 +2955,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             int pf_got = sink->next_job(sink->ud, &req, &t, block);
             if (prof_on) { double d = time_ms() - pf_w1; pf_wait += d; pf_mark += d; }
             if (!pf_got) {
+                if (prof_on) occ_free_empty++;
                 if (block) break;
                 continue;
             }
@@ -2963,6 +2969,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 continue;
             }
             ADMIT_INSTALL(b, req, t, pl);
+            if (prof_on) occ_admits++;
         }
 
         if (n_active == 0) {
@@ -3032,6 +3039,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         qwen_census_frame_at(1);
         if (prof_on) {
             pf_frames++; pf_slotframes += n_active;
+            occ_hist[n_active < 8 ? n_active : 8]++;
             for (int b = 0; b < B; b++) if (step_active[b]) pf_stepframes++;
         }
 
@@ -3250,6 +3258,16 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         fprintf(stderr,
             "\n[serve-profile] %lld frames, %lld slot-frames (mean %.2f active slots), loop %.1f s\n",
             pf_frames, pf_slotframes, (double)pf_slotframes / (double)pf_frames, wall / 1000.0);
+        {
+            fprintf(stderr, "  decode occupancy:");
+            for (int i = 0; i <= 8; i++)
+                if (occ_hist[i])
+                    fprintf(stderr, " B%d=%lld(%.1f%%)", i, occ_hist[i],
+                            100.0 * (double)occ_hist[i] / (double)pf_frames);
+            fprintf(stderr, "  · admits=%lld free-slot scans: queue-empty=%lld "
+                            "decoder-busy=%lld\n",
+                    occ_admits, occ_free_empty, occ_free_decbusy);
+        }
         if (pf_stepframes != pf_slotframes)
             fprintf(stderr, "  stepped slots/frame %.2f (of %.2f admitted): a narrowing policy is ON "
                             "(D2 priority and/or QWEN_BATCH_TALKER)\n",

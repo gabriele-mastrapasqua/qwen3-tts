@@ -175,8 +175,14 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
 | `QWEN_NO_BF16_MATMUL` | x86 | unset | `=1` drops the AVX-512 bf16 matmat, leaving the per-row twin. Only reachable where AMX is absent or declined |
 | `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
+| `QWEN_VNNI_TILE_M4N2` | x86 | unset (off) | `=1` tries the fixed `M4xN2` VNNI tile for observed `B=2` calls. It is an opt-in candidate inspired by the ARM small-B cross-product path; qualify it on the complete server path before enabling it |
+| `QWEN_VNNI_GEMV_MR` | x86 | 2 | output rows handled by the VNNI GEMV microkernel; `4` is an experimental alternative and must be qualified per workload |
+| `QWEN_VNNI_PREPACK` | x86 | unset | `=1`/`all` prepack eligible INT8 matrices in the parent; `=cp` or `=talker` limits the parent prepack to one component. It changes the batched VNNI matmat layout, not GEMV. Keep unset unless the target host shows a stable end-to-end win |
+| `QWEN_NO_VNNI_ROWSUM` | x86 | unset | `=1` disables the cached INT8 weight row sums used by VNNI GEMV; keep unset for the native path |
+| `QWEN_NO_VNNI_ACT_QUANT` | x86 | unset | `=1` disables AVX-512 activation quantization used before VNNI; keep unset for the native path |
 | `QWEN_AMX_MIN_B` · `QWEN_VNNI_MIN_B` · `QWEN_AVX2MM_MIN_B` | x86 | 4 · 2 · 2 | smallest batch width that may take that matmat |
 | `QWEN_AMX_BF16_MIN_B` · `QWEN_AMX_INT8_MIN_B` | x86 | fall back to `QWEN_AMX_MIN_B` | split the AMX gate when one threshold does not suit both datatypes; each overrides the shared one for its type only |
+| `QWEN_AMX_INT8_QKV_MIN_B` | x86 | inherits `QWEN_AMX_INT8_MIN_B` | additional lower bound for the fused INT8 QKV path only; other INT8 projections keep the normal AMX gate |
 | `QWEN_BFMMLA_MIN_B` · `QWEN_SMMLA_MIN_B` · `QWEN_KLEIDI_MIN_B` | ARM | 2 · 2 · 1 | the same thresholds on the ARM kernels |
 
 The batch gates say *when* a kernel is allowed; these say *how it tiles the output rows* once it is:
@@ -205,7 +211,7 @@ both belong before any number.
 
 | flag | default | effect |
 |---|---|---|
-| `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit (AMX or ARM BF16), else BLAS | `=0` routes prefill projections back through BLAS, `=1` forces the native matmat |
+| `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit: AMX, ARM BF16 (not Apple), or **AVX-512 BF16**; else BLAS | `=0` routes prefill projections back through BLAS, `=1` forces the native matmat. The AVX-512-BF16 arm was added 2026-09-03: before it, an AVX-512-BF16 host **without AMX** fell back to BLAS, which converts every weight matrix to f32 first — and that conversion (`bf16_to_f32_matrix`) is single-threaded, so it became a serial stage in front of a parallel GEMM. Measured on AWS c8a.4xlarge (EPYC 9R45, 16c, no AMX) in server mode, four sequential arms: TTFA p50 416 → 124 ms at C=1, p95 939 → 507 ms at C=4, TOTAL_RTF −13% at C=4, with the delta localised in the server-side `admission + prefill` stage (2844 → 1126 ms) while Talker and CP absolute times and `STREAM_RTF` were unchanged. **It changes the sampled trajectory** (mel-corr ~0.4–0.8 against the BLAS path on the same prompt), so it is a different generation, not a rounding difference |
 | `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably degrades output quality on some models.** Base models only, and the server says so when you turn it on |
 | `QWEN_KAI_NCHUNK` **(ARM only)** | 384 | sub-tiles the KleidiAI GEMM's n dimension so the second height pass finds the packed RHS in cache. `=0` restores one kernel call per slice |
 | `QWEN_KAI_OPS` **(ARM only)** | all families on | comma list restricting which KleidiAI families may be used; empty means every one |
@@ -317,6 +323,19 @@ for A/B only), `QWEN_SERVER_STRICT`, `QWEN_CANCEL_ON_DISCONNECT`, `QWEN_TTFA_FRE
 
 Where a CLI flag exists for the same thing, the CLI flag is the one to use: it lands in the
 process arguments, which a `ps` can read months later.
+
+### VNNI parent prepack — candidate, not a default
+
+`QWEN_VNNI_PREPACK=1` (also `all`) builds the eligible INT8 weight layout before prefork;
+`cp` and `talker` restrict that work to one component. The packed layout is reused by the
+batched VNNI matmat path for `B=2..8`; GEMV is unchanged. This is deliberately different from
+the ARM `QWEN_KAI_NCHUNK` knob: it changes the weight representation, not the GEMM's n tile.
+
+On the 16-core VNNI reference host, the corrected `cp` experiment prepacked 41 CP matrices
+(about 102 MB) and produced byte-identical audio. It did not improve the measured server
+objective: C=4 TTFA p95 was 318 ms without it and 319 ms with it, while total RTF moved from
+1.10 to 1.13. The profile therefore leaves the variable null. Use the flag to qualify a new
+host or workload, and record the parent prepack count before interpreting the result.
 
 ---
 

@@ -619,6 +619,16 @@ else
 endif
 	@/tmp/x86_qkv_bench $(X86_QKV_THREADS) $(X86_QKV_REPS)
 
+# Track A / B=1 GEMV A/B harness.  Built with the PRODUCTION optimisation flags
+# (-O3 -ffast-math) so the numbers are comparable with the served engine.
+X86_B1_BENCH_CF = -Wall -Wextra -O3 -ffast-math -Ivendor -I. -I$(INGOT_DIR)/include $(KAI_INC)
+X86_B1_GEMV_BENCH_SRC = tests/x86_b1_gemv_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
+                        qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+x86-b1-gemv-bench: $(INGOT_LIB)
+	@$(CC) $(X86_B1_BENCH_CF) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas $(ARCH_FLAGS) \
+	  $(X86_B1_GEMV_BENCH_SRC) $(INGOT_LIB) -lopenblas -lm -lpthread -o /tmp/x86_b1_gemv_bench
+	@/tmp/x86_b1_gemv_bench $(X86_B1_THREADS) $(X86_B1_REPS)
+
 X86_AMX_B32_BENCH_SRC = tests/x86_amx_b32_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
                         qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 x86-amx-b32-bench: $(INGOT_LIB)
@@ -1157,7 +1167,7 @@ test-it-ryan: test-small-it
 .PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
-	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench
+	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
         emotion-para-demo para-demo \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all \

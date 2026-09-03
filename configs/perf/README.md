@@ -7,7 +7,12 @@ configs/perf/schema.json          the format, architecture-neutral
 configs/perf/axion-16c-ttfa.json  recommended low-TTFA config for a 16-core Google Axion host
 configs/perf/recommended.json     stable entry point; POINTS at the current recommendation
 configs/perf/x86-8c-amx-recommended.json  x86-specific alias for the measured AMX profile
+configs/perf/scaleway-16c-vnni-ttfa.json provisional VNNI profile for a 16-core Scaleway host
+configs/perf/aws-c8a-16c-vnni-ttfa.json  provisional VNNI profile for an AWS c8a.4xlarge (EPYC 9R45, 16c, no AMX)
 ```
+
+The measured Scaleway campaign is summarized in
+[`../../docs/reference-scaleway-16c-vnni.md`](../../docs/reference-scaleway-16c-vnni.md).
 
 ```bash
 tools/perf_profile.py validate                                     # all profiles
@@ -111,6 +116,7 @@ Individual rungs remain available for investigation. The suite is the gate for a
 | `x86-8c-amx-single-stream-ttfa` | see the file | an 8-core Intel AMX host, one worker with eight physical-core threads; C=1-2 latency |
 | `x86-8c-amx-multiclient-ttfa` | see the file | the same host, two workers x four physical-core threads; balanced C=2-8 operation |
 | `x86-8c-amx-tail-latency-ttfa` | see the file | four workers x two threads: the best measured TTFA p95 at C=8 on a saturated box, and worse than the two-worker profile everywhere else |
+| `aws-c8a-16c-vnni-ttfa` | **provisional** | an AWS c8a.4xlarge (EPYC 9R45, 16 cores, no AMX). The host on which the AVX-512-BF16 prefill default was measured: pinning `QWEN_PREFILL_MATMAT=1` there moved TTFA p50 from 416 to 124 ms at C=1 and p95 from 939 to 507 ms at C=4 |
 | `x86-8c-amx-recommended` | alias | resolves to the balanced x86 AMX profile; carries no values of its own |
 | `recommended` | alias | resolves to the qualified one; carries no values of its own |
 

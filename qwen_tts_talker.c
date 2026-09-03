@@ -1004,6 +1004,117 @@ void qwen_kleidi_prepack(qwen_tts_ctx_t *ctx) {
                                     ctx->cp_emb_dim, QWEN_KAI_COMP_CP, QWEN_KAI_FAM_OTHER);
 }
 
+static void qwen_amx_prepack_one(const void *w, int rows, int cols, int kind) {
+    if (w) (void)qwen_amx_prepack_weight(w, rows, cols, kind);
+}
+
+void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx) {
+    const char *e = getenv("QWEN_AMX_PREPACK");
+    if (!ctx || !e || e[0] != '1') return;
+
+    const qwen_tts_config_t *c = &ctx->config;
+    const int h = c->hidden_size;
+    const int q_dim = c->num_heads * c->head_dim;
+    const int kv_dim = c->num_kv_heads * c->head_dim;
+    const int inter = c->intermediate_size;
+    for (int i = 0; i < c->num_layers; i++) {
+        const qwen_talker_layer_t *l = &ctx->layers[i];
+        qwen_amx_prepack_one(l->wq_bf16, q_dim, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wk_bf16, kv_dim, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wv_bf16, kv_dim, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wo_bf16, h, q_dim, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->gate_up_fused_bf16, 2 * inter, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->down_bf16, h, inter, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wq_int8, q_dim, h, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->wk_int8, kv_dim, h, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->wv_int8, kv_dim, h, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->wo_int8, h, q_dim, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->gate_up_fused_int8, 2 * inter, h, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->down_int8, h, inter, QWEN_AMX_WEIGHT_INT8);
+    }
+
+    const int ch = c->cp_hidden_size;
+    const int cq = c->cp_num_heads * c->cp_head_dim;
+    const int ckv = c->cp_num_kv_heads * c->cp_head_dim;
+    const int ci = c->cp_intermediate_size;
+    for (int i = 0; i < c->cp_num_layers; i++) {
+        const qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        qwen_amx_prepack_one(l->wq_bf16, cq, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wk_bf16, ckv, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wv_bf16, ckv, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wo_bf16, ch, cq, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->gate_up_fused_bf16, 2 * ci, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->down_bf16, ch, ci, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wq_int8, cq, ch, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->wk_int8, ckv, ch, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->wv_int8, ckv, ch, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->wo_int8, ch, cq, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->gate_up_fused_int8, 2 * ci, ch, QWEN_AMX_WEIGHT_INT8);
+        qwen_amx_prepack_one(l->down_int8, ch, ci, QWEN_AMX_WEIGHT_INT8);
+    }
+
+    int n = 0;
+    size_t bytes = 0;
+    qwen_amx_prepack_stats(&n, &bytes);
+    if (n > 0)
+        fprintf(stderr, "[amx-prepack] parent: %d matrices, %.0f MB; inherited by prefork workers\n",
+                n, (double)bytes / (1024.0 * 1024.0));
+}
+
+static void qwen_vnni_prepack_one(const int8_t *w, int rows, int cols) {
+    if (w) (void)qwen_vnni_prepack_weight(w, rows, cols);
+}
+
+void qwen_vnni_prepack_model(qwen_tts_ctx_t *ctx) {
+    const char *e = getenv("QWEN_VNNI_PREPACK");
+    if (!ctx || !e || (e[0] != '1' && strcmp(e, "all") &&
+                       strcmp(e, "cp") && strcmp(e, "talker"))) return;
+
+    const qwen_tts_config_t *c = &ctx->config;
+    const int h = c->hidden_size;
+    const int q_dim = c->num_heads * c->head_dim;
+    const int kv_dim = c->num_kv_heads * c->head_dim;
+    const int inter = c->intermediate_size;
+    const int cp_only = !strcmp(e, "cp");
+    const int talker_only = !strcmp(e, "talker");
+    if (!cp_only) {
+        for (int i = 0; i < c->num_layers; i++) {
+            const qwen_talker_layer_t *l = &ctx->layers[i];
+            qwen_vnni_prepack_one(l->wq_int8, q_dim, h);
+            qwen_vnni_prepack_one(l->wk_int8, kv_dim, h);
+            qwen_vnni_prepack_one(l->wv_int8, kv_dim, h);
+            qwen_vnni_prepack_one(l->wo_int8, h, q_dim);
+            qwen_vnni_prepack_one(l->gate_up_fused_int8, 2 * inter, h);
+            qwen_vnni_prepack_one(l->down_int8, h, inter);
+        }
+    }
+
+    const int ch = c->cp_hidden_size;
+    const int cq = c->cp_num_heads * c->cp_head_dim;
+    const int ckv = c->cp_num_kv_heads * c->cp_head_dim;
+    const int ci = c->cp_intermediate_size;
+    if (!talker_only) {
+        for (int i = 0; i < c->cp_num_layers; i++) {
+            const qwen_cp_layer_t *l = &ctx->cp_layers[i];
+            qwen_vnni_prepack_one(l->wq_int8, cq, ch);
+            qwen_vnni_prepack_one(l->wk_int8, ckv, ch);
+            qwen_vnni_prepack_one(l->wo_int8, ch, cq);
+            qwen_vnni_prepack_one(l->gate_up_fused_int8, 2 * ci, ch);
+            qwen_vnni_prepack_one(l->down_int8, ch, ci);
+        }
+        for (int g = 0; g < 15; g++)
+            qwen_vnni_prepack_one(ctx->cp_lm_head_int8[g], c->codebook_size, ch);
+        qwen_vnni_prepack_one(ctx->cp_mtp_proj_int8, ch, ctx->cp_emb_dim);
+    }
+
+    int n = 0;
+    size_t bytes = 0;
+    qwen_vnni_prepack_stats(&n, &bytes);
+    if (n > 0)
+        fprintf(stderr, "[vnni-prepack] parent: %d matrices, %.0f MB; inherited by prefork workers\n",
+                n, (double)bytes / (1024.0 * 1024.0));
+}
+
 typedef struct {
     int   len, n_layers, kv_dim;
     int   speaker_id, language_id, think_mode;
@@ -1123,7 +1234,8 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         const char *e = getenv("QWEN_PREFILL_MATMAT");
         if (e) mm_env = (e[0] == '1');
 #ifdef USE_BLAS
-        else mm_env = qwen_amx_bf16_available() || qwen_arm_bf16_matmat_available();
+        else mm_env = qwen_amx_bf16_available() || qwen_arm_bf16_matmat_available()
+                      || qwen_avx512_bf16_matmat_available();
 #else
         else mm_env = 1;
 #endif
@@ -1798,6 +1910,11 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     for (int b = 0; b < B; b++) { int p = pos_arr ? pos_arr[b] : bb->kv_len; if (p > maxpos) maxpos = p; }
     if (maxpos + 1 > bb->kv_max) return -1;
 
+    /* Same attribution bug the batched CP had: without this the batched Talker's
+     * kernels inherit whatever component ran last (the decoder thread). */
+    const int prev_comp = qwen_mm_component_get();
+    qwen_mm_component(QWEN_COMP_TALKER);
+
     qwen_batch_pack_active(bb, active);
     #define POS_B(b) (pos_arr ? pos_arr[b] : bb->kv_len)
     #define ACTIVE_B(b) (!active || active[b])
@@ -1860,6 +1977,7 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     if (!pos_arr) bb->kv_len = bb->kv_len + 1;
     #undef POS_B
     #undef ACTIVE_B
+    qwen_mm_component(prev_comp);
     return 0;
 }
 

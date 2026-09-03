@@ -1395,6 +1395,8 @@ int main(int argc, char **argv) {
     }
 
     qwen_kleidi_prepack(ctx);
+    qwen_amx_prepack_model(ctx);
+    qwen_vnni_prepack_model(ctx);
     if (!silent) {
         extern void qwen_report_model_sources(qwen_tts_ctx_t *, const char *);
         qwen_report_model_sources(ctx, model_dir);

@@ -557,6 +557,8 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir);
 qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8, int use_int4);
 
 void qwen_kleidi_prepack(qwen_tts_ctx_t *ctx);
+void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx);
+void qwen_vnni_prepack_model(qwen_tts_ctx_t *ctx);
 
 int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                            int threads_per, int max_batch);

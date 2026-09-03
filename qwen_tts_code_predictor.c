@@ -999,6 +999,13 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     int B = bb->B, ch = bb->cp_h, h = c->hidden_size, emb_dim = ctx->cp_emb_dim;
     if (!ctx->cp_layers[0].wq_bf16 || !ctx->cp_lm_head_bf16[0]) return -2;
 
+    /* The single-request path tags its kernels QWEN_COMP_CP; the batched one did
+     * not, so every batched CP projection was attributed to whichever component
+     * ran last (the Talker).  Tag here and restore on exit so the CP tag does not
+     * leak into the caller's own work either. */
+    const int prev_comp = qwen_mm_component_get();
+    qwen_mm_component(QWEN_COMP_CP);
+
     if (!qwen_batch_solo_disabled() && active) {
         int n_act = 0, only = -1;
         for (int b = 0; b < B; b++) if (active[b]) { n_act++; only = b; }
@@ -1017,6 +1024,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
             ctx->cp_kv_k = sk; ctx->cp_kv_v = sv;
             ctx->cp_kv_max = smax; ctx->cp_kv_len = slen;
             qwen_batch_pack_active(bb, active);
+            qwen_mm_component(prev_comp);
             return rc;
         }
     }
@@ -1067,6 +1075,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
             out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, normed, g, ch, c->codebook_size);
         }
     }
+    qwen_mm_component(prev_comp);
     return 0;
 #undef CPB_SKIP
 }

@@ -276,8 +276,12 @@ def result_header(a, model_path, extra_env):
     watched = ["OPENBLAS_THREAD_TIMEOUT", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
                "QWEN_POOL_NARROW", "QWEN_POOL_SPIN", "QWEN_PREFIX_CACHE"]
     if platform.machine() in ("x86_64", "amd64"):
-        watched += ["QWEN_NO_AMX", "QWEN_AMX_MIN_B", "QWEN_AMX_NCHUNK",
-                    "QWEN_NO_VNNI", "QWEN_NO_VNNI_TILE", "QWEN_VNNI_NCHUNK",
+        watched += ["QWEN_NO_AMX", "QWEN_NO_AMX_BF16", "QWEN_NO_AMX_INT8",
+                    "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B",
+                    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_AMX_NCHUNK",
+                    "QWEN_NO_VNNI", "QWEN_NO_VNNI_TILE", "QWEN_VNNI_TILE_N8",
+                    "QWEN_VNNI_TILE_M4N2", "QWEN_VNNI_PREPACK", "QWEN_NO_VNNI_ROWSUM",
+                    "QWEN_NO_VNNI_ACT_QUANT", "QWEN_VNNI_GEMV_MR", "QWEN_VNNI_NCHUNK",
                     "QWEN_NO_BF16_MATMUL", "QWEN_X86_NCHUNK"]
     else:
         watched += ["QWEN_KAI_QKV_FUSED", "QWEN_KAI_NCHUNK", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA"]

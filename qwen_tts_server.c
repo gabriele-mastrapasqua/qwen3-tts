@@ -1158,6 +1158,7 @@ static void srv_dump_counters_if_asked(void) {
     qwen_pool_stats_report();
     if (qwen_census_enabled()) qwen_census_report(NULL);
     if (qwen_matmat_stats_enabled()) qwen_matmat_stats_report(NULL);
+    qwen_kernel_timing_report(NULL);
     fflush(stderr);
 }
 
@@ -1928,6 +1929,7 @@ static void qwen_worker_dump_counters(void) {
     qwen_pool_stats_report();
     if (qwen_census_enabled()) qwen_census_report(NULL);
     if (qwen_matmat_stats_enabled()) qwen_matmat_stats_report(NULL);
+    qwen_kernel_timing_report(NULL);
     void (*yt)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "yieldtrace_report");
     if (yt) yt();
     fflush(stderr);

@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "scaleway-16c-vnni-ttfa",
+    "description": "Provisional low-TTFA VNNI profile for a 16-core Scaleway AMD host without AMX.",
+    "objective": {
+      "primary": "ttfa",
+      "secondary": "throughput",
+      "concurrency_range": [
+        1,
+        8
+      ],
+      "preferred_concurrency": 4,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "cpu_family": "AMD EPYC 9555P (Zen 5 Turin)",
+    "logical_cpus": 16,
+    "physical_cores": 16,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 256,
+    "ram_gib": 64,
+    "isa_features_used": [
+      "avx2",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512vnni",
+      "avx512bf16"
+    ],
+    "notes": "Scaleway STANDARD3-X16C-64G, 16 physical cores exposed with one thread per core and one NUMA node. Scaleway lists this size at €0.649/hour (~€473.77/month); price and availability are region-dependent and should be rechecked. The measured host has no AMX and a roughly 88 GB/s STREAM-like memory roof, so this profile targets VNNI/AVX-512 and is not an AMX configuration."
+  },
+  "build": {
+    "target": "blas",
+    "make": {
+      "command": "make blas SIMD=avx512bf16 -j16",
+      "variables": {
+        "SIMD": "avx512bf16"
+      }
+    },
+    "requirements": {
+      "blas": "OpenBLAS pthread build",
+      "isa": "AVX-512 VNNI and AVX-512 BF16"
+    }
+  },
+  "server": {
+    "prefork_workers": 2,
+    "threads_per_worker": 8,
+    "batch_size": 8,
+    "max_queue": 1,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
+    "worker_affinity": "worker 0 -> CPUs 0-7; worker 1 -> CPUs 8-15; SMT is not exposed on this host"
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 8,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8 per output row",
+      "code_predictor_weights": "int8 per output row",
+      "speech_decoder_weights": "fp32",
+      "activations": "fp32 at the API boundary; AVX-512 vectorized int8 packing is internal to VNNI matvec and matmat",
+      "gemm_backend": "AVX-512 VNNI tiled INT8 GEMM for batched shapes, AVX-512 VNNI GEMV for single-slot shapes, and AVX-512 BF16 matmat for bf16 projections"
+    },
+    "environment": {
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "Must be absent so the engine sizes OpenBLAS from the worker phase budget; an inherited value can override the measured topology.",
+        "revert": "Set it only for a measured control run."
+      },
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "Used by the measured VNNI server runs to prevent idle OpenBLAS workers from competing with the engine pool.",
+        "revert": "Unset for a control run."
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "Keeps the request-independent prefix path enabled for repeated serving requests.",
+        "revert": "QWEN_PREFIX_CACHE=0"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "LOAD-BEARING on a non-AMX host, not just a pin for auditability. Measured 2026-09-03 on AWS c8a.4xlarge (EPYC 9R45, 16c, no AMX), server mode, 4 sequential arms with a process-clean proof before each: TTFA p50 416 -> 124 ms at C=1 and p95 939 -> 507 ms at C=4, TOTAL_RTF -13% at C=4, with the delta localised in the server-side 'admission + prefill' stage (2844 -> 1126 ms). Before the qwen_avx512_bf16_matmat_available() fix the compiled default on AVX-512-BF16 hosts without AMX fell back to converting every weight matrix to f32 and calling SGEMM, and the conversion (bf16_to_f32_matrix) is single-threaded, so it became a serial stage in front of a parallel GEMM. The engine now enables this path by itself on such hosts; the pin is kept so the profile stays explicit. NOTE: it changes the sampled trajectory (mel-corr ~0.4-0.8 vs the SGEMM path, same prompt) - on this host the matmat output was judged better by ear.",
+        "revert": "QWEN_PREFILL_MATMAT=0 routes the prefill projections through BLAS (slower TTFA on this host)"
+      },
+      "QWEN_PREFILL_QUANT": {
+        "value": null,
+        "why": "Deliberately absent because quantized prefill is not part of the quality-preserving reference configuration.",
+        "revert": "QWEN_PREFILL_QUANT=1 only for a separately qualified base-model control."
+      },
+      "QWEN_CP_PREFILL2": {
+        "value": "1",
+        "why": "Keeps the two-position CP prefill path enabled and makes its state auditable in the flag report.",
+        "revert": "QWEN_CP_PREFILL2=0"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "4096",
+        "why": "Scaleway-specific interleaved sweep: 4096 beat 0 and 65536 at C=1/C=4. Spin 0 reached about 110k context switches/s and lowered throughput; 65536 also lowered C=4 throughput. 4096 is pinned for reproducibility.",
+        "revert": "Unset to use the compiled default."
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "0",
+        "why": "Scaleway-specific interleaved 3x A/B: off averaged about 179/291 ms TTFA p50/p95 at C=4 versus 191/309 ms on, with equivalent throughput. The batch wait did not pay on this workload.",
+        "revert": "QWEN_DECODER_BATCH=1"
+      },
+      "QWEN_STREAM_DECODE_CHUNK": {
+        "value": "8",
+        "why": "The measured 2x8 VNNI runs used an eight-frame steady-state decode chunk; values 4 and 16 remain unqualified alternatives.",
+        "revert": "Set another chunk size only for a measured A/B."
+      },
+      "QWEN_STREAM_DECODE_CHUNK_BUSY": {
+        "value": "0",
+        "why": "Keeps the busy-stream override disabled in the measured baseline.",
+        "revert": "Set a nonzero value only for a measured control."
+      },
+      "QWEN_VNNI_GEMV_MR": {
+        "value": "2",
+        "why": "The measured VNNI baseline uses the two-row GEMV kernel. The four-row candidate did not show a stable end-to-end win on this workload.",
+        "revert": "QWEN_VNNI_GEMV_MR=4 for an A/B."
+      },
+      "QWEN_VNNI_PREPACK": {
+        "value": null,
+        "why": "Candidate only. Parent-side CP prepack created 41 matrices (~102 MB) and preserved audio byte-for-byte, but the corrected AVX-512 BF16 + VNNI A/B did not improve C=4 p95 or total RTF. Keep it out of the deployment profile until another host or workload shows a stable win.",
+        "revert": "QWEN_VNNI_PREPACK=cp or QWEN_VNNI_PREPACK=1 for a separate measured candidate run."
+      },
+      "QWEN_NO_VNNI_ACT_QUANT": {
+        "value": null,
+        "why": "Must remain absent so AVX-512 activation quantization is used. Disabling it was slower in isolated VNNI matmat/QKV measurements and in the C=4 server comparison.",
+        "revert": "QWEN_NO_VNNI_ACT_QUANT=1 for a control run."
+      },
+      "QWEN_NO_VNNI_ROWSUM": {
+        "value": null,
+        "why": "Must remain absent so the cached INT8 row sums are reused by VNNI GEMV. Disabling the cache was slower in the isolated shape benchmark.",
+        "revert": "QWEN_NO_VNNI_ROWSUM=1 for a control run."
+      },
+      "QWEN_NO_VNNI_TILE": {
+        "value": null,
+        "why": "Must remain absent so the shape-aware AVX-512 VNNI tiled matmat path remains available. Scaleway interleaved A/B showed no material end-to-end difference from disabling it, so it is retained as the safer native path but not advertised as a measured speedup.",
+        "revert": "QWEN_NO_VNNI_TILE=1 for a control run."
+      },
+      "QWEN_VNNI_NCHUNK": {
+        "value": null,
+        "why": "Not pinned globally. A 256-row candidate slightly improved C=4 median TTFA but did not improve p95 or throughput consistently; it remains an objective-specific experiment.",
+        "revert": "Set QWEN_VNNI_NCHUNK=256 only for a paired TTFA A/B."
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "provisional",
+    "workload": "Five synchronized waves at client concurrency 1, 2, 4, 6 and 8 on the short class, plus a realistic-bank wave, Poisson open-loop checks and a 10-minute closed-loop soak at C=4; two prefork workers with eight threads each.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-1.7b base checkpoint, open weights",
+    "notes": "Measured VNNI baseline on the 16-core Scaleway host: 2x8 was the best balanced topology in the short-bank sweep. C=1/2/4/6/8 measured TTFA p50/p95 of 66/73, 101/213, 185/221, 250/310 and 310/374 ms, with stream RTF p50 0.47, 0.73, 1.11, 1.34 and 1.55 and throughput 1.30, 1.59, 2.10, 2.58 and 2.94 requests/s; all cells had zero errors and zero rejections. On the realistic full bank, 2x8 measured 640/1017 ms and RTF 1.20 at C=4. Exact-profile Poisson at C=4 measured 370/1058 ms at 1 request/s and 945/3882 ms at 2 requests/s, with zero request errors but open-loop backlog. A 10-minute closed-loop C=4 soak completed 267 requests, with 251 post-warmup KPI samples, zero errors, rejections or timeouts, stable resources, pooled TTFA p95 819.2 to 814.5 ms and stream RTF p50 1.0873 to 1.0802. Per-class p95 was not assessed because the windows had fewer than 20 samples per class. 1x16 was better at some single-stream points but 2x8 was the more balanced choice at C=4 and above; 4x4 and 8x2 had worse tail or throughput. This remains a provisional deployment profile: neither the short nor realistic C=4 workload reaches RTF below 1.0 on this 1.7B model. The diagnostic census shows the remaining opportunity is largely VNNI GEMV and solo/single-slot work rather than the already effective batched VNNI decoder path."
+  }
+}

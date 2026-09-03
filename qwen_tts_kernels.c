@@ -200,6 +200,20 @@ int qwen_arm_bf16_matmat_available(void) {
 #endif
 }
 
+/* AVX-512 BF16 without AMX still has a real batched bf16 matmat
+ * (QWEN_MMK_BF16_AVX512, VDPBF16PS).  Without this the prefill default fell back
+ * to converting every weight matrix to f32 and calling SGEMM, which is ~3x the
+ * memory traffic on the TTFA critical path. */
+int qwen_avx512_bf16_matmat_available(void) {
+#if defined(__AVX512BF16__)
+    if (!__builtin_cpu_supports("avx512bf16")) return 0;
+    const char *e = getenv("QWEN_NO_BF16_MATMUL");
+    return !(e && e[0] == '1');
+#else
+    return 0;
+#endif
+}
+
 #ifndef QWEN_GIT_REV
 #define QWEN_GIT_REV "unknown"
 #endif
@@ -211,13 +225,16 @@ static const char *const g_qwen_reported_flags[] = {
     /* kernel dispatch — which GEMM, dot or conv actually runs */
     "QWEN_NO_AMX", "QWEN_NO_AMX_BF16", "QWEN_NO_AMX_INT8", "QWEN_NO_AMX_Q4", "QWEN_NO_VNNI",
     "QWEN_NO_VNNI_TILE", "QWEN_NO_VNNI_QKV", "QWEN_NO_X86_QKV", "QWEN_NO_VNNI_ROWSUM",
-    "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_AMX_B32", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
+    "QWEN_NO_VNNI_ACT_QUANT", "QWEN_VNNI_PREPACK", "QWEN_VNNI_TILE_N8",
+    "QWEN_VNNI_TILE_M4N2", "QWEN_VNNI_GEMV_MR", "QWEN_VNNI_UACT",
+    "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_AMX_PREPACK_KINDS", "QWEN_AMX_B32", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
     "QWEN_NO_BF16_MATMUL", "QWEN_NO_SDOT", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA", "QWEN_ARM_BFDOT",
     "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
     "QWEN_Q6_SCALAR", "QWEN_Q8_SCALAR_ACT", "QWEN_NO_Q8REPACK", "QWEN_NO_SIN_POLY",
     /* kernel gates and tiling — when a kernel may run, and how it tiles */
     "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B", "QWEN_AMX_MIN_ROWS",
-    "QWEN_AMX_BF16_MIN_COLS", "QWEN_AMX_INT8_MIN_COLS", "QWEN_AMX_Q4_MIN_COLS", "QWEN_VNNI_MIN_B",
+    "QWEN_AMX_BF16_MIN_COLS", "QWEN_AMX_INT8_MIN_COLS", "QWEN_AMX_Q4_MIN_COLS",
+    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_VNNI_MIN_B",
     "QWEN_AVX2MM_MIN_B", "QWEN_BF16_MATMUL_MIN_B", "QWEN_BFMMLA_MIN_B", "QWEN_SMMLA_MIN_B",
     "QWEN_INT8_SDOT_MIN_B", "QWEN_KLEIDI_MIN_B", "QWEN_X86_NCHUNK", "QWEN_AMX_NCHUNK",
     "QWEN_VNNI_NCHUNK", "QWEN_AVX512_NCHUNK", "QWEN_KAI_NCHUNK",
@@ -256,7 +273,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_METAL_FUSED_TALKER",
     /* diagnostics — never in a run that produces a number */
     "QWEN_BATCH_STATS", "QWEN_SHAPE_CENSUS", "QWEN_SERVE_PROFILE", "QWEN_TTFA_TRACE",
-    "QWEN_LIFE_TRACE", "QWEN_REQ_TRACE", "QWEN_DUMP_CODE0", "QWEN_DUMP_CODES", "QWEN_EXPR_DEBUG",
+    "QWEN_LIFE_TRACE", "QWEN_REQ_TRACE", "QWEN_KERNEL_TIMING", "QWEN_VNNI_PHASE_TIMING", "QWEN_DUMP_CODE0", "QWEN_DUMP_CODES", "QWEN_EXPR_DEBUG",
     "QWEN_SD_DEBUG", "QWEN_SPK_DEBUG", "QWEN_TUNE_JSON", "QWEN_TUNE_QUICK",
     NULL
 };
@@ -1434,26 +1451,45 @@ static void bf16_mv_task(size_t tid, size_t nt, void *vc) {
 }
 void (*g_qwen_matvec_bf16_hook)(float *, const uint16_t *, const float *, int, int) = NULL;
 
+/* Forward declarations for the optional complete-call timing census.  The
+ * implementation lives with the other matmul counters below, while the BF16
+ * matvec entry point is intentionally kept near its dispatch helpers. */
+enum { QWEN_KT_INT8 = 0, QWEN_KT_BF16, QWEN_KT_KIND_COUNT };
+enum { QWEN_KT_B1 = 0, QWEN_KT_B2, QWEN_KT_B34, QWEN_KT_B58, QWEN_KT_B9P, QWEN_KT_BUCKET_COUNT };
+static double qwen_mm_now_s(void);
+static int qwen_kernel_timing_enabled(void);
+static void qwen_kernel_timing_note(int kind, int B, int rows, int cols,
+                                    double start_s);
+static void qwen_vnni_phase_report(FILE *out);
+
 void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
     qwen_census_op("matvec_bf16", rows, cols, 1);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     if (qwen_q8r_matmul(y, (const void *)W, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_Q8_REPACK_GEMV, rows, cols, 1);
-        return;
+        goto qwen_matvec_bf16_timed_done;
     }
     if (kai_bf16_try(y, W, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_KLEIDI_BF16_GEMV, rows, cols, 1);
-        return;
+        goto qwen_matvec_bf16_timed_done;
     }
     MMSTAT(QWEN_MMK_BF16_GEMV, rows, cols, 1);
 
-    if (g_qwen_matvec_bf16_hook) { g_qwen_matvec_bf16_hook(y, W, x, rows, cols); return; }
+    if (g_qwen_matvec_bf16_hook) {
+        g_qwen_matvec_bf16_hook(y, W, x, rows, cols);
+        goto qwen_matvec_bf16_timed_done;
+    }
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         bf16_mv_ctx c = { y, W, x, rows, cols };
         qwen_parallel((size_t)nt, bf16_mv_task, &c);
-        return;
+        goto qwen_matvec_bf16_timed_done;
     }
     bf16_matvec_fused(y, x, W, cols, rows);
+
+qwen_matvec_bf16_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_BF16, 1, rows, cols, kt_t0);
 }
 
 static atomic_int g_mm_stats = -1;
@@ -1471,6 +1507,198 @@ static double qwen_mm_now_s(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
+
+/*
+ * Diagnostic wall-time census for the complete public matvec/matmat calls.
+ * This deliberately measures the caller-visible interval, including activation
+ * preparation, dispatch, worker-pool wait, dot product, scaling and stores. It
+ * is not a kernel benchmark and must never be enabled for a timing claim.
+ * Weight bytes are the one-read lower bound (rows * cols * element_size), not
+ * a hardware counter or a claim that the implementation made one DRAM pass.
+ */
+typedef struct {
+    atomic_llong calls;
+    atomic_llong wall_ns;
+    atomic_llong macs;
+    atomic_llong weight_bytes;
+} qwen_kernel_timing_cell_t;
+static qwen_kernel_timing_cell_t
+    g_kernel_timing[QWEN_COMP_COUNT][QWEN_KT_KIND_COUNT][QWEN_KT_BUCKET_COUNT];
+static atomic_int g_kernel_timing_on = -1;
+
+static void qwen_kernel_timing_atexit(void);
+
+static int qwen_kernel_timing_enabled(void) {
+    int v = atomic_load_explicit(&g_kernel_timing_on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_KERNEL_TIMING");
+        v = e && e[0] && e[0] != '0';
+        static atomic_int registered = 0;
+        if (v && !atomic_exchange_explicit(&registered, 1, memory_order_relaxed))
+            atexit(qwen_kernel_timing_atexit);
+        atomic_store_explicit(&g_kernel_timing_on, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_kernel_timing_bucket(int B) {
+    if (B <= 1) return QWEN_KT_B1;
+    if (B == 2) return QWEN_KT_B2;
+    if (B <= 4) return QWEN_KT_B34;
+    if (B <= 8) return QWEN_KT_B58;
+    return QWEN_KT_B9P;
+}
+
+static void qwen_kernel_timing_note(int kind, int B, int rows, int cols,
+                                    double start_s) {
+    if (!start_s || rows <= 0 || cols <= 0 || kind < 0 || kind >= QWEN_KT_KIND_COUNT)
+        return;
+    const double elapsed = qwen_mm_now_s() - start_s;
+    const long long ns = elapsed > 0.0 ? (long long)(elapsed * 1e9) : 0;
+    int comp = qwen_tls_tag_get();
+    if (comp < 0 || comp >= QWEN_COMP_COUNT) comp = QWEN_COMP_OTHER;
+    qwen_kernel_timing_cell_t *cell =
+        &g_kernel_timing[comp][kind][qwen_kernel_timing_bucket(B)];
+    atomic_fetch_add_explicit(&cell->calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->wall_ns, ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->macs,
+                              (long long)rows * (long long)cols * (long long)(B > 0 ? B : 1),
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->weight_bytes,
+                              (long long)rows * (long long)cols *
+                              (long long)(kind == QWEN_KT_BF16 ? sizeof(uint16_t) : sizeof(int8_t)),
+                              memory_order_relaxed);
+}
+
+void qwen_kernel_timing_report(void *out) {
+    static const char *const cname[QWEN_COMP_COUNT] = { "other", "talker", "cp", "decoder" };
+    static const char *const kname[QWEN_KT_KIND_COUNT] = { "int8", "bf16" };
+    static const char *const bname[QWEN_KT_BUCKET_COUNT] = { "B1", "B2", "B3-4", "B5-8", "B9+" };
+    FILE *f = out ? (FILE *)out : stderr;
+    int any = 0;
+    for (int c = 0; c < QWEN_COMP_COUNT; c++)
+        for (int k = 0; k < QWEN_KT_KIND_COUNT; k++)
+            for (int b = 0; b < QWEN_KT_BUCKET_COUNT; b++)
+                if (atomic_load_explicit(&g_kernel_timing[c][k][b].calls,
+                                         memory_order_relaxed) > 0) any = 1;
+    if (any) {
+        fprintf(f, "\n[kernel-timing] v=1 pid=%d complete public matvec/matmat wall time\n",
+                (int)getpid());
+        fprintf(f, "# csv: component,kind,bucket,calls,wall_ms,wall_ms_per_call,gmac,"
+                        "nominal_weight_gb,nominal_weight_gbps\n");
+        for (int c = 0; c < QWEN_COMP_COUNT; c++)
+            for (int k = 0; k < QWEN_KT_KIND_COUNT; k++)
+                for (int b = 0; b < QWEN_KT_BUCKET_COUNT; b++) {
+                    qwen_kernel_timing_cell_t *cell = &g_kernel_timing[c][k][b];
+                    long long calls = atomic_load_explicit(&cell->calls, memory_order_relaxed);
+                    if (!calls) continue;
+                    long long ns = atomic_load_explicit(&cell->wall_ns, memory_order_relaxed);
+                    long long macs = atomic_load_explicit(&cell->macs, memory_order_relaxed);
+                    long long bytes = atomic_load_explicit(&cell->weight_bytes, memory_order_relaxed);
+                    double sec = (double)ns / 1e9;
+                    double gb = (double)bytes / 1e9;
+                    fprintf(f, "timing,%s,%s,%s,%lld,%.3f,%.3f,%.6f,%.6f,%.3f\n",
+                            cname[c], kname[k], bname[b], calls, (double)ns / 1e6,
+                            calls ? (double)ns / 1e6 / (double)calls : 0.0,
+                            (double)macs / 1e9, gb, sec > 0.0 ? gb / sec : 0.0);
+                }
+        fprintf(f, "[kernel-timing] nominal_weight_gbps is a one-read lower-bound rate; "
+                        "it excludes non-weight traffic and does not measure DRAM bytes.\n");
+    }
+    qwen_vnni_phase_report(f);
+    fflush(f);
+}
+static void qwen_kernel_timing_atexit(void) { qwen_kernel_timing_report(NULL); }
+
+/*
+ * Optional phase census for the AVX-512 VNNI B=1 path.  Unlike the public
+ * kernel-timing census, this is deliberately a diagnostic: phase times are
+ * aggregated across worker tasks and therefore are not a critical-path
+ * attribution.  It is disabled unless QWEN_VNNI_PHASE_TIMING=1.
+ */
+enum {
+    QWEN_VP_QUANT = 0,
+    QWEN_VP_ROWSUM,
+    QWEN_VP_DOT,
+    QWEN_VP_EPILOGUE,
+    QWEN_VP_PARALLEL,
+    QWEN_VP_COUNT
+};
+typedef struct {
+    atomic_llong calls;
+    atomic_llong wall_ns;
+    atomic_llong work_bytes;
+} qwen_vnni_phase_cell_t;
+static qwen_vnni_phase_cell_t
+    g_vnni_phase[QWEN_COMP_COUNT][QWEN_VP_COUNT];
+static atomic_int g_vnni_phase_on = -1;
+
+#if defined(__GNUC__) || defined(__clang__)
+#define QWEN_VNNI_PHASE_UNUSED __attribute__((unused))
+#else
+#define QWEN_VNNI_PHASE_UNUSED
+#endif
+
+static int QWEN_VNNI_PHASE_UNUSED qwen_vnni_phase_timing_enabled(void) {
+    int v = atomic_load_explicit(&g_vnni_phase_on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_VNNI_PHASE_TIMING");
+        v = e && e[0] && e[0] != '0';
+        atomic_store_explicit(&g_vnni_phase_on, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static void QWEN_VNNI_PHASE_UNUSED qwen_vnni_phase_note(
+    int phase, long long work_bytes, double start_s) {
+    if (!start_s || phase < 0 || phase >= QWEN_VP_COUNT) return;
+    const double elapsed = qwen_mm_now_s() - start_s;
+    const long long ns = elapsed > 0.0 ? (long long)(elapsed * 1e9) : 0;
+    int comp = qwen_tls_tag_get();
+    if (comp < 0 || comp >= QWEN_COMP_COUNT) comp = QWEN_COMP_OTHER;
+    qwen_vnni_phase_cell_t *cell = &g_vnni_phase[comp][phase];
+    atomic_fetch_add_explicit(&cell->calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->wall_ns, ns, memory_order_relaxed);
+    if (work_bytes > 0)
+        atomic_fetch_add_explicit(&cell->work_bytes, work_bytes, memory_order_relaxed);
+}
+
+static void qwen_vnni_phase_report(FILE *f) {
+    static const char *const cname[QWEN_COMP_COUNT] = {
+        "other", "talker", "cp", "decoder"
+    };
+    static const char *const pname[QWEN_VP_COUNT] = {
+        "activation_quant", "row_sum_lookup_or_build", "vnni_dot",
+        "scale_store_epilogue", "parallel_span"
+    };
+    int any = 0;
+    for (int c = 0; c < QWEN_COMP_COUNT; c++)
+        for (int p = 0; p < QWEN_VP_COUNT; p++)
+            if (atomic_load_explicit(&g_vnni_phase[c][p].calls,
+                                     memory_order_relaxed) > 0) any = 1;
+    if (!any) return;
+    fprintf(f, "\n[vnni-phase] v=1 pid=%d AVX-512 VNNI B=1 diagnostic\n",
+            (int)getpid());
+    fprintf(f, "# csv: component,phase,calls,wall_ms,wall_ms_per_call,work_gb,effective_gbps\n");
+    for (int c = 0; c < QWEN_COMP_COUNT; c++)
+        for (int p = 0; p < QWEN_VP_COUNT; p++) {
+            qwen_vnni_phase_cell_t *cell = &g_vnni_phase[c][p];
+            long long calls = atomic_load_explicit(&cell->calls, memory_order_relaxed);
+            if (!calls) continue;
+            long long ns = atomic_load_explicit(&cell->wall_ns, memory_order_relaxed);
+            long long bytes = atomic_load_explicit(&cell->work_bytes, memory_order_relaxed);
+            double sec = (double)ns / 1e9;
+            double gb = (double)bytes / 1e9;
+            fprintf(f, "phase,%s,%s,%lld,%.3f,%.6f,%.6f,%.3f\n",
+                    cname[c], pname[p], calls, (double)ns / 1e6,
+                    (double)ns / 1e6 / (double)calls, gb,
+                    sec > 0.0 ? gb / sec : 0.0);
+        }
+    fprintf(f, "[vnni-phase] calls are timed output-group regions; aggregate wall is across calls/tasks, not a critical-path sum.\n");
+    fprintf(f, "[vnni-phase] vnni_dot work_gb is the one-read INT8 weight byte count, not measured DRAM traffic.\n");
+    fflush(f);
+}
+#undef QWEN_VNNI_PHASE_UNUSED
 
 enum { MMC_GEMM = 0, MMC_TWIN, MMC_MATVEC, MMC_SOLO, MMC_GEMV, MMC_NCLS };
 static const struct { const char *name; int cls; } g_mmk_info[QWEN_MMK_COUNT] = {
@@ -2038,8 +2266,6 @@ static void qwen_amx_finish_config(void) {
 }
 
 enum {
-    QWEN_AMX_WEIGHT_BF16 = 1,
-    QWEN_AMX_WEIGHT_INT8 = 2,
     QWEN_AMX_WEIGHT_CACHE_MAX = 512,
 };
 
@@ -2048,6 +2274,7 @@ typedef struct {
     int rows;
     int cols;
     int kind;
+    size_t bytes;
     void *packed;
 } qwen_amx_weight_entry;
 
@@ -2066,13 +2293,31 @@ static int qwen_amx_prepack_enabled(void) {
     return v;
 }
 
+static int qwen_amx_prepack_kind_enabled(int kind) {
+    const char *e = getenv("QWEN_AMX_PREPACK_KINDS");
+    if (!e || !*e || !strcmp(e, "both") || !strcmp(e, "all")) return 1;
+    const char *want = kind == QWEN_AMX_WEIGHT_BF16 ? "bf16" : "int8";
+    size_t want_len = strlen(want);
+    for (const char *p = e; *p;) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if ((size_t)(end - start) == want_len && !strncmp(start, want, want_len)) return 1;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
 static int qwen_amx_b32_enabled(void) {
     const char *e = getenv("QWEN_AMX_B32");
     return e && e[0] == '1';
 }
 
 static void *qwen_amx_pack_weights(const void *source, int rows, int cols, int kind) {
-    if (!qwen_amx_prepack_enabled() || !source || rows < 16 || cols <= 0) return NULL;
+    if (!qwen_amx_prepack_enabled() || !qwen_amx_prepack_kind_enabled(kind) ||
+        !source || rows < 16 || cols <= 0) return NULL;
     const int kstep = kind == QWEN_AMX_WEIGHT_BF16 ? 32 : 64;
     const size_t elem_size = kind == QWEN_AMX_WEIGHT_BF16 ? sizeof(uint16_t) : sizeof(int8_t);
     const int row_blocks = rows / 16;
@@ -2129,10 +2374,38 @@ static void *qwen_amx_pack_weights(const void *source, int rows, int cols, int k
     g_amx_weights[n].rows = rows;
     g_amx_weights[n].cols = cols;
     g_amx_weights[n].kind = kind;
+    g_amx_weights[n].bytes = bytes;
     g_amx_weights[n].packed = packed;
     atomic_store_explicit(&g_amx_weight_count, n + 1, memory_order_release);
     pthread_mutex_unlock(&g_amx_weight_mu);
     return packed;
+}
+
+int qwen_amx_prepack_weight(const void *source, int rows, int cols, int kind) {
+    if (!source || rows <= 0 || cols <= 0 ||
+        (kind != QWEN_AMX_WEIGHT_BF16 && kind != QWEN_AMX_WEIGHT_INT8)) return 0;
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if (kind == QWEN_AMX_WEIGHT_BF16 && !qwen_amx_bf16_ready()) return 0;
+#elif !defined(__AMX_BF16__)
+    if (kind == QWEN_AMX_WEIGHT_BF16) return 0;
+#endif
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (kind == QWEN_AMX_WEIGHT_INT8 && !qwen_amx_int8_ready()) return 0;
+#elif !defined(__AMX_INT8__)
+    if (kind == QWEN_AMX_WEIGHT_INT8) return 0;
+#endif
+    return qwen_amx_pack_weights(source, rows, cols, kind) != NULL;
+}
+
+void qwen_amx_prepack_stats(int *n_packed, size_t *bytes) {
+    int n = 0;
+    size_t total = 0;
+    pthread_mutex_lock(&g_amx_weight_mu);
+    n = atomic_load_explicit(&g_amx_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) total += g_amx_weights[i].bytes;
+    pthread_mutex_unlock(&g_amx_weight_mu);
+    if (n_packed) *n_packed = n;
+    if (bytes) *bytes = total;
 }
 
 void qwen_amx_weight_cache_reset(void) {
@@ -2144,6 +2417,7 @@ void qwen_amx_weight_cache_reset(void) {
         g_amx_weights[i].rows = 0;
         g_amx_weights[i].cols = 0;
         g_amx_weights[i].kind = 0;
+        g_amx_weights[i].bytes = 0;
         g_amx_weights[i].packed = NULL;
     }
     atomic_store_explicit(&g_amx_weight_count, 0, memory_order_release);
@@ -2152,6 +2426,14 @@ void qwen_amx_weight_cache_reset(void) {
 #endif
 
 #if !((defined(__AMX_INT8__) || defined(__AMX_BF16__)) && defined(__AMX_TILE__))
+int qwen_amx_prepack_weight(const void *source, int rows, int cols, int kind) {
+    (void)source; (void)rows; (void)cols; (void)kind;
+    return 0;
+}
+void qwen_amx_prepack_stats(int *n_packed, size_t *bytes) {
+    if (n_packed) *n_packed = 0;
+    if (bytes) *bytes = 0;
+}
 void qwen_amx_weight_cache_reset(void) {}
 #endif
 
@@ -2551,15 +2833,21 @@ QWEN_MM_SCRATCH(corr, int)
 
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
     qwen_census_op("matmat_bf16", rows, cols, B);
-    if (g_qwen_matmat_bf16_hook) { g_qwen_matmat_bf16_hook(Y, W, X, rows, cols, B); return; }
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
+    if (g_qwen_matmat_bf16_hook) {
+        g_qwen_matmat_bf16_hook(Y, W, X, rows, cols, B);
+        goto qwen_matmat_bf16_timed_done;
+    }
     if (B <= 0) return;
     if (kai_bf16_try(Y, W, X, rows, cols, B)) {
         MMSTAT(B > 1 ? QWEN_MMK_KLEIDI_BF16 : QWEN_MMK_KLEIDI_BF16_GEMV, rows, cols, B);
-        return;
+        goto qwen_matmat_bf16_timed_done;
     }
     if (qwen_q8r_matmul(Y, (const void *)W, X, rows, cols, B)) {
         MMSTAT(QWEN_MMK_Q8_REPACK_I8MM, rows, cols, B);
-        return;
+        goto qwen_matmat_bf16_timed_done;
     }
     if (B > 64) B = 64;
     int nt = g_n_threads;
@@ -2585,7 +2873,7 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
                 bf16_amx_task(0, 1, &c);
             }
               free(Xb);
-            return;
+            goto qwen_matmat_bf16_timed_done;
         }
           free(Xb);
     }
@@ -2605,7 +2893,7 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
             } else {
                 bf16_avx512_task(0, 1, &c);
             }
-            return;
+            goto qwen_matmat_bf16_timed_done;
         }
     }
 #endif
@@ -2626,7 +2914,7 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
                     bf16_matmat_bfmmla_slice(Y, W, Xb, 0, rows, cols, B);
                 }
                 free(Xb);
-                return;
+                goto qwen_matmat_bf16_timed_done;
             }
         }
     }
@@ -2634,9 +2922,12 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
     if (nt > 1 && rows >= 256) {
         bf16_mm_ctx c = { Y, W, X, rows, cols, B };
         qwen_parallel((size_t)nt, bf16_mm_task, &c);
-        return;
+        goto qwen_matmat_bf16_timed_done;
     }
     bf16_matmat_slice(Y, W, X, 0, rows, cols, B);
+
+qwen_matmat_bf16_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, rows, cols, kt_t0);
 }
 
 static void int8_matmat_generic(float *Y, const int8_t *W, const float *scale,
@@ -2782,8 +3073,67 @@ static void int8_smm_task(size_t tid, size_t nt, void *vc) {
 }
 #endif
 
+/* The matmat input is [cols][B], so each activation column is strided by B. */
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static int qwen_vnni_col_quant_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_VNNI_ACT_QUANT");
+        v = !(e && e[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static float quantize_act_int8_col_avx512(int8_t *qb, const float *X,
+                                         int cols, int B, int b) {
+    const __m512 sign = _mm512_set1_ps(-0.0f);
+    const __m512i offsets = _mm512_setr_epi32(
+        0 * B, 1 * B, 2 * B, 3 * B, 4 * B, 5 * B, 6 * B, 7 * B,
+        8 * B, 9 * B, 10 * B, 11 * B, 12 * B, 13 * B, 14 * B, 15 * B);
+    __m512 vmax = _mm512_setzero_ps();
+    int k = 0;
+    for (; k + 16 <= cols; k += 16) {
+        const __m512i idx = _mm512_add_epi32(offsets, _mm512_set1_epi32(k * B));
+        const __m512 v = B == 1
+            ? _mm512_loadu_ps(X + b + k)
+            : _mm512_i32gather_ps(idx, X + b, 4);
+        vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+    }
+    float amax = _mm512_reduce_max_ps(vmax);
+    for (; k < cols; k++) {
+        const float a = fabsf(X[(size_t)k * B + b]);
+        if (a > amax) amax = a;
+    }
+    if (amax == 0.0f) { memset(qb, 0, (size_t)cols); return 0.0f; }
+
+    const __m512 inv = _mm512_set1_ps(127.0f / amax);
+    k = 0;
+    for (; k + 16 <= cols; k += 16) {
+        const __m512i idx = _mm512_add_epi32(offsets, _mm512_set1_epi32(k * B));
+        const __m512 v = B == 1
+            ? _mm512_loadu_ps(X + b + k)
+            : _mm512_i32gather_ps(idx, X + b, 4);
+        __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(v, inv));
+        q = _mm512_max_epi32(q, _mm512_set1_epi32(-128));
+        q = _mm512_min_epi32(q, _mm512_set1_epi32(127));
+        _mm_storeu_si128((__m128i *)(void *)(qb + k), _mm512_cvtsepi32_epi8(q));
+    }
+    for (; k < cols; k++) {
+        const int v = (int)lrintf(X[(size_t)k * B + b] * (127.0f / amax));
+        qb[k] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    return amax / 127.0f;
+}
+#endif
+
 static float quantize_act_int8_col(int8_t *qb, const float *X, int cols, int B, int b) QWEN_MAYBE_UNUSED;
 static float quantize_act_int8_col(int8_t *qb, const float *X, int cols, int B, int b) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (qwen_vnni_col_quant_enabled() && cols >= 16)
+        return quantize_act_int8_col_avx512(qb, X, cols, B, b);
+#endif
     float amax = 0.0f;
     for (int k = 0; k < cols; k++) { float a = fabsf(X[(size_t)k * B + b]); if (a > amax) amax = a; }
     if (amax == 0.0f) { memset(qb, 0, (size_t)cols); return 0.0f; }
@@ -3123,8 +3473,120 @@ int qwen_matmat_int8_amx_b32(float *Y, const int8_t *W, const float *scale,
 #define QWEN_VNNI_NOINLINE
 #endif
 
+static const int32_t *qwen_vnni_row_sums(const int8_t *W, int rows, int cols);
+
+enum { QWEN_VNNI_WEIGHT_CACHE_MAX = 512 };
+typedef struct {
+    const int8_t *weights;
+    int rows;
+    int cols;
+    size_t bytes;
+    int8_t *packed;
+} qwen_vnni_weight_entry_t;
+
+static qwen_vnni_weight_entry_t g_vnni_weights[QWEN_VNNI_WEIGHT_CACHE_MAX];
+static atomic_int g_vnni_weight_count;
+static pthread_mutex_t g_vnni_weight_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int qwen_vnni_prepack_enabled(void) {
+    const char *e = getenv("QWEN_VNNI_PREPACK");
+    return e && (e[0] == '1' || !strcmp(e, "all") || !strcmp(e, "cp") ||
+                 !strcmp(e, "talker"));
+}
+
+static int8_t *qwen_vnni_pack_n16_k4(const int8_t *source, int rows, int cols) {
+    if (!source || rows < 16 || (rows & 15) || cols <= 0 || (cols & 63)) return NULL;
+    const size_t bytes = (size_t)rows * (size_t)cols;
+    int8_t *packed = (int8_t *)aligned_malloc(bytes);
+    if (!packed) return NULL;
+
+    size_t at = 0;
+    for (int r0 = 0; r0 < rows; r0 += 16) {
+        for (int k = 0; k < cols; k += 4) {
+            for (int r = 0; r < 16; r++) {
+                memcpy(packed + at, source + (size_t)(r0 + r) * cols + k, 4);
+                at += 4;
+            }
+        }
+    }
+    return packed;
+}
+
+int qwen_vnni_prepack_weight(const int8_t *source, int rows, int cols) {
+    if (!qwen_vnni_prepack_enabled() || !source || rows < 16 || (rows & 15) ||
+        cols <= 0 || (cols & 63)) return 0;
+
+    pthread_mutex_lock(&g_vnni_weight_mu);
+    int n = atomic_load_explicit(&g_vnni_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        qwen_vnni_weight_entry_t *e = &g_vnni_weights[i];
+        if (e->weights == source && e->rows == rows && e->cols == cols) {
+            pthread_mutex_unlock(&g_vnni_weight_mu);
+            return 1;
+        }
+    }
+    if (n >= QWEN_VNNI_WEIGHT_CACHE_MAX) {
+        pthread_mutex_unlock(&g_vnni_weight_mu);
+        return 0;
+    }
+
+    int8_t *packed = qwen_vnni_pack_n16_k4(source, rows, cols);
+    if (!packed) {
+        pthread_mutex_unlock(&g_vnni_weight_mu);
+        return 0;
+    }
+    g_vnni_weights[n].weights = source;
+    g_vnni_weights[n].rows = rows;
+    g_vnni_weights[n].cols = cols;
+    g_vnni_weights[n].bytes = (size_t)rows * (size_t)cols;
+    g_vnni_weights[n].packed = packed;
+    atomic_store_explicit(&g_vnni_weight_count, n + 1, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_weight_mu);
+    (void)qwen_vnni_row_sums(source, rows, cols);
+    return 1;
+}
+
+static const int8_t *qwen_vnni_packed_lookup(const int8_t *source, int rows, int cols) {
+    if (!qwen_vnni_prepack_enabled() || !source || rows < 16 || (rows & 15) ||
+        cols <= 0 || (cols & 63)) return NULL;
+    int n = atomic_load_explicit(&g_vnni_weight_count, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        const qwen_vnni_weight_entry_t *e = &g_vnni_weights[i];
+        if (e->weights == source && e->rows == rows && e->cols == cols)
+            return e->packed;
+    }
+    return NULL;
+}
+
+void qwen_vnni_prepack_stats(int *n_packed, size_t *bytes) {
+    int n = 0;
+    size_t total = 0;
+    pthread_mutex_lock(&g_vnni_weight_mu);
+    n = atomic_load_explicit(&g_vnni_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) total += g_vnni_weights[i].bytes;
+    pthread_mutex_unlock(&g_vnni_weight_mu);
+    if (n_packed) *n_packed = n;
+    if (bytes) *bytes = total;
+}
+
+void qwen_vnni_weight_cache_reset(void) {
+    pthread_mutex_lock(&g_vnni_weight_mu);
+    int n = atomic_load_explicit(&g_vnni_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        free(g_vnni_weights[i].packed);
+        g_vnni_weights[i].weights = NULL;
+        g_vnni_weights[i].rows = 0;
+        g_vnni_weights[i].cols = 0;
+        g_vnni_weights[i].bytes = 0;
+        g_vnni_weights[i].packed = NULL;
+    }
+    atomic_store_explicit(&g_vnni_weight_count, 0, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_weight_mu);
+}
+
 static void int8_matmat_vnni_row(float *Y, const int8_t *W, const float *scale,
                                  const int8_t *qXt, const float *sx,
+                                 const int32_t *row_sums,
                                  int r, int cols, int B) {
     const __m512i ones = _mm512_set1_epi8(1);
     const __m512i v128 = _mm512_set1_epi8((char)128);
@@ -3134,14 +3596,14 @@ static void int8_matmat_vnni_row(float *Y, const int8_t *W, const float *scale,
     int k = 0;
     for (; k + 64 <= cols; k += 64) {
         __m512i wv = _mm512_loadu_si512((const void *)(w + k));
-        ws = _mm512_dpbusd_epi32(ws, ones, wv);
+        if (!row_sums) ws = _mm512_dpbusd_epi32(ws, ones, wv);
         for (int b = 0; b < B; b++) {
             __m512i ua = _mm512_add_epi8(
                 _mm512_loadu_si512((const void *)(qXt + (size_t)b * cols + k)), v128);
             acc[b] = _mm512_dpbusd_epi32(acc[b], ua, wv);
         }
     }
-    int sw = _mm512_reduce_add_epi32(ws);
+    int sw = row_sums ? row_sums[r] : _mm512_reduce_add_epi32(ws);
     for (int b = 0; b < B; b++) {
         int sum = _mm512_reduce_add_epi32(acc[b]) - 128 * sw;
         const int8_t *qb = qXt + (size_t)b * cols;
@@ -3153,20 +3615,76 @@ static void int8_matmat_vnni_row(float *Y, const int8_t *W, const float *scale,
 static inline void int8_matmat_vnni_store(float *Y, const int8_t *W, const float *scale,
                                           const int8_t *qXt, const float *sx,
                                           int r, int b, int cols, int k,
-                                          __m512i acc, __m512i ws, int B) {
+                                          __m512i acc, int sw, int B) {
     const int8_t *w = W + (size_t)r * cols;
-    int sum = _mm512_reduce_add_epi32(acc) - 128 * _mm512_reduce_add_epi32(ws);
+    int sum = _mm512_reduce_add_epi32(acc) - 128 * sw;
     const int8_t *qb = qXt + (size_t)b * cols;
     for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
     Y[(size_t)r * B + b] = (float)sum * scale[r] * sx[b];
 }
 
+static inline __m512i qwen_vnni_broadcast_q4(const int8_t *x) {
+    uint32_t q;
+    memcpy(&q, x, sizeof(q));
+    return _mm512_set1_epi32((int)q);
+}
+
+/* The packed layout is 16 output rows x 4 K values per 64-byte block. */
+static void int8_matmat_vnni_packed_slice(float *Y, const int8_t *W,
+                                          const int8_t *pW, const float *scale,
+                                          const int8_t *qXt, const float *sx,
+                                          const int32_t *row_sums,
+                                          int r0, int r1, int rows, int cols, int B) {
+    qwen_census_op("matmat_int8_vnni_packed", r1 - r0, cols, B);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    int start = (r0 + 15) & ~15;
+    int end = r1 & ~15;
+    if (start > r1) start = r1;
+    if (end < start) end = start;
+
+    for (int r = r0; r < start; r++)
+        int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+
+    for (int r0b = start; r0b < end; r0b += 16) {
+        const int8_t *p = pW + (size_t)(r0b / 16) * (size_t)cols * 16;
+        __m512i acc[8];
+        for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_si512();
+
+        for (int k = 0; k < cols; k += 4) {
+            const __m512i wv = _mm512_loadu_si512((const void *)p);
+            p += 64;
+            for (int b = 0; b < B; b++) {
+                const __m512i ua = _mm512_add_epi8(
+                    qwen_vnni_broadcast_q4(qXt + (size_t)b * cols + k), v128);
+                acc[b] = _mm512_dpbusd_epi32(acc[b], ua, wv);
+            }
+        }
+
+        int32_t sums[8][16];
+        for (int b = 0; b < B; b++) _mm512_storeu_si512(sums[b], acc[b]);
+        for (int r = 0; r < 16; r++) {
+            const int rr = r0b + r;
+            const int correction = 128 * row_sums[rr];
+            const float sr = scale[rr];
+            float *dst = Y + (size_t)rr * B;
+            for (int b = 0; b < B; b++)
+                dst[b] = (float)(sums[b][r] - correction) * sr * sx[b];
+        }
+    }
+
+    for (int r = end; r < r1; r++)
+        int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+    (void)rows;
+}
+
 static void int8_matmat_vnni_tile_m4n4(float *Y, const int8_t *W, const float *scale,
                                        const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
                                        int row0, int b0, int nb, int cols,
                                        int B) QWEN_VNNI_NOINLINE;
 static void int8_matmat_vnni_tile_m4n4(float *Y, const int8_t *W, const float *scale,
                                        const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
                                        int row0, int b0, int nb, int cols,
                                        int B) {
     const __m512i ones = _mm512_set1_epi8(1);
@@ -3189,57 +3707,63 @@ static void int8_matmat_vnni_tile_m4n4(float *Y, const int8_t *W, const float *s
             _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 3) * cols + k)), v128);
 
         __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
-        ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
         a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
         if (nb > 1) a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
         if (nb > 2) a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
         if (nb > 3) a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
 
         wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
-        ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
         a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
         if (nb > 1) a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
         if (nb > 2) a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
         if (nb > 3) a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
 
         wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 2) * cols + k));
-        ws2 = _mm512_dpbusd_epi32(ws2, ones, wv);
+        if (!row_sums) ws2 = _mm512_dpbusd_epi32(ws2, ones, wv);
         a20 = _mm512_dpbusd_epi32(a20, ua0, wv);
         if (nb > 1) a21 = _mm512_dpbusd_epi32(a21, ua1, wv);
         if (nb > 2) a22 = _mm512_dpbusd_epi32(a22, ua2, wv);
         if (nb > 3) a23 = _mm512_dpbusd_epi32(a23, ua3, wv);
 
         wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 3) * cols + k));
-        ws3 = _mm512_dpbusd_epi32(ws3, ones, wv);
+        if (!row_sums) ws3 = _mm512_dpbusd_epi32(ws3, ones, wv);
         a30 = _mm512_dpbusd_epi32(a30, ua0, wv);
         if (nb > 1) a31 = _mm512_dpbusd_epi32(a31, ua1, wv);
         if (nb > 2) a32 = _mm512_dpbusd_epi32(a32, ua2, wv);
         if (nb > 3) a33 = _mm512_dpbusd_epi32(a33, ua3, wv);
     }
-    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, ws0, B);
-    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, ws0, B);
-    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, ws0, B);
-    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, ws0, B);
-    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, ws1, B);
-    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, ws1, B);
-    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, ws1, B);
-    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, ws1, B);
-    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 0, cols, k, a20, ws2, B);
-    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 1, cols, k, a21, ws2, B);
-    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 2, cols, k, a22, ws2, B);
-    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 3, cols, k, a23, ws2, B);
-    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 0, cols, k, a30, ws3, B);
-    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 1, cols, k, a31, ws3, B);
-    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 2, cols, k, a32, ws3, B);
-    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 3, cols, k, a33, ws3, B);
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    const int sw2 = row_sums ? row_sums[row0 + 2] : _mm512_reduce_add_epi32(ws2);
+    const int sw3 = row_sums ? row_sums[row0 + 3] : _mm512_reduce_add_epi32(ws3);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, sw0, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, sw0, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, sw0, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, sw1, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, sw1, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, sw1, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 0, cols, k, a20, sw2, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 1, cols, k, a21, sw2, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 2, cols, k, a22, sw2, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 3, cols, k, a23, sw2, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 0, cols, k, a30, sw3, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 1, cols, k, a31, sw3, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 2, cols, k, a32, sw3, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 3, cols, k, a33, sw3, B);
 }
 
 static void int8_matmat_vnni_tile_m2n4(float *Y, const int8_t *W, const float *scale,
                                        const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
                                        int row0, int b0, int nb, int cols,
                                        int B) QWEN_VNNI_NOINLINE;
 static void int8_matmat_vnni_tile_m2n4(float *Y, const int8_t *W, const float *scale,
                                        const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
                                        int row0, int b0, int nb, int cols,
                                        int B) {
     const __m512i ones = _mm512_set1_epi8(1);
@@ -3260,27 +3784,191 @@ static void int8_matmat_vnni_tile_m2n4(float *Y, const int8_t *W, const float *s
             _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 3) * cols + k)), v128);
 
         __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
-        ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
         a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
         if (nb > 1) a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
         if (nb > 2) a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
         if (nb > 3) a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
 
         wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
-        ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
         a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
         if (nb > 1) a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
         if (nb > 2) a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
         if (nb > 3) a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
     }
-    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, ws0, B);
-    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, ws0, B);
-    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, ws0, B);
-    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, ws0, B);
-    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, ws1, B);
-    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, ws1, B);
-    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, ws1, B);
-    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, ws1, B);
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, sw0, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, sw0, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, sw0, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, sw1, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, sw1, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, sw1, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, sw1, B);
+}
+
+static void int8_matmat_vnni_tile_m2n8(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m2n8(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
+    __m512i a04 = a00, a05 = a00, a06 = a00, a07 = a00;
+    __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+    __m512i a14 = a00, a15 = a00, a16 = a00, a17 = a00;
+    __m512i ws0 = a00, ws1 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)0 * cols + k)), v128);
+        __m512i ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)1 * cols + k)), v128);
+        __m512i ua2 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)2 * cols + k)), v128);
+        __m512i ua3 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)3 * cols + k)), v128);
+        __m512i ua4 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)4 * cols + k)), v128);
+        __m512i ua5 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)5 * cols + k)), v128);
+        __m512i ua6 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)6 * cols + k)), v128);
+        __m512i ua7 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)7 * cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+        a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
+        a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
+        a04 = _mm512_dpbusd_epi32(a04, ua4, wv);
+        a05 = _mm512_dpbusd_epi32(a05, ua5, wv);
+        a06 = _mm512_dpbusd_epi32(a06, ua6, wv);
+        a07 = _mm512_dpbusd_epi32(a07, ua7, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+        a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
+        a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
+        a14 = _mm512_dpbusd_epi32(a14, ua4, wv);
+        a15 = _mm512_dpbusd_epi32(a15, ua5, wv);
+        a16 = _mm512_dpbusd_epi32(a16, ua6, wv);
+        a17 = _mm512_dpbusd_epi32(a17, ua7, wv);
+    }
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 0, cols, k, a00, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 1, cols, k, a01, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 2, cols, k, a02, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 3, cols, k, a03, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 4, cols, k, a04, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 5, cols, k, a05, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 6, cols, k, a06, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 7, cols, k, a07, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 0, cols, k, a10, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 1, cols, k, a11, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 2, cols, k, a12, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 3, cols, k, a13, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 4, cols, k, a14, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 5, cols, k, a15, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 6, cols, k, a16, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 7, cols, k, a17, sw1, B);
+}
+
+/* A fixed B=2 tile, analogous to the ARM SMMLA 2x2 cross-product path.
+ * Unlike the general M4xN4 helper, this has no inactive batch accumulators or
+ * nb branches.  It remains opt-in because the best M dimension is ISA- and
+ * shape-dependent; the default dispatcher is unchanged. */
+static void int8_matmat_vnni_tile_m4n2(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m4n2(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00;
+    __m512i a10 = a00, a11 = a00;
+    __m512i a20 = a00, a21 = a00;
+    __m512i a30 = a00, a31 = a00;
+    __m512i ws0 = a00, ws1 = a00, ws2 = a00, ws3 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        const __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + k)), v128);
+        const __m512i ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 0) * cols + k));
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+
+        wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 1) * cols + k));
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+
+        wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 2) * cols + k));
+        if (!row_sums) ws2 = _mm512_dpbusd_epi32(ws2, ones, wv);
+        a20 = _mm512_dpbusd_epi32(a20, ua0, wv);
+        a21 = _mm512_dpbusd_epi32(a21, ua1, wv);
+
+        wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 3) * cols + k));
+        if (!row_sums) ws3 = _mm512_dpbusd_epi32(ws3, ones, wv);
+        a30 = _mm512_dpbusd_epi32(a30, ua0, wv);
+        a31 = _mm512_dpbusd_epi32(a31, ua1, wv);
+    }
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    const int sw2 = row_sums ? row_sums[row0 + 2] : _mm512_reduce_add_epi32(ws2);
+    const int sw3 = row_sums ? row_sums[row0 + 3] : _mm512_reduce_add_epi32(ws3);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 0, cols, k, a00, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 1, cols, k, a01, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 0, cols, k, a10, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 1, cols, k, a11, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, 0, cols, k, a20, sw2, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, 1, cols, k, a21, sw2, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, 0, cols, k, a30, sw3, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, 1, cols, k, a31, sw3, B);
+}
+
+static int qwen_vnni_tile_n8_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_VNNI_TILE_N8");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_vnni_tile_m4n2_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_VNNI_TILE_M4N2");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
 }
 
 static int qwen_vnni_tile_enabled(void) {
@@ -3298,31 +3986,59 @@ static void int8_matmat_vnni_slice(float *Y, const int8_t *W, const float *scale
                                    const int8_t *qXt, const float *sx,
                                    int r0, int r1, int rows, int cols, int B) {
     MMSTAT(QWEN_MMK_INT8_VNNI, r1 - r0, cols, B);
+    const int32_t *row_sums = qwen_vnni_row_sums(W, rows, cols);
+    const int8_t *pW = qwen_vnni_packed_lookup(W, rows, cols);
+    if (pW && row_sums && B >= 2 && B <= 8) {
+        int8_matmat_vnni_packed_slice(Y, W, pW, scale, qXt, sx, row_sums,
+                                      r0, r1, rows, cols, B);
+        return;
+    }
+    if (B == 2 && qwen_vnni_tile_m4n2_enabled() &&
+        qwen_vnni_tile_enabled() && cols >= 64) {
+        qwen_census_op("matmat_int8_vnni_m4n2", r1 - r0, cols, B);
+        int r = r0;
+        for (; r + 4 <= r1; r += 4)
+            int8_matmat_vnni_tile_m4n2(Y, W, scale, qXt, sx, row_sums,
+                                       r, cols, B);
+        for (; r < r1; r++)
+            int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+        return;
+    }
     const int compact = B <= 4 || (B <= 8 && rows <= 2048 && cols <= 3072);
-    if (!qwen_vnni_tile_enabled() || cols < 64 || B < 2 || B > 8 || !compact) {
+    const int tile_n8 = B == 8 && qwen_vnni_tile_n8_enabled();
+    if (!qwen_vnni_tile_enabled() || cols < 64 || B < 2 || B > 8 ||
+        (!compact && !tile_n8)) {
         for (int r = r0; r < r1; r++)
-            int8_matmat_vnni_row(Y, W, scale, qXt, sx, r, cols, B);
+            int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
         return;
     }
 
     int r = r0;
+    if (tile_n8) {
+        for (; r + 2 <= r1; r += 2)
+            int8_matmat_vnni_tile_m2n8(Y, W, scale, qXt, sx, row_sums,
+                                        r, cols, B);
+        for (; r < r1; r++)
+            int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+        return;
+    }
     if (B <= 4) {
         for (; r + 4 <= r1; r += 4)
             for (int b0 = 0; b0 < B; b0 += 4) {
                 const int nb = (B - b0 < 4) ? (B - b0) : 4;
-                int8_matmat_vnni_tile_m4n4(Y, W, scale, qXt, sx,
+                int8_matmat_vnni_tile_m4n4(Y, W, scale, qXt, sx, row_sums,
                                             r, b0, nb, cols, B);
             }
     } else {
         for (; r + 2 <= r1; r += 2)
             for (int b0 = 0; b0 < B; b0 += 4) {
                 const int nb = (B - b0 < 4) ? (B - b0) : 4;
-                int8_matmat_vnni_tile_m2n4(Y, W, scale, qXt, sx,
+                int8_matmat_vnni_tile_m2n4(Y, W, scale, qXt, sx, row_sums,
                                             r, b0, nb, cols, B);
             }
     }
     for (; r < r1; r++)
-        int8_matmat_vnni_row(Y, W, scale, qXt, sx, r, cols, B);
+        int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
 }
 
 typedef struct { float *Y; const int8_t *W; const float *scale; const int8_t *qXt; const float *sx; int rows, cols, B; } int8_vmm_ctx;
@@ -3522,10 +4238,13 @@ static void int8_smmla_task(size_t tid, size_t nt, void *vc) {
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B) {
     qwen_census_op("matmat_int8", rows, cols, B);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
     if (B <= 0) return;
     if (kai_i8_try(Y, W, scale, X, rows, cols, B)) {
         MMSTAT(B > 1 ? QWEN_MMK_KLEIDI_I8 : QWEN_MMK_KLEIDI_I8_GEMV, rows, cols, B);
-        return;
+        goto qwen_matmat_int8_timed_done;
     }
     if (B > 64) B = 64;
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -3549,7 +4268,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 } else {
                     int8_amx_task(0, 1, &c);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -3569,7 +4288,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 } else {
                     int8_vmm_task(0, 1, &c);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -3592,7 +4311,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 } else {
                     int8_matmat_avx2_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -3612,7 +4331,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 } else {
                     int8_matmat_smmla_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -3642,7 +4361,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 } else {
                     int8_matmat_sdot_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -3651,9 +4370,12 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
     if (nt > 1 && rows >= 256) {
         int8_mm_ctx c = { Y, W, scale, X, rows, cols, B };
         qwen_parallel((size_t)nt, int8_mm_task, &c);
-        return;
+        goto qwen_matmat_int8_timed_done;
     }
     int8_matmat_slice(Y, W, scale, X, 0, rows, cols, B);
+
+qwen_matmat_int8_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_INT8, kt_B, rows, cols, kt_t0);
 }
 
 static int qwen_x86_qkv_disabled(void) QWEN_MAYBE_UNUSED;
@@ -3666,6 +4388,22 @@ static int qwen_x86_qkv_disabled(void) {
         atomic_store_explicit(&disabled, v, memory_order_relaxed);
     }
     return v;
+}
+
+static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim)
+    QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim) {
+    if (!qwen_mm_use(QWEN_MMK_INT8_AMX, B, q_dim, in_dim) ||
+        !qwen_mm_use(QWEN_MMK_INT8_AMX, B, kv_dim, in_dim)) return 0;
+
+    /* QKV has a different working set from the other projections.  This is an
+     * additional lower bound for that fused path; the general AMX INT8 gate
+     * remains authoritative and still applies to every other projection. */
+    int base = qwen_mm_minb_value(QWEN_MMK_INT8_AMX,
+                                  &g_mm_gate[QWEN_MMK_INT8_AMX]);
+    int qkv = qwen_mm_env_int("QWEN_AMX_INT8_QKV_MIN_B", base, 1, 64);
+    if (qkv < base) qkv = base;
+    return B >= qkv;
 }
 
 typedef struct {
@@ -3752,6 +4490,9 @@ int qwen_matmat_int8_qkv(float *q, float *k, float *v,
                          const float *X, int in_dim, int q_dim, int kv_dim, int B) {
     const int total = q_dim + 2 * kv_dim;
     qwen_census_op("matmat_int8_qkv", total, in_dim, B);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
 #if !defined(__x86_64__) && !defined(_M_X64)
     (void)q; (void)k; (void)v; (void)Wq; (void)sq; (void)Wk; (void)sk;
     (void)Wv; (void)sv; (void)X; (void)in_dim; (void)q_dim; (void)kv_dim; (void)B;
@@ -3773,8 +4514,7 @@ int qwen_matmat_int8_qkv(float *q, float *k, float *v,
     const int nt = g_n_threads;
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     if ((q_dim & 15) == 0 && (kv_dim & 15) == 0 &&
-        qwen_mm_use(QWEN_MMK_INT8_AMX, B, q_dim, in_dim) &&
-        qwen_mm_use(QWEN_MMK_INT8_AMX, B, kv_dim, in_dim) &&
+        qwen_amx_int8_qkv_allowed(B, q_dim, kv_dim, in_dim) &&
         qwen_amx_int8_ready()) {
         const size_t kfull = (size_t)(in_dim & ~63);
         c.pXt = mm_scratch_pack(kfull * (size_t)B);
@@ -3790,6 +4530,7 @@ int qwen_matmat_int8_qkv(float *q, float *k, float *v,
                 qwen_parallel((size_t)nt, int8_qkv_amx_task, &c);
             else
                 int8_qkv_amx_task(0, 1, &c);
+            qwen_kernel_timing_note(QWEN_KT_INT8, kt_B, total, in_dim, kt_t0);
             return 1;
         }
     }
@@ -3801,6 +4542,7 @@ int qwen_matmat_int8_qkv(float *q, float *k, float *v,
             qwen_parallel((size_t)nt, int8_qkv_vnni_mm_task, &c);
         else
             int8_qkv_vnni_mm_task(0, 1, &c);
+        qwen_kernel_timing_note(QWEN_KT_INT8, kt_B, total, in_dim, kt_t0);
         return 1;
     }
 #endif
@@ -3887,6 +4629,9 @@ int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
                          const float *X, int in_dim, int q_dim, int kv_dim, int B) {
     const int total = q_dim + 2 * kv_dim;
     qwen_census_op("matmat_bf16_qkv", total, in_dim, B);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
 #if !defined(__x86_64__) && !defined(_M_X64)
     (void)q; (void)k; (void)v; (void)Wq; (void)Wk; (void)Wv; (void)X;
     (void)in_dim; (void)q_dim; (void)kv_dim; (void)B;
@@ -3934,6 +4679,7 @@ int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
             else
                 bf16_qkv_amx_task(0, 1, &c);
             free(Xb);
+            qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, total, in_dim, kt_t0);
             return 1;
         }
     }
@@ -3947,6 +4693,7 @@ int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
         else
             bf16_qkv_avx512_task(0, 1, &c);
         free(Xb);
+        qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, total, in_dim, kt_t0);
         return 1;
     }
 #endif
@@ -4830,6 +5577,17 @@ static int qwen_vnni_rowsum_enabled(void) {
     return v;
 }
 
+static int qwen_vnni_gemv_mr(void) {
+    static atomic_int mr = -1;
+    int v = atomic_load_explicit(&mr, memory_order_relaxed);
+    if (v < 0) {
+        v = qwen_mm_env_int("QWEN_VNNI_GEMV_MR", 2, 2, 4);
+        if (v != 4) v = 2;
+        atomic_store_explicit(&mr, v, memory_order_relaxed);
+    }
+    return v;
+}
+
 static const int32_t *qwen_vnni_row_sums(const int8_t *W, int rows, int cols) {
     if (!qwen_vnni_rowsum_enabled() || !W || rows <= 0 || cols <= 0) return NULL;
     const int full_cols = cols & ~63;
@@ -4888,7 +5646,18 @@ void qwen_vnni_row_sums_reset(void) {
     pthread_mutex_unlock(&g_vnni_rowsum_mu);
 }
 
-static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
+static int qwen_vnni_act_quant_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_VNNI_ACT_QUANT");
+        v = !(e && e[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static float quantize_act_int8_x86_scalar(int8_t *qx, const float *x, int n) {
     float amax = 0.0f;
     for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     if (amax == 0.0f) { memset(qx, 0, (size_t)n); return 0.0f; }
@@ -4900,17 +5669,127 @@ static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
     return amax / 127.0f;
 }
 
+static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (qwen_vnni_act_quant_enabled() && n >= 16) {
+        const __m512 sign = _mm512_set1_ps(-0.0f);
+        __m512 vmax = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+        }
+        float amax = _mm512_reduce_max_ps(vmax);
+        for (; i < n; i++) {
+            float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0.0f) { memset(qx, 0, (size_t)n); return 0.0f; }
+
+        const __m512 inv = _mm512_set1_ps(127.0f / amax);
+        i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(v, inv));
+            q = _mm512_max_epi32(q, _mm512_set1_epi32(-128));
+            q = _mm512_min_epi32(q, _mm512_set1_epi32(127));
+            _mm_storeu_si128((__m128i *)(void *)(qx + i), _mm512_cvtsepi32_epi8(q));
+        }
+        for (; i < n; i++) {
+            int v = (int)lrintf(x[i] * (127.0f / amax));
+            qx[i] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+        }
+        return amax / 127.0f;
+    }
+#endif
+    return quantize_act_int8_x86_scalar(qx, x, n);
+}
+
+/* A1: opt-in pre-biased (unsigned) activation for the VNNI B=1 GEMV path.
+ *
+ * vpdpbusd takes an UNSIGNED first operand, so the signed int8 activation has
+ * to be shifted by +128 before it can be fed to the instruction.  The default
+ * kernels redo that _mm512_add_epi8 for every output-row group and every K
+ * chunk, i.e. out_dim/MR times more often than necessary.  With QWEN_VNNI_UACT=1
+ * the shift is applied once, while the activation is quantized, and the kernels
+ * consume the biased bytes directly.  The integer math is unchanged: the
+ * existing "- 128 * row_sum" correction already accounts for the bias, so the
+ * results are bit-identical to the signed path.
+ */
+static int qwen_vnni_uact_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        v = qwen_mm_env_int("QWEN_VNNI_UACT", 0, 0, 1);
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+/* Same quantization as quantize_act_int8_x86(), storing q + 128 as u8. */
+static float quantize_act_u8_x86(uint8_t *ux, const float *x, int n) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (qwen_vnni_act_quant_enabled() && n >= 16) {
+        const __m512 sign = _mm512_set1_ps(-0.0f);
+        __m512 vmax = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+        }
+        float amax = _mm512_reduce_max_ps(vmax);
+        for (; i < n; i++) {
+            float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0.0f) { memset(ux, 128, (size_t)n); return 0.0f; }
+
+        const __m512 inv = _mm512_set1_ps(127.0f / amax);
+        const __m128i bias = _mm_set1_epi8((char)128);
+        i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(v, inv));
+            q = _mm512_max_epi32(q, _mm512_set1_epi32(-128));
+            q = _mm512_min_epi32(q, _mm512_set1_epi32(127));
+            _mm_storeu_si128((__m128i *)(void *)(ux + i),
+                             _mm_add_epi8(_mm512_cvtsepi32_epi8(q), bias));
+        }
+        for (; i < n; i++) {
+            int v = (int)lrintf(x[i] * (127.0f / amax));
+            v = v > 127 ? 127 : (v < -128 ? -128 : v);
+            ux[i] = (uint8_t)(v + 128);
+        }
+        return amax / 127.0f;
+    }
+#endif
+    {
+        float amax = 0.0f;
+        for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+        if (amax == 0.0f) { memset(ux, 128, (size_t)n); return 0.0f; }
+        float inv = 127.0f / amax;
+        for (int i = 0; i < n; i++) {
+            int v = (int)lrintf(x[i] * inv);
+            v = v > 127 ? 127 : (v < -128 ? -128 : v);
+            ux[i] = (uint8_t)(v + 128);
+        }
+        return amax / 127.0f;
+    }
+}
+
 static void int8_matvec_vnni_legacy(float *y, const int8_t *qx, float sx,
                                     const int8_t *W, const float *scale,
                                     int in_dim, int out_dim) {
     const __m512i v128 = _mm512_set1_epi8((char)128);
     const __m512i ones = _mm512_set1_epi8(1);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
     int o = 0;
     for (; o + 1 < out_dim; o += 2) {
         const int8_t *w0 = W + (size_t)o * in_dim;
         const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
         __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
         __m512i ws0  = _mm512_setzero_si512(), ws1  = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         int k = 0;
         for (; k + 64 <= in_dim; k += 64) {
             __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
@@ -4924,12 +5803,16 @@ static void int8_matvec_vnni_legacy(float *y, const int8_t *qx, float sx,
         int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
         int s1 = _mm512_reduce_add_epi32(acc1) - 128 * _mm512_reduce_add_epi32(ws1);
         for (; k < in_dim; k++) { s0 += (int)w0[k] * qx[k]; s1 += (int)w1[k] * qx[k]; }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)2 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         y[o]     = (float)s0 * scale[o]     * sx;
         y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
     }
     if (o < out_dim) {
         const int8_t *w0 = W + (size_t)o * in_dim;
         __m512i acc0 = _mm512_setzero_si512(), ws0 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         int k = 0;
         for (; k + 64 <= in_dim; k += 64) {
             __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
@@ -4939,7 +5822,10 @@ static void int8_matvec_vnni_legacy(float *y, const int8_t *qx, float sx,
         }
         int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
         for (; k < in_dim; k++) s0 += (int)w0[k] * qx[k];
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         y[o] = (float)s0 * scale[o] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
     }
 }
 
@@ -4948,11 +5834,13 @@ static void int8_matvec_vnni_rowsum(float *y, const int8_t *qx, float sx,
                                     const int32_t *row_sums,
                                     int in_dim, int out_dim) {
     const __m512i v128 = _mm512_set1_epi8((char)128);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
     int o = 0;
     for (; o + 1 < out_dim; o += 2) {
         const int8_t *w0 = W + (size_t)o * in_dim;
         const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
         __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         int k = 0;
         for (; k + 64 <= in_dim; k += 64) {
             __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
@@ -4964,12 +5852,16 @@ static void int8_matvec_vnni_rowsum(float *y, const int8_t *qx, float sx,
         int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
         int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
         for (; k < in_dim; k++) { s0 += (int)w0[k] * qx[k]; s1 += (int)w1[k] * qx[k]; }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)2 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         y[o]     = (float)s0 * scale[o]     * sx;
         y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
     }
     if (o < out_dim) {
         const int8_t *w0 = W + (size_t)o * in_dim;
         __m512i acc0 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         int k = 0;
         for (; k + 64 <= in_dim; k += 64) {
             __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
@@ -4978,8 +5870,221 @@ static void int8_matvec_vnni_rowsum(float *y, const int8_t *qx, float sx,
         }
         int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
         for (; k < in_dim; k++) s0 += (int)w0[k] * qx[k];
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o] = (float)s0 * scale[o] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+}
+
+static void int8_matvec_vnni_rowsum_mr4(float *y, const int8_t *qx, float sx,
+                                        const int8_t *W, const float *scale,
+                                        const int32_t *row_sums,
+                                        int in_dim, int out_dim) {
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        const int8_t *w2 = w1 + in_dim;
+        const int8_t *w3 = w2 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512(), acc3 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_add_epi8(
+                _mm512_loadu_si512((const void *)(qx + k)), v128);
+            acc0 = _mm512_dpbusd_epi32(acc0, ua,
+                                       _mm512_loadu_si512((const void *)(w0 + k)));
+            acc1 = _mm512_dpbusd_epi32(acc1, ua,
+                                       _mm512_loadu_si512((const void *)(w1 + k)));
+            acc2 = _mm512_dpbusd_epi32(acc2, ua,
+                                       _mm512_loadu_si512((const void *)(w2 + k)));
+            acc3 = _mm512_dpbusd_epi32(acc3, ua,
+                                       _mm512_loadu_si512((const void *)(w3 + k)));
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        int s2 = _mm512_reduce_add_epi32(acc2) - 128 * row_sums[o + 2];
+        int s3 = _mm512_reduce_add_epi32(acc3) - 128 * row_sums[o + 3];
+        for (; k < in_dim; k++) {
+            const int q = qx[k];
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+            s2 += (int)w2[k] * q;
+            s3 += (int)w3[k] * q;
+        }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)4 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        y[o + 2] = (float)s2 * scale[o + 2] * sx;
+        y[o + 3] = (float)s3 * scale[o + 3] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+    if (o < out_dim)
+        int8_matvec_vnni_rowsum(y + o, qx, sx, W + (size_t)o * in_dim,
+                                scale + o, row_sums + o, in_dim, out_dim - o);
+}
+
+static void int8_matvec_vnni_legacy_mr4(float *y, const int8_t *qx, float sx,
+                                        const int8_t *W, const float *scale,
+                                        int in_dim, int out_dim) {
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    const __m512i ones = _mm512_set1_epi8(1);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        const int8_t *w2 = w1 + in_dim;
+        const int8_t *w3 = w2 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512(), acc3 = _mm512_setzero_si512();
+        __m512i ws0 = _mm512_setzero_si512(), ws1 = _mm512_setzero_si512();
+        __m512i ws2 = _mm512_setzero_si512(), ws3 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_add_epi8(
+                _mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            __m512i wv1 = _mm512_loadu_si512((const void *)(w1 + k));
+            __m512i wv2 = _mm512_loadu_si512((const void *)(w2 + k));
+            __m512i wv3 = _mm512_loadu_si512((const void *)(w3 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+            acc1 = _mm512_dpbusd_epi32(acc1, ua, wv1);
+            acc2 = _mm512_dpbusd_epi32(acc2, ua, wv2);
+            acc3 = _mm512_dpbusd_epi32(acc3, ua, wv3);
+            ws0 = _mm512_dpbusd_epi32(ws0, ones, wv0);
+            ws1 = _mm512_dpbusd_epi32(ws1, ones, wv1);
+            ws2 = _mm512_dpbusd_epi32(ws2, ones, wv2);
+            ws3 = _mm512_dpbusd_epi32(ws3, ones, wv3);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * _mm512_reduce_add_epi32(ws1);
+        int s2 = _mm512_reduce_add_epi32(acc2) - 128 * _mm512_reduce_add_epi32(ws2);
+        int s3 = _mm512_reduce_add_epi32(acc3) - 128 * _mm512_reduce_add_epi32(ws3);
+        for (; k < in_dim; k++) {
+            const int q = qx[k];
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+            s2 += (int)w2[k] * q;
+            s3 += (int)w3[k] * q;
+        }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)4 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        y[o + 2] = (float)s2 * scale[o + 2] * sx;
+        y[o + 3] = (float)s3 * scale[o + 3] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+    if (o < out_dim)
+        int8_matvec_vnni_legacy(y + o, qx, sx, W + (size_t)o * in_dim,
+                                scale + o, in_dim, out_dim - o);
+}
+
+/* A1 kernels: identical to int8_matvec_vnni_rowsum{,_mr4} except that the
+ * activation arrives pre-biased, so the per-row-group _mm512_add_epi8 and the
+ * extra activation load are gone from the inner loop. */
+static void int8_matvec_vnni_urowsum(float *y, const uint8_t *ux, float sx,
+                                     const int8_t *W, const float *scale,
+                                     const int32_t *row_sums,
+                                     int in_dim, int out_dim) {
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_loadu_si512((const void *)(ux + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua,
+                                       _mm512_loadu_si512((const void *)(w0 + k)));
+            acc1 = _mm512_dpbusd_epi32(acc1, ua,
+                                       _mm512_loadu_si512((const void *)(w1 + k)));
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        for (; k < in_dim; k++) {
+            const int q = (int)ux[k] - 128;
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+        }
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+    }
+    if (o < out_dim) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        __m512i acc0 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64)
+            acc0 = _mm512_dpbusd_epi32(
+                acc0, _mm512_loadu_si512((const void *)(ux + k)),
+                _mm512_loadu_si512((const void *)(w0 + k)));
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        for (; k < in_dim; k++) s0 += (int)w0[k] * ((int)ux[k] - 128);
         y[o] = (float)s0 * scale[o] * sx;
     }
+}
+
+static void int8_matvec_vnni_urowsum_mr4(float *y, const uint8_t *ux, float sx,
+                                         const int8_t *W, const float *scale,
+                                         const int32_t *row_sums,
+                                         int in_dim, int out_dim) {
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        const int8_t *w2 = w1 + in_dim;
+        const int8_t *w3 = w2 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512(), acc3 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_loadu_si512((const void *)(ux + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua,
+                                       _mm512_loadu_si512((const void *)(w0 + k)));
+            acc1 = _mm512_dpbusd_epi32(acc1, ua,
+                                       _mm512_loadu_si512((const void *)(w1 + k)));
+            acc2 = _mm512_dpbusd_epi32(acc2, ua,
+                                       _mm512_loadu_si512((const void *)(w2 + k)));
+            acc3 = _mm512_dpbusd_epi32(acc3, ua,
+                                       _mm512_loadu_si512((const void *)(w3 + k)));
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        int s2 = _mm512_reduce_add_epi32(acc2) - 128 * row_sums[o + 2];
+        int s3 = _mm512_reduce_add_epi32(acc3) - 128 * row_sums[o + 3];
+        for (; k < in_dim; k++) {
+            const int q = (int)ux[k] - 128;
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+            s2 += (int)w2[k] * q;
+            s3 += (int)w3[k] * q;
+        }
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        y[o + 2] = (float)s2 * scale[o + 2] * sx;
+        y[o + 3] = (float)s3 * scale[o + 3] * sx;
+    }
+    if (o < out_dim)
+        int8_matvec_vnni_urowsum(y + o, ux, sx, W + (size_t)o * in_dim,
+                                 scale + o, row_sums + o, in_dim, out_dim - o);
+}
+
+static void int8_matvec_vnni_u(float *y, const uint8_t *ux, float sx,
+                               const int8_t *W, const float *scale,
+                               const int32_t *row_sums,
+                               int in_dim, int out_dim) {
+    if (qwen_vnni_gemv_mr() == 4)
+        int8_matvec_vnni_urowsum_mr4(y, ux, sx, W, scale, row_sums,
+                                     in_dim, out_dim);
+    else
+        int8_matvec_vnni_urowsum(y, ux, sx, W, scale, row_sums, in_dim, out_dim);
 }
 
 static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
@@ -4987,20 +6092,32 @@ static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
                              const int32_t *row_sums,
                              int in_dim, int out_dim) {
     if (row_sums) {
-        int8_matvec_vnni_rowsum(y, qx, sx, W, scale, row_sums, in_dim, out_dim);
+        if (qwen_vnni_gemv_mr() == 4)
+            int8_matvec_vnni_rowsum_mr4(y, qx, sx, W, scale, row_sums,
+                                        in_dim, out_dim);
+        else
+            int8_matvec_vnni_rowsum(y, qx, sx, W, scale, row_sums, in_dim, out_dim);
         return;
     }
-    int8_matvec_vnni_legacy(y, qx, sx, W, scale, in_dim, out_dim);
+    if (qwen_vnni_gemv_mr() == 4)
+        int8_matvec_vnni_legacy_mr4(y, qx, sx, W, scale, in_dim, out_dim);
+    else
+        int8_matvec_vnni_legacy(y, qx, sx, W, scale, in_dim, out_dim);
 }
 
 typedef struct {
     float *y; const int8_t *qx; float sx; const int8_t *W; const float *scale;
-    const int32_t *row_sums; int rows, cols;
+    const int32_t *row_sums; int rows, cols; const uint8_t *ux;
 } int8_vnni_ctx;
 static void int8_vnni_task(size_t tid, size_t nt, void *vc) {
     int8_vnni_ctx *c = (int8_vnni_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    if (c->ux) {
+        int8_matvec_vnni_u(c->y + r0, c->ux, c->sx, c->W + (size_t)r0 * c->cols,
+                           c->scale + r0, c->row_sums + r0, c->cols, r1 - r0);
+        return;
+    }
     int8_matvec_vnni(c->y + r0, c->qx, c->sx, c->W + (size_t)r0 * c->cols,
                      c->scale + r0, c->row_sums ? c->row_sums + r0 : NULL,
                      c->cols, r1 - r0);
@@ -5013,6 +6130,7 @@ typedef struct {
     const float *sq, *sk, *sv;
     const int32_t *row_sums_q, *row_sums_k, *row_sums_v;
     int in_dim, q_dim, kv_dim;
+    const uint8_t *ux;
 } int8_qkv_vnni_ctx;
 
 static void int8_qkv_vnni_task(size_t tid, size_t nt, void *vc) {
@@ -5033,6 +6151,13 @@ static void int8_qkv_vnni_task(size_t tid, size_t nt, void *vc) {
         const int r0 = lo - seg[i].base;
         const int32_t *row_sums = i == 0 ? c->row_sums_q :
                                    (i == 1 ? c->row_sums_k : c->row_sums_v);
+        if (c->ux) {
+            int8_matvec_vnni_u(seg[i].y + r0, c->ux, c->sx,
+                               seg[i].W + (size_t)r0 * c->in_dim,
+                               seg[i].scale + r0, row_sums + r0,
+                               c->in_dim, hi - lo);
+            continue;
+        }
         int8_matvec_vnni(seg[i].y + r0, c->qx, c->sx,
                          seg[i].W + (size_t)r0 * c->in_dim, seg[i].scale + r0,
                          row_sums ? row_sums + r0 : NULL,
@@ -5055,6 +6180,15 @@ static int qwen_vnni_qkv_disabled(void) {
 
 #if !defined(__AVX512VNNI__)
 void qwen_vnni_row_sums_reset(void) {}
+int qwen_vnni_prepack_weight(const int8_t *source, int rows, int cols) {
+    (void)source; (void)rows; (void)cols;
+    return 0;
+}
+void qwen_vnni_prepack_stats(int *n_packed, size_t *bytes) {
+    if (n_packed) *n_packed = 0;
+    if (bytes) *bytes = 0;
+}
+void qwen_vnni_weight_cache_reset(void) {}
 #endif
 
 typedef struct {
@@ -5111,29 +6245,43 @@ static void int8_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
 void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
                       const float *x, int rows, int cols) {
     qwen_census_op("matvec_int8", rows, cols, 1);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     if (kai_i8_try(y, W, scale, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_KLEIDI_I8_GEMV, rows, cols, 1);
-        return;
+        goto qwen_matvec_int8_timed_done;
     }
     MMSTAT(QWEN_MMK_INT8_GEMV, rows, cols, 1);
 
 #if defined(__AVX512VNNI__)
     enum { QXV_MAX = 8192 };
+    const int vp_on = qwen_vnni_phase_timing_enabled();
     static atomic_int vnni_off = -1;
     int vnni_o = atomic_load_explicit(&vnni_off, memory_order_relaxed);
     if (vnni_o < 0) { const char *e = getenv("QWEN_NO_VNNI"); vnni_o = (e && e[0] == '1'); atomic_store_explicit(&vnni_off, vnni_o, memory_order_relaxed); }
     if (!vnni_o && cols <= QXV_MAX) {
         int8_t qx_buf[QXV_MAX];
-        float sx = quantize_act_int8_x86(qx_buf, x, cols);
+        double vp_rs = vp_on ? qwen_mm_now_s() : 0.0;
         const int32_t *row_sums = qwen_vnni_row_sums(W, rows, cols);
+        if (vp_on) qwen_vnni_phase_note(QWEN_VP_ROWSUM, 0, vp_rs);
+        const int uact = row_sums && qwen_vnni_uact_enabled();
+        const uint8_t *ux = uact ? (const uint8_t *)qx_buf : NULL;
+        double vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
+        float sx = uact ? quantize_act_u8_x86((uint8_t *)qx_buf, x, cols)
+                        : quantize_act_int8_x86(qx_buf, x, cols);
+        if (vp_on) qwen_vnni_phase_note(
+            QWEN_VP_QUANT, (long long)cols * (long long)sizeof(float), vp_t0);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
-            int8_vnni_ctx c = { y, qx_buf, sx, W, scale, row_sums, rows, cols };
+            int8_vnni_ctx c = { y, qx_buf, sx, W, scale, row_sums, rows, cols, ux };
+            vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
             qwen_parallel((size_t)nt, int8_vnni_task, &c);
-            return;
+            if (vp_on) qwen_vnni_phase_note(QWEN_VP_PARALLEL, 0, vp_t0);
+            goto qwen_matvec_int8_timed_done;
         }
-        int8_matvec_vnni(y, qx_buf, sx, W, scale, row_sums, cols, rows);
-        return;
+        if (uact) int8_matvec_vnni_u(y, ux, sx, W, scale, row_sums, cols, rows);
+        else      int8_matvec_vnni(y, qx_buf, sx, W, scale, row_sums, cols, rows);
+        goto qwen_matvec_int8_timed_done;
     }
 #endif
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -5148,19 +6296,22 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
         if (nt > 1 && rows >= 256) {
             int8_sdot_ctx c = { y, qx_buf, sx, W, scale, rows, cols };
             qwen_parallel((size_t)nt, int8_sdot_task, &c);
-            return;
+            goto qwen_matvec_int8_timed_done;
         }
         int8_matvec_sdot(y, qx_buf, sx, W, scale, cols, rows);
-        return;
+        goto qwen_matvec_int8_timed_done;
     }
 #endif
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         int8_mv_ctx c = { y, x, W, scale, rows, cols };
         qwen_parallel((size_t)nt, int8_mv_task, &c);
-        return;
+        goto qwen_matvec_int8_timed_done;
     }
     int8_matvec_fused(y, x, W, scale, cols, rows);
+
+qwen_matvec_int8_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_INT8, 1, rows, cols, kt_t0);
 }
 
 void qwen_matvec_int8_qkv(float *q, float *k, float *v,
@@ -5169,9 +6320,13 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
                            const int8_t *Wv, const float *sv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
     qwen_census_op("matvec_int8_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int total = q_dim + 2 * kv_dim;
     if (qwen_kleidi_i8_enabled() &&
         qwen_kleidi_matmul_i8_qkv(q, k, v, Wq, Wk, Wv, x, in_dim, q_dim, kv_dim)) {
-        MMSTAT(QWEN_MMK_KLEIDI_I8_GEMV, q_dim + 2 * kv_dim, in_dim, 1);
+        MMSTAT(QWEN_MMK_KLEIDI_I8_GEMV, total, in_dim, 1);
+        qwen_kernel_timing_note(QWEN_KT_INT8, 1, total, in_dim, kt_t0);
         return;
     }
     MMSTAT(QWEN_MMK_INT8_GEMV, q_dim + 2 * kv_dim, in_dim, 1);
@@ -5199,19 +6354,32 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
         const int total = q_dim + 2 * kv_dim;
         if (!qwen_vnni_qkv_disabled() && in_dim <= QX_MAX_QKV) {
             int8_t qx_buf[QX_MAX_QKV];
-            const float sx = quantize_act_int8_x86(qx_buf, x, in_dim);
+            const int vp_on = qwen_vnni_phase_timing_enabled();
             const int nt = g_n_threads;
+            double vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
             const int32_t *row_sums_q = qwen_vnni_row_sums(Wq, q_dim, in_dim);
             const int32_t *row_sums_k = qwen_vnni_row_sums(Wk, kv_dim, in_dim);
             const int32_t *row_sums_v = qwen_vnni_row_sums(Wv, kv_dim, in_dim);
+            if (vp_on) qwen_vnni_phase_note(QWEN_VP_ROWSUM, 0, vp_t0);
+            const int uact = row_sums_q && row_sums_k && row_sums_v &&
+                             qwen_vnni_uact_enabled();
+            const uint8_t *ux = uact ? (const uint8_t *)qx_buf : NULL;
+            vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
+            const float sx = uact ? quantize_act_u8_x86((uint8_t *)qx_buf, x, in_dim)
+                                  : quantize_act_int8_x86(qx_buf, x, in_dim);
+            if (vp_on) qwen_vnni_phase_note(
+                QWEN_VP_QUANT, (long long)in_dim * (long long)sizeof(float), vp_t0);
             int8_qkv_vnni_ctx c = { q, k, v, qx_buf, sx, Wq, Wk, Wv,
                                     sq, sk, sv, row_sums_q, row_sums_k, row_sums_v,
-                                    in_dim, q_dim, kv_dim };
+                                    in_dim, q_dim, kv_dim, ux };
             if (nt > 1 && total >= 256) {
+                vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
                 qwen_parallel((size_t)nt, int8_qkv_vnni_task, &c);
+                if (vp_on) qwen_vnni_phase_note(QWEN_VP_PARALLEL, 0, vp_t0);
             } else {
                 int8_qkv_vnni_task(0, 1, &c);
             }
+            qwen_kernel_timing_note(QWEN_KT_INT8, 1, total, in_dim, kt_t0);
             return;
         }
     }
