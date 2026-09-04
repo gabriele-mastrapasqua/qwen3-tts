@@ -66,9 +66,11 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
     started = time.time()
     received = first = 0
     first_at = None
+    header_at = None
     handle = open(out_path, "wb") if out_path else None
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            header_at = time.time() - started      # TTFB: status line + headers are in
             while True:
                 chunk = response.read1(1 << 16)
                 if not chunk:
@@ -91,6 +93,7 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
     stream_rtf = ((total - first_at) / remaining_s
                   if first_at is not None and remaining_s > 0 else float("nan"))
     return {
+        "ttfb_ms": (header_at or 0.0) * 1000.0,
         "ttfa_ms": (first_at or 0.0) * 1000.0,
         "total_ms": total * 1000.0,
         "bytes": received,
@@ -135,7 +138,7 @@ def main():
     with open(args.csv, "w", newline="", buffering=1, encoding="utf-8") as handle:
         output = csv.writer(handle)
         output.writerow((
-            "t_end_s", "worker", "i", "ttfa_ms", "total_ms", "bytes",
+            "t_end_s", "worker", "i", "ttfb_ms", "ttfa_ms", "total_ms", "bytes",
             "first_chunk_bytes", "audio_s", "stream_rtf", "is_probe", "class",
             "text_chars", "seed", "schedule", "error",
         ))
@@ -163,13 +166,13 @@ def main():
             end = time.time() - args.t0
             if error:
                 output.writerow((
-                    f"{end:.3f}", args.worker, index, "", "", "", "", "", "",
+                    f"{end:.3f}", args.worker, index, "", "", "", "", "", "", "",
                     int(probe), cls, len(text), seed, args.schedule, error,
                 ))
             else:
                 output.writerow((
                     f"{end:.3f}", args.worker, index,
-                    f"{result['ttfa_ms']:.1f}", f"{result['total_ms']:.1f}",
+                    f"{result['ttfb_ms']:.1f}", f"{result['ttfa_ms']:.1f}", f"{result['total_ms']:.1f}",
                     result["bytes"], result["first_chunk_bytes"],
                     f"{result['audio_s']:.3f}", f"{result['stream_rtf']:.4f}",
                     int(probe), cls, len(text), seed, args.schedule, "",

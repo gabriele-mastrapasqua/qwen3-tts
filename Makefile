@@ -105,6 +105,7 @@ SRCS = main.c \
        qwen_tts_code_predictor.c \
        qwen_tts_speech_decoder.c \
        qwen_tts_kernels.c \
+       qwen_tts_dispatch.c \
        qwen_tts_thread.c \
        qwen_tts_kernels_generic.c \
        qwen_tts_kernels_neon.c \
@@ -178,15 +179,21 @@ help:
 	@echo "  make bench-full      - Full benchmark (+ server, qvoice, instruct, INT8)"
 	@echo "  make cp-microbench   - Build qwen_tts_cpbench (per-op Code Predictor breakdown)"
 	@echo ""
+	@echo "CPU profiling gate (docs/cpu-profiling.md) — run BEFORE any CPU optimisation:"
+	@echo "  make cpu-check             - 15 s preflight: provenance, hardware, RESOLVED dispatch map, self-test,"
+	@echo "                               expected-vs-observed per ISA class -> profiles/<date>_<host>_<sha8>/"
+	@echo "  make dispatch-map          - just the resolved dispatch table (./qwen_tts --dispatch-map)"
+	@echo "  make profile-cpu-check     - is the last profile still valid for THIS binary/source/env/host?"
+	@echo ""
 	@echo "A newly provisioned box (IN THIS ORDER — see docs/hardware-testing.md):"
 	@echo "  make server-hw-check       - the truth about the silicon: hardware + memory bandwidth"
-	@echo "  make server-batch-microbench - the B=1->2->4 curve and batch efficiency (~4 min, open weights)"
-	@echo "  make mini-bench-06b|-17b   - 1/2/4 parallel requests on an OSS model"
-	@echo "  make kernel-tune           - measure the dispatcher thresholds instead of guessing them"
-	@echo "  make tune-archive BOX=<name> - the same, and archives the JSON for a cross-ISA comparison"
 	@echo "                               (tools/box_info.sh + tests/membw.c) + --caps + --self-test"
 	@echo "                               + --matmat-bench. No model needed. JSON in HW_JSON=."
 	@echo "                               (historical alias: make box-report)"
+	@echo "  make server-batch-microbench - server request-batching: M clients vs single-stream, TTFB+RTF (CustomVoice 0.6B; -full = 1.7B)"
+	@echo "  make mini-bench-06b|-17b   - 1/2/4 simultaneous requests on an OSS model, int8, compiled defaults"
+	@echo "  make kernel-tune[-quick]   - measure the dispatcher thresholds instead of guessing them (KT_ARGS=)"
+	@echo "  make tune-archive BOX=<name> - the same, and archives the JSON in docs/boxes/ for tests/mm_tune_compare.py"
 	@echo "  make membw                 - bandwidth only: Copy/Triad with a thread sweep, and the knee"
 	@echo "  make bench-matrix[-full]   - then the RTF matrix (needs a downloaded model)"
 	@echo "  make check-matmat-parity   - do the batched twins do the arithmetic they claim? (native ISA)"
@@ -306,7 +313,7 @@ bench-server: $(TARGET)
 	@bash tests/serve_batch_bench.sh $(MODEL_SMALL)
 
 check-isa:
-	@echo "=== Compile-check newer-ISA paths (syntax only, not run) ==="
+	@bash tools/check_isa.sh
 
 emotion-para-demo: $(TARGET)
 	@bash tests/emotion_para_demo.sh
@@ -785,6 +792,53 @@ test-regression:
 check-flag-registry:
 	@python3 tools/check_flag_registry.py
 
+# ── CPU profiling gate ────────────────────────────────────────────────────────────
+# One artifact directory per run, the same gate language everywhere.  cpu-check is the
+# preflight that every CPU optimisation session starts with; profile-cpu-check is the
+# 1-second "is that preflight still valid for this binary/source/env/host?".
+PROFILES_DIR ?= profiles
+CPU_PROFILE  ?=
+CPU_MODEL    ?=
+cpu-check: $(TARGET) $(MEMBW_BIN)
+	@MEMBW_BIN=$(MEMBW_BIN) PROFILES_DIR=$(PROFILES_DIR) CPU_PROFILE=$(CPU_PROFILE) \
+	  CPU_MODEL=$(CPU_MODEL) bash tools/cpu_check.sh
+dispatch-map: $(TARGET)
+	@./$(TARGET) --dispatch-map
+profile-cpu-check: $(TARGET)
+	@python3 tools/profile_check.py --profiles $(PROFILES_DIR) --bin ./$(TARGET) $(if $(CPU_MODEL),--model $(CPU_MODEL),)
+
+# ── dispatcher thresholds and the small serving curves ──────────────────────────
+# These four were listed in `make help` and .PHONY without a recipe, so `make kernel-tune`
+# printed "Nothing to be done" and exited 0.  Wired to the scripts that exist.
+KT_ARGS ?=
+MODEL_BASE_LARGE ?= qwen3-tts-1.7b-base
+NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+kernel-tune: $(TARGET)
+	@bash tests/kernel_tune.sh $(KT_ARGS)
+kernel-tune-quick: $(TARGET)
+	@bash tests/kernel_tune.sh --quick $(KT_ARGS)
+tune-archive: $(TARGET)
+	@[ -n "$(BOX)" ] || { echo "usage: make tune-archive BOX=<name>   (e.g. BOX=aws-c8a-16c-zen5)"; exit 2; }
+	@mkdir -p docs/boxes
+	@bash tests/kernel_tune.sh -o /tmp/qwen_tune_$(BOX) $(KT_ARGS) && \
+	  cp /tmp/qwen_tune_$(BOX)/tune.json docs/boxes/$(BOX)_tune.json && \
+	  echo "archived docs/boxes/$(BOX)_tune.json  (compare: python3 tests/mm_tune_compare.py)"
+# /v1/tts with a preset speaker: CustomVoice models only (a Base model has no presets)
+server-batch-microbench: $(TARGET)
+	@bash tests/serve_batch_bench.sh $(MODEL_SMALL)
+server-batch-microbench-full: $(TARGET)
+	@bash tests/serve_batch_bench.sh $(MODEL_LARGE)
+mini-bench-06b: $(TARGET)
+	@python3 tests/serve_parallel_wave.py --model $(MODEL_BASE_SMALL) --bin ./$(TARGET) \
+	  --topo 1x$(NPROC) --conc 1,2,4 --waves 2 --seed 42 --precision int8 \
+	  --no-profile "mini-bench: compiled defaults" --classes short --out /tmp/mini_bench_06b \
+	  --port 9600 --label mini06b
+mini-bench-17b: $(TARGET)
+	@python3 tests/serve_parallel_wave.py --model $(MODEL_BASE_LARGE) --bin ./$(TARGET) \
+	  --topo 1x$(NPROC) --conc 1,2,4 --waves 2 --seed 42 --precision int8 \
+	  --no-profile "mini-bench: compiled defaults" --classes short --out /tmp/mini_bench_17b \
+	  --port 9601 --label mini17b
+
 PREFILL_BENCH_SRC = tests/prefill_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
                     qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 prefill-bench: $(INGOT_LIB)
@@ -944,26 +998,24 @@ test-serve-bench: $(TARGET)
 	@./$(TARGET) -d $(MODEL_SMALL) --serve 8091 &>/dev/null & SERVER_PID=$$!; \
 	 sleep 4; \
 	 echo "--- Run 1 (cold) ---"; \
-	 T1=$$(curl -s -w "%{time_total}" -X POST http://localhost:8091/v1/tts \
+	 T1=$$(curl -s -w "total %{time_total}s  TTFB %{time_starttransfer}s" -X POST http://localhost:8091/v1/tts \
 	   -H "Content-Type: application/json" \
-	   -d '{"text":"The quick brown fox jumps over the lazy dog on a sunny afternoon.","speaker":"ryan","language":"English","seed":42}' \
+	   -d '{"text":"The quick brown fox jumps over the lazy dog on a sunny afternoon.","speaker":"ryan","language":"English","seed":42,"temperature":0}' \
 	   -o $(TEST_DIR)/bench_run1.wav); \
 	 S1=$$(stat -f%z $(TEST_DIR)/bench_run1.wav 2>/dev/null || stat -c%s $(TEST_DIR)/bench_run1.wav 2>/dev/null); \
-	 echo "  $${T1}s, $$S1 bytes"; \
+	 echo "  $${T1}, $$S1 bytes   (non-streaming /v1/tts: TTFB = whole synthesis, headers go with the WAV)"; \
 	 if [ "$$S1" -le 44 ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: empty WAV"; exit 1; fi; \
 	 echo "--- Run 2 (warm) ---"; \
-	 T2=$$(curl -s -w "%{time_total}" -X POST http://localhost:8091/v1/tts \
+	 T2=$$(curl -s -w "total %{time_total}s  TTFB %{time_starttransfer}s" -X POST http://localhost:8091/v1/tts \
 	   -H "Content-Type: application/json" \
-	   -d '{"text":"The quick brown fox jumps over the lazy dog on a sunny afternoon.","speaker":"ryan","language":"English","seed":42}' \
+	   -d '{"text":"The quick brown fox jumps over the lazy dog on a sunny afternoon.","speaker":"ryan","language":"English","seed":42,"temperature":0}' \
 	   -o $(TEST_DIR)/bench_run2.wav); \
 	 S2=$$(stat -f%z $(TEST_DIR)/bench_run2.wav 2>/dev/null || stat -c%s $(TEST_DIR)/bench_run2.wav 2>/dev/null); \
-	 echo "  $${T2}s, $$S2 bytes"; \
-	 echo "--- Comparing outputs ---"; \
-	 MD5_1=$$(md5sum $(TEST_DIR)/bench_run1.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/bench_run1.wav 2>/dev/null); \
-	 MD5_2=$$(md5sum $(TEST_DIR)/bench_run2.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/bench_run2.wav 2>/dev/null); \
-	 if [ "$$MD5_1" != "$$MD5_2" ]; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: outputs differ ($$MD5_1 vs $$MD5_2)"; exit 1; fi; \
+	 echo "  $${T2}, $$S2 bytes"; \
+	 echo "--- Comparing outputs (mel-corr + duration, not md5: multi-thread FP order flips a sample now and then) ---"; \
+	 if ! python3 tests/compare_audio.py $(TEST_DIR)/bench_run1.wav $(TEST_DIR)/bench_run2.wav --label "cold vs warm"; then kill $$SERVER_PID 2>/dev/null; echo "FAIL: cold and warm outputs diverge"; exit 1; fi; \
 	 kill $$SERVER_PID 2>/dev/null; \
-	 echo "PASS: identical output ($$MD5_1)"
+	 echo "PASS: cold and warm outputs match (temperature 0, seed 42)"
 	@echo ""
 
 test-serve-openai: $(TARGET)
@@ -1164,7 +1216,8 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench
+.PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench \
+	cpu-check dispatch-map profile-cpu-check tune-archive
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench

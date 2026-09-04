@@ -161,9 +161,10 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
                        "temperature": 0.0, "seed": seed + idx}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/tts/stream", data=body,
                                  headers={"Content-Type": "application/json"})
-    t0 = time.time(); ttfa = None; n = 0; chunks = []; marks = []
+    t0 = time.time(); ttfa = None; ttfb = None; n = 0; chunks = []; marks = []
     try:
         with urllib.request.urlopen(req, timeout=1200) as r:
+            ttfb = time.time() - t0          # urlopen returns once the status line + headers are in
             while True:
                 ch = r.read1(65536)
                 if not ch: break
@@ -182,7 +183,8 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
         _write_wav(os.path.join(SAVE_AUDIO_DIR,
                    f"{speaker}_r{idx:03d}_{cls}.wav"), b"".join(chunks))
     with lock:
-        rec = {"cls": cls, "ttfa_ms": (ttfa or 0) * 1000.0, "total_s": total,
+        rec = {"cls": cls, "ttfa_ms": (ttfa or 0) * 1000.0, "ttfb_ms": (ttfb or 0) * 1000.0,
+               "total_s": total,
                "audio_s": secs, "seed": seed + idx, "idx": idx,
                "t_send": t0, "marks": marks,
                "rtf": total / secs if secs > 0 else float("nan")}
@@ -581,6 +583,8 @@ def main():
                 row = {
                     "model": label, "topo": topo, "W": W, "K": K, "cap": cap, "conc": C,
                     "waves": a.waves, "ok": len(ok), "errors": nerr,
+                    "ttfb_p50": pct([r.get("ttfb_ms", float("nan")) for r in ok], 50),
+                    "ttfb_p95": pct([r.get("ttfb_ms", float("nan")) for r in ok], 95),
                     "ttfa_p50": pct([r["ttfa_ms"] for r in ok], 50),
                     "ttfa_p95": pct([r["ttfa_ms"] for r in ok], 95),
                     "ttfa_max": max((r["ttfa_ms"] for r in ok), default=float("nan")),
@@ -638,7 +642,8 @@ def main():
                                   "INVALID — fix the client, do not report these numbers.",
                                   flush=True)
                             bad_crosscheck = True
-                print(f"  C={C:<2} TTFA p50 {row['ttfa_p50']:6.0f} p95 {row['ttfa_p95']:6.0f} "
+                print(f"  C={C:<2} TTFB p50 {row['ttfb_p50']:6.0f} p95 {row['ttfb_p95']:6.0f} · "
+                      f"TTFA p50 {row['ttfa_p50']:6.0f} p95 {row['ttfa_p95']:6.0f} "
                       f"max {row['ttfa_max']:6.0f} · RTF {row['rtf_p50']:.2f} · "
                       f"ttc {row['ttc_p50']:5.1f}s · {row['req_s']:.2f} req/s · "
                       f"B {row['batch_eff']:.2f} · asg {row['assign']} · "
@@ -676,12 +681,13 @@ def main():
             except subprocess.TimeoutExpired: p.kill(); p.wait()
             f.close(); port += W + 2
 
-    hdr = (f"{'topo':<6}{'C':>3}{'TTFA50':>8}{'TTFA95':>8}{'TTFAmax':>9}{'RTF50':>7}{'RTF95':>7}"
+    hdr = (f"{'topo':<6}{'C':>3}{'TTFB50':>8}{'TTFB95':>8}{'TTFA50':>8}{'TTFA95':>8}{'TTFAmax':>9}{'RTF50':>7}{'RTF95':>7}"
            f"{'ttc50':>7}{'ttc95':>7}{'req/s':>7}{'B':>6}{'assign':>12}{'cores':>7}"
            f"{'csw/s':>8}{'PSS GB':>8}{'rej':>5}{'err':>5}")
     print("\n" + hdr); print("-" * len(hdr))
     for r in rows:
-        print(f"{r['topo']:<6}{r['conc']:>3}{r['ttfa_p50']:>8.0f}{r['ttfa_p95']:>8.0f}"
+        print(f"{r['topo']:<6}{r['conc']:>3}{r['ttfb_p50']:>8.0f}{r['ttfb_p95']:>8.0f}"
+              f"{r['ttfa_p50']:>8.0f}{r['ttfa_p95']:>8.0f}"
               f"{r['ttfa_max']:>9.0f}{r['rtf_p50']:>7.2f}{r['rtf_p95']:>7.2f}"
               f"{r['ttc_p50']:>7.1f}{r['ttc_p95']:>7.1f}{r['req_s']:>7.2f}"
               f"{r['batch_eff']:>6.2f}{r['assign']:>12}{r['cores']:>7.1f}"

@@ -311,8 +311,34 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
                           int rows, int K, int Kp, int blk);
 
 int qwen_amx_bf16_available(void);
+int qwen_amx_int8_available(void);
 int qwen_arm_bf16_matmat_available(void);
 int qwen_avx512_bf16_matmat_available(void);
+
+/* --dispatch-map support: resolved state of one g_mm_gate[] row, computed by the
+ * dispatcher's own predicate (qwen_mm_use), plus the env that explains it. */
+typedef struct {
+    int mmk;
+    const char *name;
+    const char *off_env, *on_env, *minb_env, *minrows_env, *mincols_env;
+    int compiled, supported, on;
+    int min_b, compiled_min_b, max_b;
+    int min_rows, compiled_min_rows, min_cols, compiled_min_cols;
+    int amx, apple_off;
+    const char *reason;
+} qwen_mm_gate_desc_t;
+int qwen_mm_gate_describe(int mmk, qwen_mm_gate_desc_t *d);   /* 0 = not a gated row */
+int qwen_amx_prepack_requested(void);
+int qwen_vnni_prepack_requested(void);
+int qwen_q4_vnni_variant(void);        /* 2, 3 or 4; meaningful only with AVX-512 VNNI */
+int qwen_bf16dot_enabled(void);        /* AVX-512 BF16 matvec (VDPBF16PS), QWEN_NO_BF16DOT */
+int qwen_arm_bfdot_on(void);           /* Arm BFDOT bf16 matvec, opt-in QWEN_ARM_BFDOT=1 (Linux bf16 hosts) */
+int qwen_prefill_matmat_resolved(const char **why);   /* the Talker prefill predicate */
+int qwen_cp_prefill2_requested(void);  /* env/arch part of cp_prefill2 (weights decide the rest) */
+int qwen_sd_int8_enabled(void);
+int qwen_pool_spin_value(void);
+int qwen_pool_narrow_value(void);
+int qwen_dispatch_map_report(void *out, const char *json_path);
 
 void qwen_conv1d_int8(float *out, const float *in,
                       const int8_t *Wq, const float *sw, const int32_t *wsum,

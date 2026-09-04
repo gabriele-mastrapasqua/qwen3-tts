@@ -1155,10 +1155,18 @@ static void srv_dump_sig(int sig) { (void)sig; g_srv_dump = 1; }
 static void srv_dump_counters_if_asked(void) {
     if (!g_srv_dump) return;
     g_srv_dump = 0;
+    /* One delimiter per dump: a harness that signals before and after a cell needs to
+       tell the two apart, and until now they were undifferentiated stderr. */
+    static long long dump_seq = 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    fprintf(stderr, "[DUMP] v=1 pid=%d seq=%lld ts=%.3f clock=CLOCK_MONOTONIC begin\n",
+            (int)getpid(), ++dump_seq, now);
     qwen_pool_stats_report();
     if (qwen_census_enabled()) qwen_census_report(NULL);
     if (qwen_matmat_stats_enabled()) qwen_matmat_stats_report(NULL);
     qwen_kernel_timing_report(NULL);
+    fprintf(stderr, "[DUMP] v=1 pid=%d seq=%lld end\n", (int)getpid(), dump_seq);
     fflush(stderr);
 }
 
@@ -1176,6 +1184,10 @@ static void install_signal_handlers(void) {
 
 static void print_banner(int port, int n_workers) {
     qwen_provenance_report(stderr);
+    /* The resolved dispatch table INSIDE the run's own log: engagement proof belongs in
+       the timed run, not in a separate invocation with "the same" env. */
+    if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_SHAPE_CENSUS"))
+        qwen_dispatch_map_report(stderr, NULL);
     fprintf(stderr, "Server listening on http://0.0.0.0:%d", port);
     if (n_workers > 1)
         fprintf(stderr, " (%d workers%s)", n_workers,
@@ -1770,6 +1782,8 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     single_arg_t swarg = { .ctx = single_ctx ? single_ctx : ctx, .jq = &jq_single, .reject = (single_ctx == NULL) };
     pthread_create(&single_thr, NULL, single_worker_main, &swarg);
 
+    if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_SHAPE_CENSUS"))
+        qwen_dispatch_map_report(stderr, NULL);   /* engagement proof inside this run's log */
     fprintf(stderr, "Server listening on http://0.0.0.0:%d (continuous request-batching: max_batch=%d, %d readers%s)\n",
             port, max_batch, n_readers, single_ctx ? ", +1 single-job clone" : "");
     fprintf(stderr, "Endpoints:\n"

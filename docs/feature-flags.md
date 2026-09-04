@@ -302,6 +302,42 @@ zero on real prefill shapes, while at `SIMD=portable`, where `--caps` shows
 `bf16 -> fixed-B twin`, the same widths move 11.87 -> 2.25 ms (B=9) and 10.03 -> 1.32 ms (int8
 B=1). Measure the dispatch before claiming the speedup.
 
+### What the flags RESOLVED to, not what was typed
+
+`[FLAGS]` is the raw environment: a variable nobody set is absent, a compiled default is
+invisible, and a predicate that decides a whole path can live outside the gate table. That is
+how an AVX-512-BF16 host ran the Talker prefill on the f32/SGEMM fallback for weeks (~400 ms of
+TTFA at C=1) while every `[FLAGS]` line looked right. `./qwen_tts --dispatch-map` prints the
+other side, per logical feature: **compiled · supported on this CPU · env · resolved · reason**,
+where *resolved* is obtained by calling the runtime predicate itself, and a second table with
+every `g_mm_gate[]` row as `qwen_mm_use()` answers it now:
+
+```
+[DISPATCH] v=1 pid=… isa_class=x86_avx512bf16 build=1496938 simd=avx512bf16
+  feature                      compiled supported env                       resolved reason
+  talker.prefill.matmat_bf16   yes      yes       QWEN_PREFILL_MATMAT=unset ON       avx512_bf16_matmat_available (VDPBF16PS)
+  talker.prefill.f32_blas_fallback yes  yes       -                         OFF      not taken: bf16 matmat selected
+  prepack.vnni                 yes      yes       QWEN_VNNI_PREPACK=unset   OFF      opt-in; int8 only; REJECTED …
+[DISPATCH-GATE] v=1 rows=13 …
+  gate.int8.vnni   int8 VNNI vpdpbusd   yes  yes  ON   2(2) …  QWEN_NO_VNNI   default ON
+```
+
+The Arm rows are there too — `talker.prefill.matmat_bf16` via `arm_bf16_matmat_available`
+(BFMMLA), `matvec.int8.sdot`, the opt-in `matvec.bf16.bfdot` (`QWEN_ARM_BFDOT`), `q8repack.neon`,
+every `kleidi.*` knob (`QWEN_NO_KLEIDI`, `QWEN_NO_KAI_I8`, `QWEN_NO_KAI_BF16`, `QWEN_KAI_OPS`,
+`QWEN_KAI_QKV_FUSED`, `QWEN_KAI_LHS`, `QWEN_KAI_NCHUNK`), the Apple `apple_off` gate rows with
+`QWEN_APPLE_MMLA`, and `QWEN_POOL_SPIN` with its Linux/aarch64 default of 65536 — so the §9
+"what does not port" list can be read off the machine instead of remembered.
+
+`QWEN_DISPATCH_JSON=path` writes the same rows as JSON; `tools/dispatch_gate.py` compares them
+with `tools/dispatch_expect.json` for the host's `isa_class` and prints `SUSPICIOUS` for a
+feature that is expected ON, compiled, supported and still OFF — the automatic detector for
+that class of bug. `make cpu-check` runs all of it (see [cpu-profiling.md](cpu-profiling.md)).
+`QWEN_DISPATCH_MAP=1` (or any of `QWEN_SERVE_PROFILE` / `QWEN_SHAPE_CENSUS`) makes the server
+print the table in its own banner, so the engagement proof sits inside the timed run's log.
+Every SIGUSR1 counter dump is now bracketed by `[DUMP] v=1 pid=… seq=N … begin` / `end`, so a
+harness that signals before and after a cell can separate the two.
+
 ### Is a flag even declarable?
 
 `[FLAGS]` can only report what `g_qwen_reported_flags[]` lists, so a flag the engine reads but

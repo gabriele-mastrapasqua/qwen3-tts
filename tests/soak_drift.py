@@ -10,7 +10,7 @@ import sys
 
 
 def percentile(values, quantile):
-    values = sorted(value for value in values if math.isfinite(value))
+    values = sorted(value for value in values if value is not None and math.isfinite(value))
     if not values:
         return None
     index = min(len(values) - 1, int(round(quantile / 100.0 * (len(values) - 1))))
@@ -42,6 +42,19 @@ def drift_percent(first, last):
     return 100.0 * (last - first) / first
 
 
+def drift_pairs(args, has_ttfb):
+    """The (metric, key, limit) triples every drift verdict is made of.  TTFB is compared
+    only when the CSV carries it: a soak recorded before the column existed must not turn
+    NOT_ASSESSED because of a metric it could not have measured."""
+    pairs = []
+    if has_ttfb:
+        pairs += [("TTFB p50", "ttfb", args.max_ttfa_drift),
+                  ("TTFB p95", "ttfb", args.max_ttfa_drift)]
+    pairs += [("TTFA p50", "ttfa", args.max_ttfa_drift),
+              ("TTFA p95", "ttfa", args.max_ttfa_drift),
+              ("stream RTF p50", "stream", args.max_stream_drift)]
+    return pairs
+
 def read_requests(path):
     rows = []
     errors = []
@@ -62,9 +75,14 @@ def read_requests(path):
             except (KeyError, TypeError, ValueError):
                 errors.append({"t": end, "error": "invalid metric row"})
                 continue
+            try:                                   # absent in CSVs written before TTFB existed
+                ttfb = float(raw["ttfb_ms"])
+            except (KeyError, TypeError, ValueError):
+                ttfb = None
             rows.append({
                 "t": end,
                 "class": raw.get("class", "unknown") or "unknown",
+                "ttfb": ttfb,
                 "ttfa": ttfa,
                 "stream": stream,
                 "audio_s": audio_s,
@@ -179,11 +197,13 @@ def analyze(directory, args):
             "end_s": args.warmup_s + (index + 1) * args.window_s,
             "n": len(group),
             "mix": proportions(group),
+            "ttfb": metric(group, "ttfb"),
             "ttfa": metric(group, "ttfa"),
             "stream": metric(group, "stream"),
             "rows": group,
         })
 
+    has_ttfb = any(row.get("ttfb") is not None for row in usable)
     print("### CLOSED-LOOP SOAK")
     print(f"completed={len(usable_all)} kpi_samples={len(usable)} "
           f"audio_probes={len(usable_all) - len(usable)} errors={len(errors)} duration_s={end:.1f} "
@@ -191,12 +211,14 @@ def analyze(directory, args):
     print(f"windows={len(windows)} window_s={args.window_s:.0f} "
           f"min_per_window={args.min_per_window}")
     print()
-    print(f"{'window':>13} {'n':>5} {'TTFA p50':>10} {'TTFA p95':>10} "
+    print(f"{'window':>13} {'n':>5} {'TTFB p50':>10} {'TTFB p95':>10} {'TTFA p50':>10} {'TTFA p95':>10} "
           f"{'RTF p50':>9} {'RTF p95':>9} {'classes':>10}")
     for window in windows:
+        ttfb = window["ttfb"]
         ttfa = window["ttfa"]
         stream = window["stream"]
         print(f"{window['start_s']:>6.0f}-{window['end_s']:<6.0f} {window['n']:>5} "
+              f"{display(ttfb['p50']):>10} {display(ttfb['p95']):>10} "
               f"{display(ttfa['p50']):>10} {display(ttfa['p95']):>10} "
               f"{display(stream['p50'], 3):>9} {display(stream['p95'], 3):>9} "
               f"{len(window['mix']):>10}")
@@ -213,11 +235,7 @@ def analyze(directory, args):
         else:
             failures = []
             comparisons = []
-            for name, key, limit in (
-                ("TTFA p50", "ttfa", args.max_ttfa_drift),
-                ("TTFA p95", "ttfa", args.max_ttfa_drift),
-                ("stream RTF p50", "stream", args.max_stream_drift),
-            ):
+            for name, key, limit in drift_pairs(args, has_ttfb):
                 quantile = 50 if "p50" in name else 95
                 before = first[key][f"p{quantile}"]
                 after = last[key][f"p{quantile}"]
@@ -254,11 +272,7 @@ def analyze(directory, args):
             comparisons = []
             failures = []
             unassessed = []
-            for name, key, limit in (
-                ("TTFA p50", "ttfa", args.max_ttfa_drift),
-                ("TTFA p95", "ttfa", args.max_ttfa_drift),
-                ("stream RTF p50", "stream", args.max_stream_drift),
-            ):
+            for name, key, limit in drift_pairs(args, has_ttfb):
                 quantile = 50 if "p50" in name else 95
                 required = min_per_class_p95 if quantile == 95 else args.min_per_class
                 if len(first_group) < required or len(last_group) < required:

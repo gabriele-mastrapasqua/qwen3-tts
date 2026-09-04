@@ -1,0 +1,90 @@
+{
+  "_doc": [
+    "Expected RESOLVED dispatch per ISA class, keyed by the isa_class that",
+    "`./qwen_tts --dispatch-map` prints.  tools/dispatch_gate.py compares this against",
+    "the observed dispatch.json and prints SUSPICIOUS for every feature that is expected",
+    "ON, is compiled AND supported on the host, and still resolved OFF.  That is exactly",
+    "the shape of the 2026-09-03 AVX-512-BF16 prefill bug (~400 ms TTFA on a c8a.4xlarge).",
+    "Values are ON / OFF / a prefix of the resolved string (ON* matches 'ON*').",
+    "A class that is missing here is checked by the generic rules only."
+  ],
+  "x86_amx": {
+    "talker.prefill.matmat_bf16": "ON",
+    "talker.prefill.f32_blas_fallback": "OFF",
+    "gate.bf16.amx": "ON",
+    "gate.int8.amx": "ON",
+    "gate.q4.amx": "ON",
+    "gate.int8.vnni": "ON",
+    "gate.q4.vnni": "ON",
+    "gate.bf16.avx512": "ON",
+    "matvec.int8.vnni": "ON",
+    "decoder.int8": "ON",
+    "cp.prefill2": "ON"
+  },
+  "x86_avx512bf16": {
+    "talker.prefill.matmat_bf16": "ON",
+    "talker.prefill.f32_blas_fallback": "OFF",
+    "gate.bf16.avx512": "ON",
+    "gate.int8.vnni": "ON",
+    "gate.q4.vnni": "ON",
+    "matvec.bf16.dpbf16": "ON",
+    "matvec.int8.vnni": "ON",
+    "decoder.int8": "ON",
+    "cp.prefill2": "ON",
+    "prepack.vnni": "OFF"
+  },
+  "x86_avx512vnni": {
+    "talker.prefill.matmat_bf16": "OFF",
+    "talker.prefill.f32_blas_fallback": "ON",
+    "gate.int8.vnni": "ON",
+    "gate.q4.vnni": "ON",
+    "matvec.int8.vnni": "ON",
+    "decoder.int8": "ON"
+  },
+  "x86_avx2": {
+    "talker.prefill.matmat_bf16": "OFF",
+    "gate.int8.avx2": "ON",
+    "gate.q4.avx2": "ON"
+  },
+  "arm_i8mm_bf16": {
+    "talker.prefill.matmat_bf16": "ON",
+    "talker.prefill.f32_blas_fallback": "OFF",
+    "gate.bf16.bfmmla": "ON",
+    "gate.int8.smmla": "ON",
+    "gate.q4.smmla": "ON",
+    "gate.q4.kleidi": "ON",
+    "kleidi.enabled": "ON",
+    "kleidi.int8": "ON",
+    "kleidi.bf16": "ON",
+    "matvec.int8.sdot": "ON",
+    "gate.int8.sdot_mm": "OFF",
+    "kleidi.qkv_fused": "ON",
+    "kleidi.prefill": "ON",
+    "q8repack.neon": "ON",
+    "matvec.bf16.bfdot": "OFF"
+  },
+  "arm_dotprod": {
+    "talker.prefill.matmat_bf16": "OFF",
+    "matvec.int8.sdot": "ON",
+    "gate.int8.sdot_mm": "OFF",
+    "q8repack.neon": "ON",
+    "kleidi.enabled": "OFF"
+  },
+  "apple_m1": {
+    "talker.prefill.matmat_bf16": "OFF",
+    "matvec.int8.sdot": "ON",
+    "gate.int8.sdot_mm": "OFF",
+    "kleidi.enabled": "OFF",
+    "q8repack.neon": "ON"
+  },
+  "apple_i8mm_bf16": {
+    "talker.prefill.matmat_bf16": "OFF",
+    "matvec.int8.sdot": "ON",
+    "gate.int8.smmla": "OFF",
+    "gate.bf16.bfmmla": "OFF",
+    "gate.q4.smmla": "ON",
+    "q8repack.neon": "ON",
+    "gate.q4.kleidi": "ON",
+    "kleidi.enabled": "ON"
+  }
+}

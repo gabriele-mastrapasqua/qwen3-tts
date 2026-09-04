@@ -17,6 +17,8 @@ SIMD each one has**, **how to check the extension actually fires**, and **what t
 
 | command | what it does |
 |---|---|
+| `make cpu-check` | **run first, before any CPU optimisation**: provenance + hardware + `--self-test` + the RESOLVED dispatch map checked against what this ISA class should select → `profiles/<date>_<host>_<sha8>/` ([cpu-profiling.md](cpu-profiling.md)) |
+| `./qwen_tts --dispatch-map` | per logical feature: compiled / supported / env / **resolved** / reason, plus every `g_mm_gate[]` row as the dispatcher answers it |
 | `./qwen_tts --caps` | runtime SIMD-extension detection (ARM dotprod/bf16/i8mm/SVE/SME, x86 AVX-512/VNNI/BF16/AMX) + the `lever:` line — "does it fire?" |
 | `./qwen_tts --self-test` | cross-ISA kernel correctness oracle (bf16/int8/int4 matmul + matmat twins vs f32 ref). Run twice: native, then `QWEN_NO_SDOT=1 QWEN_NO_VNNI=1` for the fallback |
 | `make matmat-bench` | batched matmat twins (`qwen_matmat_{bf16,int8,q4_0}`) vs B×matvec, per precision/threads (no model) |

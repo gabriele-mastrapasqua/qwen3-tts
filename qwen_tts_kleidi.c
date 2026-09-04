@@ -171,6 +171,15 @@ static void kai_ops_parse(void) {
         }
     }
 }
+/* QWEN_KAI_NCHUNK: rows per work chunk of the bf16 GEMM (default 384). One reader, so
+ * the --dispatch-map value and the kernel cannot disagree. */
+static int kai_nchunk(void) {
+    static int nchunk = -1;
+    if (nchunk < 0) { const char *e2 = getenv("QWEN_KAI_NCHUNK"); nchunk = (e2 && *e2) ? atoi(e2) : 384; }
+    return nchunk;
+}
+int qwen_kleidi_nchunk_value(void) { return kai_nchunk(); }
+
 static inline int kai_op_on(int comp, int fam) {
     kai_ops_parse();
     if (comp < 0 || comp >= QWEN_KAI_COMP_N) comp = QWEN_KAI_COMP_TALKER;
@@ -496,6 +505,7 @@ static int kai_lhs_sym_mode(void) {
     }
     return v;
 }
+int qwen_kleidi_lhs_sym(void) { return kai_lhs_sym_mode(); }
 
 static int kai_i8_run_packed(const kai_entry_t *e, float *dst, const void *lhs_packed,
                              size_t dst_stride, int rows, int cols, int B, int gemm) {
@@ -574,6 +584,7 @@ static int kai_qkv_fused(void) {
     }
     return v;
 }
+int qwen_kleidi_qkv_fused_on(void) { return kai_qkv_fused(); }
 
 int qwen_kleidi_matmul_i8_qkv_native(float *dq, float *dk, float *dv,
                                      const void *keyq, const void *keyk, const void *keyv,
@@ -844,8 +855,7 @@ static int kai_bf_run(const kai_entry_t *e, float *dst, const float *lhs,
                                                        lhs, lhs_stride, lhs_packed);
     if (tr) { qwen_kbf_pack_ms += kbf_now_ms() - t0; t0 = kbf_now_ms(); }
 
-    static int nchunk = -1;
-    if (nchunk < 0) { const char *e2 = getenv("QWEN_KAI_NCHUNK"); nchunk = (e2 && *e2) ? atoi(e2) : 384; }
+    int nchunk = kai_nchunk();
     kai_bf_job_t job = { e, lhs_packed, dst, (size_t)B, (size_t)rows, (size_t)cols,
                          dst_stride, (size_t)(nchunk > 0 ? nchunk : 0), gemm };
     size_t nt = (size_t)qwen_get_threads();
@@ -1002,6 +1012,9 @@ int qwen_kleidi_register_bf16_fam(const void *k, const uint16_t *W, int r, int c
     (void)k; (void)W; (void)r; (void)c; (void)cm; (void)f; return 0;
 }
 int qwen_kleidi_prefill_enabled(void) { return 0; }
+int qwen_kleidi_nchunk_value(void) { return -1; }
+int qwen_kleidi_lhs_sym(void) { return 0; }
+int qwen_kleidi_qkv_fused_on(void) { return 0; }
 int qwen_kleidi_matmul_i8(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
 }

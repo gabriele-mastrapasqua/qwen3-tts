@@ -136,6 +136,7 @@ static int sd_int8_enabled(void) {
     }
     return en;
 }
+int qwen_sd_int8_enabled(void) { return sd_int8_enabled(); }
 
 static int sd_phase_on(void) {
     static int v = -1;

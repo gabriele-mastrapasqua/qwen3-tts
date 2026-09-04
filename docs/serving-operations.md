@@ -114,6 +114,10 @@ so beside the numbers; what you must not do is let a `2x8` slice quietly mean fo
 ### The procedure
 
 ```bash
+# 0. the preflight, and the artifact directory every later number refers to
+make cpu-check                    # provenance + hardware + self-test + RESOLVED dispatch map vs
+                                  # what this ISA class should select; fails on a silent fallback
+
 # 1. what does this machine actually have?
 make bench-fingerprint            # cpu, cores, SMT, cache, NUMA, measured memory bandwidth
 ./qwen_tts --caps                 # which kernels the binary would pick, per batch width
@@ -383,6 +387,7 @@ QWEN_SOURCE_COMMIT=<revision-or-build-id> make bench-soak \
 
 | | what it is | why it is the one |
 |---|---|---|
+| **TTFB** | send → first byte of the HTTP response (status line + headers) | the number every TTS server benchmark quotes; printed by every harness (wave, poisson, soak) next to TTFA. On this server the `200` header travels with the first audio chunk, so TTFB ≈ TTFA today — the day headers go out early (an "accepted" reply before synthesis) the gap becomes queue + admission, and it must already be on the page |
 | **TTFA** | send → first audio chunk | what a caller hears as responsiveness |
 | **STREAM_RTF** | `(t_done − t_first_chunk) / (audio after the first chunk)`, **per request** | below 1.0 a player starting at the first chunk never stalls |
 | **rejects / errors** | refused or failed requests | a fast server that drops requests is not fast |

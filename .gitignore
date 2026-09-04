@@ -21,6 +21,8 @@ tools/para/.venv/
 # wildcard: '*.py' is ignored by default here, and a tool that lands in tools/ without an
 # entry is silently absent from the repository while looking present on disk.
 !tools/perf_profile.py
+!tools/dispatch_gate.py
+!tools/profile_check.py
 !tools/wav_qc.py
 !tools/onset_report.py
 # No trailing slash: these may be symlinks rather than real directories.
@@ -83,6 +85,8 @@ tests/test_ingot_parity
 
 # Local working material.
 /private/
+# make cpu-check / profile-cpu artifacts (one dir per run, promoted by hand into docs/).
+/profiles/
 
 # Local-only working notes.
 /CLAUDE.md

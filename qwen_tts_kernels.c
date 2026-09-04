@@ -191,6 +191,18 @@ int qwen_amx_bf16_available(void) {
 #endif
 }
 
+int qwen_amx_int8_available(void) {
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    return qwen_amx_int8_ready();
+#else
+    return 0;
+#endif
+}
+
+#if !defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+int qwen_arm_bfdot_on(void) { return 0; }
+#endif
+
 int qwen_arm_bf16_matmat_available(void) {
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) && !defined(__APPLE__)
     const char *e = getenv("QWEN_NO_BFMMLA");
@@ -275,6 +287,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_BATCH_STATS", "QWEN_SHAPE_CENSUS", "QWEN_SERVE_PROFILE", "QWEN_TTFA_TRACE",
     "QWEN_LIFE_TRACE", "QWEN_REQ_TRACE", "QWEN_KERNEL_TIMING", "QWEN_VNNI_PHASE_TIMING", "QWEN_DUMP_CODE0", "QWEN_DUMP_CODES", "QWEN_EXPR_DEBUG",
     "QWEN_SD_DEBUG", "QWEN_SPK_DEBUG", "QWEN_TUNE_JSON", "QWEN_TUNE_QUICK",
+    "QWEN_DISPATCH_MAP", "QWEN_DISPATCH_JSON",
     NULL
 };
 
@@ -959,6 +972,7 @@ static int qwen_bf16dot_disabled(void) {
     if (v < 0) { const char *e = getenv("QWEN_NO_BF16DOT"); v = (e && e[0] == '1'); atomic_store_explicit(&off, v, memory_order_relaxed); }
     return v;
 }
+int qwen_bf16dot_enabled(void) { return !qwen_bf16dot_disabled(); }
 static inline __m512bh qwen_loadu_pbh(const uint16_t *p) {
     union { __m512i i; __m512bh bh; } u;
     u.i = _mm512_loadu_si512((const void *)p);
@@ -1155,6 +1169,7 @@ static int qwen_arm_bfdot_enabled(void) {
     }
     return cached;
 }
+int qwen_arm_bfdot_on(void) { return qwen_arm_bfdot_enabled(); }
 static void bf16_matvec_bfdot(float *y, const uint16_t *xb, const uint16_t *W,
                               int in_dim, int out_dim) {
     const bfloat16_t *xv = (const bfloat16_t *)xb;
@@ -2095,6 +2110,108 @@ static int qwen_mm_use(int mmk, int B, int rows, int cols) {
         atomic_store_explicit(&g_mm_gate_mincols[mmk], minc, memory_order_relaxed);
     }
     return B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1;
+}
+
+/* --dispatch-map: which gate rows are compiled into THIS binary.  Mirrors the
+ * candidate lists of qwen_kernel_selection_report(); a row that is not compiled
+ * can never be selected whatever the env says. */
+static int qwen_mmk_compiled(int mmk) {
+    switch (mmk) {
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    case QWEN_MMK_BF16_AMX: return 1;
+#endif
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    case QWEN_MMK_BF16_BFMMLA: return 1;
+#endif
+#if defined(__AVX512BF16__)
+    case QWEN_MMK_BF16_AVX512: return 1;
+#endif
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    case QWEN_MMK_INT8_AMX: case QWEN_MMK_Q4_AMX: return 1;
+#endif
+#if defined(__AVX512VNNI__)
+    case QWEN_MMK_INT8_VNNI: case QWEN_MMK_Q4_VNNI: return 1;
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    case QWEN_MMK_INT8_SMMLA: case QWEN_MMK_Q4_SMMLA: case QWEN_MMK_KLEIDI_Q4: return 1;
+#endif
+#if defined(__AVX2__)
+    case QWEN_MMK_INT8_AVX2: case QWEN_MMK_Q4_AVX2: return 1;
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    case QWEN_MMK_INT8_SDOT: return 1;
+#endif
+    default: return 0;
+    }
+}
+
+/* Does the CPU we are running on have the instructions this row needs?  Independent
+ * of the env: the env decides "on", this decides "could it ever be on". */
+static int qwen_mmk_supported(int mmk) {
+    switch (mmk) {
+    case QWEN_MMK_BF16_AMX:  return qwen_amx_bf16_available();
+    case QWEN_MMK_INT8_AMX: case QWEN_MMK_Q4_AMX: return qwen_amx_int8_available();
+#if defined(__x86_64__) || defined(_M_X64)
+    case QWEN_MMK_BF16_AVX512: return __builtin_cpu_supports("avx512bf16") ? 1 : 0;
+    case QWEN_MMK_INT8_VNNI: case QWEN_MMK_Q4_VNNI: return __builtin_cpu_supports("avx512vnni") ? 1 : 0;
+    case QWEN_MMK_INT8_AVX2: case QWEN_MMK_Q4_AVX2: return __builtin_cpu_supports("avx2") ? 1 : 0;
+#endif
+    case QWEN_MMK_KLEIDI_Q4: return qwen_kleidi_supported();
+    default: return qwen_mmk_compiled(mmk);   /* -march=native: compiled == the host has it */
+    }
+}
+
+/* The env-side explanation of a gate row.  This is a DESCRIPTION for the report;
+ * the truth (`on`) comes from calling qwen_mm_use() itself, never from here. */
+static const char *qwen_mm_gate_reason(const qwen_mm_gate_t *g, int on) {
+    const char *e;
+    if (g->on_env) {
+        e = getenv(g->on_env);
+        if (!(e && e[0] == '1')) return "opt-in, env unset";
+    }
+    if (g->off_env && (e = getenv(g->off_env)) && e[0] == '1') return "off_env=1";
+    if (g->amx && (e = getenv("QWEN_NO_AMX")) && e[0] == '1') return "QWEN_NO_AMX=1";
+#if defined(__APPLE__)
+    if (g->apple_off) {
+        e = getenv("QWEN_APPLE_MMLA");
+        return (e && e[0] == '1') ? "QWEN_APPLE_MMLA=1" : "default OFF on Apple (QWEN_APPLE_MMLA=1)";
+    }
+#endif
+    if (g->on_env) return "opt-in env set";
+    return on ? "default ON" : "gate refused at probe shape";
+}
+
+int qwen_mm_gate_describe(int mmk, qwen_mm_gate_desc_t *d) {
+    if (!d || mmk <= 0 || mmk >= QWEN_MMK_COUNT) return 0;
+    const qwen_mm_gate_t *g = &g_mm_gate[mmk];
+    if (g->max_b == 0) return 0;
+    memset(d, 0, sizeof *d);
+    d->mmk = mmk;
+    d->name = g_mmk_info[mmk].name;
+    d->off_env = g->off_env; d->on_env = g->on_env; d->minb_env = g->minb_env;
+    d->minrows_env = g->minrows_env; d->mincols_env = g->mincols_env;
+    d->compiled_min_b = g->min_b; d->max_b = g->max_b;
+    d->compiled_min_rows = g->min_rows; d->compiled_min_cols = g->min_cols;
+    d->amx = g->amx; d->apple_off = g->apple_off;
+    d->compiled = qwen_mmk_compiled(mmk);
+    d->supported = d->compiled ? qwen_mmk_supported(mmk) : 0;
+    d->min_b = qwen_mm_minb_value(mmk, g);
+    d->min_rows = qwen_mm_env_int(g->minrows_env, g->min_rows, 0, 1 << 20);
+    d->min_cols = qwen_mm_env_int(g->mincols_env, g->min_cols, 0, 1 << 20);
+    /* the real predicate, at the smallest B and a shape past every row/col floor */
+    d->on = qwen_mm_use(mmk, d->min_b, 1 << 16, 1 << 16);
+    d->reason = qwen_mm_gate_reason(g, d->on);
+    return 1;
+}
+
+int qwen_amx_prepack_requested(void) {
+    const char *e = getenv("QWEN_AMX_PREPACK");
+    return e && e[0] == '1';
+}
+int qwen_vnni_prepack_requested(void) {
+    const char *e = getenv("QWEN_VNNI_PREPACK");
+    return e && (e[0] == '1' || !strcmp(e, "all") || !strcmp(e, "cp") ||
+                 !strcmp(e, "talker"));
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -6831,6 +6948,7 @@ static int q4_vnni_v4_on(void) {
                  atomic_store_explicit(&v, r, memory_order_relaxed); }
     return r;
 }
+int qwen_q4_vnni_variant(void) { return q4_vnni_v4_on() ? 4 : (q4_vnni_v3_on() ? 3 : 2); }
 
 static inline void q4_vnni_rows(float *y, const int8_t *qx, float sx,
                                 const q4_0_block_t *W, int cols, int rows) {

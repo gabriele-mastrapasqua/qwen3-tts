@@ -126,7 +126,8 @@
           "minimum": 1
         },
         "l3_mib": {
-          "type": "number"
+          "type": ["number", "null"],
+          "description": "Usable last-level cache in MiB. null = not established: on a cloud slice lscpu reports the SOCKET L3, not the slice share, and a guessed number is worse than none."
         },
         "ram_gib": {
           "type": "number"

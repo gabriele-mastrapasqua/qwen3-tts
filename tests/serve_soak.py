@@ -478,7 +478,7 @@ def merge_requests(out):
             rows.extend(reader)
     if not fields:
         fields = [
-            "t_end_s", "worker", "i", "ttfa_ms", "total_ms", "bytes",
+            "t_end_s", "worker", "i", "ttfb_ms", "ttfa_ms", "total_ms", "bytes",
             "first_chunk_bytes", "audio_s", "stream_rtf", "is_probe", "class",
             "text_chars", "seed", "schedule", "error",
         ]

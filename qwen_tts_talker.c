@@ -1209,6 +1209,29 @@ static double pf_ph[9];
 #define PF_T0()      (pf_mark = trace ? pfx_now_ms() : 0.0)
 #define PF_ACC(i_)   do { if (trace && pf_mark > 0.0) pf_ph[(i_)] += pfx_now_ms() - pf_mark; } while (0)
 
+/* THE prefill dispatch predicate.  One definition, used by the prefill itself and
+ * by --dispatch-map, so the report can never disagree with the runtime.  The
+ * 2026-09-03 AVX-512-BF16 bug (prefill silently on the f32/SGEMM fallback for
+ * ~400 ms of TTFA) lived exactly here and was printed nowhere. */
+int qwen_prefill_matmat_resolved(const char **why) {
+    const char *e = getenv("QWEN_PREFILL_MATMAT");
+    if (e) {
+        int on = (e[0] == '1');
+        if (why) *why = on ? "explicit env QWEN_PREFILL_MATMAT=1" : "explicit env QWEN_PREFILL_MATMAT=0";
+        return on;
+    }
+#ifdef USE_BLAS
+    if (qwen_amx_bf16_available())          { if (why) *why = "amx_bf16_available"; return 1; }
+    if (qwen_arm_bf16_matmat_available())   { if (why) *why = "arm_bf16_matmat_available (BFMMLA)"; return 1; }
+    if (qwen_avx512_bf16_matmat_available()){ if (why) *why = "avx512_bf16_matmat_available (VDPBF16PS)"; return 1; }
+    if (why) *why = "no bf16 matmat unit -> f32 convert + SGEMM (BLAS) prefill";
+    return 0;
+#else
+    if (why) *why = "no BLAS build: bf16 matmat is the only prefill path";
+    return 1;
+#endif
+}
+
 int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     double pf_mark = 0.0;
     qwen_mm_component(QWEN_COMP_TALKER);
@@ -1230,16 +1253,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     float eps = c->rms_norm_eps;
 
     static __thread int mm_env = -1;
-    if (mm_env < 0) {
-        const char *e = getenv("QWEN_PREFILL_MATMAT");
-        if (e) mm_env = (e[0] == '1');
-#ifdef USE_BLAS
-        else mm_env = qwen_amx_bf16_available() || qwen_arm_bf16_matmat_available()
-                      || qwen_avx512_bf16_matmat_available();
-#else
-        else mm_env = 1;
-#endif
-    }
+    if (mm_env < 0) mm_env = qwen_prefill_matmat_resolved(NULL);
     int use_matmat = mm_env;
     int pref_quant = !use_matmat && tk_prefill_quant_enabled();
     if (pref_quant) tk_release_bf16(ctx);

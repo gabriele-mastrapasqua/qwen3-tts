@@ -28,13 +28,14 @@ def one_request(port, results, lock):
                        "seed": 42}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/tts/stream", data=body,
                                  headers={"Content-Type": "application/json"})
-    t0 = time.time(); ttfb = None; n = 0
+    t0 = time.time(); ttfb = None; ttfa = None; n = 0
     try:
         with urllib.request.urlopen(req, timeout=900) as r:
+            ttfb = time.time() - t0            # status line + headers in (TTFB)
             while True:
                 c = r.read1(65536)
                 if not c: break
-                if ttfb is None: ttfb = time.time() - t0
+                if ttfa is None: ttfa = time.time() - t0   # first audio chunk (TTFA)
                 n += len(c)
     except Exception as e:
         with lock: results.append({"err": str(e)})
@@ -42,7 +43,7 @@ def one_request(port, results, lock):
     total = time.time() - t0
     secs = n / 2.0 / 24000.0
     with lock:
-        results.append({"ttfa": ttfb, "total": total, "audio_s": secs,
+        results.append({"ttfb": ttfb, "ttfa": ttfa, "total": total, "audio_s": secs,
                         "rtf": total / secs if secs > 0 else float("nan")})
 
 def proc_counters(pid):
@@ -145,6 +146,8 @@ def run_topology(a, W, K, kai, conc, port0, out):
         "tag": tag, "W": W, "K": K, "kai": kai, "conc": conc,
         "n_ok": len(ok), "n_err": len(res) - len(ok),
         "req_s": len(ok) / wall if wall else 0,
+        "ttfb_p50": pct([r["ttfb"] for r in ok if r.get("ttfb")], .50),
+        "ttfb_p95": pct([r["ttfb"] for r in ok if r.get("ttfb")], .95),
         "ttfa_p50": pct([r["ttfa"] for r in ok if r["ttfa"]], .50),
         "ttfa_p95": pct([r["ttfa"] for r in ok if r["ttfa"]], .95),
         "rtf_p50": pct([r["rtf"] for r in ok], .50),
@@ -193,13 +196,14 @@ def main():
                 rows.append(r); port += max(W, 1) + 1
                 json.dump(rows, open(os.path.join(a.out, "topo.json"), "w"), indent=1)
 
-    hdr = (f"{'cell':<18}{'req/s':>7}{'TTFA50':>8}{'TTFA95':>8}{'RTF50':>7}{'RTF95':>7}"
+    hdr = (f"{'cell':<18}{'req/s':>7}{'TTFB50':>8}{'TTFB95':>8}{'TTFA50':>8}{'TTFA95':>8}{'RTF50':>7}{'RTF95':>7}"
            f"{'cores':>7}{'csw/s':>9}{'migr':>8}{'RSS MB':>8}{'err':>5}")
     print("\n" + hdr); print("-" * len(hdr))
     for r in rows:
         if "error" in r:
             print(f"{r['tag']:<18} ERROR {r['error']}"); continue
-        print(f"{r['tag']:<18}{r['req_s']:>7.2f}{r['ttfa_p50']:>8.2f}{r['ttfa_p95']:>8.2f}"
+        print(f"{r['tag']:<18}{r['req_s']:>7.2f}{r.get('ttfb_p50', float('nan')):>8.2f}{r.get('ttfb_p95', float('nan')):>8.2f}"
+              f"{r['ttfa_p50']:>8.2f}{r['ttfa_p95']:>8.2f}"
               f"{r['rtf_p50']:>7.2f}{r['rtf_p95']:>7.2f}{r['cores']:>7.2f}"
               f"{r['csw_s']:>9.0f}{r['migr']:>8.0f}{r['rss_mb']:>8.0f}{r['n_err']:>5d}")
 

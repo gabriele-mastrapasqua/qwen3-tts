@@ -33,6 +33,9 @@ int qwen_kleidi_register_i8_fam(const void *key, const int8_t *W, const float *s
 int qwen_kleidi_register_bf16_fam(const void *key, const uint16_t *W,
                                   int rows, int cols, int comp, int fam);
 int qwen_kleidi_prefill_enabled(void);
+int qwen_kleidi_nchunk_value(void);    /* QWEN_KAI_NCHUNK as the bf16 GEMM reads it; -1 = no KleidiAI */
+int qwen_kleidi_lhs_sym(void);         /* QWEN_KAI_LHS=sym: symmetric LHS quantisation */
+int qwen_kleidi_qkv_fused_on(void);    /* QWEN_KAI_QKV_FUSED (default ON) */
 
 int qwen_kleidi_matmul_i8_qkv_native(float *dq, float *dk, float *dv,
                                      const void *keyq, const void *keyk, const void *keyv,

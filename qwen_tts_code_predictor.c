@@ -632,15 +632,21 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
         cp_layer_body(ctx, x, x_norm, pos, layer);
 }
 
+/* Env/arch half of the cp_prefill2 decision (default ON with AVX-512 VNNI, opt-in
+ * elsewhere).  The other half needs the weights: every CP layer int8 or int4. */
+int qwen_cp_prefill2_requested(void) {
+    const char *e = getenv("QWEN_CP_PREFILL2");
+#if defined(__AVX512VNNI__)
+    return !(e && e[0] == '0');
+#else
+    return (e && e[0] == '1');
+#endif
+}
+
 static int cp_prefill2_mode(qwen_tts_ctx_t *ctx) {
     static __thread int cached = -2;
     if (cached != -2) return cached;
-    const char *e = getenv("QWEN_CP_PREFILL2");
-#if defined(__AVX512VNNI__)
-    if (e && e[0] == '0') return cached = 0;
-#else
-    if (!(e && e[0] == '1')) return cached = 0;
-#endif
+    if (!qwen_cp_prefill2_requested()) return cached = 0;
     int all8 = 1, all4 = 1;
     for (int l = 0; l < ctx->config.cp_num_layers; l++) {
         qwen_cp_layer_t *L = &ctx->cp_layers[l];

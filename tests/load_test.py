@@ -6,7 +6,10 @@ Arrival modes: all-at-once (synchronised worst case, the default), poisson and u
 so two runs are comparable.
 
 Definitions (wall clock, client side):
-  ttfa     first audio byte - request sent
+  ttfb     first byte of the HTTP response (status line) - request sent
+  ttfa     first audio byte - request sent   (on this server the 200 header travels with
+           the first chunk, so TTFB ~= TTFA; they are printed apart because TTFB is the
+           number other TTS servers quote, and the two diverge the day headers go early)
   total    last audio byte  - request sent
   audio_s  PCM bytes / 2 / 24000 (int16 mono 24 kHz)
   RTF      total / audio_s
@@ -152,7 +155,7 @@ async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audi
     ).encode()
 
     rec = {"request_id": req_id, "class": cls, "text": payload["text"],
-           "ttfa_ms": None, "total_ms": None, "audio_s": 0.0, "rtf": None,
+           "ttfb_ms": None, "ttfa_ms": None, "total_ms": None, "audio_s": 0.0, "rtf": None,
            "bytes": 0, "status": None, "error": "",
            "arrival_sched_ms": arrival_sched_ms,
            "arrival_ms": None,
@@ -175,6 +178,7 @@ async def one_request(host, port, path, payload, req_id, cls, out_dir, save_audi
         await writer.drain()
 
         raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)
+        rec["ttfb_ms"] = (time.perf_counter() - t_start) * 1000.0   # status line + headers
         status_line = raw.split(b"\r\n", 1)[0].decode("latin1")
         rec["status"] = int(status_line.split()[1]) if len(status_line.split()) > 1 else 0
         chunked = b"transfer-encoding: chunked" in raw.lower()
@@ -456,6 +460,7 @@ def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
     ok = [r for r in records if not r["error"] and r["status"] == 200]
     bad = [r for r in records if r not in ok]
     ttfa = [r["ttfa_ms"] for r in ok if r["ttfa_ms"] is not None]
+    ttfb = [r["ttfb_ms"] for r in ok if r.get("ttfb_ms") is not None]
     rtf = [r["rtf"] for r in ok if r["rtf"] is not None]
     audio = sum(r["audio_s"] for r in ok)
     over = [r for r in ok if r["ttfa_ms"] is not None and r["ttfa_ms"] > budget_ms]
@@ -464,6 +469,8 @@ def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
     return {
         "concurrency": conc, "requests": len(records), "ok": len(ok), "errors": len(bad),
         "wall_s": wall, "audio_s": audio, "throughput_Q": (audio / wall) if wall else 0.0,
+        "ttfb_p50": pct(ttfb, 50), "ttfb_p95": pct(ttfb, 95), "ttfb_p99": pct(ttfb, 99),
+        "ttfb_max": max(ttfb) if ttfb else float("nan"),
         "ttfa_p50": p50, "ttfa_p95": p95, "ttfa_p99": pct(ttfa, 99),
         "ttfa_max": max(ttfa) if ttfa else float("nan"),
         "ttfa_mean": statistics.fmean(ttfa) if ttfa else float("nan"),
@@ -489,7 +496,7 @@ def print_table(rows, budget_ms):
     b95 = base["ttfa_p95"] if base else None
     print()
     print("=============== TTFA — THE FIRST-CLASS METRIC")
-    hdr = (f"{'conc':>5}{'req':>5}{'err':>4} | {'TTFA p50':>9}{'p95':>8}{'p99':>8}{'max':>8}"
+    hdr = (f"{'conc':>5}{'req':>5}{'err':>4} | {'TTFB p50':>9}{'p95':>8} | {'TTFA p50':>9}{'p95':>8}{'p99':>8}{'max':>8}"
            f" | {'degrad':>8}{'stab':>6}{'>budget':>9} | {'inflight':>9}{'Q':>7}"
            f"{'RTF p50':>9}{'p95':>7}")
     print(hdr)
@@ -498,6 +505,7 @@ def print_table(rows, budget_ms):
         deg = (s["ttfa_p95"] / b95) if (b95 and b95 > 0) else float("nan")
         over = f"{s['ttfa_over_budget']}/{s['ok']}"
         print(f"{s['concurrency']:>5}{s['requests']:>5}{s['errors']:>4} | "
+              f"{s.get('ttfb_p50', float('nan')):>9.0f}{s.get('ttfb_p95', float('nan')):>8.0f} | "
               f"{s['ttfa_p50']:>9.0f}{s['ttfa_p95']:>8.0f}{s['ttfa_p99']:>8.0f}{s['ttfa_max']:>8.0f}"
               f" | {deg:>7.2f}x{s['ttfa_stability']:>6.2f}{over:>9} | "
               f"{s['mean_inflight']:>9.2f}{s['throughput_Q']:>7.2f}"

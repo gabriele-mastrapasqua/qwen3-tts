@@ -237,6 +237,8 @@ static int qwen_pool_narrow(void) {
     }
     return v;
 }
+int qwen_pool_spin_value(void)   { return qwen_pool_spin(); }
+int qwen_pool_narrow_value(void) { return qwen_pool_narrow(); }
 
 static inline void qwen_cpu_relax(void) {
 #if defined(__aarch64__) || defined(__arm__)
@@ -469,4 +471,7 @@ int qwen_parallel_is_reentrant(void) {
 
 #if defined(__APPLE__) && defined(__BLOCKS__) && !defined(QWEN_FORCE_PTHREAD)
 void qwen_pool_stats_report(void) { }
+/* GCD has no spin/narrow knobs: report the values as "not applicable". */
+int qwen_pool_spin_value(void)   { return -1; }
+int qwen_pool_narrow_value(void) { return -1; }
 #endif
