@@ -327,3 +327,38 @@ wall at ~1 admission/s/worker, bf16-arithmetic-bound) and the steady frame loop 
 89 % of the worker-local read roof). Within the quality-safe numerics there is no measured
 lever left above the ±3 % noise; the levers that exist change numerics (int8 prefill) or the
 concurrency statement (C3).
+
+---
+
+## Final BF16 qualification result (canonical 5-minute C4 soaks on the complete stack)
+
+Stack: `faa496c` (execution ownership `a449f60`, CP region `b152946`, decoder allocations
+`b0570a6`, batched CP heads `110ff48`, Talker region `faa496c`), BF16 production prefill,
+no INT8 prefill, no wide-B prefill, opt-ins off. Binary `49d98b11`, profile
+`aws-c8a-16c-vnni-ttfa`, `tests/serve_soak.py --concurrency 4 --minutes 5 --classes short
+--schedule stratified --schedule-seed 42`. Artifact `profiles/final_q_20260904_190342`.
+
+| configuration | N completed / errors / rejects | STREAM p50 / p95 (recomputed 60-300 s) | TTFA p50 / p95 | req/s |
+|---|---|---|---|---|
+| production defaults | 627 / 0 / 0 | **0.976 / 1.058** | 151 / 197 ms | 2.60 |
+| + `QWEN_PREFILL_HELPER=1 QWEN_PREFILL_LOW_MS=150` (BF16 unchanged) | 592 / 0 / 0 | **0.959 / 1.040** | 259 / 458 ms | 2.45 |
+
+Both runs error- and reject-free, no drift across the four windows, survivors 0, BF16
+production quality preserved (audio bit-identical to the original baseline). **The strict
+production gate (STREAM p50 < 1 and p95 < 1) is not met at C4 on this c8a: C4 is not
+production-qualified.** Day total on the gate, bit-identical: p50 1.030 → 0.976, p95 1.108 →
+1.058 (defaults) / 1.040 (helper policy).
+
+Decision record:
+
+1. BF16-safe conclusion: C4 fails the strict STREAM p95 < 1 gate on the c8a.4xlarge; C3 is
+   the conservative production-capacity candidate (not yet declared).
+2. The only remaining measured candidate able to move C4 materially is the INT8 prefill
+   (`QWEN_PREFILL_INT8MM=1`, opt-in, uncommitted), to be re-tested on top of this final
+   stack. It is **not** production qualification: its output differs from BF16 and needs an
+   explicit audio-quality qualification (corpus, mel/audio comparison, language and voice
+   edge cases, listening) before any promotion.
+3. Project-owned FP32 decoder GEMMs (OpenBLAS replacement): deferred. Measured ceiling ~1-2 %
+   of wall, OpenBLAS threads already parked; acceptance criteria are non-bitwise and are to
+   be defined before implementation.
+4. Post-c8a cross-backend audit of today's runtime fixes: preserved in the plan.
