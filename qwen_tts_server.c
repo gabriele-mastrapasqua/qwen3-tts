@@ -1543,6 +1543,35 @@ static int sink_cancelled(void *ud, void *tag) {
     return j->client_gone;
 }
 
+void qwen_topology_emit(int worker, int threads, const char *configured_mask,
+                        const char *mode) {
+    char actual[512];
+    snprintf(actual, sizeof actual, "%s", "unknown");
+#if defined(__linux__)
+    cpu_set_t set; CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        size_t o = 0; actual[0] = '\0';
+        int ncpu = (int)sysconf(_SC_NPROCESSORS_CONF);
+        if (ncpu <= 0 || ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
+        for (int i = 0; i < ncpu; ) {
+            if (!CPU_ISSET(i, &set)) { i++; continue; }
+            int j = i;
+            while (j + 1 < ncpu && CPU_ISSET(j + 1, &set)) j++;
+            int k = (i == j) ? snprintf(actual + o, sizeof actual - o, "%s%d", o ? "," : "", i)
+                             : snprintf(actual + o, sizeof actual - o, "%s%d-%d", o ? "," : "", i, j);
+            if (k < 0 || (size_t)k >= sizeof actual - o) break;
+            o += (size_t)k; i = j + 1;
+        }
+        if (!o) snprintf(actual, sizeof actual, "?");
+    }
+#endif
+    fprintf(stderr, "[TOPOLOGY] v=1 worker=%d pid=%d configured_mask=%s actual_mask=%s "
+                    "threads=%d mode=%s\n",
+            worker, (int)getpid(), configured_mask ? configured_mask : "inherited",
+            actual, threads, mode ? mode : "?");
+    fflush(stderr);
+}
+
 static int qwen_life_trace(void) {
     static int v = -1;
     if (v < 0) v = getenv("QWEN_LIFE_TRACE") ? 1 : 0;
@@ -2059,6 +2088,9 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             qwen_set_threads(threads_per);
             fprintf(stderr, "prefork: worker %d pid %d cpus %d-%d threads %d\n",
                     w, (int)getpid(), w * per, w * per + per - 1, threads_per);
+            { char cfg[64];
+              snprintf(cfg, sizeof cfg, "%d-%d", w * per, w * per + per - 1);
+              qwen_topology_emit(w, threads_per, cfg, "prefork"); }
             int rc = (max_batch >= 2) ? qwen_tts_serve_batched(ctx, port, max_batch)
                                       : qwen_tts_serve_ex(ctx, port, 1);
             qwen_worker_dump_counters();

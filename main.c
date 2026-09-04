@@ -1,3 +1,10 @@
+#if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#include <unistd.h>
+#endif
 /* main.c - Qwen3-TTS CLI */
 
 #include "qwen_tts.h"
@@ -758,6 +765,7 @@ int main(int argc, char **argv) {
     int serve_batch = 1;
     int serve_prefork = 1;
     int serve_prefork_threads = 0;
+    const char *serve_cpu_mask = NULL;   /* --cpu-mask: benchmark control, see below */
     int serve_max_queue = -1;
     int serve_queue_timeout = 0;
     int serve_max_request_s = -1;
@@ -889,6 +897,7 @@ int main(int argc, char **argv) {
         {"workers",       required_argument, 0, 1026},
         {"batch-size",    required_argument, 0, 1043},
         {"prefork",         required_argument, 0, 1810},
+        {"cpu-mask",        required_argument, 0, 1813},
         {"prefork-threads", required_argument, 0, 1811},
         {"prefork-elastic", no_argument,       0, 1812},
         {"ml-steer",      required_argument, 0, 1044},
@@ -1029,6 +1038,7 @@ int main(int argc, char **argv) {
             case 1043: serve_batch = atoi(optarg); if (serve_batch < 1) serve_batch = 1; break;
             case 1810: serve_prefork = atoi(optarg); if (serve_prefork < 1) serve_prefork = 1; break;
             case 1811: serve_prefork_threads = atoi(optarg); break;
+            case 1813: serve_cpu_mask = optarg; break;
             case 1812: setenv("QWEN_PREFORK_ELASTIC", "1", 1); break;
             case 1044: ml_steer_path = optarg; break;
             case 1045: ml_steer_weight = atof(optarg); break;
@@ -1347,6 +1357,54 @@ int main(int argc, char **argv) {
     }
 
     qwen_check_runtime_isa();
+
+    /* --cpu-mask: EXPLICIT execution domain for a qualification run.  It exists because
+       `--prefork 1` never reaches the prefork path and therefore never calls
+       sched_setaffinity, so "1x8" used to mean "8 threads free to roam every cpu of the
+       host" — which on a multi-CCX part is a different bandwidth domain from a pinned
+       8-core worker, not a smaller one.  Without this flag a single-worker control is
+       scientifically undefined.
+
+       It changes NOTHING by default: absent, the process keeps whatever mask it inherited,
+       exactly as before.  It is refused together with --prefork > 1, where the per-worker
+       split already owns the affinity; silently letting one override the other is how a
+       topology label stops describing the run.
+
+       Applied HERE, before the thread pool exists: pthreads inherit the creating thread's
+       affinity, so a mask set after the pool started would leave the workers outside it. */
+    if (serve_cpu_mask) {
+#if defined(__linux__)
+        if (serve_prefork > 1) {
+            fprintf(stderr, "--cpu-mask is for a single-worker qualification run; with "
+                            "--prefork %d the per-worker split already sets affinity.\n",
+                    serve_prefork);
+            return 2;
+        }
+        cpu_set_t set; CPU_ZERO(&set);
+        int ok = 1;
+        { char buf[512]; snprintf(buf, sizeof buf, "%s", serve_cpu_mask);
+          for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+              int a2, b2;
+              if (sscanf(tok, "%d-%d", &a2, &b2) == 2) { for (int c2 = a2; c2 <= b2; c2++) CPU_SET(c2, &set); }
+              else if (sscanf(tok, "%d", &a2) == 1)    { CPU_SET(a2, &set); }
+              else { ok = 0; break; }
+          } }
+        if (!ok || CPU_COUNT(&set) == 0) {
+            fprintf(stderr, "--cpu-mask: cannot parse '%s' (expected e.g. 0-7 or 0,2,4)\n",
+                    serve_cpu_mask);
+            return 2;
+        }
+        if (sched_setaffinity(0, sizeof set, &set) != 0) {
+            perror("--cpu-mask: sched_setaffinity");
+            return 2;
+        }
+        fprintf(stderr, "cpu-mask: process pid %d confined to cpus %s (%d cpus)\n",
+                (int)getpid(), serve_cpu_mask, CPU_COUNT(&set));
+#else
+        fprintf(stderr, "--cpu-mask is only supported on Linux\n");
+        return 2;
+#endif
+    }
 
     /* --prefork 1 runs a single server, which never reaches the prefork path: without this
        its pool would silently keep the default size while the invocation asked for K. */
@@ -2836,6 +2894,9 @@ int main(int argc, char **argv) {
             qwen_tts_server_set_max_request_ms(serve_max_request_s * 1000);
         if (serve_max_text_chars > 0)
             qwen_tts_server_set_max_text_chars(serve_max_text_chars);
+        if (serve_prefork <= 1)
+            qwen_topology_emit(0, qwen_get_threads(),
+                               serve_cpu_mask ? serve_cpu_mask : "inherited", "single");
         if (serve_prefork > 1) {
             ret = qwen_tts_serve_prefork(ctx, serve_port, serve_prefork,
                                          serve_prefork_threads, serve_batch);

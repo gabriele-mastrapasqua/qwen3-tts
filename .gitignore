@@ -24,6 +24,10 @@ tools/para/.venv/
 !tools/dispatch_gate.py
 !tools/profile_check.py
 !tools/costmap_report.py
+!tools/topology.py
+!tools/roofs.py
+!tools/topology_report.py
+!tools/envelope_report.py
 !tools/wav_qc.py
 !tools/onset_report.py
 # No trailing slash: these may be symlinks rather than real directories.

@@ -203,6 +203,12 @@ help:
 	@echo "                               proves the instrumentation moved no executed path."
 	@echo "                               COSTMAP_LEVEL=1 macro, =2 adds per-layer CP + prefill layout."
 	@echo "  make cost-map-overhead     - what the cost map costs, A/B/B/A interleaved (box drift)"
+	@echo "  make roofs ROOF_MASKS=0-15,0-7,8-15"
+	@echo "                             - bandwidth roof PER CPU MASK (read/copy/triad + saturation"
+	@echo "                               curve, t90/t95/t99), cached per hardware fingerprint."
+	@echo "                               A worker roof is measured, never divided from the host."
+	@echo "  make topology-report       - execution domain + roofs + scope-checked comparison"
+	@echo "  make envelope WAVE_JSON=…  - scaling envelope + cliffs from a canonical wave run"
 	@echo ""
 	@echo "A newly provisioned box (IN THIS ORDER — see docs/hardware-testing.md):"
 	@echo "  make server-hw-check       - the truth about the silicon: hardware + memory bandwidth"
@@ -842,6 +848,28 @@ cost-map: $(TARGET)
 cost-map-overhead: $(TARGET)
 	@bash tools/costmap_ab.sh --model $(PROFILE_MODEL) --profile $(PROFILE_PROFILE) \
 	  --conc $(COSTMAP_CONC) --level $(COSTMAP_LEVEL) --waves $(PROFILE_WAVES) --topo $(PROFILE_TOPO)
+
+# ── topology-aware roofs (B1-B6) ──────────────────────────────────────────────
+# A bandwidth roof belongs to ONE cpu mask.  On a multi-CCX part the host roof and a
+# pinned worker's roof differ by ~2x, and a worker roof can never be derived by dividing
+# a host roof -- on any architecture.  `roofs` measures each mask separately and caches
+# them per hardware fingerprint (a roof does not depend on the model, so a model switch
+# must not force a re-measurement).  ROOF_MASKS lists the execution domains to qualify.
+ROOF_MASKS ?=
+ROOF_STORE ?= $(PROFILES_DIR)/roofs
+roofs: $(MEMBW_BIN)
+	@python3 tools/roofs.py measure --membw $(MEMBW_BIN) --store $(ROOF_STORE) \
+	  $(if $(ROOF_MASKS),--masks $(ROOF_MASKS),) $(if $(HW_JSON),--hardware $(HW_JSON),)
+	@python3 tools/roofs.py show --store $(ROOF_STORE) $(if $(HW_JSON),--hardware $(HW_JSON),)
+topology-report:
+	@python3 tools/topology_report.py --store $(ROOF_STORE) \
+	  $(if $(HW_JSON),--hardware $(HW_JSON),) $(if $(TOPO_JSON),--topology $(TOPO_JSON),) \
+	  $(if $(COMPARE_JSON),--compare $(COMPARE_JSON),)
+envelope:
+	@python3 tools/envelope_report.py --wave $(WAVE_JSON) --store $(ROOF_STORE) \
+	  $(if $(HW_JSON),--hardware $(HW_JSON),) $(if $(TOPO_JSON),--topology $(TOPO_JSON),) \
+	  $(if $(CENSUS_JSON),--census $(CENSUS_JSON),) \
+	  $(if $(COSTMAP_JSON),--costmap $(COSTMAP_JSON),) $(if $(ENV_OUT),--out $(ENV_OUT),)
 
 # ── CPU profiling gate ────────────────────────────────────────────────────────────
 # One artifact directory per run, the same gate language everywhere.  cpu-check is the

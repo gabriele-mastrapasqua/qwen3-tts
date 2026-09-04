@@ -127,6 +127,35 @@ else
     gate SKIP "hardware fingerprint" "tools/box_info.sh missing"
 fi
 
+# ── 4.bis execution domain: topology + a roof PER MASK ──────────────────────────────
+# A roof belongs to one cpu mask.  Measuring only the host and then judging a pinned
+# worker against it is how "at roof" reads as "57% of roof" (AWS c8a: host 113 GB/s,
+# one CCX 54).  ROOF_MASKS names the domains to qualify; the host mask is always taken.
+python3 tools/topology.py --hardware "$OUT/hardware.json" --out "$OUT/topology.json" \
+    > /dev/null 2>&1 && gate PASS "execution domain recorded" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("host mask "+str(d["host"]["cpus_allowed"])+", LLC domains "+str([x["cpus"] for x in d["host"]["llc_domains"]]))' "$OUT/topology.json" 2>/dev/null)" \
+    || gate WARN "execution domain recorded" "tools/topology.py failed"
+
+ROOF_STORE=${ROOF_STORE:-$PROFILES_DIR/roofs}
+if [ -n "$MEMBW_BIN" ] && [ -x "$MEMBW_BIN" ]; then
+    _hostmask=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host"]["cpus_allowed"])' "$OUT/topology.json" 2>/dev/null)
+    _masks="${ROOF_MASKS:-$_hostmask}"
+    if python3 tools/roofs.py measure --membw "$MEMBW_BIN" --store "$ROOF_STORE" \
+           --hardware "$OUT/hardware.json" --masks "$_masks" > "$OUT/roofs.txt" 2>&1; then
+        python3 tools/roofs.py show --store "$ROOF_STORE" --hardware "$OUT/hardware.json" \
+            >> "$OUT/roofs.txt" 2>&1
+        gate PASS "bandwidth roofs per mask" "masks $_masks -> $ROOF_STORE (read/copy/triad + saturation curve)"
+    else
+        gate WARN "bandwidth roofs per mask" "tools/roofs.py failed (see $OUT/roofs.txt)"
+    fi
+else
+    gate SKIP "bandwidth roofs per mask" "no membw binary (make membw)"
+fi
+python3 tools/topology_report.py --hardware "$OUT/hardware.json" \
+    --topology "$OUT/topology.json" --store "$ROOF_STORE" > "$OUT/topology_report.txt" 2>&1 \
+    && gate PASS "topology report" "$OUT/topology_report.txt" \
+    || gate WARN "topology report" "tools/topology_report.py failed"
+
 # ── 5. build / compiler ─────────────────────────────────────────────────────────────
 { make -s info 2>/dev/null; echo; CC_=${CC:-cc}; echo "cc: $CC_"; $CC_ --version 2>/dev/null | head -2; } > "$OUT/build.txt" 2>&1
 gate PASS "compiler + flags recorded" "$OUT/build.txt"
