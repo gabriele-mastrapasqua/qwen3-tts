@@ -1955,6 +1955,147 @@ void qwen_batch_free(qwen_batch_t *bb) {
     free(bb);
 }
 
+/* ---- one batched Talker step as ONE persistent parallel region -------------------------
+ * Same design as the code-predictor region: the team enters the pool once per step, the
+ * four projections of every layer run as the VNNI row blocks the dispatched path uses,
+ * and the per-slot sections (input norm, q/k norm, rope, KV store, attention, residual
+ * norms, swiglu) run one slot per thread between spin barriers.  Eight barriers per layer,
+ * one dispatch per step instead of 112.  Kernels and partition are unchanged, so the
+ * hidden states are bit-identical.  QWEN_TK_REGION=0 restores the dispatched path. */
+typedef struct {
+    qwen_tts_ctx_t *ctx; qwen_batch_t *bb; const int *pos_arr; const uint8_t *active;
+    int BW; const int *idx; float scale;
+    int8_t *qx; float *swtmp; float sx[16];
+    qwen_barrier_t bar;
+} tk_region_t;
+
+static void tk_region_gather_quant(tk_region_t *r, const float *src, int b, int j, int cols, int srcstride) {
+    float *Xt = r->bb->Xt; const float *s = src + (size_t)b * srcstride;
+    for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
+    r->sx[j] = qwen_i8mm_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
+}
+static void tk_region_scatter(tk_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
+    float *d = dst + (size_t)b * rows;
+    for (int i = 0; i < rows; i++) d[i] = Yt[(size_t)i * r->BW + j];
+}
+
+static void tk_region_task(size_t tid, size_t nt, void *v) {
+    tk_region_t *r = (tk_region_t *)v;
+    qwen_tts_ctx_t *ctx = r->ctx; qwen_batch_t *bb = r->bb; qwen_tts_config_t *c = &ctx->config;
+    const int BW = r->BW, h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
+    const float eps = c->rms_norm_eps, scale = r->scale;
+    float *Yt = bb->Yt;
+#define TSLOT(j) (r->idx ? r->idx[j] : (j))
+#define TMINE(j) ((size_t)(j) % nt == tid)
+#define TPOS(b)  (r->pos_arr ? r->pos_arr[b] : bb->kv_len)
+    for (int j = 0; j < BW; j++) if (TMINE(j)) {
+        int b = TSLOT(j);
+        qwen_rms_norm(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h, ctx->layers[0].input_norm, 1, h, eps);
+        tk_region_gather_quant(r, bb->x_norm, b, j, h, h);
+    }
+    qwen_barrier_wait(&r->bar);
+    for (int L = 0; L < c->num_layers; L++) {
+        qwen_talker_layer_t *l = &ctx->layers[L];
+        float *Yk = Yt + (size_t)qd * BW, *Yv = Yt + (size_t)(qd + kvd) * BW;
+        qwen_i8mm_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
+                          l->wv_int8, l->wv_scale, r->qx, r->sx, qd, kvd, h, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j), pos = TPOS(b);
+            tk_region_scatter(r, bb->q, Yt, b, j, qd);
+            tk_region_scatter(r, bb->k, Yk, b, j, kvd);
+            tk_region_scatter(r, bb->v, Yv, b, j, kvd);
+            qwen_rms_norm_per_head(bb->q + (size_t)b * qd,  l->q_norm, 1, c->num_heads,    c->head_dim, eps);
+            qwen_rms_norm_per_head(bb->k + (size_t)b * kvd, l->k_norm, 1, c->num_kv_heads, c->head_dim, eps);
+            apply_rope_neox_inplace(bb->q + (size_t)b * qd,  c->num_heads,    c->head_dim, ctx->rope_cos, ctx->rope_sin, pos);
+            apply_rope_neox_inplace(bb->k + (size_t)b * kvd, c->num_kv_heads, c->head_dim, ctx->rope_cos, ctx->rope_sin, pos);
+            size_t kvbase = ((size_t)b * bb->num_layers + L) * bb->kv_max * kvd + (size_t)pos * kvd;
+            f32_to_bf16_vec(bb->kv_k + kvbase, bb->k + (size_t)b * kvd, kvd);
+            f32_to_bf16_vec(bb->kv_v + kvbase, bb->v + (size_t)b * kvd, kvd);
+            size_t lbase = ((size_t)b * bb->num_layers + L) * bb->kv_max * kvd;
+            qwen_causal_attention_bf16kv(bb->attn_out + (size_t)b * qd, bb->q + (size_t)b * qd,
+                                         bb->kv_k + lbase, bb->kv_v + lbase, 1, pos + 1,
+                                         c->num_heads, c->num_kv_heads, c->head_dim, scale, pos);
+            tk_region_gather_quant(r, bb->attn_out, b, j, qd, qd);
+        }
+        qwen_barrier_wait(&r->bar);
+        qwen_i8mm_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, h, qd, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j);
+            tk_region_scatter(r, bb->proj_out, Yt, b, j, h);
+            qwen_rms_norm_residual(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h,
+                                   bb->proj_out + (size_t)b * h, l->post_attn_norm, h, eps);
+            tk_region_gather_quant(r, bb->x_norm, b, j, h, h);
+        }
+        qwen_barrier_wait(&r->bar);
+        qwen_i8mm_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * inter, h, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j);
+            tk_region_scatter(r, bb->gate, Yt, b, j, 2 * inter);
+            qwen_swiglu_inplace(bb->gate + (size_t)b * 2 * inter, r->swtmp + (size_t)j * inter, inter);
+            tk_region_gather_quant(r, bb->gate, b, j, inter, 2 * inter);
+        }
+        qwen_barrier_wait(&r->bar);
+        qwen_i8mm_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, h, inter, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j);
+            tk_region_scatter(r, bb->proj_out, Yt, b, j, h);
+            if (L + 1 < c->num_layers) {
+                qwen_rms_norm_residual(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h,
+                                       bb->proj_out + (size_t)b * h, ctx->layers[L + 1].input_norm, h, eps);
+                tk_region_gather_quant(r, bb->x_norm, b, j, h, h);
+            } else {
+                float *xb = bb->x + (size_t)b * h, *pb = bb->proj_out + (size_t)b * h;
+                for (int i = 0; i < h; i++) xb[i] += pb[i];
+            }
+        }
+        qwen_barrier_wait(&r->bar);
+    }
+#undef TSLOT
+#undef TMINE
+#undef TPOS
+}
+
+/* Returns 1 when the whole layer stack ran as one region (the caller skips its loop). */
+static int tk_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const int *pos_arr,
+                         const uint8_t *active, float scale) {
+    static int shapes_ok = -1;
+    qwen_tts_config_t *c = &ctx->config;
+    int BW = bb->B_eff > 0 ? bb->B_eff : bb->B;
+    int h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
+    if (shapes_ok < 0) {
+        const char *e = getenv("QWEN_TK_REGION");
+        qwen_talker_layer_t *l = &ctx->layers[0];
+        shapes_ok = !(e && e[0] == '0') && qwen_parallel_team() >= 2 && bb->B >= 2 &&
+                    l->wq_int8 && l->wk_int8 && l->wv_int8 && l->wo_int8 && l->gate_up_fused_int8 && l->down_int8 &&
+                    !l->wq_q4 && !l->wk_q4 && !l->wv_q4 && !l->wo_q4 && !l->gate_up_fused_q4 && !l->down_q4 &&
+                    qwen_i8mm_qkv_usable(qd, kvd, h, 2) && qwen_i8mm_usable(h, qd, 2) &&
+                    qwen_i8mm_usable(2 * inter, h, 2) && qwen_i8mm_usable(h, inter, 2);
+        fprintf(stderr, "[talker] batched step as one parallel region: %s (team %d)\n",
+                shapes_ok ? "ON" : "off", qwen_parallel_team());
+    }
+    if (!shapes_ok || bb->force_matvec || BW < 2 || BW > 16) return 0;
+    if (!(qwen_i8mm_qkv_usable(qd, kvd, h, BW) && qwen_i8mm_usable(h, qd, BW) &&
+          qwen_i8mm_usable(2 * inter, h, BW) && qwen_i8mm_usable(h, inter, BW))) return 0;
+    static int8_t *qx = NULL; static float *swtmp = NULL; static size_t qx_cap = 0, sw_cap = 0;
+    size_t maxc = (size_t)(inter > qd ? inter : qd); if (maxc < (size_t)h) maxc = h;
+    size_t need = (size_t)BW * maxc + 64, swn = (size_t)BW * inter;
+    if (need > qx_cap) { free(qx); qx = (int8_t *)aligned_alloc(64, (need + 63) & ~(size_t)63); qx_cap = qx ? need : 0; }
+    if (swn > sw_cap) { free(swtmp); swtmp = (float *)malloc(swn * sizeof(float)); sw_cap = swtmp ? swn : 0; }
+    if (!qx || !swtmp) return 0;
+    tk_region_t r; memset(&r, 0, sizeof r);
+    r.ctx = ctx; r.bb = bb; r.pos_arr = pos_arr; r.active = active; r.BW = BW; r.idx = bb->act_idx;
+    r.scale = scale; r.qx = qx; r.swtmp = swtmp;
+    int team = qwen_parallel_team();
+    qwen_barrier_init(&r.bar, team);
+    qwen_parallel((size_t)team, tk_region_task, &r);
+    (void)c;
+    return 1;
+}
+
 static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                   const float *embeds, const int *pos_arr,
                                   const uint8_t *active, float *hidden_out) {
@@ -1978,7 +2119,8 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     memcpy(bb->x, embeds, (size_t)B * h * sizeof(float));
     float scale = 1.0f / sqrtf((float)c->head_dim);
 
-    for (int layer = 0; layer < c->num_layers; layer++) {
+    const int region_done = tk_region_run(ctx, bb, pos_arr, active, scale);
+    for (int layer = 0; layer < c->num_layers && !region_done; layer++) {
         qwen_talker_layer_t *l = &ctx->layers[layer];
         for (int b = 0; b < B; b++)
             qwen_rms_norm(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h, l->input_norm, 1, h, eps);
