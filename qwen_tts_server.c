@@ -1495,7 +1495,9 @@ static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block)
 }
 
 static int send_pcm_chunk(int fd, const float *samples, int n) {
-    int16_t *pcm = (int16_t *)malloc((size_t)n * sizeof(int16_t));
+    /* per-thread grow-once conversion buffer: no allocation per chunk on the streaming path */
+    static __thread int16_t *pcm = NULL; static __thread size_t pcm_cap = 0;
+    if ((size_t)n > pcm_cap) { free(pcm); pcm = (int16_t *)malloc((size_t)n * sizeof(int16_t)); pcm_cap = pcm ? (size_t)n : 0; }
     if (!pcm) return 0;
     for (int i = 0; i < n; i++) {
         float s = samples[i]; if (s < -1.0f) s = -1.0f; if (s > 1.0f) s = 1.0f;
@@ -1507,7 +1509,6 @@ static int send_pcm_chunk(int fd, const float *samples, int n) {
     if (write_all_or_gone(fd, ch, (size_t)chlen) < 0) gone = 1;
     else if (write_all_or_gone(fd, pcm, (size_t)data_len) < 0) gone = 1;
     else if (write_all_or_gone(fd, "\r\n", 2) < 0) gone = 1;
-    free(pcm);
     return gone;
 }
 

@@ -285,7 +285,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
     "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
-    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION",
+    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
@@ -3094,6 +3094,9 @@ static void bf16_amx_task(size_t tid, size_t nt, void *vc) {
 QWEN_MM_SCRATCH(qx,   int8_t)
 QWEN_MM_SCRATCH(pack, int8_t)
 QWEN_MM_SCRATCH(packb, uint16_t)
+QWEN_MM_SCRATCH(sdcolf, float)
+QWEN_MM_SCRATCH(sdcolq, int8_t)
+QWEN_MM_SCRATCH(sdsa, float)
 QWEN_MM_SCRATCH(corr, int)
 
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
@@ -8678,9 +8681,11 @@ static void sd_conv1d_worker(void *vj) {
     int K = j->in_ch * j->kernel;
     int nblk = j->Kp / j->blk;
     int pad_left = (j->kernel - 1) * j->dilation;
-    float *colf = (float *)aligned_malloc((size_t)SD_INT8_NC * K * sizeof(float));
-    int8_t *colq = (int8_t *)aligned_malloc((size_t)SD_INT8_NC * j->Kp);
-    float *sa = (float *)aligned_malloc((size_t)SD_INT8_NC * nblk * sizeof(float));
+    /* per-thread, grow-once: the worker runs one panel at a time, so the column scratch is
+     * reused across panels, conv layers and chunks instead of being re-allocated per call */
+    float *colf = mm_scratch_sdcolf((size_t)SD_INT8_NC * K);
+    int8_t *colq = mm_scratch_sdcolq((size_t)SD_INT8_NC * j->Kp);
+    float *sa = mm_scratch_sdsa((size_t)SD_INT8_NC * nblk);
     for (;;) {
         int p = atomic_fetch_add(&j->next_panel, 1);
         if (p >= j->n_panels) break;
@@ -8801,9 +8806,9 @@ void qwen_conv1d_int8(float *out, const float *in,
     int K = in_ch * kernel;
     int nblk = Kp / blk;
     int pad_left = (kernel - 1) * dilation;
-    float *colf = (float *)aligned_malloc((size_t)K * sizeof(float));
-    int8_t *colq = (int8_t *)aligned_malloc((size_t)Kp);
-    float *sa = (float *)aligned_malloc((size_t)nblk * sizeof(float));
+    float *colf = mm_scratch_sdcolf((size_t)K);
+    int8_t *colq = mm_scratch_sdcolq((size_t)Kp);
+    float *sa = mm_scratch_sdsa((size_t)nblk);
     for (int t = 0; t < length; t++) {
         for (int ic = 0; ic < in_ch; ic++)
             for (int kk = 0; kk < kernel; kk++) {

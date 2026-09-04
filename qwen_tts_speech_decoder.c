@@ -31,6 +31,57 @@
 #define cblas_sgemm qwen_sd_sgemm
 #define CONV_TILE_MAX_BYTES (256 * 1024 * 1024)
 
+/* ---- per-stream decoder scratch --------------------------------------------------------
+ * Every temporary of one streaming chunk (conv-stack ping-pong buffers, im2col columns,
+ * transformer activations, ...) comes from a bump arena owned by the stream state and
+ * reset at the start of each chunk.  Blocks are never moved or freed while the stream is
+ * alive, so pointers handed out earlier in the chunk stay valid when the arena grows; a
+ * grow adds a block (rare: the first chunks of a stream, until the 8-frame steady shape is
+ * seen) and is counted.  Outside a streaming chunk (g_sd_arena == NULL: the one-shot and
+ * batched decoders) the helpers are plain aligned_malloc/free, so those paths are unchanged.
+ * Buffers returned to the caller (the chunk's audio) never come from the arena. */
+#define SD_ARENA_MAX_BLOCKS 16
+#define SD_ARENA_BLOCK_MIN  (32u << 20)   /* one 8-frame chunk of the conv stack needs tens of MB */
+typedef struct {
+    unsigned char *blk[SD_ARENA_MAX_BLOCKS];
+    size_t cap[SD_ARENA_MAX_BLOCKS], used[SD_ARENA_MAX_BLOCKS];
+    size_t chunk_bytes, peak_bytes;   /* bytes handed out in the current chunk / the largest chunk */
+    int n, cur, grows, spills;        /* spills = allocations that had to leave the arena */
+} sd_arena_t;
+static __thread sd_arena_t *g_sd_arena = NULL;
+
+static void sd_arena_reset(sd_arena_t *a) {
+    for (int i = 0; i < a->n; i++) a->used[i] = 0;
+    a->cur = 0;
+    if (a->chunk_bytes > a->peak_bytes) a->peak_bytes = a->chunk_bytes;
+    a->chunk_bytes = 0;
+}
+static void sd_arena_destroy(sd_arena_t *a) { if (!a) return; for (int i = 0; i < a->n; i++) free(a->blk[i]); free(a); }
+static void *sd_tmp_alloc(size_t bytes) {
+    sd_arena_t *a = g_sd_arena;
+    if (!a) return aligned_malloc(bytes);
+    bytes = (bytes + 63) & ~(size_t)63;
+    a->chunk_bytes += bytes;
+    for (int i = 0; i < a->n; i++) {
+        if (a->cap[i] - a->used[i] >= bytes) { void *p = a->blk[i] + a->used[i]; a->used[i] += bytes; return p; }
+    }
+    if (a->n >= SD_ARENA_MAX_BLOCKS) { a->spills++; return aligned_malloc(bytes); }   /* correctness fallback, counted */
+    size_t cap = bytes > SD_ARENA_BLOCK_MIN ? bytes : SD_ARENA_BLOCK_MIN;
+    void *b = NULL;
+    if (posix_memalign(&b, 64, cap) != 0) return NULL;
+    a->blk[a->n] = (unsigned char *)b; a->cap[a->n] = cap; a->used[a->n] = bytes; a->n++; a->grows++;
+    return b;
+}
+static void *sd_tmp_calloc(size_t n, size_t sz) { void *p = sd_tmp_alloc(n * sz); if (p) memset(p, 0, n * sz); return p; }
+static void *sd_tmp_malloc(size_t bytes) { return sd_tmp_alloc(bytes); }
+static void sd_tmp_free(void *p) {
+    sd_arena_t *a = g_sd_arena;
+    if (a && p) for (int i = 0; i < a->n; i++)
+        if ((unsigned char *)p >= a->blk[i] && (unsigned char *)p < a->blk[i] + a->cap[i]) return;
+    free(p);
+}
+int qwen_sd_stream_scratch_grows(const qwen_sd_stream_state_t *st) { return st && st->scratch ? ((sd_arena_t *)st->scratch)->grows : 0; }
+
 #ifdef QWEN_HAVE_CUDA
 #include "qwen_tts_cuda.h"
 static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float *A,int lda,
@@ -366,7 +417,7 @@ static void causal_conv1d_blas(float *out, const float *in,
     if (max_tile < 1) max_tile = 1;
     if (max_tile > length) max_tile = length;
 
-    float *col = (float *)aligned_malloc(col_rows * max_tile * sizeof(float));
+    float *col = (float *)sd_tmp_alloc(col_rows * max_tile * sizeof(float));
 
     for (int ts = 0; ts < length; ts += (int)max_tile) {
         int tile = ((int64_t)ts + max_tile > length) ? length - ts : (int)max_tile;
@@ -394,7 +445,7 @@ static void causal_conv1d_blas(float *out, const float *in,
         if (sd_phase_on()) sd_gemm_macs += (long long)out_ch * tile * col_rows;
     }
 
-    free(col);
+    sd_tmp_free(col);
     CV_T0();
     conv_add_bias(out, bias, out_ch, length);
     CV_ACC(sd_cbias);
@@ -435,7 +486,7 @@ static void causal_conv_transpose1d_blas(float *out, const float *in,
 
     const int _cph = sd_phase_on();
     double _cg = 0, _cm = 0, _cs = 0, _cb = 0, _ct0 = _cph ? sd_ph_now() : 0.0, _cx;
-    float *rk = (float *)aligned_malloc((int64_t)out_ch * in_len * sizeof(float));
+    float *rk = (float *)sd_tmp_alloc((int64_t)out_ch * in_len * sizeof(float));
 
     for (int k = 0; k < kernel; k++) {
         if (_cph) _cx = sd_ph_now();
@@ -461,7 +512,7 @@ static void causal_conv_transpose1d_blas(float *out, const float *in,
         if (_cph) _cs += sd_ph_now() - _cx;
     }
 
-    free(rk);
+    sd_tmp_free(rk);
     if (_cph) _cx = sd_ph_now();
     conv_add_bias(out, bias, out_ch, out_len);
     if (_cph) {
@@ -1372,17 +1423,54 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
     return 0;
 }
 
+/* Stream buffers are recycled across requests on the thread that decodes them: the
+ * scratch arena, the transformer KV caches, the latent cache and the vq pad of a finished
+ * stream are parked here and adopted by the next stream instead of being freed and
+ * re-grown, so a steady worker allocates nothing per request for them.  Logical state
+ * (lengths, counters, the causal tails) still starts from zero. */
+#define SD_RETIRED_MAX 8
+typedef struct {
+    void *scratch; float *k[QWEN_SD_STREAM_MAX_LAYERS], *v[QWEN_SD_STREAM_MAX_LAYERS];
+    int kv_alloc; float *latent; int latent_alloc; float *vq_pad;
+} sd_retired_t;
+static __thread sd_retired_t g_sd_retired[SD_RETIRED_MAX];
+static __thread int g_sd_nretired = 0;
+
 void qwen_sd_stream_init(qwen_sd_stream_state_t *st) {
     memset(st, 0, sizeof(*st));
+    if (g_sd_nretired > 0) {
+        sd_retired_t *r = &g_sd_retired[--g_sd_nretired];
+        st->scratch = r->scratch;
+        for (int i = 0; i < QWEN_SD_STREAM_MAX_LAYERS; i++) { st->k_cache[i] = r->k[i]; st->v_cache[i] = r->v[i]; }
+        st->kv_alloc = r->kv_alloc;
+        st->latent_cache = r->latent; st->latent_alloc = r->latent_alloc;
+        st->vq_pad = r->vq_pad;
+        memset(r, 0, sizeof(*r));
+    }
 }
 
 void qwen_sd_stream_free(qwen_sd_stream_state_t *st) {
-    for (int i = 0; i < QWEN_SD_STREAM_MAX_LAYERS; i++) {
-        free(st->k_cache[i]); st->k_cache[i] = NULL;
-        free(st->v_cache[i]); st->v_cache[i] = NULL;
+    if (st->scratch && getenv("QWEN_SD_SCRATCH_STATS")) {
+        sd_arena_t *a = (sd_arena_t *)st->scratch;
+        size_t peak = a->chunk_bytes > a->peak_bytes ? a->chunk_bytes : a->peak_bytes, tot = 0;
+        for (int i = 0; i < a->n; i++) tot += a->cap[i];
+        fprintf(stderr, "[SD_SCRATCH] blocks=%d reserved=%.1fMB peak_chunk=%.1fMB grows=%d spills=%d\n",
+                a->n, tot / 1048576.0, peak / 1048576.0, a->grows, a->spills);
     }
-    free(st->latent_cache); st->latent_cache = NULL;
-    free(st->vq_pad); st->vq_pad = NULL;
+    if (g_sd_nretired < SD_RETIRED_MAX) {
+        sd_retired_t *r = &g_sd_retired[g_sd_nretired++];
+        r->scratch = st->scratch;
+        for (int i = 0; i < QWEN_SD_STREAM_MAX_LAYERS; i++) { r->k[i] = st->k_cache[i]; r->v[i] = st->v_cache[i]; }
+        r->kv_alloc = st->kv_alloc; r->latent = st->latent_cache; r->latent_alloc = st->latent_alloc;
+        r->vq_pad = st->vq_pad;
+    } else {
+        sd_arena_destroy((sd_arena_t *)st->scratch);
+        for (int i = 0; i < QWEN_SD_STREAM_MAX_LAYERS; i++) { free(st->k_cache[i]); free(st->v_cache[i]); }
+        free(st->latent_cache); free(st->vq_pad);
+    }
+    st->scratch = NULL;
+    for (int i = 0; i < QWEN_SD_STREAM_MAX_LAYERS; i++) { st->k_cache[i] = NULL; st->v_cache[i] = NULL; }
+    st->latent_cache = NULL; st->vq_pad = NULL;
     for (int b = 0; b < 2; b++) { free(st->cs_cn_dw_tail[b]); st->cs_cn_dw_tail[b] = NULL; }
     free(st->cs_init_tail);  st->cs_init_tail = NULL;
     free(st->cs_final_tail); st->cs_final_tail = NULL;
@@ -1417,7 +1505,7 @@ static void convnext_mlp(qwen_sd_convnext_t *cn, float *signal, const float *res
     }
 
     int pw_dim = 4096;
-    float *pw1_out = (float *)aligned_malloc((int64_t)pw_dim * cur_len * sizeof(float));
+    float *pw1_out = (float *)sd_tmp_alloc((int64_t)pw_dim * cur_len * sizeof(float));
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 pw_dim, cur_len, cur_ch, 1.0f,
@@ -1457,7 +1545,7 @@ static void convnext_mlp(qwen_sd_convnext_t *cn, float *signal, const float *res
             signal[(int64_t)o * cur_len + t] = sum;
         }
 #endif
-    free(pw1_out);
+    sd_tmp_free(pw1_out);
 
     for (int ci = 0; ci < cur_ch; ci++) {
         float g = cn->gamma[ci];
@@ -1618,7 +1706,7 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
     int tail_cols = (kernel - 1) * dilation;
 
     if (!warm) {
-        float *out = (float *)aligned_calloc((int64_t)out_ch * len, sizeof(float));
+        float *out = (float *)sd_tmp_calloc((int64_t)out_ch * len, sizeof(float));
         if (!out) return NULL;
         causal_conv1d(out, in, w, b, in_ch, out_ch, len, kernel, dilation);
         cs_save_tail(tail, in, in_ch, len, tail_cols);
@@ -1627,7 +1715,7 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
 
     int ext_len = tail_cols + len;
     C1_T0();
-    float *ext = (float *)aligned_malloc((int64_t)in_ch * ext_len * sizeof(float));
+    float *ext = (float *)sd_tmp_alloc((int64_t)in_ch * ext_len * sizeof(float));
     if (!ext) return NULL;
     for (int ic = 0; ic < in_ch; ic++) {
         memcpy(ext + (int64_t)ic * ext_len, tail + (int64_t)ic * tail_cols,
@@ -1641,21 +1729,21 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
 
     C1_ACC(sd_c1_ext);
     C1_T0();
-    float *full = (float *)aligned_calloc((int64_t)out_ch * ext_len, sizeof(float));
-    if (!full) { free(ext); return NULL; }
+    float *full = (float *)sd_tmp_calloc((int64_t)out_ch * ext_len, sizeof(float));
+    if (!full) { sd_tmp_free(ext); return NULL; }
     causal_conv1d(full, ext, w, b, in_ch, out_ch, ext_len, kernel, dilation);
-    free(ext);
+    sd_tmp_free(ext);
     C1_ACC(sd_c1_conv);
     if (sd_phase_on()) { sd_c1_calls++; sd_c1_cols_kept += len; sd_c1_cols_conv += ext_len; }
     C1_T0();
 
-    float *out = (float *)aligned_malloc((int64_t)out_ch * len * sizeof(float));
-    if (!out) { free(full); return NULL; }
+    float *out = (float *)sd_tmp_alloc((int64_t)out_ch * len * sizeof(float));
+    if (!out) { sd_tmp_free(full); return NULL; }
     for (int oc = 0; oc < out_ch; oc++)
         memcpy(out + (int64_t)oc * len, full + (int64_t)oc * ext_len + tail_cols,
                (size_t)len * sizeof(float));
     C1_ACC(sd_c1_cut);
-    free(full);
+    sd_tmp_free(full);
     return out;
 }
 
@@ -1665,12 +1753,12 @@ static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
     int cs = kernel - stride;
     int full_len = (len - 1) * stride + kernel;
     int out_len = len * stride;
-    float *full = (float *)aligned_calloc((int64_t)out_ch * full_len, sizeof(float));
+    float *full = (float *)sd_tmp_calloc((int64_t)out_ch * full_len, sizeof(float));
     if (!full) return NULL;
     causal_conv_transpose1d(full, in, w, NULL, in_ch, out_ch, len, full_len,
                             kernel, stride);
-    float *out = (float *)aligned_malloc((int64_t)out_ch * out_len * sizeof(float));
-    if (!out) { free(full); return NULL; }
+    float *out = (float *)sd_tmp_alloc((int64_t)out_ch * out_len * sizeof(float));
+    if (!out) { sd_tmp_free(full); return NULL; }
     for (int oc = 0; oc < out_ch; oc++) {
         float *f = full + (int64_t)oc * full_len;
         float *o = out + (int64_t)oc * out_len;
@@ -1685,13 +1773,13 @@ static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
             for (int i = 0; i < cs; i++) cr[i] = f[out_len + i];
         }
     }
-    free(full);
+    sd_tmp_free(full);
     return out;
 }
 
 static float *cs_dwconv(const float *in, int ch, int len,
                         const float *w, const float *b, float *tail) {
-    float *out = (float *)aligned_malloc((int64_t)ch * len * sizeof(float));
+    float *out = (float *)sd_tmp_alloc((int64_t)ch * len * sizeof(float));
     if (!out) return NULL;
     for (int c = 0; c < ch; c++) {
         const float *src = in + (int64_t)c * len;
@@ -1772,34 +1860,34 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
                                           float *signal, int m,
                                           float **audio_out, int *n_samples_out) {
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
-    if (cs_ensure_alloc(st) != 0) { free(signal); return -1; }
+    if (cs_ensure_alloc(st) != 0) { sd_tmp_free(signal); return -1; }
     int cur_ch = 1024, cur_len = m;
     const int _ph = sd_phase_on();
     double _m = _ph ? sd_ph_now() : 0.0;
 
     for (int b = 0; b < 2; b++) {
         qwen_sd_convnext_t *cn = &sd->convnext[b];
-        if (!cn->conv_weight) { free(signal); return -1; }
+        if (!cn->conv_weight) { sd_tmp_free(signal); return -1; }
         float *up = cs_convt(signal, cur_ch, cur_ch, cur_len, 2, 2,
                              cn->conv_weight, cn->conv_bias, NULL);
-        free(signal);
+        sd_tmp_free(signal);
         if (!up) return -1;
         cur_len *= 2;
         float *dw = cs_dwconv(up, cur_ch, cur_len, cn->dwconv_weight, cn->dwconv_bias,
                               st->cs_cn_dw_tail[b]);
-        if (!dw) { free(up); return -1; }
+        if (!dw) { sd_tmp_free(up); return -1; }
         convnext_mlp(cn, dw, up, cur_ch, cur_len);
-        free(up);
+        sd_tmp_free(up);
         signal = dw;
     }
 
     if (_ph) { double _t = sd_ph_now(); sd_p6a += _t - _m; _m = _t; }
 
-    if (!sd->initial_conv_weight) { free(signal); return -1; }
+    if (!sd->initial_conv_weight) { sd_tmp_free(signal); return -1; }
     float *ic_out = cs_conv1d(signal, cur_ch, 1536, cur_len, 7, 1,
                               sd->initial_conv_weight, sd->initial_conv_bias,
                               st->cs_init_tail, st->cs_warm);
-    free(signal);
+    sd_tmp_free(signal);
     if (!ic_out) return -1;
     signal = ic_out; cur_ch = 1536;
     if (_ph) { double _t = sd_ph_now(); sd_p6b += _t - _m; _m = _t; }
@@ -1812,7 +1900,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         int rate = up_rates[b];
         int kernel = rate * 2;
         int out_ch = out_channels[b];
-        if (!ub->upsample.conv_weight) { free(signal); return -1; }
+        if (!ub->upsample.conv_weight) { sd_tmp_free(signal); return -1; }
 
         { UP_T0();
           if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
@@ -1824,7 +1912,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
                                  ub->upsample.conv_weight, ub->upsample.conv_bias,
                                  st->cs_up_carry[b]);
         UP_ACC(sd_up_convt);
-        free(signal);
+        sd_tmp_free(signal);
         if (!up_out) return -1;
         signal = up_out; cur_ch = out_ch; cur_len *= rate;
 
@@ -1832,8 +1920,8 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         for (int r = 0; r < 3; r++) {
             int dil = dilations[r];
             UP_T0();
-            float *res = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
-            if (!res) { free(signal); return -1; }
+            float *res = (float *)sd_tmp_alloc((int64_t)cur_ch * cur_len * sizeof(float));
+            if (!res) { sd_tmp_free(signal); return -1; }
             memcpy(res, signal, (int64_t)cur_ch * cur_len * sizeof(float));
             UP_ACC(sd_up_resadd);
 
@@ -1852,8 +1940,8 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
                                       ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias,
                                       st->cs_res_tail[b][r], st->cs_warm);
             UP_ACC(sd_up_res1);
-            free(signal);
-            if (!c1_out) { free(res); return -1; }
+            sd_tmp_free(signal);
+            if (!c1_out) { sd_tmp_free(res); return -1; }
             signal = c1_out;
 
             { UP_T0();
@@ -1863,8 +1951,8 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
               UP_ACC(sd_up_snake); }
 
             UP_T0();
-            float *c2_out = (float *)aligned_calloc((int64_t)cur_ch * cur_len, sizeof(float));
-            if (!c2_out) { free(res); free(signal); return -1; }
+            float *c2_out = (float *)sd_tmp_calloc((int64_t)cur_ch * cur_len, sizeof(float));
+            if (!c2_out) { sd_tmp_free(res); sd_tmp_free(signal); return -1; }
             UP_ACC(sd_up_alloc);
             {
                 char _nm[32]; snprintf(_nm, sizeof _nm, "blk%d_res%d_conv2", b, r);
@@ -1879,19 +1967,19 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
               for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
                   signal[i] = res[i] + c2_out[i];
               UP_ACC(sd_up_resadd); }
-            { UP_T0(); free(c2_out); free(res); UP_ACC(sd_up_alloc); }
+            { UP_T0(); sd_tmp_free(c2_out); sd_tmp_free(res); UP_ACC(sd_up_alloc); }
         }
     }
 
-    if (!sd->final_snake.alpha || !sd->final_conv_weight) { free(signal); return -1; }
+    if (!sd->final_snake.alpha || !sd->final_conv_weight) { sd_tmp_free(signal); return -1; }
     UP_T0();
     snake_activation(signal, cur_ch, cur_len, sd->final_snake.alpha, sd->final_snake.beta);
 
     float *audio = (float *)aligned_calloc(cur_len, sizeof(float));
-    if (!audio) { free(signal); return -1; }
+    if (!audio) { sd_tmp_free(signal); return -1; }
     cs_final_conv(audio, signal, cur_len, 0, cur_ch, cur_len,
                   sd->final_conv_weight, sd->final_conv_bias, st->cs_final_tail);
-    free(signal);
+    sd_tmp_free(signal);
 
     for (int i = 0; i < cur_len; i++) {
         if (audio[i] < -1.0f) audio[i] = -1.0f;
@@ -1923,7 +2011,12 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
                                           float **audio_out, int *n_samples) {
     const int own = qwen_region_begin_unique(QWEN_RGN_SD_TOTAL);
     const int d = qwen_region_depth();
+    if (!st->scratch) st->scratch = calloc(1, sizeof(sd_arena_t));
+    sd_arena_t *prev = g_sd_arena;
+    g_sd_arena = (sd_arena_t *)st->scratch;
+    if (g_sd_arena) sd_arena_reset(g_sd_arena);
     int rc = sd_stream_st_body(ctx, st, new_codes, new_frames, audio_out, n_samples);
+    g_sd_arena = prev;
     qwen_region_unwind(d);
     if (own) qwen_region_end(QWEN_RGN_SD_TOTAL);
     return rc;
@@ -1964,8 +2057,8 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
 
     if (_ph) _ph_mark = sd_ph_now();
     qwen_region_begin(QWEN_RGN_SD_VQ);
-    float *vq_out = (float *)aligned_calloc((int64_t)new_frames * vq_hidden, sizeof(float));
-    float *cb_sum = (float *)aligned_malloc(cb_dim * sizeof(float));
+    float *vq_out = (float *)sd_tmp_calloc((int64_t)new_frames * vq_hidden, sizeof(float));
+    float *cb_sum = (float *)sd_tmp_alloc(cb_dim * sizeof(float));
 
     for (int f = 0; f < new_frames; f++) {
         int code0 = new_codes[f * 16];
@@ -1997,13 +2090,13 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
             }
         }
     }
-    free(cb_sum);
+    sd_tmp_free(cb_sum);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[0] += _t - _ph_mark; _ph_mark = _t; }
     qwen_region_end(QWEN_RGN_SD_VQ); qwen_region_begin(QWEN_RGN_SD_PRECONV);
     int pad_frames = st->vq_pad_valid ? 2 : 0;
     int conv_in_len = pad_frames + new_frames;
-    float *vq_cf = (float *)aligned_calloc((int64_t)vq_hidden * conv_in_len, sizeof(float));
+    float *vq_cf = (float *)sd_tmp_calloc((int64_t)vq_hidden * conv_in_len, sizeof(float));
 
     if (st->vq_pad_valid && st->vq_pad) {
         for (int ch = 0; ch < vq_hidden; ch++)
@@ -2027,28 +2120,28 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                 st->vq_pad[(int64_t)ch * 2 + t] = 0;
     }
     st->vq_pad_valid = 1;
-    free(vq_out);
+    sd_tmp_free(vq_out);
 
-    float *pre_conv_out = (float *)aligned_calloc((int64_t)latent_dim * conv_in_len, sizeof(float));
+    float *pre_conv_out = (float *)sd_tmp_calloc((int64_t)latent_dim * conv_in_len, sizeof(float));
     causal_conv1d(pre_conv_out, vq_cf, sd->pre_conv_weight, sd->pre_conv_bias,
                   vq_hidden, latent_dim, conv_in_len, 3, 1);
-    free(vq_cf);
+    sd_tmp_free(vq_cf);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[1] += _t - _ph_mark; _ph_mark = _t; }
     qwen_region_end(QWEN_RGN_SD_PRECONV); qwen_region_begin(QWEN_RGN_SD_INPROJ);
-    float *hidden = (float *)aligned_malloc((int64_t)new_frames * dec_hidden * sizeof(float));
+    float *hidden = (float *)sd_tmp_alloc((int64_t)new_frames * dec_hidden * sizeof(float));
 #ifdef USE_BLAS
-    float *pre_conv_rm = (float *)aligned_malloc((int64_t)new_frames * latent_dim * sizeof(float));
+    float *pre_conv_rm = (float *)sd_tmp_alloc((int64_t)new_frames * latent_dim * sizeof(float));
     for (int f = 0; f < new_frames; f++)
         for (int d = 0; d < latent_dim; d++)
             pre_conv_rm[(int64_t)f * latent_dim + d] = pre_conv_out[(int64_t)d * conv_in_len + pad_frames + f];
-    free(pre_conv_out);
+    sd_tmp_free(pre_conv_out);
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 new_frames, dec_hidden, latent_dim, 1.0f,
                 pre_conv_rm, latent_dim,
                 sd->input_proj_weight, latent_dim,
                 0.0f, hidden, dec_hidden);
-    free(pre_conv_rm);
+    sd_tmp_free(pre_conv_rm);
     if (sd->input_proj_bias)
         for (int f = 0; f < new_frames; f++)
             for (int o = 0; o < dec_hidden; o++)
@@ -2063,7 +2156,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
             hidden[(int64_t)f * dec_hidden + o] = sum;
         }
     }
-    free(pre_conv_out);
+    sd_tmp_free(pre_conv_out);
 #endif
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[2] += _t - _ph_mark; _ph_mark = _t; }
@@ -2096,11 +2189,11 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
         }
     }
 
-    float *q = (float *)aligned_malloc((int64_t)new_frames * qkv_dim * sizeof(float));
-    float *new_k = (float *)aligned_malloc((int64_t)new_frames * qkv_dim * sizeof(float));
-    float *new_v = (float *)aligned_malloc((int64_t)new_frames * qkv_dim * sizeof(float));
-    float *x_norm = (float *)aligned_malloc((int64_t)new_frames * dec_hidden * sizeof(float));
-    float *attn_out = (float *)aligned_malloc((int64_t)new_frames * qkv_dim * sizeof(float));
+    float *q = (float *)sd_tmp_alloc((int64_t)new_frames * qkv_dim * sizeof(float));
+    float *new_k = (float *)sd_tmp_alloc((int64_t)new_frames * qkv_dim * sizeof(float));
+    float *new_v = (float *)sd_tmp_alloc((int64_t)new_frames * qkv_dim * sizeof(float));
+    float *x_norm = (float *)sd_tmp_alloc((int64_t)new_frames * dec_hidden * sizeof(float));
+    float *attn_out = (float *)sd_tmp_alloc((int64_t)new_frames * qkv_dim * sizeof(float));
 
     for (int layer = 0; layer < c->dec_num_layers; layer++) {
         qwen_sd_pre_layer_t *l = &sd->pre_layers[layer];
@@ -2173,7 +2266,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
 
                 int n_keys = sk_end - sk_start + 1;
                 float scores_buf[512];
-                float *scores = n_keys <= 512 ? scores_buf : (float *)malloc(n_keys * sizeof(float));
+                float *scores = n_keys <= 512 ? scores_buf : (float *)sd_tmp_malloc(n_keys * sizeof(float));
                 float max_score = -1e30f;
                 for (int j = 0; j < n_keys; j++) {
                     int sk = sk_start + j;
@@ -2197,7 +2290,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                     float w = scores[j] * inv_sum;
                     for (int d = 0; d < head_dim; d++) oh[d] += vh[d] * w;
                 }
-                if (scores != scores_buf) free(scores);
+                if (scores != scores_buf) sd_tmp_free(scores);
             }
         }
 
@@ -2236,8 +2329,8 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
 
 #ifdef USE_BLAS
         {
-            float *ffn_gate = (float *)aligned_malloc((int64_t)new_frames * dec_inter * sizeof(float));
-            float *ffn_up = (float *)aligned_malloc((int64_t)new_frames * dec_inter * sizeof(float));
+            float *ffn_gate = (float *)sd_tmp_alloc((int64_t)new_frames * dec_inter * sizeof(float));
+            float *ffn_up = (float *)sd_tmp_alloc((int64_t)new_frames * dec_inter * sizeof(float));
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, dec_inter, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->ffn_gate, dec_hidden,
@@ -2248,13 +2341,13 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                         0.0f, ffn_up, dec_inter);
             for (int64_t i = 0; i < (int64_t)new_frames * dec_inter; i++)
                 ffn_gate[i] = (ffn_gate[i] / (1.0f + expf(-ffn_gate[i]))) * ffn_up[i];
-            free(ffn_up);
-            float *ffn_down_out = (float *)aligned_malloc((int64_t)new_frames * dec_hidden * sizeof(float));
+            sd_tmp_free(ffn_up);
+            float *ffn_down_out = (float *)sd_tmp_alloc((int64_t)new_frames * dec_hidden * sizeof(float));
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, dec_hidden, dec_inter, 1.0f,
                         ffn_gate, dec_inter, l->ffn_down, dec_inter,
                         0.0f, ffn_down_out, dec_hidden);
-            free(ffn_gate);
+            sd_tmp_free(ffn_gate);
             for (int s = 0; s < new_frames; s++) {
                 float *hs = hidden + s * dec_hidden;
                 float *ds = ffn_down_out + s * dec_hidden;
@@ -2264,7 +2357,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                     for (int o = 0; o < dec_hidden; o++) hs[o] += ds[o];
                 }
             }
-            free(ffn_down_out);
+            sd_tmp_free(ffn_down_out);
         }
 #else
         for (int s = 0; s < new_frames; s++) {
@@ -2292,7 +2385,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
 
     st->kv_len += new_frames;
 
-    free(q); free(new_k); free(new_v); free(x_norm); free(attn_out);
+    sd_tmp_free(q); sd_tmp_free(new_k); sd_tmp_free(new_v); sd_tmp_free(x_norm); sd_tmp_free(attn_out);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[3] += _t - _ph_mark; _ph_mark = _t; }
     qwen_region_end(QWEN_RGN_SD_TRANSFORMER); qwen_region_begin(QWEN_RGN_SD_OUTPROJ);
@@ -2343,12 +2436,12 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
     }
 #endif
     st->latent_frames += new_frames;
-    free(hidden);
+    sd_tmp_free(hidden);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[4] += _t - _ph_mark; _ph_mark = _t; }
     qwen_region_end(QWEN_RGN_SD_OUTPROJ);
     if (sd_exact_stream_enabled()) {
-        float *signal = (float *)aligned_malloc((int64_t)latent_dim * new_frames * sizeof(float));
+        float *signal = (float *)sd_tmp_alloc((int64_t)latent_dim * new_frames * sizeof(float));
         if (!signal) return -1;
         const float *lat_new = st->latent_cache
             + (int64_t)(st->latent_frames - new_frames - st->latent_base) * latent_dim;
@@ -2385,7 +2478,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
     }
     int window_start = st->latent_frames - window_frames;
 
-    float *signal = (float *)aligned_malloc((int64_t)latent_dim * window_frames * sizeof(float));
+    float *signal = (float *)sd_tmp_alloc((int64_t)latent_dim * window_frames * sizeof(float));
     const float *lat_src = st->latent_cache + (int64_t)(window_start - st->latent_base) * latent_dim;
     for (int f = 0; f < window_frames; f++)
         for (int d = 0; d < latent_dim; d++)
@@ -2403,7 +2496,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
     int context_samples = context_frames * 1920;
     int new_samples = full_samples - context_samples;
     if (new_samples <= 0) {
-        free(full_audio);
+        sd_tmp_free(full_audio);
         *audio_out = NULL;
         *n_samples = 0;
         return 0;
@@ -2411,7 +2504,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
 
     float *new_audio = (float *)aligned_malloc(new_samples * sizeof(float));
     memcpy(new_audio, full_audio + context_samples, new_samples * sizeof(float));
-    free(full_audio);
+    sd_tmp_free(full_audio);
 
     st->frames_decoded += new_frames;
     st->samples_produced += new_samples;

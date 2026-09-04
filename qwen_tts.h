@@ -316,6 +316,7 @@ typedef struct {
     int frames_decoded;
     int samples_produced;
     int initialized;
+    void *scratch;            /* per-stream decoder scratch arena (qwen_tts_speech_decoder.c) */
 } qwen_sd_stream_state_t;
 
 typedef struct {
