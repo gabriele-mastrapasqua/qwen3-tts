@@ -299,3 +299,31 @@ lever but is a quality path and stays opt-in until qualified.
 * `QWEN_POOL_SPIN=65536`: neutral in wave, +11 % p95 in soak.
 * Internal cost map / census at sustained C4: distorts (use C1 for structure, external counters at C4).
 * Any script that backgrounds the server and then calls bare `wait`.
+
+---
+
+## Addendum — what the ranked interventions delivered (same day)
+
+| # | change | commit | structural cost removed (measured) | C4 2-min soak STREAM p50 / p95 | audio |
+|---|---|---|---|---|---|
+| 2 | decoder scratch arena + recycled stream buffers + per-thread conv/PCM scratch | `b0570a6` | posix_memalign 11 899 → 41 per request, free 12 516 → 624, mmap 78 → 1.3, munmap 154 → 1.3, brk 1 → 0; 0 arena spills, 212 MB peak per 8-frame chunk | 0.977-0.988 / 1.031-1.046 (before 0.975-0.983 / 1.038-1.044) | bit-identical |
+| 3 | CP MTP + lm_head batched over active slots | `110ff48` | CP dispatches per frame-pair 80 → 48; lm_head/MTP weight traffic 128 → 64 MB per frame-pair | 0.968-0.978 / 1.033-1.046 | bit-identical (B=2, single-process server) |
+| 4 | Talker step as one persistent region | `faa496c` | dispatches per frame-pair ≈ 170 → ≈ 58; context switches 12.1k → 7.0k/s | 0.968-0.985 / 1.031-1.067 | bit-identical (B=2, single-process server) |
+| 1 | prefill | — | bf16 wide chunk (one traversal for ≤ 32 tokens, bit-identical) measured **2× slower**: the bf16 prefill is bound by `dpbf16` throughput and X reads from L2 (~1 024 FMA instructions + 64 KB of X per weight row for 16 tokens → ~40-50 ms per 16-token pass on 8 cores), not by weight traversals. No bf16 kernel shortens it. `QWEN_PREFILL_INT8MM=1` (opt-in, **not quality-qualified**): 60 ms, soak 0.96 / 1.01, TTFA −15 %, different rendition (mel-corr 0.39-0.60 vs bf16). | — | — |
+| 5 | project-owned kernels for the decoder SGEMM families | not started | direct SGEMM arithmetic ≈ 2 % of wall; OpenBLAS threads already parked | — | an fp32 kernel of our own cannot reproduce OpenBLAS's accumulation order: md5 parity is unattainable by construction; needs a quality-based acceptance rule first |
+
+Remaining barriers (8 per layer in both regions) each separate a phase that consumes the
+whole output of the previous one (all quantised columns → row blocks → all rows → per-slot
+sections); none can be removed without redundant per-thread recomputation.
+
+Parity method for batched changes: the prefork server sends two concurrent requests to two
+different workers (B = 1 each), so a prefork md5 test never exercises the batched paths.
+Use a single-process server (`-j 8 --cpu-mask 0-7`) with two concurrent streams, or the CLI
+`--batch` (same batched kernels, not the server loop).
+
+Net effect of the day on the production gate: canonical soak p50 1.030 → ≈ 0.98, p95 1.108
+→ ≈ 1.03-1.05. Still above 1. The remaining gap is compute: the admission prefill (~10 % of
+wall at ~1 admission/s/worker, bf16-arithmetic-bound) and the steady frame loop (Talker at
+89 % of the worker-local read roof). Within the quality-safe numerics there is no measured
+lever left above the ±3 % noise; the levers that exist change numerics (int8 prefill) or the
+concurrency statement (C3).
