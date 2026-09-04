@@ -1,5 +1,8 @@
 /* qwen_tts.c - Qwen3-TTS Pure C Inference Engine */
 #include "qwen_tts.h"
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "qwen_tts_voice_clone.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_costmap.h"
@@ -556,7 +559,9 @@ static void dt_append_audio(decoder_thread_t *dt, const float *samples, int n) {
     dt->audio_len += n;
 }
 
+static void qwen_thread_name(const char *prefix);
 static void *decoder_thread_fn(void *arg) {
+    qwen_thread_name("dec-ovlp");
     qwen_region_thread_role("decoder");
     decoder_thread_t *dt = (decoder_thread_t *)arg;
     qwen_tts_ctx_t *ctx = dt->ctx;
@@ -2213,7 +2218,21 @@ typedef struct {
     float eps;
 } prefill_helper_arg_t;
 
+/* Name the thread for /proc and top: the thread ownership table of a worker is then
+ * readable without a debugger.  Zero cost after creation. */
+static void qwen_thread_name(const char *prefix) {
+    static _Atomic int counter = 0;
+    char name[16];
+    int n = atomic_fetch_add(&counter, 1);
+    snprintf(name, sizeof name, "%.9s-%d", prefix, n);
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    prctl(PR_SET_NAME, name, 0, 0, 0);
+#endif
+}
 static void *prefill_helper_main(void *arg) {
+    qwen_thread_name("pf-helper");
     qwen_region_thread_role("prefill_helper");
     prefill_helper_arg_t *a = (prefill_helper_arg_t *)arg;
     qwen_tts_ctx_t *pf = a->pf_ctx;
@@ -2312,6 +2331,7 @@ static void dec_push(dec_pool_t *dp, dec_job_t *j) {
 #define DEC_GROUP_MAX 16
 
 static void *dec_worker_main(void *arg) {
+    qwen_thread_name("dec-thr");
     qwen_region_thread_role("decoder");
     dec_pool_t *dp = (dec_pool_t *)arg;
     dec_job_t *grp[DEC_GROUP_MAX];

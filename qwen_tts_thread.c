@@ -1,5 +1,8 @@
 /* qwen_tts_thread.c - Cross-OS parallel-for */
 #include "qwen_tts_thread.h"
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include <time.h>
 
 double qwen_parallel_now_ms(void) {
@@ -216,6 +219,7 @@ int qwen_parallel_team(void) { return 1; }
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 typedef struct {
     qwen_task_fn fn;
@@ -341,6 +345,11 @@ static void run_chunks(qwen_job_t *job) {
 static void *worker_main(void *arg) {
     qwen_ftz_on();
     const qwen_worker_arg_t *wa = (const qwen_worker_arg_t *)arg;
+    { char name[16]; snprintf(name, sizeof name, "qwen-pool-%d", wa->idx);
+#if defined(__linux__)
+      prctl(PR_SET_NAME, name, 0, 0, 0);
+#endif
+    }
     const int my_idx = wa->idx;
     const unsigned long long my_bit = my_idx < 64 ? (1ULL << my_idx) : 0ULL;
     unsigned long seen = wa->seen0;

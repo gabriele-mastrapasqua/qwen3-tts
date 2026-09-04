@@ -8363,7 +8363,21 @@ static int sdp_pending = 0;
 static void (*sdp_fn)(void *) = NULL;
 static void *sdp_ctx = NULL;
 
+/* Name the thread for /proc and top: the thread ownership table of a worker is then
+ * readable without a debugger.  Zero cost after creation. */
+static void qwen_thread_name_k(const char *prefix) {
+    static _Atomic int counter = 0;
+    char name[16];
+    int n = atomic_fetch_add(&counter, 1);
+    snprintf(name, sizeof name, "%.9s-%d", prefix, n);
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    prctl(PR_SET_NAME, name, 0, 0, 0);
+#endif
+}
 static void *sdp_worker_main(void *arg) {
+    qwen_thread_name_k("sd-pool");
     (void)arg;
     qwen_ftz_on();
     unsigned seen = 0;

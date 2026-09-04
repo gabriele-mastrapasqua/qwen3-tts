@@ -5,6 +5,9 @@
 #endif
 #endif
 #include "qwen_tts_server.h"
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "qwen_tts_costmap.h"
 #include "qwen_tts_kernels.h"
 #include <dlfcn.h>
@@ -1058,7 +1061,9 @@ typedef struct {
     int id;
 } worker_arg_t;
 
+static void qwen_thread_name(const char *prefix);
 static void *worker_main(void *arg) {
+    qwen_thread_name("srv-slot");
     worker_arg_t *wa = (worker_arg_t *)arg;
     for (;;) {
         int fd = cq_pop(wa->q);
@@ -1386,6 +1391,7 @@ typedef struct { qwen_tts_ctx_t *ctx; conn_queue_t *cq; job_queue_t *jq; job_que
                  int def_speaker_id; int def_language_id; } reader_arg_t;
 
 static void *reader_main(void *arg) {
+    qwen_thread_name("srv-read");
     reader_arg_t *ra = (reader_arg_t *)arg;
     for (;;) {
         int fd = cq_pop(ra->cq);
@@ -1678,6 +1684,7 @@ static int sink_running(void *ud) {
 
 typedef struct { qwen_tts_ctx_t *ctx; job_queue_t *jq; int max_batch; } sched_arg_t;
 static void *scheduler_main(void *arg) {
+    qwen_thread_name("srv-sched");
     sched_arg_t *sa = (sched_arg_t *)arg;
     sink_ctx_t sc = { .jq = sa->jq, .running = &server_running, .admitted = 0, .done = 0 };
     qwen_batch_sink_t sink = {
@@ -1703,7 +1710,21 @@ static void *scheduler_main(void *arg) {
 }
 
 typedef struct { qwen_tts_ctx_t *ctx; job_queue_t *jq; int reject; } single_arg_t;
+/* Name the thread for /proc and top: the thread ownership table of a worker is then
+ * readable without a debugger.  Zero cost after creation. */
+static void qwen_thread_name(const char *prefix) {
+    static _Atomic int counter = 0;
+    char name[16];
+    int n = atomic_fetch_add(&counter, 1);
+    snprintf(name, sizeof name, "%.9s-%d", prefix, n);
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    prctl(PR_SET_NAME, name, 0, 0, 0);
+#endif
+}
 static void *single_worker_main(void *arg) {
+    qwen_thread_name("srv-single");
     single_arg_t *sw = (single_arg_t *)arg;
     for (;;) {
         batch_job_t *j = jq_pop(sw->jq);
