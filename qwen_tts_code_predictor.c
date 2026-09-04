@@ -1178,6 +1178,54 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         batch_cp_layer(ctx, bb, x, x_norm, pos, layer, active);
 }
 
+/* ---- B-batched code-predictor head/projection ---------------------------------------
+ * At concurrency >= 2 the MTP projection and every lm_head were run once per slot as
+ * B=1 GEMVs, i.e. the same 2 MB weight was streamed once per slot per group.  These run
+ * the active slots through one int8 matmat (same per-column quantiser, exact int32 dots,
+ * same scaling expression), so the weight leaves DRAM once per step.  They return 0 when
+ * the int8 matmat path is not the one that would run, and the caller keeps the per-slot
+ * path; QWEN_CP_BATCH_HEAD=0 forces the per-slot path. */
+static int cp_batch_head_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("QWEN_CP_BATCH_HEAD"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static int cp_batch_mtp(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, float *cx,
+                        const float *const *src, const uint8_t *active) {
+    int B = bb->B, ch = ctx->config.cp_hidden_size, ed = ctx->cp_emb_dim;
+    if (!cp_batch_head_enabled() || !ctx->cp_mtp_proj_int8 || ctx->cp_mtp_proj_q4) return 0;
+    int idx[64], BW = 0;
+    for (int b = 0; b < B && BW < 64; b++) if (!active || active[b]) idx[BW++] = b;
+    if (BW < 2 || BW > 16 || !qwen_i8mm_usable(ch, ed, BW)) return 0;
+    float *Xt = bb->cp_Xt, *Yt = bb->cp_Yt;
+    for (int j = 0; j < BW; j++) { const float *x = src[idx[j]]; for (int k = 0; k < ed; k++) Xt[(size_t)k * BW + j] = x[k]; }
+    qwen_matmat_int8(Yt, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale, Xt, ch, ed, BW);
+    const float *bias = ctx->cp_mtp_proj_bias;
+    for (int j = 0; j < BW; j++) {
+        float *d = cx + (size_t)idx[j] * ch;
+        for (int i = 0; i < ch; i++) d[i] = Yt[(size_t)i * BW + j];
+        if (bias) for (int i = 0; i < ch; i++) d[i] += bias[i];
+    }
+    return 1;
+}
+static int cp_batch_lm(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const float *normed_rows, int g,
+                       int *out_codes, const uint8_t *active) {
+    int B = bb->B, ch = ctx->config.cp_hidden_size, vocab = ctx->config.codebook_size;
+    if (!cp_batch_head_enabled() || !ctx->cp_lm_head_int8[g] || ctx->cp_lm_head_q4[g]) return 0;
+    int idx[64], BW = 0;
+    for (int b = 0; b < B && BW < 64; b++) if (!active || active[b]) idx[BW++] = b;
+    if (BW < 2 || BW > 16 || !qwen_i8mm_usable(vocab, ch, BW)) return 0;
+    float *Xt = bb->cp_Xt, *Yt = bb->cp_Yt;
+    for (int j = 0; j < BW; j++) { const float *x = normed_rows + (size_t)idx[j] * ch; for (int k = 0; k < ch; k++) Xt[(size_t)k * BW + j] = x[k]; }
+    qwen_matmat_int8(Yt, ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g], Xt, vocab, ch, BW);
+    for (int j = 0; j < BW; j++) {
+        int best = 0; float bv = Yt[j];
+        for (int o = 1; o < vocab; o++) { float v = Yt[(size_t)o * BW + j]; if (v > bv) { bv = v; best = o; } }
+        out_codes[(size_t)idx[j] * 15 + g] = best;
+    }
+    return 1;
+}
+
 int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                           const float *talker_hidden, const int *code0, int *out_codes,
                           const uint8_t *active) {
@@ -1219,50 +1267,97 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     qwen_batch_pack_active(bb, active);
 
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
-    float emb_buf[4096], normed[2048];
 
 #define CPB_SKIP(b) (active && !active[b])
 
-    for (int b = 0; b < B; b++) {
-        if (CPB_SKIP(b)) { memset(cx + (size_t)b * ch, 0, ch * sizeof(float)); continue; }
-        cp_mtp_project(ctx, cx + (size_t)b * ch, talker_hidden + (size_t)b * h);
+    {
+        const float *srcs[64]; int any = 0;
+        for (int b = 0; b < B && b < 64; b++) { srcs[b] = talker_hidden + (size_t)b * h; if (!CPB_SKIP(b)) any = 1; }
+        int done = (any && B <= 64) ? cp_batch_mtp(ctx, bb, cx, srcs, active) : 0;
+        for (int b = 0; b < B; b++) {
+            if (CPB_SKIP(b)) { memset(cx + (size_t)b * ch, 0, ch * sizeof(float)); continue; }
+            if (!done) cp_mtp_project(ctx, cx + (size_t)b * ch, talker_hidden + (size_t)b * h);
+        }
     }
     batch_cp_transformer_step(ctx, bb, cx, cxn, 0, active);
 
-    for (int b = 0; b < B; b++) {
-        if (CPB_SKIP(b)) continue;
-        int code0_b = code0[b];
-        if (ctx->codec_embedding_bf16 && code0_b >= 0 && code0_b < c->codec_vocab_size) {
-            qwen_bf16_to_f32_vec(emb_buf, ctx->codec_embedding_bf16 + (int64_t)code0_b * h, h);
-            cp_mtp_project(ctx, cx + (size_t)b * ch, emb_buf);
-        } else memset(cx + (size_t)b * ch, 0, ch * sizeof(float));
+    {
+        /* embeddings of all active slots first (bb->cp_Yt is free here), then one projection */
+        float *embs = bb->cp_gate;   /* B x 2*cint floats, unused between steps: room for B x h */
+        uint8_t ok[64]; const float *srcs[64]; int nok = 0;
+        for (int b = 0; b < B && b < 64; b++) {
+            ok[b] = 0; srcs[b] = embs + (size_t)b * h;
+            if (CPB_SKIP(b)) continue;
+            int code0_b = code0[b];
+            if (ctx->codec_embedding_bf16 && code0_b >= 0 && code0_b < c->codec_vocab_size) {
+                qwen_bf16_to_f32_vec(embs + (size_t)b * h, ctx->codec_embedding_bf16 + (int64_t)code0_b * h, h);
+                ok[b] = 1; nok++;
+            }
+        }
+        int done = 0;
+        if (nok >= 2 && B <= 64) {
+            uint8_t act2[64]; for (int b = 0; b < B; b++) act2[b] = ok[b];
+            done = cp_batch_mtp(ctx, bb, cx, srcs, act2);
+        }
+        for (int b = 0; b < B; b++) {
+            if (CPB_SKIP(b)) continue;
+            if (!ok[b]) { memset(cx + (size_t)b * ch, 0, ch * sizeof(float)); continue; }
+            if (!done) cp_mtp_project(ctx, cx + (size_t)b * ch, srcs[b]);
+        }
     }
     batch_cp_transformer_step(ctx, bb, cx, cxn, 1, active);
 
-    for (int b = 0; b < B; b++) {
-        if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + 0] = 0; continue; }
+    {
         qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
-        qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
-        out_codes[(size_t)b * 15 + 0] = cp_lm_argmax(ctx, normed, 0, ch, c->codebook_size);
+        for (int b = 0; b < B; b++) {
+            if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + 0] = 0; continue; }
+            qwen_rms_norm(cxn + (size_t)b * ch, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
+        }
+        if (!cp_batch_lm(ctx, bb, cxn, 0, out_codes, active))
+            for (int b = 0; b < B; b++) {
+                if (CPB_SKIP(b)) continue;
+                out_codes[(size_t)b * 15 + 0] = cp_lm_argmax(ctx, cxn + (size_t)b * ch, 0, ch, c->codebook_size);
+            }
         qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
     }
 
     for (int g = 1; g < 15; g++) {
         int pos = g + 1;
-        for (int b = 0; b < B; b++) {
-            if (CPB_SKIP(b)) continue;
-            int prev = out_codes[(size_t)b * 15 + (g - 1)];
-            if (ctx->cp_codec_emb_bf16[g - 1] && prev >= 0 && prev < c->codebook_size) {
-                qwen_bf16_to_f32_vec(emb_buf, ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev * emb_dim, emb_dim);
-                cp_mtp_project(ctx, cx + (size_t)b * ch, emb_buf);
-            } else memset(cx + (size_t)b * ch, 0, ch * sizeof(float));
+        {
+            float *embs = bb->cp_gate;
+            uint8_t ok[64]; const float *srcs[64]; int nok = 0;
+            for (int b = 0; b < B && b < 64; b++) {
+                ok[b] = 0; srcs[b] = embs + (size_t)b * emb_dim;
+                if (CPB_SKIP(b)) continue;
+                int prev = out_codes[(size_t)b * 15 + (g - 1)];
+                if (ctx->cp_codec_emb_bf16[g - 1] && prev >= 0 && prev < c->codebook_size) {
+                    qwen_bf16_to_f32_vec(embs + (size_t)b * emb_dim, ctx->cp_codec_emb_bf16[g - 1] + (int64_t)prev * emb_dim, emb_dim);
+                    ok[b] = 1; nok++;
+                }
+            }
+            int done = 0;
+            if (nok >= 2 && B <= 64) {
+                uint8_t act2[64]; for (int b = 0; b < B; b++) act2[b] = ok[b];
+                done = cp_batch_mtp(ctx, bb, cx, srcs, act2);
+            }
+            for (int b = 0; b < B; b++) {
+                if (CPB_SKIP(b)) continue;
+                if (!ok[b]) { memset(cx + (size_t)b * ch, 0, ch * sizeof(float)); continue; }
+                if (!done) cp_mtp_project(ctx, cx + (size_t)b * ch, srcs[b]);
+            }
         }
         batch_cp_transformer_step(ctx, bb, cx, cxn, pos, active);
-        for (int b = 0; b < B; b++) {
-            if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + g] = 0; continue; }
+        {
             qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
-            qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
-            out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, normed, g, ch, c->codebook_size);
+            for (int b = 0; b < B; b++) {
+                if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + g] = 0; continue; }
+                qwen_rms_norm(cxn + (size_t)b * ch, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
+            }
+            if (!cp_batch_lm(ctx, bb, cxn, g, out_codes, active))
+                for (int b = 0; b < B; b++) {
+                    if (CPB_SKIP(b)) continue;
+                    out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, cxn + (size_t)b * ch, g, ch, c->codebook_size);
+                }
             qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
         }
     }
