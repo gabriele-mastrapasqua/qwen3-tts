@@ -35,11 +35,13 @@ static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float 
     if (g_cuda_decoder_on &&
         qwen_cuda_sd_sgemm(ta==CblasTrans, tb==CblasTrans, M,N,K, al,A,lda,B,ldb,be,C,ldc) == 0)
         return;   /* did it on the GPU; else fall through to CPU (too big / unsupported) */
+    qwen_census_op_len(QWEN_PATH_DECODER_SGEMM, N, K, M); qwen_census_leaf(QWEN_LEAF_BLAS);
     cblas_sgemm(CblasRowMajor,(QWEN_CBLAS_TRANSPOSE)ta,(QWEN_CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
 }
 #else
 static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float *A,int lda,
                            const float *B,int ldb,float be,float *C,int ldc){
+    qwen_census_op_len(QWEN_PATH_DECODER_SGEMM, N, K, M); qwen_census_leaf(QWEN_LEAF_BLAS);
     cblas_sgemm(CblasRowMajor,(QWEN_CBLAS_TRANSPOSE)ta,(QWEN_CBLAS_TRANSPOSE)tb,M,N,K,al,A,lda,B,ldb,be,C,ldc);
 }
 #endif
@@ -77,6 +79,8 @@ static void causal_conv1d_naive(float *out, const float *in,
                                 const float *weight, const float *bias,
                                 int in_ch, int out_ch, int length,
                                 int kernel, int dilation) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_NAIVE, out_ch, in_ch * kernel, length);
+    qwen_census_leaf(QWEN_LEAF_SCALAR);
     int pad_left = (kernel - 1) * dilation;
     for (int oc = 0; oc < out_ch; oc++) {
         float b = bias ? bias[oc] : 0;

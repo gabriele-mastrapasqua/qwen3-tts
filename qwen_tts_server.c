@@ -2101,6 +2101,9 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         }
         if (g_prefork_dump) {
             g_prefork_dump = 0;
+            /* the counters that matter (shape census, batch audit, kernel timing) live in
+               the workers: forward the request so every process dumps under [DUMP] */
+            for (int w = 0; w < workers; w++) if (kids[w] > 0) kill(kids[w], SIGUSR1);
             fprintf(stderr, "[prefork-stats] mean_inflight %.3f dispatched %lld rejected %lld ·",
                     act_time > 0 ? act_area / act_time : 0.0, dispatched, rejected);
             for (int w = 0; w < workers; w++)

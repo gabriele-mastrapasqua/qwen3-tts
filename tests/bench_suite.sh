@@ -74,13 +74,21 @@ fi
 # A run off a shipped tree has no .git, and "UNKNOWN" in a manifest makes the whole result
 # unattributable. QWEN_SOURCE_COMMIT lets the caller state it, exactly as serve_parallel_wave.py
 # already accepts; git stays the source of truth when it is there.
-COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "${QWEN_SOURCE_COMMIT:-UNKNOWN}")
-if git rev-parse HEAD >/dev/null 2>&1; then
-  DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo yes || echo no)
+# The binary's embedded fingerprint (commit[-dirty]:tree-hash) is the record; git and the
+# declared QWEN_SOURCE_COMMIT are fallbacks for binaries built before it existed.
+SRC_FP=$("$BIN" --caps 2>/dev/null | sed -n 's/.*src=\([^ ]*\).*/\1/p' | head -1)
+if [ -n "$SRC_FP" ]; then
+  COMMIT="$SRC_FP"; case "$SRC_FP" in *-dirty:*) DIRTY=yes;; *:clean) DIRTY=no;; *) DIRTY=unknown;; esac
+  gate "source_fp         = $SRC_FP   (embedded in the binary)   dirty= $DIRTY"
 else
-  DIRTY="${QWEN_SOURCE_DIRTY:-unknown (no git in this tree)}"
+  COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "${QWEN_SOURCE_COMMIT:-UNKNOWN} (declared, unverified)")
+  if git rev-parse HEAD >/dev/null 2>&1; then
+    DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo yes || echo no)
+  else
+    DIRTY="${QWEN_SOURCE_DIRTY:-unknown (no git in this tree)}"
+  fi
+  gate "source_commit     = $COMMIT   dirty= $DIRTY   (binary carries no fingerprint: rebuild)"
 fi
-gate "source_commit     = $COMMIT   dirty= $DIRTY"
 [ "$DIRTY" = "no" ] || echo "  WARNING: dirty tree. Final numbers require dirty=no (commit first)."
 
 mkdir -p "$OUT"

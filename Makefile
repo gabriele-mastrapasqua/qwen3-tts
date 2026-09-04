@@ -47,9 +47,14 @@ else
     ARCH_FLAGS = -march=native
 endif
 
-GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
-CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -ffast-math \
-              -DQWEN_GIT_REV=\"$(GIT_REV)\" -DQWEN_SIMD_PROFILE=\"$(SIMD)\"
+# Source identity, computed by tools/source_fingerprint.sh where git is and read from the
+# shipped .source_fingerprint on a box without it.  It goes into a GENERATED header
+# (qwen_build_id.h) that is rewritten only when its content changes, so the objects that
+# embed it are rebuilt exactly when the identity changes — a -D flag is invisible to make
+# and used to leave a stale build tag inside a fresh binary.
+SRC_FP  := $(shell bash tools/source_fingerprint.sh 2>/dev/null || echo unknown)
+GIT_REV ?= $(firstword $(subst :, ,$(SRC_FP)))
+CFLAGS_BASE = -Wall -Wextra -O3 $(ARCH_FLAGS) -ffast-math -DQWEN_SIMD_PROFILE=\"$(SIMD)\"
 LDLIBS = -lm -lpthread
 
 CFLAGS_BASE += -Ivendor
@@ -125,6 +130,14 @@ OBJS = $(SRCS:.c=.o) $(KAI_AOBJ)
 %_asm.o: %_asm.S
 	$(CC) $(CFLAGS) -c -o $@ $<
 TARGET = qwen_tts
+
+qwen_build_id.h: FORCE
+	@printf '#define QWEN_BUILD_GIT_REV "%s"\n#define QWEN_BUILD_SOURCE_FP "%s"\n#define QWEN_BUILD_SIMD "%s"\n' \
+	  "$(GIT_REV)" "$(SRC_FP)" "$(SIMD)" > qwen_build_id.h.tmp; \
+	if cmp -s qwen_build_id.h.tmp qwen_build_id.h 2>/dev/null; then rm -f qwen_build_id.h.tmp; else mv qwen_build_id.h.tmp qwen_build_id.h; fi
+FORCE:
+.PHONY: FORCE
+qwen_tts_kernels.o qwen_tts_dispatch.o: qwen_build_id.h
 
 INGOT_DIR := third_party/ingot
 INGOT_LIB := $(INGOT_DIR)/libingot.a
@@ -304,6 +317,7 @@ qwen_tts_speech_encoder.o: qwen_tts_speech_encoder.c
 -include $(OBJS:.o=.d) qwen_tts_backend.d qwen_tts_cuda.d qwen_tts_metal.d
 
 clean:
+	@rm -f qwen_build_id.h qwen_build_id.h.tmp
 	rm -f $(OBJS) $(OBJS:.o=.d) $(TARGET) qwen_tts_backend.o qwen_tts_cuda.o qwen_tts_metal.o qwen_tts_cuda_kernels.o
 	rm -f qwen_tts_backend.d qwen_tts_cuda.d qwen_tts_metal.d vendor/lz4.d
 	rm -f test_decoder_standalone.o test_decoder_standalone.d qwen_tts_decoder_tool
@@ -792,6 +806,22 @@ test-regression:
 check-flag-registry:
 	@python3 tools/check_flag_registry.py
 
+# ── profile-cpu, V1 step 1: what the engine ACTUALLY executed ─────────────────
+# cpu-check (fresh dir) + one clean serving run + the same run with the shape census on
+# (stable path ids, kernel + leaf attribution, JSON per process) -> call map, coverage,
+# UNKNOWN/fallback count joined with the dispatch map, and the census overhead vs clean.
+PROFILE_MODEL   ?= qwen3-tts-1.7b-base
+PROFILE_PROFILE ?= recommended
+PROFILE_TOPO    ?= 2x8
+PROFILE_CONC    ?= 1,4
+PROFILE_WAVES   ?= 3
+PROFILE_CLASSES ?= short
+PROFILE_BANK    ?= tests/load_texts_en.txt
+profile-cpu: $(TARGET) $(MEMBW_BIN)
+	@MEMBW_BIN=$(MEMBW_BIN) PROFILES_DIR=$(PROFILES_DIR) CPU_PROFILE=$(PROFILE_PROFILE) CPU_MODEL=$(PROFILE_MODEL) \
+	  PROFILE_TOPO=$(PROFILE_TOPO) PROFILE_CONC=$(PROFILE_CONC) PROFILE_WAVES=$(PROFILE_WAVES) \
+	  PROFILE_CLASSES=$(PROFILE_CLASSES) PROFILE_BANK=$(PROFILE_BANK) bash tools/profile_cpu.sh
+
 # ── CPU profiling gate ────────────────────────────────────────────────────────────
 # One artifact directory per run, the same gate language everywhere.  cpu-check is the
 # preflight that every CPU optimisation session starts with; profile-cpu-check is the
@@ -1217,7 +1247,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench \
-	cpu-check dispatch-map profile-cpu-check tune-archive
+	cpu-check dispatch-map profile-cpu-check profile-cpu tune-archive
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench

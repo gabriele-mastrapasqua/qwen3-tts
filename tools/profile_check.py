@@ -40,11 +40,13 @@ def sha256_file(path):
 
 
 def git_state():
-    commit = sh("git rev-parse --short HEAD", default="")
-    if not commit:
-        return {"source_commit": os.environ.get("QWEN_SOURCE_COMMIT", "UNKNOWN"),
-                "dirty": os.environ.get("QWEN_SOURCE_DIRTY", "unknown"),
-                "source_fingerprint": "no-git"}
+    """One implementation of the identity: tools/source_fingerprint.sh (git where it exists,
+    the shipped .source_fingerprint otherwise).  Never QWEN_SOURCE_COMMIT."""
+    fp = sh("bash tools/source_fingerprint.sh", default="unknown")
+    commit = fp.split(":", 1)[0]
+    if not sh("git rev-parse --short HEAD", default=""):
+        return {"source_commit": commit, "dirty": "yes" if "-dirty" in commit else ("no" if commit != "unknown" else "unknown"),
+                "source_fingerprint": fp, "fingerprint_origin": "shipped .source_fingerprint (no git here)"}
     changed = sh("git status --porcelain --untracked-files=all", default="")
     dirty = "yes" if changed else "no"
     h = hashlib.sha256()
@@ -57,7 +59,8 @@ def git_state():
         if os.path.isfile(full) and any(path.endswith(g.lstrip("*")) for g in SOURCE_GLOBS):
             h.update(path.encode()); h.update(sha256_file(full).encode())
     return {"source_commit": commit + ("-dirty" if changed else ""), "dirty": dirty,
-            "source_fingerprint": h.hexdigest()}
+            "source_fingerprint": fp, "fingerprint_origin": "git",
+            "dirty_detail_sha256": h.hexdigest()}
 
 
 def binary_state(bin_path):
@@ -66,9 +69,11 @@ def binary_state(bin_path):
                 "binary_simd": ""}
     caps = sh(f"'{bin_path}' --caps", default="")
     m = re.search(r"^\s*build:\s*(\S+)\s*·\s*SIMD=(\S+)", caps, re.M)
+    fp = re.search(r"src=(\S+)", caps)
     return {"binary": bin_path, "binary_sha256": sha256_file(bin_path),
             "binary_build_tag": m.group(1) if m else "UNKNOWN",
             "binary_simd": m.group(2) if m else "UNKNOWN",
+            "binary_source_fp": fp.group(1) if fp else "",
             "binary_mtime": os.path.getmtime(bin_path)}
 
 
@@ -172,6 +177,10 @@ def check(profiles_dir, bin_path, model_dir):
             errors.append(f"{label}: profile={old.get(key)} current={now.get(key)}")
 
     cmp("binary_sha256", "binary SHA256 differs (rebuilt since the profile)")
+    cmp("binary_source_fp", "fingerprint embedded in the binary differs")
+    if now.get("binary_source_fp") and now.get("source_fingerprint") not in (None, "unknown") \
+            and now["binary_source_fp"] != now["source_fingerprint"]:
+        errors.append(f"binary was built from another tree: binary src={now['binary_source_fp']} tree={now['source_fingerprint']}")
     cmp("source_commit", "source commit differs")
     cmp("source_fingerprint", "dirty-source fingerprint differs (uncommitted edits changed)")
     cmp("cpu_model", "host CPU differs")

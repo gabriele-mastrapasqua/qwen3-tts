@@ -226,8 +226,12 @@ int qwen_avx512_bf16_matmat_available(void) {
 #endif
 }
 
+#include "qwen_build_id.h"
 #ifndef QWEN_GIT_REV
-#define QWEN_GIT_REV "unknown"
+#define QWEN_GIT_REV QWEN_BUILD_GIT_REV
+#endif
+#ifndef QWEN_SOURCE_FP
+#define QWEN_SOURCE_FP QWEN_BUILD_SOURCE_FP
 #endif
 #ifndef QWEN_SIMD_PROFILE
 #define QWEN_SIMD_PROFILE "unknown"
@@ -287,14 +291,14 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_BATCH_STATS", "QWEN_SHAPE_CENSUS", "QWEN_SERVE_PROFILE", "QWEN_TTFA_TRACE",
     "QWEN_LIFE_TRACE", "QWEN_REQ_TRACE", "QWEN_KERNEL_TIMING", "QWEN_VNNI_PHASE_TIMING", "QWEN_DUMP_CODE0", "QWEN_DUMP_CODES", "QWEN_EXPR_DEBUG",
     "QWEN_SD_DEBUG", "QWEN_SPK_DEBUG", "QWEN_TUNE_JSON", "QWEN_TUNE_QUICK",
-    "QWEN_DISPATCH_MAP", "QWEN_DISPATCH_JSON",
+    "QWEN_DISPATCH_MAP", "QWEN_DISPATCH_JSON", "QWEN_CENSUS_JSON",
     NULL
 };
 
 void qwen_provenance_report(void *out) {
     FILE *f = out ? (FILE *)out : stderr;
-    fprintf(f, "  build:            %s · SIMD=%s · %s %s\n",
-            QWEN_GIT_REV, QWEN_SIMD_PROFILE, __DATE__, __TIME__);
+    fprintf(f, "  build:            %s · SIMD=%s · src=%s · %s %s\n",
+            QWEN_GIT_REV, QWEN_SIMD_PROFILE, QWEN_SOURCE_FP, __DATE__, __TIME__);
     int n = 0;
     for (int i = 0; g_qwen_reported_flags[i]; i++) {
         const char *v = getenv(g_qwen_reported_flags[i]);
@@ -1219,11 +1223,21 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
     int o = 0;
 #if defined(__AVX512BF16__)
     if (!qwen_bf16dot_disabled() && in_dim <= QWEN_BF16DOT_XMAX) {
+        qwen_census_leaf(QWEN_LEAF_DPBF16);
         uint16_t xb[QWEN_BF16DOT_XMAX];
         qwen_f32_to_bf16_row(xb, x, in_dim);
         bf16_matvec_dpbf16(y, xb, x, W, in_dim, out_dim);
         return;
     }
+#endif
+#if defined(__AVX512F__)
+    qwen_census_leaf(QWEN_LEAF_AVX512F);
+#elif defined(__ARM_NEON)
+    qwen_census_leaf(QWEN_LEAF_NEON);
+#elif defined(__AVX2__)
+    qwen_census_leaf(QWEN_LEAF_AVX2);
+#else
+    qwen_census_leaf(QWEN_LEAF_SCALAR);
 #endif
 #if defined(__AVX512F__)
     for (; o + 1 < out_dim; o += 2) {
@@ -1478,7 +1492,7 @@ static void qwen_kernel_timing_note(int kind, int B, int rows, int cols,
 static void qwen_vnni_phase_report(FILE *out);
 
 void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
-    qwen_census_op("matvec_bf16", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_BF16, rows, cols, 1);
     const int kt_on = qwen_kernel_timing_enabled();
     const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     if (qwen_q8r_matmul(y, (const void *)W, x, rows, cols, 1)) {
@@ -1781,16 +1795,73 @@ static atomic_llong g_mm_calls_c[QWEN_COMP_COUNT][QWEN_MMK_COUNT];
 
 #define QWEN_CENSUS_MAX 256
 typedef struct {
-    const char *entry;
+    int path;
     int comp, rows, cols, B;
     atomic_llong calls, macs;
-    atomic_uint  kmask;
+    atomic_uint  kmask;     /* QWEN_MMK_* that ran (matmat dispatch) */
+    atomic_uint  lmask;     /* QWEN_LEAF_* that ran (branch inside the entry) */
 } qwen_census_row_t;
 static qwen_census_row_t g_census[QWEN_CENSUS_MAX];
 static atomic_int   g_census_n;
 static atomic_int   g_census_on = -1;
 static atomic_llong g_census_frames;
-static _Atomic(qwen_census_row_t *) g_census_cur;
+/* The row the CURRENT THREAD is attributing to.  Was one global: under the pool a
+ * worker's kernel mask landed on whatever row another thread had just opened. */
+static __thread qwen_census_row_t *t_census_cur;
+
+static const struct { int id; const char *name; int kind; } g_path_info[] = {
+    { QWEN_PATH_MATVEC_BF16, "matvec_bf16", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_BF16_QKV, "matvec_bf16_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_INT8, "matvec_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_INT8_QKV, "matvec_int8_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q4_0, "matvec_q4_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q4_0_QKV, "matvec_q4_0_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q2_0, "matvec_q2_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q6_0, "matvec_q6_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q6_0_QKV, "matvec_q6_0_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_ARGMAX_MATVEC_BF16, "argmax_matvec_bf16", QWEN_PATHK_CALL },
+    { QWEN_PATH_ARGMAX_MATVEC_INT8, "argmax_matvec_int8", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_ARGMAX_MATVEC_Q4_0, "argmax_matvec_q4_0", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_MATMAT_BF16, "matmat_bf16", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_BF16_ROWS, "matmat_bf16_rows", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_BF16_QKV, "matmat_bf16_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_INT8, "matmat_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_INT8_QKV, "matmat_int8_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_Q4_0, "matmat_q4_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_INT8_VNNI_PACKED_SLICE, "matmat_int8_vnni_packed.slice", QWEN_PATHK_SLICE },
+    { QWEN_PATH_MATMAT_INT8_VNNI_M4N2_SLICE, "matmat_int8_vnni_m4n2.slice", QWEN_PATHK_SLICE },
+    { QWEN_PATH_PREFILL_BF16_NATIVE, "prefill_bf16_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_PREFILL_F32_SGEMM, "prefill_f32_sgemm", QWEN_PATHK_CALL },
+    { QWEN_PATH_BF16_ROWPACK_SHARED, "bf16_rowpack_shared", QWEN_PATHK_TRANSFORM },
+    { QWEN_PATH_MATMAT_INT8_NATIVE, "matmat_int8_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_MATMAT_BF16_NATIVE, "matmat_bf16_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_MATMAT_INT8_QKV_NATIVE, "matmat_int8_qkv_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_DECODER_SGEMM, "decoder_sgemm", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_INT8, "decoder_conv_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_NAIVE, "decoder_conv_naive", QWEN_PATHK_CALL },
+};
+const char *qwen_path_name(int path) {
+    for (size_t i = 0; i < sizeof g_path_info / sizeof g_path_info[0]; i++)
+        if (g_path_info[i].id == path) return g_path_info[i].name;
+    return "unknown_path";
+}
+int qwen_path_kind(int path) {
+    for (size_t i = 0; i < sizeof g_path_info / sizeof g_path_info[0]; i++)
+        if (g_path_info[i].id == path) return g_path_info[i].kind;
+    return QWEN_PATHK_CALL;
+}
+static const char *const g_leaf_name[QWEN_LEAF_COUNT] = {
+    "none", "vnni", "dpbf16", "sdot", "avx512f", "avx2", "neon", "scalar", "blas",
+    "f32_fused", "kleidi", "amx", "delegated"
+};
+const char *qwen_leaf_name(int leaf) {
+    return (leaf > 0 && leaf < QWEN_LEAF_COUNT) ? g_leaf_name[leaf] : "none";
+}
+void qwen_census_leaf(int leaf) {
+    if (leaf <= 0 || leaf >= QWEN_LEAF_COUNT) return;
+    if (atomic_load_explicit(&g_census_on, memory_order_relaxed) <= 0) return;
+    if (t_census_cur) atomic_fetch_or_explicit(&t_census_cur->lmask, 1u << leaf, memory_order_relaxed);
+}
 static pthread_mutex_t g_census_mu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int   g_census_overflow;
 
@@ -1818,7 +1889,16 @@ void qwen_census_frame_at(int site) {
 }
 void qwen_census_frame(void) { qwen_census_frame_at(0); }
 
-void qwen_census_op(const char *entry, int rows, int cols, int B) {
+static void qwen_census_op_impl(int path, int rows, int cols, int B, long long macs);
+void qwen_census_op(int path, int rows, int cols, int B) {
+    qwen_census_op_impl(path, rows, cols, B, (long long)rows * (long long)cols * (long long)B);
+}
+void qwen_census_op_len(int path, int rows, int cols, int len) {
+    if (len <= 0) return;
+    int b = 1; while (b < len) b <<= 1;          /* key = next power of two of the length */
+    qwen_census_op_impl(path, rows, cols, b, (long long)rows * (long long)cols * (long long)len);
+}
+static void qwen_census_op_impl(int path, int rows, int cols, int B, long long macs) {
     if (!qwen_census_enabled() || B <= 0) return;
     const int comp = qwen_tls_tag_get();
     const int n = atomic_load_explicit(&g_census_n, memory_order_acquire);
@@ -1826,7 +1906,7 @@ void qwen_census_op(const char *entry, int rows, int cols, int B) {
     for (int i = 0; i < n; i++) {
         qwen_census_row_t *r = &g_census[i];
         if (r->rows == rows && r->cols == cols && r->B == B &&
-            r->comp == comp && r->entry == entry) { hit = r; break; }
+            r->comp == comp && r->path == path) { hit = r; break; }
     }
     if (!hit) {
         pthread_mutex_lock(&g_census_mu);
@@ -1834,7 +1914,7 @@ void qwen_census_op(const char *entry, int rows, int cols, int B) {
         for (int i = n; i < m && !hit; i++) {
             qwen_census_row_t *r = &g_census[i];
             if (r->rows == rows && r->cols == cols && r->B == B &&
-                r->comp == comp && r->entry == entry) hit = r;
+                r->comp == comp && r->path == path) hit = r;
         }
         if (!hit) {
             if (m >= QWEN_CENSUS_MAX) {
@@ -1843,17 +1923,15 @@ void qwen_census_op(const char *entry, int rows, int cols, int B) {
                 return;
             }
             hit = &g_census[m];
-            hit->entry = entry; hit->comp = comp;
+            hit->path = path; hit->comp = comp;
             hit->rows = rows; hit->cols = cols; hit->B = B;
             atomic_store_explicit(&g_census_n, m + 1, memory_order_release);
         }
         pthread_mutex_unlock(&g_census_mu);
     }
     atomic_fetch_add_explicit(&hit->calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&hit->macs,
-                              (long long)rows * (long long)cols * (long long)B,
-                              memory_order_relaxed);
-    atomic_store_explicit(&g_census_cur, hit, memory_order_relaxed);
+    atomic_fetch_add_explicit(&hit->macs, macs, memory_order_relaxed);
+    t_census_cur = hit;
 }
 
 void qwen_census_report(void *out) {
@@ -1868,37 +1946,85 @@ void qwen_census_report(void *out) {
             atomic_load_explicit(&g_census_frames_at[1], memory_order_relaxed),
             atomic_load_explicit(&g_census_frames_at[2], memory_order_relaxed),
             g_n_threads);
-    fprintf(f, "# csv: comp,entry,N,K,B,calls,calls_per_frame,gmac,gmac_per_frame,kernels\n");
+    fprintf(f, "# csv: comp,path,N,K,B,calls,calls_per_frame,gmac,gmac_per_frame,kernels,leaves\n");
     for (int i = 0; i < n; i++) {
         qwen_census_row_t *r = &g_census[i];
         long long c = atomic_load_explicit(&r->calls, memory_order_relaxed);
         long long m = atomic_load_explicit(&r->macs,  memory_order_relaxed);
         unsigned km = atomic_load_explicit(&r->kmask, memory_order_relaxed);
+        unsigned lm = atomic_load_explicit(&r->lmask, memory_order_relaxed);
         char kbuf[256]; kbuf[0] = 0;
         for (int k = 1; k < QWEN_MMK_COUNT; k++) {
             if (!(km & (1u << k))) continue;
             if (kbuf[0]) strncat(kbuf, "+", sizeof kbuf - strlen(kbuf) - 1);
             strncat(kbuf, g_mmk_info[k].name, sizeof kbuf - strlen(kbuf) - 1);
         }
-        fprintf(f, "census,%s,%s,%d,%d,%d,%lld,%.3f,%.4f,%.6f,%s\n",
-                cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp], r->entry,
+        char lbuf[128]; lbuf[0] = 0;
+        for (int k = 1; k < QWEN_LEAF_COUNT; k++) {
+            if (!(lm & (1u << k))) continue;
+            if (lbuf[0]) strncat(lbuf, "+", sizeof lbuf - strlen(lbuf) - 1);
+            strncat(lbuf, g_leaf_name[k], sizeof lbuf - strlen(lbuf) - 1);
+        }
+        fprintf(f, "census,%s,%s,%d,%d,%d,%lld,%.3f,%.4f,%.6f,%s,%s\n",
+                cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp], qwen_path_name(r->path),
                 r->rows, r->cols, r->B, c,
                 frames ? (double)c / (double)frames : 0.0,
                 (double)m / 1e9,
                 frames ? (double)m / 1e9 / (double)frames : 0.0,
-                kbuf[0] ? kbuf : "(none)");
+                kbuf[0] ? kbuf : "(none)", lbuf[0] ? lbuf : "(none)");
     }
     int ov = atomic_load_explicit(&g_census_overflow, memory_order_relaxed);
     if (ov) fprintf(f, "[shape-census] WARNING: %d ops dropped, table full (%d rows)\n",
                     ov, QWEN_CENSUS_MAX);
     fflush(f);
+
+    /* Machine-readable twin: QWEN_CENSUS_JSON=path, "%d" -> pid (prefork workers each
+       write their own).  Counters are cumulative, so the last dump is the whole run. */
+    const char *jp = getenv("QWEN_CENSUS_JSON");
+    if (jp && jp[0]) {
+        char path[1024];
+        const char *pct = strstr(jp, "%d");
+        if (pct) snprintf(path, sizeof path, "%.*s%d%s", (int)(pct - jp), jp, (int)getpid(), pct + 2);
+        else     snprintf(path, sizeof path, "%s", jp);
+        FILE *j = fopen(path, "w");
+        if (j) {
+            fprintf(j, "{\n  \"v\": 1,\n  \"pid\": %d,\n  \"threads\": %d,\n  \"frames\": %lld,\n"
+                       "  \"frames_single\": %lld,\n  \"frames_batched\": %lld,\n  \"frames_batched_slot\": %lld,\n"
+                       "  \"dropped_ops\": %d,\n  \"rows\": [\n",
+                    (int)getpid(), g_n_threads, frames,
+                    atomic_load_explicit(&g_census_frames_at[0], memory_order_relaxed),
+                    atomic_load_explicit(&g_census_frames_at[1], memory_order_relaxed),
+                    atomic_load_explicit(&g_census_frames_at[2], memory_order_relaxed), ov);
+            for (int i = 0; i < n; i++) {
+                qwen_census_row_t *r = &g_census[i];
+                long long c = atomic_load_explicit(&r->calls, memory_order_relaxed);
+                long long m = atomic_load_explicit(&r->macs,  memory_order_relaxed);
+                unsigned km = atomic_load_explicit(&r->kmask, memory_order_relaxed);
+                unsigned lm = atomic_load_explicit(&r->lmask, memory_order_relaxed);
+                fprintf(j, "    {\"path_id\": %d, \"path\": \"%s\", \"kind\": %d, \"comp\": \"%s\", "
+                           "\"N\": %d, \"K\": %d, \"B\": %d, \"calls\": %lld, \"macs\": %lld, \"kernels\": [",
+                        r->path, qwen_path_name(r->path), qwen_path_kind(r->path),
+                        cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp],
+                        r->rows, r->cols, r->B, c, m);
+                int first = 1;
+                for (int k = 1; k < QWEN_MMK_COUNT; k++)
+                    if (km & (1u << k)) { fprintf(j, "%s\"%s\"", first ? "" : ", ", g_mmk_info[k].name); first = 0; }
+                fprintf(j, "], \"leaves\": [");
+                first = 1;
+                for (int k = 1; k < QWEN_LEAF_COUNT; k++)
+                    if (lm & (1u << k)) { fprintf(j, "%s\"%s\"", first ? "" : ", ", g_leaf_name[k]); first = 0; }
+                fprintf(j, "]}%s\n", i + 1 < n ? "," : "");
+            }
+            fprintf(j, "  ]\n}\n");
+            fclose(j);
+        }
+    }
 }
 
 void qwen_matmat_stats_note(int k, long long macs) {
     if (k <= 0 || k >= QWEN_MMK_COUNT) return;
     if (atomic_load_explicit(&g_census_on, memory_order_relaxed) > 0) {
-        qwen_census_row_t *cur = atomic_load_explicit(&g_census_cur, memory_order_relaxed);
-        if (cur) atomic_fetch_or_explicit(&cur->kmask, 1u << k, memory_order_relaxed);
+        if (t_census_cur) atomic_fetch_or_explicit(&t_census_cur->kmask, 1u << k, memory_order_relaxed);
     }
     atomic_fetch_add_explicit(&g_mm_macs[k], macs, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_mm_calls[k], 1, memory_order_relaxed);
@@ -2949,7 +3075,7 @@ QWEN_MM_SCRATCH(packb, uint16_t)
 QWEN_MM_SCRATCH(corr, int)
 
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
-    qwen_census_op("matmat_bf16", rows, cols, B);
+    qwen_census_op(QWEN_PATH_MATMAT_BF16, rows, cols, B);
     const int kt_on = qwen_kernel_timing_enabled();
     const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     const int kt_B = B;
@@ -3752,7 +3878,7 @@ static void int8_matmat_vnni_packed_slice(float *Y, const int8_t *W,
                                           const int8_t *qXt, const float *sx,
                                           const int32_t *row_sums,
                                           int r0, int r1, int rows, int cols, int B) {
-    qwen_census_op("matmat_int8_vnni_packed", r1 - r0, cols, B);
+    qwen_census_op(QWEN_PATH_MATMAT_INT8_VNNI_PACKED_SLICE, r1 - r0, cols, B);
     const __m512i v128 = _mm512_set1_epi8((char)128);
     int start = (r0 + 15) & ~15;
     int end = r1 & ~15;
@@ -4112,7 +4238,7 @@ static void int8_matmat_vnni_slice(float *Y, const int8_t *W, const float *scale
     }
     if (B == 2 && qwen_vnni_tile_m4n2_enabled() &&
         qwen_vnni_tile_enabled() && cols >= 64) {
-        qwen_census_op("matmat_int8_vnni_m4n2", r1 - r0, cols, B);
+        qwen_census_op(QWEN_PATH_MATMAT_INT8_VNNI_M4N2_SLICE, r1 - r0, cols, B);
         int r = r0;
         for (; r + 4 <= r1; r += 4)
             int8_matmat_vnni_tile_m4n2(Y, W, scale, qXt, sx, row_sums,
@@ -4354,7 +4480,7 @@ static void int8_smmla_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B) {
-    qwen_census_op("matmat_int8", rows, cols, B);
+    qwen_census_op(QWEN_PATH_MATMAT_INT8, rows, cols, B);
     const int kt_on = qwen_kernel_timing_enabled();
     const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     const int kt_B = B;
@@ -4606,7 +4732,7 @@ int qwen_matmat_int8_qkv(float *q, float *k, float *v,
                          const int8_t *Wv, const float *sv,
                          const float *X, int in_dim, int q_dim, int kv_dim, int B) {
     const int total = q_dim + 2 * kv_dim;
-    qwen_census_op("matmat_int8_qkv", total, in_dim, B);
+    qwen_census_op(QWEN_PATH_MATMAT_INT8_QKV, total, in_dim, B);
     const int kt_on = qwen_kernel_timing_enabled();
     const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     const int kt_B = B;
@@ -4745,7 +4871,7 @@ int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
                          const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
                          const float *X, int in_dim, int q_dim, int kv_dim, int B) {
     const int total = q_dim + 2 * kv_dim;
-    qwen_census_op("matmat_bf16_qkv", total, in_dim, B);
+    qwen_census_op(QWEN_PATH_MATMAT_BF16_QKV, total, in_dim, B);
     const int kt_on = qwen_kernel_timing_enabled();
     const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     const int kt_B = B;
@@ -5117,7 +5243,7 @@ static void q4_smmla_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                       int rows, int cols, int B) {
-    qwen_census_op("matmat_q4_0", rows, cols, B);
+    qwen_census_op(QWEN_PATH_MATMAT_Q4_0, rows, cols, B);
     if (B <= 0) return;
     if (B > 64) B = 64;
     if (qwen_mm_use(QWEN_MMK_KLEIDI_Q4, B, rows, cols) &&
@@ -5307,7 +5433,7 @@ static void bf16_qkv_task(size_t tid, size_t nt, void *vc) {
 void qwen_matvec_bf16_qkv(float *q, float *k, float *v,
                            const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_bf16_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_BF16_QKV, q_dim + 2 * kv_dim, in_dim, 1);
     if (qwen_q8r_matmul(q, (const void *)Wq, x, q_dim,  in_dim, 1) &&
         qwen_q8r_matmul(k, (const void *)Wk, x, kv_dim, in_dim, 1) &&
         qwen_q8r_matmul(v, (const void *)Wv, x, kv_dim, in_dim, 1)) {
@@ -6361,7 +6487,7 @@ static void int8_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
                       const float *x, int rows, int cols) {
-    qwen_census_op("matvec_int8", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_INT8, rows, cols, 1);
     const int kt_on = qwen_kernel_timing_enabled();
     const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     if (kai_i8_try(y, W, scale, x, rows, cols, 1)) {
@@ -6377,6 +6503,7 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
     int vnni_o = atomic_load_explicit(&vnni_off, memory_order_relaxed);
     if (vnni_o < 0) { const char *e = getenv("QWEN_NO_VNNI"); vnni_o = (e && e[0] == '1'); atomic_store_explicit(&vnni_off, vnni_o, memory_order_relaxed); }
     if (!vnni_o && cols <= QXV_MAX) {
+        qwen_census_leaf(QWEN_LEAF_VNNI);
         int8_t qx_buf[QXV_MAX];
         double vp_rs = vp_on ? qwen_mm_now_s() : 0.0;
         const int32_t *row_sums = qwen_vnni_row_sums(W, rows, cols);
@@ -6409,6 +6536,7 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
     if (!sdot_o && cols <= QX_MAX) {
         int8_t qx_buf[QX_MAX];
         float sx = quantize_act_int8(qx_buf, x, cols);
+        qwen_census_leaf(QWEN_LEAF_SDOT);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
             int8_sdot_ctx c = { y, qx_buf, sx, W, scale, rows, cols };
@@ -6419,6 +6547,7 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
         goto qwen_matvec_int8_timed_done;
     }
 #endif
+    qwen_census_leaf(QWEN_LEAF_F32_FUSED);
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         int8_mv_ctx c = { y, x, W, scale, rows, cols };
@@ -6436,7 +6565,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
                            const int8_t *Wk, const float *sk,
                            const int8_t *Wv, const float *sv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_int8_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_INT8_QKV, q_dim + 2 * kv_dim, in_dim, 1);
     const int kt_on = qwen_kernel_timing_enabled();
     const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     const int total = q_dim + 2 * kv_dim;
@@ -6458,6 +6587,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
         if (!qo && in_dim <= QX_MAX_QKV && nt > 1 && (q_dim + 2 * kv_dim) >= 256) {
             int8_t qx_buf[QX_MAX_QKV];
             float sx = quantize_act_int8(qx_buf, x, in_dim);
+            qwen_census_leaf(QWEN_LEAF_SDOT);
             int8_qkv_sdot_ctx c = { q, k, v, qx_buf, sx, Wq, Wk, Wv, sq, sk, sv,
                                     in_dim, q_dim, kv_dim };
             qwen_parallel((size_t)nt, int8_qkv_sdot_task, &c);
@@ -6470,6 +6600,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
         enum { QX_MAX_QKV = 8192 };
         const int total = q_dim + 2 * kv_dim;
         if (!qwen_vnni_qkv_disabled() && in_dim <= QX_MAX_QKV) {
+            qwen_census_leaf(QWEN_LEAF_VNNI);
             int8_t qx_buf[QX_MAX_QKV];
             const int vp_on = qwen_vnni_phase_timing_enabled();
             const int nt = g_n_threads;
@@ -6501,6 +6632,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
         }
     }
 #endif
+    qwen_census_leaf(QWEN_LEAF_DELEGATED);   /* the three rows below carry the work */
     qwen_matvec_int8(q, Wq, sq, x, q_dim, in_dim);
     qwen_matvec_int8(k, Wk, sk, x, kv_dim, in_dim);
     qwen_matvec_int8(v, Wv, sv, x, kv_dim, in_dim);
@@ -6508,7 +6640,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
 
 int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
                             int in_dim, int out_dim) {
-    qwen_census_op("argmax_matvec_int8", out_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_ARGMAX_MATVEC_INT8, out_dim, in_dim, 1);
     static __thread float *y = NULL;
     static __thread int y_cap = 0;
     if (out_dim > y_cap) {
@@ -6525,7 +6657,7 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 }
 
 int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, int out_dim) {
-    qwen_census_op("argmax_matvec_q4_0", out_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_ARGMAX_MATVEC_Q4_0, out_dim, in_dim, 1);
     static __thread float *y = NULL;
     static __thread int y_cap = 0;
     if (out_dim > y_cap) {
@@ -6969,7 +7101,7 @@ static void q4_0_vnni_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
-    qwen_census_op("matvec_q4_0", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q4_0, rows, cols, 1);
     if (qwen_mm_use(QWEN_MMK_KLEIDI_Q4, 1, rows, cols) &&
         qwen_kleidi_matmul_q4(y, (const void *)W, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_KLEIDI_Q4, rows, cols, 1);
@@ -6980,6 +7112,7 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
     if (!q4_sdot_disabled() && cols <= Q4_QX_MAX && cols % Q4_0_BLOCK_SIZE == 0) {
         int8_t qx_buf[Q4_QX_MAX];
         float sx = quantize_act_int8_x86(qx_buf, x, cols);
+        qwen_census_leaf(QWEN_LEAF_VNNI);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
             q4_0_vnni_ctx c = { y, qx_buf, sx, W, rows, cols };
@@ -6995,6 +7128,7 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
         int8_t qx_buf[Q4_QX_MAX];
         float sx = quantize_act_int8(qx_buf, x, cols);
         int nt = g_n_threads;
+        qwen_census_leaf(QWEN_LEAF_SDOT);
         if (nt > 1 && rows >= 256) {
             q4_0_sdot_ctx c = { y, qx_buf, sx, W, rows, cols };
             qwen_parallel((size_t)nt, q4_0_sdot_task, &c);
@@ -7004,6 +7138,7 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
         return;
     }
 #endif
+    qwen_census_leaf(QWEN_LEAF_F32_FUSED);
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         q4_0_mv_ctx c = { y, W, x, rows, cols, cols / Q4_0_BLOCK_SIZE };
@@ -7114,7 +7249,7 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_q4_0_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q4_0_QKV, q_dim + 2 * kv_dim, in_dim, 1);
     if (qwen_mm_use(QWEN_MMK_KLEIDI_Q4, 1, q_dim, in_dim) &&
         qwen_kleidi_matmul_q4(q, (const void *)Wq, x, q_dim,  in_dim, 1) &&
         qwen_kleidi_matmul_q4(k, (const void *)Wk, x, kv_dim, in_dim, 1) &&
@@ -7129,6 +7264,7 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
     int qkv_o = atomic_load_explicit(&qkv_off, memory_order_relaxed);
     if (qkv_o < 0) { const char *e = getenv("QWEN_NO_VNNI_QKV"); qkv_o = (e && e[0] == '1'); atomic_store_explicit(&qkv_off, qkv_o, memory_order_relaxed); }
     if (!qkv_o && !q4_sdot_disabled() && in_dim <= Q4_QX_MAX && in_dim % Q4_0_BLOCK_SIZE == 0) {
+        qwen_census_leaf(QWEN_LEAF_VNNI);
         int8_t qx_buf[Q4_QX_MAX];
         float sx = quantize_act_int8_x86(qx_buf, x, in_dim);
         int nt = g_n_threads;
@@ -7199,7 +7335,7 @@ void qwen_quantize_bf16_to_q2_0(const uint16_t *src_bf16, int rows, int cols,
 
 void qwen_matvec_q2_0(float *y, const q2_0_block_t *W, const float *x,
                       int rows, int cols) {
-    qwen_census_op("matvec_q2_0", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q2_0, rows, cols, 1);
     int bpr = cols / Q2_0_BLOCK_SIZE;
     for (int o = 0; o < rows; o++) {
         const q2_0_block_t *wr = W + (size_t)o * bpr;
@@ -7493,7 +7629,7 @@ static int q6_scalar_forced(void) {
 
 void qwen_matvec_q6_0(float *y, const q6_0_block_t *W, const float *x,
                        int rows, int cols) {
-    qwen_census_op("matvec_q6_0", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q6_0, rows, cols, 1);
     int8_t qx_buf[Q6_QX_MAX];
     int32_t sumx_buf[Q6_QX_MAX / Q6_0_BLOCK_SIZE];
     if (cols > Q6_QX_MAX || cols % Q6_0_BLOCK_SIZE != 0) {
@@ -7561,7 +7697,7 @@ void qwen_matvec_q6_0_qkv(float *q, float *k, float *v,
                           const q6_0_block_t *Wq, const q6_0_block_t *Wk,
                           const q6_0_block_t *Wv,
                           const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_q6_0_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q6_0_QKV, q_dim + 2 * kv_dim, in_dim, 1);
     if (in_dim > Q6_QX_MAX || in_dim % Q6_0_BLOCK_SIZE != 0) {
         qwen_matvec_q6_0(q, Wq, x, q_dim, in_dim);
         qwen_matvec_q6_0(k, Wk, x, kv_dim, in_dim);
@@ -8519,6 +8655,16 @@ void qwen_conv1d_int8(float *out, const float *in,
                       const float *bias,
                       int in_ch, int out_ch, int length, int kernel, int dilation,
                       int Kp, int blk) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, out_ch, in_ch * kernel, length);
+#if defined(__ARM_FEATURE_DOTPROD)
+    qwen_census_leaf(QWEN_LEAF_SDOT);
+#elif defined(__AVX512VNNI__)
+    qwen_census_leaf(QWEN_LEAF_VNNI);
+#elif defined(__AVX512F__)
+    qwen_census_leaf(QWEN_LEAF_AVX512F);
+#else
+    qwen_census_leaf(QWEN_LEAF_SCALAR);
+#endif
     sd_conv_job_t job = {
         .out = out, .in = in, .Wq = Wq, .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = length,
@@ -8594,6 +8740,8 @@ void qwen_conv1d_int8(float *out, const float *in,
                       const float *bias,
                       int in_ch, int out_ch, int length, int kernel, int dilation,
                       int Kp, int blk) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, out_ch, in_ch * kernel, length);
+    qwen_census_leaf(QWEN_LEAF_SCALAR);   /* the portable fallback: sd_scalar_dot */
     (void)wsum;
     int K = in_ch * kernel;
     int nblk = Kp / blk;
@@ -8865,7 +9013,7 @@ void qwen_apply_rope_interleaved(float *x, const float *cos_vals, const float *s
 }
 
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16, int in_dim, int out_dim) {
-    qwen_census_op("argmax_matvec_bf16", out_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_ARGMAX_MATVEC_BF16, out_dim, in_dim, 1);
     int best_idx = 0;
     float best_val = -1e30f;
     int o = 0;

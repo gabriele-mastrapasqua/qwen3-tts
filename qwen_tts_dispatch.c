@@ -30,8 +30,12 @@
 #include "qwen_tts_thread.h"
 #include "qwen_tts_q8repack.h"
 
+#include "qwen_build_id.h"
 #ifndef QWEN_GIT_REV
-#define QWEN_GIT_REV "unknown"
+#define QWEN_GIT_REV QWEN_BUILD_GIT_REV
+#endif
+#ifndef QWEN_SOURCE_FP
+#define QWEN_SOURCE_FP QWEN_BUILD_SOURCE_FP
 #endif
 #ifndef QWEN_SIMD_PROFILE
 #define QWEN_SIMD_PROFILE "unknown"
@@ -325,8 +329,8 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
 
     /* ---- Print ---------------------------------------------------------------------- */
     const char *cls = isa_class();
-    fprintf(f, "[DISPATCH] v=1 pid=%d isa_class=%s build=%s simd=%s\n",
-            (int)getpid(), cls, QWEN_GIT_REV, QWEN_SIMD_PROFILE);
+    fprintf(f, "[DISPATCH] v=1 pid=%d isa_class=%s build=%s simd=%s src=%s\n",
+            (int)getpid(), cls, QWEN_GIT_REV, QWEN_SIMD_PROFILE, QWEN_SOURCE_FP);
     fprintf(f, "  %-34s %-8s %-9s %-30s %-10s %s\n",
             "feature", "compiled", "supported", "env", "resolved", "reason");
     for (int i = 0; i < n; i++) {
@@ -367,6 +371,7 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
         json_str(j, cls);
         fprintf(j, ",\n  \"build\": "); json_str(j, QWEN_GIT_REV);
         fprintf(j, ",\n  \"simd\": ");  json_str(j, QWEN_SIMD_PROFILE);
+        fprintf(j, ",\n  \"source_fp\": ");  json_str(j, QWEN_SOURCE_FP);
         fprintf(j, ",\n  \"threads\": %d,\n  \"features\": [\n", qwen_get_threads());
         for (int i = 0; i < n; i++) {
             fprintf(j, "    {\"id\": "); json_str(j, feats[i].id);

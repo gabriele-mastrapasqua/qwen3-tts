@@ -62,6 +62,44 @@ enum {
     QWEN_MMK_COUNT
 };
 enum { QWEN_COMP_OTHER = 0, QWEN_COMP_TALKER, QWEN_COMP_CP, QWEN_COMP_DECODER, QWEN_COMP_COUNT };
+
+/* Stable runtime PATH ids for the shape census.  Append only, never renumber: the ids are
+ * the join key between census.json, tools/census_report.py and dispatch_expect.json.
+ * A path is an ENTRY the engine calls (what work was asked); which instructions did it
+ * is the kernel mask (QWEN_MMK_*) plus the LEAF noted at the branch that ran. */
+enum {
+    QWEN_PATH_NONE = 0,
+    QWEN_PATH_MATVEC_BF16 = 1, QWEN_PATH_MATVEC_BF16_QKV, QWEN_PATH_MATVEC_INT8,
+    QWEN_PATH_MATVEC_INT8_QKV, QWEN_PATH_MATVEC_Q4_0, QWEN_PATH_MATVEC_Q4_0_QKV,
+    QWEN_PATH_MATVEC_Q2_0, QWEN_PATH_MATVEC_Q6_0, QWEN_PATH_MATVEC_Q6_0_QKV,
+    QWEN_PATH_ARGMAX_MATVEC_BF16 = 10, QWEN_PATH_ARGMAX_MATVEC_INT8, QWEN_PATH_ARGMAX_MATVEC_Q4_0,
+    QWEN_PATH_MATMAT_BF16 = 20, QWEN_PATH_MATMAT_BF16_ROWS, QWEN_PATH_MATMAT_BF16_QKV,
+    QWEN_PATH_MATMAT_INT8, QWEN_PATH_MATMAT_INT8_QKV, QWEN_PATH_MATMAT_Q4_0,
+    QWEN_PATH_MATMAT_INT8_VNNI_PACKED_SLICE = 30, QWEN_PATH_MATMAT_INT8_VNNI_M4N2_SLICE,
+    QWEN_PATH_PREFILL_BF16_NATIVE = 40, QWEN_PATH_PREFILL_F32_SGEMM, QWEN_PATH_BF16_ROWPACK_SHARED,
+    QWEN_PATH_MATMAT_INT8_NATIVE, QWEN_PATH_MATMAT_BF16_NATIVE, QWEN_PATH_MATMAT_INT8_QKV_NATIVE,
+    QWEN_PATH_DECODER_SGEMM = 50, QWEN_PATH_DECODER_CONV_INT8, QWEN_PATH_DECODER_CONV_NAIVE,
+    QWEN_PATH_COUNT
+};
+/* kind: what a row means for coverage accounting */
+enum { QWEN_PATHK_CALL = 0, QWEN_PATHK_SLICE, QWEN_PATHK_WRAPPER, QWEN_PATHK_TRANSFORM };
+const char *qwen_path_name(int path);
+int         qwen_path_kind(int path);
+
+/* LEAF: the instruction class that actually executed inside a path, noted at the branch. */
+enum {
+    QWEN_LEAF_NONE = 0, QWEN_LEAF_VNNI, QWEN_LEAF_DPBF16, QWEN_LEAF_SDOT, QWEN_LEAF_AVX512F,
+    QWEN_LEAF_AVX2, QWEN_LEAF_NEON, QWEN_LEAF_SCALAR, QWEN_LEAF_BLAS, QWEN_LEAF_F32_FUSED,
+    QWEN_LEAF_KLEIDI, QWEN_LEAF_AMX,
+    QWEN_LEAF_DELEGATED,   /* the entry delegated to per-matrix calls: their rows carry the work */
+    QWEN_LEAF_COUNT
+};
+const char *qwen_leaf_name(int leaf);
+void qwen_census_leaf(int leaf);
+/* Same as qwen_census_op, but with an explicit MAC count and a bucketed B for the key:
+ * the speech decoder's conv/GEMM "B" is the time length and differs on nearly every call,
+ * which would fill the 256-row table with one row per length. */
+void qwen_census_op_len(int path, int rows, int cols, int len);
 void qwen_mm_component(int comp);
 int  qwen_mm_component_get(void);
 
@@ -69,7 +107,7 @@ int  qwen_matmat_stats_enabled(void);
 void qwen_matmat_stats_note(int kernel_id, long long macs);
 void qwen_matmat_stats_note_bytes(long long weight_bytes);
 int  qwen_census_enabled(void);
-void qwen_census_op(const char *entry, int rows, int cols, int B);
+void qwen_census_op(int path, int rows, int cols, int B);
 void qwen_census_frame(void);
 void qwen_census_frame_at(int site);
 void qwen_census_report(void *out);

@@ -270,7 +270,10 @@ def result_header(a, model_path, extra_env):
     kern = sh("uname -sr")
     bsha = sh(f"sha256sum {a.bin} 2>/dev/null | cut -c1-16")
     brev = sh(f"{a.bin} --caps 2>/dev/null | awk '/build:/{{print $2}}'")
-    commit = os.environ.get("QWEN_SOURCE_COMMIT") or sh("git rev-parse --short HEAD 2>/dev/null")
+    src_fp = sh(f"{a.bin} --caps 2>/dev/null | sed -n 's/.*src=\\([^ ]*\\).*/\\1/p' | head -1", "")
+    # the fingerprint the BINARY carries is the record; a declared commit is only a fallback
+    commit = src_fp or sh("git rev-parse --short HEAD 2>/dev/null") or \
+             (os.environ.get("QWEN_SOURCE_COMMIT", "") + " (declared, unverified)" if os.environ.get("QWEN_SOURCE_COMMIT") else "UNKNOWN")
     dirty = os.environ.get("QWEN_SOURCE_DIRTY") or \
         sh("git diff --quiet HEAD 2>/dev/null && echo no || echo yes", "UNKNOWN")
     # The levers worth recording differ by ISA: an x86 run that reports QWEN_NO_BFMMLA and stays
@@ -681,14 +684,17 @@ def main():
             except subprocess.TimeoutExpired: p.kill(); p.wait()
             f.close(); port += W + 2
 
-    hdr = (f"{'topo':<6}{'C':>3}{'TTFB50':>8}{'TTFB95':>8}{'TTFA50':>8}{'TTFA95':>8}{'TTFAmax':>9}{'RTF50':>7}{'RTF95':>7}"
+    hdr = (f"{'topo':<6}{'C':>3}{'TTFB50':>8}{'TTFB95':>8}{'TTFA50':>8}{'TTFA95':>8}{'TTFAmax':>9}"
+           f"{'STRM50':>7}{'STRM95':>7}{'TOT50':>7}{'TOT95':>7}"
            f"{'ttc50':>7}{'ttc95':>7}{'req/s':>7}{'B':>6}{'assign':>12}{'cores':>7}"
            f"{'csw/s':>8}{'PSS GB':>8}{'rej':>5}{'err':>5}")
     print("\n" + hdr); print("-" * len(hdr))
+    print("# STRM = STREAM_RTF per request (after the first chunk); TOT = TOTAL_RTF (send -> last byte / audio); "
+          "TTFB = first HTTP byte, TTFA = first audio chunk; B = measured batch, not C")
     for r in rows:
         print(f"{r['topo']:<6}{r['conc']:>3}{r['ttfb_p50']:>8.0f}{r['ttfb_p95']:>8.0f}"
-              f"{r['ttfa_p50']:>8.0f}{r['ttfa_p95']:>8.0f}"
-              f"{r['ttfa_max']:>9.0f}{r['rtf_p50']:>7.2f}{r['rtf_p95']:>7.2f}"
+              f"{r['ttfa_p50']:>8.0f}{r['ttfa_p95']:>8.0f}{r['ttfa_max']:>9.0f}"
+              f"{r['stream_p50']:>7.3f}{r['stream_p95']:>7.3f}{r['rtf_p50']:>7.3f}{r['rtf_p95']:>7.3f}"
               f"{r['ttc_p50']:>7.1f}{r['ttc_p95']:>7.1f}{r['req_s']:>7.2f}"
               f"{r['batch_eff']:>6.2f}{r['assign']:>12}{r['cores']:>7.1f}"
               f"{r['csw_s']:>8.0f}{r['pss_mb']/1024:>8.1f}{r['rejects']:>5}{r['errors']:>5}")

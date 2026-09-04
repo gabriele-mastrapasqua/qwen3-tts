@@ -826,7 +826,7 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
 static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
                                 int seq, int in_dim, int out_dim,
                                 float *xT, float *yT) {
-    qwen_census_op("prefill_bf16_native", out_dim, in_dim, seq);
+    qwen_census_op(QWEN_PATH_PREFILL_BF16_NATIVE, out_dim, in_dim, seq);
     if (qwen_kleidi_prefill_enabled() &&
         qwen_kleidi_matmul_bf16_native(Y, W, Xn,
                                        (size_t)in_dim * sizeof(float),
@@ -1401,12 +1401,15 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             if (trace) { pj_v_ms += pfx_now_ms() - _p; pj_calls++; }
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, q_dim, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, q_dim, h, 1.0f,
                     pref_x_norm, h, wq_f32, h, 0.0f, pref_q, q_dim);
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, kv_dim, h, 1.0f,
                     pref_x_norm, h, wk_f32, h, 0.0f, pref_kn, kv_dim);
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, kv_dim, h, 1.0f,
                     pref_x_norm, h, wv_f32, h, 0.0f, pref_vn, kv_dim);
@@ -1477,6 +1480,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                 residual[i] += pref_proj[i];
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, q_dim, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, h, q_dim, 1.0f,
                     pref_attn_out, q_dim, wo_f32, q_dim, 0.0f, pref_proj, h);
@@ -1504,6 +1508,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             prefill_proj_matmat(pref_gate, PREFW(l, gate_up_fused), pref_x_norm, n_new, h, 2 * inter, pp_xT, pp_yT);
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, 2 * inter, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, 2 * inter, h, 1.0f,
                     pref_x_norm, h, gate_up_f32, h, 0.0f, pref_gate, 2 * inter);
@@ -1543,6 +1548,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
               if (trace) ffn_resid_ms += pfx_now_ms() - _t; }
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, inter, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, h, inter, 1.0f,
                     pref_gate, inter, down_f32, inter, 0.0f, pref_proj, h);
@@ -1712,8 +1718,8 @@ void qwen_batch_proj_q(float *dst,
         int contig = 1;
         if (idx) for (int j = 0; j < B; j++) if (idx[j] != j) { contig = 0; break; }
         if (contig) {
-            if (Wi) qwen_census_op("matmat_int8_native", rows, cols, B);
-            else if (!Wq) qwen_census_op("matmat_bf16_native", rows, cols, B);
+            if (Wi) qwen_census_op(QWEN_PATH_MATMAT_INT8_NATIVE, rows, cols, B);
+            else if (!Wq) qwen_census_op(QWEN_PATH_MATMAT_BF16_NATIVE, rows, cols, B);
             if (Wi && qwen_kleidi_matmul_i8_native(dst, Wi, src,
                                                    (size_t)srcstride * sizeof(float),
                                                    (size_t)rows * sizeof(float),
@@ -1759,7 +1765,7 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
                                              (size_t)srcstride * sizeof(float),
                                              cols, q_rows, kv_rows, B)) {
             if (qwen_census_enabled())
-                qwen_census_op("matmat_int8_qkv_native", q_rows + 2 * kv_rows, cols, B);
+                qwen_census_op(QWEN_PATH_MATMAT_INT8_QKV_NATIVE, q_rows + 2 * kv_rows, cols, B);
             if (qwen_matmat_stats_enabled() || qwen_census_enabled()) {
                 qwen_matmat_stats_note(QWEN_MMK_KLEIDI_I8,
                                        (long long)(q_rows + 2 * kv_rows) * cols * B);

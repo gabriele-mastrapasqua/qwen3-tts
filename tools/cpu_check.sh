@@ -69,27 +69,25 @@ BSHA=$(sha256 "$BIN")
 CAPS=$("$BIN" --caps 2>&1)
 BTAG=$(printf '%s\n' "$CAPS" | sed -n 's/^  build: *\([^ ]*\).*/\1/p' | head -1)
 BSIMD=$(printf '%s\n' "$CAPS" | sed -n 's/.*SIMD=\([^ ]*\).*/\1/p' | head -1)
-gate PASS "binary SHA recorded" "${BSHA:0:16}…  build=$BTAG simd=$BSIMD"
+BFP=$(printf '%s\n' "$CAPS" | sed -n 's/.*src=\([^ ]*\).*/\1/p' | head -1)
+gate PASS "binary SHA recorded" "${BSHA:0:16}…  build=$BTAG simd=$BSIMD src=${BFP:-none}"
 
 # ── 2. source vs binary ─────────────────────────────────────────────────────────────
-COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "")
-if [ -n "$COMMIT" ]; then
-    DIRTY=$(git status --porcelain 2>/dev/null | grep -q . && echo yes || echo no)
-    TREE_TAG="$COMMIT$([ "$DIRTY" = yes ] && echo -dirty)"
-    if [ "$BTAG" = "$TREE_TAG" ]; then
-        gate PASS "binary matches tree" "$TREE_TAG"
-    elif [ "${BTAG%-dirty}" = "$COMMIT" ]; then
-        gate WARN "binary matches tree" "binary=$BTAG tree=$TREE_TAG (dirty state changed since the build: rebuild before measuring)"
-    else
-        gate FAIL "binary matches tree" "binary=$BTAG tree=$TREE_TAG  -> STALE BINARY, make blas"
-    fi
-    if [ "$DIRTY" = yes ]; then
-        gate WARN "dirty tree" "uncommitted edits: numbers that leave the repo need dirty=no"
-    fi
+# Source identity: the fingerprint EMBEDDED in the binary (commit[-dirty]:tree-hash, computed
+# where git is) against the tree's fingerprint now (git, or the shipped .source_fingerprint).
+TREE_FP=$(bash tools/source_fingerprint.sh 2>/dev/null || echo unknown)
+HAVE_GIT=$(git rev-parse HEAD >/dev/null 2>&1 && echo yes || echo no)
+if [ -z "$BFP" ]; then
+    gate FAIL "binary matches tree" "binary carries no source fingerprint (built before qwen_build_id.h): make blas"
+elif [ "$BFP" = "$TREE_FP" ]; then
+    gate PASS "binary matches tree" "src=$BFP  (embedded == tree$([ $HAVE_GIT = no ] && echo ', tree = shipped .source_fingerprint'))"
+elif [ "${BFP%%[:-]*}" = "${TREE_FP%%[:-]*}" ]; then
+    gate FAIL "binary matches tree" "same commit, different edits: binary=$BFP tree=$TREE_FP -> STALE BINARY, make blas"
 else
-    DIRTY="unknown"; TREE_TAG="${QWEN_SOURCE_COMMIT:-UNKNOWN}"
-    gate WARN "binary matches tree" "no git here; QWEN_SOURCE_COMMIT=${QWEN_SOURCE_COMMIT:-unset}"
+    gate FAIL "binary matches tree" "binary=$BFP tree=$TREE_FP -> STALE BINARY, make blas"
 fi
+case "$BFP" in *-dirty:*) DIRTY=yes; gate WARN "dirty tree" "uncommitted edits ($BFP): numbers that leave the repo need a clean fingerprint";; *) DIRTY=no;; esac
+[ -n "${QWEN_SOURCE_COMMIT:-}" ] && gate WARN "declared provenance" "QWEN_SOURCE_COMMIT=$QWEN_SOURCE_COMMIT is set but the binary's own src=$BFP is the record; the variable is ignored"
 
 # ── 3. artifact directory ───────────────────────────────────────────────────────────
 HOSTSLUG=$(hostname -s 2>/dev/null | tr -cd 'a-zA-Z0-9-' | cut -c1-24); HOSTSLUG=${HOSTSLUG:-box}
