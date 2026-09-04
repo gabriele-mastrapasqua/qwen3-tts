@@ -36,6 +36,19 @@ int  qwen_blas_threads_now(void);       /* openblas_get_num_threads(), -1 if una
  * 0 = the decoder's private worker team.  QWEN_SD_POOL=qwen|private overrides the default. */
 void qwen_sd_pool_default(int mode);
 int  qwen_sd_pool_mode(void);
+/* In-region int8 matmat (x86 AVX-512 VNNI): the dispatched drivers split into a per-column
+ * activation quantisation and a per-thread row block, so a persistent parallel region can
+ * run the same kernels between its own barriers.  Same partition and same kernels as the
+ * dispatched path: outputs are bit-identical.  Xt is k-major [cols][B]; Y is [rows][B]. */
+int   qwen_i8mm_usable(int rows, int cols, int B);
+int   qwen_i8mm_qkv_usable(int q_rows, int kv_rows, int cols, int B);
+float qwen_i8mm_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b);
+void  qwen_i8mm_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
+                    const float *sx, int rows, int cols, int B, size_t tid, size_t nt);
+void  qwen_i8mm_run_qkv(float *q, float *k, float *v,
+                        const int8_t *Wq, const float *sq, const int8_t *Wk, const float *sk,
+                        const int8_t *Wv, const float *sv, const int8_t *qXt, const float *sx,
+                        int q_rows, int kv_rows, int cols, int B, size_t tid, size_t nt);
 void qwen_sd_sgemm(int order, int ta, int tb, int M, int N, int K, float alpha,
                    const float *A, int lda, const float *B, int ldb, float beta,
                    float *C, int ldc);

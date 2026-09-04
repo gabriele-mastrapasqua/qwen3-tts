@@ -4,6 +4,7 @@
 #include "qwen_tts_costmap.h"
 #include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
+#include "qwen_tts_thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1005,6 +1006,131 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 #undef CP_SKIP
 }
 
+/* ---- one CP transformer step as ONE persistent parallel region -------------------------
+ * The dispatched path leaves and re-enters the pool 20 times per step (4 projections x 5
+ * layers) and runs every per-slot section (q/k norm, rope, KV store, attention, residual
+ * norms, swiglu) on the loop thread with the pool idle.  Here the whole team enters once,
+ * the projections run as the same VNNI row blocks the dispatched path uses, and the per-slot
+ * sections run one slot per thread between spin barriers.  Math and kernels are unchanged,
+ * so the outputs are bit-identical; QWEN_CP_REGION=0 restores the dispatched path. */
+typedef struct {
+    qwen_tts_ctx_t *ctx; qwen_batch_t *bb; float *x, *x_norm; int pos;
+    int BW; const int *idx;
+    int8_t *qx; float *swtmp; float sx[16];
+    qwen_barrier_t bar;
+} cp_region_t;
+
+static void cp_region_gather_quant(cp_region_t *r, const float *src, int b, int j,
+                                   int cols, int srcstride) {
+    float *Xt = r->bb->cp_Xt; const float *s = src + (size_t)b * srcstride;
+    for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
+    r->sx[j] = qwen_i8mm_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
+}
+static void cp_region_scatter(cp_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
+    float *d = dst + (size_t)b * rows;
+    for (int i = 0; i < rows; i++) d[i] = Yt[(size_t)i * r->BW + j];
+}
+
+static void cp_region_task(size_t tid, size_t nt, void *v) {
+    cp_region_t *r = (cp_region_t *)v;
+    qwen_tts_ctx_t *ctx = r->ctx; qwen_batch_t *bb = r->bb; qwen_tts_config_t *c = &ctx->config;
+    const int BW = r->BW, ch = bb->cp_h, cqd = bb->cp_q_dim, ckvd = bb->cp_kv_dim, cint = bb->cp_inter;
+    const float eps = c->rms_norm_eps, ascale = 1.0f / sqrtf((float)c->cp_head_dim);
+    const int pos = r->pos;
+    float *Yt = bb->cp_Yt;
+#define RSLOT(j) (r->idx ? r->idx[j] : (j))
+#define RMINE(j) ((size_t)(j) % nt == tid)
+    for (int j = 0; j < BW; j++) if (RMINE(j)) cp_region_gather_quant(r, r->x_norm, RSLOT(j), j, ch, ch);
+    qwen_barrier_wait(&r->bar);
+    for (int L = 0; L < c->cp_num_layers; L++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[L];
+        float *Yk = Yt + (size_t)cqd * BW, *Yv = Yt + (size_t)(cqd + ckvd) * BW;
+        qwen_i8mm_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
+                          l->wv_int8, l->wv_scale, r->qx, r->sx, cqd, ckvd, ch, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (RMINE(j)) {
+            int b = RSLOT(j);
+            cp_region_scatter(r, bb->cp_q, Yt, b, j, cqd);
+            cp_region_scatter(r, bb->cp_k, Yk, b, j, ckvd);
+            cp_region_scatter(r, bb->cp_v, Yv, b, j, ckvd);
+            qwen_rms_norm_per_head(bb->cp_q + (size_t)b * cqd,  l->q_norm, 1, c->cp_num_heads,    c->cp_head_dim, eps);
+            qwen_rms_norm_per_head(bb->cp_k + (size_t)b * ckvd, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
+            apply_rope_neox(bb->cp_q + (size_t)b * cqd,  c->cp_num_heads,    c->cp_head_dim, ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
+            apply_rope_neox(bb->cp_k + (size_t)b * ckvd, c->cp_num_kv_heads, c->cp_head_dim, ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
+            size_t kvbase = ((size_t)b * bb->cp_num_layers + L) * bb->cp_kv_max * ckvd + (size_t)pos * ckvd;
+            f32_to_bf16_vec(bb->cp_kv_k + kvbase, bb->cp_k + (size_t)b * ckvd, ckvd);
+            f32_to_bf16_vec(bb->cp_kv_v + kvbase, bb->cp_v + (size_t)b * ckvd, ckvd);
+            size_t lbase = ((size_t)b * bb->cp_num_layers + L) * bb->cp_kv_max * ckvd;
+            qwen_causal_attention_bf16kv(bb->cp_attn + (size_t)b * cqd, bb->cp_q + (size_t)b * cqd,
+                                         bb->cp_kv_k + lbase, bb->cp_kv_v + lbase, 1, pos + 1,
+                                         c->cp_num_heads, c->cp_num_kv_heads, c->cp_head_dim, ascale, pos);
+            cp_region_gather_quant(r, bb->cp_attn, b, j, cqd, cqd);
+        }
+        qwen_barrier_wait(&r->bar);
+        qwen_i8mm_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, ch, cqd, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (RMINE(j)) {
+            int b = RSLOT(j);
+            cp_region_scatter(r, bb->cp_proj, Yt, b, j, ch);
+            qwen_rms_norm_residual(r->x_norm + (size_t)b * ch, r->x + (size_t)b * ch,
+                                   bb->cp_proj + (size_t)b * ch, l->post_attn_norm, ch, eps);
+            cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
+        }
+        qwen_barrier_wait(&r->bar);
+        qwen_i8mm_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * cint, ch, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (RMINE(j)) {
+            int b = RSLOT(j);
+            cp_region_scatter(r, bb->cp_gate, Yt, b, j, 2 * cint);
+            qwen_swiglu_inplace(bb->cp_gate + (size_t)b * 2 * cint, r->swtmp + (size_t)j * cint, cint);
+            cp_region_gather_quant(r, bb->cp_gate, b, j, cint, 2 * cint);
+        }
+        qwen_barrier_wait(&r->bar);
+        qwen_i8mm_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, ch, cint, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (RMINE(j)) {
+            int b = RSLOT(j);
+            cp_region_scatter(r, bb->cp_proj, Yt, b, j, ch);
+            if (L + 1 < c->cp_num_layers) {
+                qwen_rms_norm_residual(r->x_norm + (size_t)b * ch, r->x + (size_t)b * ch,
+                                       bb->cp_proj + (size_t)b * ch, ctx->cp_layers[L + 1].input_norm, ch, eps);
+                cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
+            } else {
+                float *xb = r->x + (size_t)b * ch, *pb = bb->cp_proj + (size_t)b * ch;
+                for (int i = 0; i < ch; i++) xb[i] += pb[i];
+            }
+        }
+        qwen_barrier_wait(&r->bar);
+    }
+#undef RSLOT
+#undef RMINE
+}
+
+/* Can this step run as one region?  Decided once per process for the CP shapes (they never
+ * change) and re-checked for the cheap per-call conditions. */
+static int cp_region_ok(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, int BW) {
+    static int shapes_ok = -1;
+    if (shapes_ok < 0) {
+        const char *e = getenv("QWEN_CP_REGION");
+        qwen_cp_layer_t *l = &ctx->cp_layers[0];
+        shapes_ok = !(e && e[0] == '0') && qwen_parallel_team() >= 2 && bb->B >= 2 &&
+                    l->wq_int8 && l->wk_int8 && l->wv_int8 && l->wo_int8 &&
+                    l->gate_up_fused_int8 && l->down_int8 &&
+                    !l->wq_q4 && !l->wk_q4 && !l->wv_q4 && !l->wo_q4 && !l->gate_up_fused_q4 && !l->down_q4 &&
+                    qwen_i8mm_qkv_usable(bb->cp_q_dim, bb->cp_kv_dim, bb->cp_h, 2) &&
+                    qwen_i8mm_usable(bb->cp_h, bb->cp_q_dim, 2) &&
+                    qwen_i8mm_usable(2 * bb->cp_inter, bb->cp_h, 2) &&
+                    qwen_i8mm_usable(bb->cp_h, bb->cp_inter, 2);
+        fprintf(stderr, "[cp] transformer step as one parallel region: %s (team %d)\n",
+                shapes_ok ? "ON" : "off", qwen_parallel_team());
+    }
+    if (!shapes_ok || bb->force_matvec || BW < 2 || BW > 16) return 0;
+    return qwen_i8mm_qkv_usable(bb->cp_q_dim, bb->cp_kv_dim, bb->cp_h, BW) &&
+           qwen_i8mm_usable(bb->cp_h, bb->cp_q_dim, BW) &&
+           qwen_i8mm_usable(2 * bb->cp_inter, bb->cp_h, BW) &&
+           qwen_i8mm_usable(bb->cp_h, bb->cp_inter, BW);
+}
+
 static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                       float *x, float *x_norm, int pos, const uint8_t *active) {
     qwen_tts_config_t *c = &ctx->config;
@@ -1027,6 +1153,26 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     for (int b = 0; b < B; b++) {
         if (active && !active[b]) continue;
         qwen_rms_norm(x_norm + (size_t)b * ch, x + (size_t)b * ch, ctx->cp_layers[0].input_norm, 1, ch, eps);
+    }
+    {
+        int BW = bb->B_eff > 0 ? bb->B_eff : B;
+        if (cp_region_ok(ctx, bb, BW)) {
+            static int8_t *qx = NULL; static float *swtmp = NULL; static size_t qx_cap = 0, sw_cap = 0;
+            size_t maxc = (size_t)(bb->cp_inter > bb->cp_q_dim ? bb->cp_inter : bb->cp_q_dim);
+            if (maxc < (size_t)ch) maxc = ch;
+            size_t need = (size_t)BW * maxc + 64, swn = (size_t)BW * bb->cp_inter;
+            if (need > qx_cap) { free(qx); qx = (int8_t *)aligned_alloc(64, (need + 63) & ~(size_t)63); qx_cap = qx ? need : 0; }
+            if (swn > sw_cap) { free(swtmp); swtmp = (float *)malloc(swn * sizeof(float)); sw_cap = swtmp ? swn : 0; }
+            if (qx && swtmp) {
+                cp_region_t r; memset(&r, 0, sizeof r);
+                r.ctx = ctx; r.bb = bb; r.x = x; r.x_norm = x_norm; r.pos = pos;
+                r.BW = BW; r.idx = bb->act_idx; r.qx = qx; r.swtmp = swtmp;
+                int team = qwen_parallel_team();
+                qwen_barrier_init(&r.bar, team);
+                qwen_parallel((size_t)team, cp_region_task, &r);
+                return;
+            }
+        }
     }
     for (int layer = 0; layer < c->cp_num_layers; layer++)
         batch_cp_layer(ctx, bb, x, x_norm, pos, layer, active);

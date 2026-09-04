@@ -38,6 +38,16 @@ int qwen_parallel_active(void);
 void   qwen_parallel_set_low_until(double until_ms);
 double qwen_parallel_now_ms(void);
 
+/* Persistent parallel regions.  qwen_parallel_team() is the number of threads that take
+ * part in a dispatch of exactly that many chunks (the caller plus every pool worker), so a
+ * region dispatched with nt == team can keep the whole team inside one task and separate
+ * dependent phases with qwen_barrier_wait instead of leaving and re-dispatching.  A team
+ * of 1 means the pool cannot promise that and the caller must use plain dispatches. */
+int qwen_parallel_team(void);
+typedef struct { volatile int arrived; volatile int phase; int nt; } qwen_barrier_t;
+void qwen_barrier_init(qwen_barrier_t *b, int nt);
+void qwen_barrier_wait(qwen_barrier_t *b);
+
 #ifdef __cplusplus
 }
 #endif

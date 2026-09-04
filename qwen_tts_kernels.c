@@ -285,7 +285,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
     "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
-    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US",
+    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
@@ -10146,4 +10146,61 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
         fprintf(f, "\nJSON: %s\n", jpath);
     }
     return 0;
+}
+
+/* ---- in-region int8 matmat: the dispatched drivers, split into prep + per-thread run ---- */
+int qwen_i8mm_usable(int rows, int cols, int B) {
+#if defined(__AVX512VNNI__)
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, rows, cols) && qwen_amx_int8_ready()) return 0;
+#endif
+    return B >= 2 && B <= 16 && rows >= 256 && qwen_mm_use(QWEN_MMK_INT8_VNNI, B, rows, cols);
+#else
+    (void)rows; (void)cols; (void)B; return 0;
+#endif
+}
+int qwen_i8mm_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
+#if defined(__AVX512VNNI__) && defined(__x86_64__)
+    if (qwen_x86_qkv_disabled() || B <= 1 || B > 16) return 0;
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if ((q_rows & 15) == 0 && (kv_rows & 15) == 0 &&
+        qwen_amx_int8_qkv_allowed(B, q_rows, kv_rows, cols) && qwen_amx_int8_ready()) return 0;
+#endif
+    return (q_rows + 2 * kv_rows) >= 256 &&
+           qwen_mm_use(QWEN_MMK_INT8_VNNI, B, q_rows, cols) &&
+           qwen_mm_use(QWEN_MMK_INT8_VNNI, B, kv_rows, cols);
+#else
+    (void)q_rows; (void)kv_rows; (void)cols; (void)B; return 0;
+#endif
+}
+float qwen_i8mm_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b) {
+#if defined(__AVX512VNNI__)
+    return quantize_act_int8_col(qb, Xt, cols, B, b);
+#else
+    (void)qb; (void)Xt; (void)cols; (void)B; (void)b; return 0.0f;
+#endif
+}
+void qwen_i8mm_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
+                   const float *sx, int rows, int cols, int B, size_t tid, size_t nt) {
+#if defined(__AVX512VNNI__)
+    int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
+    int8_vmm_task(tid, nt, &c);
+#else
+    (void)Y; (void)W; (void)scale; (void)qXt; (void)sx; (void)rows; (void)cols; (void)B; (void)tid; (void)nt;
+#endif
+}
+void qwen_i8mm_run_qkv(float *q, float *k, float *v,
+                       const int8_t *Wq, const float *sq, const int8_t *Wk, const float *sk,
+                       const int8_t *Wv, const float *sv, const int8_t *qXt, const float *sx,
+                       int q_rows, int kv_rows, int cols, int B, size_t tid, size_t nt) {
+#if defined(__AVX512VNNI__) && defined(__x86_64__)
+    int8_qkv_mm_ctx c = {
+        { q, k, v }, { Wq, Wk, Wv }, { NULL, NULL, NULL }, { sq, sk, sv },
+        NULL, qXt, sx, { q_rows, kv_rows, kv_rows }, cols, B
+    };
+    int8_qkv_vnni_mm_task(tid, nt, &c);
+#else
+    (void)q; (void)k; (void)v; (void)Wq; (void)sq; (void)Wk; (void)sk; (void)Wv; (void)sv;
+    (void)qXt; (void)sx; (void)q_rows; (void)kv_rows; (void)cols; (void)B; (void)tid; (void)nt;
+#endif
 }

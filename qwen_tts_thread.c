@@ -6,6 +6,26 @@ double qwen_parallel_now_ms(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
+
+/* Sense-reversing spin barrier for phases inside one region: every participant is a
+ * distinct thread already running (the region was dispatched with nt == team), and the
+ * phases are microseconds long, so spinning is the right wait. */
+void qwen_barrier_init(qwen_barrier_t *b, int nt) { b->arrived = 0; b->phase = 0; b->nt = nt; }
+void qwen_barrier_wait(qwen_barrier_t *b) {
+    int ph = __atomic_load_n(&b->phase, __ATOMIC_ACQUIRE);
+    if (__atomic_add_fetch(&b->arrived, 1, __ATOMIC_ACQ_REL) == b->nt) {
+        __atomic_store_n(&b->arrived, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&b->phase, ph + 1, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&b->phase, __ATOMIC_ACQUIRE) == ph) {
+#if defined(__x86_64__) || defined(__i386__)
+            __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+#endif
+        }
+    }
+}
 #include "qwen_tts_costmap.h"
 
 static __thread int g_qwen_tls_tag = 0;
@@ -62,6 +82,7 @@ void qwen_threadpool_after_fork(void) {}
 int qwen_parallel_is_reentrant(void) { return 1; }
 int qwen_parallel_active(void) { return 0; }
 void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
+int qwen_parallel_team(void) { return 1; }
 
 #elif defined(_WIN32) && !defined(QWEN_USE_PTHREADS)
 
@@ -187,6 +208,7 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 int qwen_parallel_is_reentrant(void) { return 0; }
 int qwen_parallel_active(void) { return 0; }
 void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
+int qwen_parallel_team(void) { return 1; }
 
 #else
 
@@ -512,6 +534,10 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     P.job = NULL;
     pthread_mutex_unlock(&P.submit_mtx);
     qwen_region_end(QWEN_RGN_RT_POOL_DISPATCH);
+}
+
+int qwen_parallel_team(void) {
+    return (g_inited && P.nworkers > 0) ? P.nworkers + 1 : 1;
 }
 
 int qwen_parallel_is_reentrant(void) {
