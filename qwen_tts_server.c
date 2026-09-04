@@ -5,6 +5,7 @@
 #endif
 #endif
 #include "qwen_tts_server.h"
+#include "qwen_tts_costmap.h"
 #include "qwen_tts_kernels.h"
 #include <dlfcn.h>
 #include "qwen_tts.h"
@@ -1166,6 +1167,7 @@ static void srv_dump_counters_if_asked(void) {
     if (qwen_census_enabled()) qwen_census_report(NULL);
     if (qwen_matmat_stats_enabled()) qwen_matmat_stats_report(NULL);
     qwen_kernel_timing_report(NULL);
+    qwen_costmap_dump_env();
     fprintf(stderr, "[DUMP] v=1 pid=%d seq=%lld end\n", (int)getpid(), dump_seq);
     fflush(stderr);
 }
@@ -1186,7 +1188,8 @@ static void print_banner(int port, int n_workers) {
     qwen_provenance_report(stderr);
     /* The resolved dispatch table INSIDE the run's own log: engagement proof belongs in
        the timed run, not in a separate invocation with "the same" env. */
-    if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_SHAPE_CENSUS"))
+    if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") ||
+        getenv("QWEN_SHAPE_CENSUS") || getenv("QWEN_COST_MAP"))
         qwen_dispatch_map_report(stderr, NULL);
     fprintf(stderr, "Server listening on http://0.0.0.0:%d", port);
     if (n_workers > 1)
@@ -1546,6 +1549,16 @@ static int qwen_life_trace(void) {
     return v;
 }
 static void qwen_life_emit(batch_job_t *j) {
+    if (qwen_costmap_level()) {
+        const double d = srv_now_ms();
+        if (j->t_recv > 0.0 && d > j->t_recv)
+            qwen_region_add_ns(QWEN_RGN_RT_REQUEST,
+                               (unsigned long long)((d - j->t_recv) * 1e6));
+        if (j->t_admit > 0.0 && j->enq_ms > 0.0 && j->t_admit > j->enq_ms)
+            qwen_region_add_ns(QWEN_RGN_RT_ADMISSION,
+                               (unsigned long long)((j->t_admit - j->enq_ms) * 1e6));
+        qwen_costmap_request_done();
+    }
     if (!qwen_life_trace()) return;
     const double d = srv_now_ms();
     if (j->t_first == 0.0) j->t_first = d;
@@ -1719,6 +1732,7 @@ static double prewarm_now_ms(void) {
 }
 static void server_prewarm(qwen_tts_ctx_t *ctx) {
     if (getenv("QWEN_NO_PREWARM")) return;
+    qwen_costmap_count_requests(0);   /* a pre-warm is not a request */
     int sv_silent = ctx->silent;
     ctx->silent = 1;
     float *aud = NULL; int n = 0;
@@ -1726,6 +1740,7 @@ static void server_prewarm(qwen_tts_ctx_t *ctx) {
     int rc = qwen_tts_generate(ctx, "Warm up.", &aud, &n);
     free(aud);
     ctx->silent = sv_silent;
+    qwen_costmap_count_requests(1);
     reset_request_state(ctx);
     if (rc == 0 && n > 0)
         fprintf(stderr, "[serve] pre-warm: %.0f ms, %.2f s of audio discarded "
@@ -1782,7 +1797,8 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     single_arg_t swarg = { .ctx = single_ctx ? single_ctx : ctx, .jq = &jq_single, .reject = (single_ctx == NULL) };
     pthread_create(&single_thr, NULL, single_worker_main, &swarg);
 
-    if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_SHAPE_CENSUS"))
+    if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") ||
+        getenv("QWEN_SHAPE_CENSUS") || getenv("QWEN_COST_MAP"))
         qwen_dispatch_map_report(stderr, NULL);   /* engagement proof inside this run's log */
     fprintf(stderr, "Server listening on http://0.0.0.0:%d (continuous request-batching: max_batch=%d, %d readers%s)\n",
             port, max_batch, n_readers, single_ctx ? ", +1 single-job clone" : "");
@@ -1944,6 +1960,7 @@ static void qwen_worker_dump_counters(void) {
     if (qwen_census_enabled()) qwen_census_report(NULL);
     if (qwen_matmat_stats_enabled()) qwen_matmat_stats_report(NULL);
     qwen_kernel_timing_report(NULL);
+    qwen_costmap_dump_env();
     void (*yt)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "yieldtrace_report");
     if (yt) yt();
     fflush(stderr);
@@ -2038,6 +2055,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             for (int c = w * per; c < (w + 1) * per && c < ncpu; c++) CPU_SET(c, &set);
             if (sched_setaffinity(0, sizeof(set), &set) != 0) perror("sched_setaffinity");
             qwen_threadpool_after_fork();
+            qwen_costmap_after_fork();
             qwen_set_threads(threads_per);
             fprintf(stderr, "prefork: worker %d pid %d cpus %d-%d threads %d\n",
                     w, (int)getpid(), w * per, w * per + per - 1, threads_per);

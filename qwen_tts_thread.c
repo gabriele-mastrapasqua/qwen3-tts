@@ -1,5 +1,6 @@
 /* qwen_tts_thread.c - Cross-OS parallel-for */
 #include "qwen_tts_thread.h"
+#include "qwen_tts_costmap.h"
 
 static __thread int g_qwen_tls_tag = 0;
 int  qwen_tls_tag_get(void) { return g_qwen_tls_tag; }
@@ -36,12 +37,17 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     if (nt == 0) return;
     if (nt == 1) { fn(0, 1, ctx); return; }
     const int tag = g_qwen_tls_tag;
+    /* GCD's dispatch_apply both dispatches and joins, so on this backend the wait is
+     * inside the call and NOT separable: pool_wait_completion stays unrecorded here
+     * rather than being filled with a guess. */
+    qwen_region_begin(QWEN_RGN_RT_POOL_DISPATCH);
     dispatch_apply(nt, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                    ^(size_t tid) {
         qwen_ftz_on();
         qwen_tls_tag_set(tag);
         fn(tid, nt, ctx);
     });
+    qwen_region_end(QWEN_RGN_RT_POOL_DISPATCH);
 }
 
 void qwen_threadpool_start(int n_threads) { (void)n_threads; }
@@ -415,11 +421,14 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     }
     PS_INC(ps_dispatch);
     if (g_qp_meter) atomic_fetch_add(&g_qp_dispatches, 1);
+    qwen_region_begin(QWEN_RGN_RT_POOL_DISPATCH);
     qwen_job_t job;
     job.fn = fn; job.ctx = ctx; job.nt = nt; job.tag = g_qwen_tls_tag;
     atomic_init(&job.next, 0);
 
+    qwen_region_begin(QWEN_RGN_RT_POOL_SUBMIT);
     pthread_mutex_lock(&P.submit_mtx);
+    qwen_region_end(QWEN_RGN_RT_POOL_SUBMIT);
 
     int need = (int)nt - 1;
     if (need > P.nworkers) need = P.nworkers;
@@ -445,6 +454,10 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 
     run_chunks(&job);
 
+    /* The caller has finished its own chunks: everything from here to `completed ==
+     * need` is time spent WAITING FOR THE WORKERS, and nothing else.  That is the one
+     * kind of sync wait this pool can attribute honestly. */
+    qwen_region_begin(QWEN_RGN_RT_POOL_WAIT);
     int budget = qwen_pool_spin();
     while (budget-- > 0 &&
            atomic_load_explicit(&P.completed, memory_order_acquire) != need)
@@ -458,8 +471,10 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
         P.main_sleeping = 0;
         pthread_mutex_unlock(&P.mtx);
     }
+    qwen_region_end(QWEN_RGN_RT_POOL_WAIT);
     P.job = NULL;
     pthread_mutex_unlock(&P.submit_mtx);
+    qwen_region_end(QWEN_RGN_RT_POOL_DISPATCH);
 }
 
 int qwen_parallel_is_reentrant(void) {

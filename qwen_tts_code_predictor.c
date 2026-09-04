@@ -1,6 +1,7 @@
 /* qwen_tts_code_predictor.c - Code Predictor (MTP) forward pass */
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_costmap.h"
 #include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
 
@@ -498,6 +499,7 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     qwen_cp_layer_t *l = &ctx->cp_layers[layer];
     float *proj = ctx->cp_dec_ffn_out;
 
+    qwen_region_begin2(QWEN_RGN_CP_D_QKV);
     if (l->wq_q4) {
         qwen_matvec_q4_0_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
                               l->wq_q4, l->wk_q4, l->wv_q4,
@@ -514,7 +516,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
                               x_norm, cp_h, cp_q_dim, cp_kv_dim);
     }
     CPB_MARK(CPB_QKV);
+    qwen_region_end2(QWEN_RGN_CP_D_QKV);
 
+    qwen_region_begin2(QWEN_RGN_CP_D_ATTN);
     qwen_rms_norm_per_head(ctx->cp_dec_q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
     qwen_rms_norm_per_head(ctx->cp_dec_k, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
     CPB_MARK(CPB_QKNORM);
@@ -536,7 +540,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
                                  1, pos + 1, c->cp_num_heads, c->cp_num_kv_heads,
                                  c->cp_head_dim, attn_scale, pos);
     CPB_MARK(CPB_ATTN);
+    qwen_region_end2(QWEN_RGN_CP_D_ATTN);
 
+    qwen_region_begin2(QWEN_RGN_CP_D_OPROJ);
     if (l->wo_q4)
         qwen_matvec_q4_0(proj, l->wo_q4, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
     else if (l->wo_int8)
@@ -547,7 +553,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
 
     qwen_rms_norm_residual(x_norm, x, proj, l->post_attn_norm, cp_h, eps);
     CPB_MARK(CPB_RESNORM);
+    qwen_region_end2(QWEN_RGN_CP_D_OPROJ);
 
+    qwen_region_begin2(QWEN_RGN_CP_D_GATEUP);
     if (l->gate_up_fused_q2)
         qwen_matvec_q2_0(ctx->cp_dec_gate, l->gate_up_fused_q2, x_norm, 2 * cp_inter, cp_h);
     else if (l->gate_up_fused_q4)
@@ -560,7 +568,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     CPB_MARK(CPB_FFN_GU);
     qwen_swiglu_inplace(ctx->cp_dec_gate, ctx->swiglu_tmp, cp_inter);
     CPB_MARK(CPB_SWIGLU);
+    qwen_region_end2(QWEN_RGN_CP_D_GATEUP);
 
+    qwen_region_begin2(QWEN_RGN_CP_D_DOWN);
     if (ql_ffn_on) {
         long z = 0;
         for (int i = 0; i < cp_inter; i++)
@@ -592,6 +602,7 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
     }
     CPB_MARK(CPB_RESNORM);
+    qwen_region_end2(QWEN_RGN_CP_D_DOWN);
 }
 
 void *g_cuda_cp_state = NULL;
@@ -666,7 +677,13 @@ static inline void cp_dcol2(float *dst, const float *Y2, int n, int p) {
     for (int i = 0; i < n; i++) dst[i] = Y2[2 * i + p];
 }
 
+static void cp_prefill2_body(qwen_tts_ctx_t *ctx, int mode, float *x0, float *x1);
 static void cp_prefill2(qwen_tts_ctx_t *ctx, int mode, float *x0, float *x1) {
+    qwen_region_begin(QWEN_RGN_CP_PREFILL);
+    cp_prefill2_body(ctx, mode, x0, x1);
+    qwen_region_end(QWEN_RGN_CP_PREFILL);
+}
+static void cp_prefill2_body(qwen_tts_ctx_t *ctx, int mode, float *x0, float *x1) {
     qwen_tts_config_t *c = &ctx->config;
     int cp_h  = c->cp_hidden_size;
     int qd    = c->cp_num_heads * c->cp_head_dim;
@@ -800,6 +817,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 #endif
 
     ql_init();
+    qwen_region_begin(QWEN_RGN_CP_DECODE);
 
     if (ctx->cp_roughness > 0.0f && !ctx->cp_rough_built) cp_build_roughness(ctx);
 
@@ -813,7 +831,8 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     cp_mtp_project(ctx, cp_x, talker_hidden);
 
     static __thread float *x1in = NULL;
-    if (!x1in) { x1in = (float *)malloc((size_t)cp_h * sizeof(float)); if (!x1in) return -1; }
+    if (!x1in) { x1in = (float *)malloc((size_t)cp_h * sizeof(float));
+                 if (!x1in) { qwen_region_end(QWEN_RGN_CP_DECODE); return -1; } }
     {
         int h = c->hidden_size;
         if (ctx->codec_embedding_bf16 && code0 >= 0 && code0 < c->codec_vocab_size) {
@@ -841,6 +860,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     }
 
     qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
+    qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
     if (ctx->cp_lm_head_q4[0])
         out_codes[0] = qwen_argmax_matvec_q4_0(cp_normed, ctx->cp_lm_head_q4[0], cp_h, c->codebook_size);
     else if (ctx->cp_lm_head_int8[0])
@@ -848,6 +868,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
                                                 ctx->cp_lm_head_scale[0], cp_h, c->codebook_size);
     else
         out_codes[0] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[0], cp_h, c->codebook_size);
+    qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
     CPB_MARK(CPB_LMHEAD);
 
     const int _cx = cpx_on();
@@ -876,6 +897,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 
         qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
         if (_cx) { double _t = cpx_now(); cpx_norm += _t - _cm; _cm = _t; }
+        qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
         if (ctx->cp_lm_head_q4[g])
             out_codes[g] = qwen_argmax_matvec_q4_0(cp_normed, ctx->cp_lm_head_q4[g], cp_h, c->codebook_size);
         else if (ctx->cp_lm_head_int8[g])
@@ -883,6 +905,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
                                                     ctx->cp_lm_head_scale[g], cp_h, c->codebook_size);
         else
             out_codes[g] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[g], cp_h, c->codebook_size);
+        qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
         CPB_MARK(CPB_LMHEAD);
         if (_cx) { double _t = cpx_now(); cpx_head += _t - _cm; _cm = _t; }
     }
@@ -900,6 +923,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
         fputc('\n', ql_codes_fp);
     }
 
+    qwen_region_end(QWEN_RGN_CP_DECODE);
     return 0;
 }
 
@@ -921,12 +945,15 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     qwen_cp_layer_t *l = &ctx->cp_layers[layer];
 #define CP_SKIP(b) (active && !active[b])
 
+    qwen_region_begin2(QWEN_RGN_CP_D_QKV);
     qwen_batch_proj_qkv(bb->cp_q, bb->cp_k, bb->cp_v,
                         l->wq_bf16, l->wq_int8, l->wq_scale, l->wq_q4,
                         l->wk_bf16, l->wk_int8, l->wk_scale, l->wk_q4,
                         l->wv_bf16, l->wv_int8, l->wv_scale, l->wv_q4,
                         x_norm, cqd, ckvd, ch, ch, BW, bb->act_idx, fm,
                         bb->cp_Xt, bb->cp_Yt);
+    qwen_region_end2(QWEN_RGN_CP_D_QKV);
+    qwen_region_begin2(QWEN_RGN_CP_D_ATTN);
     for (int b = 0; b < B; b++) {
         if (CP_SKIP(b)) continue;
         qwen_rms_norm_per_head(bb->cp_q + (size_t)b * cqd,  l->q_norm, 1, c->cp_num_heads,    c->cp_head_dim, eps);
@@ -941,18 +968,24 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                      bb->cp_kv_k + lbase, bb->cp_kv_v + lbase, 1, pos + 1,
                                      c->cp_num_heads, c->cp_num_kv_heads, c->cp_head_dim, ascale, pos);
     }
+    qwen_region_end2(QWEN_RGN_CP_D_ATTN);
+    qwen_region_begin2(QWEN_RGN_CP_D_OPROJ);
     qwen_batch_proj_q(bb->cp_proj, l->wo_bf16, l->wo_int8, l->wo_scale, l->wo_q4, bb->cp_attn, ch, cqd, cqd, BW, bb->act_idx, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++) {
         if (CP_SKIP(b)) continue;
         qwen_rms_norm_residual(x_norm + (size_t)b * ch, x + (size_t)b * ch,
                                bb->cp_proj + (size_t)b * ch, l->post_attn_norm, ch, eps);
     }
+    qwen_region_end2(QWEN_RGN_CP_D_OPROJ);
+    qwen_region_begin2(QWEN_RGN_CP_D_GATEUP);
     qwen_batch_proj_q(bb->cp_gate, l->gate_up_fused_bf16, l->gate_up_fused_int8, l->gate_up_fused_scale,
                       l->gate_up_fused_q4, x_norm, 2 * cint, ch, ch, BW, bb->act_idx, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++) {
         if (CP_SKIP(b)) continue;
         qwen_swiglu_inplace(bb->cp_gate + (size_t)b * 2 * cint, bb->cp_swiglu_tmp, cint);
     }
+    qwen_region_end2(QWEN_RGN_CP_D_GATEUP);
+    qwen_region_begin2(QWEN_RGN_CP_D_DOWN);
     qwen_batch_proj_q(bb->cp_proj, l->down_bf16, l->down_int8, l->down_scale, l->down_q4,
                       bb->cp_gate, ch, cint, 2 * cint, BW, bb->act_idx, fm, bb->cp_Xt, bb->cp_Yt);
     if (layer + 1 < c->cp_num_layers) {
@@ -968,6 +1001,7 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
             for (int i = 0; i < ch; i++) xb[i] += pb[i];
         }
     }
+    qwen_region_end2(QWEN_RGN_CP_D_DOWN);
 #undef CP_SKIP
 }
 
@@ -1035,6 +1069,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         }
     }
 
+    qwen_region_begin(QWEN_RGN_CP_DECODE);
     qwen_batch_pack_active(bb, active);
 
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
@@ -1060,8 +1095,10 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 
     for (int b = 0; b < B; b++) {
         if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + 0] = 0; continue; }
+        qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
         qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
         out_codes[(size_t)b * 15 + 0] = cp_lm_argmax(ctx, normed, 0, ch, c->codebook_size);
+        qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
     }
 
     for (int g = 1; g < 15; g++) {
@@ -1077,11 +1114,14 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         batch_cp_transformer_step(ctx, bb, cx, cxn, pos, active);
         for (int b = 0; b < B; b++) {
             if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + g] = 0; continue; }
+            qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
             qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
             out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, normed, g, ch, c->codebook_size);
+            qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
         }
     }
     qwen_mm_component(prev_comp);
+    qwen_region_end(QWEN_RGN_CP_DECODE);
     return 0;
 #undef CPB_SKIP
 }

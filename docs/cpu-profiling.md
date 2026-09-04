@@ -1,4 +1,4 @@
-# CPU profiling gate — `make cpu-check`, `make profile-cpu-check`
+# CPU profiling gate — `make cpu-check`, `make profile-cpu-check`, `make cost-map`
 
 > A fast kernel does not make an efficient engine. The two largest x86 wins of 2026-09
 > were both *around* the kernels — a dispatch predicate that silently chose the f32/SGEMM
@@ -158,6 +158,89 @@ directions, so "what was recorded" and "what is compared" cannot drift. It is th
 command of an optimisation session, and the one that protects a long session from
 compaction: the profile you are reasoning from must describe the binary you are about to
 change.
+
+## `make cost-map`: where the wall time goes around the kernels
+
+The shape census answers *which* kernel ran, with which shape, on which ISA path. It does
+not answer *where the time went*, and in particular it says nothing about the work that is
+not a kernel: transposes, RMS norms, KV writes, the swap between layouts, the wait for the
+thread pool. `QWEN_COST_MAP` adds a second, coarse layer for that.
+
+**The semantics are fixed before any number is collected**, because a table that mixes
+inclusive and exclusive timing is worse than no table:
+
+- every region is **inclusive** — it contains everything entered inside it;
+- **self time is derived**, `ns - child_ns`, never measured separately;
+- **nesting is declared** in the region table and **verified at runtime**: a `begin` whose
+  dynamic parent is not the declared one bumps `nest_mismatch` instead of being accepted.
+  `QWEN_RGN_MULTI` marks the regions that legitimately have several parents;
+- accumulation is **thread-local**, merged only at dump time, so the hot path has no
+  atomic read-modify-write and no lock;
+- one `clock_gettime(CLOCK_MONOTONIC)` per begin and per end, **never inside an inner
+  kernel loop**. When the map is off, a marker is one load of an `int` and a branch.
+
+Two levels, so the per-layer sites cannot tax the default:
+
+| `QWEN_COST_MAP` | what it adds |
+|---|---|
+| unset / `0` | off |
+| `1` | component totals, Talker prefill stages, decoder stages, pool and server |
+| `2` | plus the per-layer CP decode stages and the Talker prefill layout transposes |
+
+```
+make cost-map           PROFILE_MODEL=… PROFILE_PROFILE=… COSTMAP_CONC=1 COSTMAP_LEVEL=1
+make cost-map-overhead  …same…
+```
+
+`cost-map` runs the workload **twice with the same binary** — census only, then census plus
+cost map — and diffs the two census reports. The cost map ships with the proof that turning
+it on did not move a single executed path id, coverage number, UNKNOWN or fallback count;
+without that proof the numbers would be unfalsifiable. `cost-map-overhead` measures the
+price **A/B/B/A interleaved**, never one clean run followed by one instrumented run: on this
+class of box the drift between two identical runs can be larger than the effect, and the
+report says so explicitly when the clean arms spread more than the measured delta.
+
+### `sync_wait` is not one bucket
+
+The one thing a wait accounting must not become is a drawer for everything unexplained.
+What this pool can and cannot separate:
+
+| category | status |
+|---|---|
+| waiting for worker completion | **measured** — `runtime.pool_wait_completion`, the window between the caller finishing its own chunks and `completed == need`, one clock pair per dispatch |
+| waiting to submit a job | **measured** — `runtime.pool_submit_wait`, the `submit_mtx` acquisition |
+| scheduler / admission idle | **derived** — `runtime.admission`, from the job timestamps (`enq_ms` → `t_admit`) |
+| barrier synchronisation | **UNRESOLVED** — this pool has no distinct barrier primitive; completion is a counter plus a condvar, so barrier time is not separable from "waiting for worker completion" without changing the pool |
+
+On Apple's GCD backend `dispatch_apply` both dispatches and joins, so the wait is inside the
+call and is *not* recorded rather than guessed; only `runtime.pool_dispatch` appears there.
+
+### Regions that are derived, not bracketed
+
+The server request lifecycle crosses threads: the connection thread receives, the scheduler
+admits, the batch loop serves. No thread-local stack can bracket that, so
+`runtime.request.total` and `runtime.admission` are added as durations from the job
+timestamps and carry `"mode": "derived"` in the JSON. Everything else is `"mode": "stack"`.
+The report prints the column, so the two kinds are never read as the same measurement.
+
+### The prefork parent's work is not counted N times
+
+A prefork server loads the model and pre-warms in the parent, then forks. Without care
+every worker would inherit those counters and report them again, so merging N workers
+would count one pre-warm N times. `qwen_costmap_after_fork()` clears the map in the child
+next to `qwen_threadpool_after_fork()`: a worker's cost map describes only what that
+worker actually served, and start-up work is out of scope by construction.
+
+### Reading the table
+
+Shares are given **within a thread role**. The speech decoder runs on its own thread
+concurrently with the Talker and the code predictor, so the roles do **not** sum to 100% of
+the request, and any report that presented them as one flat breakdown would be lying.
+
+The integrity block is a gate: `nest_mismatch`, region stack overflows and unbalanced ends
+must all be zero, otherwise the tree is not trustworthy and the numbers are refused.
+`leaked` counts regions closed by the unwind that every component entry point performs on
+the way out — early `return`s inside a decoder body cannot leave a region open forever.
 
 ## Counters that now have a delimiter
 

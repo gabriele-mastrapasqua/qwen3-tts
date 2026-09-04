@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_costmap.h"
 #include "qwen_tts_thread.h"
 #include "ingot/safetensors.h"
 
@@ -710,8 +711,19 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
     return 0;
 }
 
+static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
+                          float **audio_out, int *n_samples);
 int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
                                 float **audio_out, int *n_samples) {
+    const int own = qwen_region_begin_unique(QWEN_RGN_SD_TOTAL);
+    const int d = qwen_region_depth();
+    int rc = sd_decode_body(ctx, codes, n_frames, audio_out, n_samples);
+    qwen_region_unwind(d);
+    if (own) qwen_region_end(QWEN_RGN_SD_TOTAL);
+    return rc;
+}
+static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
+                          float **audio_out, int *n_samples) {
     qwen_mm_component(QWEN_COMP_DECODER);
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
     qwen_tts_config_t *c = &ctx->config;
@@ -1901,9 +1913,22 @@ static int sd_exact_stream_enabled(void) {
     return !(e && *e && *e != '0');
 }
 
+static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
+                             const int *new_codes, int new_frames,
+                             float **audio_out, int *n_samples);
 int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                                           const int *new_codes, int new_frames,
                                           float **audio_out, int *n_samples) {
+    const int own = qwen_region_begin_unique(QWEN_RGN_SD_TOTAL);
+    const int d = qwen_region_depth();
+    int rc = sd_stream_st_body(ctx, st, new_codes, new_frames, audio_out, n_samples);
+    qwen_region_unwind(d);
+    if (own) qwen_region_end(QWEN_RGN_SD_TOTAL);
+    return rc;
+}
+static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
+                             const int *new_codes, int new_frames,
+                             float **audio_out, int *n_samples) {
     qwen_mm_component(QWEN_COMP_DECODER);
     const int  _ph    = sd_phase_on();
     const double _ph_call0 = _ph ? sd_ph_now() : 0.0;
@@ -1936,6 +1961,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     int half_hd = head_dim / 2;
 
     if (_ph) _ph_mark = sd_ph_now();
+    qwen_region_begin(QWEN_RGN_SD_VQ);
     float *vq_out = (float *)aligned_calloc((int64_t)new_frames * vq_hidden, sizeof(float));
     float *cb_sum = (float *)aligned_malloc(cb_dim * sizeof(float));
 
@@ -1972,6 +1998,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     free(cb_sum);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[0] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_VQ); qwen_region_begin(QWEN_RGN_SD_PRECONV);
     int pad_frames = st->vq_pad_valid ? 2 : 0;
     int conv_in_len = pad_frames + new_frames;
     float *vq_cf = (float *)aligned_calloc((int64_t)vq_hidden * conv_in_len, sizeof(float));
@@ -2006,6 +2033,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     free(vq_cf);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[1] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_PRECONV); qwen_region_begin(QWEN_RGN_SD_INPROJ);
     float *hidden = (float *)aligned_malloc((int64_t)new_frames * dec_hidden * sizeof(float));
 #ifdef USE_BLAS
     float *pre_conv_rm = (float *)aligned_malloc((int64_t)new_frames * latent_dim * sizeof(float));
@@ -2037,6 +2065,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 #endif
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[2] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_INPROJ); qwen_region_begin(QWEN_RGN_SD_TRANSFORMER);
     int need = (st->kv_len + new_frames) - st->kv_base;
     if (need > st->kv_alloc) {
         int keep_from = st->kv_len - (window - 1);
@@ -2264,6 +2293,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     free(q); free(new_k); free(new_v); free(x_norm); free(attn_out);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[3] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_TRANSFORMER); qwen_region_begin(QWEN_RGN_SD_OUTPROJ);
     if (sd->final_norm_weight) {
         qwen_rms_norm(hidden, hidden, sd->final_norm_weight, new_frames, dec_hidden, eps);
     }
@@ -2314,6 +2344,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
     free(hidden);
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[4] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_OUTPROJ);
     if (sd_exact_stream_enabled()) {
         float *signal = (float *)aligned_malloc((int64_t)latent_dim * new_frames * sizeof(float));
         if (!signal) return -1;
@@ -2325,14 +2356,18 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 
         float *new_audio = NULL;
         int new_samples = 0;
+        qwen_region_begin(QWEN_RGN_SD_CONVSTACK);
         int ret = conv_decoder_forward_streaming(ctx, st, signal, new_frames,
                                                  &new_audio, &new_samples);
+        qwen_region_end(QWEN_RGN_SD_CONVSTACK);
         if (ret != 0) return ret;
 
+        qwen_region_begin(QWEN_RGN_SD_POST);
         st->frames_decoded += new_frames;
         st->samples_produced += new_samples;
         *audio_out = new_audio;
         *n_samples = new_samples;
+        qwen_region_end(QWEN_RGN_SD_POST);
         SD_PHASE_EMIT("per-slot", 1, new_frames);
         return 0;
     }
@@ -2356,10 +2391,13 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 
     float *full_audio = NULL;
     int full_samples = 0;
+    qwen_region_begin(QWEN_RGN_SD_CONVSTACK);
     int ret = conv_decoder_forward(ctx, signal, latent_dim, window_frames,
                                     &full_audio, &full_samples);
+    qwen_region_end(QWEN_RGN_SD_CONVSTACK);
     if (ret != 0) return ret;
 
+    qwen_region_begin(QWEN_RGN_SD_POST);
     int context_samples = context_frames * 1920;
     int new_samples = full_samples - context_samples;
     if (new_samples <= 0) {
@@ -2378,6 +2416,7 @@ int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_
 
     *audio_out = new_audio;
     *n_samples = new_samples;
+    qwen_region_end(QWEN_RGN_SD_POST);
     SD_PHASE_EMIT("per-slot-windowed", 1, new_frames);
     return 0;
 }
@@ -2742,8 +2781,17 @@ static int sd_batch_fallback(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, int 
 }
 
 #ifdef USE_BLAS
+static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, int n_items);
 int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
                                                qwen_sd_batch_item_t *it, int n_items) {
+    const int own = qwen_region_begin_unique(QWEN_RGN_SD_TOTAL);
+    const int d = qwen_region_depth();
+    int rc = sd_stream_batch_body(ctx, it, n_items);
+    qwen_region_unwind(d);
+    if (own) qwen_region_end(QWEN_RGN_SD_TOTAL);
+    return rc;
+}
+static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, int n_items) {
     qwen_mm_component(QWEN_COMP_DECODER);
     const int  _ph    = sd_phase_on();
     const double _ph_call0 = _ph ? sd_ph_now() : 0.0;
@@ -2796,6 +2844,7 @@ int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
     TF = fr.total;
 
     if (_ph) { sd_p6a = sd_p6b = sd_p6c = 0.0; _ph_mark = sd_ph_now(); }
+    qwen_region_begin(QWEN_RGN_SD_VQ);
     vq_out = (float *)aligned_calloc(TF * vq_hidden, sizeof(float));
     cb_sum = (float *)aligned_malloc(cb_dim * sizeof(float));
     if (!vq_out || !cb_sum) goto done;
@@ -2835,6 +2884,7 @@ int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
     }
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[0] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_VQ); qwen_region_begin(QWEN_RGN_SD_PRECONV);
     vq_cf = (float *)aligned_malloc((int64_t)vq_hidden * TF * sizeof(float));
     if (!vq_cf) goto done;
     for (int b = 0; b < nb; b++)
@@ -2859,6 +2909,7 @@ int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
     for (int b = 0; b < nb; b++) sts[b]->vq_pad_valid = 1;
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[1] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_PRECONV); qwen_region_begin(QWEN_RGN_SD_INPROJ);
     hidden = (float *)aligned_malloc(TF * dec_hidden * sizeof(float));
     pre_conv_rm = (float *)aligned_malloc(TF * latent_dim * sizeof(float));
     if (!hidden || !pre_conv_rm) goto done;
@@ -2877,6 +2928,7 @@ int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
                 hidden[f * dec_hidden + o] += sd->input_proj_bias[o];
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[2] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_INPROJ); qwen_region_begin(QWEN_RGN_SD_TRANSFORMER);
     for (int b = 0; b < nb; b++) {
         qwen_sd_stream_state_t *st = sts[b];
         int nf = fr.len[b];
@@ -3050,6 +3102,7 @@ int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
     free(x_norm); x_norm = NULL; free(attn_out); attn_out = NULL;
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[3] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_TRANSFORMER); qwen_region_begin(QWEN_RGN_SD_OUTPROJ);
     if (sd->final_norm_weight)
         qwen_rms_norm(hidden, hidden, sd->final_norm_weight, (int)TF, dec_hidden, eps);
 
@@ -3095,6 +3148,7 @@ int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
     }
 
     if (_ph) { double _t = sd_ph_now(); _ph_p[4] += _t - _ph_mark; _ph_mark = _t; }
+    qwen_region_end(QWEN_RGN_SD_OUTPROJ);
     signal = (float *)aligned_malloc((int64_t)latent_dim * TF * sizeof(float));
     if (!signal) goto done;
     for (int64_t f = 0; f < TF; f++)
@@ -3103,7 +3157,9 @@ int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx,
     free(lat_tmp); lat_tmp = NULL;
 
     {
+        qwen_region_begin(QWEN_RGN_SD_CONVSTACK);
         int frc = conv_decoder_forward_streaming_batch(ctx, sts, nb, signal, &fr, auds, ans);
+        qwen_region_end(QWEN_RGN_SD_CONVSTACK);
         signal = NULL;
         if (frc != 0) { for (int b = 0; b < nb; b++) free(auds[b]); goto done; }
     }

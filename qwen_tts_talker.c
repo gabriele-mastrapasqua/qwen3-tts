@@ -1,6 +1,7 @@
 /* qwen_tts_talker.c - Talker LLM forward pass with KV cache */
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_costmap.h"
 #include "qwen_tts_thread.h"
 #include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
@@ -705,6 +706,7 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
 
     if (kv_cache_grow(ctx, pos + 1) != 0) return -1;
 
+    qwen_region_begin(QWEN_RGN_TK_DECODE);
     actmap_init(c->num_layers, h);
 
     memcpy(ctx->dec_x, embed, h * sizeof(float));
@@ -820,6 +822,7 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
     if (g_actmap_path) { actmap_accum(c->num_layers, hidden_out, h); g_actmap_frames++; }
 
     ctx->kv_len = pos + 1;
+    qwen_region_end(QWEN_RGN_TK_DECODE);
     return 0;
 }
 
@@ -839,15 +842,19 @@ static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
     }
     for (int s0 = 0; s0 < seq; s0 += 16) {
         int B = seq - s0; if (B > 16) B = 16;
+        qwen_region_begin2(QWEN_RGN_TK_PF_LAYOUT_IN);
         for (int b = 0; b < B; b++) {
             const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
             for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
         }
+        qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_IN);
         qwen_matmat_bf16(yT, W, xT, out_dim, in_dim, B);
+        qwen_region_begin2(QWEN_RGN_TK_PF_LAYOUT_OUT);
         for (int b = 0; b < B; b++) {
             float *yr = Y + (int64_t)(s0 + b) * out_dim;
             for (int o = 0; o < out_dim; o++) yr[o] = yT[(int64_t)o * B + b];
         }
+        qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_OUT);
     }
 }
 
@@ -1235,6 +1242,7 @@ int qwen_prefill_matmat_resolved(const char **why) {
 int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     double pf_mark = 0.0;
     qwen_mm_component(QWEN_COMP_TALKER);
+    qwen_region_begin(QWEN_RGN_TK_PREFILL);
     static int trace = -1;
     if (trace < 0) { const char *e = getenv("QWEN_TTFA_TRACE"); trace = (e && e[0] && e[0] != '0'); }
     double pfx_t0 = trace ? pfx_now_ms() : 0.0;
@@ -1317,6 +1325,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         !pref_attn_out || !pref_gate || !pref_proj ||
         !wq_f32 || !wk_f32 || !wv_f32 || !wo_f32 || !gate_up_f32 || !down_f32) {
         fprintf(stderr, "Error: prefill allocation failed\n");
+        qwen_region_end(QWEN_RGN_TK_PREFILL);
         return -1;
     }
 
@@ -1371,6 +1380,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 
         if (!use_matmat) {
+            qwen_region_begin(QWEN_RGN_TK_PF_WEIGHT_PREP);
             tk_prefill_weight_f32(wq_f32, PREFW(l, wq), l->wq_int8, l->wq_scale,
                                   l->wq_q4, l->wq_q6, q_dim, h, pref_quant);
             tk_prefill_weight_f32(wk_f32, PREFW(l, wk), l->wk_int8, l->wk_scale,
@@ -1385,12 +1395,16 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                                   2 * inter, h, pref_quant);
             tk_prefill_weight_f32(down_f32, PREFW(l, down), l->down_int8, l->down_scale,
                                   l->down_q4, l->down_q6, h, inter, pref_quant);
+            qwen_region_end(QWEN_RGN_TK_PF_WEIGHT_PREP);
         }
 
         PF_ACC(8); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
         qwen_rms_norm(pref_x_norm, residual, l->input_norm, n_new, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
 
         PF_ACC(0); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_QKV);
         if (use_matmat) {
             double _p = trace ? pfx_now_ms() : 0.0;
             prefill_proj_matmat(pref_q, PREFW(l, wq), pref_x_norm, n_new, h, q_dim,  pp_xT, pp_yT);
@@ -1441,7 +1455,10 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_QKV);
+
         PF_ACC(1); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_QKROPEKV);
         qwen_rms_norm_per_head(pref_q, l->q_norm, n_new, c->num_heads, c->head_dim, eps);
         qwen_rms_norm_per_head(pref_kn, l->k_norm, n_new, c->num_kv_heads, c->head_dim, eps);
 
@@ -1465,13 +1482,18 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         f32_to_bf16_vec(ctx->kv_cache_k + cache_base, pref_k, (int64_t)seq_len * kv_dim);
         f32_to_bf16_vec(ctx->kv_cache_v + cache_base, pref_v, (int64_t)seq_len * kv_dim);
 
+        qwen_region_end(QWEN_RGN_TK_PF_QKROPEKV);
+
         PF_ACC(4); PF_T0();
         float scale = 1.0f / sqrtf((float)c->head_dim);
+        qwen_region_begin(QWEN_RGN_TK_PF_ATTN);
         qwen_causal_attention_prefill(pref_attn_out, pref_q, pref_k, pref_v,
                               n_new, seq_len, c->num_heads, c->num_kv_heads,
                               c->head_dim, scale, pos0);
+        qwen_region_end(QWEN_RGN_TK_PF_ATTN);
 
         PF_ACC(5); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_OPROJ);
         if (use_matmat) {
             double _p = trace ? pfx_now_ms() : 0.0;
             prefill_proj_matmat(pref_proj, PREFW(l, wo), pref_attn_out, n_new, q_dim, h, pp_xT, pp_yT);
@@ -1500,10 +1522,15 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_OPROJ);
+
         PF_ACC(6); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
         qwen_rms_norm(pref_x_norm, residual, l->post_attn_norm, n_new, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
 
         PF_ACC(7); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_GATEUP);
         if (use_matmat) {
             prefill_proj_matmat(pref_gate, PREFW(l, gate_up_fused), pref_x_norm, n_new, h, 2 * inter, pp_xT, pp_yT);
         } else {
@@ -1526,6 +1553,9 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_GATEUP);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_FFN_ACT);
         for (int s = 0; s < n_new; s++) {
             float *src = pref_gate + (int64_t)s * 2 * inter;
             float *dst = pref_gate + (int64_t)s * inter;
@@ -1540,6 +1570,9 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             }
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_FFN_ACT);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_DOWN);
         if (use_matmat) {
             prefill_proj_matmat(pref_proj, l->down_bf16, pref_gate, n_new, inter, h, pp_xT, pp_yT);
             { double _t = trace ? pfx_now_ms() : 0.0;
@@ -1567,6 +1600,8 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 #endif
         }
+
+        qwen_region_end(QWEN_RGN_TK_PF_DOWN);
 
         if (ctx->debug) {
             fprintf(stderr, "  Layer %d/%d done", layer + 1, c->num_layers);
@@ -1639,6 +1674,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                 "unacc=%.3f\n", n_new, pf_ph[0],pf_ph[1],pf_ph[2],pf_ph[3],pf_ph[4],
                 pf_ph[5],pf_ph[6],pf_ph[7],pf_ph[8], _sum, _tot, _tot-_sum);
     }
+    qwen_region_end(QWEN_RGN_TK_PREFILL);
     return 0;
 }
 
@@ -1926,9 +1962,10 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     int B = bb->B, h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
     float eps = c->rms_norm_eps;
     if (ctx->layers[0].wq_bf16 == NULL) return -2;
+    qwen_region_begin(QWEN_RGN_TK_DECODE);
     int maxpos = 0;
     for (int b = 0; b < B; b++) { int p = pos_arr ? pos_arr[b] : bb->kv_len; if (p > maxpos) maxpos = p; }
-    if (maxpos + 1 > bb->kv_max) return -1;
+    if (maxpos + 1 > bb->kv_max) { qwen_region_end(QWEN_RGN_TK_DECODE); return -1; }
 
     /* Same attribution bug the batched CP had: without this the batched Talker's
      * kernels inherit whatever component ran last (the decoder thread). */
@@ -1998,6 +2035,7 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     #undef POS_B
     #undef ACTIVE_B
     qwen_mm_component(prev_comp);
+    qwen_region_end(QWEN_RGN_TK_DECODE);
     return 0;
 }
 

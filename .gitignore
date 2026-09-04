@@ -23,6 +23,7 @@ tools/para/.venv/
 !tools/perf_profile.py
 !tools/dispatch_gate.py
 !tools/profile_check.py
+!tools/costmap_report.py
 !tools/wav_qc.py
 !tools/onset_report.py
 # No trailing slash: these may be symlinks rather than real directories.

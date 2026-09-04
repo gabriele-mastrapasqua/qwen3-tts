@@ -111,6 +111,7 @@ SRCS = main.c \
        qwen_tts_speech_decoder.c \
        qwen_tts_kernels.c \
        qwen_tts_dispatch.c \
+       qwen_tts_costmap.c \
        qwen_tts_thread.c \
        qwen_tts_kernels_generic.c \
        qwen_tts_kernels_neon.c \
@@ -197,6 +198,11 @@ help:
 	@echo "                               expected-vs-observed per ISA class -> profiles/<date>_<host>_<sha8>/"
 	@echo "  make dispatch-map          - just the resolved dispatch table (./qwen_tts --dispatch-map)"
 	@echo "  make profile-cpu-check     - is the last profile still valid for THIS binary/source/env/host?"
+	@echo "  make cost-map              - coarse cost map: where the wall time goes AROUND the kernels."
+	@echo "                               Runs census-only vs census+cost-map with the SAME binary and"
+	@echo "                               proves the instrumentation moved no executed path."
+	@echo "                               COSTMAP_LEVEL=1 macro, =2 adds per-layer CP + prefill layout."
+	@echo "  make cost-map-overhead     - what the cost map costs, A/B/B/A interleaved (box drift)"
 	@echo ""
 	@echo "A newly provisioned box (IN THIS ORDER — see docs/hardware-testing.md):"
 	@echo "  make server-hw-check       - the truth about the silicon: hardware + memory bandwidth"
@@ -821,6 +827,21 @@ profile-cpu: $(TARGET) $(MEMBW_BIN)
 	@MEMBW_BIN=$(MEMBW_BIN) PROFILES_DIR=$(PROFILES_DIR) CPU_PROFILE=$(PROFILE_PROFILE) CPU_MODEL=$(PROFILE_MODEL) \
 	  PROFILE_TOPO=$(PROFILE_TOPO) PROFILE_CONC=$(PROFILE_CONC) PROFILE_WAVES=$(PROFILE_WAVES) \
 	  PROFILE_CLASSES=$(PROFILE_CLASSES) PROFILE_BANK=$(PROFILE_BANK) bash tools/profile_cpu.sh
+
+# ── cost-map, V1 step 2: where the wall time goes AROUND the kernels ──────────
+# Coarse semantic regions (inclusive, thread-local, merged at dump).  `cost-map` runs
+# the workload twice with the same binary — census only, then census + cost map — so
+# the report always ships with the proof that the instrumentation did not move the
+# executed paths.  `cost-map-overhead` measures what it costs, A/B/B/A interleaved
+# because one clean run followed by one instrumented run cannot outvote box drift.
+COSTMAP_LEVEL ?= 1
+COSTMAP_CONC  ?= 1
+cost-map: $(TARGET)
+	@bash tools/costmap_parity.sh --model $(PROFILE_MODEL) --profile $(PROFILE_PROFILE) \
+	  --conc $(COSTMAP_CONC) --level $(COSTMAP_LEVEL) --waves $(PROFILE_WAVES) --topo $(PROFILE_TOPO)
+cost-map-overhead: $(TARGET)
+	@bash tools/costmap_ab.sh --model $(PROFILE_MODEL) --profile $(PROFILE_PROFILE) \
+	  --conc $(COSTMAP_CONC) --level $(COSTMAP_LEVEL) --waves $(PROFILE_WAVES) --topo $(PROFILE_TOPO)
 
 # ── CPU profiling gate ────────────────────────────────────────────────────────────
 # One artifact directory per run, the same gate language everywhere.  cpu-check is the

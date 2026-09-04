@@ -2,6 +2,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_voice_clone.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_costmap.h"
 #include "ingot/safetensors.h"
 #include "qwen_tts_tokenizer.h"
 #include "qwen_tts_audio.h"
@@ -556,6 +557,7 @@ static void dt_append_audio(decoder_thread_t *dt, const float *samples, int n) {
 }
 
 static void *decoder_thread_fn(void *arg) {
+    qwen_region_thread_role("decoder");
     decoder_thread_t *dt = (decoder_thread_t *)arg;
     qwen_tts_ctx_t *ctx = dt->ctx;
 
@@ -1777,6 +1779,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     ttfa_ms, dt_state.chunk_frames);
     }
 
+    qwen_costmap_request_done();
     return 0;
 }
 
@@ -2211,6 +2214,7 @@ typedef struct {
 } prefill_helper_arg_t;
 
 static void *prefill_helper_main(void *arg) {
+    qwen_region_thread_role("prefill_helper");
     prefill_helper_arg_t *a = (prefill_helper_arg_t *)arg;
     qwen_tts_ctx_t *pf = a->pf_ctx;
     for (;;) {
@@ -2301,6 +2305,7 @@ static void dec_push(dec_pool_t *dp, dec_job_t *j) {
 #define DEC_GROUP_MAX 16
 
 static void *dec_worker_main(void *arg) {
+    qwen_region_thread_role("decoder");
     dec_pool_t *dp = (dec_pool_t *)arg;
     dec_job_t *grp[DEC_GROUP_MAX];
     qwen_sd_batch_item_t items[DEC_GROUP_MAX];
@@ -2403,6 +2408,7 @@ static void dec_enqueue(dec_pool_t *dp, int slot, const int *codes, int nframes,
 }
 
 int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sink) {
+    qwen_region_thread_role("serve");
     if (B < 1) B = 1;
     int want_cuda_batch = 0;
 #ifdef QWEN_HAVE_CUDA
