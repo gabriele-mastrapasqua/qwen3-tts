@@ -242,6 +242,98 @@ must all be zero, otherwise the tree is not trustworthy and the numbers are refu
 `leaked` counts regions closed by the unwind that every component entry point performs on
 the way out — early `return`s inside a decoder body cannot leave a region open forever.
 
+## Execution domain: topology identity and per-mask roofs
+
+A bandwidth roof belongs to **one CPU mask**, and a worker roof can never be obtained by
+dividing a host roof — on any architecture. Measured on the AWS c8a.4xlarge (2 CCX x 8
+cores, SMT off):
+
+| mask | read | copy | triad | read t90 / t95 | triad t90 / t95 |
+|---|---|---|---|---|---|
+| 0-15 (host) | 165.0 | 110.0 | 111.6 | 16T / 16T | 4T / 4T |
+| 0-7 (one CCX) | 66.9 | 53.4 | 55.2 | 4T / 4T | 2T / 2T |
+| 8-15 (other CCX) | ~67 | ~53 | ~54 | — | — |
+
+The prefork server pins each worker to one CCX, so a single request can only reach ~67
+GB/s of read bandwidth. Judging it against the host's 165 turned "at roof" into "57% of
+roof" and invented ~230 ms/request of headroom that does not exist. That is why the
+comparison is now a contract in code rather than a habit.
+
+### Topology identity
+
+`2x8` and `1x8` are not identities. These are four different machines:
+
+| id | workers | threads | mask | domain |
+|---|---|---|---|---|
+| `1W8T_m0-7` | 1 | 8 | 0-7 | one CCX |
+| `1W8T_m0-15` | 1 | 8 | 0-15 | 8 threads spanning both |
+| `1W16T_m0-15` | 1 | 16 | 0-15 | 16 threads spanning both |
+| `2W8T_m0-7\|8-15` | 2 | 8 each | 0-7 + 8-15 | one CCX each |
+
+**Single-worker affinity differs from prefork affinity.** `--prefork > 1` splits the host
+and calls `sched_setaffinity` per worker. `--prefork 1` never reaches that path, so
+without help "1x8" means *8 threads free to roam every cpu of the host*. `--cpu-mask 0-7`
+supplies the missing control; it is a **benchmark/qualification** flag, changes nothing by
+default, is refused together with `--prefork > 1`, and is applied before the thread pool
+exists because pthreads inherit the creating thread's affinity. Both serving paths now
+print `[TOPOLOGY] v=1 worker=N pid=P configured_mask=M actual_mask=A threads=K mode=X` —
+both masks, because "asked for" and "granted by the kernel" are different claims.
+
+### Tools, inputs, outputs
+
+| tool | consumes | produces | when |
+|---|---|---|---|
+| `tests/membw.c` | `--cpus MASK`, `--threads`, `--l3-mb` | per-mask copy/triad/**read** roof, full thread sweep, t90/t95/t99, working set, residency | offline |
+| `tools/topology.py` | server log (`[TOPOLOGY]`, legacy `prefork:`), `/proc/<pid>/status`, sysfs LLC/NUMA, `hardware.json` | `topology.json` | offline |
+| `tools/roofs.py` | `membw` + masks | `profiles/roofs/roofs_<hwfp>.json`; also the `select_roof` contract | offline |
+| `tools/topology_report.py` | `topology.json` + roof store (+ numerators) | the doctor block | offline |
+| `tools/envelope_report.py` | canonical `parallel_*.json`, census, cost map, topology, roofs | `envelope.json` + cliffs | offline |
+| `tests/roof_matvec_int8.c` | the four Talker decode shapes | `PRIMITIVE` roof, DRAM-resident | offline |
+
+Nothing above runs on the serving path. The only engine-side additions are `--cpu-mask`
+(one `sched_setaffinity` at startup) and one `[TOPOLOGY]` line per process.
+
+Artifacts land in the run's `profiles/<date>_<host>_<sha8>/` (`topology.json`,
+`roofs.txt`, `topology_report.txt`) and in `profiles/roofs/` for the roof cache.
+
+### Roof scopes
+
+* `HOST` — every cpu the process may use.
+* `WORKER[i]` — measured under **that worker's** mask.
+* `PRIMITIVE[op]` — same mask, thread count and access pattern as the operation judged.
+
+A roof is a property of *(hardware, mask, benchmark)* and **not** of the model, so the
+store is keyed by a hardware fingerprint and survives model switches; it is re-measured
+when the hardware changes or when `tests/membw.c` itself changes.
+
+### ROOF UNKNOWN / NOT COMPARABLE
+
+`roofs.select_roof()` proves hardware fingerprint, mask, benchmark kind and residency
+before any division:
+
+* no roof of that kind measured at all → **ROOF UNKNOWN**;
+* roofs exist but describe another mask → **NOT COMPARABLE**;
+* mask matches but residency differs → **NOT COMPARABLE**.
+
+There is **no fallback from WORKER to HOST** anywhere in the path. A percentage is never
+printed unless the scopes were checked.
+
+### Reproducing a topology qualification
+
+```
+make membw
+make roofs ROOF_MASKS=0-15,0-7,8-15            # per-mask roofs, cached
+make cpu-check CPU_MODEL=… CPU_PROFILE=…       # topology.json + doctor block
+python3 tests/serve_parallel_wave.py --topo '1x8@0-7,1x8@0-15,1x16@0-15,2x8' \
+    --conc 1,2,4,5,6 --waves 3 --model … --profile … --out OUT
+make envelope WAVE_JSON='OUT/parallel_*.json' TOPO_JSON=OUT/topology_*.json
+```
+
+`--topo WxK@MASK` is the canonical way to express a single-worker cell; use `+` inside a
+mask (`0+2+4`) because `--topo` is comma-separated. One server per topology, held while
+concurrency rises. Every result row carries `topology_id`, `worker_masks` and
+`mask_confidence`.
+
 ## Counters that now have a delimiter
 
 Every SIGUSR1 dump of the server (`POOLSTATS`, `[shape-census]`, `[batch-audit]`,

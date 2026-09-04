@@ -6,6 +6,11 @@ RUN_DATE = datetime.date.today().isoformat()
 import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import serve_procstats as PS
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+try:
+    import topology as TOPO                       # execution-domain identity for each cell
+except Exception:
+    TOPO = None
 
 TEXTS = []
 
@@ -468,7 +473,14 @@ def main():
         print(f"### ⚠️ --save-audio {a.save_audio}: this is a QUALITY run, not a timing run")
     for topo in a.topo.split(","):
         elastic = topo.endswith("e")
-        W, K = (int(x) for x in topo.rstrip("e").split("x"))
+        # `WxK` or `WxK@MASK`.  The mask is what makes a single-worker cell a defined
+        # experiment: "1x8" alone does not say whether those 8 threads were confined to
+        # one bandwidth domain or free to roam the socket, and on a multi-CCX host those
+        # are different machines.  Use `+` inside a mask (0+2+4) since `--topo` is
+        # comma-separated.  W>1 keeps the prefork split, which owns its own affinity.
+        spec, _, maskspec = topo.rstrip("e").partition("@")
+        cpu_mask = maskspec.replace("+", ",") if maskspec else ""
+        W, K = (int(x) for x in spec.split("x"))
         # In-flight requests a worker may hold. The default splits a box-wide budget of 16
         # across the workers; it is NOT the core count, and --batch-cap overrides it when a
         # deployment pins a different admission width.
@@ -477,9 +489,15 @@ def main():
         if a.precision == "int8":
             cmd.insert(3, "--int8")
         if W > 1:
+            if cpu_mask:
+                sys.exit(f"--topo {topo}: an explicit @mask applies to a single-worker "
+                         f"cell; with {W} prefork workers the per-worker split already "
+                         f"sets affinity")
             cmd += ["--prefork", str(W), "--prefork-threads", str(8 if elastic else K)]
         else:
             cmd += ["-j", str(K)]
+            if cpu_mask:
+                cmd += ["--cpu-mask", cpu_mask]
         if elastic:
             cmd += ["--prefork-elastic"]
         cmd += getattr(a, "profile_argv", [])
@@ -537,9 +555,22 @@ def main():
             for wi in range(min(4, W * 2)):
                 one_request(port, res, lock, wi, a.speaker, a.language, a.seed + 900000)
             res.clear()
-            wmap = {i: pid for i, pid, _cpus, _thr in PS.worker_pids_from_log(log)}
+            wmap = {i: pid for i, pid, _cpus, _thr in PS.worker_pids_from_log(log)} \
+                   or {0: p.pid}
             dump_signal_supported = W > 1
 
+            # The execution domain this cell actually got, from the engine's own
+            # [TOPOLOGY] line joined with /proc: recorded in every result row so a later
+            # comparison cannot mistake one mask for another.
+            topo_doc = None
+            if TOPO is not None:
+                try:
+                    topo_doc = TOPO.build(log, None, None, K)
+                    json.dump(topo_doc, open(os.path.join(a.out, f"topology_{label}_{topo}.json"), "w"), indent=1)
+                    print(f"###   execution domain: {topo_doc['topology_id']}  masks="
+                          f"{[w.get('actual_mask') for w in topo_doc['workers']]}", flush=True)
+                except Exception as e:
+                    print(f"###   topology identity unavailable: {e}", flush=True)
             for C in concs:
                 if dump_signal_supported:
                     try: p.send_signal(signal.SIGUSR1)
@@ -585,6 +616,12 @@ def main():
                 rej = re.search(r"rejected (\d+)", stats)
                 row = {
                     "model": label, "topo": topo, "W": W, "K": K, "cap": cap, "conc": C,
+                    "cpu_mask_requested": cpu_mask or None,
+                    "topology_id": topo_doc.get("topology_id") if topo_doc else None,
+                    "worker_masks": ([w.get("actual_mask") for w in topo_doc["workers"]]
+                                     if topo_doc else None),
+                    "mask_confidence": ([w.get("mask_confidence") for w in topo_doc["workers"]]
+                                        if topo_doc else None),
                     "waves": a.waves, "ok": len(ok), "errors": nerr,
                     "ttfb_p50": pct([r.get("ttfb_ms", float("nan")) for r in ok], 50),
                     "ttfb_p95": pct([r.get("ttfb_ms", float("nan")) for r in ok], 95),
