@@ -54,6 +54,7 @@ void qwen_threadpool_start(int n_threads) { (void)n_threads; }
 void qwen_threadpool_stop(void) {}
 void qwen_threadpool_after_fork(void) {}
 int qwen_parallel_is_reentrant(void) { return 1; }
+int qwen_parallel_active(void) { return 0; }
 
 #elif defined(_WIN32) && !defined(QWEN_USE_PTHREADS)
 
@@ -177,6 +178,7 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 }
 
 int qwen_parallel_is_reentrant(void) { return 0; }
+int qwen_parallel_active(void) { return 0; }
 
 #else
 
@@ -279,9 +281,13 @@ void qwen_pool_stats_report(void) { }
 #define PS_INC(c) ((void)0)
 #endif
 
+static __thread int g_qp_depth = 0;
+int qwen_parallel_active(void) { return g_qp_depth > 0; }
+
 static void run_chunks(qwen_job_t *job) {
     size_t i;
     qwen_tls_tag_set(job->tag);
+    g_qp_depth++;
     while ((i = atomic_fetch_add(&job->next, 1)) < job->nt)
     {   PS_INC(ps_chunks);
         if (g_qp_meter) {
@@ -290,6 +296,7 @@ static void run_chunks(qwen_job_t *job) {
             atomic_fetch_add(&g_qp_busy_us, qp_now_us() - t0);
             atomic_fetch_add(&g_qp_chunks, 1);
         } else job->fn(i, job->nt, job->ctx); }
+    g_qp_depth--;
 }
 
 static void *worker_main(void *arg) {

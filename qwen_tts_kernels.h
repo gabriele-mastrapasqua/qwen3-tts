@@ -26,6 +26,19 @@ static inline void *aligned_calloc(size_t count, size_t size) {
 void qwen_set_threads(int n);
 
 void qwen_blas_set_threads(int n);
+/* Execution budget: when "own" is on, OpenBLAS is held at ONE thread (it may compute a
+ * serial SGEMM, it may not run its own worker team) and the decoder's SGEMMs are
+ * partitioned across the engine pool by qwen_sd_sgemm instead.  QWEN_BLAS_OWN overrides. */
+void qwen_blas_own(int on);
+int  qwen_blas_own_get(void);
+int  qwen_blas_threads_now(void);       /* openblas_get_num_threads(), -1 if unavailable */
+/* Decoder parallel tiles: 1 = run on the engine pool (inline when already inside a region),
+ * 0 = the decoder's private worker team.  QWEN_SD_POOL=qwen|private overrides the default. */
+void qwen_sd_pool_default(int mode);
+int  qwen_sd_pool_mode(void);
+void qwen_sd_sgemm(int order, int ta, int tb, int M, int N, int K, float alpha,
+                   const float *A, int lda, const float *B, int ldb, float beta,
+                   float *C, int ldc);
 int qwen_get_threads(void);
 int qwen_get_num_cpus(void);
 void qwen_init_threads(void);
@@ -377,6 +390,12 @@ int qwen_sd_int8_enabled(void);
 int qwen_pool_spin_value(void);
 int qwen_pool_narrow_value(void);
 int qwen_dispatch_map_report(void *out, const char *json_path);
+int qwen_matmat_bf16_rows(float *Y, const uint16_t *W, const float *Xr,
+                          int ldx, int rows, int cols, int B);
+int qwen_matmat_bf16_rows_usable(int rows, int cols, int B);
+void qwen_bf16_pack_rows(uint16_t *Xb, const float *Xr, int ldx, int cols, int B);
+void qwen_matmat_bf16_packed(float *Y, const uint16_t *W, const uint16_t *Xb,
+                             int rows, int cols, int B);
 
 void qwen_conv1d_int8(float *out, const float *in,
                       const int8_t *Wq, const float *sw, const int32_t *wsum,

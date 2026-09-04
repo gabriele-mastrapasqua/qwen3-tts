@@ -27,6 +27,8 @@
 #include <cblas.h>
 #define QWEN_CBLAS_TRANSPOSE CBLAS_TRANSPOSE
 #endif
+/* Every decoder SGEMM goes through the engine's budgeted wrapper (qwen_tts_sd_gemm.c). */
+#define cblas_sgemm qwen_sd_sgemm
 #define CONV_TILE_MAX_BYTES (256 * 1024 * 1024)
 
 #ifdef QWEN_HAVE_CUDA

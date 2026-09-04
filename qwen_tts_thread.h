@@ -26,6 +26,10 @@ void qwen_threadpool_stop(void);
 void qwen_pool_stats_report(void);
 
 int qwen_parallel_is_reentrant(void);
+/* 1 while the calling thread is executing a chunk of a qwen_parallel region (worker or
+ * caller).  A nested dispatch from there would deadlock on the pool's single job slot, so
+ * code that may run in both contexts asks this and runs its work inline when set. */
+int qwen_parallel_active(void);
 
 #ifdef __cplusplus
 }

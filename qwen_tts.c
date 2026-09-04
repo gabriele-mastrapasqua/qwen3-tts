@@ -2631,6 +2631,18 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
       if (e && atoi(e) > 0) g_dec_chunk_busy = atoi(e);
       if (g_dec_chunk_busy > 32) g_dec_chunk_busy = 32; }
 
+    {   /* Execution budget of this worker: decoder tiles run on the engine pool and OpenBLAS
+         * is held at one thread with the decoder SGEMMs partitioned on that same pool, so
+         * one worker team owns its CPUs.  Measured on AWS c8a 2x8 (2026-09-04): C4 wave
+         * STREAM p95 0.98 -> 0.95, context switches -48%, 5-min C4 soak p50/p95 1.03/1.11 ->
+         * 1.00/1.06, WAV bit-identical.  QWEN_SD_POOL=private / QWEN_BLAS_OWN=0 restore the
+         * old teams; the OpenBLAS count is read back, not assumed. */
+        qwen_sd_pool_default(1);
+        qwen_blas_own(1);
+        fprintf(stderr, "[serve] execution budget: decoder pool=%s · blas=%s · openblas threads now %d\n",
+                qwen_sd_pool_mode() ? "engine" : "private",
+                qwen_blas_own_get() ? "serial+partitioned" : "own team", qwen_blas_threads_now());
+    }
     int blas_solo = 0, blas_busy = 0, blas_now = 0;
     { const char *e = getenv("QWEN_SERVE_BLAS");      if (e && atoi(e) > 0) blas_solo = atoi(e); }
     { const char *e = getenv("QWEN_SERVE_BLAS_BUSY"); if (e && atoi(e) > 0) blas_busy = atoi(e); }

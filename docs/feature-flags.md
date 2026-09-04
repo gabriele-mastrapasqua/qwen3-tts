@@ -242,6 +242,9 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_DECODER_BATCH` | **on in the server** (`[serve]` says so), off in the CLI | one pass over the decoder weights for every active slot. `=0` opts out. It pays only where a worker actually holds several slots: on an 8-core host split `2x4`, C=4 gives each worker ~1.4 active slots, the gang never exceeds 2, and turning it **off** measured 12% better at C=4 TTFA p95 with identical RTF. Read `decoder batch: calls / mean` before believing either direction |
 | `QWEN_SERVER_NO_DECODER_BATCH` | unset | present = the server does not turn the above on for you |
 | `QWEN_DECODER_THREAD` | off | runs the decoder on its own thread beside the Talker |
+| `QWEN_SD_POOL` | server: `qwen` | `qwen` runs the decoder's tiles on the engine pool (inline when already inside a region); `private` keeps the decoder's own worker team |
+| `QWEN_BLAS_OWN` | server: `1` | `1` holds OpenBLAS at one thread and partitions the decoder SGEMMs across the engine pool (exact sub-problems, output bit-identical); `0` lets OpenBLAS run its own team |
+| `QWEN_SD_SGEMM_CENSUS` | off | diagnostic: prints every decoder SGEMM shape with its wall time (every 100 calls and at exit) |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |

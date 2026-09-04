@@ -67,11 +67,31 @@ void qwen_ftz_on(void) {
 static int g_n_threads = 1;
 #if defined(__GNUC__) && !defined(__APPLE__)
 extern void openblas_set_num_threads(int) __attribute__((weak));
+extern int  openblas_get_num_threads(void) __attribute__((weak));
 #endif
+
+static int g_blas_own = -1;   /* -1 = not decided: env, else the default set by the server */
+int qwen_blas_own_get(void) {
+    if (g_blas_own < 0) { const char *e = getenv("QWEN_BLAS_OWN"); g_blas_own = (e && e[0] == '1') ? 1 : 0; }
+    return g_blas_own;
+}
+void qwen_blas_own(int on) {
+    /* A default from the server; an explicit QWEN_BLAS_OWN in the environment wins. */
+    if (!getenv("QWEN_BLAS_OWN")) g_blas_own = on ? 1 : 0;
+    qwen_blas_set_threads(g_n_threads);
+}
+int qwen_blas_threads_now(void) {
+#if defined(__GNUC__) && !defined(__APPLE__)
+    return openblas_get_num_threads ? openblas_get_num_threads() : -1;
+#else
+    return -1;
+#endif
+}
 
 void qwen_blas_set_threads(int n) {
 #if defined(__GNUC__) && !defined(__APPLE__)
     if (getenv("OPENBLAS_NUM_THREADS")) return;
+    if (qwen_blas_own_get()) n = 1;   /* the engine pool owns parallelism; BLAS stays serial */
     if (openblas_set_num_threads) openblas_set_num_threads(n > 0 ? n : 1);
 #else
     (void)n;
@@ -265,6 +285,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
     "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
+    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
@@ -8375,10 +8396,29 @@ static void sd_gcd_task(size_t tid, size_t nt, void *vj) {
     j->fn(j->ctx);
 }
 
+static int g_sd_pool_mode = -1;
+void qwen_sd_pool_default(int mode) { if (!getenv("QWEN_SD_POOL")) g_sd_pool_mode = mode ? 1 : 0; }
+int qwen_sd_pool_mode(void) {
+    if (g_sd_pool_mode < 0) {
+        const char *e = getenv("QWEN_SD_POOL");
+        g_sd_pool_mode = (e && (e[0] == '1' || e[0] == 'q')) ? 1 : 0;
+    }
+    return g_sd_pool_mode;
+}
+
 static void sd_pool_run(void (*fn)(void *), void *ctx) {
     int nt = sd_pool_threads();
     if (nt < 1) nt = 1;
     if (nt == 1) { fn(ctx); return; }
+    if (qwen_sd_pool_mode()) {
+        /* The engine pool owns the CPU budget.  Every worker body pulls its tiles from an
+         * atomic counter, so running it once per chunk on the pool is the same schedule the
+         * private team used; inside an existing region one worker drains all tiles. */
+        if (qwen_parallel_active()) { fn(ctx); return; }
+        sd_gcd_job_t j = { fn, ctx };
+        qwen_parallel((size_t)nt, sd_gcd_task, &j);
+        return;
+    }
 
     if (qwen_parallel_is_reentrant()) {
         sd_gcd_job_t j = { fn, ctx };
