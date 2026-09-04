@@ -2223,9 +2223,16 @@ static void *prefill_helper_main(void *arg) {
         double _t_admitted = qwen_mono_ms();
         pf->speaker_id = req.speaker_id; pf->language_id = req.language_id;
         pf->prev_prefill_len = 0; pf->prefill_only = 1;
+        /* QWEN_PREFILL_LOW_MS>0: this prefill submits LOW for that long, filling only the
+         * pool windows the frame loop leaves free, so an already-playing stream keeps its
+         * frames; then it becomes ordinary so TTFA stays bounded. */
+        { static double low_ms = -1.0;
+          if (low_ms < 0) { const char *e = getenv("QWEN_PREFILL_LOW_MS"); low_ms = e ? atof(e) : 0.0; }
+          if (low_ms > 0) qwen_parallel_set_low_until(qwen_parallel_now_ms() + low_ms); }
         double _t_pf_start = qwen_mono_ms();
         int prc = qwen_tts_generate(pf, req.text, NULL, NULL);
         double _t_pf_done = qwen_mono_ms();
+        qwen_parallel_set_low_until(0.0);
         pf->prefill_only = 0;
         int pl = pf->kv_len;
         prefilled_t *p = (prefilled_t *)calloc(1, sizeof(prefilled_t));

@@ -30,6 +30,13 @@ int qwen_parallel_is_reentrant(void);
  * caller).  A nested dispatch from there would deadlock on the pool's single job slot, so
  * code that may run in both contexts asks this and runs its work inline when set. */
 int qwen_parallel_active(void);
+/* Dispatch priority.  A thread whose deadline is in the future submits LOW: its dispatch
+ * waits while a normal (HIGH) submitter has dispatched within the last window, so LOW work
+ * only fills the pool's idle windows between the frame loop's own dispatches.  Past the
+ * deadline the thread is ordinary again, which bounds how long LOW work can be starved.
+ * until_ms is CLOCK_MONOTONIC milliseconds (qwen_parallel_now_ms); 0 = HIGH (default). */
+void   qwen_parallel_set_low_until(double until_ms);
+double qwen_parallel_now_ms(void);
 
 #ifdef __cplusplus
 }

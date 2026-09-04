@@ -244,6 +244,8 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_DECODER_THREAD` | off | runs the decoder on its own thread beside the Talker |
 | `QWEN_SD_POOL` | server: `qwen` | `qwen` runs the decoder's tiles on the engine pool (inline when already inside a region); `private` keeps the decoder's own worker team |
 | `QWEN_BLAS_OWN` | server: `1` | `1` holds OpenBLAS at one thread and partitions the decoder SGEMMs across the engine pool (exact sub-problems, output bit-identical); `0` lets OpenBLAS run its own team |
+| `QWEN_PREFILL_LOW_MS` | 0 | with `QWEN_PREFILL_HELPER=1`: for this many ms each prefill submits to the pool at LOW priority, taking only the windows the frame loop leaves free (trade-off knob: STREAM −3%, TTFA +100/+250 ms on c8a C4) |
+| `QWEN_POOL_HI_WINDOW_US` | 200 | a LOW submitter waits while an ordinary one dispatched within this window |
 | `QWEN_SD_SGEMM_CENSUS` | off | diagnostic: prints every decoder SGEMM shape with its wall time (every 100 calls and at exit) |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |

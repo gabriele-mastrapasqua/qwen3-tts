@@ -1,5 +1,11 @@
 /* qwen_tts_thread.c - Cross-OS parallel-for */
 #include "qwen_tts_thread.h"
+#include <time.h>
+
+double qwen_parallel_now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
 #include "qwen_tts_costmap.h"
 
 static __thread int g_qwen_tls_tag = 0;
@@ -55,6 +61,7 @@ void qwen_threadpool_stop(void) {}
 void qwen_threadpool_after_fork(void) {}
 int qwen_parallel_is_reentrant(void) { return 1; }
 int qwen_parallel_active(void) { return 0; }
+void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
 
 #elif defined(_WIN32) && !defined(QWEN_USE_PTHREADS)
 
@@ -179,6 +186,7 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 
 int qwen_parallel_is_reentrant(void) { return 0; }
 int qwen_parallel_active(void) { return 0; }
+void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
 
 #else
 
@@ -283,6 +291,15 @@ void qwen_pool_stats_report(void) { }
 
 static __thread int g_qp_depth = 0;
 int qwen_parallel_active(void) { return g_qp_depth > 0; }
+
+static __thread double g_qp_low_until = 0.0;
+static _Atomic double g_qp_last_hi_ms = 0.0;   /* when a HIGH submitter last dispatched */
+void qwen_parallel_set_low_until(double until_ms) { g_qp_low_until = until_ms; }
+static double qwen_pool_hi_window_ms(void) {
+    static double v = -1.0;
+    if (v < 0) { const char *e = getenv("QWEN_POOL_HI_WINDOW_US"); v = (e ? atof(e) : 200.0) / 1000.0; }
+    return v;
+}
 
 static void run_chunks(qwen_job_t *job) {
     size_t i;
@@ -434,7 +451,20 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     atomic_init(&job.next, 0);
 
     qwen_region_begin(QWEN_RGN_RT_POOL_SUBMIT);
+    if (g_qp_low_until > 0.0) {
+        /* LOW: step aside while the frame loop is in a burst of dispatches; only take the
+         * pool in a window the loop is not using.  Past the deadline this is skipped. */
+        double win = qwen_pool_hi_window_ms();
+        for (;;) {
+            double now = qwen_parallel_now_ms();
+            if (now >= g_qp_low_until) { g_qp_low_until = 0.0; break; }
+            if (now - atomic_load_explicit(&g_qp_last_hi_ms, memory_order_relaxed) >= win) break;
+            qwen_cpu_relax();
+        }
+    }
     pthread_mutex_lock(&P.submit_mtx);
+    if (g_qp_low_until <= 0.0)
+        atomic_store_explicit(&g_qp_last_hi_ms, qwen_parallel_now_ms(), memory_order_relaxed);
     qwen_region_end(QWEN_RGN_RT_POOL_SUBMIT);
 
     int need = (int)nt - 1;
