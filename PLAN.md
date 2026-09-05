@@ -13,7 +13,8 @@ into individual kernels and backends while that sat in plain sight. So:
 
 1. close ONLY PARITY-1/2/3 below — nothing else from the parity backlog;
 2. then P0-PROFILER, which OUTRANKS all further x86 kernel work;
-3. only then X86-4/X86-5/X86-6/X86-7/X86-8 and P5.10, and their queue order comes from what
+3. then P1-CONFIG, the server config control plane;
+4. only then X86-4/X86-5/X86-6/X86-7/X86-8 and P5.10, and their queue order comes from what
    the profiler's FAST run measures, not from what looks interesting.
 
 PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something equivalent":
@@ -133,6 +134,26 @@ PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something eq
 
       It becomes a permanent engineering and regression tool for ARM, x86 and future backends:
       it does not optimise the TTS directly, it makes every later optimisation much faster.
+
+- [ ] P1-CONFIG SERVER CONFIG CONTROL PLANE — detail: `.work/config-control-plane.md`.
+      [After P0-PROFILER. Not "tidy the JSONs": remove the normal path that can ignore them.]
+      The proof it is an abstraction problem and not a documentation one: the correct GCP
+      topology was ALREADY in `configs/perf/gcp-c4-standard-24-vnni-ttfa.json` (2 workers x 6
+      threads, affinity 0-5 / 6-11, with a warning about the 24 logical CPUs) and three
+      campaigns still ran at 2x8 from memory. The JSON was right and the experiment was wrong.
+      Measured duplication today: 22 of 28 env keys appear in more than one profile,
+      `QWEN_POOL_SPIN` in seven (4096 on six x86, 65536 on Arm), so P5.0 — "make 65536 the x86
+      default" — means editing six files and hoping none is missed. A common engine default has
+      no owner. One 200-line object also mixes runtime config, experimental candidates,
+      benchmark history and open TODOs in one namespace.
+      Layering, one owner per value: common engine -> Linux CPU server -> backend family
+      (ARM/KAI | x86 VNNI | x86 AMX) -> host topology -> experiment override (only the variable
+      under test). Done when: no duplicated semantic default across host profiles · one
+      inheritance/resolution mechanism · ONE canonical launcher every suite goes through ·
+      qualification cannot bypass resolution · effective config emitted per run · real host
+      topology verified against the resolved profile, mismatch FATAL · one owner and default per
+      flag · overrides contain only what was intentionally changed · resolved-config + binary +
+      model hashes stored with results · changing one common x86 default propagates everywhere.
 
 ## P0 — correctness of our performance evidence
 
@@ -343,7 +364,10 @@ PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something eq
       per-ISA reference sets, a looser cross-ISA threshold justified by listening, or state plainly
       that golden is an ARM-only regression net and give x86 its own. The +14% duration on AMX
       deserves an ear check before anything else — it is a different-length utterance, not noise.
-- [ ] P5.0 [low] Set `QWEN_POOL_SPIN=65536` as the x86 server default and update related JSON profiles.
+- [ ] P5.0 [low, BLOCKED-BY P1-CONFIG] Set `QWEN_POOL_SPIN=65536` as the x86 server default.
+      Deliberately not done by hand: the value is duplicated in seven profiles today, so this is
+      the worked example of why a common default needs one owner. Do it once at the x86 level
+      after the control plane exists, not as six edits.
 - [ ] P5.1 [low] Compare AutoRound/LLM Compressor W4A16 and Intel ARK packed kernels with runtime INT8: https://vllm.ai/blog/2025-12-09-intel-autoround-llmc https://github.com/intel/auto-round/tree/main/auto_round_extension/ark
 - [ ] P5.2 [low] Run isolated Xeon AMX/VNNI GEMV/GEMM oracle probes with oneDNN benchdnn and OpenVINO CPU: https://github.com/uxlfoundation/oneDNN/tree/main/tests/benchdnn https://github.com/openvinotoolkit/openvino/blob/master/docs/articles_en/openvino-workflow/running-inference/inference-devices-and-modes/cpu-device.rst
 - [ ] P5.3 [low] Audit vLLM CPU, oneDNN and IPEX prepacking/fusion/cache behavior against CP, Talker and INT8 conv: https://community.intel.com/t5/Blogs/Tech-Innovation/Artificial-Intelligence-AI/A-Practical-Guide-to-CPU-Optimized-LLM-Deployment-on-Intel-Xeon/post/1737233
