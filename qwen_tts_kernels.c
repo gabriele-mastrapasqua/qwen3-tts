@@ -450,10 +450,25 @@ void qwen_caps_report(void *out) {
             __builtin_cpu_supports("avx512vnni") ? " avx512vnni"   : "",
             __builtin_cpu_supports("avx512bf16") ? " avx512bf16"   : "",
             amx_str);
-    fprintf(f, "  lever (x86):      %s\n",
-            __builtin_cpu_supports("avx512vnni") ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
-          : __builtin_cpu_supports("avx2")       ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
-          :                                        "no AVX2 — scalar; rebuild SIMD=scalar");
+    /* The lever is a property of THIS BINARY, not of the CPU: a SIMD=avx512 or SIMD=portable
+     * build running on a VNNI host has no VNNI dot to recommend, and used to advertise one. */
+    {
+#if defined(__AVX512VNNI__)
+        const int vnni_built = 1;
+#else
+        const int vnni_built = 0;
+#endif
+        const int vnni_cpu = __builtin_cpu_supports("avx512vnni") ? 1 : 0;
+        fprintf(f, "  lever (x86):      %s\n",
+                (vnni_built && vnni_cpu)
+                  ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
+              : (vnni_cpu && !vnni_built)
+                  ? "this CPU has VNNI but this build does NOT — rebuild SIMD=avx512vnni "
+                    "(or avx512bf16/amx) to get the native int8 dot"
+              : __builtin_cpu_supports("avx2")
+                  ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
+                  : "no AVX2 — scalar; rebuild SIMD=scalar");
+    }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     fprintf(f, "  x86 amx int8:     %s\n",
             qwen_amx_int8_ready()
@@ -3371,9 +3386,12 @@ static int qwen_vnni_col_quant_enabled(void) {
     return v;
 }
 
+/* |x| via an integer AND, not _mm512_andnot_ps: the float-domain logic ops are AVX512DQ,
+ * and the plain AVX-512F profile (SIMD=avx512: F/BW/VL, no DQ, no VNNI) must build too.
+ * Same bits, same kernel -- 0x7FFFFFFF clears the sign exactly as andnot(-0.0f, v) does. */
 static float quantize_act_int8_col_avx512(int8_t *qb, const float *X,
                                          int cols, int B, int b) {
-    const __m512 sign = _mm512_set1_ps(-0.0f);
+    const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
     const __m512i offsets = _mm512_setr_epi32(
         0 * B, 1 * B, 2 * B, 3 * B, 4 * B, 5 * B, 6 * B, 7 * B,
         8 * B, 9 * B, 10 * B, 11 * B, 12 * B, 13 * B, 14 * B, 15 * B);
@@ -3384,7 +3402,8 @@ static float quantize_act_int8_col_avx512(int8_t *qb, const float *X,
         const __m512 v = B == 1
             ? _mm512_loadu_ps(X + b + k)
             : _mm512_i32gather_ps(idx, X + b, 4);
-        vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+        vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
     }
     float amax = _mm512_reduce_max_ps(vmax);
     for (; k < cols; k++) {
@@ -5952,12 +5971,13 @@ static float quantize_act_int8_x86_scalar(int8_t *qx, const float *x, int n) {
 static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if (qwen_vnni_act_quant_enabled() && n >= 16) {
-        const __m512 sign = _mm512_set1_ps(-0.0f);
+        const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
         __m512 vmax = _mm512_setzero_ps();
         int i = 0;
         for (; i + 16 <= n; i += 16) {
             __m512 v = _mm512_loadu_ps(x + i);
-            vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+            vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
         }
         float amax = _mm512_reduce_max_ps(vmax);
         for (; i < n; i++) {
@@ -6010,12 +6030,13 @@ static int qwen_vnni_uact_enabled(void) {
 static float quantize_act_u8_x86(uint8_t *ux, const float *x, int n) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if (qwen_vnni_act_quant_enabled() && n >= 16) {
-        const __m512 sign = _mm512_set1_ps(-0.0f);
+        const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
         __m512 vmax = _mm512_setzero_ps();
         int i = 0;
         for (; i + 16 <= n; i += 16) {
             __m512 v = _mm512_loadu_ps(x + i);
-            vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+            vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
         }
         float amax = _mm512_reduce_max_ps(vmax);
         for (; i < n; i++) {
@@ -8325,32 +8346,48 @@ int qwen_sd_int8_available(void) {
  * on a build where every gate is off (AVX2 and AVX-512F for bf16, any non-VNNI x86 for the
  * integer paths) the map used to say nothing about what runs.  Evaluated at a representative
  * large shape so the thresholds in g_mm_gate[] are applied rather than duplicated here. */
-static const char *mmk_first_available(const int *cand, int n, const char *none) {
-    enum { RB = 4, RR = 4096, RC = 4096 };
+/* One probe shape, so say which: a family row answers "who serves this dtype at a batched
+ * shape", not "who serves every shape".  A gate with a higher min_b or a rows/cols floor can
+ * still decline the real projection, and the per-gate table below carries those numbers. */
+#define QWEN_MMK_PROBE_B    4
+#define QWEN_MMK_PROBE_ROWS 4096
+#define QWEN_MMK_PROBE_COLS 4096
+static const char *mmk_first_available(const int *cand, int n, const char *none,
+                                       char *buf, size_t bsz) {
+    enum { RB = QWEN_MMK_PROBE_B, RR = QWEN_MMK_PROBE_ROWS, RC = QWEN_MMK_PROBE_COLS };
     for (int i = 0; i < n; i++) {
         int k = cand[i];
-        if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) && qwen_mm_use(k, RB, RR, RC))
-            return g_mmk_info[k].name;
+        if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) && qwen_mm_use(k, RB, RR, RC)) {
+            snprintf(buf, bsz, "%s (probe B=%d %dx%d)", g_mmk_info[k].name, RB, RR, RC);
+            return buf;
+        }
     }
-    return none;
+    snprintf(buf, bsz, "%s (probe B=%d %dx%d)", none, RB, RR, RC);
+    return buf;
 }
 const char *qwen_matmat_family_int8(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
                                 QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };
+    static char buf[96];
     return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
-                               "int8 f32-accum twin (no int8 GEMM gate on this build)");
+                               "int8 f32-accum twin (no int8 GEMM gate on this build)",
+                               buf, sizeof buf);
 }
 const char *qwen_matmat_family_q4(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_Q4, QWEN_MMK_Q4_AMX, QWEN_MMK_Q4_VNNI,
                                 QWEN_MMK_Q4_AVX2, QWEN_MMK_Q4_SMMLA, QWEN_MMK_Q4_BMATVEC };
+    static char buf[96];
     return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
-                               "q4 generic twin (no q4 GEMM gate on this build)");
+                               "q4 generic twin (no q4 GEMM gate on this build)",
+                               buf, sizeof buf);
 }
 const char *qwen_matmat_family_bf16(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_BF16, QWEN_MMK_BF16_AMX,
                                 QWEN_MMK_BF16_AVX512, QWEN_MMK_BF16_BFMMLA };
+    static char buf[96];
     return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
-                               "bf16 fixed-B twin (no bf16 GEMM gate on this build)");
+                               "bf16 fixed-B twin (no bf16 GEMM gate on this build)",
+                               buf, sizeof buf);
 }
 
 /* Does B=1 reach a native integer kernel on this build, or the f32 fused twin?

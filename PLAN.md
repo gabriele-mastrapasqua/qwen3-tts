@@ -36,7 +36,17 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       observed B1/B2; AMX BF16 prefill executes; AMX INT8 observed only at C8 B4/B5.
       `suspicious=1` was a census reporter false positive (B>=2 vs real AMX INT8 B>=4).
       P2/P3 implementation follow-ups are now unblocked.
-- [ ] P1.5 Verify AVX2 / AVX-512F non-VNNI fallbacks (no int8/q4 GEMV, f32 SGEMM prefill)
+- [x] P1.5 AVX2 / AVX-512F non-VNNI fallbacks verified on the GCP x86 box, and one real defect
+      found: `SIMD=avx512` (F/BW/VL, no DQ, no VNNI) did NOT COMPILE — three |x| reductions used
+      `_mm512_andnot_ps`, which is AVX512DQ, inside `__AVX512F__` code. Replaced with the integer
+      abs-mask (same bits). All three profiles now build, `--self-test` PASSES on each, and a
+      real generation runs: avx512 and portable 69120 samples, VNNI 67200, each bit-repeatable
+      across two runs (different integer kernels -> different trajectory, both valid audio).
+      Resolved rows match the static contract: `matvec.int8.native`/`matvec.q4.native` = no on
+      both non-VNNI builds (B=1 dequantises to the f32 fused twin, P3.6), `matmat.{int8,q4}.family`
+      = AVX2 maddubs even on the AVX-512F build, `matmat.bf16.family` = the fixed-B twin on all
+      three, `decoder.int8` OFF (no kernel on those ISAs, P3.4a). Also fixed the `--caps` "lever"
+      line, which asked the CPU instead of the build and advertised VNNI on a binary without it
 - [ ] P1.6 Verify Apple/GCD/Accelerate runtime (SGEMM partition with Accelerate threads)
 
 ## P2 — runtime parity (evidence for the whole block — detail: `.work/p2-cross-backend-runtime.md`)
