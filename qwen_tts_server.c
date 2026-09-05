@@ -1968,7 +1968,6 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
      * before it.  Neither reproduces on the batched/prefork server, which isolates workers by
      * process and is the production path. */
     g_serialize_synth = 1;
-    (void)qwen_pool_concurrent_submit_ok();
 
     qwen_tts_ctx_t **ctxs = (qwen_tts_ctx_t **)calloc(n_workers, sizeof(*ctxs));
     pthread_t *threads = (pthread_t *)calloc(n_workers, sizeof(pthread_t));

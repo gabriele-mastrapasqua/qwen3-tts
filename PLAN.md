@@ -97,10 +97,16 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       different questions and on pthread returned the QWEN_PREFILL_HELPER opt-in, so a feature
       flag drove decoder-team and server-serialisation policy. Replaced by
       `qwen_pool_nested_dispatch_ok()` / `qwen_pool_concurrent_submit_ok()`, both reported in
-      the dispatch map. NOTE: on Linux the legacy threaded `--serve N` path therefore stops
-      serialising synthesis by default (per-worker contexts, submit_mtx makes it safe);
-      prefork is unaffected. detail: `.work/p3-runtime-knob-parity.md`
-- [ ] P3.3b Cloud A/B only for the differences P3.3a leaves unresolved
+      the dispatch map. CORRECTION (2026-09-05): 47ede94 also let the new predicate decide
+      whether the legacy threaded `--serve N` path serialises synthesis, which was the same
+      mistake one level down -- "may two threads submit to the pool" is not "may two syntheses
+      overlap in one process", and the engine's process-wide state has never been audited for
+      that. The long-standing serialised default is restored; prefork was never affected.
+      detail: `.work/p3-runtime-knob-parity.md`
+- [ ] P3.3b Cloud A/B only for the differences P3.3a leaves unresolved. The one that matters is
+      now named: whether two syntheses may overlap inside ONE process (the threaded `--serve N`
+      path). Answering it is an engine-state audit plus a concurrent A/B, not a pool question,
+      and it is not on the production path (prefork isolates by process)
 - [x] P3.4a Decoder int8-conv capability split from policy (47ede94): `qwen_sd_int8_available`
       (kernels compiled) + `qwen_sd_int8_usable` (shapes the kernels cover, moved off the
       decoder call site) vs a named per-backend default with its reason. AVX2/AVX-512F have no
@@ -147,6 +153,14 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       output. What remains: the CP/Talker region body gathers k-major `[cols][B]` for the
       shared per-column quantiser while KleidiAI wants row-major activations it quantises
       itself, so the region needs a second gather shape. Needs an Arm i8mm box to validate.
+
+- [x] P3.12 `make check-matmat-parity` did not link: `qwen_tts_thread.c` calls
+      `qwen_region_begin_/end_` (cost-map instrumentation) but `PARITY_SRC` never listed
+      `qwen_tts_costmap.c`, so the batched-twin arithmetic gate had been failing at the linker
+      instead of running. Fixed; it now PASSES on M1 native (int8 twin within 2.2e-2 rel of the
+      integer reference, q4 exact) and on the Rosetta x86-64-v3 build (both exact).
+      `prefill-bench` had the identical gap in its own hand-written source list and was also
+      dead at the linker (confirmed by rebuilding it from the unpatched Makefile); both fixed
 
 ## P4 — architecture cleanup (no implementation before P0-P3 are understood)
 

@@ -745,8 +745,10 @@ server-soak: bench-soak
 bench-suite-full: bench-suite
 	@$(MAKE) bench-soak
 
+# qwen_tts_costmap.c is not optional: qwen_tts_thread.c calls qwen_region_begin_/end_, so
+# leaving it out breaks the link, not the measurement.
 PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c \
-             qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+             qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I. -I$(INGOT_DIR)/include $(KAI_INC)
 check-matmat-parity: $(INGOT_LIB)
 	@echo "=== matmat parity — native ISA ==="
@@ -920,7 +922,7 @@ mini-bench-17b: $(TARGET)
 	  --port 9601 --label mini17b
 
 PREFILL_BENCH_SRC = tests/prefill_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
-                    qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+                    qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 prefill-bench: $(INGOT_LIB)
 	@echo "=== prefill cost: what the per-call fixed cost actually is ==="
 ifeq ($(UNAME_S),Darwin)
