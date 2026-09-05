@@ -29,6 +29,18 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 - [x] P1.0 HEAD compiled and ran only as the working tree: conv scratch freed, prctl include
       missing — fixed in fb3d32d; rule ENGINEERING.md §13
 - [x] P1.1 Static cross-backend audit — `docs/cross-backend-audit-2026-09-05.md` (fb3d32d)
+- [ ] P0.6 [NEW, 2026-09-05 — evidence gap, needs a decision] The golden references DO NOT hold
+      on x86, and nobody knew because that box had neither numpy nor librosa, so `make test-golden`
+      printed "SKIP: librosa not installed" and exited 0. Installed both and measured the 1.7B
+      reference on the GCP host: `SIMD=amx` mel-corr 0.60122 with duration 5.20s vs 4.56s (+14%),
+      `avx512vnni` 0.74555 (dur 1.8%), `portable` 0.79514 (dur 1.8%) — all far under the 0.98 gate,
+      and the three profiles differ from each other as well. NOT a regression: the same run against
+      commit 85f2678 gives byte-identical WAVs (md5 48176f02 amx, 85e95b89 vnni on both trees), so
+      this predates everything on this branch. What it kills is the belief that mel-corr ≥0.98 is
+      our cross-ISA check: the references are M1-generated and only hold on ARM. Decide which:
+      per-ISA reference sets, a looser cross-ISA threshold justified by listening, or state plainly
+      that golden is an ARM-only regression net and give x86 its own. The +14% duration on AMX
+      deserves an ear check before anything else — it is a different-length utterance, not noise.
 - [ ] P1.2 [BLOCKED: no ARM i8mm host in reach] Verify Arm KleidiAI GEMV/GEMM shape coverage on
       a box. M1 does NOT qualify and must not be used as a stand-in: `kleidi.enabled` reads
       "not compiled (needs an i8mm target)" there, so an M1 run measures the NEON fallback and
@@ -161,6 +173,12 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       integer reference, q4 exact) and on the Rosetta x86-64-v3 build (both exact).
       `prefill-bench` had the identical gap in its own hand-written source list and was also
       dead at the linker (confirmed by rebuilding it from the unpatched Makefile); both fixed
+      and both re-verified on the LINUX/gcc box, where the int8 twin is exact (0.000e+00,
+      it is the real VNNI integer kernel there) against 2.2e-2 on the M1 f32 twin.
+      `make test-golden` now guards MODEL_SMALL the way it already guarded MODEL_LARGE, and
+      refuses to report PASS when nothing ran: a rented box carries one checkpoint, and a
+      missing model was being reported as a numerical regression. The x86 box can now run the
+      golden net (numpy + librosa installed there)
 
 ## P4 — architecture cleanup (no implementation before P0-P3 are understood)
 
@@ -215,6 +233,15 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       scatter passes. Rest of old P5.6; the decoder half of old P5.7 is partly done by 9933948
       (x86 SIMD `qwen_int8_quant_rows`), the im2col fusion is not.
 - [ ] X86-5 AMX activation-pack reuse — check reuse across workers inside a held region.
+      NOTE (2026-09-05, box): the B=32 two-accumulator prototype in `tests/prefill_bench.c` is
+      not usable as it stands. On the AMX build it dies with SIGILL before its first line while
+      the engine's AMX path is live in the same process; `QWEN_NO_AMX=1` makes the SAME binary
+      run to completion, and a dedicated probe on that host showed the engine's own AMX matmat
+      is healthy with the permission requested either before or after the pool exists, so the
+      fault is the prototype's tile handling, not the runtime. It is also numerically wrong
+      (worst relative 2.18 vs the shipped path, its own check says so). Now behind
+      `QWEN_PB_AMX_PROTO=1` so `make prefill-bench` measures the per-call fixed cost instead of
+      crashing on exactly the machines it exists for
 - [ ] X86-6 Real 0.6B server qualification — repeat the shape-oracle conclusions with the actual
       checkpoint and C1/C2/C4 screens.
 - [ ] X86-7 0.6B vs 1.7B serving profile — compare Talker, CP and decoder time shifts after the
