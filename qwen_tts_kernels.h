@@ -51,6 +51,8 @@ void qwen_exec_budget_engine_owned(const char *who);
 int   qwen_region_i8_usable(int rows, int cols, int B);
 int   qwen_region_i8_qkv_usable(int q_rows, int kv_rows, int cols, int B);
 float qwen_region_i8_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b);
+/* Same quantiser for one source row; avoids materialising the [cols][B] staging matrix. */
+float qwen_region_i8_quant_row(int8_t *qb, const float *src, int cols);
 void  qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
                     const float *sx, int rows, int cols, int B, size_t tid, size_t nt);
 void  qwen_region_i8_run_qkv(float *q, float *k, float *v,

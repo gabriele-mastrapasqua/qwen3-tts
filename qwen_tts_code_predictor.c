@@ -1024,9 +1024,8 @@ typedef struct {
 
 static void cp_region_gather_quant(cp_region_t *r, const float *src, int b, int j,
                                    int cols, int srcstride) {
-    float *Xt = r->bb->cp_Xt; const float *s = src + (size_t)b * srcstride;
-    for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
-    r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
+    const float *s = src + (size_t)b * srcstride;
+    r->sx[j] = qwen_region_i8_quant_row(r->qx + (size_t)j * cols, s, cols);
 }
 static void cp_region_scatter(cp_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
     float *d = dst + (size_t)b * rows;
@@ -1257,7 +1256,7 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
     const int BW = r->BW, ch = bb->cp_h, ed = ctx->cp_emb_dim, h = c->hidden_size;
     const int vocab = c->codebook_size, estride = (h > ed ? h : ed);
     const float eps = c->rms_norm_eps;
-    float *Xt = bb->cp_Xt, *Yt = bb->cp_Yt, *embs = bb->cp_gate;
+    float *Yt = bb->cp_Yt, *embs = bb->cp_gate;
 #define RSLOT(j) (r->idx ? r->idx[j] : (j))
 #define RMINE(j) ((size_t)(j) % nt == tid)
     for (int s = 0; s < 16; s++) {
@@ -1276,8 +1275,7 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
                                          (int64_t)r->out_codes[(size_t)b * 15 + (s - 2)] * ed, ed);
                 src = e;
             }
-            for (int k = 0; k < ed; k++) Xt[(size_t)k * BW + j] = src[k];
-            r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * ed, Xt, ed, BW, j);
+            r->sx[j] = qwen_region_i8_quant_row(r->qx + (size_t)j * ed, src, ed);
         }
         qwen_barrier_wait(&r->bar);
         qwen_region_i8_run(Yt, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale, r->qx, r->sx,

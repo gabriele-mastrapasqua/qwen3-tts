@@ -10453,6 +10453,10 @@ int qwen_region_i8_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
 float qwen_region_i8_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b) {
     return quantize_act_int8_col(qb, Xt, cols, B, b);
 }
+float qwen_region_i8_quant_row(int8_t *qb, const float *src, int cols) {
+    /* B=1 is the same quantiser and rounding/clamp contract on a contiguous row. */
+    return quantize_act_int8_col(qb, src, cols, 1, 0);
+}
 void qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
                    const float *sx, int rows, int cols, int B, size_t tid, size_t nt) {
 #if defined(__AVX512VNNI__)

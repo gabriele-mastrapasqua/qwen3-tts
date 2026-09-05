@@ -2024,9 +2024,8 @@ typedef struct {
 } tk_region_t;
 
 static void tk_region_gather_quant(tk_region_t *r, const float *src, int b, int j, int cols, int srcstride) {
-    float *Xt = r->bb->Xt; const float *s = src + (size_t)b * srcstride;
-    for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
-    r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
+    const float *s = src + (size_t)b * srcstride;
+    r->sx[j] = qwen_region_i8_quant_row(r->qx + (size_t)j * cols, s, cols);
 }
 static void tk_region_scatter(tk_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
     float *d = dst + (size_t)b * rows;
