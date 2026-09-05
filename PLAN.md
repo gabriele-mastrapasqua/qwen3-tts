@@ -104,10 +104,17 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       tautology where the x86 path is absent. Box: all cases equal, identical WAV md5 with the
       path on/off, function 428->278 ns (96x7 column) to 83.1->26.8 us (96x672 panel), one shape
       +4% where gcc already auto-vectorises, end-to-end -0.8%. im2col is pure memcpy, no asymmetry
-- [ ] P3.11 NEON `qwen_int8_quant_rows` rounds half-to-EVEN (`vcvtnq_s32_f32`) while the scalar
-      tail of the same function rounds half-AWAY-from-zero, so within one row the vector body and
-      the tail disagree on .5 boundaries. Predates all of this; ARM-only; decide which rounding is
-      the contract before touching it, and gate it with the same parity test
+- [x] P3.11 The NEON body of `qwen_int8_quant_rows` rounds half-to-EVEN (`vcvtnq_s32_f32`) while
+      the scalar tail rounded half-AWAY, so one value quantised differently depending on whether
+      its index landed in the vector body or the remainder. Fixed as an INTERNAL consistency
+      defect, not by normalising the platforms: `quant_round_i32()` gives each platform ONE rule
+      everywhere (ARM half-to-even, matching its body and its qualified audio; x86 half-away,
+      matching its body and 9933948). The x86/ARM difference is left standing on purpose -- it is
+      a policy question, and neither side's audio was qualified against the other's rounding.
+      `QWEN_NO_SIMD_QUANT` now also gates the NEON path, which it never did, so the `--self-test`
+      parity gate is real on ARM instead of comparing NEON with itself. Proven discriminating:
+      restoring the old tail makes 3 of the 8 cases FAIL. M1 golden 4/4 unchanged
+      (1.00000/1.00000/1.00000/0.99995), so no qualified ARM audio moved
 - [ ] P3.6 AVX2 / AVX-512F have int8+q4 GEMM but NO integer GEMV, so every B=1 dequantises to
       the f32 fused twin. Now visible (`matvec.int8.native` / `matvec.q4.native`, 47ede94); the
       fix is a kernel, not a gate — no wasted conversion exists to remove and reusing the GEMM

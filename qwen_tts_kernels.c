@@ -8435,11 +8435,23 @@ int qwen_int8_kp(int K, int blk) { return (K + blk - 1) / blk * blk; }
  * every value that lands on a .5 boundary.  amax is a max reduction, which is
  * order-independent, so vectorising it is exact by construction.
  *
- * (The NEON path above rounds half to EVEN and saturates to [-128, 127]; that divergence
- * predates this change and is recorded in PLAN, not silently "fixed" here.  The -128 case
- * is unreachable anyway: inv = 127/amax bounds |q| by 127.)
+ * The NEON body rounds half to EVEN (vcvtnq_s32_f32) and saturates to [-128, 127].  So the
+ * two platforms have DIFFERENT rounding contracts, and normalising them is a separate
+ * decision -- ARM audio was qualified with half-to-even, x86 with half-away.  What is not
+ * defensible is the body and the TAIL of the same kernel disagreeing, which is what
+ * quant_round_i32() below fixes: each platform now rounds one way everywhere, so a value
+ * quantises the same whether its index lands in the vector body or the remainder.  (The
+ * -128 saturation is unreachable either way: inv = 127/amax bounds |q| by 127.)
  *
- * QWEN_NO_SIMD_QUANT=1 forces the scalar path; the self-test uses it to compare the two. */
+ * QWEN_NO_SIMD_QUANT=1 forces the scalar path on both x86 and ARM; the self-test uses it to
+ * compare the two, which is only a real comparison because the tail follows the platform. */
+static inline int quant_round_i32(float q) {
+#ifdef __ARM_NEON
+    return (int)vcvtns_s32_f32(q);              /* nearest, ties to even: what the body does */
+#else
+    return (int)(q >= 0 ? q + 0.5f : q - 0.5f); /* nearest, ties away: what x86 always did */
+#endif
+}
 static int g_quant_simd_off = -1;
 static int quant_simd_off(void) {
     if (g_quant_simd_off < 0) {
@@ -8474,10 +8486,12 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
             }
 #endif
 #ifdef __ARM_NEON
-            float32x4_t vmax = vdupq_n_f32(0.0f);
-            for (; i + 3 < kn; i += 4)
-                vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(s + k0 + i)));
-            amax = vmaxvq_f32(vmax);
+            if (!quant_simd_off()) {
+                float32x4_t vmax = vdupq_n_f32(0.0f);
+                for (; i + 3 < kn; i += 4)
+                    vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(s + k0 + i)));
+                amax = vmaxvq_f32(vmax);
+            }
 #endif
             for (; i < kn; i++) { float a = fabsf(s[k0 + i]); if (a > amax) amax = a; }
             float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
@@ -8502,6 +8516,7 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
             }
 #endif
 #ifdef __ARM_NEON
+            if (!quant_simd_off()) {
             float32x4_t vinv = vdupq_n_f32(inv);
             for (; i + 15 < kn; i += 16) {
                 int32x4_t q0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(s + k0 + i),      vinv));
@@ -8512,10 +8527,11 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
                 int16x8_t p1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
                 vst1q_s8(d + k0 + i, vcombine_s8(vqmovn_s16(p0), vqmovn_s16(p1)));
             }
+            }
 #endif
             for (; i < kn; i++) {
                 float q = s[k0 + i] * inv;
-                int v = (int)(q >= 0 ? q + 0.5f : q - 0.5f);
+                int v = quant_round_i32(q);
                 if (v > 127) v = 127;
                 if (v < -127) v = -127;
                 d[k0 + i] = (int8_t)v;
@@ -9686,15 +9702,16 @@ int qwen_kernel_selftest(void *out) {
             {768,  768, 64, "decoder panel 768x1"   },
         };
         const int ncase = (int)(sizeof qcase / sizeof qcase[0]);
-#if !defined(__AVX512F__)
-        /* Honest instead of a green tautology: without the AVX-512 path both runs execute
-         * the same code here, so the comparison would prove nothing.  (The NEON path is a
-         * separate question -- it rounds half to EVEN where the scalar rounds half AWAY,
-         * a divergence that predates this work and is tracked in the plan, not hidden by
-         * making this gate compare NEON against itself.) */
-        fprintf(f, "  [quant_rows] SIMD/scalar parity: n/a, this build has no x86 SIMD "
+#if !defined(__AVX512F__) && !defined(__ARM_NEON)
+        /* Honest instead of a green tautology: with no SIMD path at all both runs execute
+         * the same code here, so the comparison would prove nothing. */
+        fprintf(f, "  [quant_rows] SIMD/scalar parity: n/a, this build has no SIMD "
                    "quantiser (%d cases skipped)\n", ncase);
 #else
+        /* Real on both sides now: QWEN_NO_SIMD_QUANT gates the NEON body as well as the
+         * AVX-512 one, and the scalar tail follows the platform's rounding contract, so
+         * this compares the vector body against the scalar reference instead of comparing
+         * a half-to-even body against a half-away tail (PLAN P3.11). */
         for (int c = 0; c < ncase; c++) {
             const int rows = qcase[c].rows, K = qcase[c].K, blk = qcase[c].blk;
             const int Kp = qwen_int8_kp(K, blk), nblk = Kp / blk;
