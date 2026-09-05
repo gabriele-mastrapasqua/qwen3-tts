@@ -14,6 +14,7 @@
     } while (0)
 
 #include "qwen_tts_thread.h"
+#include "qwen_tts_costmap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9136,6 +9137,7 @@ static void sd_conv1d_worker(void *vj) {
     for (;;) {
         int p = atomic_fetch_add(&j->next_panel, 1);
         if (p >= j->n_panels) break;
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 1);
         int t0 = p * j->nc;
         int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
         for (int c = 0; c < nc; c++) {
@@ -9179,6 +9181,10 @@ void qwen_conv1d_int8(float *out, const float *in,
     job.nc = sd_conv_nc(length, sd_pool_threads());
     job.n_panels = (length + job.nc - 1) / job.nc;
     atomic_store(&job.next_panel, 0);
+    /* The decomposition itself, so a report can say 2 of 6 workers instead of only a
+     * wall time: this layer's panels are the parallel unit, and a short layer cannot
+     * fill the pool no matter how fast the kernel is. */
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
     sd_pool_run(sd_conv1d_worker, &job);
 }
 
@@ -10760,6 +10766,9 @@ void qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int
     }
 #endif
     if (tid == 0) qwen_region_i8_note_backend("VNNI row blocks", rows, cols, B);
+    if (tid == 0) qwen_region_pool_at(QWEN_RGN_MM_REGION_I8, (int)nt, rows);
+    {   int r0 = (int)(tid * (size_t)rows / nt), r1 = (int)((tid + 1) * (size_t)rows / nt);
+        if (r1 > r0) qwen_region_units_at(QWEN_RGN_MM_REGION_I8, r1 - r0); }
     int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
     int8_vmm_task(tid, nt, &c);
 #else

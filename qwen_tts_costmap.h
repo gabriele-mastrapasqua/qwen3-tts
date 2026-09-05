@@ -80,6 +80,10 @@ enum {
     QWEN_RGN_RT_POOL_WAIT,        /* caller done, waiting for workers to finish   */
     QWEN_RGN_RT_POOL_SUBMIT,      /* waiting to acquire the submit lock           */
 
+    /* ---- parallel work decomposition (appended; ids are append-only) ------- */
+    QWEN_RGN_SD_CONV_INT8 = 66,   /* decoder INT8 conv: panels claimed per worker */
+    QWEN_RGN_MM_REGION_I8,        /* in-region INT8 runner: row blocks per worker */
+
     QWEN_RGN_MAX = 72
 };
 
@@ -108,6 +112,29 @@ void qwen_region_unwind(int depth);
 int  qwen_region_begin_unique_(int id);
 static inline int qwen_region_begin_unique(int id) {
     return qwen_costmap_level_v ? qwen_region_begin_unique_(id) : 0;
+}
+
+/* ---- pool occupancy: who actually did the work ---------------------------------
+ *
+ * Wall time alone cannot say that a region ran on two of six workers.  The decoder INT8
+ * conv did exactly that for months -- its parallel unit was a fixed 128-column panel, so
+ * the most expensive layer had two panels and four workers idled -- and finding it took a
+ * manual dissection.  These record the decomposition itself:
+ *
+ *   qwen_region_pool_at(id, threads, tasks)   the dispatch: workers asked for, units offered
+ *   qwen_region_units_at(id, n)               a worker claiming n units of that region
+ *
+ * The id is explicit because a pool worker runs on its own thread with its own region
+ * stack: it is not "inside" the caller's region and cannot infer the attribution.
+ * Accumulation stays thread-local; occupancy is derived at dump time as
+ * (threads that claimed at least one unit) / (threads the dispatch asked for). */
+void qwen_region_pool_at_(int id, int threads, long long tasks);
+void qwen_region_units_at_(int id, long long n);
+static inline void qwen_region_pool_at(int id, int threads, long long tasks) {
+    if (qwen_costmap_level_v) qwen_region_pool_at_(id, threads, tasks);
+}
+static inline void qwen_region_units_at(int id, long long n) {
+    if (qwen_costmap_level_v) qwen_region_units_at_(id, n);
 }
 
 /* Label the calling thread for attribution ("main", "decoder", "prefill_helper", ...).
