@@ -67,6 +67,10 @@ static const rgn_info_t g_rgn[] = {
     { QWEN_RGN_RT_POOL_SUBMIT,    "runtime.pool_submit_wait",         QWEN_RGN_RT_POOL_DISPATCH, 1, "runtime" , "stack" },
     { QWEN_RGN_SD_CONV_INT8,      "decoder.conv_int8.panels",         QWEN_RGN_MULTI,       1, "decoder" , "stack" },
     { QWEN_RGN_MM_REGION_I8,      "region.int8_runner.rows",          QWEN_RGN_MULTI,       1, "runtime" , "stack" },
+    { QWEN_RGN_CPB_MTP,           "cp.batch.mtp",                     QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_QKV,           "cp.batch.qkv_attn",                QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_PROJ,          "cp.batch.proj_ffn",                QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_LMHEAD,        "cp.batch.lm_head",                 QWEN_RGN_MULTI,       1, "cp"      , "derived" },
 };
 static const int g_rgn_n = (int)(sizeof g_rgn / sizeof g_rgn[0]);
 
@@ -256,6 +260,8 @@ void qwen_costmap_after_fork(void) {
     pthread_mutex_init(&g_rgn_mtx, NULL);
     pthread_mutex_init(&g_req_mtx, NULL);
 }
+
+unsigned long long qwen_costmap_now_ns(void) { return rgn_now_ns(); }
 
 void qwen_region_add_ns(int id, unsigned long long ns) {
     if (!qwen_costmap_level_v) return;

@@ -1259,7 +1259,18 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
     float *Yt = bb->cp_Yt, *embs = bb->cp_gate;
 #define RSLOT(j) (r->idx ? r->idx[j] : (j))
 #define RMINE(j) ((size_t)(j) % nt == tid)
+    /* Phase attribution for the path the SERVER actually runs.  The whole frame lives inside
+     * one held region, so cp.decode had no children at all.  Accumulate plain nanoseconds in
+     * locals across the 16 steps and submit FOUR derived durations once per frame per worker:
+     * no begin/end pair per step or per layer, which is what made the pool markers unaffordable.
+     * Cost is 5 clock reads per step per worker -- ~0.02% of a frame. */
+    const int prof = qwen_costmap_level() != 0;
+    uint64_t ph_mtp = 0, ph_qkv = 0, ph_proj = 0, ph_head = 0, tmark = 0;
+#define CPB_T0() do { if (prof) tmark = qwen_costmap_now_ns(); } while (0)
+#define CPB_ACC(acc) do { if (prof) { uint64_t _n = qwen_costmap_now_ns(); (acc) += _n - tmark; \
+                                      tmark = _n; } } while (0)
     for (int s = 0; s < 16; s++) {
+        CPB_T0();
         /* MTP projection: this step's source row per slot, quantised, then one matmat. */
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
@@ -1293,7 +1304,9 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
             cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
         }
         qwen_barrier_wait(&r->bar);
+        CPB_ACC(ph_mtp);
         cp_region_layers(r, tid, nt, s);
+        CPB_ACC(ph_qkv);          /* the transformer step: QKV+attention and the projections */
         if (s == 0) continue;                        /* the first step has no head */
         {
             const int g = s - 1;
@@ -1314,8 +1327,18 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
                 }
                 r->out_codes[(size_t)b * 15 + g] = best;
             }
+            CPB_ACC(ph_head);
         }
     }
+    if (prof) {
+        /* ONE submission per worker per frame, four derived durations. */
+        qwen_region_add_ns(QWEN_RGN_CPB_MTP, ph_mtp);
+        qwen_region_add_ns(QWEN_RGN_CPB_QKV, ph_qkv);
+        qwen_region_add_ns(QWEN_RGN_CPB_PROJ, ph_proj);
+        qwen_region_add_ns(QWEN_RGN_CPB_LMHEAD, ph_head);
+    }
+#undef CPB_T0
+#undef CPB_ACC
 #undef RSLOT
 #undef RMINE
 }

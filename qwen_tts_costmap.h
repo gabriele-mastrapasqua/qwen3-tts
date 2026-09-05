@@ -84,7 +84,18 @@ enum {
     QWEN_RGN_SD_CONV_INT8 = 66,   /* decoder INT8 conv: panels claimed per worker */
     QWEN_RGN_MM_REGION_I8,        /* in-region INT8 runner: row blocks per worker */
 
-    QWEN_RGN_MAX = 72
+    /* ---- batched CP, the path the production server actually runs ---------
+     * The single-request CP has level-2 regions; the SERVER uses
+     * qwen_batch_cp_predict, whose whole frame runs inside one held region, so
+     * cp.decode had no children at all.  These are accumulated as plain
+     * nanoseconds inside the region body and submitted ONCE per frame per
+     * worker: no begin/end pair per layer or per step. */
+    QWEN_RGN_CPB_MTP = 68,        /* MTP projection + gather                      */
+    QWEN_RGN_CPB_QKV,             /* fused QKV + attention                        */
+    QWEN_RGN_CPB_PROJ,            /* out proj + gate/up + down                    */
+    QWEN_RGN_CPB_LMHEAD,          /* the 15 lm_head projections + argmax          */
+
+    QWEN_RGN_MAX = 76
 };
 
 #define QWEN_RGN_MULTI (-1)       /* declared parent for legitimately multi-parent regions */
@@ -174,6 +185,9 @@ void qwen_region_thread_role(const char *role);
  * marked mode="derived" in the JSON so nobody reads them as if they were measured
  * the same way as the rest. */
 void qwen_region_add_ns(int id, unsigned long long ns);
+/* The same clock the regions use, for a caller that accumulates phase durations itself and
+ * submits them once (see the batched CP frame region). */
+unsigned long long qwen_costmap_now_ns(void);
 
 /* One completed request, so the report can print ms/request. */
 void qwen_costmap_request_done(void);
