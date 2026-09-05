@@ -291,7 +291,18 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 - [ ] X86-4 Activation preparation/fusion follow-up — remove remaining generic gather, q8-pack and
       scatter passes. Rest of old P5.6; the decoder half of old P5.7 is partly done by 9933948
       (x86 SIMD `qwen_int8_quant_rows`), the im2col fusion is not.
-- [ ] X86-5 AMX activation-pack reuse — check reuse across workers inside a held region.
+- [ ] X86-5 AMX activation-pack reuse — REAL but currently worthless on this serving profile;
+      do not spend on it until per-worker B rises. The redundancy is confirmed by reading:
+      `qwen_region_i8_run` calls `amx_pack_act_int8` on EVERY thread, each packing the same
+      B x cols activation into its own scratch, so the pack is duplicated nt times. (The fused
+      QKV already shares one pack across Q, K and V, which is also why its gate is judged on
+      q+2kv.) Sizing from the B-sweep: the AMX cost is nearly flat in B and the pack slope is
+      about 1.4 us per unit of B on TK Down (cols 6144), i.e. ~10% of that projection at B=4, so
+      packing once instead of nt times is worth roughly 5-10% of AMX projection time.
+      Why it does not pay HERE: the batched server measures B 1.2-2.9 per prefork worker at
+      C=2..6, and INT8 AMX needs B>=3 plus rows/thread >= 256, so AMX barely executes at this
+      concurrency. Revisit when a host or profile actually sustains B>=3 per worker; the fix
+      needs a barrier inside the runner or the pack hoisted into the region body, which has one.
       NOTE (2026-09-05, box): the B=32 two-accumulator prototype in `tests/prefill_bench.c` is
       not usable as it stands. On the AMX build it dies with SIGILL before its first line while
       the engine's AMX path is live in the same process; `QWEN_NO_AMX=1` makes the SAME binary
