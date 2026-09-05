@@ -211,7 +211,7 @@ both belong before any number.
 
 | flag | default | effect |
 |---|---|---|
-| `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit: AMX, ARM BF16 (not Apple), or **AVX-512 BF16**; else BLAS | `=0` routes prefill projections back through BLAS, `=1` forces the native matmat. The AVX-512-BF16 arm was added 2026-09-03: before it, an AVX-512-BF16 host **without AMX** fell back to BLAS, which converts every weight matrix to f32 first — and that conversion (`bf16_to_f32_matrix`) is single-threaded, so it became a serial stage in front of a parallel GEMM. Measured on AWS c8a.4xlarge (EPYC 9R45, 16c, no AMX) in server mode, four sequential arms: TTFA p50 416 → 124 ms at C=1, p95 939 → 507 ms at C=4, TOTAL_RTF −13% at C=4, with the delta localised in the server-side `admission + prefill` stage (2844 → 1126 ms) while Talker and CP absolute times and `STREAM_RTF` were unchanged. **It changes the sampled trajectory** (mel-corr ~0.4–0.8 against the BLAS path on the same prompt), so it is a different generation, not a rounding difference |
+| `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit: AMX, ARM BF16 (not Apple), or **AVX-512 BF16**; else BLAS | `=0` routes prefill projections back through BLAS, `=1` requests the native matmat but cannot create a missing capability. If the request is `1` and no compiled/runtime-enabled native BF16 unit exists, the engine resolves to the auditable BLAS fallback and the profile/dispatch gate refuses the run. The AVX-512-BF16 arm was added 2026-09-03: before it, an AVX-512-BF16 host **without AMX** fell back to BLAS, which converts every weight matrix to f32 first — and that conversion (`bf16_to_f32_matrix`) is single-threaded, so it became a serial stage in front of a parallel GEMM. Measured on AWS c8a.4xlarge (EPYC 9R45, 16c, no AMX) in server mode, four sequential arms: TTFA p50 416 → 124 ms at C=1, p95 939 → 507 ms at C=4, TOTAL_RTF −13% at C=4, with the delta localised in the server-side `admission + prefill` stage (2844 → 1126 ms) while Talker and CP absolute times and `STREAM_RTF` were unchanged. **It changes the sampled trajectory** (mel-corr ~0.4–0.8 against the BLAS path on the same prompt), so it is a different generation, not a rounding difference |
 | `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably degrades output quality on some models.** Base models only, and the server says so when you turn it on |
 | `QWEN_KAI_NCHUNK` **(ARM only)** | 384 | sub-tiles the KleidiAI GEMM's n dimension so the second height pass finds the packed RHS in cache. `=0` restores one kernel call per slice |
 | `QWEN_KAI_OPS` **(ARM only)** | all families on | comma list restricting which KleidiAI families may be used; empty means every one |
@@ -320,7 +320,10 @@ how an AVX-512-BF16 host ran the Talker prefill on the f32/SGEMM fallback for we
 TTFA at C=1) while every `[FLAGS]` line looked right. `./qwen_tts --dispatch-map` prints the
 other side, per logical feature: **compiled · supported on this CPU · env · resolved · reason**,
 where *resolved* is obtained by calling the runtime predicate itself, and a second table with
-every `g_mm_gate[]` row as `qwen_mm_use()` answers it now:
+every `g_mm_gate[]` row as `qwen_mm_use()` answers it now. When `tools/cpu_check.sh` receives a
+profile, it runs this map under the profile's actual environment; an explicit
+`QWEN_PREFILL_MATMAT=1` with no native BF16 unit is a hard dispatch-gate finding instead of a
+warning that can survive into a long suite:
 
 ```
 [DISPATCH] v=1 pid=… isa_class=x86_avx512bf16 build=1496938 simd=avx512bf16

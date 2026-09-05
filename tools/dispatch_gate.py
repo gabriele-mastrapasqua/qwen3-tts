@@ -12,6 +12,8 @@ Reads the JSON that `./qwen_tts --dispatch-map` writes (QWEN_DISPATCH_JSON=path)
          without an explicit env switch is a fallback nobody asked for;
        - talker.prefill.f32_blas_fallback ON while talker.prefill.matmat_bf16 is
          compiled and supported is the 2026-09-03 bug, on any class.
+       - QWEN_PREFILL_MATMAT=1 while no native BF16 unit is compiled/supported is an
+         unsatisfied request, even when the class expectation historically allowed OFF.
 
 Verdict per finding:
   SUSPICIOUS  expected ON, compiled+supported on this host, resolved OFF  -> exit 1
@@ -104,6 +106,20 @@ def evaluate(doc, expect_all):
             and "talker.prefill.matmat_bf16" not in expect and not explicit_env_set(mb):
         findings.append(("SUSPICIOUS", "talker.prefill.f32_blas_fallback",
                          "f32/SGEMM prefill selected although a bf16 matmat unit is compiled and supported"))
+
+    # generic rule 3: an explicit native-prefill request must be satisfiable.  This is
+    # deliberately checked even for x86_avx512vnni, whose historical expectation is
+    # OFF: that class can still receive QWEN_PREFILL_MATMAT=1 and otherwise enter the
+    # generic BF16 twin, which is neither AVX-512 BF16 nor AMX.
+    requested_unavailable = (
+        mb and mb.get("env") == "QWEN_PREFILL_MATMAT" and mb.get("env_value") == "1"
+        and (not mb["compiled"] or not mb["supported"]
+             or "no native" in mb.get("reason", "")
+             or "no compiled" in mb.get("reason", "")))
+    if requested_unavailable and not any(fid == "talker.prefill.matmat_bf16" for _, fid, _ in findings):
+        findings.append(("SUSPICIOUS", "talker.prefill.matmat_bf16",
+                         "QWEN_PREFILL_MATMAT=1 cannot be honored by this binary/CPU: "
+                         "no native BF16 matmat unit; the run would use a fallback"))
     return cls, findings
 
 
@@ -141,10 +157,20 @@ def selftest():
     os.environ.pop("QWEN_NO_BF16_MATMUL", None)
     cls, f = evaluate(doc, expect)
     ids = {(v, i) for v, i, _ in f}
+    requested_doc = {"isa_class": "x86_avx512vnni", "features": [
+        {"id": "talker.prefill.matmat_bf16", "compiled": "no", "supported": "no",
+         "env": "QWEN_PREFILL_MATMAT", "env_value": "1", "resolved": "OFF",
+         "reason": "explicit QWEN_PREFILL_MATMAT=1 but no native BF16 unit -> fallback"},
+        {"id": "talker.prefill.f32_blas_fallback", "compiled": "yes", "supported": "yes",
+         "env": "", "env_value": "", "resolved": "ON", "reason": "fallback"},
+    ]}
+    _, requested_findings = evaluate(requested_doc, expect)
+    requested_ids = {(v, i) for v, i, _ in requested_findings}
     ok = ("SUSPICIOUS", "talker.prefill.matmat_bf16") in ids \
         and ("SUSPICIOUS", "gate.bf16.avx512") in ids \
         and ("MISMATCH", "decoder.int8") in ids \
-        and not any(i == "gate.int8.vnni" for _, i, _ in f)
+        and not any(i == "gate.int8.vnni" for _, i, _ in f) \
+        and ("SUSPICIOUS", "talker.prefill.matmat_bf16") in requested_ids
     report(cls, f)
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1

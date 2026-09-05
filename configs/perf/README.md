@@ -9,6 +9,7 @@ configs/perf/recommended.json     stable entry point; POINTS at the current reco
 configs/perf/x86-8c-amx-recommended.json  x86-specific alias for the measured AMX profile
 configs/perf/scaleway-16c-vnni-ttfa.json provisional VNNI profile for a 16-core Scaleway host
 configs/perf/aws-c8a-16c-vnni-ttfa.json  provisional VNNI profile for an AWS c8a.4xlarge (EPYC 9R45, 16c, no AMX)
+configs/perf/gcp-c4-standard-24-vnni-ttfa.json  unqualified VNNI/BF16-prefill starting profile for GCP c4-standard-24 (12 physical / 24 logical Intel cores)
 ```
 
 The measured Scaleway campaign is summarized in
@@ -117,6 +118,7 @@ Individual rungs remain available for investigation. The suite is the gate for a
 | `x86-8c-amx-multiclient-ttfa` | see the file | the same host, two workers x four physical-core threads; balanced C=2-8 operation |
 | `x86-8c-amx-tail-latency-ttfa` | see the file | four workers x two threads: the best measured TTFA p95 at C=8 on a saturated box, and worse than the two-worker profile everywhere else |
 | `aws-c8a-16c-vnni-ttfa` | **provisional** | an AWS c8a.4xlarge (EPYC 9R45, 16 cores, no AMX). The host on which the AVX-512-BF16 prefill default was measured: pinning `QWEN_PREFILL_MATMAT=1` there moved TTFA p50 from 416 to 124 ms at C=1 and p95 from 939 to 507 ms at C=4 |
+| `gcp-c4-standard-24-vnni-ttfa` | **unqualified** | a GCP c4-standard-24 starting profile. It deliberately requires `SIMD=avx512bf16` (VNNI + AVX-512 BF16, no AMX); the previous C4 run used `SIMD=avx512vnni`, which could not compile the native BF16 prefill |
 | `x86-8c-amx-recommended` | alias | resolves to the balanced x86 AMX profile; carries no values of its own |
 | `recommended` | alias | resolves to the qualified one; carries no values of its own |
 

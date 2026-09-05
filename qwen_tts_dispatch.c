@@ -160,8 +160,20 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
 #else
             0;
 #endif
-        int supported = qwen_amx_bf16_available() || qwen_arm_bf16_matmat_available()
-                        || qwen_avx512_bf16_matmat_available();
+        /* `supported` is a hardware/permission fact, not the result of an operator
+         * kill switch.  The effective env-controlled choice is reported separately by
+         * qwen_prefill_matmat_resolved().  In particular, QWEN_NO_BF16_MATMUL=1 must
+         * not make an AVX-512-BF16 CPU look as if it lacked the instruction. */
+        int supported = 0;
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+        supported |= qwen_amx_bf16_available();
+#endif
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) && !defined(__APPLE__)
+        supported = 1;
+#endif
+#if defined(__AVX512BF16__)
+        supported |= __builtin_cpu_supports("avx512bf16") ? 1 : 0;
+#endif
         row(&feats[n++], "talker.prefill.matmat_bf16", yn(compiled), yn(supported),
             "QWEN_PREFILL_MATMAT", onoff(on), why);
 #ifdef USE_BLAS

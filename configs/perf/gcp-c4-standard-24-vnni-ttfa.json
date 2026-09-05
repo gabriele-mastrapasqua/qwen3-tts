@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "gcp-c4-standard-24-vnni-ttfa",
+    "description": "Unqualified VNNI/BF16-prefill starting profile for a GCP c4-standard-24: 12 physical Intel cores, 24 logical CPUs, AMX present in the host but deliberately excluded from this binary.",
+    "objective": {
+      "primary": "ttfa",
+      "secondary": "realtime_factor",
+      "concurrency_range": [
+        1,
+        8
+      ],
+      "preferred_concurrency": "unspecified",
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "cpu_family": "Intel Xeon Platinum 8581C (Emerald Rapids)",
+    "logical_cpus": 24,
+    "physical_cores": 12,
+    "threads_per_core": 2,
+    "numa_nodes": 1,
+    "l3_mib": 260,
+    "ram_gib": 88.38,
+    "isa_features_used": [
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512vnni",
+      "avx512bf16"
+    ],
+    "notes": "GCP c4-standard-24, one socket and one NUMA node. The host exposes AMX tile/INT8/BF16 and SMT siblings 0-11 / 12-23, but this profile is VNNI-only in the operational sense: rebuild with SIMD=avx512bf16, which includes AVX-512 VNNI and BF16 but no AMX compiler flags. Yesterday's SIMD=avx512vnni campaign did not compile the BF16 matmat unit and is historical evidence only. Qualify SMT-on and SMT-off separately; the conservative starting topology is 2 workers x 6 physical cores with SMT off. Visible shared L3 is 260 MiB, not 260 MiB per core. The previous host sweep measured approximately 101.5 GB/s Triad on the 12-CPU physical mask and 106.0 GB/s on all 24 logical CPUs; these are roof references, not per-worker bandwidth obtained by division."
+  },
+  "build": {
+    "target": "blas",
+    "make": {
+      "command": "make -B blas SIMD=avx512bf16 -j12",
+      "variables": {
+        "SIMD": "avx512bf16"
+      }
+    },
+    "requirements": {
+      "blas": "OpenBLAS pthread build",
+      "isa": "AVX-512 VNNI and AVX-512 BF16; no AMX code in this profile",
+      "ingot": "clean rebuild on the GCP x86 toolchain; do not copy a macOS or Arm static library"
+    }
+  },
+  "server": {
+    "prefork_workers": 2,
+    "threads_per_worker": 6,
+    "batch_size": 8,
+    "max_queue": 1,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
+    "worker_affinity": "SMT-off starting point: worker 0 -> CPUs 0-5; worker 1 -> CPUs 6-11. Re-measure the same topology with SMT-on siblings explicitly before using 24 logical CPUs."
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 8,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8 per output row; BF16 copy retained for quality-preserving prefill",
+      "code_predictor_weights": "int8 per output row",
+      "speech_decoder_weights": "fp32",
+      "activations": "fp32 at the API boundary; AVX-512 VNNI activation packing is internal to INT8 paths",
+      "gemm_backend": "AVX-512 BF16 VDPBF16PS for native BF16 prefill matmat, AVX-512 VNNI VPDPBUSD for INT8/Q4 batched paths, and OpenBLAS SGEMM only for the explicit fallback/control path; AMX is intentionally not compiled"
+    },
+    "environment": {
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "Must be absent: the engine sizes OpenBLAS from the worker phase budget. An inherited value silently replaces the measured thread split.",
+        "revert": "Set explicitly only for a measured control run."
+      },
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "Starting value copied from the measured x86/Arm profiles: parks idle OpenBLAS workers instead of letting them contend with the engine pool. Re-measure on this C4 after the corrected BF16 build.",
+        "revert": "Unset for a control run."
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "Keeps the request-independent prompt head enabled for repeated serving requests; already used by the previous C4 campaign.",
+        "revert": "QWEN_PREFIX_CACHE=0"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "Required for this candidate after rebuilding SIMD=avx512bf16: it requests the native BF16 prefill and the new dispatch gate will fail before measurement if the BF16 unit is not compiled/supported. The old SIMD=avx512vnni binary could not satisfy this request.",
+        "revert": "QWEN_PREFILL_MATMAT=0 for the explicit BLAS control path."
+      },
+      "QWEN_PREFILL_QUANT": {
+        "value": null,
+        "why": "Quality-preserving reference: quantized prefill remains a separate candidate and is not enabled by this profile.",
+        "revert": "QWEN_PREFILL_QUANT=1 only for a separately qualified base-model control."
+      },
+      "QWEN_CP_PREFILL2": {
+        "value": "1",
+        "why": "Keeps the two-position Code Predictor prefill path explicit for an AVX-512 VNNI build; it was active in the previous C4 runs.",
+        "revert": "QWEN_CP_PREFILL2=0"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "4096",
+        "why": "Starting x86 value and the value used in the previous C4 measurements. It is not copied from Axion: Linux/aarch64 defaults to 65536, while x86 defaults to 4096. The corrected BF16 build still needs a short C4 A/B for 0/4096/65536.",
+        "revert": "Unset for the compiled x86 default; test 0 or 65536 only as separate controls."
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "0",
+        "why": "Starting value from the prior C4 VNNI campaign. The server would otherwise enable decoder batching; whether the wider SMT-on C4 can amortize it is a separate measurement.",
+        "revert": "QWEN_DECODER_BATCH=1"
+      },
+      "QWEN_STREAM_DECODE_CHUNK": {
+        "value": "8",
+        "why": "The previous C4 VNNI runs used an eight-frame steady-state chunk; keep it fixed while changing only the build/dispatch capability.",
+        "revert": "Change only in a paired streaming A/B."
+      },
+      "QWEN_STREAM_DECODE_CHUNK_BUSY": {
+        "value": "0",
+        "why": "Busy-stream override was disabled in the previous C4 campaign; keep the baseline isolated.",
+        "revert": "Set a nonzero value only in a paired control."
+      },
+      "QWEN_VNNI_GEMV_MR": {
+        "value": "2",
+        "why": "The previous C4 VNNI run used the two-row GEMV microkernel. Retain it while correcting only the BF16 compiler capability.",
+        "revert": "QWEN_VNNI_GEMV_MR=4 for a separate A/B."
+      },
+      "QWEN_NO_AMX": {
+        "value": null,
+        "why": "Must remain absent: AMX is excluded by the SIMD=avx512bf16 build, not by a runtime kill switch. This makes a mistaken AMX build visible in the dispatch map instead of hiding it behind an env flag.",
+        "revert": "QWEN_NO_AMX=1 is only a control on an AMX binary."
+      },
+      "QWEN_NO_AMX_BF16": {
+        "value": null,
+        "why": "Absent because the VNNI/BF16 profile has no AMX BF16 code; it is relevant only to an AMX build.",
+        "revert": "Set only for an AMX per-consumer control."
+      },
+      "QWEN_NO_AMX_INT8": {
+        "value": null,
+        "why": "Absent because the VNNI/BF16 profile has no AMX INT8 code; it is relevant only to an AMX build.",
+        "revert": "Set only for an AMX per-consumer control."
+      },
+      "QWEN_NO_VNNI": {
+        "value": null,
+        "why": "Must remain absent so the native AVX-512 VNNI INT8/Q4 paths are available.",
+        "revert": "QWEN_NO_VNNI=1 for the fallback self-test/control."
+      },
+      "QWEN_NO_VNNI_TILE": {
+        "value": null,
+        "why": "Must remain absent so the shape-aware VNNI tiled matmat remains available.",
+        "revert": "QWEN_NO_VNNI_TILE=1 for a control."
+      },
+      "QWEN_NO_VNNI_ROWSUM": {
+        "value": null,
+        "why": "Must remain absent so cached INT8 row sums are used by VNNI GEMV.",
+        "revert": "QWEN_NO_VNNI_ROWSUM=1 for a control."
+      },
+      "QWEN_NO_VNNI_ACT_QUANT": {
+        "value": null,
+        "why": "Must remain absent so AVX-512 activation quantization remains enabled in the VNNI path.",
+        "revert": "QWEN_NO_VNNI_ACT_QUANT=1 for a control."
+      },
+      "QWEN_NO_BF16_MATMUL": {
+        "value": null,
+        "why": "Must remain absent: with QWEN_PREFILL_MATMAT=1 this is the direct kill switch for the AVX-512 BF16 prefill unit, and the dispatch gate now rejects that contradiction.",
+        "revert": "Set to 1 only for the explicit BLAS/fallback control."
+      },
+      "QWEN_VNNI_PREPACK": {
+        "value": null,
+        "why": "Candidate only; previous C4 VNNI measurements did not establish a stable end-to-end win.",
+        "revert": "QWEN_VNNI_PREPACK=cp or =1 in a separate candidate run."
+      },
+      "QWEN_VNNI_NCHUNK": {
+        "value": null,
+        "why": "Not pinned until a corrected-build C4 measurement shows a stable p95/RTF win.",
+        "revert": "Set a row count only for a paired A/B."
+      },
+      "QWEN_AVX512_NCHUNK": {
+        "value": null,
+        "why": "Experimental output-row chunking for the AVX-512 BF16 family; no C4 measurement exists under the corrected build yet.",
+        "revert": "Set only for a paired A/B."
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "unqualified",
+    "workload": "NONE YET for this corrected SIMD=avx512bf16 profile. The 2026-09-05 C4 VNNI results used SIMD=avx512vnni and are retained as historical comparison, not qualification.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-1.7b base checkpoint, open weights, --int8",
+    "speaker": "ryan",
+    "notes": "First action on the next boot: clean-rebuild Ingot and the engine with make -B blas SIMD=avx512bf16 -j12, verify --caps reports AVX-512 BF16 VDPBF16PS and AMX not compiled, then run --dispatch-map under this profile. The gate must show talker.prefill.matmat_bf16 compiled=yes supported=yes resolved=ON and f32_blas_fallback=OFF before any suite or soak. SMT-off 2x6 is the conservative starting topology; SMT-on 4x6 and 3x8 remain separate candidates from the old build and must be rechecked after the BF16 correction."
+  }
+}

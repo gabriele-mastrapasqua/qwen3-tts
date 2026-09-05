@@ -18,6 +18,7 @@
 #   dispatch.txt / dispatch.json   ./qwen_tts --dispatch-map (RESOLVED flags, not raw env)
 #   dispatch_gate.txt              expected-vs-observed for this ISA class
 #   env.txt         every QWEN_* / OPENBLAS_* / OMP_* variable present
+#   profile_env.txt exact comma-profile environment applied to dispatch-map and its gate
 #   gate.txt        the PASS/FAIL/WARN/SKIP lines below
 #
 # and exits non-zero on any FAIL.  profiles/LATEST points at the newest run.
@@ -179,23 +180,17 @@ else
 fi
 
 # ── 8. resolved dispatch map ────────────────────────────────────────────────────────
-if QWEN_DISPATCH_JSON="$OUT/dispatch.json" "$BIN" --dispatch-map > "$OUT/dispatch.txt" 2>&1 && [ -s "$OUT/dispatch.json" ]; then
-    ISA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["isa_class"])' "$OUT/dispatch.json")
-    gate PASS "resolved dispatch map" "isa_class=$ISA  $OUT/dispatch.txt"
-    python3 tools/dispatch_gate.py --coverage "$OUT/dispatch.json" > "$OUT/coverage.txt" 2>&1 \
-        && gate INFO "feature coverage" "$(grep -m1 'resolved by the map' "$OUT/coverage.txt" | sed 's/^ *//')"
-    if python3 tools/dispatch_gate.py "$OUT/dispatch.json" > "$OUT/dispatch_gate.txt" 2>&1; then
-        gate PASS "expected-vs-observed dispatch" "no SUSPICIOUS / MISMATCH for $ISA"
-    else
-        gate FAIL "expected-vs-observed dispatch" "$(grep -c -E 'SUSPICIOUS|MISMATCH' "$OUT/dispatch_gate.txt") finding(s), see below"
-    fi
-else
-    gate FAIL "resolved dispatch map" "--dispatch-map failed (binary without it? rebuild)"
-fi
-
-# ── 9. serving profile (optional) ───────────────────────────────────────────────────
+# Resolve the deployment profile BEFORE asking the binary for its map.  The old order
+# measured compiled defaults here and only resolved the profile afterwards, so a profile
+# value such as QWEN_PREFILL_MATMAT=1 was absent from the map that gated a ten-hour run.
+PROFILE_ENV_ARGS=()
+PROFILE_ENV_READY=0
+SENV=""
 if [ -n "$CPU_PROFILE" ]; then
     if SENV=$(python3 tools/perf_profile.py server-env "$CPU_PROFILE" 2>"$OUT/profile_err.txt"); then
+        PROFILE_ENV_READY=1
+        [ -z "$SENV" ] || IFS=',' read -r -a PROFILE_ENV_ARGS <<< "$SENV"
+        printf '%s\n' "$SENV" | tr ',' '\n' | sort > "$OUT/profile_env.txt"
         gate PASS "profile resolves" "$CPU_PROFILE -> $SENV"
         FORB_PRESENT=""
         for V in $(python3 tools/perf_profile.py forbidden-env "$CPU_PROFILE" 2>/dev/null); do
@@ -210,7 +205,37 @@ else
     gate SKIP "profile resolves" "CPU_PROFILE= not given"
 fi
 
-# ── 10. model fingerprint (optional) ────────────────────────────────────────────────
+if [ "$PROFILE_ENV_READY" = "1" ]; then
+    env "${PROFILE_ENV_ARGS[@]}" QWEN_DISPATCH_JSON="$OUT/dispatch.json" "$BIN" --dispatch-map > "$OUT/dispatch.txt" 2>&1
+else
+    QWEN_DISPATCH_JSON="$OUT/dispatch.json" "$BIN" --dispatch-map > "$OUT/dispatch.txt" 2>&1
+fi
+if [ $? = 0 ] && [ -s "$OUT/dispatch.json" ]; then
+    ISA=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["isa_class"])' "$OUT/dispatch.json")
+    gate PASS "resolved dispatch map" "isa_class=$ISA  $OUT/dispatch.txt"
+    if [ "$PROFILE_ENV_READY" = "1" ]; then
+        env "${PROFILE_ENV_ARGS[@]}" python3 tools/dispatch_gate.py --coverage "$OUT/dispatch.json" > "$OUT/coverage.txt" 2>&1
+    else
+        python3 tools/dispatch_gate.py --coverage "$OUT/dispatch.json" > "$OUT/coverage.txt" 2>&1
+    fi
+    if [ -s "$OUT/coverage.txt" ]; then
+        gate INFO "feature coverage" "$(grep -m1 'resolved by the map' "$OUT/coverage.txt" | sed 's/^ *//')"
+    fi
+    if [ "$PROFILE_ENV_READY" = "1" ]; then
+        env "${PROFILE_ENV_ARGS[@]}" python3 tools/dispatch_gate.py "$OUT/dispatch.json" > "$OUT/dispatch_gate.txt" 2>&1
+    else
+        python3 tools/dispatch_gate.py "$OUT/dispatch.json" > "$OUT/dispatch_gate.txt" 2>&1
+    fi
+    if [ $? = 0 ]; then
+        gate PASS "expected-vs-observed dispatch" "no SUSPICIOUS / MISMATCH for $ISA"
+    else
+        gate FAIL "expected-vs-observed dispatch" "$(grep -c -E 'SUSPICIOUS|MISMATCH' "$OUT/dispatch_gate.txt") finding(s), see below"
+    fi
+else
+    gate FAIL "resolved dispatch map" "--dispatch-map failed (binary without it? rebuild)"
+fi
+
+# ── 9. model fingerprint (optional) ────────────────────────────────────────────────
 if [ -n "$CPU_MODEL" ]; then
     if [ -d "$CPU_MODEL" ]; then gate PASS "model fingerprint" "$CPU_MODEL (config + file sizes)"
     else gate FAIL "model fingerprint" "$CPU_MODEL is not a directory"; fi
@@ -218,11 +243,11 @@ else
     gate SKIP "model fingerprint" "CPU_MODEL= not given"
 fi
 
-# ── 11. perf availability (informational) ───────────────────────────────────────────
+# ── 10. perf availability (informational) ───────────────────────────────────────────
 if have perf; then gate PASS "perf available" "$(perf --version 2>/dev/null | head -1)"
 else gate SKIP "perf available" "not installed (Linux: linux-tools); profile-cpu will skip the system profile"; fi
 
-# ── 12. manifest ────────────────────────────────────────────────────────────────────
+# ── 11. manifest ────────────────────────────────────────────────────────────────────
 python3 tools/profile_check.py --fingerprint --bin "$BIN" ${CPU_MODEL:+--model "$CPU_MODEL"} > "$OUT/manifest.json" 2>"$OUT/manifest_err.txt"
 if [ -s "$OUT/manifest.json" ]; then
     python3 - "$OUT/manifest.json" "$OUT" "$CPU_PROFILE" "$NFAIL" "$NWARN" <<'PY'
