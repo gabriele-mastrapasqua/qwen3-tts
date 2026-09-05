@@ -281,7 +281,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_AMX_PREPACK_KINDS", "QWEN_AMX_B32", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
     "QWEN_NO_BF16_MATMUL", "QWEN_NO_SDOT", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA", "QWEN_ARM_BFDOT",
     "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
-    "QWEN_Q6_SCALAR", "QWEN_Q8_SCALAR_ACT", "QWEN_NO_Q8REPACK", "QWEN_NO_SIN_POLY",
+    "QWEN_Q6_SCALAR", "QWEN_Q8_SCALAR_ACT", "QWEN_NO_SIMD_QUANT", "QWEN_NO_Q8REPACK", "QWEN_NO_SIN_POLY",
     /* kernel gates and tiling — when a kernel may run, and how it tiles */
     "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B", "QWEN_AMX_MIN_ROWS",
     "QWEN_AMX_BF16_MIN_COLS", "QWEN_AMX_INT8_MIN_COLS", "QWEN_AMX_Q4_MIN_COLS",
@@ -8387,6 +8387,31 @@ int qwen_sd_int8_usable(int in_ch, int out_ch) {
 
 int qwen_int8_kp(int K, int blk) { return (K + blk - 1) / blk * blk; }
 
+/* The x86 half of the activation-panel quantiser.
+ *
+ * Note what the reference actually is: the scalar tail rounds HALF AWAY FROM ZERO
+ * ((int)(q >= 0 ? q + 0.5f : q - 0.5f), i.e. add the signed half then truncate toward zero)
+ * and clamps to [-127, 127].  It is not lrintf, which rounds half to even.  x86 had no SIMD
+ * path at all, so on x86 every byte this function has ever produced came from that scalar
+ * expression -- it is the contract to preserve here, and the code below reproduces it
+ * exactly rather than using _mm512_cvtps_epi32, whose round-half-to-even would differ on
+ * every value that lands on a .5 boundary.  amax is a max reduction, which is
+ * order-independent, so vectorising it is exact by construction.
+ *
+ * (The NEON path above rounds half to EVEN and saturates to [-128, 127]; that divergence
+ * predates this change and is recorded in PLAN, not silently "fixed" here.  The -128 case
+ * is unreachable anyway: inv = 127/amax bounds |q| by 127.)
+ *
+ * QWEN_NO_SIMD_QUANT=1 forces the scalar path; the self-test uses it to compare the two. */
+static int g_quant_simd_off = -1;
+static int quant_simd_off(void) {
+    if (g_quant_simd_off < 0) {
+        const char *e = getenv("QWEN_NO_SIMD_QUANT");
+        g_quant_simd_off = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_quant_simd_off;
+}
+
 void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
                           int rows, int K, int Kp, int blk) {
     int nblk = Kp / blk;
@@ -8400,6 +8425,17 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
             if (kn <= 0) { sc[b] = 1.0f; memset(d + k0, 0, blk); continue; }
             float amax = 0.0f;
             int i = 0;
+#if defined(__AVX512F__)
+            if (!quant_simd_off()) {
+                const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
+                __m512 vmax = _mm512_setzero_ps();
+                for (; i + 15 < kn; i += 16) {
+                    __m512i v = _mm512_castps_si512(_mm512_loadu_ps(s + k0 + i));
+                    vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(_mm512_and_si512(v, absmask)));
+                }
+                amax = _mm512_reduce_max_ps(vmax);
+            }
+#endif
 #ifdef __ARM_NEON
             float32x4_t vmax = vdupq_n_f32(0.0f);
             for (; i + 3 < kn; i += 4)
@@ -8411,6 +8447,23 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
             float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
             sc[b] = scale;
             i = 0;
+#if defined(__AVX512F__)
+            if (!quant_simd_off()) {
+                const __m512i signbit = _mm512_set1_epi32((int)0x80000000);
+                const __m512i halfbits = _mm512_castps_si512(_mm512_set1_ps(0.5f));
+                const __m512 vinv = _mm512_set1_ps(inv);
+                const __m512i clo = _mm512_set1_epi32(-127), chi = _mm512_set1_epi32(127);
+                for (; i + 15 < kn; i += 16) {
+                    __m512 q = _mm512_mul_ps(_mm512_loadu_ps(s + k0 + i), vinv);
+                    /* the signed half the scalar adds: copysign(0.5f, q) */
+                    __m512 bias = _mm512_castsi512_ps(_mm512_or_si512(
+                        _mm512_and_si512(_mm512_castps_si512(q), signbit), halfbits));
+                    __m512i v = _mm512_cvttps_epi32(_mm512_add_ps(q, bias));  /* toward zero */
+                    v = _mm512_max_epi32(_mm512_min_epi32(v, chi), clo);
+                    _mm_storeu_si128((__m128i *)(d + k0 + i), _mm512_cvtsepi32_epi8(v));
+                }
+            }
+#endif
 #ifdef __ARM_NEON
             float32x4_t vinv = vdupq_n_f32(inv);
             for (; i + 15 < kn; i += 16) {
@@ -9576,6 +9629,77 @@ int qwen_kernel_selftest(void *out) {
             free(in); free(wf2); free(wq2); free(sw2); free(ws2);
             free(outk); free(colf); free(colq); free(sa2);
         }
+    }
+
+    /* ---- activation-panel quantiser: SIMD must equal the scalar reference byte for byte --
+     * The scalar expression is the contract on x86 (it is what this function has always
+     * produced there), so the gate is exact equality of every output byte and every scale
+     * bit, not a tolerance.  Runs both paths over the input classes that can separate them:
+     * zeros, sign extremes, exact .5 rounding boundaries, tails that are not a multiple of
+     * the vector width, and real decoder panel shapes. */
+    {
+        static const struct { int rows, K, blk; const char *what; } qcase[] = {
+            {  1,   64, 32, "zeros"                 },
+            {  1,  128, 32, "exact .5 boundaries"   },
+            {  1,  128, 32, "sign extremes"         },
+            {  3,   77, 32, "tail, K % 16 != 0"      },
+            {  1,  100, 64, "tail, K % blk != 0"     },
+            { 96,  672, 32, "decoder panel 96x7"    },
+            {384, 2688, 32, "decoder panel 384x7"   },
+            {768,  768, 64, "decoder panel 768x1"   },
+        };
+        const int ncase = (int)(sizeof qcase / sizeof qcase[0]);
+#if !defined(__AVX512F__)
+        /* Honest instead of a green tautology: without the AVX-512 path both runs execute
+         * the same code here, so the comparison would prove nothing.  (The NEON path is a
+         * separate question -- it rounds half to EVEN where the scalar rounds half AWAY,
+         * a divergence that predates this work and is tracked in the plan, not hidden by
+         * making this gate compare NEON against itself.) */
+        fprintf(f, "  [quant_rows] SIMD/scalar parity: n/a, this build has no x86 SIMD "
+                   "quantiser (%d cases skipped)\n", ncase);
+#else
+        for (int c = 0; c < ncase; c++) {
+            const int rows = qcase[c].rows, K = qcase[c].K, blk = qcase[c].blk;
+            const int Kp = qwen_int8_kp(K, blk), nblk = Kp / blk;
+            float *src = (float *)malloc((size_t)rows * K * sizeof(float));
+            int8_t *d1 = (int8_t *)malloc((size_t)rows * Kp);
+            int8_t *d2 = (int8_t *)malloc((size_t)rows * Kp);
+            float *s1 = (float *)malloc((size_t)rows * nblk * sizeof(float));
+            float *s2 = (float *)malloc((size_t)rows * nblk * sizeof(float));
+            if (!src || !d1 || !d2 || !s1 || !s2) {
+                fprintf(f, "  [quant_rows %s] OOM, skipped\n", qcase[c].what);
+                free(src); free(d1); free(d2); free(s1); free(s2); continue;
+            }
+            for (int r = 0; r < rows; r++)
+                for (int k = 0; k < K; k++) {
+                    float v;
+                    switch (c) {
+                        case 0: v = 0.0f; break;
+                        /* amax becomes 127 so inv == 1.0f exactly and q lands on .5 */
+                        case 1: v = (k == 0) ? 127.0f
+                                             : ((k & 1) ? 1.0f : -1.0f) * ((float)((k % 254) / 2) + 0.5f);
+                                break;
+                        case 2: v = (k % 4 == 0) ? 1e30f : (k % 4 == 1) ? -1e30f
+                                  : (k % 4 == 2) ? 1e-30f : -0.0f; break;
+                        default: v = ((float)((k * 37 + r * 11) % 2001) - 1000.0f) / 250.0f; break;
+                    }
+                    src[(size_t)r * K + k] = v;
+                }
+            memset(d1, 0x5A, (size_t)rows * Kp); memset(d2, 0xA5, (size_t)rows * Kp);
+            g_quant_simd_off = 0; qwen_int8_quant_rows(d1, s1, src, rows, K, Kp, blk);
+            g_quant_simd_off = 1; qwen_int8_quant_rows(d2, s2, src, rows, K, Kp, blk);
+            g_quant_simd_off = -1;
+            int bad_b = memcmp(d1, d2, (size_t)rows * Kp) != 0;
+            int bad_s = memcmp(s1, s2, (size_t)rows * nblk * sizeof(float)) != 0;
+            int ok = !bad_b && !bad_s;
+            fprintf(f, "  [quant_rows %-22s rows=%3d K=%4d blk=%2d] SIMD vs scalar: "
+                       "bytes %s scales %s  %s\n",
+                    qcase[c].what, rows, K, blk, bad_b ? "DIFFER" : "equal",
+                    bad_s ? "DIFFER" : "equal", ok ? "PASS" : "FAIL");
+            if (!ok) failures++;
+            free(src); free(d1); free(d2); free(s1); free(s2);
+        }
+#endif
     }
 
     #undef NEXT_F
