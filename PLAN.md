@@ -127,8 +127,10 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 - [ ] Rename legacy CLI `--batch/--batch-words/--batch-dry` (deprecation alias)
 - [ ] Custom decoder fp32 GEMM evaluation (non-bitwise acceptance first)
 - [ ] INT8 prefill quality qualification (`QWEN_PREFILL_INT8MM`, separate numerical path)
-- [ ] Decide `docs/reference-gcp-c3d-8c-vnni.md` (untracked, unreviewed) and the stray
-      `main-5b5256e9.o.tmp`
+- [ ] Decide the two unreviewed GCP reference notes (c3d 8c VNNI, c4-standard-24 VNNI
+      corrected) and the stray object file left in the primary checkout. They exist only as
+      untracked files there, so they are named, not linked: a plan reference must resolve in
+      any clone (ENGINEERING.md §2b).
 - [ ] P5.10 [low, DEFERRED — not a current task] BLAS removal / replacement audit. Inventory the
       remaining hot-path OpenBLAS/SGEMM usage; measure the COMPLETE per-operation cost, not the
       GEMM arithmetic alone (layout and conversion work, thread-runtime overhead, the partition
