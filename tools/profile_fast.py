@@ -89,6 +89,10 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--port", type=int, default=9800)
     ap.add_argument("--level", type=int, default=1, help="cost-map level: 1 FAST, 2 DEEP")
+    ap.add_argument("--deep-pass", action="store_true",
+                    help="after the FAST pass, repeat the run at cost-map level 2 into "
+                         "costmap-deep/ so the fine breakdown exists without perturbing the "
+                         "timings the FAST pass reports")
     ap.add_argument("--no-profiler", action="store_true",
                     help="control arm: same run with the cost map off, for the overhead gate")
     a = ap.parse_args()
@@ -136,12 +140,12 @@ def main():
 
     import threading
     res = []
-    def one(i):
+    def one(i, p=None):
         body = json.dumps({"text": TEXT, "speaker": "ryan", "language": "English",
                            "seed": 42, "temperature": 0}).encode()
         t0 = time.time(); first = None; n = 0
         try:
-            req = urllib.request.Request("http://127.0.0.1:%d/v1/tts/stream" % port,
+            req = urllib.request.Request("http://127.0.0.1:%d/v1/tts/stream" % (p or port),
                                          data=body, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=180) as r:
                 while True:
@@ -170,6 +174,36 @@ def main():
         srv.kill(); srv.wait(timeout=20)
     log.close()
 
+    if a.deep_pass and not a.no_profiler:
+        # A separate DEEP run: FAST cannot afford one timestamp per CP layer/step, so the fine
+        # breakdown is measured in its own pass and the FAST pass keeps the honest timings.
+        os.makedirs(os.path.join(out, "costmap-deep"), exist_ok=True)
+        denv = dict(env); denv["QWEN_COST_MAP"] = "2"
+        denv["QWEN_COSTMAP_JSON"] = os.path.join(out, "costmap-deep", "cm-%d.json")
+        dlog = open(os.path.join(out, "server-deep.log"), "w")
+        dport = free_port(port + 37)
+        d = subprocess.Popen(
+            [binp, "-d", a.model, "--int8", "--serve", str(dport),
+             "--batch-size", str(a.batch_size), "--prefork", str(a.workers),
+             "--prefork-threads", str(a.threads), "--max-queue", "8",
+             "--max-request-seconds", "120"],
+            stdout=dlog, stderr=subprocess.STDOUT, cwd=ROOT, env=denv)
+        for _ in range(180):
+            time.sleep(1)
+            if "Server listening" in open(os.path.join(out, "server-deep.log")).read():
+                break
+            if d.poll() is not None:
+                break
+        dth = [threading.Thread(target=one, args=(100 + i, dport)) for i in range(a.conc)]
+        for t in dth: t.start()
+        for t in dth: t.join()
+        d.send_signal(signal.SIGINT)
+        try:
+            d.wait(timeout=40)
+        except subprocess.TimeoutExpired:
+            d.kill(); d.wait(timeout=20)
+        dlog.close()
+
     cm = sorted(f for f in os.listdir(os.path.join(out, "costmap")) if f.endswith(".json"))
     report = ""
     if cm:
@@ -177,7 +211,7 @@ def main():
                [os.path.join(out, "costmap", f) for f in cm])
         report = r.stdout + r.stderr
 
-    good = [x for x in res if "error" not in x]
+    good = [x for x in res if "error" not in x and x["i"] < 100]
     def pct(v, p):
         v = sorted(v)
         return v[min(len(v) - 1, int(round((len(v) - 1) * p)))] if v else None
