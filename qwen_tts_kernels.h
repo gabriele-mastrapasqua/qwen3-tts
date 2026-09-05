@@ -31,6 +31,7 @@ void qwen_blas_set_threads(int n);
  * partitioned across the engine pool by qwen_sd_sgemm instead.  QWEN_BLAS_OWN overrides. */
 void qwen_blas_own(int on);
 int  qwen_blas_own_get(void);
+int  qwen_blas_own_effective(void);   /* own AND the platform really has BLAS thread control */
 int  qwen_blas_threads_now(void);       /* openblas_get_num_threads(), -1 if unavailable */
 /* Decoder parallel tiles: 1 = run on the engine pool (inline when already inside a region),
  * 0 = the decoder's private worker team.  QWEN_SD_POOL=qwen|private overrides the default. */

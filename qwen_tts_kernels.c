@@ -83,6 +83,18 @@ void qwen_blas_own(int on) {
     if (!getenv("QWEN_BLAS_OWN")) g_blas_own = on ? 1 : 0;
     qwen_blas_set_threads(g_n_threads);
 }
+/* Owning the BLAS is a CLAIM; this is the fact.  qwen_blas_set_threads() below is compiled
+ * out where the vendor BLAS has no thread control (Accelerate, or a build without the
+ * OpenBLAS symbol), so there "own" never caps anything and slicing the SGEMM across the
+ * engine pool would run on top of the BLAS's own team instead of replacing it. */
+int qwen_blas_own_effective(void) {
+#if defined(__GNUC__) && !defined(__APPLE__)
+    return qwen_blas_own_get() && openblas_set_num_threads != NULL &&
+           !getenv("OPENBLAS_NUM_THREADS");
+#else
+    return 0;
+#endif
+}
 int qwen_blas_threads_now(void) {
 #if defined(__GNUC__) && !defined(__APPLE__)
     return openblas_get_num_threads ? openblas_get_num_threads() : -1;
@@ -3102,6 +3114,10 @@ QWEN_MM_SCRATCH(sdcolf, float)
 QWEN_MM_SCRATCH(sdcolq, int8_t)
 QWEN_MM_SCRATCH(sdsa, float)
 QWEN_MM_SCRATCH(corr, int)
+QWEN_MM_SCRATCH(xb,   uint16_t)
+QWEN_MM_SCRATCH(xcol, float)
+QWEN_MM_SCRATCH(ycol, float)
+QWEN_MM_SCRATCH(snk,  float)
 
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
     qwen_census_op(QWEN_PATH_MATMAT_BF16, rows, cols, B);
@@ -3126,7 +3142,7 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
 #if defined(__AMX_BF16__) && defined(__AMX_TILE__)
     if (qwen_mm_use(QWEN_MMK_BF16_AMX, B, rows, cols) && qwen_amx_bf16_ready()) {
         const size_t kfull = (size_t)(cols & ~31);
-        uint16_t *Xb  = (uint16_t *)malloc((size_t)B * cols * sizeof(uint16_t));
+        uint16_t *Xb  = mm_scratch_xb((size_t)B * cols);
         uint16_t *pXb = NULL;
         if (Xb) pXb = mm_scratch_packb(kfull * (size_t)B);
         if (Xb && pXb) {
@@ -3144,10 +3160,8 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
             } else {
                 bf16_amx_task(0, 1, &c);
             }
-              free(Xb);
             goto qwen_matmat_bf16_timed_done;
         }
-          free(Xb);
     }
 #endif
 #if defined(__AVX512BF16__)
@@ -3172,7 +3186,7 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
     {
         if (qwen_mm_use(QWEN_MMK_BF16_BFMMLA, B, rows, cols)) {
-            uint16_t *Xb = (uint16_t *)malloc((size_t)B * cols * sizeof(uint16_t));
+            uint16_t *Xb = mm_scratch_xb((size_t)B * cols);
             if (Xb) {
                 for (int b = 0; b < B; b++)
                     for (int k = 0; k < cols; k++) {
@@ -3185,7 +3199,6 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
                 } else {
                     bf16_matmat_bfmmla_slice(Y, W, Xb, 0, rows, cols, B);
                 }
-                free(Xb);
                 goto qwen_matmat_bf16_timed_done;
             }
         }
@@ -4912,7 +4925,7 @@ int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
     if (qwen_x86_qkv_disabled() || B <= 1 || B > 16 || in_dim <= 0 ||
         q_dim <= 0 || kv_dim <= 0 || !Wq || !Wk || !Wv) return 0;
 
-    uint16_t *Xb = (uint16_t *)malloc((size_t)B * in_dim * sizeof(uint16_t));
+    uint16_t *Xb = mm_scratch_xb((size_t)B * in_dim);
     if (!Xb) return 0;
     for (int b = 0; b < B; b++)
         for (int i = 0; i < in_dim; i++) {
@@ -4950,7 +4963,6 @@ int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
                 qwen_parallel((size_t)nt, bf16_qkv_amx_task, &c);
             else
                 bf16_qkv_amx_task(0, 1, &c);
-            free(Xb);
             qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, total, in_dim, kt_t0);
             return 1;
         }
@@ -4964,12 +4976,10 @@ int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
             qwen_parallel((size_t)nt, bf16_qkv_avx512_task, &c);
         else
             bf16_qkv_avx512_task(0, 1, &c);
-        free(Xb);
         qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, total, in_dim, kt_t0);
         return 1;
     }
 #endif
-    free(Xb);
     return 0;
 #endif
 }
@@ -5402,8 +5412,8 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
     }
 #elif defined(__ARM_FEATURE_DOTPROD)
     if (cols % Q4_0_BLOCK_SIZE == 0) {
-        float *xcol = (float *)malloc((size_t)cols * sizeof(float));
-        float *ycol = (float *)malloc((size_t)rows * sizeof(float));
+        float *xcol = mm_scratch_xcol((size_t)cols);
+        float *ycol = mm_scratch_ycol((size_t)rows);
         if (xcol && ycol) {
             MMSTAT(QWEN_MMK_Q4_BMATVEC, rows, cols, B);
             for (int b = 0; b < B; b++) {
@@ -5411,10 +5421,8 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                 qwen_matvec_q4_0(ycol, W, xcol, rows, cols);
                 for (int r = 0; r < rows; r++) Y[(size_t)r * B + b] = ycol[r];
             }
-            free(xcol); free(ycol);
             return;
         }
-        free(xcol); free(ycol);
     }
 #endif
     int nt = g_n_threads;
@@ -8928,8 +8936,9 @@ static void snake_row(float *data, int c, int length,
 #if defined(__APPLE__) && defined(USE_BLAS)
         {
             int n = length;
-            float *temp = (float *)malloc(n * sizeof(float));
-
+            /* grow-once per thread: this ran once per channel row */
+            float *temp = mm_scratch_snk((size_t)n);
+            if (temp) {
             vDSP_vsmul(row, 1, &a, temp, 1, n);
 
             vvsinf(temp, temp, &n);
@@ -8937,8 +8946,7 @@ static void snake_row(float *data, int c, int length,
             vDSP_vsq(temp, 1, temp, 1, n);
 
             vDSP_vsma(temp, 1, &inv_b, row, 1, row, 1, n);
-
-            free(temp);
+            }
         }
 #elif defined(__ARM_NEON)
         {
@@ -10180,6 +10188,7 @@ QWEN_MAYBE_UNUSED static void qwen_i8mm_note_backend(const char *what, int rows,
     fprintf(stderr, "[region] int8 in-region runner: %s (first use %dx%d B=%d)\n",
             what, rows, cols, B);
 }
+
 /* A shape is region-usable when SOME in-region row-block runner can execute it, not only
  * the VNNI one.  The AMX tiles are a valid runner too: qwen_i8mm_run below packs the
  * activations per thread and calls the same int8_amx_task the dispatched path calls, so the

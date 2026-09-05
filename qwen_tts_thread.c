@@ -62,9 +62,11 @@ static inline long long qp_now_us(void) {
 
 #include <dispatch/dispatch.h>
 
+static __thread int g_qp_depth;
+
 void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     if (nt == 0) return;
-    if (nt == 1) { fn(0, 1, ctx); return; }
+    if (nt == 1) { g_qp_depth++; fn(0, 1, ctx); g_qp_depth--; return; }
     const int tag = g_qwen_tls_tag;
     /* GCD's dispatch_apply both dispatches and joins, so on this backend the wait is
      * inside the call and NOT separable: pool_wait_completion stays unrecorded here
@@ -74,7 +76,9 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
                    ^(size_t tid) {
         qwen_ftz_on();
         qwen_tls_tag_set(tag);
+        g_qp_depth++;
         fn(tid, nt, ctx);
+        g_qp_depth--;
     });
     qwen_region_end(QWEN_RGN_RT_POOL_DISPATCH);
 }
@@ -83,9 +87,14 @@ void qwen_threadpool_start(int n_threads) { (void)n_threads; }
 void qwen_threadpool_stop(void) {}
 void qwen_threadpool_after_fork(void) {}
 int qwen_parallel_is_reentrant(void) { return 1; }
-int qwen_parallel_active(void) { return 0; }
+/* Truthful now: a task running under dispatch_apply IS inside the pool, so a nested
+ * qwen_parallel caller runs its body inline instead of dispatching a second apply on top
+ * of the first.  Reporting 0 here (as this did) was safe but oversubscribed. */
+int qwen_parallel_active(void) { return g_qp_depth > 0; }
 void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
-int qwen_parallel_team(void) { return 1; }
+/* 0 = this backend cannot hold a fixed team of workers inside a spin barrier, so the
+ * persistent regions stay off here.  It is a capability answer, not a thread count. */
+int qwen_parallel_team(void) { return 0; }
 
 #elif defined(_WIN32) && !defined(QWEN_USE_PTHREADS)
 
@@ -112,11 +121,15 @@ static struct {
 } P;
 static int g_inited = 0;
 
+static __thread int g_qp_depth;
+
 static void run_chunks(qwen_job_t *job) {
     LONG64 v;
     while ((v = InterlockedIncrement64(&job->next)) <= (LONG64)job->nt) {
         qwen_tls_tag_set(job->tag);
+        g_qp_depth++;
         job->fn((size_t)(v - 1), job->nt, job->ctx);
+        g_qp_depth--;
     }
 }
 
@@ -209,9 +222,11 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 }
 
 int qwen_parallel_is_reentrant(void) { return 0; }
-int qwen_parallel_active(void) { return 0; }
+/* The single global job slot means a nested qwen_parallel would deadlock; reporting the
+ * depth truthfully makes every in-pool caller run inline instead. */
+int qwen_parallel_active(void) { return g_qp_depth > 0; }
 void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
-int qwen_parallel_team(void) { return 1; }
+int qwen_parallel_team(void) { return 0; }
 
 #else
 

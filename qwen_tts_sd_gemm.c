@@ -108,7 +108,7 @@ static void sdg_run(int order, int ta, int tb, int M, int N, int K, float alpha,
     int nt = qwen_get_threads();
     /* Small problems, single thread, inside a region, or BLAS still owning its team:
      * plain call.  The threshold keeps a ~us-scale GEMM from paying a pool dispatch. */
-    if (!qwen_blas_own_get() || nt <= 1 || order != (int)CblasRowMajor ||
+    if (!qwen_blas_own_effective() || nt <= 1 || order != (int)CblasRowMajor ||
         qwen_parallel_active() || (double)M * (double)N * (double)K < 262144.0) {
         cblas_sgemm((SDG_ORDER)order, (SDG_TRANS)ta, (SDG_TRANS)tb, M, N, K,
                     alpha, A, lda, B, ldb, beta, C, ldc);
