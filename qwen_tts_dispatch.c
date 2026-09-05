@@ -249,6 +249,17 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
 
     /* ---- B=1 matvec dot products (not gate rows) --------------------------------- */
     {
+        /* Unconditional, because the interesting case is the build that has NO row below:
+         * AVX2 and AVX-512F without VNNI have int8/q4 GEMM but no integer GEMV, and used to
+         * say nothing at all while every B=1 call ran the f32 fused twin. */
+        row(&feats[n++], "matvec.int8.native", yn(qwen_int8_gemv_native()),
+            yn(qwen_int8_gemv_native()), NULL, onoff(qwen_int8_gemv_native()),
+            qwen_int8_gemv_native() ? "native integer GEMV"
+                                    : "NO integer GEMV in this build: B=1 runs the f32 fused twin");
+        row(&feats[n++], "matvec.q4.native", yn(qwen_q4_gemv_native()),
+            yn(qwen_q4_gemv_native()), NULL, onoff(qwen_q4_gemv_native()),
+            qwen_q4_gemv_native() ? "native q4 GEMV"
+                                  : "NO q4 GEMV in this build: B=1 runs the f32 fused twin");
 #if defined(__AVX512BF16__)
         row(&feats[n++], "matvec.bf16.dpbf16", "yes", yn(__builtin_cpu_supports("avx512bf16")),
             "QWEN_NO_BF16DOT", onoff(qwen_bf16dot_enabled()), "default ON; QWEN_NO_BF16DOT=1 disables");
@@ -332,9 +343,27 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             row(&feats[n++], "pool.narrow", "-", "-", "QWEN_POOL_NARROW", onoff(narrow),
                 "clamp workers to nt-1 (main thread also works)");
         }
-        row(&feats[n++], "pool.reentrant", "-", "-", "QWEN_PREFILL_HELPER",
-            onoff(qwen_parallel_is_reentrant()),
-            qwen_parallel_is_reentrant() ? "nested qwen_parallel allowed" : "nested qwen_parallel serialises");
+        row(&feats[n++], "blas.owned_effective", yn(qwen_blas_own_get()),
+            yn(qwen_blas_own_effective()), "QWEN_BLAS_OWN",
+            onoff(qwen_blas_own_effective()),
+            qwen_blas_own_effective()
+                ? "BLAS held at one thread; decoder SGEMMs partitioned on the engine pool"
+                : (qwen_blas_own_get()
+                       ? "requested, but this build has no BLAS thread control: NOT partitioned, "
+                         "so the vendor BLAS keeps its own team and no nesting is created"
+                       : "BLAS runs its own team by request"));
+        row(&feats[n++], "decoder.pool", "-", "-", "QWEN_SD_POOL",
+            qwen_sd_pool_mode() ? "engine" : "private",
+            qwen_sd_pool_mode() ? "decoder tiles run on the engine pool (inline inside a region)"
+                                : "decoder raises its own worker team");
+        row(&feats[n++], "pool.nested_dispatch", "-", "-", NULL,
+            onoff(qwen_pool_nested_dispatch_ok()),
+            qwen_pool_nested_dispatch_ok() ? "a task on the pool may dispatch again"
+                                           : "a task on the pool must run nested work inline");
+        row(&feats[n++], "pool.concurrent_submit", "-", "-", NULL,
+            onoff(qwen_pool_concurrent_submit_ok()),
+            qwen_pool_concurrent_submit_ok() ? "two threads may submit at once"
+                                             : "submission must be serialised by the caller");
         snprintf(tmp, sizeof tmp, "%d", qwen_get_threads());
         row(&feats[n++], "pool.threads", "-", "-", NULL, tmp, "matvec threads in this process (-j)");
     }

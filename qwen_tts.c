@@ -2878,7 +2878,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         for (int _j = 0; _j < h; _j++) _se[_j] += tts_pad[_j];                               \
     } while (0)
 
-    int use_helper = qwen_parallel_is_reentrant();
+    /* The helper submits from its own thread beside the frame loop, so it needs concurrent
+     * submitters (a pool capability) and the QWEN_PREFILL_HELPER opt-in (a feature flag).
+     * One predicate used to stand for both, which made a feature flag change pool policy. */
+    const char *ph = getenv("QWEN_PREFILL_HELPER");
+    int use_helper = (ph && ph[0] == '1') && qwen_pool_concurrent_submit_ok();
     qwen_tts_ctx_t *pf_ctx = use_helper ? qwen_tts_clone_for_worker(ctx) : NULL;
     prefill_q_t pfq; pthread_t pf_thr; prefill_helper_arg_t pf_arg;
     if (pf_ctx) {

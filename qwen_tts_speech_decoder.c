@@ -182,15 +182,24 @@ static void causal_conv_transpose1d_naive(float *out, const float *in,
 }
 #endif
 
+/* Policy, split from capability.  The int8 decoder convolutions are compiled for AVX-512
+ * VNNI and for ARM dotprod, but only the VNNI one has been qualified end to end, so only it
+ * is on by default; on dotprod the first-frame cost was measured worse and it stays opt-in
+ * until that is re-measured on an ARM box.  A backend with no kernel at all cannot be
+ * enabled by any value of the env.  This is deliberately not symmetry for its own sake. */
+static int sd_int8_default_on(void) {
+#if defined(__AVX512VNNI__)
+    return 1;               /* qualified: default on */
+#else
+    return 0;               /* kernel may exist (ARM dotprod) but is opt-in until qualified */
+#endif
+}
 static int sd_int8_enabled(void) {
     static int en = -1;
     if (en < 0) {
         const char *e = getenv("QWEN_SD_INT8");
-#if defined(__AVX512VNNI__)
-        en = qwen_sd_int8_available() && !(e && *e == '0');
-#else
-        en = (e && *e && *e != '0') && qwen_sd_int8_available();
-#endif
+        int want = (e && *e) ? (*e != '0') : sd_int8_default_on();
+        en = want && qwen_sd_int8_available();
     }
     return en;
 }
@@ -389,7 +398,7 @@ static void causal_conv1d_blas(float *out, const float *in,
                                const float *weight, const float *bias,
                                int in_ch, int out_ch, int length,
                                int kernel, int dilation) {
-    if (sd_int8_enabled() && in_ch == out_ch && in_ch <= 768) {
+    if (sd_int8_enabled() && qwen_sd_int8_usable(in_ch, out_ch)) {
         sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
         if (e) {
             qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,

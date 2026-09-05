@@ -373,6 +373,10 @@ int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, i
 #endif
 
 int qwen_sd_int8_available(void);
+int qwen_sd_int8_usable(int in_ch, int out_ch);   /* available AND a shape the kernels cover */
+/* B=1 capability: 1 = a native integer GEMV runs, 0 = B=1 dequantises to the f32 twin. */
+int qwen_int8_gemv_native(void);
+int qwen_q4_gemv_native(void);
 
 int qwen_int8_kp(int K, int blk);
 

@@ -1937,7 +1937,9 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
         return 0;
     }
 
-    g_serialize_synth = !qwen_parallel_is_reentrant();
+    /* Two request threads may only run the engine at once if the pool accepts concurrent
+     * submitters; this is a pool capability, not the prefill-helper opt-in it used to read. */
+    g_serialize_synth = !qwen_pool_concurrent_submit_ok();
 
     qwen_tts_ctx_t **ctxs = (qwen_tts_ctx_t **)calloc(n_workers, sizeof(*ctxs));
     pthread_t *threads = (pthread_t *)calloc(n_workers, sizeof(pthread_t));

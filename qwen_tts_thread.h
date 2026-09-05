@@ -25,7 +25,14 @@ void qwen_threadpool_start(int n_threads);
 void qwen_threadpool_stop(void);
 void qwen_pool_stats_report(void);
 
-int qwen_parallel_is_reentrant(void);
+/* Two capability questions the pool must answer honestly, because three callers used to
+ * ask one predicate that meant something different on each backend (on pthread it read the
+ * QWEN_PREFILL_HELPER opt-in, which is a feature flag and not a capability at all).
+ *
+ * nested_dispatch_ok: may a task ALREADY running on the pool call qwen_parallel again?
+ * concurrent_submit_ok: may two independent threads submit to the pool at the same time? */
+int qwen_pool_nested_dispatch_ok(void);
+int qwen_pool_concurrent_submit_ok(void);
 /* 1 while the calling thread is executing a chunk of a qwen_parallel region (worker or
  * caller).  A nested dispatch from there would deadlock on the pool's single job slot, so
  * code that may run in both contexts asks this and runs its work inline when set. */

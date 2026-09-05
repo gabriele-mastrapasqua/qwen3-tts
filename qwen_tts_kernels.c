@@ -8305,6 +8305,11 @@ void qwen_bf16_to_f32_vec(float *dst, const uint16_t *src_bf16, int n) {
     }
 }
 
+/* Capability, split from policy.  _available says the int8 decoder-convolution kernels are
+ * compiled for this build; _usable adds the shapes those kernels actually cover, which the
+ * decoder used to spell out at its call site (in_ch == out_ch && in_ch <= 768) even though
+ * the constraint belongs to the kernel.  Neither answers whether the path is ENABLED --
+ * that is a per-backend policy decision and lives with the decoder. */
 int qwen_sd_int8_available(void) {
 #if defined(__ARM_FEATURE_DOTPROD)
     return 1;
@@ -8313,6 +8318,37 @@ int qwen_sd_int8_available(void) {
 #else
     return 0;
 #endif
+}
+/* Does B=1 reach a native integer kernel on this build, or the f32 fused twin?
+ * The AVX2 and AVX-512F(-no-VNNI) builds have int8/q4 GEMM but no integer GEMV, so every
+ * B=1 call dequantises into the f32 path.  That is a missing kernel, not accidental
+ * overhead -- there is no wasted conversion to remove, and reusing the int8 GEMM at B=1
+ * would change the arithmetic -- so the honest fix here is to stop being silent about it.
+ * These mirror the ladders in qwen_matvec_int8 / qwen_matvec_q4_0, disable envs included. */
+int qwen_int8_gemv_native(void) {
+    if (qwen_mmk_compiled(QWEN_MMK_KLEIDI_I8_GEMV) && qwen_kleidi_i8_enabled()) return 1;
+#if defined(__AVX512VNNI__)
+    { const char *e = getenv("QWEN_NO_VNNI"); if (!(e && e[0] == '1')) return 1; }
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    { const char *e = getenv("QWEN_NO_SDOT"); if (!(e && e[0] == '1')) return 1; }
+#endif
+    return 0;
+}
+int qwen_q4_gemv_native(void) {
+    /* the gate row exists on every build; only qwen_mmk_compiled() knows if the kernel does */
+    if (qwen_mmk_compiled(QWEN_MMK_KLEIDI_Q4) && qwen_mmk_supported(QWEN_MMK_KLEIDI_Q4) &&
+        qwen_mm_use(QWEN_MMK_KLEIDI_Q4, 1, 4096, 4096)) return 1;
+#if defined(__AVX512VNNI__)
+    if (!q4_sdot_disabled()) return 1;
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    if (!q4_sdot_disabled()) return 1;
+#endif
+    return 0;
+}
+int qwen_sd_int8_usable(int in_ch, int out_ch) {
+    return qwen_sd_int8_available() && in_ch == out_ch && in_ch > 0 && in_ch <= 768;
 }
 
 int qwen_int8_kp(int K, int blk) { return (K + blk - 1) / blk * blk; }
@@ -8479,7 +8515,10 @@ static void sd_pool_run(void (*fn)(void *), void *ctx) {
         return;
     }
 
-    if (qwen_parallel_is_reentrant()) {
+    /* Private mode, but the pool can still absorb this without a second team: only where a
+     * nested dispatch is actually safe, and never from inside a held team. */
+    if (qwen_parallel_active()) { fn(ctx); return; }
+    if (qwen_pool_nested_dispatch_ok()) {
         sd_gcd_job_t j = { fn, ctx };
         qwen_parallel((size_t)nt, sd_gcd_task, &j);
         return;

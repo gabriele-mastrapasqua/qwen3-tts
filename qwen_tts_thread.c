@@ -86,7 +86,9 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 void qwen_threadpool_start(int n_threads) { (void)n_threads; }
 void qwen_threadpool_stop(void) {}
 void qwen_threadpool_after_fork(void) {}
-int qwen_parallel_is_reentrant(void) { return 1; }
+/* dispatch_apply re-enters and accepts concurrent submitters; it owns no job slot. */
+int qwen_pool_nested_dispatch_ok(void) { return 1; }
+int qwen_pool_concurrent_submit_ok(void) { return 1; }
 /* Truthful now: a task running under dispatch_apply IS inside the pool, so a nested
  * qwen_parallel caller runs its body inline instead of dispatching a second apply on top
  * of the first.  Reporting 0 here (as this did) was safe but oversubscribed. */
@@ -221,7 +223,10 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     LeaveCriticalSection(&P.mtx);
 }
 
-int qwen_parallel_is_reentrant(void) { return 0; }
+/* One job slot and no submit lock held across the dispatch: a nested call deadlocks and
+ * two submitters would overwrite each other's job. */
+int qwen_pool_nested_dispatch_ok(void) { return 0; }
+int qwen_pool_concurrent_submit_ok(void) { return 0; }
 /* The single global job slot means a nested qwen_parallel would deadlock; reporting the
  * depth truthfully makes every in-pool caller run inline instead. */
 int qwen_parallel_active(void) { return g_qp_depth > 0; }
@@ -564,10 +569,11 @@ int qwen_parallel_team(void) {
     return (g_inited && P.nworkers > 0) ? P.nworkers + 1 : 1;
 }
 
-int qwen_parallel_is_reentrant(void) {
-    const char *e = getenv("QWEN_PREFILL_HELPER");
-    return (e && e[0] == '1') ? 1 : 0;
-}
+/* A worker inside run_chunks() cannot take submit_mtx: the outer submitter holds it until
+ * every chunk has completed, so a nested dispatch deadlocks.  Two independent threads are
+ * fine -- submit_mtx serialises them, the second simply waits for the first. */
+int qwen_pool_nested_dispatch_ok(void) { return 0; }
+int qwen_pool_concurrent_submit_ok(void) { return 1; }
 
 #endif
 
