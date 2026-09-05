@@ -1,6 +1,9 @@
 /* qwen_tts_kernels.c - Kernel implementations */
 
 #include <pthread.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_kleidi.h"
 #include "qwen_tts_q8repack.h"
@@ -306,8 +309,9 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_FFN_SPARSITY", "QWEN_TF_CODES", "QWEN_TF_PREFIX", "QWEN_TF_CB_KEEP",
     /* GPU backends */
     "QWEN_CUDA_BATCH", "QWEN_CUDA_CONVDEC", "QWEN_CUDA_DECODER", "QWEN_CUDA_FUSED_TALKER",
-    "QWEN_METAL_BATCH", "QWEN_METAL_BATCH_NOCP", "QWEN_METAL_CP_PERPASS",
-    "QWEN_METAL_FUSED_TALKER",
+    "QWEN_CUDA_DP4A", "QWEN_DEC_NAIVE7", "QWEN_DEC_NAIVET",
+    "QWEN_METAL_BATCH", "QWEN_METAL_BATCH_NOCP", "QWEN_METAL_BATCH_MMA", "QWEN_METAL_CP_NOSYNC",
+    "QWEN_METAL_CP_PERPASS", "QWEN_METAL_FUSED_TALKER", "QWEN_METAL_PROFILE", "QWEN_METAL_Q4_VEC",
     /* diagnostics — never in a run that produces a number */
     "QWEN_BATCH_STATS", "QWEN_SHAPE_CENSUS", "QWEN_SERVE_PROFILE", "QWEN_TTFA_TRACE",
     "QWEN_LIFE_TRACE", "QWEN_REQ_TRACE", "QWEN_KERNEL_TIMING", "QWEN_VNNI_PHASE_TIMING", "QWEN_DUMP_CODE0", "QWEN_DUMP_CODES", "QWEN_EXPR_DEBUG",
@@ -8707,7 +8711,6 @@ static void sd_conv1d_worker(void *vj) {
         sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
                       colq, sa, t0, nc, j->Kp, j->blk);
     }
-    free(colf); free(colq); free(sa);
 }
 
 void qwen_conv1d_int8(float *out, const float *in,
@@ -8822,7 +8825,6 @@ void qwen_conv1d_int8(float *out, const float *in,
                 sd_scalar_dot(Wq + (size_t)m * Kp, sw + (size_t)m * nblk, colq, sa, Kp, blk)
                 + (bias ? bias[m] : 0.0f);
     }
-    free(colf); free(colq); free(sa);
 }
 
 void qwen_gemm_int8(float *out, int out_ld,
