@@ -45,12 +45,15 @@ void qwen_exec_budget_engine_owned(const char *who);
  * activation quantisation and a per-thread row block, so a persistent parallel region can
  * run the same kernels between its own barriers.  Same partition and same kernels as the
  * dispatched path: outputs are bit-identical.  Xt is k-major [cols][B]; Y is [rows][B]. */
-int   qwen_i8mm_usable(int rows, int cols, int B);
-int   qwen_i8mm_qkv_usable(int q_rows, int kv_rows, int cols, int B);
-float qwen_i8mm_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b);
-void  qwen_i8mm_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
+/* Named for the capability, not for an ISA feature: "can SOME in-region row-block runner
+ * execute this shape inside a held team".  It used to be called qwen_i8mm_usable, which
+ * stopped being true the moment the AMX tiles became a valid in-region runner too. */
+int   qwen_region_i8_usable(int rows, int cols, int B);
+int   qwen_region_i8_qkv_usable(int q_rows, int kv_rows, int cols, int B);
+float qwen_region_i8_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b);
+void  qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
                     const float *sx, int rows, int cols, int B, size_t tid, size_t nt);
-void  qwen_i8mm_run_qkv(float *q, float *k, float *v,
+void  qwen_region_i8_run_qkv(float *q, float *k, float *v,
                         const int8_t *Wq, const float *sq, const int8_t *Wk, const float *sk,
                         const int8_t *Wv, const float *sv, const int8_t *qXt, const float *sx,
                         int q_rows, int kv_rows, int cols, int B, size_t tid, size_t nt);
@@ -377,6 +380,11 @@ int qwen_sd_int8_usable(int in_ch, int out_ch);   /* available AND a shape the k
 /* B=1 capability: 1 = a native integer GEMV runs, 0 = B=1 dequantises to the f32 twin. */
 int qwen_int8_gemv_native(void);
 int qwen_q4_gemv_native(void);
+/* B>1 capability: the family that actually serves each dtype on this build, dispatcher
+ * order, evaluated at a representative large shape.  Never NULL. */
+const char *qwen_matmat_family_int8(void);
+const char *qwen_matmat_family_q4(void);
+const char *qwen_matmat_family_bf16(void);
 
 int qwen_int8_kp(int K, int blk);
 

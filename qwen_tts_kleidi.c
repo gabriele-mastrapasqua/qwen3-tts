@@ -626,6 +626,51 @@ static int kai_qkv_fused(void) {
 }
 int qwen_kleidi_qkv_fused_on(void) { return kai_qkv_fused(); }
 
+/* Same two phases for the fused Q/K/V projection the regions use for attention: prep is
+ * shared with the plain entry above (one activation pack feeds all three weights, which is
+ * the whole point of the fused call), and run executes this thread's slice of the combined
+ * n-tile space.  Job layout built exactly as qwen_kleidi_matmul_i8_qkv_native() builds it. */
+int qwen_kleidi_i8_qkv_region_usable(const void *keyq, const void *keyk, const void *keyv,
+                                     int q_rows, int kv_rows, int cols, int B) {
+    if (!qwen_kleidi_i8_enabled() || g_kai_bypass || B < 1) return 0;
+    if (!kai_qkv_fused()) return 0;
+    const kai_entry_t *eq = kai_lookup_kind(keyq, KAI_KIND_I8);
+    const kai_entry_t *ek = kai_lookup_kind(keyk, KAI_KIND_I8);
+    const kai_entry_t *ev = kai_lookup_kind(keyv, KAI_KIND_I8);
+    if (!eq || !ek || !ev) return 0;
+    if (eq->rows != q_rows || ek->rows != kv_rows || ev->rows != kv_rows) return 0;
+    if (eq->cols != cols || ek->cols != cols || ev->cols != cols) return 0;
+    return kai_op_on(eq->comp, eq->fam);
+}
+
+void qwen_kleidi_i8_qkv_region_run(const void *keyq, const void *keyk, const void *keyv,
+                                   float *dq, float *dk, float *dv,
+                                   const void *lhs_packed,
+                                   int q_rows, int kv_rows, int cols, int B,
+                                   size_t tid, size_t nt) {
+    const kai_entry_t *eq = kai_lookup_kind(keyq, KAI_KIND_I8);
+    const kai_entry_t *ek = kai_lookup_kind(keyk, KAI_KIND_I8);
+    const kai_entry_t *ev = kai_lookup_kind(keyv, KAI_KIND_I8);
+    if (!eq || !ek || !ev || !lhs_packed || nt == 0) return;
+    const int gemm = (B > 1);
+    kai_i8_qkv_job_t job;
+    job.e[0] = eq; job.e[1] = ek; job.e[2] = ev;
+    job.dst[0] = dq; job.dst[1] = dk; job.dst[2] = dv;
+    job.dst_stride[0] = (size_t)q_rows  * sizeof(float);
+    job.dst_stride[1] = (size_t)kv_rows * sizeof(float);
+    job.dst_stride[2] = (size_t)kv_rows * sizeof(float);
+    job.n[0] = (size_t)q_rows; job.n[1] = (size_t)kv_rows; job.n[2] = (size_t)kv_rows;
+    job.lhs_packed = lhs_packed;
+    job.m = (size_t)B; job.k = (size_t)cols; job.gemm = gemm;
+    const size_t n_step = gemm ? KI8_GEMM(get_n_step)() : KI8_GEMV(get_n_step)();
+    job.cum[0] = 0;
+    for (int i = 0; i < 3; i++) {
+        job.tiles[i] = (job.n[i] + n_step - 1) / n_step;
+        job.cum[i + 1] = job.cum[i] + job.tiles[i];
+    }
+    kai_i8_qkv_task(tid, nt, &job);
+}
+
 int qwen_kleidi_matmul_i8_qkv_native(float *dq, float *dk, float *dv,
                                      const void *keyq, const void *keyk, const void *keyv,
                                      const float *lhs, size_t lhs_stride,
@@ -1063,6 +1108,16 @@ int qwen_kleidi_i8_region_usable(const void *k, int r, int c, int B) {
 }
 const void *qwen_kleidi_i8_region_prep(const float *l, size_t ls, int c, int B) {
     (void)l; (void)ls; (void)c; (void)B; return NULL;
+}
+int qwen_kleidi_i8_qkv_region_usable(const void *a, const void *b, const void *c,
+                                     int q, int kv, int co, int B) {
+    (void)a; (void)b; (void)c; (void)q; (void)kv; (void)co; (void)B; return 0;
+}
+void qwen_kleidi_i8_qkv_region_run(const void *a, const void *b, const void *c,
+                                   float *dq, float *dk, float *dv, const void *lp,
+                                   int q, int kv, int co, int B, size_t tid, size_t nt) {
+    (void)a; (void)b; (void)c; (void)dq; (void)dk; (void)dv; (void)lp;
+    (void)q; (void)kv; (void)co; (void)B; (void)tid; (void)nt;
 }
 void qwen_kleidi_i8_region_run(const void *k, float *d, size_t ds, const void *lp,
                                int r, int c, int B, size_t tid, size_t nt) {

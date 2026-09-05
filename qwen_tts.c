@@ -2249,7 +2249,15 @@ static void *prefill_helper_main(void *arg) {
          * pool windows the frame loop leaves free, so an already-playing stream keeps its
          * frames; then it becomes ordinary so TTFA stays bounded. */
         { static double low_ms = -1.0;
-          if (low_ms < 0) { const char *e = getenv("QWEN_PREFILL_LOW_MS"); low_ms = e ? atof(e) : 0.0; }
+          if (low_ms < 0) {
+              const char *e = getenv("QWEN_PREFILL_LOW_MS");
+              low_ms = e ? atof(e) : 0.0;
+              if (low_ms > 0 && !qwen_pool_priority_ok()) {
+                  fprintf(stderr, "[prefill] QWEN_PREFILL_LOW_MS=%g ignored: this thread pool "
+                                  "has no submit priority\n", low_ms);
+                  low_ms = 0.0;
+              }
+          }
           if (low_ms > 0) qwen_parallel_set_low_until(qwen_parallel_now_ms() + low_ms); }
         double _t_pf_start = qwen_mono_ms();
         int prc = qwen_tts_generate(pf, req.text, NULL, NULL);

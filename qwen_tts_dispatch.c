@@ -256,6 +256,12 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             yn(qwen_int8_gemv_native()), NULL, onoff(qwen_int8_gemv_native()),
             qwen_int8_gemv_native() ? "native integer GEMV"
                                     : "NO integer GEMV in this build: B=1 runs the f32 fused twin");
+        row(&feats[n++], "matmat.int8.family", "-", "-", NULL, "see reason",
+            qwen_matmat_family_int8());
+        row(&feats[n++], "matmat.q4.family", "-", "-", NULL, "see reason",
+            qwen_matmat_family_q4());
+        row(&feats[n++], "matmat.bf16.family", "-", "-", NULL, "see reason",
+            qwen_matmat_family_bf16());
         row(&feats[n++], "matvec.q4.native", yn(qwen_q4_gemv_native()),
             yn(qwen_q4_gemv_native()), NULL, onoff(qwen_q4_gemv_native()),
             qwen_q4_gemv_native() ? "native q4 GEMV"
@@ -365,6 +371,10 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_pool_concurrent_submit_ok() ? "two threads may submit at once"
                                              : "submission must be serialised by the caller");
         snprintf(tmp, sizeof tmp, "%d", qwen_get_threads());
+        row(&feats[n++], "pool.submit_priority", "-", "-", "QWEN_PREFILL_LOW_MS",
+            onoff(qwen_pool_priority_ok()),
+            qwen_pool_priority_ok() ? "a submitter can step aside for the frame loop (LOW)"
+                                    : "no submit priority here: QWEN_PREFILL_LOW_MS is ignored");
         row(&feats[n++], "pool.threads", "-", "-", NULL, tmp, "matvec threads in this process (-j)");
     }
 

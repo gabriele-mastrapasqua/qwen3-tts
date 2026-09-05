@@ -30,6 +30,13 @@ const void *qwen_kleidi_i8_region_prep(const float *lhs, size_t lhs_stride, int 
 void qwen_kleidi_i8_region_run(const void *key, float *dst, size_t dst_stride,
                                const void *lhs_packed, int rows, int cols, int B,
                                size_t tid, size_t nt);
+/* Fused Q/K/V: one activation pack (the plain _prep above) feeds all three weights. */
+int  qwen_kleidi_i8_qkv_region_usable(const void *keyq, const void *keyk, const void *keyv,
+                                      int q_rows, int kv_rows, int cols, int B);
+void qwen_kleidi_i8_qkv_region_run(const void *keyq, const void *keyk, const void *keyv,
+                                   float *dq, float *dk, float *dv, const void *lhs_packed,
+                                   int q_rows, int kv_rows, int cols, int B,
+                                   size_t tid, size_t nt);
 
 int qwen_kleidi_matmul_i8_native(float *dst, const void *key, const float *lhs,
                                  size_t lhs_stride, size_t dst_stride,

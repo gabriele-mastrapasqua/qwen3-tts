@@ -33,6 +33,9 @@ void qwen_pool_stats_report(void);
  * concurrent_submit_ok: may two independent threads submit to the pool at the same time? */
 int qwen_pool_nested_dispatch_ok(void);
 int qwen_pool_concurrent_submit_ok(void);
+/* Does qwen_parallel_set_low_until() actually deprioritise a submitter on this backend, or
+ * is it a no-op?  A knob that silently does nothing is worse than one that says so. */
+int qwen_pool_priority_ok(void);
 /* 1 while the calling thread is executing a chunk of a qwen_parallel region (worker or
  * caller).  A nested dispatch from there would deadlock on the pool's single job slot, so
  * code that may run in both contexts asks this and runs its work inline when set. */

@@ -8319,6 +8319,40 @@ int qwen_sd_int8_available(void) {
     return 0;
 #endif
 }
+/* Which family actually serves a B>1 matmat on THIS build, in the order the dispatcher
+ * tries them.  The gate table already prints compiled/supported per family, but it cannot
+ * say which one wins, and it has no row at all for the unconditional B-twin fallback -- so
+ * on a build where every gate is off (AVX2 and AVX-512F for bf16, any non-VNNI x86 for the
+ * integer paths) the map used to say nothing about what runs.  Evaluated at a representative
+ * large shape so the thresholds in g_mm_gate[] are applied rather than duplicated here. */
+static const char *mmk_first_available(const int *cand, int n, const char *none) {
+    enum { RB = 4, RR = 4096, RC = 4096 };
+    for (int i = 0; i < n; i++) {
+        int k = cand[i];
+        if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) && qwen_mm_use(k, RB, RR, RC))
+            return g_mmk_info[k].name;
+    }
+    return none;
+}
+const char *qwen_matmat_family_int8(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
+                                QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };
+    return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
+                               "int8 f32-accum twin (no int8 GEMM gate on this build)");
+}
+const char *qwen_matmat_family_q4(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_Q4, QWEN_MMK_Q4_AMX, QWEN_MMK_Q4_VNNI,
+                                QWEN_MMK_Q4_AVX2, QWEN_MMK_Q4_SMMLA, QWEN_MMK_Q4_BMATVEC };
+    return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
+                               "q4 generic twin (no q4 GEMM gate on this build)");
+}
+const char *qwen_matmat_family_bf16(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_BF16, QWEN_MMK_BF16_AMX,
+                                QWEN_MMK_BF16_AVX512, QWEN_MMK_BF16_BFMMLA };
+    return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
+                               "bf16 fixed-B twin (no bf16 GEMM gate on this build)");
+}
+
 /* Does B=1 reach a native integer kernel on this build, or the f32 fused twin?
  * The AVX2 and AVX-512F(-no-VNNI) builds have int8/q4 GEMM but no integer GEMV, so every
  * B=1 call dequantises into the f32 path.  That is a missing kernel, not accidental
@@ -10250,7 +10284,7 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
  * Rule 6 of ENGINEERING.md: which implementation ran must be visible.  The in-region
  * runners bypass the dispatcher (and therefore the census), so each distinct backend
  * announces itself once per process the first time a region actually uses it. */
-QWEN_MAYBE_UNUSED static void qwen_i8mm_note_backend(const char *what, int rows, int cols, int B) {
+QWEN_MAYBE_UNUSED static void qwen_region_i8_note_backend(const char *what, int rows, int cols, int B) {
     static const char *seen[8]; static int nseen = 0;
     for (int i = 0; i < nseen; i++) if (seen[i] == what) return;
     if (nseen < 8) seen[nseen++] = what;
@@ -10259,12 +10293,12 @@ QWEN_MAYBE_UNUSED static void qwen_i8mm_note_backend(const char *what, int rows,
 }
 
 /* A shape is region-usable when SOME in-region row-block runner can execute it, not only
- * the VNNI one.  The AMX tiles are a valid runner too: qwen_i8mm_run below packs the
+ * the VNNI one.  The AMX tiles are a valid runner too: qwen_region_i8_run below packs the
  * activations per thread and calls the same int8_amx_task the dispatched path calls, so the
  * row results are the ones the dispatcher would have produced.  Returning 0 for AMX shapes
  * (as this did) silently switched the CP/Talker regions and the batched heads off exactly
  * when batching got wide enough for AMX. */
-int qwen_i8mm_usable(int rows, int cols, int B) {
+int qwen_region_i8_usable(int rows, int cols, int B) {
 #if defined(__AVX512VNNI__)
     if (B < 2 || B > 16 || rows < 256) return 0;
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -10275,7 +10309,7 @@ int qwen_i8mm_usable(int rows, int cols, int B) {
     (void)rows; (void)cols; (void)B; return 0;
 #endif
 }
-int qwen_i8mm_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
+int qwen_region_i8_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
 #if defined(__AVX512VNNI__) && defined(__x86_64__)
     if (qwen_x86_qkv_disabled() || B <= 1 || B > 16) return 0;
     if ((q_rows + 2 * kv_rows) < 256) return 0;
@@ -10292,10 +10326,10 @@ int qwen_i8mm_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
 /* ISA-neutral on purpose: this is the same per-column quantiser the dispatched int8
  * matmat uses on every backend that has one, so a future ARM/other in-region runner needs
  * no second copy of it. */
-float qwen_i8mm_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b) {
+float qwen_region_i8_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b) {
     return quantize_act_int8_col(qb, Xt, cols, B, b);
 }
-void qwen_i8mm_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
+void qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
                    const float *sx, int rows, int cols, int B, size_t tid, size_t nt) {
 #if defined(__AVX512VNNI__)
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -10310,20 +10344,20 @@ void qwen_i8mm_run(float *Y, const int8_t *W, const float *scale, const int8_t *
                 W, rows, cols, QWEN_AMX_WEIGHT_INT8);
             amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
             int8_amx_ctx ac = { Y, W, pW, scale, pXt, qXt, sx, rows, cols, B };
-            if (tid == 0) qwen_i8mm_note_backend("AMX int8 tiles", rows, cols, B);
+            if (tid == 0) qwen_region_i8_note_backend("AMX int8 tiles", rows, cols, B);
             int8_amx_task(tid, nt, &ac);
             return;
         }
     }
 #endif
-    if (tid == 0) qwen_i8mm_note_backend("VNNI row blocks", rows, cols, B);
+    if (tid == 0) qwen_region_i8_note_backend("VNNI row blocks", rows, cols, B);
     int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
     int8_vmm_task(tid, nt, &c);
 #else
     (void)Y; (void)W; (void)scale; (void)qXt; (void)sx; (void)rows; (void)cols; (void)B; (void)tid; (void)nt;
 #endif
 }
-void qwen_i8mm_run_qkv(float *q, float *k, float *v,
+void qwen_region_i8_run_qkv(float *q, float *k, float *v,
                        const int8_t *Wq, const float *sq, const int8_t *Wk, const float *sk,
                        const int8_t *Wv, const float *sv, const int8_t *qXt, const float *sx,
                        int q_rows, int kv_rows, int cols, int B, size_t tid, size_t nt) {
@@ -10343,13 +10377,13 @@ void qwen_i8mm_run_qkv(float *q, float *k, float *v,
             c.pW[1] = (const uint8_t *)qwen_amx_pack_weights(Wk, kv_rows, cols, QWEN_AMX_WEIGHT_INT8);
             c.pW[2] = (const uint8_t *)qwen_amx_pack_weights(Wv, kv_rows, cols, QWEN_AMX_WEIGHT_INT8);
             amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
-            if (tid == 0) qwen_i8mm_note_backend("AMX int8 tiles (fused QKV)", q_rows, cols, B);
+            if (tid == 0) qwen_region_i8_note_backend("AMX int8 tiles (fused QKV)", q_rows, cols, B);
             int8_qkv_amx_task(tid, nt, &c);
             return;
         }
     }
 #endif
-    if (tid == 0) qwen_i8mm_note_backend("VNNI row blocks (fused QKV)", q_rows, cols, B);
+    if (tid == 0) qwen_region_i8_note_backend("VNNI row blocks (fused QKV)", q_rows, cols, B);
     int8_qkv_vnni_mm_task(tid, nt, &c);
 #else
     (void)q; (void)k; (void)v; (void)Wq; (void)sq; (void)Wk; (void)sk; (void)Wv; (void)sv;

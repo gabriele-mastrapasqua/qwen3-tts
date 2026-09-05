@@ -2026,7 +2026,7 @@ typedef struct {
 static void tk_region_gather_quant(tk_region_t *r, const float *src, int b, int j, int cols, int srcstride) {
     float *Xt = r->bb->Xt; const float *s = src + (size_t)b * srcstride;
     for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
-    r->sx[j] = qwen_i8mm_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
+    r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
 }
 static void tk_region_scatter(tk_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
     float *d = dst + (size_t)b * rows;
@@ -2051,7 +2051,7 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
     for (int L = 0; L < c->num_layers; L++) {
         qwen_talker_layer_t *l = &ctx->layers[L];
         float *Yk = Yt + (size_t)qd * BW, *Yv = Yt + (size_t)(qd + kvd) * BW;
-        qwen_i8mm_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
+        qwen_region_i8_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
                           l->wv_int8, l->wv_scale, r->qx, r->sx, qd, kvd, h, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
@@ -2073,7 +2073,7 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
             tk_region_gather_quant(r, bb->attn_out, b, j, qd, qd);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_i8mm_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, h, qd, BW, tid, nt);
+        qwen_region_i8_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, h, qd, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
             int b = TSLOT(j);
@@ -2083,7 +2083,7 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
             tk_region_gather_quant(r, bb->x_norm, b, j, h, h);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_i8mm_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * inter, h, BW, tid, nt);
+        qwen_region_i8_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * inter, h, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
             int b = TSLOT(j);
@@ -2092,7 +2092,7 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
             tk_region_gather_quant(r, bb->gate, b, j, inter, 2 * inter);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_i8mm_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, h, inter, BW, tid, nt);
+        qwen_region_i8_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, h, inter, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
             int b = TSLOT(j);
@@ -2126,14 +2126,14 @@ static int tk_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const int *pos_a
         shapes_ok = !(e && e[0] == '0') && qwen_parallel_team() >= 2 && bb->B >= 2 &&
                     l->wq_int8 && l->wk_int8 && l->wv_int8 && l->wo_int8 && l->gate_up_fused_int8 && l->down_int8 &&
                     !l->wq_q4 && !l->wk_q4 && !l->wv_q4 && !l->wo_q4 && !l->gate_up_fused_q4 && !l->down_q4 &&
-                    qwen_i8mm_qkv_usable(qd, kvd, h, 2) && qwen_i8mm_usable(h, qd, 2) &&
-                    qwen_i8mm_usable(2 * inter, h, 2) && qwen_i8mm_usable(h, inter, 2);
+                    qwen_region_i8_qkv_usable(qd, kvd, h, 2) && qwen_region_i8_usable(h, qd, 2) &&
+                    qwen_region_i8_usable(2 * inter, h, 2) && qwen_region_i8_usable(h, inter, 2);
         fprintf(stderr, "[talker] batched step as one parallel region: %s (team %d)\n",
                 shapes_ok ? "ON" : "off", qwen_parallel_team());
     }
     if (!shapes_ok || bb->force_matvec || BW < 2 || BW > 16) return 0;
-    if (!(qwen_i8mm_qkv_usable(qd, kvd, h, BW) && qwen_i8mm_usable(h, qd, BW) &&
-          qwen_i8mm_usable(2 * inter, h, BW) && qwen_i8mm_usable(h, inter, BW))) return 0;
+    if (!(qwen_region_i8_qkv_usable(qd, kvd, h, BW) && qwen_region_i8_usable(h, qd, BW) &&
+          qwen_region_i8_usable(2 * inter, h, BW) && qwen_region_i8_usable(h, inter, BW))) return 0;
     static int8_t *qx = NULL; static float *swtmp = NULL; static size_t qx_cap = 0, sw_cap = 0;
     size_t maxc = (size_t)(inter > qd ? inter : qd); if (maxc < (size_t)h) maxc = h;
     size_t need = (size_t)BW * maxc + 64, swn = (size_t)BW * inter;

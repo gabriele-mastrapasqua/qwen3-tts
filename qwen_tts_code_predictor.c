@@ -1026,7 +1026,7 @@ static void cp_region_gather_quant(cp_region_t *r, const float *src, int b, int 
                                    int cols, int srcstride) {
     float *Xt = r->bb->cp_Xt; const float *s = src + (size_t)b * srcstride;
     for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
-    r->sx[j] = qwen_i8mm_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
+    r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
 }
 static void cp_region_scatter(cp_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
     float *d = dst + (size_t)b * rows;
@@ -1043,7 +1043,7 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
     for (int L = 0; L < c->cp_num_layers; L++) {
         qwen_cp_layer_t *l = &ctx->cp_layers[L];
         float *Yk = Yt + (size_t)cqd * BW, *Yv = Yt + (size_t)(cqd + ckvd) * BW;
-        qwen_i8mm_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
+        qwen_region_i8_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
                           l->wv_int8, l->wv_scale, r->qx, r->sx, cqd, ckvd, ch, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
@@ -1065,7 +1065,7 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
             cp_region_gather_quant(r, bb->cp_attn, b, j, cqd, cqd);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_i8mm_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, ch, cqd, BW, tid, nt);
+        qwen_region_i8_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, ch, cqd, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
@@ -1075,7 +1075,7 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
             cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_i8mm_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * cint, ch, BW, tid, nt);
+        qwen_region_i8_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * cint, ch, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
@@ -1084,7 +1084,7 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
             cp_region_gather_quant(r, bb->cp_gate, b, j, cint, 2 * cint);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_i8mm_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, ch, cint, BW, tid, nt);
+        qwen_region_i8_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, ch, cint, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
@@ -1125,18 +1125,18 @@ static int cp_region_ok(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, int BW) {
                     l->wq_int8 && l->wk_int8 && l->wv_int8 && l->wo_int8 &&
                     l->gate_up_fused_int8 && l->down_int8 &&
                     !l->wq_q4 && !l->wk_q4 && !l->wv_q4 && !l->wo_q4 && !l->gate_up_fused_q4 && !l->down_q4 &&
-                    qwen_i8mm_qkv_usable(bb->cp_q_dim, bb->cp_kv_dim, bb->cp_h, 2) &&
-                    qwen_i8mm_usable(bb->cp_h, bb->cp_q_dim, 2) &&
-                    qwen_i8mm_usable(2 * bb->cp_inter, bb->cp_h, 2) &&
-                    qwen_i8mm_usable(bb->cp_h, bb->cp_inter, 2);
+                    qwen_region_i8_qkv_usable(bb->cp_q_dim, bb->cp_kv_dim, bb->cp_h, 2) &&
+                    qwen_region_i8_usable(bb->cp_h, bb->cp_q_dim, 2) &&
+                    qwen_region_i8_usable(2 * bb->cp_inter, bb->cp_h, 2) &&
+                    qwen_region_i8_usable(bb->cp_h, bb->cp_inter, 2);
         fprintf(stderr, "[cp] transformer step as one parallel region: %s (team %d)\n",
                 shapes_ok ? "ON" : "off", qwen_parallel_team());
     }
     if (!shapes_ok || bb->force_matvec || BW < 2 || BW > 16) return 0;
-    return qwen_i8mm_qkv_usable(bb->cp_q_dim, bb->cp_kv_dim, bb->cp_h, BW) &&
-           qwen_i8mm_usable(bb->cp_h, bb->cp_q_dim, BW) &&
-           qwen_i8mm_usable(2 * bb->cp_inter, bb->cp_h, BW) &&
-           qwen_i8mm_usable(bb->cp_h, bb->cp_inter, BW);
+    return qwen_region_i8_qkv_usable(bb->cp_q_dim, bb->cp_kv_dim, bb->cp_h, BW) &&
+           qwen_region_i8_usable(bb->cp_h, bb->cp_q_dim, BW) &&
+           qwen_region_i8_usable(2 * bb->cp_inter, bb->cp_h, BW) &&
+           qwen_region_i8_usable(bb->cp_h, bb->cp_inter, BW);
 }
 
 /* One grow-once scratch pair for both region entry points: qx holds BW quantised activation
@@ -1212,7 +1212,7 @@ static int cp_batch_mtp(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, float *cx,
     if (!cp_batch_head_enabled() || !ctx->cp_mtp_proj_int8 || ctx->cp_mtp_proj_q4) return 0;
     int idx[64], BW = 0;
     for (int b = 0; b < B && BW < 64; b++) if (!active || active[b]) idx[BW++] = b;
-    if (BW < 2 || BW > 16 || !qwen_i8mm_usable(ch, ed, BW)) return 0;
+    if (BW < 2 || BW > 16 || !qwen_region_i8_usable(ch, ed, BW)) return 0;
     float *Xt = bb->cp_Xt, *Yt = bb->cp_Yt;
     for (int j = 0; j < BW; j++) { const float *x = src[idx[j]]; for (int k = 0; k < ed; k++) Xt[(size_t)k * BW + j] = x[k]; }
     qwen_matmat_int8(Yt, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale, Xt, ch, ed, BW);
@@ -1230,7 +1230,7 @@ static int cp_batch_lm(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const float *norme
     if (!cp_batch_head_enabled() || !ctx->cp_lm_head_int8[g] || ctx->cp_lm_head_q4[g]) return 0;
     int idx[64], BW = 0;
     for (int b = 0; b < B && BW < 64; b++) if (!active || active[b]) idx[BW++] = b;
-    if (BW < 2 || BW > 16 || !qwen_i8mm_usable(vocab, ch, BW)) return 0;
+    if (BW < 2 || BW > 16 || !qwen_region_i8_usable(vocab, ch, BW)) return 0;
     float *Xt = bb->cp_Xt, *Yt = bb->cp_Yt;
     for (int j = 0; j < BW; j++) { const float *x = normed_rows + (size_t)idx[j] * ch; for (int k = 0; k < ch; k++) Xt[(size_t)k * BW + j] = x[k]; }
     qwen_matmat_int8(Yt, ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g], Xt, vocab, ch, BW);
@@ -1277,10 +1277,10 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
                 src = e;
             }
             for (int k = 0; k < ed; k++) Xt[(size_t)k * BW + j] = src[k];
-            r->sx[j] = qwen_i8mm_quant_col(r->qx + (size_t)j * ed, Xt, ed, BW, j);
+            r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * ed, Xt, ed, BW, j);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_i8mm_run(Yt, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale, r->qx, r->sx,
+        qwen_region_i8_run(Yt, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale, r->qx, r->sx,
                       ch, ed, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
@@ -1305,7 +1305,7 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
                 cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
             }
             qwen_barrier_wait(&r->bar);
-            qwen_i8mm_run(Yt, ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g], r->qx, r->sx,
+            qwen_region_i8_run(Yt, ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g], r->qx, r->sx,
                           vocab, ch, BW, tid, nt);
             qwen_barrier_wait(&r->bar);
             for (int j = 0; j < BW; j++) if (RMINE(j)) {
@@ -1353,7 +1353,7 @@ static int cp_frame_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const floa
     if (!ctx->codec_embedding_bf16) return 0;
     for (int g = 0; g < 15; g++) if (!ctx->cp_lm_head_int8[g] || ctx->cp_lm_head_q4[g]) return 0;
     for (int g = 1; g < 15; g++) if (!ctx->cp_codec_emb_bf16[g - 1]) return 0;
-    if (!qwen_i8mm_usable(ch, ed, BW) || !qwen_i8mm_usable(vocab, ch, BW)) return 0;
+    if (!qwen_region_i8_usable(ch, ed, BW) || !qwen_region_i8_usable(vocab, ch, BW)) return 0;
     /* the shared batch scratch must hold the two extra operands as well */
     int cmaxcols = ch; if (cqd > cmaxcols) cmaxcols = cqd; if (cint > cmaxcols) cmaxcols = cint;
     int cmaxrows = 2 * cint; if (cqd > cmaxrows) cmaxrows = cqd; if (ch > cmaxrows) cmaxrows = ch;
