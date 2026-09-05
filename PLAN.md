@@ -88,10 +88,20 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 - [ ] Rename legacy CLI `--batch/--batch-words/--batch-dry` (deprecation alias)
 - [ ] Custom decoder fp32 GEMM evaluation (non-bitwise acceptance first)
 - [ ] INT8 prefill quality qualification (`QWEN_PREFILL_INT8MM`, separate numerical path)
-- [ ] Decide `docs/reference-gcp-c3d-8c-vnni.md` (untracked, unreviewed) and the stray
-      `main-5b5256e9.o.tmp`
+- [ ] Decide whether to publish the pending GCP C3D/8c VNNI reference note (not in this
+      committed tree) and the stray `main-5b5256e9.o.tmp`
 - [ ] P5.0 [low] Set `QWEN_POOL_SPIN=65536` as the x86 server default and update related JSON profiles.
 - [ ] P5.1 [low] Compare AutoRound/LLM Compressor W4A16 and Intel ARK packed kernels with runtime INT8: https://vllm.ai/blog/2025-12-09-intel-autoround-llmc https://github.com/intel/auto-round/tree/main/auto_round_extension/ark
 - [ ] P5.2 [low] Run isolated Xeon AMX/VNNI GEMV/GEMM oracle probes with oneDNN benchdnn and OpenVINO CPU: https://github.com/uxlfoundation/oneDNN/tree/main/tests/benchdnn https://github.com/openvinotoolkit/openvino/blob/master/docs/articles_en/openvino-workflow/running-inference/inference-devices-and-modes/cpu-device.rst
 - [ ] P5.3 [low] Audit vLLM CPU, oneDNN and IPEX prepacking/fusion/cache behavior against CP, Talker and INT8 conv: https://community.intel.com/t5/Blogs/Tech-Innovation/Artificial-Intelligence-AI/A-Practical-Guide-to-CPU-Optimized-LLM-Deployment-on-Intel-Xeon/post/1737233
 - [ ] P5.4 [low] Run GCP oracle probes only from an isolated copied folder and only at 0% CPU with no competing workload.
+
+### X86 dataflow follow-ups
+
+- [x] X86-1 Direct source-row INT8 quantization for CP/Talker regions — landed in `d847d9c`; details: `docs/x86-int8-dataflow-2026-09-05.md`
+- [ ] X86-2 Low-B x86 AMX/VNNI crossover — validate B1/B2 on real engine shapes, not only oneDNN.
+- [ ] X86-3 Persistent packed-RHS consumption audit — prove hot B1/B2 projections consume the packed representation.
+- [ ] X86-4 Activation preparation/fusion follow-up — remove remaining generic gather, q8-pack, and scatter passes.
+- [ ] X86-5 AMX activation-pack reuse — check reuse across workers inside a held region.
+- [ ] X86-6 Real 0.6B server qualification — repeat shape-oracle conclusions with the actual checkpoint and C1/C2/C4 screens.
+- [ ] X86-7 0.6B vs 1.7B serving profile — compare Talker, CP, and decoder time shifts after the Talker width change.
