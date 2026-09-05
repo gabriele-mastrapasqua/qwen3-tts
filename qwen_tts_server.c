@@ -1784,6 +1784,11 @@ static double prewarm_now_ms(void) {
 static void server_prewarm(qwen_tts_ctx_t *ctx) {
     if (getenv("QWEN_NO_PREWARM")) return;
     qwen_costmap_count_requests(0);   /* a pre-warm is not a request */
+    /* Warm the path a REQUEST will take.  Without this the warm-up ran on whatever the CLI
+     * left in the context -- language_id -1 among other things -- so it primed per-request
+     * state for a configuration no request uses, and the first real request came out
+     * different from every one after it (test-serve-repro's "trajectory fork"). */
+    reset_request_state(ctx);
     int sv_silent = ctx->silent;
     ctx->silent = 1;
     float *aud = NULL; int n = 0;
