@@ -40,7 +40,7 @@ IGNORE_TOKENS = {"defined", "USE_BLAS", "USE_OPENBLAS", "QWEN_ASAN", "__GNUC__",
                  "ACCELERATE_NEW_LAPACK", "QWEN_MAYBE_UNUSED"}
 
 COND = re.compile(r'^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$')
-FLAG = re.compile(r'"(QWEN_[A-Z0-9_]+)"')
+FLAG = re.compile(r'"(QWEN_[A-Z0-9_]*[A-Z0-9])"')   # a trailing _ marks a family prefix
 
 
 def families_of(cond_stack):
