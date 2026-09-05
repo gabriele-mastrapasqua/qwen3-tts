@@ -148,6 +148,18 @@ static inline void qwen_region_pool_at(int id, int threads, long long tasks) {
 static inline void qwen_region_units_at(int id, long long n) {
     if (qwen_costmap_level_v) qwen_region_units_at_(id, n);
 }
+/* DEEP-only variants.  Row-block and per-projection accounting is a micro-event: on x86 the
+ * in-region runner alone produced 813k of these in one request, dwarfing everything else.
+ * FAST keeps the coarse dispatch summary; DEEP gets the per-worker detail. */
+static inline void qwen_region_units_at2(int id, long long n) {
+    if (qwen_costmap_level_v > 1) qwen_region_units_at_(id, n);
+}
+static inline void qwen_region_workers_at2(int id, int entered) {
+    if (qwen_costmap_level_v > 1) qwen_region_workers_at_(id, entered);
+}
+static inline void qwen_region_pool_at2(int id, int threads, long long tasks) {
+    if (qwen_costmap_level_v > 1) qwen_region_pool_at_(id, threads, tasks);
+}
 static inline void qwen_region_workers_at(int id, int entered) {
     if (qwen_costmap_level_v) qwen_region_workers_at_(id, entered);
 }
