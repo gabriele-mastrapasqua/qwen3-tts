@@ -9136,10 +9136,13 @@ static void sd_conv1d_worker(void *vj) {
     float *colf = mm_scratch_sdcolf((size_t)SD_INT8_NC * K);
     int8_t *colq = mm_scratch_sdcolq((size_t)SD_INT8_NC * j->Kp);
     float *sa = mm_scratch_sdsa((size_t)SD_INT8_NC * nblk);
+    long long claimed = 0;      /* accumulate locally: ONE profiler hook per worker, not
+                                 * one per panel -- the per-unit call was 20% of all
+                                 * instrumentation events and buys nothing a sum cannot give */
     for (;;) {
         int p = atomic_fetch_add(&j->next_panel, 1);
         if (p >= j->n_panels) break;
-        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 1);
+        claimed++;
         int t0 = p * j->nc;
         int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
         for (int c = 0; c < nc; c++) {
@@ -9158,6 +9161,7 @@ static void sd_conv1d_worker(void *vj) {
         sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
                       colq, sa, t0, nc, j->Kp, j->blk);
     }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
 
 void qwen_conv1d_int8(float *out, const float *in,

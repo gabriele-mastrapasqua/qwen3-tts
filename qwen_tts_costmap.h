@@ -134,6 +134,14 @@ void qwen_region_units_at_(int id, long long n);
  * from which threads happened to touch a marker: a thread that never reaches a marker leaves
  * no record, and turning that silence into an underfill claim would be a lie. */
 void qwen_region_workers_at_(int id, int entered);
+/* Count an event WITHOUT reading the clock.  FAST uses this where the event is frequent but
+ * its duration is already inside a coarse region: the pool dispatch happens tens of thousands
+ * of times in one request, and timestamping all three of its regions was 88% of all profiler
+ * events and doubled TTFA.  DEEP still times them. */
+void qwen_region_tick_at_(int id, long long n);
+static inline void qwen_region_tick_at(int id, long long n) {
+    if (qwen_costmap_level_v) qwen_region_tick_at_(id, n);
+}
 static inline void qwen_region_pool_at(int id, int threads, long long tasks) {
     if (qwen_costmap_level_v) qwen_region_pool_at_(id, threads, tasks);
 }
