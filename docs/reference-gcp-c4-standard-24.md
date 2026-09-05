@@ -27,6 +27,30 @@ The source used on the VM was copied directly with `rsync` from the local dirty 
 GitHub fetch, clone, or source cleanup was used. Private data, models, virtual environments,
 and local build artifacts were excluded from the transfer.
 
+## Machine identity and canonical topology (corrected 2026-09-05)
+
+| | |
+|---|---|
+| CPU | Intel Xeon Platinum 8581C (Emerald Rapids) @ 2.30 GHz, 1 socket |
+| cores | **12 physical**, SMT 2 -> 24 logical when SMT is enabled |
+| NUMA | 1 node, L3 260 MiB (one instance) |
+| ISA | AMX-INT8/BF16 + AVX-512 VNNI + AVX-512 BF16 |
+| **canonical topology** | **2 workers x 6 threads on the 12 physical cores, SMT DISABLED** |
+| pinning | physical-core-major: worker 0 -> cores 0-5, worker 1 -> cores 6-11 |
+
+**`24 vCPU -> 2x8` is not a valid canonical configuration for this machine** and must not appear
+as one. With SMT off it oversubscribes; with SMT on, a contiguous LOGICAL slice gives worker 0
+cpus 0-11 and worker 1 cpus 12-23 — the same twelve physical cores, one worker per hyperthread —
+so the workers share execution units and the per-core AMX tile unit while the log shows two tidy
+disjoint ranges. 2x8 may be run here only as a labelled AWS-equivalent SUBSET topology that
+states which CPUs are unused.
+
+For canonical measurements SMT is disabled on the host
+(`echo off | sudo tee /sys/devices/system/cpu/smt/control`, leaving 12 online CPUs); a result
+taken with SMT on is not comparable with one taken with it off and must say so. The engine now
+builds the per-worker mask itself and prints it, and warns when SMT is on or when masks overlap
+(`serve: pin prefork workers to whole physical cores`).
+
 ## Result in one page
 
 The VM is a serious VNNI candidate, but the first stable topology is not the c8a-shaped

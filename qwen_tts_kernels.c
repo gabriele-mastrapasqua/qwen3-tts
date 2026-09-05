@@ -2264,8 +2264,8 @@ static void qwen_mm_force_kernel(int mmk) {
     atomic_store_explicit(&g_mm_force, mmk, memory_order_relaxed);
 }
 
-/* AMX INT8 needs a WORK-PER-THREAD condition, not only a batch one.  Measured on Granite
- * Rapids with the complete in-region contract (activation pack + packed RHS + matmul + scale)
+/* AMX INT8 needs a WORK-PER-THREAD condition, not only a batch one.  Measured on a Xeon
+ * Platinum 8581C (Emerald Rapids, 12 physical cores, SMT off) with the complete in-region contract (activation pack + packed RHS + matmul + scale)
  * against the VNNI row blocks, on the real 1.7B projections, paired and interleaved inside one
  * process, median of 7 rounds, B=4.  The AMX arm is the winner marked (+ means AMX is slower):
  *

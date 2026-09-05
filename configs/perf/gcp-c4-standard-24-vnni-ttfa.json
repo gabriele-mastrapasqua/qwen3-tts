@@ -31,7 +31,9 @@
       "avx512vnni",
       "avx512bf16"
     ],
-    "notes": "GCP c4-standard-24, one socket and one NUMA node. The host exposes AMX tile/INT8/BF16 and SMT siblings 0-11 / 12-23, but this profile is VNNI-only in the operational sense: rebuild with SIMD=avx512bf16, which includes AVX-512 VNNI and BF16 but no AMX compiler flags. Yesterday's SIMD=avx512vnni campaign did not compile the BF16 matmat unit and is historical evidence only. Qualify SMT-on and SMT-off separately; the conservative starting topology is 2 workers x 6 physical cores with SMT off. Visible shared L3 is 260 MiB, not 260 MiB per core. The previous host sweep measured approximately 101.5 GB/s Triad on the 12-CPU physical mask and 106.0 GB/s on all 24 logical CPUs; these are roof references, not per-worker bandwidth obtained by division."
+    "notes": "GCP c4-standard-24, one socket and one NUMA node. The host exposes AMX tile/INT8/BF16 and SMT siblings 0-11 / 12-23, but this profile is VNNI-only in the operational sense: rebuild with SIMD=avx512bf16, which includes AVX-512 VNNI and BF16 but no AMX compiler flags. Yesterday's SIMD=avx512vnni campaign did not compile the BF16 matmat unit and is historical evidence only. Qualify SMT-on and SMT-off separately; the conservative starting topology is 2 workers x 6 physical cores with SMT off. Visible shared L3 is 260 MiB, not 260 MiB per core. The previous host sweep measured approximately 101.5 GB/s Triad on the 12-CPU physical mask and 106.0 GB/s on all 24 logical CPUs; these are roof references, not per-worker bandwidth obtained by division.",
+    "smt_policy": "SMT is part of the experiment, not of the host description. Canonical measurements on this box are taken with SMT DISABLED (echo off > /sys/devices/system/cpu/smt/control), which leaves 12 online CPUs = 12 physical cores. A result measured with SMT on is not comparable with one measured with it off and must say so.",
+    "canonical_topology": "2 workers x 6 threads on 12 physical cores, SMT off. The old '24 vCPU -> 2x8' shorthand is NOT a valid canonical configuration for this machine: 2x8 either oversubscribes with SMT off or lands both workers on the same physical cores with SMT on. 2x8 may be run here only as a labelled AWS-equivalent SUBSET topology, stating which CPUs are unused."
   },
   "build": {
     "target": "blas",
@@ -55,7 +57,7 @@
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
     "max_text_chars": "unspecified",
-    "worker_affinity": "SMT-off starting point: worker 0 -> CPUs 0-5; worker 1 -> CPUs 6-11. Re-measure the same topology with SMT-on siblings explicitly before using 24 logical CPUs."
+    "worker_affinity": "physical-core-major: worker 0 -> cores 0-5, worker 1 -> cores 6-11, each worker gets whole physical cores. The engine builds this mask itself (qwen_cpu_core_major_order) and prints it; do NOT read it as a logical-cpu range. With SMT ON, a contiguous LOGICAL slice would give worker 1 the hyperthread siblings of worker 0 -- the same twelve cores -- so the workers would share execution units and the per-core AMX tile unit while the log showed two disjoint ranges."
   },
   "streaming": {
     "first_chunk_ramp": [

@@ -16,19 +16,54 @@ into individual kernels and backends while that sat in plain sight. So:
 3. only then X86-4/X86-5/X86-6/X86-7/X86-8 and P5.10, and their queue order comes from what
    the profiler's FAST run measures, not from what looks interesting.
 
-- [ ] PARITY-1 Common/shared code path parity across the supported CPU backends. Keep the
-      common engine semantics common; a backend may differ only where the ISA or the kernel
-      genuinely differs. Open pieces: P2.7 (ARM region wiring, hardware-blocked), P4.1/P4.2.
-- [ ] PARITY-2 Feature-flag / runtime-knob parity. Equivalent functionality must expose the
-      same meaningful controls, defaults, observability and enable/disable semantics on ARM and
-      x86. Compiling on both is NOT parity: name every knob that exists on one side and is
-      missing, INERT, opt-in-only, or structurally different on the other — the class of defect
-      already found twice (`QWEN_NO_SIMD_QUANT` did nothing on ARM; `QWEN_PREFILL_LOW_MS` was
-      ignored on GCD). Where a packed/fused/default-on path exists on ARM and its x86
-      equivalent is absent or opt-in, that belongs in the profiler's effective-configuration
-      section, not in a reader's memory. Builds on P3.1/P3.2; P3.3b is the open remainder.
-- [ ] PARITY-3 Backend/dispatch functional parity — the remaining confirmed cleanup, with
-      differences isolated to real ISA/kernel capability. Open: P1.2, P1.3, P3.4b, P4.3.
+PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something equivalent":
+
+  1. every common semantic feature has a BACKEND MATRIX generated from the code;
+  2. every runtime flag has requested / effective / default semantics PER BACKEND;
+  3. every ARM performance feature has an explicit x86 status:
+     equivalent / deliberately different / missing;
+  4. no flag is silently inert anywhere;
+  5. the server can dump its COMPLETE EFFECTIVE configuration at runtime — this does NOT wait
+     for the profiler, it is config correctness, and without it the profiler could report 50 ms
+     in AMX while an env everyone believed active had been ignored;
+  6. the current GCP and AWS server profiles are reproducible FROM DECLARED CONFIG.
+
+- [ ] PARITY-1 Common/shared code path parity across the supported CPU backends, expressed as a
+      generated matrix with THREE distinct states per cell — implemented / selectable /
+      ACTUALLY EFFECTIVE — because that is exactly where `QWEN_NO_SIMD_QUANT` hid: it existed,
+      it looked like a feature, and on ARM it did nothing. Columns: common · ARM/KleidiAI ·
+      AVX2 · VNNI · AMX · Apple · CUDA/Metal, plus flag, default and effective. Rows are
+      semantic features, not functions: fused QKV · persistent region · activation reuse ·
+      packed RHS · native GEMV · GEMM-used-as-GEMV at small B · snake SIMD · decoder int8 conv ·
+      pool ownership · pool spin · BF16 prefill · fused activation quant · direct source-row
+      quant · prepack lifetime parent->fork · batch-aware dispatch · row/block scheduling ·
+      activation scratch reuse · full-sequence prefill GEMM.
+      Open pieces: P2.7 (ARM region wiring, hardware-blocked), P4.1/P4.2.
+- [ ] PARITY-2 Feature-flag / runtime-knob parity, and the EFFECTIVE-CONFIG DUMP that proves it.
+      178 getenv calls cannot be the operating contract of a production server: env should mean
+      debug, experiment, forced dispatch, kill switch and profiling — not configuration. Every
+      artifact must therefore open with the effective server configuration AFTER parsing,
+      defaults and capability gating, not with what happened to be in the environment:
+          profile · prefork · threads/worker · SMT · per-worker affinity · pool_spin ·
+          blas_owner · openblas_runtime_threads · prefill mode and chunk · prefill_helper ·
+          amx_int8_min_b · amx_min_rows_per_thread · amx_prepack · decoder_int8 · ...
+      and where a request cannot be honoured it must say so in that dump:
+          foo.requested = 1 · foo.effective = 0 · foo.reason = unsupported_on_avx512vnni
+      Builds on P3.1/P3.2; P3.3b is the open remainder.
+- [ ] PARITY-3 Backend/dispatch functional parity, driven by ARM AS THE ORACLE. Do not ask the
+      generic question "what is x86 missing"; take the mature ARM/KleidiAI backend and, feature
+      by feature, ask where the x86 equivalent is and answer all of: same semantics · same
+      default · same flag · same runtime observability · same numerical contract · same batch
+      range · same persistent lifetime. A "no" anywhere is a parity gap even when x86 works.
+      Also lands the BLAS ownership decision, which is architectural and not a 2% question: two
+      compute schedulers in one process is the defect. The end state is either "BLAS is always
+      forced single-threaded and cannot escape engine ownership" or "BLAS removed from the hot
+      paths" — never "usually one thread if we remembered the right variable".
+      Open: P1.2, P1.3, P3.4b, P4.3.
+      Deliberately NOT started here, but the immediate consequence of closing this: a
+      declarative versioned server profile (a per-host-class JSON beside `configs/perf/`) the server
+      verifies at start, printing EXPECTED vs ACTUAL and refusing to benchmark on a mismatch —
+      `FATAL: production benchmark profile mismatch`, not a warning it measures through anyway.
 
 - [ ] P0-PROFILER — ENGINE RUNTIME PROFILER. [Do NOT start before PARITY-1/2/3 are closed.
       Outranks every further x86 kernel optimization once they are.]

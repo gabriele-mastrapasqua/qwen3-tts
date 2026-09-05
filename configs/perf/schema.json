@@ -126,7 +126,10 @@
           "minimum": 1
         },
         "l3_mib": {
-          "type": ["number", "null"],
+          "type": [
+            "number",
+            "null"
+          ],
           "description": "Usable last-level cache in MiB. null = not established: on a cloud slice lscpu reports the SOCKET L3, not the slice share, and a guessed number is worse than none."
         },
         "ram_gib": {
@@ -140,6 +143,14 @@
         },
         "notes": {
           "type": "string"
+        },
+        "smt_policy": {
+          "type": "string",
+          "description": "Whether SMT was ON or OFF for the canonical measurements on this host, and how to reproduce that. SMT is part of the experiment, not of the host description: a result measured with SMT on is not comparable with one measured with it off, and with SMT on a contiguous LOGICAL cpu slice hands two prefork workers the hyperthread siblings of the same physical cores."
+        },
+        "canonical_topology": {
+          "type": "string",
+          "description": "The worker x thread layout this host is qualified at, and which layouts are NOT valid for it. A topology from another host may be run here only as a labelled subset, stating which CPUs are unused. This matters beyond bookkeeping: INT8 AMX dispatch depends on rows per thread, so changing the layout can change which kernel is selected."
         }
       }
     },
