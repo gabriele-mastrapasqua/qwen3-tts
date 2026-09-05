@@ -10,7 +10,7 @@ path it is running.
 
 ## 1. Work from a small plan
 
-Before non-trivial work read `PLAN.md` (local, untracked, next to this file).
+Before non-trivial work read `PLAN.md` (tracked, next to this file).
 It is a checklist, not a research document or a diary.
 
 - Keep it below ~150 lines. If it is longer, shorten it before adding anything.
@@ -23,16 +23,27 @@ It is a checklist, not a research document or a diary.
 
 ## 2. Separate plan from evidence
 
-Long notes, profiler dumps, hypotheses and transcripts live under `.work/` (untracked).
+Long notes and hypotheses live under `.work/` as reviewed public-safe `*.md` addenda;
+the profiler dumps, transcripts and run artefacts they cite stay in the untracked
+private areas beside them.
 Every addendum starts with: Task · Question · Known facts · Unknowns ·
 Files/functions inspected · Evidence · Conclusion · Next action.
 An addendum never becomes a second global plan.
 
-Privacy split. Tracked: `ENGINEERING.md`, `CLAUDE.md`, `AGENTS.md`, stable public-safe
-docs and code. Untracked and private: `PLAN.md`, `.work/`, `plan_*.md`, `private/`, raw
-profiler/debug evidence, temporary benchmark notes. Agents never copy `PLAN.md` or
-`.work/` content into tracked docs unless the user approves that specific content;
-tracked docs stay public-safe (no hosts, addresses, credentials, customer material).
+Privacy split. The public-safe control plane is TRACKED: `ENGINEERING.md`, `CLAUDE.md`,
+`AGENTS.md`, `PLAN.md`, the reviewed `.work/*.md` addenda, stable docs and code. Untracked
+and private: the raw evidence those notes summarise (`.work/evidence/`, `.work/private/`,
+`private/`), profiler and debug dumps, benchmark artifact trees, `plan_*.md` scratch notes.
+
+Tracking the control plane is deliberate: untracked `PLAN.md`/`.work/` state diverges
+between worktrees, and that caused real coordination failures. Worktrees now share both
+through normal git history.
+
+Never `git add .work/` wholesale — track one reviewed file at a time. Before staging any
+control-plane file, read the STAGED content and reject: credentials and tokens, private
+hostnames or addresses, SSH commands and key paths, absolute personal paths, customer or
+commercial material, raw profiler dumps, raw benchmark artifact paths, machine
+identifiers. A tracked note SUMMARISES private evidence; it never reproduces it.
 
 ## 2b. Plan integrity
 
@@ -44,6 +55,11 @@ duplicate task id, a `[x]` task pointing to a missing file, or an addendum namin
 the plan does not have. On failure: do not claim completion, create the real file or
 remove the reference, report the failure. Never create placeholder links or empty
 addenda for work that has not been written.
+
+Worktrees share the control plane through git. A task finished in another worktree still
+ends with an explicit statement of what changed — PLAN task and status, which addenda —
+but reconciliation is a merge of tracked files, not a re-typing of prose, and the private
+evidence behind an addendum does not travel with it.
 
 ## 3. Code is the source of truth
 
@@ -154,8 +170,9 @@ Selective staging (`git add -p`, patched copies) is verified by building an isol
 checkout of the staged/committed tree, not the working tree, on every touched
 platform that is available; platforms that were not available are listed under
 WHAT REMAINS UNKNOWN, never reported as tested. Commit messages: English, imperative,
-what and why, no tool attribution. `PLAN.md`, `plan_*.md`, `.work/`, `private/` are
-never committed.
+what and why, no tool attribution. `plan_*.md`, `private/` and the raw evidence areas
+(`.work/evidence/`, `.work/private/`) are never committed; the public-safe control plane
+(`PLAN.md`, reviewed `.work/*.md`) is.
 
 ## 13b. Repository integrity
 
