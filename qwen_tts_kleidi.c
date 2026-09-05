@@ -529,6 +529,46 @@ static int kai_i8_run(const kai_entry_t *e, float *dst, const float *lhs,
     return kai_i8_run_packed(e, dst, lp, dst_stride, rows, cols, B, gemm);
 }
 
+/* ---- prepared-state interface for a persistent region --------------------------------
+ * The dispatched KleidiAI int8 call is already two phases: pack the B activations once
+ * (kai_i8_pack_lhs*, weights were packed at registration), then run n-tiles of the GEMM
+ * from that prepared state (kai_i8_task, partitioned by tid/nt).  Only the second phase
+ * was reachable from outside, and only through qwen_parallel, which is what stopped a
+ * held team from running the same work between its own barriers.
+ *
+ * These three entries expose exactly the phases that already exist.  Same pack, same
+ * kernel, same n-tile partition, so the values are the ones the dispatcher produces --
+ * this is not an SMMLA substitution and it changes no arithmetic.  There is no consumer
+ * yet: the CP/Talker regions gather k-major [cols][B] for the shared per-column int8
+ * quantiser, while KleidiAI wants row-major float activations it quantises itself, so
+ * wiring them needs a second gather shape in the region body (a separate task).
+ *
+ * Contract: EVERY thread of the team calls prep (it packs into its own thread-local
+ * scratch, O(B*cols) against O(rows*cols/nt) of work), then calls run with its tid. */
+int qwen_kleidi_i8_region_usable(const void *key, int rows, int cols, int B) {
+    if (!qwen_kleidi_i8_enabled() || B < 1 || g_kai_bypass) return 0;
+    const kai_entry_t *e = kai_lookup_kind(key, KAI_KIND_I8);
+    if (!e || e->rows != rows || e->cols != cols) return 0;
+    return kai_op_on(e->comp, e->fam);
+}
+
+const void *qwen_kleidi_i8_region_prep(const float *lhs, size_t lhs_stride,
+                                       int cols, int B) {
+    const int gemm = (B > 1);
+    return kai_lhs_sym_mode() ? kai_i8_pack_lhs_sym(lhs, lhs_stride, cols, B, gemm)
+                              : kai_i8_pack_lhs(lhs, lhs_stride, cols, B, gemm);
+}
+
+void qwen_kleidi_i8_region_run(const void *key, float *dst, size_t dst_stride,
+                               const void *lhs_packed, int rows, int cols, int B,
+                               size_t tid, size_t nt) {
+    const kai_entry_t *e = kai_lookup_kind(key, KAI_KIND_I8);
+    if (!e || !lhs_packed || nt == 0) return;
+    kai_i8_job_t job = { e, lhs_packed, dst, (size_t)B, (size_t)rows, (size_t)cols,
+                         dst_stride, (B > 1) };
+    kai_i8_task(tid, nt, &job);
+}
+
 typedef struct {
     const kai_entry_t *e[3];
     float  *dst[3];
@@ -1017,6 +1057,16 @@ int qwen_kleidi_lhs_sym(void) { return 0; }
 int qwen_kleidi_qkv_fused_on(void) { return 0; }
 int qwen_kleidi_matmul_i8(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
+}
+int qwen_kleidi_i8_region_usable(const void *k, int r, int c, int B) {
+    (void)k; (void)r; (void)c; (void)B; return 0;
+}
+const void *qwen_kleidi_i8_region_prep(const float *l, size_t ls, int c, int B) {
+    (void)l; (void)ls; (void)c; (void)B; return NULL;
+}
+void qwen_kleidi_i8_region_run(const void *k, float *d, size_t ds, const void *lp,
+                               int r, int c, int B, size_t tid, size_t nt) {
+    (void)k; (void)d; (void)ds; (void)lp; (void)r; (void)c; (void)B; (void)tid; (void)nt;
 }
 int qwen_kleidi_matmul_i8_native(float *d, const void *k, const float *l, size_t ls,
                                  size_t ds, int r, int c, int B) {

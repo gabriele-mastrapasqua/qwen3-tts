@@ -37,6 +37,10 @@ int  qwen_blas_threads_now(void);       /* openblas_get_num_threads(), -1 if una
  * 0 = the decoder's private worker team.  QWEN_SD_POOL=qwen|private overrides the default. */
 void qwen_sd_pool_default(int mode);
 int  qwen_sd_pool_mode(void);
+/* Claim the engine pool as the single owner of this process's compute budget:
+ * decoder tiles on the engine pool, BLAS serial and its GEMMs partitioned there.
+ * No-op at one thread; explicit QWEN_SD_POOL / QWEN_BLAS_OWN still win. */
+void qwen_exec_budget_engine_owned(const char *who);
 /* In-region int8 matmat (x86 AVX-512 VNNI): the dispatched drivers split into a per-column
  * activation quantisation and a per-thread row block, so a persistent parallel region can
  * run the same kernels between its own barriers.  Same partition and same kernels as the

@@ -8435,6 +8435,36 @@ int qwen_sd_pool_mode(void) {
     return g_sd_pool_mode;
 }
 
+/* One execution budget, decided in one place.
+ *
+ * The CLI, the plain server and the batched server all drive the same engine, but only the
+ * batched server used to claim the budget.  The other two could therefore run three compute
+ * teams over the same cores at once: the engine pool, the decoder's private team and the
+ * BLAS's own team.  The rule is not "copy the batched server's defaults everywhere"; it is:
+ * when the engine already owns a usable multi-thread pool, the decoder tiles and the decoder
+ * SGEMM run on THAT pool instead of raising teams beside it.
+ *
+ * Both setters yield to an explicit QWEN_SD_POOL / QWEN_BLAS_OWN, so a user override
+ * survives.  With one thread there is no budget to own and this does nothing.  Idempotent:
+ * a prefork child calls it again after its own qwen_set_threads(). */
+void qwen_exec_budget_engine_owned(const char *who) {
+    if (qwen_get_threads() <= 1) return;
+    qwen_sd_pool_default(1);
+    qwen_blas_own(1);
+    /* Report once per process, not once per request: a prefork child is a new pid and says
+     * it again, an entry point that claims the budget after another one stays quiet. */
+    static pid_t reported = 0;
+    if (reported == getpid()) return;
+    reported = getpid();
+    fprintf(stderr, "[%s] execution budget: decoder pool=%s · blas=%s · openblas threads now %d\n",
+            who ? who : "engine",
+            qwen_sd_pool_mode() ? "engine" : "private",
+            qwen_blas_own_effective() ? "serial+partitioned"
+                                      : (qwen_blas_own_get() ? "claimed but no thread control"
+                                                             : "own team"),
+            qwen_blas_threads_now());
+}
+
 static void sd_pool_run(void (*fn)(void *), void *ctx) {
     int nt = sd_pool_threads();
     if (nt < 1) nt = 1;

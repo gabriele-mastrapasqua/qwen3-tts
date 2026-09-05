@@ -1809,6 +1809,7 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     ctx->silent = 1;
     server_default_memory_levers(ctx);
     server_default_decoder_batch(ctx);
+    qwen_exec_budget_engine_owned("serve");
     server_prewarm(ctx);
 
     int n_readers = max_batch; if (n_readers < 2) n_readers = 2; if (n_readers > 16) n_readers = 16;
@@ -1914,6 +1915,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
     ctx->silent = 1;
     server_default_memory_levers(ctx);
     server_default_decoder_batch(ctx);
+    qwen_exec_budget_engine_owned("serve");
     server_prewarm(ctx);
 
     if (n_workers == 1) {

@@ -20,6 +20,17 @@ void qwen_kleidi_stats(int *n_packed, size_t *bytes);
 int qwen_kleidi_register_i8(const void *key, const int8_t *W, const float *scale,
                             int rows, int cols);
 int qwen_kleidi_matmul_i8(float *Y, const void *key, const float *X, int rows, int cols, int B);
+/* Persistent-region interface over the SAME prepared KleidiAI int8 path the dispatcher
+ * uses: usable() asks whether this backend can execute the shape as n-blocks from prepared
+ * state, prep() packs the B activations (every thread of the team calls it, into its own
+ * thread-local scratch), run() executes this thread's n-block.  No new kernel, no change to
+ * the arithmetic or to the normal dispatched path. */
+int  qwen_kleidi_i8_region_usable(const void *key, int rows, int cols, int B);
+const void *qwen_kleidi_i8_region_prep(const float *lhs, size_t lhs_stride, int cols, int B);
+void qwen_kleidi_i8_region_run(const void *key, float *dst, size_t dst_stride,
+                               const void *lhs_packed, int rows, int cols, int B,
+                               size_t tid, size_t nt);
+
 int qwen_kleidi_matmul_i8_native(float *dst, const void *key, const float *lhs,
                                  size_t lhs_stride, size_t dst_stride,
                                  int rows, int cols, int B);
