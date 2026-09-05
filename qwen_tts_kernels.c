@@ -2287,8 +2287,8 @@ static void qwen_mm_force_kernel(int mmk) {
  *
  * 0 disables the rule.  Thread count is the engine's, which in a prefork worker is that
  * worker's slice -- the same workers that will split these rows. */
-static int qwen_amx_int8_rows_ok(long long rows) QWEN_MAYBE_UNUSED;
-static int qwen_amx_int8_rows_ok(long long rows) {
+static int qwen_amx_int8_rows_ok_nt(long long rows, int nt) QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_rows_ok_nt(long long rows, int nt) {
     static atomic_int rpt = 0;
     int v = atomic_load_explicit(&rpt, memory_order_relaxed);
     if (v == 0) {
@@ -2297,9 +2297,12 @@ static int qwen_amx_int8_rows_ok(long long rows) {
     }
     v -= 1;
     if (v <= 0) return 1;
-    int nt = qwen_get_threads();
     if (nt < 1) nt = 1;
     return rows >= (long long)v * nt;
+}
+static int qwen_amx_int8_rows_ok(long long rows) QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_rows_ok(long long rows) {
+    return qwen_amx_int8_rows_ok_nt(rows, qwen_get_threads());
 }
 
 static int qwen_mm_use_(int mmk, int B, int rows, int cols, int amx_shape) QWEN_MAYBE_UNUSED;
@@ -8489,6 +8492,26 @@ const char *qwen_region_i8_backend(void) {
     if (!strcmp(b2, b4)) snprintf(buf, sizeof buf, "%s (B=2 and B=4)", b2);
     else                 snprintf(buf, sizeof buf, "%s at B=2, %s at B=4", b2, b4);
     return buf;
+}
+
+/* Would the INT8 AMX gate ever select this projection on this host?  Prepacking a weight the
+ * gate can never choose costs its whole size in RAM and buys nothing: `gate_rows` is the height
+ * the gate actually judges, which for a fused QKV member is q+2kv, not that member's own rows. */
+int qwen_amx_int8_pack_worth(int rows, int cols, int gate_rows, int threads) {
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (!qwen_amx_int8_ready()) return 0;
+    if (gate_rows <= 0) gate_rows = rows;
+    /* threads is the SERVING worker's count, not the packing process's: the parent prepacks
+     * before it forks, and a prefork worker runs with --prefork-threads, so asking
+     * qwen_get_threads() here would judge the gate with the wrong denominator. */
+    if (!qwen_amx_int8_rows_ok_nt(gate_rows, threads)) return 0;
+    /* B is irrelevant to the shape half of the gate; probe at the kernel's own minimum. */
+    return qwen_mm_use_(QWEN_MMK_INT8_AMX, qwen_mm_minb_value(QWEN_MMK_INT8_AMX,
+                                                              &g_mm_gate[QWEN_MMK_INT8_AMX]),
+                        rows, cols, 0);
+#else
+    (void)rows; (void)cols; (void)gate_rows; (void)threads; return 0;
+#endif
 }
 
 int qwen_matmat_int8_max_b(void) {

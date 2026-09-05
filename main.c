@@ -1463,7 +1463,9 @@ int main(int argc, char **argv) {
     }
 
     qwen_kleidi_prepack(ctx);
-    qwen_amx_prepack_model(ctx);
+    /* Judge pack-worthiness with the threads a SERVING worker will have, not this process's. */
+    qwen_amx_prepack_model_nt(ctx, serve_prefork > 1 && serve_prefork_threads > 0
+                                       ? serve_prefork_threads : 0);
     qwen_vnni_prepack_model(ctx);
     if (!silent) {
         extern void qwen_report_model_sources(qwen_tts_ctx_t *, const char *);

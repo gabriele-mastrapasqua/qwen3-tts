@@ -237,17 +237,24 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       B=3, where the rule keeps only the winners (Gate/Up -12..-14%, TK Down -4.4%, TK WO -3.0%).
       A first server A/B of the shape rule alone was a null result for exactly that reason.
       Subsumes old P5.5 and P5.8 (oneDNN/benchdnn on real CP/Talker shapes, small-B VNNI vs oracle).
-- [ ] X86-3 Persistent packed-RHS consumption audit — ANSWERED for AMX, not yet measured:
+- [x] X86-3 Persistent packed-RHS consumption audit — ANSWERED and MEASURED; stays opt-in.
       `QWEN_AMX_PREPACK` defaults to 0, so `qwen_amx_pack_weights()` returns NULL and every AMX
       tile load runs STRIDED off the row-major weights (`_tile_loadd(2, w0, pW ? 64 : cols)`).
-      The persistent representation already exists and is built in the parent before fork
-      (`qwen_amx_prepack_model`, inherited by prefork workers through copy-on-write) — it is
-      simply off. Two open items: (1) measure whether the packed RHS wins, since the whole X86-2
-      crossover above was measured on the UNPACKED tile path; (2) `qwen_amx_prepack_model` packs
-      everything — bf16 and int8, Talker and CP, every projection — about 1.45 GB of int8 alone,
-      including projections the gate can never select, so if it is turned on it should pack only
-      what the gate would use. VNNI has no packed RHS in production either (`QWEN_VNNI_PREPACK`
-      rejected on Zen5), only a cached row-sums array, which is by design. Was P5.9.
+      The persistent representation already existed and is built in the parent before fork
+      (`qwen_amx_prepack_model`, inherited by prefork workers through copy-on-write).
+      Microbench (paired, 6 threads, host-native): the packed RHS helps AMX exactly where it was
+      losing — CP WO goes from +24.3% to -11.0% at B=3, CP Down from +8.4% to +0.6% — confirming
+      the strided tile load was the reason short/deep projections lost.
+      Server A/B (2x6, SMT off, C=2/4/6): STREAM_RTF p95 1.036 -> 1.015 at C=4 and 1.440 -> 1.341
+      at C=6, but TTFA p95 838 -> 929 ms at C=6 and PSS 11.0 -> 15.3 GB. 4.2 GB of packed copies
+      for <=7% sustained RTF and a latency regression is not a default: the copies evict the
+      working set, which is the same L3 pressure the microbench showed. KEPT OPT-IN.
+      Landed anyway: the INT8 half of the prepack now packs only what the gate can select, judged
+      with the SERVING worker's thread count rather than the packing process's (the parent
+      prepacks before it forks and runs a different -j). VNNI has no packed RHS in production
+      either (`QWEN_VNNI_PREPACK` rejected on Zen5), only a cached row-sums array, by design.
+      Open follow-up if this is ever enabled: the bf16 half is still packed unconditionally and
+      is the bulk of the 4.2 GB. Was P5.9.
 - [ ] X86-4 Activation preparation/fusion follow-up — remove remaining generic gather, q8-pack and
       scatter passes. Rest of old P5.6; the decoder half of old P5.7 is partly done by 9933948
       (x86 SIMD `qwen_int8_quant_rows`), the im2col fusion is not.
