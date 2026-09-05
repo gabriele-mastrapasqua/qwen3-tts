@@ -1942,9 +1942,23 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
         return 0;
     }
 
-    /* Two request threads may only run the engine at once if the pool accepts concurrent
-     * submitters; this is a pool capability, not the prefill-helper opt-in it used to read. */
-    g_serialize_synth = !qwen_pool_concurrent_submit_ok();
+    /* This asked the wrong question twice.  It used to read the prefill-helper opt-in, which
+     * is a feature flag; 47ede94 moved it to qwen_pool_concurrent_submit_ok(), which is a real
+     * capability but not THIS one.  Whether two syntheses may overlap in one process is an
+     * ENGINE question, and nothing here answers it: the worker contexts are separate but the
+     * engine's process-wide state is not, and that has never been audited.  47ede94 therefore
+     * flipped Linux from serialised to concurrent on the strength of a predicate that does not
+     * cover the risk; this restores the long-standing default until the engine state is
+     * actually shown to be per-worker.
+     *
+     * It is NOT what makes tests/test_parallel.sh fail.  That failure is deterministic --
+     * identical mel-correlations across runs, unchanged by serialising -- and is the same
+     * sequential-history dependency test-serve-repro reports on this non-batched path: an
+     * identical request returns a different trajectory depending on the length of the request
+     * before it.  Neither reproduces on the batched/prefork server, which isolates workers by
+     * process and is the production path. */
+    g_serialize_synth = 1;
+    (void)qwen_pool_concurrent_submit_ok();
 
     qwen_tts_ctx_t **ctxs = (qwen_tts_ctx_t **)calloc(n_workers, sizeof(*ctxs));
     pthread_t *threads = (pthread_t *)calloc(n_workers, sizeof(pthread_t));
