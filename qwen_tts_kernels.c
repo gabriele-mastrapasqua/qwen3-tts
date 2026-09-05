@@ -89,8 +89,11 @@ void qwen_blas_own(int on) {
  * engine pool would run on top of the BLAS's own team instead of replacing it. */
 int qwen_blas_own_effective(void) {
 #if defined(__GNUC__) && !defined(__APPLE__)
-    return qwen_blas_own_get() && openblas_set_num_threads != NULL &&
-           !getenv("OPENBLAS_NUM_THREADS");
+    /* An OPENBLAS_NUM_THREADS in the environment used to mean "we are not really in control",
+     * which was true while qwen_blas_set_threads() returned early on seeing it.  It no longer
+     * does: ownership overrides the variable and holds BLAS at one thread, so counting the env
+     * as a loss of control made this report the opposite of what the engine was doing. */
+    return qwen_blas_own_get() && openblas_set_num_threads != NULL;
 #else
     return 0;
 #endif
@@ -103,10 +106,28 @@ int qwen_blas_threads_now(void) {
 #endif
 }
 
+/* Set when an OPENBLAS_NUM_THREADS in the environment was overridden because the engine owns
+ * the budget, so --effective-config can say so instead of leaving it to be discovered. */
+static atomic_int g_blas_env_overridden;
+int qwen_blas_env_overridden(void) {
+    return atomic_load_explicit(&g_blas_env_overridden, memory_order_relaxed);
+}
+
 void qwen_blas_set_threads(int n) {
 #if defined(__GNUC__) && !defined(__APPLE__)
-    if (getenv("OPENBLAS_NUM_THREADS")) return;
-    if (qwen_blas_own_get()) n = 1;   /* the engine pool owns parallelism; BLAS stays serial */
+    const char *env = getenv("OPENBLAS_NUM_THREADS");
+    if (qwen_blas_own_get()) {
+        /* Engine ownership is structural, not advisory.  This used to RETURN when the variable
+         * was present, so an exported OPENBLAS_NUM_THREADS silently left OpenBLAS with its own
+         * compute team while the engine believed it owned the budget -- two schedulers in one
+         * process, decided by whether someone remembered a variable.  The engine now wins and
+         * the override is reported. */
+        if (env && *env && atoi(env) != 1)
+            atomic_store_explicit(&g_blas_env_overridden, 1, memory_order_relaxed);
+        if (openblas_set_num_threads) openblas_set_num_threads(1);
+        return;
+    }
+    if (env) return;                  /* not owned: an explicit control experiment may set it */
     if (openblas_set_num_threads) openblas_set_num_threads(n > 0 ? n : 1);
 #else
     (void)n;

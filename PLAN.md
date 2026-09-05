@@ -40,7 +40,18 @@ PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something eq
       quant · prepack lifetime parent->fork · batch-aware dispatch · row/block scheduling ·
       activation scratch reuse · full-sequence prefill GEMM.
       Open pieces: P2.7 (ARM region wiring, hardware-blocked), P4.1/P4.2.
-- [ ] PARITY-2 Feature-flag / runtime-knob parity, and the EFFECTIVE-CONFIG DUMP that proves it.
+- [x] PARITY-2 DONE (00513f0 + the BLAS commit): `--effective-config` prints requested /
+      honoured-or-IGNORED / reason for every flag an operator set, and the batched server prints
+      it at startup so an artifact opens with what the engine is doing. Three sources, in order
+      of authority: the OWNER (`qwen_pool_flag_inert`, `qwen_kleidi_flag_inert` — one owner per
+      flag, the only place that can answer honestly), the GATE TABLE
+      (`qwen_flag_gate_status` + `qwen_mmk_compiled`: QWEN_NO_VNNI on an Arm binary disables a
+      kernel that was never compiled), and a scope table GENERATED from the sources by
+      `tools/flag_parity.py` (`make check-flag-parity` regenerates and diffs it). Matrix: 22
+      x86-only flags, 1 ARM-only, 1 Apple-only, 9 GPU-only of 179. Verified on M1 and on the box
+      across portable / avx512 / avx512vnni / amx: each profile names exactly the flags its own
+      kernels cannot honour.
+- [ ] PARITY-2b Feature-flag / runtime-knob parity, remaining.
       178 getenv calls cannot be the operating contract of a production server: env should mean
       debug, experiment, forced dispatch, kill switch and profiling — not configuration. Every
       artifact must therefore open with the effective server configuration AFTER parsing,
@@ -56,10 +67,16 @@ PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something eq
       by feature, ask where the x86 equivalent is and answer all of: same semantics · same
       default · same flag · same runtime observability · same numerical contract · same batch
       range · same persistent lifetime. A "no" anywhere is a parity gap even when x86 works.
-      Also lands the BLAS ownership decision, which is architectural and not a 2% question: two
-      compute schedulers in one process is the defect. The end state is either "BLAS is always
-      forced single-threaded and cannot escape engine ownership" or "BLAS removed from the hot
-      paths" — never "usually one thread if we remembered the right variable".
+      BLAS ownership: DONE, state (A) reached. The escape path was real, not theoretical —
+      `qwen_blas_set_threads()` began with `if (getenv("OPENBLAS_NUM_THREADS")) return;`, so an
+      exported variable made the engine leave OpenBLAS with its own compute team while it
+      believed it owned the budget: two schedulers in one process, decided by who remembered a
+      variable. Ownership is now structural (force 1, override the env, report the override),
+      and `qwen_blas_own_effective()` no longer counts the env as a loss of control — it had
+      become stale and reported the opposite of what the engine was doing. The variable stays
+      meaningful only where ownership is NOT claimed, i.e. a deliberate control experiment.
+      Box-verified on both prefork workers: budget `serial+partitioned`, openblas threads 1,
+      `OPENBLAS_NUM_THREADS=8 -> OVERRIDDEN`, `blas.ownership = engine`.
       Open: P1.2, P1.3, P3.4b, P4.3.
       Deliberately NOT started here, but the immediate consequence of closing this: a
       declarative versioned server profile (a per-host-class JSON beside `configs/perf/`) the server

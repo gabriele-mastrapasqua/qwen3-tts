@@ -218,6 +218,7 @@ int qwen_effective_config_report(void *out) {
             continue;
         }
         const char *inert = qwen_pool_flag_inert(name);
+        if (!inert) inert = qwen_kleidi_flag_inert(name);
         if (inert) {
             inert_n++;
             fprintf(f, "  %-34s %-10s %-9s IGNORED: %s\n", name, req, "ignored", inert);
@@ -245,6 +246,26 @@ int qwen_effective_config_report(void *out) {
                     name, req, "ignored", qwen_scope_names(sc, sb, sizeof sb),
                     qwen_scope_names(build, bb, sizeof bb));
         }
+    }
+    {   /* Not a QWEN_ flag, but the one env that can put a second compute scheduler in this
+         * process.  Engine ownership now overrides it; say so rather than leaving it silent. */
+        const char *ob = getenv("OPENBLAS_NUM_THREADS");
+        if (ob && *ob) {
+            set_n++;
+            if (qwen_blas_own_effective() || qwen_blas_env_overridden()) {
+                inert_n++;
+                fprintf(f, "  %-34s %-10s %-9s OVERRIDDEN: the engine owns the compute budget; "
+                           "BLAS is forced to 1 thread\n", "OPENBLAS_NUM_THREADS", ob, "1");
+            } else {
+                fprintf(f, "  %-34s %-10s %-9s BLAS runs its own team by request\n",
+                        "OPENBLAS_NUM_THREADS", ob, ob);
+            }
+        }
+        fprintf(f, "  %-34s %-10s %-9s %s\n", "blas.ownership", "-",
+                qwen_blas_own_effective() ? "engine" : "blas",
+                qwen_blas_own_effective()
+                  ? "engine owns the budget: BLAS is held at one thread and cannot escape it"
+                  : "BLAS keeps its own team (no thread control here, or ownership not claimed)");
     }
     fprintf(f, "  %d flag%s set in the environment, %d of them IGNORED by this build\n",
             set_n, set_n == 1 ? "" : "s", inert_n);

@@ -427,7 +427,8 @@ int qwen_pool_spin_value(void);
 int qwen_pool_narrow_value(void);
 int qwen_dispatch_map_report(void *out, const char *json_path);
 int qwen_effective_config_report(void *out);
-int qwen_flag_gate_status(const char *flag, int *compiled, const char **kernel);   /* requested vs effective, per declared flag */
+int qwen_flag_gate_status(const char *flag, int *compiled, const char **kernel);
+int qwen_blas_env_overridden(void);   /* requested vs effective, per declared flag */
 int qwen_matmat_bf16_rows(float *Y, const uint16_t *W, const float *Xr,
                           int ldx, int rows, int cols, int B);
 int qwen_matmat_bf16_rows_usable(int rows, int cols, int B);
