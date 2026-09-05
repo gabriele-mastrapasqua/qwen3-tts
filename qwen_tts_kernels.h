@@ -387,6 +387,8 @@ int qwen_q4_gemv_native(void);
 const char *qwen_matmat_family_int8(void);
 const char *qwen_matmat_family_q4(void);
 const char *qwen_matmat_family_bf16(void);
+int qwen_matmat_int8_max_b(void);
+const char *qwen_region_i8_backend(void);
 
 int qwen_int8_kp(int K, int blk);
 

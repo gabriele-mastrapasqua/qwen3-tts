@@ -8381,6 +8381,65 @@ const char *qwen_matmat_family_q4(void) {
                                "q4 generic twin (no q4 GEMM gate on this build)",
                                buf, sizeof buf);
 }
+/* Largest B the int8 matmat family still accepts, probed at the same shape as the family
+ * rows.  It matters because --batch-size is NOT clamped to it: every batched int8 gate has
+ * max_b = 16, and above that they all decline, so a server started with --batch-size 24
+ * steps its slots through one GEMV each -- exactly the work batching was asked to avoid --
+ * without a word.  Prefill already chunks itself to 16 (prefill_proj_matmat); the batched
+ * decode path passes the live slot count straight through, and chunking it here would move
+ * a remainder column onto the B=1 dequant twin, i.e. change its arithmetic.  So this is
+ * reported, not silently corrected. */
+/* Which in-region int8 runner a build/host can hold, named.  The persistent CP and Talker
+ * regions are the largest backend difference we have -- present on VNNI and AMX, absent on
+ * AVX2/AVX-512F and (until the gather shape lands) on Arm -- and until now the only place
+ * that said so was a one-shot stderr line printed by the engine at the first batched step,
+ * i.e. after traffic.  The model's own shapes still decide; this answers the prior question
+ * of whether the runner exists at all. */
+static const char *region_i8_backend_at(int B) {
+    enum { RR = QWEN_MMK_PROBE_ROWS, RC = QWEN_MMK_PROBE_COLS };
+#if defined(__AVX512VNNI__)
+    if (!qwen_region_i8_usable(RR, RC, B)) return "none";
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, RR, RC) && qwen_amx_int8_ready())
+        return "AMX int8 tiles";
+#endif
+    return "VNNI row blocks";
+#else
+    (void)B; return "none";
+#endif
+}
+
+const char *qwen_region_i8_backend(void) {
+    /* Report BOTH batch widths: the AMX gate starts at B=4, so an AMX host answers "VNNI row
+     * blocks" at B=2 and "AMX int8 tiles" at B=4, and a single-B row would hide half of that. */
+    static char buf[112];
+    const char *b2 = region_i8_backend_at(2), *b4 = region_i8_backend_at(4);
+    if (!strcmp(b2, "none") && !strcmp(b4, "none")) {
+#if defined(__AVX512VNNI__)
+        return "none: the int8 gate declines at the probe shape for B=2 and B=4";
+#else
+        return "none: no in-region int8 runner in this build (needs VNNI or AMX; Arm wiring open)";
+#endif
+    }
+    if (!strcmp(b2, b4)) snprintf(buf, sizeof buf, "%s (B=2 and B=4)", b2);
+    else                 snprintf(buf, sizeof buf, "%s at B=2, %s at B=4", b2, b4);
+    return buf;
+}
+
+int qwen_matmat_int8_max_b(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
+                                QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };
+    const int n = (int)(sizeof cand / sizeof cand[0]);
+    int best = 0;
+    for (int B = 1; B <= 64; B++)
+        for (int i = 0; i < n; i++) {
+            int k = cand[i];
+            if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) &&
+                qwen_mm_use(k, B, QWEN_MMK_PROBE_ROWS, QWEN_MMK_PROBE_COLS)) { best = B; break; }
+        }
+    return best;
+}
+
 const char *qwen_matmat_family_bf16(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_BF16, QWEN_MMK_BF16_AMX,
                                 QWEN_MMK_BF16_AVX512, QWEN_MMK_BF16_BFMMLA };

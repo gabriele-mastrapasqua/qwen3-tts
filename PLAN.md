@@ -29,8 +29,19 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 - [x] P1.0 HEAD compiled and ran only as the working tree: conv scratch freed, prctl include
       missing — fixed in fb3d32d; rule ENGINEERING.md §13
 - [x] P1.1 Static cross-backend audit — `docs/cross-backend-audit-2026-09-05.md` (fb3d32d)
-- [ ] P1.2 Verify Arm KleidiAI GEMV/GEMM shape coverage on a box
-- [ ] P1.3 Verify VNNI GEMV/GEMM shape coverage (q4 GEMM 0.80x is the known weak one)
+- [ ] P1.2 [BLOCKED: no ARM i8mm host in reach] Verify Arm KleidiAI GEMV/GEMM shape coverage on
+      a box. M1 does NOT qualify and must not be used as a stand-in: `kleidi.enabled` reads
+      "not compiled (needs an i8mm target)" there, so an M1 run measures the NEON fallback and
+      proves nothing about the KleidiAI kernels. Needs: an aarch64 host with i8mm (Graviton 3/4,
+      Neoverse V1/V2/N2, Oracle A1 is N1 = no i8mm), `make blas` picking up KleidiAI, then
+      `--dispatch-map` + `--self-test` + a golden run
+- [ ] P1.3 Verify VNNI GEMV/GEMM shape coverage (q4 GEMM 0.80x is the known weak one).
+      Partly answered while closing P1.5: prefill chunks itself to B<=16 (`prefill_proj_matmat`)
+      so it never crosses `max_b`, but the batched DECODE passes the live slot count straight
+      through, and every batched int8 gate stops at B=16 while `--batch-size` is not clamped to
+      anything. New row `matmat.int8.batch_ceiling` + a one-line server warning make that
+      visible; chunking it silently is NOT the fix, since a remainder column would move onto the
+      B=1 dequant twin and change its arithmetic. What remains is the per-shape q4 GEMM measurement
 - [x] P1.4 Verify AMX B>=4 region/head paths — detail: `.work/p1-4-amx-runtime.md`
       Runtime verified on GCP AMX host: production-like C4 decode remains VNNI at
       observed B1/B2; AMX BF16 prefill executes; AMX INT8 observed only at C8 B4/B5.
@@ -47,7 +58,15 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       = AVX2 maddubs even on the AVX-512F build, `matmat.bf16.family` = the fixed-B twin on all
       three, `decoder.int8` OFF (no kernel on those ISAs, P3.4a). Also fixed the `--caps` "lever"
       line, which asked the CPU instead of the build and advertised VNNI on a binary without it
-- [ ] P1.6 Verify Apple/GCD/Accelerate runtime (SGEMM partition with Accelerate threads)
+- [x] P1.6 Apple/GCD/Accelerate runtime verified on M1 at the capability level (no macOS perf
+      campaign, deliberately). Resolved map is consistent with the code: `blas.owned_effective`
+      OFF -> the decoder SGEMM partition is skipped and Accelerate keeps its own team, which is
+      the right answer where BLAS thread count cannot be set; `decoder.pool` private;
+      `pool.nested_dispatch` ON, `pool.concurrent_submit` ON, `pool.submit_priority` OFF with
+      QWEN_PREFILL_LOW_MS reported as ignored (GCD has no submit priority); prefill resolves to
+      the f32 convert + SGEMM twin, no bf16 matmat unit. Known Apple asymmetry, left as is: a
+      private decoder team and Accelerate's own threads can oversubscribe. That is a performance
+      question, not a capability lie
 
 ## P2 — runtime parity (evidence for the whole block — detail: `.work/p2-cross-backend-runtime.md`)
 
@@ -86,7 +105,8 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       (kernels compiled) + `qwen_sd_int8_usable` (shapes the kernels cover, moved off the
       decoder call site) vs a named per-backend default with its reason. AVX2/AVX-512F have no
       int8 conv kernel at all, so there is nothing to wire there — not made symmetric on purpose
-- [ ] P3.4b Measure the ARM dotprod first-frame cost and decide whether it may default ON
+- [ ] P3.4b [BLOCKED: needs an ARM box and a measurement campaign] Measure the ARM dotprod
+      first-frame cost and decide whether it may default ON
 - [x] P3.7 Path selection observable (8aa95db): `matmat.{int8,q4,bf16}.family` name the family
       that actually serves each dtype (dispatcher order, resolved through `qwen_mm_use`), so a
       build where every gate is off no longer stays silent. Audited AVX2/AVX-512F for removable
@@ -115,14 +135,10 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       parity gate is real on ARM instead of comparing NEON with itself. Proven discriminating:
       restoring the old tail makes 3 of the 8 cases FAIL. M1 golden 4/4 unchanged
       (1.00000/1.00000/1.00000/0.99995), so no qualified ARM audio moved
-- [ ] P3.6 AVX2 / AVX-512F have int8+q4 GEMM but NO integer GEMV, so every B=1 dequantises to
-      the f32 fused twin. Now visible (`matvec.int8.native` / `matvec.q4.native`, 47ede94); the
-      fix is a kernel, not a gate — no wasted conversion exists to remove and reusing the GEMM
-      at B=1 would change the arithmetic
 - [x] P3.5 AMX/x86-QKV/decoder knobs documented in docs/feature-flags.md; region rows
       updated for AMX; `QWEN_CP_FRAME_REGION` added. check-flag-registry 180/180
 
-- [ ] P2.7 ARM persistent region: interface COMPLETE, wiring blocked on hardware (8aa95db adds
+- [ ] P2.7 [BLOCKED: same ARM i8mm host requirement as P1.2] ARM persistent region: interface COMPLETE, wiring blocked on hardware (8aa95db adds
       the fused Q/K/V phases beside the plain ones, so every shape the region needs is exposed).
       Remaining: give the region body a row-major gather shape; needs an ARM i8mm box.
       Original analysis: blocker NARROWED, no longer numerical (e78e861).
@@ -137,7 +153,12 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 - [ ] P4.1 Draft module boundaries: common runtime / cpu dispatch+caps / cpu arm / cpu x86 / gpu
 - [ ] P4.2 Promote `g_mm_gate[]` + compiled/supported predicates to the one capability table,
       extended to non-matmat capabilities (regions, heads, conv int8, prefill, budget)
-- [ ] P4.3 Make fallback selection observable and testable from that table
+- [ ] P4.3 Make fallback selection observable and testable from that table. Partly delivered
+      ahead of P4.2 where it cost nothing: `--dispatch-map` now carries the persistent regions
+      (`region.int8_runner` names AMX tiles / VNNI row blocks / none, `region.team`,
+      and the four region knobs) and `matmat.int8.batch_ceiling`. Before this the only place
+      that said whether a region runs was a one-shot stderr line the engine prints at the first
+      batched step, i.e. after traffic. dispatch_gate coverage 42 -> 46 flags resolved
 
 ## Later
 
@@ -155,6 +176,11 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       already have; remove only where the measured win justifies the numerical and maintenance
       risk. Sequenced last on purpose: it is optimization work and waits until structural
       parity is substantially closed.
+- [ ] P3.6 [moved here 2026-09-05: this is kernel work, not a parity gap] AVX2 / AVX-512F have
+      int8+q4 GEMM but NO integer GEMV, so every B=1 dequantises to the f32 fused twin. Visible
+      since 47ede94 (`matvec.int8.native` / `matvec.q4.native`) and confirmed at runtime on the
+      box in P1.5. The fix is a kernel: there is no wasted conversion to remove, and reusing the
+      GEMM at B=1 would change the arithmetic.
 - [ ] P5.0 [low] Set `QWEN_POOL_SPIN=65536` as the x86 server default and update related JSON profiles.
 - [ ] P5.1 [low] Compare AutoRound/LLM Compressor W4A16 and Intel ARK packed kernels with runtime INT8: https://vllm.ai/blog/2025-12-09-intel-autoround-llmc https://github.com/intel/auto-round/tree/main/auto_round_extension/ark
 - [ ] P5.2 [low] Run isolated Xeon AMX/VNNI GEMV/GEMM oracle probes with oneDNN benchdnn and OpenVINO CPU: https://github.com/uxlfoundation/oneDNN/tree/main/tests/benchdnn https://github.com/openvinotoolkit/openvino/blob/master/docs/articles_en/openvino-workflow/running-inference/inference-devices-and-modes/cpu-device.rst

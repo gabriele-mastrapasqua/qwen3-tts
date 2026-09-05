@@ -1836,6 +1836,16 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     fprintf(stderr, "[serve] %d slots · %d may wait (%d in the system) · queue deadline %s\n",
             max_batch, jq.cap, max_batch + jq.cap,
             g_srv.queue_timeout_ms > 0 ? "on" : "none");
+    {
+        /* Say it once at start instead of letting the throughput quietly not happen: above
+         * the batched int8 ceiling every gate declines and a step runs one GEMV per slot. */
+        int ceil_b = qwen_matmat_int8_max_b();
+        if (ceil_b > 0 && max_batch > ceil_b)
+            fprintf(stderr, "[serve] WARNING --batch-size %d is above the batched int8 ceiling "
+                            "(B<=%d on this build): a fuller batch runs one GEMV per slot "
+                            "instead of the batched kernel. See matmat.int8.batch_ceiling in "
+                            "--dispatch-map.\n", max_batch, ceil_b);
+    }
     job_queue_t jq_single; jq_init(&jq_single);
 
     pthread_t *readers = (pthread_t *)calloc(n_readers, sizeof(pthread_t));

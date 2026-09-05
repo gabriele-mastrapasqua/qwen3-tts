@@ -141,7 +141,7 @@ static void json_str(FILE *j, const char *s) {
     fputc('"', j);
 }
 
-#define NFEAT 40
+#define NFEAT 64
 
 int qwen_dispatch_map_report(void *out, const char *json_path) {
     FILE *f = out ? (FILE *)out : stderr;
@@ -262,6 +262,16 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_matmat_family_q4());
         row(&feats[n++], "matmat.bf16.family", "-", "-", NULL, "see reason",
             qwen_matmat_family_bf16());
+        {
+            /* --batch-size is not clamped to this: above it every batched int8 gate declines
+             * and the step runs one GEMV per slot instead (prefill chunks itself to 16). */
+            char mb[24]; int ceil_b = qwen_matmat_int8_max_b();
+            snprintf(mb, sizeof mb, "%d", ceil_b);
+            row(&feats[n++], "matmat.int8.batch_ceiling", "-", "-", NULL, mb,
+                ceil_b ? "largest B the int8 matmat family accepts; --batch-size above it falls "
+                         "back to one GEMV per slot, silently"
+                       : "no batched int8 kernel here at all: every B runs per-slot GEMV");
+        }
         row(&feats[n++], "matvec.q4.native", yn(qwen_q4_gemv_native()),
             yn(qwen_q4_gemv_native()), NULL, onoff(qwen_q4_gemv_native()),
             qwen_q4_gemv_native() ? "native q4 GEMV"
@@ -376,6 +386,32 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_pool_priority_ok() ? "a submitter can step aside for the frame loop (LOW)"
                                     : "no submit priority here: QWEN_PREFILL_LOW_MS is ignored");
         row(&feats[n++], "pool.threads", "-", "-", NULL, tmp, "matvec threads in this process (-j)");
+    }
+
+    /* ---- Persistent execution regions ------------------------------------------------
+     * The engine prints the resolved answer, with the model's own shapes, at the first
+     * batched step ("[cp] transformer step as one parallel region: ..."). These rows are
+     * what can be known BEFORE traffic: whether an in-region runner exists at all, whether
+     * the pool can hold a team, and which knobs are set. */
+    {
+        const char *rb = qwen_region_i8_backend();
+        int held = qwen_parallel_team();
+        char tb[24]; snprintf(tb, sizeof tb, "%d", held);
+        row(&feats[n++], "region.int8_runner", "-", "-", NULL,
+            (rb[0] == 'n' && rb[1] == 'o') ? "OFF" : "ON", rb);
+        row(&feats[n++], "region.team", "-", "-", NULL, tb,
+            held >= 2 ? "holdable team: a region can keep its workers between phases"
+                      : "no holdable team (needs >= 2): every region predicate is off");
+        row(&feats[n++], "region.cp", "-", "-", "QWEN_CP_REGION", "see reason",
+            "CP transformer step as one parallel region; needs int8 weights (no q4), B in 2..16 "
+            "and the runner above. QWEN_CP_REGION=0 restores the dispatched path");
+        row(&feats[n++], "region.cp_frame", "-", "-", "QWEN_CP_FRAME_REGION", "see reason",
+            "all 16 CP steps in one pool entry; also needs the batched heads");
+        row(&feats[n++], "region.cp_batch_head", "-", "-", "QWEN_CP_BATCH_HEAD", "see reason",
+            "MTP projection and lm_heads once for all active slots");
+        row(&feats[n++], "region.talker", "-", "-", "QWEN_TK_REGION", "see reason",
+            "batched Talker step as one parallel region, same conditions as region.cp. "
+            "QWEN_TK_REGION=0 restores the dispatched path");
     }
 
     /* ---- Print ---------------------------------------------------------------------- */
