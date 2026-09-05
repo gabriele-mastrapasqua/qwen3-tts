@@ -288,7 +288,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
     "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
-    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_TK_REGION", "QWEN_SD_SCRATCH_STATS",
+    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
@@ -10169,13 +10169,30 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
     return 0;
 }
 
-/* ---- in-region int8 matmat: the dispatched drivers, split into prep + per-thread run ---- */
+/* ---- in-region int8 matmat: the dispatched drivers, split into prep + per-thread run ----
+ * Rule 6 of ENGINEERING.md: which implementation ran must be visible.  The in-region
+ * runners bypass the dispatcher (and therefore the census), so each distinct backend
+ * announces itself once per process the first time a region actually uses it. */
+QWEN_MAYBE_UNUSED static void qwen_i8mm_note_backend(const char *what, int rows, int cols, int B) {
+    static const char *seen[8]; static int nseen = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == what) return;
+    if (nseen < 8) seen[nseen++] = what;
+    fprintf(stderr, "[region] int8 in-region runner: %s (first use %dx%d B=%d)\n",
+            what, rows, cols, B);
+}
+/* A shape is region-usable when SOME in-region row-block runner can execute it, not only
+ * the VNNI one.  The AMX tiles are a valid runner too: qwen_i8mm_run below packs the
+ * activations per thread and calls the same int8_amx_task the dispatched path calls, so the
+ * row results are the ones the dispatcher would have produced.  Returning 0 for AMX shapes
+ * (as this did) silently switched the CP/Talker regions and the batched heads off exactly
+ * when batching got wide enough for AMX. */
 int qwen_i8mm_usable(int rows, int cols, int B) {
 #if defined(__AVX512VNNI__)
+    if (B < 2 || B > 16 || rows < 256) return 0;
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
-    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, rows, cols) && qwen_amx_int8_ready()) return 0;
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, rows, cols) && qwen_amx_int8_ready()) return 1;
 #endif
-    return B >= 2 && B <= 16 && rows >= 256 && qwen_mm_use(QWEN_MMK_INT8_VNNI, B, rows, cols);
+    return qwen_mm_use(QWEN_MMK_INT8_VNNI, B, rows, cols);
 #else
     (void)rows; (void)cols; (void)B; return 0;
 #endif
@@ -10183,27 +10200,45 @@ int qwen_i8mm_usable(int rows, int cols, int B) {
 int qwen_i8mm_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
 #if defined(__AVX512VNNI__) && defined(__x86_64__)
     if (qwen_x86_qkv_disabled() || B <= 1 || B > 16) return 0;
+    if ((q_rows + 2 * kv_rows) < 256) return 0;
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     if ((q_rows & 15) == 0 && (kv_rows & 15) == 0 &&
-        qwen_amx_int8_qkv_allowed(B, q_rows, kv_rows, cols) && qwen_amx_int8_ready()) return 0;
+        qwen_amx_int8_qkv_allowed(B, q_rows, kv_rows, cols) && qwen_amx_int8_ready()) return 1;
 #endif
-    return (q_rows + 2 * kv_rows) >= 256 &&
-           qwen_mm_use(QWEN_MMK_INT8_VNNI, B, q_rows, cols) &&
+    return qwen_mm_use(QWEN_MMK_INT8_VNNI, B, q_rows, cols) &&
            qwen_mm_use(QWEN_MMK_INT8_VNNI, B, kv_rows, cols);
 #else
     (void)q_rows; (void)kv_rows; (void)cols; (void)B; return 0;
 #endif
 }
+/* ISA-neutral on purpose: this is the same per-column quantiser the dispatched int8
+ * matmat uses on every backend that has one, so a future ARM/other in-region runner needs
+ * no second copy of it. */
 float qwen_i8mm_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b) {
-#if defined(__AVX512VNNI__)
     return quantize_act_int8_col(qb, Xt, cols, B, b);
-#else
-    (void)qb; (void)Xt; (void)cols; (void)B; (void)b; return 0.0f;
-#endif
 }
 void qwen_i8mm_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
                    const float *sx, int rows, int cols, int B, size_t tid, size_t nt) {
 #if defined(__AVX512VNNI__)
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, rows, cols) && qwen_amx_int8_ready()) {
+        /* Every thread packs the same B x cols activation into its own scratch: O(B*cols)
+         * against O(rows*cols/nt) of real work, and it keeps the runner allocation-free and
+         * lock-free inside the region.  The weight pack cache is already mutex-guarded. */
+        const size_t kfull = (size_t)(cols & ~63);
+        int8_t *pXt = mm_scratch_pack(kfull * (size_t)B);
+        if (pXt) {
+            const uint8_t *pW = (const uint8_t *)qwen_amx_pack_weights(
+                W, rows, cols, QWEN_AMX_WEIGHT_INT8);
+            amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
+            int8_amx_ctx ac = { Y, W, pW, scale, pXt, qXt, sx, rows, cols, B };
+            if (tid == 0) qwen_i8mm_note_backend("AMX int8 tiles", rows, cols, B);
+            int8_amx_task(tid, nt, &ac);
+            return;
+        }
+    }
+#endif
+    if (tid == 0) qwen_i8mm_note_backend("VNNI row blocks", rows, cols, B);
     int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
     int8_vmm_task(tid, nt, &c);
 #else
@@ -10219,6 +10254,24 @@ void qwen_i8mm_run_qkv(float *q, float *k, float *v,
         { q, k, v }, { Wq, Wk, Wv }, { NULL, NULL, NULL }, { sq, sk, sv },
         NULL, qXt, sx, { q_rows, kv_rows, kv_rows }, cols, B
     };
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if ((q_rows & 15) == 0 && (kv_rows & 15) == 0 &&
+        qwen_amx_int8_qkv_allowed(B, q_rows, kv_rows, cols) && qwen_amx_int8_ready()) {
+        const size_t kfull = (size_t)(cols & ~63);
+        int8_t *pXt = mm_scratch_pack(kfull * (size_t)B);
+        if (pXt) {
+            c.pXt = pXt;
+            c.pW[0] = (const uint8_t *)qwen_amx_pack_weights(Wq, q_rows,  cols, QWEN_AMX_WEIGHT_INT8);
+            c.pW[1] = (const uint8_t *)qwen_amx_pack_weights(Wk, kv_rows, cols, QWEN_AMX_WEIGHT_INT8);
+            c.pW[2] = (const uint8_t *)qwen_amx_pack_weights(Wv, kv_rows, cols, QWEN_AMX_WEIGHT_INT8);
+            amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
+            if (tid == 0) qwen_i8mm_note_backend("AMX int8 tiles (fused QKV)", q_rows, cols, B);
+            int8_qkv_amx_task(tid, nt, &c);
+            return;
+        }
+    }
+#endif
+    if (tid == 0) qwen_i8mm_note_backend("VNNI row blocks (fused QKV)", q_rows, cols, B);
     int8_qkv_vnni_mm_task(tid, nt, &c);
 #else
     (void)q; (void)k; (void)v; (void)Wq; (void)sq; (void)Wk; (void)sk; (void)Wv; (void)sv;

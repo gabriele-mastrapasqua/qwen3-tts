@@ -1018,6 +1018,8 @@ typedef struct {
     int BW; const int *idx;
     int8_t *qx; float *swtmp; float sx[16];
     qwen_barrier_t bar;
+    /* frame mode only: the whole 15-group decode inside one region */
+    const float *talker_hidden; const int *code0; int *out_codes;
 } cp_region_t;
 
 static void cp_region_gather_quant(cp_region_t *r, const float *src, int b, int j,
@@ -1031,17 +1033,13 @@ static void cp_region_scatter(cp_region_t *r, float *dst, const float *Yt, int b
     for (int i = 0; i < rows; i++) d[i] = Yt[(size_t)i * r->BW + j];
 }
 
-static void cp_region_task(size_t tid, size_t nt, void *v) {
-    cp_region_t *r = (cp_region_t *)v;
+static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
     qwen_tts_ctx_t *ctx = r->ctx; qwen_batch_t *bb = r->bb; qwen_tts_config_t *c = &ctx->config;
     const int BW = r->BW, ch = bb->cp_h, cqd = bb->cp_q_dim, ckvd = bb->cp_kv_dim, cint = bb->cp_inter;
     const float eps = c->rms_norm_eps, ascale = 1.0f / sqrtf((float)c->cp_head_dim);
-    const int pos = r->pos;
     float *Yt = bb->cp_Yt;
 #define RSLOT(j) (r->idx ? r->idx[j] : (j))
 #define RMINE(j) ((size_t)(j) % nt == tid)
-    for (int j = 0; j < BW; j++) if (RMINE(j)) cp_region_gather_quant(r, r->x_norm, RSLOT(j), j, ch, ch);
-    qwen_barrier_wait(&r->bar);
     for (int L = 0; L < c->cp_num_layers; L++) {
         qwen_cp_layer_t *l = &ctx->cp_layers[L];
         float *Yk = Yt + (size_t)cqd * BW, *Yv = Yt + (size_t)(cqd + ckvd) * BW;
@@ -1106,6 +1104,16 @@ static void cp_region_task(size_t tid, size_t nt, void *v) {
 #undef RMINE
 }
 
+static void cp_region_task(size_t tid, size_t nt, void *v) {
+    cp_region_t *r = (cp_region_t *)v;
+    const int BW = r->BW, ch = r->bb->cp_h;
+    for (int j = 0; j < BW; j++)
+        if ((size_t)j % nt == tid)
+            cp_region_gather_quant(r, r->x_norm, r->idx ? r->idx[j] : j, j, ch, ch);
+    qwen_barrier_wait(&r->bar);
+    cp_region_layers(r, tid, nt, r->pos);
+}
+
 /* Can this step run as one region?  Decided once per process for the CP shapes (they never
  * change) and re-checked for the cheap per-call conditions. */
 static int cp_region_ok(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, int BW) {
@@ -1129,6 +1137,17 @@ static int cp_region_ok(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, int BW) {
            qwen_i8mm_usable(bb->cp_h, bb->cp_q_dim, BW) &&
            qwen_i8mm_usable(2 * bb->cp_inter, bb->cp_h, BW) &&
            qwen_i8mm_usable(bb->cp_h, bb->cp_inter, BW);
+}
+
+/* One grow-once scratch pair for both region entry points: qx holds BW quantised activation
+ * columns of the widest operand, swtmp the per-slot swiglu temporary. */
+static int cp_region_scratch(int BW, size_t maxc, int cint, int8_t **pqx, float **psw) {
+    static int8_t *qx = NULL; static float *swtmp = NULL; static size_t qx_cap = 0, sw_cap = 0;
+    size_t need = (size_t)BW * maxc + 64, swn = (size_t)BW * cint;
+    if (need > qx_cap) { free(qx); qx = (int8_t *)aligned_alloc(64, (need + 63) & ~(size_t)63); qx_cap = qx ? need : 0; }
+    if (swn > sw_cap) { free(swtmp); swtmp = (float *)malloc(swn * sizeof(float)); sw_cap = swtmp ? swn : 0; }
+    *pqx = qx; *psw = swtmp;
+    return qx && swtmp;
 }
 
 static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
@@ -1157,13 +1176,10 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     {
         int BW = bb->B_eff > 0 ? bb->B_eff : B;
         if (cp_region_ok(ctx, bb, BW)) {
-            static int8_t *qx = NULL; static float *swtmp = NULL; static size_t qx_cap = 0, sw_cap = 0;
+            int8_t *qx = NULL; float *swtmp = NULL;
             size_t maxc = (size_t)(bb->cp_inter > bb->cp_q_dim ? bb->cp_inter : bb->cp_q_dim);
             if (maxc < (size_t)ch) maxc = ch;
-            size_t need = (size_t)BW * maxc + 64, swn = (size_t)BW * bb->cp_inter;
-            if (need > qx_cap) { free(qx); qx = (int8_t *)aligned_alloc(64, (need + 63) & ~(size_t)63); qx_cap = qx ? need : 0; }
-            if (swn > sw_cap) { free(swtmp); swtmp = (float *)malloc(swn * sizeof(float)); sw_cap = swtmp ? swn : 0; }
-            if (qx && swtmp) {
+            if (cp_region_scratch(BW, maxc, bb->cp_inter, &qx, &swtmp)) {
                 cp_region_t r; memset(&r, 0, sizeof r);
                 r.ctx = ctx; r.bb = bb; r.x = x; r.x_norm = x_norm; r.pos = pos;
                 r.BW = BW; r.idx = bb->act_idx; r.qx = qx; r.swtmp = swtmp;
@@ -1226,6 +1242,146 @@ static int cp_batch_lm(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const float *norme
     return 1;
 }
 
+/* ---- the whole CP frame as ONE parallel region ----------------------------------------
+ * Even with the step region and the batched heads on, a 16-step frame still leaves and
+ * re-enters the pool 47 times: 16 steps, 16 MTP projections and 15 lm_heads, each one a
+ * submit/wake/wait pair with the gather, the scatter and the argmax running on the loop
+ * thread while the team idles.  The sequence is fully decidable up front (every embedding
+ * row index is either code0 or an argmax this frame produced), so the team can enter once
+ * and run the entire decode.  Kernels, per-column quantiser, accumulation and argmax order
+ * are the ones the dispatched path uses, so the codes are bit-identical.
+ * QWEN_CP_FRAME_REGION=0 restores the per-call path. */
+static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
+    cp_region_t *r = (cp_region_t *)v;
+    qwen_tts_ctx_t *ctx = r->ctx; qwen_batch_t *bb = r->bb; qwen_tts_config_t *c = &ctx->config;
+    const int BW = r->BW, ch = bb->cp_h, ed = ctx->cp_emb_dim, h = c->hidden_size;
+    const int vocab = c->codebook_size, estride = (h > ed ? h : ed);
+    const float eps = c->rms_norm_eps;
+    float *Xt = bb->cp_Xt, *Yt = bb->cp_Yt, *embs = bb->cp_gate;
+#define RSLOT(j) (r->idx ? r->idx[j] : (j))
+#define RMINE(j) ((size_t)(j) % nt == tid)
+    for (int s = 0; s < 16; s++) {
+        /* MTP projection: this step's source row per slot, quantised, then one matmat. */
+        for (int j = 0; j < BW; j++) if (RMINE(j)) {
+            int b = RSLOT(j);
+            const float *src;
+            if (s == 0) {
+                src = r->talker_hidden + (size_t)b * h;
+            } else {
+                float *e = embs + (size_t)j * estride;
+                if (s == 1)
+                    qwen_bf16_to_f32_vec(e, ctx->codec_embedding_bf16 + (int64_t)r->code0[b] * h, h);
+                else
+                    qwen_bf16_to_f32_vec(e, ctx->cp_codec_emb_bf16[s - 2] +
+                                         (int64_t)r->out_codes[(size_t)b * 15 + (s - 2)] * ed, ed);
+                src = e;
+            }
+            for (int k = 0; k < ed; k++) Xt[(size_t)k * BW + j] = src[k];
+            r->sx[j] = qwen_i8mm_quant_col(r->qx + (size_t)j * ed, Xt, ed, BW, j);
+        }
+        qwen_barrier_wait(&r->bar);
+        qwen_i8mm_run(Yt, ctx->cp_mtp_proj_int8, ctx->cp_mtp_proj_scale, r->qx, r->sx,
+                      ch, ed, BW, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (RMINE(j)) {
+            int b = RSLOT(j);
+            cp_region_scatter(r, r->x, Yt, b, j, ch);
+            if (ctx->cp_mtp_proj_bias) {
+                float *d = r->x + (size_t)b * ch;
+                for (int i = 0; i < ch; i++) d[i] += ctx->cp_mtp_proj_bias[i];
+            }
+            qwen_rms_norm(r->x_norm + (size_t)b * ch, r->x + (size_t)b * ch,
+                          ctx->cp_layers[0].input_norm, 1, ch, eps);
+            cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
+        }
+        qwen_barrier_wait(&r->bar);
+        cp_region_layers(r, tid, nt, s);
+        if (s == 0) continue;                        /* the first step has no head */
+        {
+            const int g = s - 1;
+            for (int j = 0; j < BW; j++) if (RMINE(j)) {
+                int b = RSLOT(j);
+                qwen_rms_norm(r->x_norm + (size_t)b * ch, r->x + (size_t)b * ch, ctx->cp_norm, 1, ch, eps);
+                cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
+            }
+            qwen_barrier_wait(&r->bar);
+            qwen_i8mm_run(Yt, ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g], r->qx, r->sx,
+                          vocab, ch, BW, tid, nt);
+            qwen_barrier_wait(&r->bar);
+            for (int j = 0; j < BW; j++) if (RMINE(j)) {
+                int b = RSLOT(j), best = 0; float bv = Yt[j];
+                for (int o = 1; o < vocab; o++) {
+                    float vv = Yt[(size_t)o * BW + j];
+                    if (vv > bv) { bv = vv; best = o; }
+                }
+                r->out_codes[(size_t)b * 15 + g] = best;
+            }
+        }
+    }
+#undef RSLOT
+#undef RMINE
+}
+
+static int cp_frame_region_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("QWEN_CP_FRAME_REGION"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
+/* Returns 1 when the whole frame ran as one region (out_codes filled for every active
+ * slot), 0 when any precondition fails and the caller must run its own sequence. */
+static int cp_frame_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const float *talker_hidden,
+                               const int *code0, int *out_codes, const uint8_t *active) {
+    qwen_tts_config_t *c = &ctx->config;
+    const int B = bb->B, ch = bb->cp_h, ed = ctx->cp_emb_dim, h = c->hidden_size;
+    const int vocab = c->codebook_size, cint = bb->cp_inter, cqd = bb->cp_q_dim;
+    const int BW = bb->B_eff > 0 ? bb->B_eff : B;
+    if (!cp_frame_region_enabled() || !cp_batch_head_enabled()) return 0;
+#ifdef QWEN_HAVE_CUDA
+    { extern void *g_cuda_cp_batch_state; if (g_cuda_cp_batch_state) return 0; }
+#endif
+#ifdef QWEN_HAVE_METAL
+    if (g_metal_cp_batch_state) return 0;
+#endif
+    if (B > 64 || BW < 2 || BW > 16) return 0;
+    if (!cp_region_ok(ctx, bb, BW)) return 0;
+    /* act_idx must be exactly the active set (QWEN_BATCH_NO_BEFF packs inactive slots too) */
+    { int nact = 0;
+      for (int b = 0; b < B; b++) if (!active || active[b]) nact++;
+      if (nact != BW) return 0; }
+    if (!ctx->cp_mtp_proj_bf16 || !ctx->cp_mtp_proj_int8 || ctx->cp_mtp_proj_q4) return 0;
+    if (!ctx->codec_embedding_bf16) return 0;
+    for (int g = 0; g < 15; g++) if (!ctx->cp_lm_head_int8[g] || ctx->cp_lm_head_q4[g]) return 0;
+    for (int g = 1; g < 15; g++) if (!ctx->cp_codec_emb_bf16[g - 1]) return 0;
+    if (!qwen_i8mm_usable(ch, ed, BW) || !qwen_i8mm_usable(vocab, ch, BW)) return 0;
+    /* the shared batch scratch must hold the two extra operands as well */
+    int cmaxcols = ch; if (cqd > cmaxcols) cmaxcols = cqd; if (cint > cmaxcols) cmaxcols = cint;
+    int cmaxrows = 2 * cint; if (cqd > cmaxrows) cmaxrows = cqd; if (ch > cmaxrows) cmaxrows = ch;
+    const int estride = h > ed ? h : ed;
+    if (ed > cmaxcols || vocab > cmaxrows || ed > h) return 0;
+    if ((long long)BW * estride > (long long)B * 2 * cint) return 0;
+    for (int b = 0; b < B; b++) {
+        if (active && !active[b]) continue;
+        if (code0[b] < 0 || code0[b] >= c->codec_vocab_size) return 0;
+    }
+    size_t maxc = (size_t)cmaxcols; if ((size_t)ed > maxc) maxc = (size_t)ed;
+    int8_t *qx = NULL; float *swtmp = NULL;
+    if (!cp_region_scratch(BW, maxc, cint, &qx, &swtmp)) return 0;
+    cp_region_t r; memset(&r, 0, sizeof r);
+    r.ctx = ctx; r.bb = bb; r.x = bb->cp_x; r.x_norm = bb->cp_x_norm; r.pos = 0;
+    r.BW = BW; r.idx = bb->act_idx; r.qx = qx; r.swtmp = swtmp;
+    r.talker_hidden = talker_hidden; r.code0 = code0; r.out_codes = out_codes;
+    int team = qwen_parallel_team();
+    static int announced = 0;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "[cp] whole decode frame as one parallel region: ON (team %d, BW %d)\n", team, BW);
+    }
+    qwen_barrier_init(&r.bar, team);
+    qwen_parallel((size_t)team, cp_region_frame_task, &r);
+    return 1;
+}
+
 int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                           const float *talker_hidden, const int *code0, int *out_codes,
                           const uint8_t *active) {
@@ -1269,6 +1425,17 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
 
 #define CPB_SKIP(b) (active && !active[b])
+
+    if (cp_frame_region_run(ctx, bb, talker_hidden, code0, out_codes, active)) {
+        for (int b = 0; b < B; b++) {
+            if (!CPB_SKIP(b)) continue;
+            memset(cx + (size_t)b * ch, 0, (size_t)ch * sizeof(float));
+            for (int g = 0; g < 15; g++) out_codes[(size_t)b * 15 + g] = 0;
+        }
+        qwen_mm_component(prev_comp);
+        qwen_region_end(QWEN_RGN_CP_DECODE);
+        return 0;
+    }
 
     {
         const float *srcs[64]; int any = 0;
