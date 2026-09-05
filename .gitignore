@@ -107,3 +107,6 @@ tests/test_ingot_parity
 # Local listening/experiment notes that land under samples/.
 samples/*.md
 samples/ingot_v101_check/
+
+# Per-task working addenda (ENGINEERING.md §2).
+/.work/
