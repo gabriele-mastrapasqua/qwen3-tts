@@ -34,6 +34,17 @@ profiler/debug evidence, temporary benchmark notes. Agents never copy `PLAN.md` 
 `.work/` content into tracked docs unless the user approves that specific content;
 tracked docs stay public-safe (no hosts, addresses, credentials, customer material).
 
+## 2b. Plan integrity
+
+`PLAN.md` never contains dangling references. Every `detail: .work/<file>.md`, every
+tracked doc it names, and every evidence file behind a `[x]` task MUST exist before the
+plan update is reported as complete. Before finalising any plan edit run
+`python3 tools/check_plan.py`; it fails on a missing `.work/` or repository path, a
+duplicate task id, a `[x]` task pointing to a missing file, or an addendum naming a task
+the plan does not have. On failure: do not claim completion, create the real file or
+remove the reference, report the failure. Never create placeholder links or empty
+addenda for work that has not been written.
+
 ## 3. Code is the source of truth
 
 Docs, feature tables and old benchmark pages may be stale. For implementation or
@@ -54,6 +65,10 @@ Reference: `docs/cross-backend-audit-2026-09-05.md`.
 
 ## 5. A benchmark is invalid until dispatch is proven
 
+CPU/server performance work MUST follow `docs/BENCHMARKING.md`. If a canonical benchmark
+tool, profile or procedure changes, the same change updates the runbook. Do not select
+benchmark commands from memory or old docs.
+
 Before every performance run record, from the process being measured and after its
 environment is applied: git commit and dirty state, source fingerprint and binary
 hash, compiler SIMD target, CPU model and features, profile name, exact command,
@@ -61,10 +76,9 @@ exact environment, worker topology and CPU masks, and the resolved backend, GEMV
 GEMM/matmat, prefill and decoder paths with the relevant flags.
 
 Every benchmark directory carries one machine-readable `run_manifest.json`, produced
-from the actual serving configuration after the environment is applied: commit, dirty
-state, binary hash/build id, CPU and features, compile SIMD, profile, exact env,
-topology/masks, requested dispatch, resolved dispatch per important operation. A
-dispatch file generated independently before the env is never authoritative evidence.
+from the actual serving configuration after the environment is applied (fields in
+`docs/BENCHMARKING.md` §4 and §6). A dispatch file generated independently before the
+env is never authoritative evidence.
 
 Never infer the active kernel from a profile filename, a requested env flag or the
 compile target name. The strongest evidence is in-process: the server's own resolved
@@ -142,6 +156,17 @@ platform that is available; platforms that were not available are listed under
 WHAT REMAINS UNKNOWN, never reported as tested. Commit messages: English, imperative,
 what and why, no tool attribution. `PLAN.md`, `plan_*.md`, `.work/`, `private/` are
 never committed.
+
+## 13b. Repository integrity
+
+Tracked canonical tools and scripts never depend on untracked local files. Every
+repo-local runtime dependency of a tracked script is itself tracked, produced by a
+documented build step, or explicitly optional; a fresh clone never silently depends on
+one developer's working tree. `python3 tools/check_repo_integrity.py` fails on a tracked
+script that references a file present here but not in git. Three failure classes, all
+seen in practice: PLAN integrity (no dangling references, §2b), repository integrity
+(this rule), benchmark integrity (no qualifying run without proven commit, binary, env
+and dispatch, §5 and §13).
 
 ## 14. Completion rule
 

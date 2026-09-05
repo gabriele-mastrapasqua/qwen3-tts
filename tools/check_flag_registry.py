@@ -27,7 +27,8 @@ def registry(src):
 
 def read_by_engine():
     names = {}
-    for path in sorted(glob.glob(os.path.join(ROOT, "*.c")) + glob.glob(os.path.join(ROOT, "*.h"))):
+    # every engine source that can call getenv: C, headers, CUDA and Objective-C (Metal)
+    for path in sorted(sum((glob.glob(os.path.join(ROOT, ext)) for ext in ("*.c", "*.h", "*.cu", "*.m")), [])):
         src = open(path, errors="replace").read()
         if os.path.basename(path) == "qwen_tts_kernels.c":
             src = REG_RE.sub("", src)          # the register itself is not a read
