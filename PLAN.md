@@ -4,6 +4,101 @@ Goal: backend parity of the runtime work, and a proven (not inferred) explanatio
 Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.md`,
 `plan_x86_parity.md`) are history, read only when a task points at them.
 
+## PRIORITY ORDER (set 2026-09-05, after the decoder finding)
+
+This replaces "pick the next interesting component". The decoder fix exposed a process
+failure larger than any single defect: a component worth ~31% of the request was running its
+most expensive kernel on 2 of 6 workers, and it took a manual dissection to see it. Weeks went
+into individual kernels and backends while that sat in plain sight. So:
+
+1. close ONLY PARITY-1/2/3 below — nothing else from the parity backlog;
+2. then P0-PROFILER, which OUTRANKS all further x86 kernel work;
+3. only then X86-4/X86-5/X86-6/X86-7/X86-8 and P5.10, and their queue order comes from what
+   the profiler's FAST run measures, not from what looks interesting.
+
+- [ ] PARITY-1 Common/shared code path parity across the supported CPU backends. Keep the
+      common engine semantics common; a backend may differ only where the ISA or the kernel
+      genuinely differs. Open pieces: P2.7 (ARM region wiring, hardware-blocked), P4.1/P4.2.
+- [ ] PARITY-2 Feature-flag / runtime-knob parity. Equivalent functionality must expose the
+      same meaningful controls, defaults, observability and enable/disable semantics on ARM and
+      x86. Compiling on both is NOT parity: name every knob that exists on one side and is
+      missing, INERT, opt-in-only, or structurally different on the other — the class of defect
+      already found twice (`QWEN_NO_SIMD_QUANT` did nothing on ARM; `QWEN_PREFILL_LOW_MS` was
+      ignored on GCD). Where a packed/fused/default-on path exists on ARM and its x86
+      equivalent is absent or opt-in, that belongs in the profiler's effective-configuration
+      section, not in a reader's memory. Builds on P3.1/P3.2; P3.3b is the open remainder.
+- [ ] PARITY-3 Backend/dispatch functional parity — the remaining confirmed cleanup, with
+      differences isolated to real ISA/kernel capability. Open: P1.2, P1.3, P3.4b, P4.3.
+
+- [ ] P0-PROFILER — ENGINE RUNTIME PROFILER. [Do NOT start before PARITY-1/2/3 are closed.
+      Outranks every further x86 kernel optimization once they are.]
+
+      NOT another pile of ad-hoc timing logs and NOT another `PROFILE=1` that prints 800 lines.
+      One coherent profiler for the real engine/server flow: from ONE short real-model run
+      (~2 s of generated audio) it produces a complete, readable X-ray of the request, and the
+      next optimization queue is built from its measured total-request impact.
+
+      TWO LEVELS AT ONCE, because neither alone is enough. `perf` can say `sd_gemm_panel` is
+      X% but not that the work belongs to Decoder -> conv_up -> res1 -> conv1d -> block0, and
+      above all not that there were 2 work items for a pool of 6. Internal timers alone cannot
+      see LLC misses, context switches, migrations, IPC or page faults. The combination is the
+      point.
+
+      POOL OCCUPANCY IS A FIRST-CLASS METRIC, not a footnote next to wall_ms. Every parallel
+      region must answer `nt_requested / nt_active / tasks / utilization`. The defect just
+      fixed would have been one red line on the first profiling run:
+          conv_up/res1  wall=... request_share=31%
+            pool_threads=6 work_items=2 active_threads=2 occupancy=33%
+            WARNING: parallel work decomposition underfills the pool
+
+      MUST REPORT, without anyone reading the source:
+      · HOST/BUILD — CPU model, physical cores, SMT on/off, logical CPUs, NUMA, ISA caps, build
+        flags and SIMD backend, model and quantization mode, worker topology, threads per
+        worker, actual affinity masks, pinned or not, effective values of the runtime flags.
+      · REQUEST/SERVER — concurrency, observed batch size over time and per worker, TTFA,
+        STREAM_RTF, prebuffer, frames and audio duration, scheduler/admission behaviour.
+      · FULL EXECUTION TREE — per phase/component: parent->child, inclusive and self time,
+        % of request wall, call count, time/call, frames or tokens per call, backend AND kernel
+        actually selected, and the FALLBACK REASON when the preferred path was not taken.
+      · THREADING — per expensive component: requested vs actually participating threads, idle
+        workers, work items/panels/tiles, distribution, pool dispatches, barriers, waits/spins,
+        nested dispatch, BLAS thread participation, effective parallel efficiency.
+      · MEMORY — malloc/calloc/realloc/free counts and bytes, aligned allocations, mmap/munmap,
+        hot-path allocations, scratch growth, temporary copies, bytes copied/gathered/scattered/
+        packed/quantized where observable, persistent packed-weight footprint, per-request
+        temporary footprint, repeated packing or conversion.
+      · HARDWARE COUNTERS (Linux, `perf_event_open`, low overhead): cycles, instructions/IPC,
+        context switches, CPU migrations, page faults, cache references/misses, LLC misses,
+        branch misses, stalled cycles where supported. Uncore/bandwidth counters when the host
+        exposes them — absence or missing permissions must never break the profiler.
+      · DATAFLOW MAP — per major projection/conv: input -> gather/copy -> conversion/quant ->
+        activation pack -> weight representation -> kernel -> output conversion/scatter, with
+        duplicated transformations flagged, so avoidable data movement is visible at a glance.
+
+      AUTOMATIC RED FLAGS: component >5% wall with poor occupancy · scalar fallback on a
+      SIMD-capable host · expected backend not selected · repeated weight conversion/packing ·
+      hot-path heap allocation · excessive memcpy/gather/scatter · excessive barriers or spin ·
+      BLAS unexpectedly spawning threads · SMT sibling contention · CPU migrations despite
+      pinning · batch ceiling forcing a fallback · significant unattributed time · large
+      cache-miss/memory-traffic component · large inclusive time with low useful-arithmetic
+      occupancy.
+
+      OUTPUT: one command produces `profile-summary.md` (hierarchical, scannable: the request
+      tree, then a sorted HOTSPOTS table, then RED FLAGS / FALLBACKS / UNDERUTILIZATION) and
+      `profile.json`.
+
+      MODES: FAST (~one short request, ~2 s audio, enough for architectural diagnosis, the
+      development default) and DEEP (optional, more counters and tracing, allowed to perturb
+      the runtime, attribution only — never a production benchmark claim). Production
+      qualification stays instrumentation-light.
+
+      DESIGN RULE: instrument SEMANTIC engine components and dispatch decisions, not function
+      addresses. The wanted line is "Talker layer 7 down projection, INT8, VNNI, B=2, activation
+      quant 4.1 us, kernel 38 us, scatter 2 us, pool 6/6", not "qwen_matmat_int8() 12.7%".
+
+      It becomes a permanent engineering and regression tool for ARM, x86 and future backends:
+      it does not optimise the TTS directly, it makes every later optimisation much faster.
+
 ## P0 — correctness of our performance evidence
 
 - [x] P0.0 GCP c4 fallback: explicit `QWEN_PREFILL_MATMAT=1` on a non-BF16 build ran the
