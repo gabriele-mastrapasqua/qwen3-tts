@@ -97,9 +97,7 @@ tests/test_ingot_parity
 /qwen_build_id.h.tmp
 /.source_fingerprint
 
-# Local-only working notes.
-/CLAUDE.md
-/AGENTS.md
+# Local-only working notes (CLAUDE.md and AGENTS.md are tracked entry points, see ENGINEERING.md).
 /PLAN.md
 /plan_*.md
 /TODO.md

@@ -28,6 +28,12 @@ Every addendum starts with: Task · Question · Known facts · Unknowns ·
 Files/functions inspected · Evidence · Conclusion · Next action.
 An addendum never becomes a second global plan.
 
+Privacy split. Tracked: `ENGINEERING.md`, `CLAUDE.md`, `AGENTS.md`, stable public-safe
+docs and code. Untracked and private: `PLAN.md`, `.work/`, `plan_*.md`, `private/`, raw
+profiler/debug evidence, temporary benchmark notes. Agents never copy `PLAN.md` or
+`.work/` content into tracked docs unless the user approves that specific content;
+tracked docs stay public-safe (no hosts, addresses, credentials, customer material).
+
 ## 3. Code is the source of truth
 
 Docs, feature tables and old benchmark pages may be stale. For implementation or
@@ -54,15 +60,23 @@ hash, compiler SIMD target, CPU model and features, profile name, exact command,
 exact environment, worker topology and CPU masks, and the resolved backend, GEMV,
 GEMM/matmat, prefill and decoder paths with the relevant flags.
 
+Every benchmark directory carries one machine-readable `run_manifest.json`, produced
+from the actual serving configuration after the environment is applied: commit, dirty
+state, binary hash/build id, CPU and features, compile SIMD, profile, exact env,
+topology/masks, requested dispatch, resolved dispatch per important operation. A
+dispatch file generated independently before the env is never authoritative evidence.
+
 Never infer the active kernel from a profile filename, a requested env flag or the
 compile target name. The strongest evidence is in-process: the server's own resolved
-table at startup and the kernel census after warm-up (`--dispatch-map`, `[FLAGS]`,
-`QWEN_SHAPE_CENSUS`); a side tool that re-runs the predicates is second-best.
+table at startup and the kernel census after warm-up, compared against an
+expected/allowed/forbidden manifest per operation and profile (a native-BF16 prefill
+profile forbids the f32/generic fallback; the decoder's serial OpenBLAS SGEMM may still
+be allowed; `auto` reports what it resolved to and does not fail for differing from
+another backend). A side tool that re-runs the predicates is second-best.
 
 An explicit request is a request, not a capability. If an explicitly requested path
-differs from the resolved path: stop, do not run the benchmark. A profile that says
-`auto` reports what it resolved to; that is not a failure. A fallback run is never
-reported as a measurement of the requested optimized path.
+differs from the resolved path, or a forbidden leaf ran: stop, do not run the
+benchmark. A fallback run is never reported as a measurement of the requested path.
 
 ## 6. Fallbacks must be visible
 
@@ -113,12 +127,21 @@ accumulation order, an approximation or fusion that reorders floating point) is 
 structural optimization. It needs its own quality qualification and is never promoted
 on performance numbers alone. Production defaults change only by explicit decision.
 
-## 13. What gets committed is what was built
+## 13. What gets committed is what was built, and what qualifies is committed
 
-Selective staging (`git add -p`, patched copies) must be verified by building the
-staged tree, not the working tree. HEAD must compile and run on its own on every
-platform it claims. Commit messages: English, imperative, what and why, no tool
-attribution. `PLAN.md`, `plan_*.md`, `.work/`, `private/` are never committed.
+Canonical SOAK evidence comes from a CLEAN COMMITTED TREE: build that exact commit.
+A dirty-tree binary serves development, WAVE and DIAGNOSTIC only and is labelled
+NON-QUALIFYING. An uncommitted candidate that needs canonical qualification gets an
+isolated candidate commit or worktree first, and that exact tree is built. Both the
+GCP dispatch incident and the broken-HEAD discovery were evidence produced by an
+artifact different from the source state we believed we had.
+
+Selective staging (`git add -p`, patched copies) is verified by building an isolated
+checkout of the staged/committed tree, not the working tree, on every touched
+platform that is available; platforms that were not available are listed under
+WHAT REMAINS UNKNOWN, never reported as tested. Commit messages: English, imperative,
+what and why, no tool attribution. `PLAN.md`, `plan_*.md`, `.work/`, `private/` are
+never committed.
 
 ## 14. Completion rule
 
