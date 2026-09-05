@@ -255,18 +255,20 @@ def main():
             # measure; `units` only covers workers whose thread-local block reached the dump.
             per_disp = entered / disp if disp else 0.0
             pct = 100.0 * per_disp / nt if nt else 0.0
+            # Order matters, and getting it wrong made this tool assert a false underfill:
+            # ACCOUNTING COMPLETENESS IS CHECKED FIRST.  Only a region whose units are nearly
+            # all recorded has a trustworthy participation count; where they are not, `entered`
+            # may itself be under-recorded and no underfill claim may be made from it.
             verdict = "ok"
-            if entered and nt and per_disp < nt * 0.7:
-                verdict = ("!!! POOL UNDERFILLED: %.1f of %d workers entered the body per dispatch"
-                           % (per_disp, nt))
-            elif tasks and units < tasks * 0.9:
+            if tasks and units < tasks * 0.9:
                 # Do not call this underfill: a worker that never touches a costmap marker
                 # leaves no record, so missing units can equally mean an instrumentation gap.
                 verdict = ("workers OK (%.1f/%d entered), but only %d of %d units recorded — "
                            "UNACCOUNTED instrumentation, not underfill"
                            % (per_disp, nt, units, tasks))
-            elif nt > 1 and pct < 70.0:
-                verdict = "!!! POOL UNDERFILLED: %d of %d workers claimed work" % (useful, nt)
+            elif entered and nt and per_disp < nt * 0.7:
+                verdict = ("!!! POOL UNDERFILLED: %.1f of %d workers entered the body per dispatch"
+                           % (per_disp, nt))
             elif nt > 1 and per < nt:
                 verdict = "thin: %.1f tasks per dispatch for %d workers" % (per, nt)
             print("  %-28s %8d %8.1f %8.1f %7.0f%%  %s" % (name, nt, per, per_disp, pct, verdict))

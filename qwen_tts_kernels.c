@@ -10771,7 +10771,11 @@ void qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int
 #endif
     if (tid == 0) qwen_region_i8_note_backend("VNNI row blocks", rows, cols, B);
     if (tid == 0) qwen_region_pool_at(QWEN_RGN_MM_REGION_I8, (int)nt, rows);
-    {   int r0 = (int)(tid * (size_t)rows / nt), r1 = (int)((tid + 1) * (size_t)rows / nt);
+    {   /* Every thread that reaches the runner counts as an entry, and reports the rows it
+         * owns: the split is by tid/nt, so a thread with r1 == r0 entered but had nothing to
+         * do -- which is the difference between an idle worker and an unrecorded one. */
+        int r0 = (int)(tid * (size_t)rows / nt), r1 = (int)((tid + 1) * (size_t)rows / nt);
+        qwen_region_workers_at(QWEN_RGN_MM_REGION_I8, 1);
         if (r1 > r0) qwen_region_units_at(QWEN_RGN_MM_REGION_I8, r1 - r0); }
     int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
     int8_vmm_task(tid, nt, &c);
