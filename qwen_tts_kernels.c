@@ -8514,6 +8514,27 @@ int qwen_amx_int8_pack_worth(int rows, int cols, int gate_rows, int threads) {
 #endif
 }
 
+/* Ground truth for --effective-config, better than any static inference: the gate table
+ * already maps a flag name to the kernel it controls, and qwen_mmk_compiled() knows whether
+ * that kernel exists in this build.  A QWEN_NO_VNNI on an Arm binary is not "honoured", it
+ * controls a kernel that was never compiled.  Returns 1 when the flag belongs to a gate,
+ * writing 1/0 into *compiled; 0 when the flag is not a gate flag at all. */
+int qwen_flag_gate_status(const char *flag, int *compiled, const char **kernel) {
+    if (!flag || !*flag) return 0;
+    for (int k = 1; k < QWEN_MMK_COUNT; k++) {
+        const qwen_mm_gate_t *g = &g_mm_gate[k];
+        const char *names[5] = { g->off_env, g->on_env, g->minb_env, g->minrows_env, g->mincols_env };
+        for (int i = 0; i < 5; i++) {
+            if (names[i] && !strcmp(names[i], flag)) {
+                if (compiled) *compiled = qwen_mmk_compiled(k);
+                if (kernel) *kernel = g_mmk_info[k].name;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int qwen_matmat_int8_max_b(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
                                 QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };

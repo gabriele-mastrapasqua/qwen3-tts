@@ -782,6 +782,7 @@ int main(int argc, char **argv) {
     int run_matmat_bench = 0;
     int run_matmat_tune = 0;
     int run_dispatch_map = 0;
+    int run_effective_config = 0;
     int run_gpu_selftest = 0;
     int run_gpu_selftest_talker = 0;
     int run_gpu_batch_bench = 0; int gpu_batch_B = 4;
@@ -909,6 +910,7 @@ int main(int argc, char **argv) {
         {"matmat-bench",  no_argument,       0, 1038},
         {"matmat-tune",   no_argument,       0, 1096},
         {"dispatch-map",  no_argument,       0, 1097},
+        {"effective-config", no_argument,  0, 1098},
         {"gpu-selftest",  no_argument,       0, 1070},
         {"backend",       required_argument, 0, 1071},
         {"gpu-selftest-talker", no_argument, 0, 1072},
@@ -1049,6 +1051,7 @@ int main(int argc, char **argv) {
             case 1038: run_matmat_bench = 1; break;
             case 1096: run_matmat_tune = 1; break;
             case 1097: run_dispatch_map = 1; break;
+            case 1098: run_effective_config = 1; break;
             case 1070: run_gpu_selftest = 1; break;
             case 1071: gpu_backend_str = optarg; break;
             case 1072: run_gpu_selftest_talker = 1; break;
@@ -1196,6 +1199,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --matmat-bench             Time batched matmat vs B*matvec per precision and exit\n");
                 fprintf(stderr, "  --matmat-tune              Measure the kernel-gate thresholds for this box and exit\n");
                 fprintf(stderr, "  --dispatch-map             Print every dispatch decision RESOLVED for this host+env\n");
+        fprintf(stderr, "  --effective-config         Per declared flag: requested vs effective, and why they differ\n");
                 fprintf(stderr, "                             (compiled/supported/env/resolved/reason; QWEN_DISPATCH_JSON=path) and exit\n");
                 return opt == 'h' ? 0 : 1;
         }
@@ -1219,6 +1223,12 @@ int main(int argc, char **argv) {
     if (run_dispatch_map) {
         QWEN_DIAG_INIT_THREADS();
         return qwen_dispatch_map_report(stdout, getenv("QWEN_DISPATCH_JSON"));
+    }
+
+    if (run_effective_config) {
+        QWEN_DIAG_INIT_THREADS();
+        (void)qwen_effective_config_report(stdout);
+        return 0;
     }
 
     if (run_matmat_bench) {

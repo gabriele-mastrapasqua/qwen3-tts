@@ -143,6 +143,116 @@ static void json_str(FILE *j, const char *s) {
 
 #define NFEAT 64
 
+#include "qwen_flag_scope.h"
+
+/* --effective-config: what the engine is ACTUALLY doing, per flag.
+ *
+ * The dispatch map answers "which kernel runs"; this answers the question that kept biting us
+ * one level below it -- an operator sets a variable, the engine parses it, and nothing happens
+ * because this build or this CPU cannot reach the code it controls.  QWEN_NO_SIMD_QUANT was
+ * inert on ARM for exactly that reason and nothing said so.  For every declared flag this
+ * prints requested / default / effective and, when they differ, WHY.
+ *
+ * The scope table is generated from the sources by tools/flag_parity.py, so it cannot drift
+ * from the guards the code actually has. */
+static unsigned qwen_build_scope(void) {
+    unsigned s = 0;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    s |= QWEN_FSCOPE_ARM;
+#endif
+#if defined(__APPLE__)
+    s |= QWEN_FSCOPE_APPLE;
+#endif
+#if defined(__AVX2__) || defined(__x86_64__)
+    s |= QWEN_FSCOPE_AVX2;
+#endif
+#if defined(__AVX512F__)
+    s |= QWEN_FSCOPE_AVX512F;
+#endif
+#if defined(__AVX512VNNI__)
+    s |= QWEN_FSCOPE_VNNI;
+#endif
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    s |= QWEN_FSCOPE_AMX;
+#endif
+#if defined(QWEN_HAVE_CUDA) || defined(QWEN_HAVE_METAL)
+    s |= QWEN_FSCOPE_GPU;
+#endif
+    return s ? s : QWEN_FSCOPE_ALL;
+}
+
+static const char *qwen_scope_names(unsigned sc, char *buf, size_t n) {
+    struct { unsigned bit; const char *name; } m[] = {
+        { QWEN_FSCOPE_ARM, "arm" }, { QWEN_FSCOPE_AVX2, "avx2" },
+        { QWEN_FSCOPE_AVX512F, "avx512f" }, { QWEN_FSCOPE_VNNI, "vnni" },
+        { QWEN_FSCOPE_AMX, "amx" }, { QWEN_FSCOPE_APPLE, "apple" },
+        { QWEN_FSCOPE_GPU, "gpu" },
+    };
+    size_t k = 0; buf[0] = 0;
+    for (size_t i = 0; i < sizeof m / sizeof m[0]; i++)
+        if (sc & m[i].bit)
+            k += (size_t)snprintf(buf + k, k < n ? n - k : 0, "%s%s", k ? "," : "", m[i].name);
+    if (!buf[0]) snprintf(buf, n, "none");
+    return buf;
+}
+
+int qwen_effective_config_report(void *out) {
+    FILE *f = out ? (FILE *)out : stdout;
+    const unsigned build = qwen_build_scope();
+    char sb[96], bb[96];
+    const int n = (int)(sizeof g_qwen_flag_scope / sizeof g_qwen_flag_scope[0]);
+    int set_n = 0, inert_n = 0;
+
+    fprintf(f, "[EFFECTIVE-CONFIG] v=1 build_scope=%s flags=%d\n",
+            qwen_scope_names(build, bb, sizeof bb), n);
+    fprintf(f, "  %-34s %-10s %-9s %s\n", "flag", "requested", "effective", "scope / reason");
+    for (int i = 0; i < n; i++) {
+        const char *name = g_qwen_flag_scope[i].name;
+        const unsigned sc = g_qwen_flag_scope[i].scope;
+        const char *req = getenv(name);
+        const int reachable = (sc & build) != 0;
+        if (req && *req) set_n++;
+        if (!req || !*req) {
+            /* Only the flags an operator actually set are worth a line here; the rest are
+             * their documented defaults and live in docs/feature-flags.md. */
+            continue;
+        }
+        const char *inert = qwen_pool_flag_inert(name);
+        if (inert) {
+            inert_n++;
+            fprintf(f, "  %-34s %-10s %-9s IGNORED: %s\n", name, req, "ignored", inert);
+            continue;
+        }
+        /* A gate flag has a better answer than any static scope: is its kernel compiled? */
+        int gate_compiled = 0; const char *kernel = NULL;
+        if (qwen_flag_gate_status(name, &gate_compiled, &kernel)) {
+            if (!gate_compiled) {
+                inert_n++;
+                fprintf(f, "  %-34s %-10s %-9s IGNORED: \"%s\" is not compiled into this build\n",
+                        name, req, "ignored", kernel ? kernel : "?");
+            } else {
+                fprintf(f, "  %-34s %-10s %-9s gate: %s\n", name, req, "honoured",
+                        kernel ? kernel : "?");
+            }
+            continue;
+        }
+        if (reachable) {
+            fprintf(f, "  %-34s %-10s %-9s %s\n", name, req, "honoured",
+                    qwen_scope_names(sc, sb, sizeof sb));
+        } else {
+            inert_n++;
+            fprintf(f, "  %-34s %-10s %-9s %s -- IGNORED: this build reaches %s\n",
+                    name, req, "ignored", qwen_scope_names(sc, sb, sizeof sb),
+                    qwen_scope_names(build, bb, sizeof bb));
+        }
+    }
+    fprintf(f, "  %d flag%s set in the environment, %d of them IGNORED by this build\n",
+            set_n, set_n == 1 ? "" : "s", inert_n);
+    if (inert_n)
+        fprintf(f, "  WARNING: an ignored flag is a configuration that is not being applied.\n");
+    return inert_n;
+}
+
 int qwen_dispatch_map_report(void *out, const char *json_path) {
     FILE *f = out ? (FILE *)out : stderr;
     feat_t feats[NFEAT];

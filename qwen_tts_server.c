@@ -1867,6 +1867,9 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") ||
         getenv("QWEN_SHAPE_CENSUS") || getenv("QWEN_COST_MAP"))
         qwen_dispatch_map_report(stderr, NULL);   /* engagement proof inside this run's log */
+    /* Always: an artifact must open with what the engine is ACTUALLY doing, not with what was
+     * in the environment.  Silent when nothing is set, one line per flag that is. */
+    (void)qwen_effective_config_report(stderr);
     fprintf(stderr, "Server listening on http://0.0.0.0:%d (continuous request-batching: max_batch=%d, %d readers%s)\n",
             port, max_batch, n_readers, single_ctx ? ", +1 single-job clone" : "");
     fprintf(stderr, "Endpoints:\n"

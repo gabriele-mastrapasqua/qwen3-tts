@@ -886,6 +886,17 @@ cpu-check: $(TARGET) $(MEMBW_BIN)
 	  CPU_MODEL=$(CPU_MODEL) bash tools/cpu_check.sh
 dispatch-map: $(TARGET)
 	@./$(TARGET) --dispatch-map
+
+# PARITY-2: what the engine is ACTUALLY doing, per declared flag.  The scope table it embeds is
+# generated from the sources, so `check-flag-parity` regenerates and diffs it: a new backend
+# guard around a flag's effect cannot drift away from what the engine reports.
+effective-config: $(TARGET)
+	@./$(TARGET) --effective-config
+check-flag-parity:
+	@python3 tools/flag_parity.py --emit-c /tmp/qwen_flag_scope.gen.h >/dev/null
+	@diff -u qwen_flag_scope.h /tmp/qwen_flag_scope.gen.h \
+	  || { echo "FAIL: qwen_flag_scope.h is stale — run tools/flag_parity.py --emit-c qwen_flag_scope.h"; exit 1; }
+	@python3 tools/flag_parity.py --check | tail -8
 profile-cpu-check: $(TARGET)
 	@python3 tools/profile_check.py --profiles $(PROFILES_DIR) --bin ./$(TARGET) $(if $(CPU_MODEL),--model $(CPU_MODEL),)
 

@@ -587,3 +587,28 @@ void qwen_pool_stats_report(void) { }
 int qwen_pool_spin_value(void)   { return -1; }
 int qwen_pool_narrow_value(void) { return -1; }
 #endif
+
+/* Owner-declared inertness, for --effective-config.
+ *
+ * PARITY-2 wants one owner per flag, and the owner is the only place that can say honestly
+ * whether a knob does anything here.  Static scope analysis cannot: QWEN_POOL_SPIN is read in
+ * portable code, so it "reaches" every backend, yet on the GCD pool there is no spin loop to
+ * control and on Windows there is no submit priority.  Returns a reason, or NULL when the flag
+ * is not one of ours or is genuinely live. */
+const char *qwen_pool_flag_inert(const char *flag) {
+    if (!flag) return NULL;
+#if defined(__APPLE__) && !defined(QWEN_USE_PTHREADS)
+    if (!strcmp(flag, "QWEN_POOL_SPIN") || !strcmp(flag, "QWEN_POOL_HI_WINDOW_US"))
+        return "GCD dispatch has no spin loop to tune";
+    if (!strcmp(flag, "QWEN_PREFILL_LOW_MS"))
+        return "GCD dispatch exposes no submit priority";
+#elif defined(_WIN32) && !defined(QWEN_USE_PTHREADS)
+    if (!strcmp(flag, "QWEN_POOL_SPIN") || !strcmp(flag, "QWEN_POOL_HI_WINDOW_US"))
+        return "the Win32 pool parks immediately; there is no spin loop";
+    if (!strcmp(flag, "QWEN_PREFILL_LOW_MS"))
+        return "the Win32 pool exposes no submit priority";
+#else
+    (void)flag;
+#endif
+    return NULL;
+}
