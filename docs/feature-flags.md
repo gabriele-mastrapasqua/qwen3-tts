@@ -177,6 +177,14 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
 | `QWEN_VNNI_TILE_M4N2` | x86 | unset (off) | `=1` tries the fixed `M4xN2` VNNI tile for observed `B=2` calls. It is an opt-in candidate inspired by the ARM small-B cross-product path; qualify it on the complete server path before enabling it |
 | `QWEN_VNNI_GEMV_MR` | x86 | 2 | output rows handled by the VNNI GEMV microkernel; `4` is an experimental alternative and must be qualified per workload |
+| `QWEN_NO_VNNI_QKV` | x86 | unset | `=1` drops the fused Q/K/V **GEMV** (one activation quantisation shared by the three projections) back to three separate matvecs |
+| `QWEN_NO_X86_QKV` | x86 | unset | `=1` drops the fused Q/K/V **matmat** (int8 and bf16, VNNI and AMX) back to three separate matmats. This is the gate the persistent regions ask about, not the one above |
+| `QWEN_VNNI_TILE_N8` | x86 | unset (off) | `=1` tries the 8-column VNNI tile. Opt-in candidate; qualify on the server path |
+| `QWEN_Q4_VNNI_V3` · `QWEN_Q4_VNNI_V4` | x86 | v3 on | which q4 VNNI microkernel variant runs; `QWEN_Q4_VNNI_V4=1` selects the v4 experiment |
+| `QWEN_AMX_PREPACK` | x86 AMX | on | pre-tiles weights once into the AMX tile layout and caches them by source pointer; `=0` re-tiles per call |
+| `QWEN_AMX_PREPACK_KINDS` | x86 AMX | all | limits the prepack cache to some weight kinds (`int8`, `bf16`, `q4`), for attributing the cache itself |
+| `QWEN_AMX_PERSIST_CFG` | x86 AMX | on | keeps the AMX tile configuration loaded across calls instead of `ldtilecfg`/`tilerelease` per call |
+| `QWEN_AMX_B32` | x86 AMX | unset (off) | prototype 32-wide AMX int8 matmat. No production caller; reachable only from `make x86-amx-b32-bench` |
 | `QWEN_VNNI_PREPACK` | x86 | unset | `=1`/`all` prepack eligible INT8 matrices in the parent; `=cp` or `=talker` limits the parent prepack to one component. It changes the batched VNNI matmat layout, not GEMV. Keep unset unless the target host shows a stable end-to-end win |
 | `QWEN_NO_VNNI_ROWSUM` | x86 | unset | `=1` disables the cached INT8 weight row sums used by VNNI GEMV; keep unset for the native path |
 | `QWEN_NO_VNNI_ACT_QUANT` | x86 | unset | `=1` disables AVX-512 activation quantization used before VNNI; keep unset for the native path |
@@ -244,9 +252,10 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_DECODER_THREAD` | off | runs the decoder on its own thread beside the Talker |
 | `QWEN_SD_POOL` | server: `qwen` | `qwen` runs the decoder's tiles on the engine pool (inline when already inside a region); `private` keeps the decoder's own worker team |
 | `QWEN_BLAS_OWN` | server: `1` | `1` holds OpenBLAS at one thread and partitions the decoder SGEMMs across the engine pool (exact sub-problems, output bit-identical); `0` lets OpenBLAS run its own team |
-| `QWEN_CP_REGION` | on (x86 VNNI, int8 CP) | runs each batched code-predictor transformer step as ONE persistent parallel region with spin barriers between phases instead of 20 pool dispatches; per-slot sections run one slot per thread; outputs bit-identical; `0` restores the dispatched path |
+| `QWEN_CP_REGION` | on (x86 VNNI **and AMX**, int8 CP) | runs each batched code-predictor transformer step as ONE persistent parallel region with spin barriers between phases instead of 20 pool dispatches; per-slot sections run one slot per thread; outputs bit-identical; `0` restores the dispatched path. The in-region runner follows the same gate table the dispatcher uses, so an AMX host runs AMX tiles in-region at `B>=4` and VNNI row blocks below that |
 | `QWEN_TK_REGION` | on (x86 VNNI, int8 Talker) | same design for the batched Talker step: one pool entry per step (28 layers, projections as VNNI row blocks, per-slot sections one slot per thread) instead of 112 dispatches; outputs bit-identical; `0` restores the dispatched path. Off automatically on every other ISA, with int4/bf16 weights and on the GCD pool |
-| `QWEN_CP_BATCH_HEAD` | on (x86 VNNI, int8 CP heads) | at concurrency >= 2 runs the MTP projection and each lm_head once for all active slots as one int8 matmat (same quantiser, exact int32 dots, codes bit-identical) instead of one GEMV per slot; `0` restores the per-slot path; int4/bf16 heads and other ISAs keep the per-slot path automatically |
+| `QWEN_CP_FRAME_REGION` | on (same build/shape conditions as `QWEN_CP_REGION`) | runs the WHOLE 16-step code-predictor frame — every MTP projection, every transformer step and every lm_head argmax — inside ONE pool entry instead of 47. The embedding row of each step is either `code0` or an argmax this frame produced, so the sequence is decidable before entering; kernels, quantiser and argmax order are unchanged and the codes are bit-identical. `0` restores the per-call path |
+| `QWEN_CP_BATCH_HEAD` | on (x86 VNNI **and AMX**, int8 CP heads) | at concurrency >= 2 runs the MTP projection and each lm_head once for all active slots as one int8 matmat (same quantiser, exact int32 dots, codes bit-identical) instead of one GEMV per slot; `0` restores the per-slot path; int4/bf16 heads and other ISAs keep the per-slot path automatically |
 | `QWEN_SD_SCRATCH_STATS` | off | diagnostic: when a stream ends, prints its decoder scratch arena (blocks, bytes, peak per chunk, spills) |
 | `QWEN_SD_THREADS` | = `-j` | thread count of the decoder's tile jobs (int8 conv, int8 GEMM, snake), whichever pool runs them |
 | `QWEN_PREFILL_LOW_MS` | 0 | with `QWEN_PREFILL_HELPER=1`: for this many ms each prefill submits to the pool at LOW priority, taking only the windows the frame loop leaves free (trade-off knob: STREAM −3%, TTFA +100/+250 ms on c8a C4) |
@@ -256,7 +265,12 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
-| `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32 |
+| `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |
+| `QWEN_SD_INT8_BLK` | compiled default | block size of the int8 decoder convolution tiles |
+| `QWEN_SD_WINDOWED` | off | windowed decoder evaluation; diagnostic for the streaming boundary |
+| `QWEN_DEC_FIRSTCHUNK_GROUP` | 0 (off) | `=1` groups the first streaming chunk of several slots into one decoder pass |
+| `QWEN_THREADS_TALKER` · `QWEN_THREADS_DECODER` | unset (both = `-j`) | split the thread budget between the Talker/CP phase and the decoder phase inside one worker |
+| `QWEN_NO_SIN_POLY` | unset | `=1` drops the polynomial sine used by the snake activation back to `sinf`; the polynomial is only used where the argument is in range |
 
 ## 6. Precision and voice
 
