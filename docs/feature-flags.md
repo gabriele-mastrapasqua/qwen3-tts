@@ -191,6 +191,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_AMX_MIN_B` · `QWEN_VNNI_MIN_B` · `QWEN_AVX2MM_MIN_B` | x86 | 4 · 2 · 2 | smallest batch width that may take that matmat |
 | `QWEN_AMX_BF16_MIN_B` · `QWEN_AMX_INT8_MIN_B` | x86 | fall back to `QWEN_AMX_MIN_B` | split the AMX gate when one threshold does not suit both datatypes; each overrides the shared one for its type only |
 | `QWEN_AMX_INT8_QKV_MIN_B` | x86 | inherits `QWEN_AMX_INT8_MIN_B` | additional lower bound for the fused INT8 QKV path only; other INT8 projections keep the normal AMX gate |
+| `QWEN_AMX_INT8_MIN_ROWS_PER_THREAD` | x86 | 256 | AMX INT8 also needs enough output rows PER WORKER (`rows >= N * threads`; the fused QKV counts `q+2kv`). Measured: below ~256 the tile setup and activation pack are not amortised and VNNI wins, and the same projection flips sign with the thread count. 0 disables the rule |
 | `QWEN_BFMMLA_MIN_B` · `QWEN_SMMLA_MIN_B` · `QWEN_KLEIDI_MIN_B` | ARM | 2 · 2 · 1 | the same thresholds on the ARM kernels |
 
 The batch gates say *when* a kernel is allowed; these say *how it tiles the output rows* once it is:

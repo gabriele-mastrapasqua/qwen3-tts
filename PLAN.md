@@ -29,18 +29,6 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 - [x] P1.0 HEAD compiled and ran only as the working tree: conv scratch freed, prctl include
       missing — fixed in fb3d32d; rule ENGINEERING.md §13
 - [x] P1.1 Static cross-backend audit — `docs/cross-backend-audit-2026-09-05.md` (fb3d32d)
-- [ ] P0.6 [NEW, 2026-09-05 — evidence gap, needs a decision] The golden references DO NOT hold
-      on x86, and nobody knew because that box had neither numpy nor librosa, so `make test-golden`
-      printed "SKIP: librosa not installed" and exited 0. Installed both and measured the 1.7B
-      reference on the GCP host: `SIMD=amx` mel-corr 0.60122 with duration 5.20s vs 4.56s (+14%),
-      `avx512vnni` 0.74555 (dur 1.8%), `portable` 0.79514 (dur 1.8%) — all far under the 0.98 gate,
-      and the three profiles differ from each other as well. NOT a regression: the same run against
-      commit 85f2678 gives byte-identical WAVs (md5 48176f02 amx, 85e95b89 vnni on both trees), so
-      this predates everything on this branch. What it kills is the belief that mel-corr ≥0.98 is
-      our cross-ISA check: the references are M1-generated and only hold on ARM. Decide which:
-      per-ISA reference sets, a looser cross-ISA threshold justified by listening, or state plainly
-      that golden is an ARM-only regression net and give x86 its own. The +14% duration on AMX
-      deserves an ear check before anything else — it is a different-length utterance, not noise.
 - [ ] P1.2 [BLOCKED: no ARM i8mm host in reach] Verify Arm KleidiAI GEMV/GEMM shape coverage on
       a box. M1 does NOT qualify and must not be used as a stand-in: `kleidi.enabled` reads
       "not compiled (needs an i8mm target)" there, so an M1 run measures the NEON fallback and
@@ -213,6 +201,18 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       since 47ede94 (`matvec.int8.native` / `matvec.q4.native`) and confirmed at runtime on the
       box in P1.5. The fix is a kernel: there is no wasted conversion to remove, and reusing the
       GEMM at B=1 would change the arithmetic.
+- [ ] P0.6 [PARKED 2026-09-05 by explicit decision: not a priority, do NOT work on it] The golden references DO NOT hold
+      on x86, and nobody knew because that box had neither numpy nor librosa, so `make test-golden`
+      printed "SKIP: librosa not installed" and exited 0. Installed both and measured the 1.7B
+      reference on the GCP host: `SIMD=amx` mel-corr 0.60122 with duration 5.20s vs 4.56s (+14%),
+      `avx512vnni` 0.74555 (dur 1.8%), `portable` 0.79514 (dur 1.8%) — all far under the 0.98 gate,
+      and the three profiles differ from each other as well. NOT a regression: the same run against
+      commit 85f2678 gives byte-identical WAVs (md5 48176f02 amx, 85e95b89 vnni on both trees), so
+      this predates everything on this branch. What it kills is the belief that mel-corr ≥0.98 is
+      our cross-ISA check: the references are M1-generated and only hold on ARM. Decide which:
+      per-ISA reference sets, a looser cross-ISA threshold justified by listening, or state plainly
+      that golden is an ARM-only regression net and give x86 its own. The +14% duration on AMX
+      deserves an ear check before anything else — it is a different-length utterance, not noise.
 - [ ] P5.0 [low] Set `QWEN_POOL_SPIN=65536` as the x86 server default and update related JSON profiles.
 - [ ] P5.1 [low] Compare AutoRound/LLM Compressor W4A16 and Intel ARK packed kernels with runtime INT8: https://vllm.ai/blog/2025-12-09-intel-autoround-llmc https://github.com/intel/auto-round/tree/main/auto_round_extension/ark
 - [ ] P5.2 [low] Run isolated Xeon AMX/VNNI GEMV/GEMM oracle probes with oneDNN benchdnn and OpenVINO CPU: https://github.com/uxlfoundation/oneDNN/tree/main/tests/benchdnn https://github.com/openvinotoolkit/openvino/blob/master/docs/articles_en/openvino-workflow/running-inference/inference-devices-and-modes/cpu-device.rst
@@ -225,10 +225,29 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
 
 - [x] X86-1 Direct source-row INT8 quantization for CP/Talker regions — landed on this branch as
       `40c156f` (`d847d9c` in the worktree it was written in). Subsumes the old P5.6 staging half.
-- [ ] X86-2 Low-B x86 AMX/VNNI crossover — validate B1/B2 on real engine shapes, not only oneDNN.
+- [ ] X86-2 Low-B x86 AMX/VNNI crossover — MEASURED on the AMX box, `tests/region_lowb_bench.c`
+      (paired arms interleaved in one process via the new `qwen_mm_force()` hook; unpaired
+      cross-process arms swung 14% on an unchanged config, larger than the effect).
+      Findings: (a) the discriminator is ROWS PER THREAD, not B and not the rows/cols ratio — the
+      same projection flips sign with the thread count (CP Down -17.3% at 4 threads, +1.3% at 8),
+      and a rows>=cols rule I first shipped was wrong (TK Down is AMX -5.2% at 8 threads despite
+      being 3x deeper than tall). `rows/thread >= 256`, fused QKV judged on q+2kv, agrees with 23
+      of 24 measured cells. (b) The BATCHED SERVER measures B 0.9-3.8 per prefork worker across
+      C=1..8, so the B>=4 gate left AMX essentially unused in production; INT8 AMX now starts at
+      B=3, where the rule keeps only the winners (Gate/Up -12..-14%, TK Down -4.4%, TK WO -3.0%).
+      A first server A/B of the shape rule alone was a null result for exactly that reason.
       Subsumes old P5.5 and P5.8 (oneDNN/benchdnn on real CP/Talker shapes, small-B VNNI vs oracle).
-- [ ] X86-3 Persistent packed-RHS consumption audit — prove hot B1/B2 projections consume the
-      packed representation. Was P5.9.
+- [ ] X86-3 Persistent packed-RHS consumption audit — ANSWERED for AMX, not yet measured:
+      `QWEN_AMX_PREPACK` defaults to 0, so `qwen_amx_pack_weights()` returns NULL and every AMX
+      tile load runs STRIDED off the row-major weights (`_tile_loadd(2, w0, pW ? 64 : cols)`).
+      The persistent representation already exists and is built in the parent before fork
+      (`qwen_amx_prepack_model`, inherited by prefork workers through copy-on-write) — it is
+      simply off. Two open items: (1) measure whether the packed RHS wins, since the whole X86-2
+      crossover above was measured on the UNPACKED tile path; (2) `qwen_amx_prepack_model` packs
+      everything — bf16 and int8, Talker and CP, every projection — about 1.45 GB of int8 alone,
+      including projections the gate can never select, so if it is turned on it should pack only
+      what the gate would use. VNNI has no packed RHS in production either (`QWEN_VNNI_PREPACK`
+      rejected on Zen5), only a cached row-sums array, which is by design. Was P5.9.
 - [ ] X86-4 Activation preparation/fusion follow-up — remove remaining generic gather, q8-pack and
       scatter passes. Rest of old P5.6; the decoder half of old P5.7 is partly done by 9933948
       (x86 SIMD `qwen_int8_quant_rows`), the im2col fusion is not.
@@ -246,6 +265,33 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       checkpoint and C1/C2/C4 screens.
 - [ ] X86-7 0.6B vs 1.7B serving profile — compare Talker, CP and decoder time shifts after the
       Talker width change.
+- [ ] X86-8 SERVER OPERATING PROFILES — latency-first vs streaming-safe. [LATER: do not start
+      before X86-2..X86-5 close. NOT a note: this is a serving OBJECTIVE and outranks further
+      TTFA work once the structural x86 work is done.]
+
+      WHY, from the real server screen (GCP AMX box, 1.7B --int8, batched + prefork 2x8,
+      `serve_parallel_wave`, C=1..8, 2026-09-05): STREAM_RTF p50 is already 0.958 at C=4 with
+      p95 1.008, and C=6/C=8 are in sustained underrun (18/18 and 24/24 requests starved,
+      prebuffer needed 1.2-2.7 s). Ultra-low TTFA on its own is therefore NOT an acceptable
+      production objective — the stream does not survive at the concurrency it advertises.
+
+      PRINCIPLE to record explicitly: for sustained human streaming, TTFA 200 ms with
+      STREAM_RTF 1.15 is NOT preferable to TTFA 500 ms with STREAM_RTF 0.85.
+
+      Deliberately search for TWO operating points from ONE engine and one codebase — scheduler,
+      prebuffer, admission and batching policy only, never two implementations:
+
+        1. latency-first — minimise TTFA, for highly interactive workloads; must still declare
+           a SAFE supported concurrency rather than a best-case one.
+        2. streaming-safe / balanced — allow a higher TTFA where needed (~400-600 ms), require
+           STREAM_RTF p95 < 1 with real headroom, target roughly 0.8-0.9 where achievable, and
+           optimise for uninterrupted playback and stable concurrency.
+
+      Decision priority for the balanced profile, in order:
+        1. zero underruns, errors and rejects;
+        2. STREAM_RTF p95 < 1 with margin;
+        3. TTFA inside an acceptable interactive envelope;
+        4. throughput and concurrency.
 - [ ] RESOLVED cause of the `git add` anomaly (2026-09-05): not a git alias, hook or wrapper.
       A second agent stages files in the SAME working tree concurrently, so the shared index
       carries its work as well as ours. Mitigation used: build a commit through a private

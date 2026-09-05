@@ -285,7 +285,7 @@ static const char *const g_qwen_reported_flags[] = {
     /* kernel gates and tiling — when a kernel may run, and how it tiles */
     "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B", "QWEN_AMX_MIN_ROWS",
     "QWEN_AMX_BF16_MIN_COLS", "QWEN_AMX_INT8_MIN_COLS", "QWEN_AMX_Q4_MIN_COLS",
-    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_VNNI_MIN_B",
+    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_AMX_INT8_MIN_ROWS_PER_THREAD", "QWEN_VNNI_MIN_B",
     "QWEN_AVX2MM_MIN_B", "QWEN_BF16_MATMUL_MIN_B", "QWEN_BFMMLA_MIN_B", "QWEN_SMMLA_MIN_B",
     "QWEN_INT8_SDOT_MIN_B", "QWEN_KLEIDI_MIN_B", "QWEN_X86_NCHUNK", "QWEN_AMX_NCHUNK",
     "QWEN_VNNI_NCHUNK", "QWEN_AVX512_NCHUNK", "QWEN_KAI_NCHUNK",
@@ -2230,7 +2230,14 @@ static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_BF16_BFMMLA] = { "QWEN_NO_BFMMLA",   NULL,                "QWEN_BFMMLA_MIN_B",  NULL,                NULL,                     2, 64,  0,  0, 0, 1 },
     [QWEN_MMK_BF16_AVX512] = { "QWEN_NO_BF16_MATMUL", NULL,              "QWEN_BF16_MATMUL_MIN_B", NULL,             NULL,                     1, 16,  0,  0, 0, 0 },
     [QWEN_MMK_BF16_AMX]    = { "QWEN_NO_AMX_BF16", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_BF16_MIN_COLS", 4, 16, 32, 32, 1, 0 },
-    [QWEN_MMK_INT8_AMX]    = { "QWEN_NO_AMX_INT8", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_INT8_MIN_COLS", 4, 16, 32, 64, 1, 0 },
+    /* INT8 AMX starts at B=3, not 4: the batched server measured B 0.9-3.8 per prefork worker
+     * across C=1..8, so a B>=4 gate left the tile path essentially unused in production.  At
+     * B=3 with the rows-per-thread rule below, the paired measurement gives CP Gate/Up -14.5%,
+     * TK Gate/Up -12.4%, TK Down -4.4%, TK WO -3.0% and QKV neutral, while the two projections
+     * that lose there (CP WO +19.9%, CP Down +7.0%) are the ones the rule already excludes.
+     * B=2 stays VNNI: the wins shrink to -3..-5% and more shapes turn negative.  BF16 AMX
+     * keeps its own default. */
+    [QWEN_MMK_INT8_AMX]    = { "QWEN_NO_AMX_INT8", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_INT8_MIN_COLS", 3, 16, 32, 64, 1, 0 },
     [QWEN_MMK_INT8_VNNI]   = { "QWEN_NO_VNNI",     NULL,                "QWEN_VNNI_MIN_B",    NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_INT8_AVX2]   = { "QWEN_NO_AVX2MM",   NULL,                "QWEN_AVX2MM_MIN_B",  NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_INT8_SMMLA]  = { "QWEN_NO_SMMLA",    NULL,                "QWEN_SMMLA_MIN_B",   NULL,                NULL,                     2, 16,  0,  0, 0, 1 },
@@ -2248,12 +2255,59 @@ static atomic_int g_mm_gate_mincols[QWEN_MMK_COUNT];
 
 static atomic_int g_mm_force;
 static void qwen_mm_force_kernel(int mmk) QWEN_MAYBE_UNUSED;
+/* Bench hook: pin the batched dispatcher to ONE kernel so two arms can be interleaved inside
+ * a single process.  Comparing arms across processes on a shared box measured 14% swings on an
+ * unchanged configuration -- larger than the effect under test -- so a paired design is the
+ * only honest way to time these. 0 restores normal dispatch. */
+void qwen_mm_force(int mmk) { qwen_mm_force_kernel(mmk); }
 static void qwen_mm_force_kernel(int mmk) {
     atomic_store_explicit(&g_mm_force, mmk, memory_order_relaxed);
 }
 
+/* AMX INT8 needs a WORK-PER-THREAD condition, not only a batch one.  Measured on Granite
+ * Rapids with the complete in-region contract (activation pack + packed RHS + matmul + scale)
+ * against the VNNI row blocks, on the real 1.7B projections, paired and interleaved inside one
+ * process, median of 7 rounds, B=4.  The AMX arm is the winner marked (+ means AMX is slower):
+ *
+ *   rows/thread   projection (threads)              AMX vs VNNI
+ *          85     CP WO (12), CP Down (12)          +38.3%, +13.4%   VNNI
+ *         128     CP WO  (8), CP Down  (8)           +9.6%,  +1.3%   VNNI
+ *         170     TK WO (12), TK Down (12)           +1.1%,  +1.2%   VNNI
+ *         170     CP QKV(12), TK QKV  (12)           -7.9%,  -6.0%   AMX (fused, see below)
+ *         256     CP QKV (8), TK QKV (8), TK WO (8), TK Down (8), CP Down (4)
+ *                                                    -16.4% .. -5.2% AMX
+ *         512+    QKV/WO/Down (4), Gate/Up (all)     -28.2% .. -3.8% AMX
+ *
+ * The tile path needs enough output rows PER WORKER to amortise its tile setup and its
+ * activation pack; below roughly 256 it cannot, and the same projection flips sign purely by
+ * changing the thread count -- CP Down is -17.3% at 4 threads and +1.3% at 8.  A rows-vs-cols
+ * rule looked convincing on unpaired numbers and was wrong: TK Down (2048x6144) is AMX -5.2%
+ * at 8 threads despite being three times deeper than tall.  rows/thread >= 256 agrees with 23
+ * of the 24 measured cells (the exception is CP WO at 4 threads, +4.4%).
+ *
+ * 0 disables the rule.  Thread count is the engine's, which in a prefork worker is that
+ * worker's slice -- the same workers that will split these rows. */
+static int qwen_amx_int8_rows_ok(long long rows) QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_rows_ok(long long rows) {
+    static atomic_int rpt = 0;
+    int v = atomic_load_explicit(&rpt, memory_order_relaxed);
+    if (v == 0) {
+        v = qwen_mm_env_int("QWEN_AMX_INT8_MIN_ROWS_PER_THREAD", 256, 0, 1 << 20) + 1;
+        atomic_store_explicit(&rpt, v, memory_order_relaxed);
+    }
+    v -= 1;
+    if (v <= 0) return 1;
+    int nt = qwen_get_threads();
+    if (nt < 1) nt = 1;
+    return rows >= (long long)v * nt;
+}
+
+static int qwen_mm_use_(int mmk, int B, int rows, int cols, int amx_shape) QWEN_MAYBE_UNUSED;
 static int qwen_mm_use(int mmk, int B, int rows, int cols) QWEN_MAYBE_UNUSED;
 static int qwen_mm_use(int mmk, int B, int rows, int cols) {
+    return qwen_mm_use_(mmk, B, rows, cols, 1);
+}
+static int qwen_mm_use_(int mmk, int B, int rows, int cols, int amx_shape) {
     if (mmk <= 0 || mmk >= QWEN_MMK_COUNT) return 0;
     const qwen_mm_gate_t *g = &g_mm_gate[mmk];
     if (g->max_b == 0) return 0;
@@ -2288,7 +2342,13 @@ static int qwen_mm_use(int mmk, int B, int rows, int cols) {
         minc = qwen_mm_env_int(g->mincols_env, g->min_cols, 0, 1 << 20) + 1;
         atomic_store_explicit(&g_mm_gate_mincols[mmk], minc, memory_order_relaxed);
     }
-    return B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1;
+    if (!(B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1)) return 0;
+#if defined(__x86_64__) || defined(_M_X64)
+    if (amx_shape && mmk == QWEN_MMK_INT8_AMX && !qwen_amx_int8_rows_ok(rows)) return 0;
+#else
+    (void)amx_shape;
+#endif
+    return 1;
 }
 
 /* --dispatch-map: which gate rows are compiled into THIS binary.  Mirrors the
@@ -4697,8 +4757,13 @@ static int qwen_x86_qkv_disabled(void) {
 static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim)
     QWEN_MAYBE_UNUSED;
 static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim) {
-    if (!qwen_mm_use(QWEN_MMK_INT8_AMX, B, q_dim, in_dim) ||
-        !qwen_mm_use(QWEN_MMK_INT8_AMX, B, kv_dim, in_dim)) return 0;
+    if (!qwen_mm_use_(QWEN_MMK_INT8_AMX, B, q_dim, in_dim, 0) ||
+        !qwen_mm_use_(QWEN_MMK_INT8_AMX, B, kv_dim, in_dim, 0)) return 0;
+    /* Q, K and V share ONE activation pack and one tile configuration here, so the work-per-
+     * thread rule belongs to their combined height, not to k and v on their own.  That is also
+     * what the measurement shows: at 12 threads both QKV projections are AMX wins (-7.9% and
+     * -6.0%) while the plain 2048-row projections at the same rows/thread are VNNI. */
+    if (!qwen_amx_int8_rows_ok((long long)q_dim + 2LL * (long long)kv_dim)) return 0;
 
     /* QKV has a different working set from the other projections.  This is an
      * additional lower bound for that fused path; the general AMX INT8 gate
