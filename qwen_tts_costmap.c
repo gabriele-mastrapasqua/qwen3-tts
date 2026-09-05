@@ -93,6 +93,7 @@ typedef struct rgn_tls_s {
     uint64_t tasks[QWEN_RGN_MAX];        /* units offered by dispatches it opened */
     uint32_t pool_nt[QWEN_RGN_MAX];      /* widest dispatch seen for this region  */
     uint64_t dispatches[QWEN_RGN_MAX];
+    uint64_t entered[QWEN_RGN_MAX];      /* workers that entered the job body   */
     int      stack_id[RGN_STACK_MAX];
     uint64_t stack_t0[RGN_STACK_MAX];
     int      depth;
@@ -149,6 +150,13 @@ void qwen_region_pool_at_(int id, int threads, long long tasks) {
     t->dispatches[id]++;
     t->tasks[id] += (uint64_t)(tasks > 0 ? tasks : 0);
     if (threads > 0 && (uint32_t)threads > t->pool_nt[id]) t->pool_nt[id] = (uint32_t)threads;
+}
+
+void qwen_region_workers_at_(int id, int entered) {
+    if (id <= 0 || id >= QWEN_RGN_MAX || entered <= 0) return;
+    rgn_tls_t *t = rgn_self();
+    if (!t) return;
+    t->entered[id] += (uint64_t)entered;
 }
 
 void qwen_region_units_at_(int id, long long n) {
@@ -289,20 +297,21 @@ int qwen_costmap_dump(const char *path) {
                 (unsigned long long)t->unbalanced, (unsigned long long)t->leaked);
         int first_r = 1;
         for (int i = 0; i < QWEN_RGN_MAX; i++) {
-            if (!t->calls[i] && !t->units[i] && !t->dispatches[i]) continue;
+            if (!t->calls[i] && !t->units[i] && !t->dispatches[i] && !t->entered[i]) continue;
             if (!first_r) fprintf(f, ",\n");
             first_r = 0;
             fprintf(f, "   { \"id\": %d, \"name\": \"%s\", \"component\": \"%s\", "
                        "\"parent\": %d, \"level\": %d, \"mode\": \"%s\", \"calls\": %llu, "
                        "\"ns\": %llu, \"child_ns\": %llu, \"nest_mismatch\": %u, "
                        "\"units\": %llu, \"tasks\": %llu, \"dispatches\": %llu, "
-                       "\"pool_threads\": %u }",
+                       "\"pool_threads\": %u, \"entered\": %llu }",
                     i, qwen_region_name(i), qwen_region_component(i),
                     qwen_region_parent(i), qwen_region_level(i), rgn_mode(i),
                     (unsigned long long)t->calls[i], (unsigned long long)t->ns[i],
                     (unsigned long long)t->child_ns[i], t->nest_mismatch[i],
                     (unsigned long long)t->units[i], (unsigned long long)t->tasks[i],
-                    (unsigned long long)t->dispatches[i], t->pool_nt[i]);
+                    (unsigned long long)t->dispatches[i], t->pool_nt[i],
+                    (unsigned long long)t->entered[i]);
         }
         fprintf(f, "\n  ] }");
     }

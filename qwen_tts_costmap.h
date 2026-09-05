@@ -130,11 +130,18 @@ static inline int qwen_region_begin_unique(int id) {
  * (threads that claimed at least one unit) / (threads the dispatch asked for). */
 void qwen_region_pool_at_(int id, int threads, long long tasks);
 void qwen_region_units_at_(int id, long long n);
+/* Workers that actually ENTERED the job body, counted by the job itself rather than inferred
+ * from which threads happened to touch a marker: a thread that never reaches a marker leaves
+ * no record, and turning that silence into an underfill claim would be a lie. */
+void qwen_region_workers_at_(int id, int entered);
 static inline void qwen_region_pool_at(int id, int threads, long long tasks) {
     if (qwen_costmap_level_v) qwen_region_pool_at_(id, threads, tasks);
 }
 static inline void qwen_region_units_at(int id, long long n) {
     if (qwen_costmap_level_v) qwen_region_units_at_(id, n);
+}
+static inline void qwen_region_workers_at(int id, int entered) {
+    if (qwen_costmap_level_v) qwen_region_workers_at_(id, entered);
 }
 
 /* Label the calling thread for attribution ("main", "decoder", "prefill_helper", ...).

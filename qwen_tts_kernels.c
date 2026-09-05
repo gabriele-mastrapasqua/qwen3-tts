@@ -9084,6 +9084,7 @@ typedef struct {
     const int8_t *Wq; const float *sw; const int32_t *wsum; const float *bias;
     int in_ch, out_ch, length, kernel, dilation, Kp, blk;
     _Atomic int next_panel;
+    _Atomic int entered;      /* workers that reached the body: the honest denominator */
     int n_panels;
     int nc;                 /* output columns per panel: the parallel unit, see sd_conv_nc() */
 } sd_conv_job_t;
@@ -9126,6 +9127,7 @@ static int sd_conv_nc(int length, int nt) {
 
 static void sd_conv1d_worker(void *vj) {
     sd_conv_job_t *j = (sd_conv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     int K = j->in_ch * j->kernel;
     int nblk = j->Kp / j->blk;
     int pad_left = (j->kernel - 1) * j->dilation;
@@ -9185,7 +9187,9 @@ void qwen_conv1d_int8(float *out, const float *in,
      * wall time: this layer's panels are the parallel unit, and a short layer cannot
      * fill the pool no matter how fast the kernel is. */
     qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
     sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 
 typedef struct {
