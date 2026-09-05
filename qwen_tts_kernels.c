@@ -299,7 +299,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
-    "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
+    "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
@@ -9042,7 +9042,44 @@ typedef struct {
     int in_ch, out_ch, length, kernel, dilation, Kp, blk;
     _Atomic int next_panel;
     int n_panels;
+    int nc;                 /* output columns per panel: the parallel unit, see sd_conv_nc() */
 } sd_conv_job_t;
+
+/* The decoder conv parallelises over OUTPUT COLUMNS only, one panel per work item, so a short
+ * layer cannot fill the pool: measured on the real 1.7B decoder, the first upsample block runs
+ * 256 columns (M=768, K=5376, 1057 MMAC -- a quarter of all conv1 work) which is TWO panels of
+ * 128, so four of six workers sat idle on the most expensive layer, and at one frame per chunk
+ * it was a single panel running single-threaded. Size the panel from the work instead: each
+ * column is im2col'd and quantised exactly once whatever the panel size, and its scale is
+ * per column, so this changes only who computes what, never a single output byte -- proven at
+ * one thread, where forcing four different panel widths gives one md5. Keep a floor so the
+ * panel GEMM stays wide enough to be worth its setup. */
+#define SD_INT8_NC_MIN 24
+static int sd_conv_nc(int length, int nt) {
+    static atomic_int forced = 0;                 /* QWEN_SD_CONV_NC=128 restores the old fixed
+                                                   * panel, which is how this is A/B'd */
+    int f = atomic_load_explicit(&forced, memory_order_relaxed);
+    if (f == 0) {
+        const char *e = getenv("QWEN_SD_CONV_NC");
+        int v = e && *e ? atoi(e) : 0;
+        f = (v >= SD_INT8_NC_MIN && v <= SD_INT8_NC) ? v + 1 : 1;
+        atomic_store_explicit(&forced, f, memory_order_relaxed);
+    }
+    if (f > 1) return f - 1;
+    if (nt < 2 || length <= SD_INT8_NC) return SD_INT8_NC;
+    int want = (length + nt - 1) / nt;
+    if (want >= SD_INT8_NC) return SD_INT8_NC;
+    if (want < SD_INT8_NC_MIN) want = SD_INT8_NC_MIN;
+    /* Round up to a multiple of 4 for SPEED, not for correctness: sd_gemm_panel walks a panel
+     * in groups of four columns (sd_tile_2x4) and sends the remainder to the narrower
+     * sd_tile_1xN, so an unaligned width pays that tail once per panel instead of once per
+     * layer.  Correctness does not depend on it -- forcing 128, 124, 44 and 24 at one thread
+     * gives the same WAV md5, and the differences seen at -j6 were the multi-thread float
+     * ordering the engine already has, not the panel width. */
+    want = (want + 3) & ~3;
+    if (want > SD_INT8_NC) want = SD_INT8_NC;
+    return want;
+}
 
 static void sd_conv1d_worker(void *vj) {
     sd_conv_job_t *j = (sd_conv_job_t *)vj;
@@ -9057,8 +9094,8 @@ static void sd_conv1d_worker(void *vj) {
     for (;;) {
         int p = atomic_fetch_add(&j->next_panel, 1);
         if (p >= j->n_panels) break;
-        int t0 = p * SD_INT8_NC;
-        int nc = j->length - t0 < SD_INT8_NC ? j->length - t0 : SD_INT8_NC;
+        int t0 = p * j->nc;
+        int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
         for (int c = 0; c < nc; c++) {
             float *dst = colf + (size_t)c * K;
             int tt = t0 + c - pad_left;
@@ -9096,8 +9133,9 @@ void qwen_conv1d_int8(float *out, const float *in,
         .out = out, .in = in, .Wq = Wq, .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = length,
         .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
-        .n_panels = (length + SD_INT8_NC - 1) / SD_INT8_NC,
     };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
     atomic_store(&job.next_panel, 0);
     sd_pool_run(sd_conv1d_worker, &job);
 }

@@ -255,6 +255,39 @@ Arm/x86 serving gap. Addenda in `.work/`; the old long plans (`plan_profile_cpu.
       either (`QWEN_VNNI_PREPACK` rejected on Zen5), only a cached row-sums array, by design.
       Open follow-up if this is ever enabled: the bf16 half is still packed unconditionally and
       is the bulk of the 4.2 GB. Was P5.9.
+- [x] X86-4b [FIXED, promoted by measurement 2026-09-05] The speech decoder CONV STACK is the
+      single largest block of a request, not the CP/Talker integer path. Level-2 cost map on the
+      real server (GCP host-native 2x6, SMT off, 1.7B --int8, C=2, `serve` role, blocks are
+      sequential on that thread and sum to request.total 5595 ms/req):
+        decoder.conv_stack  1923 ms/req  34%   (95.3% of all decoder time)
+        talker.decode       2379 ms/req  43%
+        cp.decode           1050 ms/req  19%   (gate_up 337, qkv 209, down 166, out_proj 116,
+                                                lm_head 50, attention 40; only 3.1% unattributed)
+        prefill both        219 ms/req    4%
+      Pool synchronisation costs 7.5% of the request (518k dispatches, 3644 ms waiting for worker
+      completion = 7.6% of dispatch, 572 ms on the submit lock = 1.2%).
+      This is the "unless profiling shows the cost distribution has materially changed" case for
+      the decoder: 9933948 measured only 0.8% end to end because it optimised the ACTIVATION
+      QUANTISER, not the convolutions themselves.
+      CAUSE FOUND, and it was pool fill, not arithmetic. `conv_up` is 90.3% of decoder time and
+      `res1` is 57% of that. The INT8 decoder conv parallelises over OUTPUT COLUMNS only, one
+      fixed 128-column panel per work item, never over out_ch. At the real shapes the most
+      expensive layer per column (blk0, M=768 K=5376, 1057 MMAC = a quarter of all conv1 work)
+      has 256 columns = TWO panels, so four of six workers idled on it, and at one frame per
+      chunk it was a single panel running single-threaded. `sd_conv_nc()` now sizes the panel
+      from the layer length and the pool (floor 24, rounded to a multiple of 4 for the tile
+      path); `QWEN_SD_CONV_NC=128` restores the old fixed panel and is the A/B arm.
+      Bit-preserving, PROVEN not asserted: at one thread, widths 128/124/44/24 all give WAV md5
+      fe66a43d. Two earlier md5 differences were multi-thread float ordering, and the first
+      explanation offered for them (tile-tail grouping) was wrong.
+      Measured, host-native 2x6 SMT off, same binary both arms:
+        decoder conv_up  frames=8 126.2 -> 116.2 ms, frames=4 82.3 -> 66.2 ms (-19.5%)
+        decoder res1     frames=8  72.4 ->  64.7 ms, frames=4 50.7 -> 34.4 ms (-32.2%)
+        server C=2  STREAM_RTF p50 0.660 -> 0.634  p95 0.692 -> 0.661
+        server C=4  STREAM_RTF p50 0.937 -> 0.896  TTFA p95 577 -> 674 (worse)
+        server C=6  STREAM_RTF p50 1.140 -> 1.021  p95 1.311 -> 1.178
+      Open: the TTFA regression at C=4 is unexplained and worth one look; out_ch is still never
+      a parallel axis, which is the remaining fix if a layer is short AND narrow.
 - [ ] X86-4 Activation preparation/fusion follow-up — remove remaining generic gather, q8-pack and
       scatter passes. Rest of old P5.6; the decoder half of old P5.7 is partly done by 9933948
       (x86 SIMD `qwen_int8_quant_rows`), the im2col fusion is not.

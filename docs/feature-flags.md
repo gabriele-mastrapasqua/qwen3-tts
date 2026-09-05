@@ -268,6 +268,7 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
 | `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |
 | `QWEN_SD_INT8_BLK` | compiled default | block size of the int8 decoder convolution tiles |
+| `QWEN_SD_CONV_NC` | all | auto | output columns per work item in the INT8 decoder conv. Auto sizes the panel from the layer length and the pool so a short layer still fills it; `=128` restores the old fixed panel (the A/B arm). Each column is im2col'd, quantised and scaled independently, so the panel size changes only WHO computes a column, never its value |
 | `QWEN_SD_WINDOWED` | off | windowed decoder evaluation; diagnostic for the streaming boundary |
 | `QWEN_DEC_FIRSTCHUNK_GROUP` | 0 (off) | `=1` groups the first streaming chunk of several slots into one decoder pass |
 | `QWEN_THREADS_TALKER` · `QWEN_THREADS_DECODER` | unset (both = `-j`) | split the thread budget between the Talker/CP phase and the decoder phase inside one worker |
