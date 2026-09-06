@@ -9738,6 +9738,31 @@ void qwen_sd_amx_bf16_report(void) {
 #ifndef SD_INT8_NC
 #define SD_INT8_NC 128
 #endif
+
+/* Shared by the INT8 and BF16 decoder panel workers.  Keep the decomposition helper
+ * independent of the VNNI INT8 implementation so an AMX-BF16-only build still links the
+ * real BF16 path rather than being forced through a scalar stub. */
+#define SD_INT8_NC_MIN 24
+static int sd_conv_nc(int length, int nt) {
+    static atomic_int forced = 0;                 /* QWEN_SD_CONV_NC=128 restores the old fixed
+                                                   * panel, which is how this is A/B'd */
+    int f = atomic_load_explicit(&forced, memory_order_relaxed);
+    if (f == 0) {
+        const char *e = getenv("QWEN_SD_CONV_NC");
+        int v = e && *e ? atoi(e) : 0;
+        f = (v >= SD_INT8_NC_MIN && v <= SD_INT8_NC) ? v + 1 : 1;
+        atomic_store_explicit(&forced, f, memory_order_relaxed);
+    }
+    if (f > 1) return f - 1;
+    if (nt < 2 || length <= SD_INT8_NC) return SD_INT8_NC;
+    int want = (length + nt - 1) / nt;
+    if (want >= SD_INT8_NC) return SD_INT8_NC;
+    if (want < SD_INT8_NC_MIN) want = SD_INT8_NC_MIN;
+    want = (want + 3) & ~3;
+    if (want > SD_INT8_NC) want = SD_INT8_NC;
+    return want;
+}
+
 #if defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__)
 static void sd_gemm_panel(float *out, int out_ld, int M,
                           const int8_t *Wq, const float *swb, const int32_t *wsum,
@@ -9774,40 +9799,8 @@ typedef struct {
 } sd_conv_job_t;
 
 /* The decoder conv parallelises over OUTPUT COLUMNS only, one panel per work item, so a short
- * layer cannot fill the pool: measured on the real 1.7B decoder, the first upsample block runs
- * 256 columns (M=768, K=5376, 1057 MMAC -- a quarter of all conv1 work) which is TWO panels of
- * 128, so four of six workers sat idle on the most expensive layer, and at one frame per chunk
- * it was a single panel running single-threaded. Size the panel from the work instead: each
- * column is im2col'd and quantised exactly once whatever the panel size, and its scale is
- * per column, so this changes only who computes what, never a single output byte -- proven at
- * one thread, where forcing four different panel widths gives one md5. Keep a floor so the
- * panel GEMM stays wide enough to be worth its setup. */
-#define SD_INT8_NC_MIN 24
-static int sd_conv_nc(int length, int nt) {
-    static atomic_int forced = 0;                 /* QWEN_SD_CONV_NC=128 restores the old fixed
-                                                   * panel, which is how this is A/B'd */
-    int f = atomic_load_explicit(&forced, memory_order_relaxed);
-    if (f == 0) {
-        const char *e = getenv("QWEN_SD_CONV_NC");
-        int v = e && *e ? atoi(e) : 0;
-        f = (v >= SD_INT8_NC_MIN && v <= SD_INT8_NC) ? v + 1 : 1;
-        atomic_store_explicit(&forced, f, memory_order_relaxed);
-    }
-    if (f > 1) return f - 1;
-    if (nt < 2 || length <= SD_INT8_NC) return SD_INT8_NC;
-    int want = (length + nt - 1) / nt;
-    if (want >= SD_INT8_NC) return SD_INT8_NC;
-    if (want < SD_INT8_NC_MIN) want = SD_INT8_NC_MIN;
-    /* Round up to a multiple of 4 for SPEED, not for correctness: sd_gemm_panel walks a panel
-     * in groups of four columns (sd_tile_2x4) and sends the remainder to the narrower
-     * sd_tile_1xN, so an unaligned width pays that tail once per panel instead of once per
-     * layer.  Correctness does not depend on it -- forcing 128, 124, 44 and 24 at one thread
-     * gives the same WAV md5, and the differences seen at -j6 were the multi-thread float
-     * ordering the engine already has, not the panel width. */
-    want = (want + 3) & ~3;
-    if (want > SD_INT8_NC) want = SD_INT8_NC;
-    return want;
-}
+ * layer cannot fill the pool.  The shared helper above sizes the panel from the work while
+ * preserving the per-column quantisation/convert contract for both AMX precisions. */
 
 static void sd_conv1d_worker(void *vj) {
     sd_conv_job_t *j = (sd_conv_job_t *)vj;
