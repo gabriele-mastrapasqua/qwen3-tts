@@ -17,6 +17,13 @@ into individual kernels and backends while that sat in plain sight. So:
 4. only then X86-4/X86-5/X86-6/X86-7/X86-8 and P5.10, and their queue order comes from what
    the profiler's FAST run measures, not from what looks interesting.
 
+REVISED 2026-09-06 — EPIC AMX (below) takes 3 and 4. PARITY-1/2/3 are closed except the
+hardware-blocked ARM items. P0-PROFILER is not abandoned and not a separate project: it is
+absorbed as AMX-0a/AMX-0, its first real consumer. P1-CONFIG follows the epic. The reason
+for the change: we have been asking how to win another few percent on generic x86, when the
+question that decides whether this host was worth choosing is whether the serving workload
+can be made to use its matrix engine at all.
+
 PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something equivalent":
 
   1. every common semantic feature has a BACKEND MATRIX generated from the code;
@@ -179,6 +186,185 @@ PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something eq
       topology verified against the resolved profile, mismatch FATAL · one owner and default per
       flag · overrides contain only what was intentionally changed · resolved-config + binary +
       model hashes stored with results · changing one common x86 default propagates everywhere.
+
+## AMX-MISSION — streaming-safe concurrency is the production objective (set 2026-09-06)
+
+The product is a concurrent streaming TTS server. Minimum TTFA in isolation is NOT the
+objective: once audio has started it must never stop. Priority order for every change:
+
+  1. correctness and audio quality;
+  2. zero underruns, starvation, errors or rejects;
+  3. STREAM_RTF p95 < 1.0 with real margin — target p50 0.80-0.85;
+  4. sustainable concurrency;
+  5. TTFA inside an interactive envelope, preferably <= 500-600 ms;
+  6. throughput and secondary latency metrics.
+
+TTFA 500 ms with STREAM_RTF 0.85 BEATS TTFA 200 ms with STREAM_RTF 1.15. Never buy TTFA
+with steady-state decode. Report both numbers for every benchmark, and use
+`stream_margin = 1 - STREAM_RTF`: 0.95 is 5% margin, which is not a production win.
+X86-8 is the implementation of this objective; this is the objective itself.
+
+## EPIC AMX — AMX as an execution ARCHITECTURE, not an INT8 kernel (set 2026-09-06)
+Detail, evidence table and metric definitions: `.work/amx-native-epic.md`.
+Every task carries: QUESTION · EVIDENCE · IMPL (if any) · VALIDATION · RESULT · NEXT.
+
+Central question: HOW MUCH OF THE REAL QWEN3-TTS WORKLOAD CAN BECOME EFFICIENT AMX WORK,
+AT WHICH PRECISION, WITHOUT DESTROYING TTFA? Assume none of: AMX INT8 is always best ·
+BF16 is slower · W4 implies one activation type · tiny-M must be forced onto AMX.
+
+Precision regimes in scope from the start, so today's decisions do not foreclose them:
+AMX INT8/W8A8 · AMX BF16 · existing W4/INT4 · future W4A16 / W4A8 / mixed W4-W8.
+Do NOT build a new quantization framework in this epic; do NOT design the backend as if
+INT8 were the only future AMX path. oneDNN is an ORACLE — never a serving dependency.
+Sequenced ahead of X86-4..X86-8 and P1-CONFIG. P0-PROFILER is absorbed as AMX-0a.
+
+- [ ] AMX-0a Census machinery must be trusted before it is read. [BLOCKS AMX-0]
+      Q: do prefork children and pool worker threads reach the cost-map dump at all?
+      E: `8f950bd` instrumented the batched CP frame and produced ZERO — `cp.decode.total`
+      stayed 76.1% unattributed. Same symptom previously hit `units`. Unverified hypotheses in
+      order: prefork children exit via `_exit()`, which does not run `atexit` handlers; pool
+      workers never register their TLS block. Also: `ph_proj` in `cp_region_frame_task` is
+      declared and never accumulated — `CPB_ACC(ph_proj)` is missing.
+      V: the four `cp.batch.*` phases sum close to `cp.decode.total`; CP unexplained < 10%.
+      NEXT: without this AMX-0 reports an AMX share of zero and we believe it.
+- [x] AMX-0 DONE 2026-09-06 — weighted execution census of the REAL batched+prefork path.
+      Method: existing `qwen_census_op` rows (comp, path, N, K, B, calls, MACs, kmask) from a
+      `QWEN_SHAPE_CENSUS=1` FAST profile, 1.7B --int8, AMX build, 2x6 prefork, C=4, on the
+      Emerald Rapids host with SMT off. CORRECTION APPLIED: a first aggregate double-counted,
+      because `prefill_bf16_native` and the `matmat_*_native` paths are WRAPPER rows and
+      `matmat_int8_vnni_*.slice` are SLICE rows, all re-recording MACs already counted by the
+      CALL row beneath. Only `QWEN_PATHK_CALL` rows are summed.
+      RESULT — 1212.1 GMAC over 16525 calls:
+        amx_mac_share  14.0%   amx_call_share 10.2%
+        VNNI 2.1% MAC / 6.1% calls · int8 GEMV 4.5% MAC / 53.8% calls · NOT DISPATCHED 79.4%
+      By component, MACs vs COMPUTE WALL (serve threads, same run) - the divergence is the
+      point, and it is why both metrics exist:
+        decoder  81.2% of MACs, 46.3% of compute wall, AMX inside it 0.0%
+        talker   16.4% of MACs, 39.1% of compute wall, AMX inside it 84.8%
+        cp        2.3% of MACs, 14.6% of compute wall, AMX inside it 0.0%
+      CP is 6x more expensive in wall than in MACs: it is B=1 GEMV re-reading weights, i.e.
+      bandwidth-bound, and no AMX kernel fixes that.
+      `amx_eligible_share` of the 86% that is NOT on AMX:
+        (c) structurally outside the dispatcher   94.1%   <- the decoder, entirely
+        (b) B=1 GEMV with no AMX form              5.3%
+        (a) shape-eligible but gated to VNNI       0.5%
+      DECISION THIS FORCES: gate tuning addresses 0.5% of the weighted work. The B>=3 rule,
+      rows/thread, QKV-on-q+2kv - all of it operates on half a percent. Top non-AMX sites:
+      `decoder_conv_int8` 804.1 GMAC (66.3% of everything, hand-written register tile),
+      `decoder_sgemm` 157.8 GMAC (13.0%, fp32 OpenBLAS), then talker/cp B=1 GEMV.
+- [ ] AMX-0-OLD Weighted execution census of the REAL batched+prefork path.
+      Q: what shapes carry most of the weighted work that does NOT run on AMX today?
+      Scope: Talker prefill · Talker decode · CP prefill · CP decode (`qwen_batch_cp_predict`,
+      NOT the CLI path) · lm_heads · decoder. Per linear site: M/effective B · N · K ·
+      calls/req · MACs · wall · kernel · ISA · AMX y/n · VNNI y/n · precision · weight repr ·
+      activation repr · activation-prep cost · pack/repack cost · kernel cost · epilogue cost ·
+      threads/decomposition. VERIFY THE RUNTIME PATH — never infer execution from a name.
+      Metrics: `amx_call_share` · `amx_mac_share` · `amx_wall_share` · VNNI/fallback equivalents ·
+      `amx_eligible_share`, which splits non-AMX work into shape-eligible-but-gated /
+      shape-ineligible / structurally-outside-the-dispatcher. That last split is the cheapest
+      A-vs-B discriminator and costs no oneDNN run.
+      Also 1.7B vs 0.6B: shared shape families, materially different layers, and do NOT assume
+      one break-even policy across two sets of dimensions.
+      V: shares sum to 100% with unattributed < 10%; denominators per request and per frame.
+- [x] AMX-1 Prior AMX evidence recovered — DONE 2026-09-06, table in `.work/amx-native-epic.md`
+      (CURRENT / OBSOLETE / RETEST / REJECTED over: batch thresholds, B>=3 vs B>=4 history,
+      rows/thread, persistent prepack, RSS/TTFA penalty, AMX-vs-VNNI, BF16, oneDNN, tile
+      occupancy, activation prep, x86 QKV/dataflow, failed experiments).
+      RESULT — two corrections it forces:
+      (a) the v0.18.0 "-21% BF16" is AVX-512 `VDPBF16PS`, a VNNI-class instruction, NOT AMX
+          `TDPBF16PS`. It is not evidence about AMX BF16 and must stop being cited as such:
+          we have never measured AMX BF16.
+      (b) the packed-RHS result (+7% for +4.3 GB RSS) is CURRENT as a measurement but RETEST as
+          a design — it says the lifetime and layout were wrong, not that prepacking fails.
+      REJECTED, do not rerun as written: the B=32 two-accumulator prototype (SIGILL, and
+      numerically wrong at 2.18 worst relative); the rows>=cols gate; cross-process A/B arms.
+- [ ] AMX-2 Precision + shape truth table, on the REAL hot shapes from AMX-0.
+      Q: at each shape the server actually produces, which precision and which implementation
+      wins on TOTAL layer cost?
+      Sweep effective M = 1,2,3,4,6,8,12,16,24,32 where relevant per real N/K — 3 and 6 included
+      because those are widths the server produces. Arms where technically available: native
+      VNNI INT8 · native AMX INT8/W8A8 · oneDNN AMX INT8 · native AMX BF16 · oneDNN AMX BF16 ·
+      current W4/INT4 · a clean diagnostic W4-with-wider-activation if the code can expose one.
+      Report SEPARATELY, never a single number: activation prep · activation quant · activation
+      pack · RHS pack/reorder · matrix kernel · accumulation/epilogue · conversion/dequant ·
+      TOTAL. Plus latency · GOP/s · cycles/MAC where practical · bytes touched · observed
+      bandwidth · threads · tile utilization where observable.
+      V: paired and interleaved inside ONE process via `qwen_mm_force()` — cross-process arms
+      swing 14%, larger than the effect being measured. Subsumes P5.2, P5.5, P5.8.
+      NEXT — the classification, and nothing broad starts before it exists:
+        A our AMX is substantially below the oracle on AMX-friendly shapes -> kernel/layout/tile;
+        B our kernels are healthy and serving presents mostly tiny-M/GEMV -> feeding/fusion;
+        C both;
+        D the oracle itself does not win below an M we can never produce -> stop pursuing AMX on
+          decode; the epic reduces to AMX-5a plus prefill. (Added because A/B/C alone can only
+          ever conclude "work harder".)
+- [ ] AMX-2b [GATED on AMX-2 = A or C] Close the native AMX kernel gap: tile shape · K and N
+      blocking · tails · tile-config lifetime · RHS layout · LHS packing · epilogue · thread
+      decomposition · cache blocking. One shape at a time, parity then microbench, never
+      straight to a server soak.
+- [ ] AMX-3 AMX BF16 as a FIRST-CLASS path, judged on total layer latency, not tile throughput.
+      Q: does removing quant+pack+int32-rescale+convert beat a higher theoretical peak?
+      INT8 pays activation -> quantize -> pack -> AMX INT8 -> int32 accum -> scale/convert.
+      BF16 pays bf16 activation -> AMX BF16 -> fp32 accum -> output. A plausible outcome is a
+      shape-aware policy (tiny-M VNNI INT8, medium-M AMX BF16, large-M AMX INT8) but the
+      measured crossover decides, not the example. Keep W4A16 / W4A8 / W8A8 / mixed W4-W8
+      reachable; implement none of them here.
+      E: starts from zero — see AMX-1 (a).
+- [ ] AMX-4 Weight and activation dataflow for the hottest Talker/CP linears.
+      Q: what is rebuilt in decode that could have been built once at model load, and why?
+      Reconstruct source activation -> gather -> quantize/convert -> pack -> matrix op ->
+      epilogue -> scatter, and classify EVERY transformation by lifetime: model load · per
+      worker · per request · per frame · per layer · per projection.
+      Find: repeated activation quantization · duplicate Q/K/V preparation · repeated RHS
+      pack/reorder · temporary copies · non-AMX-friendly layout transitions · scale-metadata
+      traffic · avoidable int32/fp conversions · tile-config overhead · worker-local vs
+      reusable packed representation. Measure shared read-only pages across prefork workers as
+      REAL RSS — that is what sank X86-3, so do not blindly re-enable full prepack; decide WHAT
+      is persistent, for WHICH layers, and WHY. Subsumes X86-5: `qwen_region_i8_run` calls
+      `amx_pack_act_int8` on every thread, packing the same activation nt times.
+- [ ] AMX-5 Make the engine feed AMX. Highest-value architectural phase.
+      Q as posed: why do multiple ready streams still execute as independent GEMV against the
+      same weights? CORRECTION FROM MEASUREMENT — for CROSS-STREAM fusion the answer is
+      "they mostly do not": continuous batching already fuses them, the measured B 0.9-3.8 per
+      worker at C=1..8 IS the fused width, and with 2 workers C=8 ideally gives B=4 against 3.8
+      measured. M is bounded by admissible concurrency, and C=6/C=8 already underrun (18/18 and
+      24/24 starved). So cross-stream fusion is real but nearly exhausted, and it is sequenced
+      LAST here rather than first:
+        AMX-5a [HIGHEST VALUE] bring the SPEECH DECODER into the dispatcher at all. It is the
+              largest block in the request — `decoder.conv_stack` 1526 of 1610 ms/req at C=4,
+              94.8% of the decoder — and `qwen_tts_speech_decoder.c` makes ZERO calls to
+              `qwen_mm_use`. Two sub-paths, both outside every AMX decision taken so far: fp32
+              `im2col` + `cblas_sgemm`, and int8 `sd_gemm_panel` -> `sd_tile_2x4`/`sd_tile_1xN`,
+              a hand-written register tile. Shape is favourable: M = out_ch 512-1024,
+              K = in_ch*kernel, N = panel columns. Until it is in the denominator, every
+              "AMX coverage is X%" statement is meaningless.
+        AMX-5b Raise M INSIDE one request: CP's 16 sequential steps and 15 lm_heads over one
+              frame, the MTP projection, multi-frame decode — rows that exist and are executed
+              as separate small calls. Prove numerical validity before fusing.
+        AMX-5c Prove cross-slot fusion numerical parity for ONE linear.
+        AMX-5d Fuse one hot projection, then QKV/shared-prep, then a full layer row group.
+        AMX-5e Scheduler-aware fusion. NO artificial waiting, ever: fuse only streams already
+              runnable at the same scheduling point, so a request with no peers keeps its TTFA.
+- [ ] AMX-6 Latency lane vs streaming lane — two regimes, ONE worker, ONE codebase, threshold
+      measured not invented. LATENCY: new request, first chunk, no artificial delay, lowest
+      measured overhead (likely VNNI at tiny M — measure). STREAMING: audio already flowing,
+      sustainable rate, opportunistic AMX fusion, keep RTF margin. Scheduler priority:
+      underrun risk > established decode > first-audio deadline > non-critical prefill.
+      Invariant: admission and prefill for new requests must not starve established streams.
+- [ ] AMX-7 1.7B vs 0.6B. Shared-vs-different shape matrix: same projection families · same
+      kernel opportunities · dimensions that move the crossover · which model reaches
+      AMX-friendly regimes earlier · which benefits more from BF16 · which from fusion.
+      Shared backend code with SHAPE-DERIVED policy, never model-name special cases.
+- [ ] AMX-8 AMX-native server baseline: profiles AUTO legacy · VNNI-only · AMX-native, at
+      C = 1,2,4,6, on the canonical host only (Emerald Rapids, SMT OFF, 12 online cores, 2x6
+      prefork — the old 2x8 SMT-overlap setup is invalid and must not reappear). Report TTFA ·
+      STREAM_RTF p50/p95 · `stream_margin = 1 - RTF` · throughput · observed effective M/B ·
+      amx_mac_share · amx_wall_share · VNNI share · precision share · worker balance.
+      Judged by AMX-MISSION: a TTFA regression inside the envelope with a materially better RTF
+      PASSES, and a TTFA win that regresses STREAM_RTF FAILS.
+- [ ] AMX-9 Production qualification: output parity, ear check on real text, no drift, C4/C6
+      soak. Do NOT rent a higher-bandwidth Xeon before this host is shown to consume the
+      compute and bandwidth it already has.
 
 ## P0 — correctness of our performance evidence
 
@@ -470,7 +656,7 @@ PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something eq
 - [ ] X86-4 Activation preparation/fusion follow-up — remove remaining generic gather, q8-pack and
       scatter passes. Rest of old P5.6; the decoder half of old P5.7 is partly done by 9933948
       (x86 SIMD `qwen_int8_quant_rows`), the im2col fusion is not.
-- [ ] X86-5 AMX activation-pack reuse — REAL but currently worthless on this serving profile;
+- [ ] X86-5 [SUBSUMED by AMX-4, 2026-09-06] AMX activation-pack reuse — REAL but currently worthless on this serving profile;
       do not spend on it until per-worker B rises. The redundancy is confirmed by reading:
       `qwen_region_i8_run` calls `amx_pack_act_int8` on EVERY thread, each packing the same
       B x cols activation into its own scratch, so the pack is duplicated nt times. (The fused
@@ -495,9 +681,9 @@ PARITY IS CLOSED ONLY WHEN ALL SIX HOLD. Not "ARM has this, x86 has something eq
       checkpoint and C1/C2/C4 screens.
 - [ ] X86-7 0.6B vs 1.7B serving profile — compare Talker, CP and decoder time shifts after the
       Talker width change.
-- [ ] X86-8 SERVER OPERATING PROFILES — latency-first vs streaming-safe. [LATER: do not start
-      before X86-2..X86-5 close. NOT a note: this is a serving OBJECTIVE and outranks further
-      TTFA work once the structural x86 work is done.]
+- [ ] X86-8 SERVER OPERATING PROFILES — latency-first vs streaming-safe. [2026-09-06: the
+      objective itself is now stated once at the top as AMX-MISSION, and the two-lane
+      implementation is AMX-6. This item stays as the profile/qualification half.]
 
       WHY, from the real server screen (GCP AMX box, 1.7B --int8, batched + prefork 2x8,
       `serve_parallel_wave`, C=1..8, 2026-09-05): STREAM_RTF p50 is already 0.958 at C=4 with
