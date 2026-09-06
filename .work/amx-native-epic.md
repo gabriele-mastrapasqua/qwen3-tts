@@ -158,3 +158,37 @@ class B, and AMX-2's oracle sweep can raise at most the 14% already on AMX.
 
 Top non-AMX sites: `decoder_conv_int8` 804.1 GMAC (66.3% of all MACs, hand-written 2x4
 register tile), `decoder_sgemm` 157.8 GMAC (13.0%, fp32 OpenBLAS), then Talker/CP B=1 GEMV.
+
+## 9. AMX-0 CORRECTED (second pass, merged HEAD) — the first number was wrong
+
+`amx_mac_share` is **2.0%**, not the 14.0% reported in section 8. Section 8 stands only as a
+record of the error.
+
+Two defects in the method, both inflating AMX:
+1. `kmask` is an OR of every kernel a shape ever used. A shape that took AMX once and VNNI a
+   thousand times sets both bits, and classifying on "does the mask contain AMX" counted it as
+   fully AMX. A share cannot be read off a mask.
+2. `t_census_cur` is never cleared, so `qwen_matmat_stats_note` attributes a kernel to whichever
+   row that thread opened last. This produced `decoder_conv_int8 -> VNNI` rows, which contradict
+   the code (the decoder makes no dispatcher call) and should have been investigated the moment
+   they appeared rather than reported.
+
+Fixed: per-row `kmacs[]`/`kcalls[]` per kernel, and the path `kind` emitted by the engine so the
+aggregator stops guessing which paths are wrappers (that hardcoded list was also wrong, which is
+why the denominator moved 1212.1 -> 1403.5 GMAC).
+
+| kernel | GMAC | % of all |
+|---|---|---|
+| **INT8 AMX** | **0.0** | **0.0% — it never runs** |
+| int8 VNNI vpdpbusd | 172.6 | 12.3% |
+| int8 GEMV | 149.4 | 10.6% |
+| bf16 AMX tiles | 27.9 | 2.0% |
+| never reached the dispatcher | — | 75.0% |
+
+**The finding: INT8 AMX executes zero MACs under the real server.** Its gate requires B>=3 AND
+rows/thread>=256. The batched server measures B 0.9-3.8 per worker, and CP rows over 6 threads
+fall below 256. Every parameter tuned on that gate governs a path that does not run. The only
+AMX in production is BF16 tiles in the Talker prefill, 2.0% of all MACs.
+
+This strengthens the class-B classification rather than weakening it, since both method errors
+were in AMX's favour.

@@ -234,20 +234,32 @@ Sequenced ahead of X86-4..X86-8 and P1-CONFIG. P0-PROFILER is absorbed as AMX-0a
       because `prefill_bf16_native` and the `matmat_*_native` paths are WRAPPER rows and
       `matmat_int8_vnni_*.slice` are SLICE rows, all re-recording MACs already counted by the
       CALL row beneath. Only `QWEN_PATHK_CALL` rows are summed.
-      RESULT — 1212.1 GMAC over 16525 calls:
-        amx_mac_share  14.0%   amx_call_share 10.2%
-        VNNI 2.1% MAC / 6.1% calls · int8 GEMV 4.5% MAC / 53.8% calls · NOT DISPATCHED 79.4%
+      CORRECTED 2026-09-06, second pass: the first result (14.0%) was NOT a measurement. It was
+      read off `kmask`, an OR of every kernel a shape ever used, so a shape that took AMX once
+      and VNNI a thousand times counted as fully AMX; `t_census_cur` is also never cleared, so a
+      kernel lands on whichever row that thread opened last (which is where the impossible
+      `decoder_conv_int8 -> VNNI` rows came from). Both errors inflate AMX. Fixed by keeping
+      MACs and calls PER KERNEL per row, and by emitting the path `kind` from the engine instead
+      of guessing which paths are wrappers. Remeasured on the merged HEAD, 1403.5 GMAC:
+        amx_mac_share  2.0%   -- and ALL of it is BF16 tiles in the Talker prefill
+        INT8 AMX                       0.0 GMAC   ZERO. It never runs in production.
+        int8 VNNI vpdpbusd           172.6 GMAC  12.3%  (88875 calls)
+        int8 GEMV                    149.4 GMAC  10.6%  (24534 calls)
+        bf16 AMX tiles                27.9 GMAC   2.0%  (1681 calls)
+        never reached the dispatcher              75.0%
+      THE FINDING: the INT8 AMX path executes zero MACs under the real server. Its gate needs
+      B>=3 AND rows/thread>=256; the batched server measures B 0.9-3.8 per worker and CP rows
+      over 6 threads fall under 256. Everything tuned on that gate - B>=3, rows per thread,
+      selective prepack, QKV on q+2kv - governs a path that never runs.
       By component, MACs vs COMPUTE WALL (serve threads, same run) - the divergence is the
       point, and it is why both metrics exist:
-        decoder  81.2% of MACs, 46.3% of compute wall, AMX inside it 0.0%
-        talker   16.4% of MACs, 39.1% of compute wall, AMX inside it 84.8%
-        cp        2.3% of MACs, 14.6% of compute wall, AMX inside it 0.0%
+        decoder  76.6% of MACs, 46.3% of compute wall, AMX inside it  0.0%
+        talker   17.9% of MACs, 39.1% of compute wall, AMX inside it 11.1% (BF16 prefill only)
+        cp        5.5% of MACs, 14.6% of compute wall, AMX inside it  0.0%
       CP is 6x more expensive in wall than in MACs: it is B=1 GEMV re-reading weights, i.e.
       bandwidth-bound, and no AMX kernel fixes that.
-      `amx_eligible_share` of the 86% that is NOT on AMX:
-        (c) structurally outside the dispatcher   94.1%   <- the decoder, entirely
-        (b) B=1 GEMV with no AMX form              5.3%
-        (a) shape-eligible but gated to VNNI       0.5%
+      `amx_eligible_share` of the 98% that is NOT on AMX: 76.5% never reaches the dispatcher
+      (the decoder), 15.2% is dispatched to int8 VNNI, 10.8% is B=1 GEMV with no AMX form.
       DECISION THIS FORCES: gate tuning addresses 0.5% of the weighted work. The B>=3 rule,
       rows/thread, QKV-on-q+2kv - all of it operates on half a percent. Top non-AMX sites:
       `decoder_conv_int8` 804.1 GMAC (66.3% of everything, hand-written register tile),

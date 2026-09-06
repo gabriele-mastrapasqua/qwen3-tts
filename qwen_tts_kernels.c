@@ -1904,6 +1904,12 @@ typedef struct {
     int comp, rows, cols, B;
     atomic_llong calls, macs;
     atomic_uint  kmask;     /* QWEN_MMK_* that ran (matmat dispatch) */
+    /* kmask is an OR of every kernel this shape ever used, so it cannot say HOW MUCH ran on
+     * each one: a row that took AMX once and VNNI a thousand times looks identical to a row
+     * that is pure AMX.  A coverage share read off the mask is an upper bound, not a
+     * measurement, so keep MACs and calls PER KERNEL as well. */
+    atomic_llong kmacs[QWEN_MMK_COUNT];
+    atomic_llong kcalls[QWEN_MMK_COUNT];
     atomic_uint  lmask;     /* QWEN_LEAF_* that ran (branch inside the entry) */
 } qwen_census_row_t;
 static qwen_census_row_t g_census[QWEN_CENSUS_MAX];
@@ -2051,7 +2057,10 @@ void qwen_census_report(void *out) {
             atomic_load_explicit(&g_census_frames_at[1], memory_order_relaxed),
             atomic_load_explicit(&g_census_frames_at[2], memory_order_relaxed),
             g_n_threads);
-    fprintf(f, "# csv: comp,path,N,K,B,calls,calls_per_frame,gmac,gmac_per_frame,kernels,leaves\n");
+    fprintf(f, "# csv: comp,path,N,K,B,calls,calls_per_frame,gmac,gmac_per_frame,kernels,leaves,kind\n");
+    /* Per-kernel split, emitted as its own record type: the "kernels" column above is an OR
+     * mask and cannot carry a share. */
+    fprintf(f, "# csv2: kcensus,comp,path,N,K,B,kernel,kernel_calls,kernel_gmac\n");
     for (int i = 0; i < n; i++) {
         qwen_census_row_t *r = &g_census[i];
         long long c = atomic_load_explicit(&r->calls, memory_order_relaxed);
@@ -2070,13 +2079,24 @@ void qwen_census_report(void *out) {
             if (lbuf[0]) strncat(lbuf, "+", sizeof lbuf - strlen(lbuf) - 1);
             strncat(lbuf, g_leaf_name[k], sizeof lbuf - strlen(lbuf) - 1);
         }
-        fprintf(f, "census,%s,%s,%d,%d,%d,%lld,%.3f,%.4f,%.6f,%s,%s\n",
+        for (int k = 1; k < QWEN_MMK_COUNT; k++) {
+            long long kc = atomic_load_explicit(&r->kcalls[k], memory_order_relaxed);
+            if (!kc) continue;
+            fprintf(f, "kcensus,%s,%s,%d,%d,%d,%s,%lld,%.4f\n",
+                    cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp], qwen_path_name(r->path), r->rows, r->cols, r->B,
+                    g_mmk_info[k].name, kc,
+                    (double)atomic_load_explicit(&r->kmacs[k], memory_order_relaxed) / 1e9);
+        }
+        fprintf(f, "census,%s,%s,%d,%d,%d,%lld,%.3f,%.4f,%.6f,%s,%s,%s\n",
                 cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp], qwen_path_name(r->path),
                 r->rows, r->cols, r->B, c,
                 frames ? (double)c / (double)frames : 0.0,
                 (double)m / 1e9,
                 frames ? (double)m / 1e9 / (double)frames : 0.0,
-                kbuf[0] ? kbuf : "(none)", lbuf[0] ? lbuf : "(none)");
+                kbuf[0] ? kbuf : "(none)", lbuf[0] ? lbuf : "(none)",
+                qwen_path_kind(r->path) == QWEN_PATHK_CALL      ? "call"
+              : qwen_path_kind(r->path) == QWEN_PATHK_SLICE     ? "slice"
+              : qwen_path_kind(r->path) == QWEN_PATHK_WRAPPER   ? "wrapper" : "transform");
     }
     int ov = atomic_load_explicit(&g_census_overflow, memory_order_relaxed);
     if (ov) fprintf(f, "[shape-census] WARNING: %d ops dropped, table full (%d rows)\n",
@@ -2129,7 +2149,11 @@ void qwen_census_report(void *out) {
 void qwen_matmat_stats_note(int k, long long macs) {
     if (k <= 0 || k >= QWEN_MMK_COUNT) return;
     if (atomic_load_explicit(&g_census_on, memory_order_relaxed) > 0) {
-        if (t_census_cur) atomic_fetch_or_explicit(&t_census_cur->kmask, 1u << k, memory_order_relaxed);
+        if (t_census_cur) {
+            atomic_fetch_or_explicit(&t_census_cur->kmask, 1u << k, memory_order_relaxed);
+            atomic_fetch_add_explicit(&t_census_cur->kmacs[k], macs, memory_order_relaxed);
+            atomic_fetch_add_explicit(&t_census_cur->kcalls[k], 1, memory_order_relaxed);
+        }
     }
     atomic_fetch_add_explicit(&g_mm_macs[k], macs, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_mm_calls[k], 1, memory_order_relaxed);
