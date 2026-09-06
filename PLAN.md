@@ -339,11 +339,11 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       was 425.5 ms vs V1 438.1 ms in the first short A/B.
       D3 [x] the same explicit D arm now enters the actual inline
       continuous-batching decoder path, not only the per-slot/prefork path. On the canonical
-      2x6/SMT-off host, C2/C4 batch-cap=2 had TTFA p95 100/187 ms, STREAM_RTF p50/p95
-      0.615/0.621 and 1.093/1.234, zero errors/rejects, D rows in the census and non-zero
-      `TDPBSSD` tiles. The 1x6 cap=4 FAST arm reached D at C4 but p95 1.607: integration
-      is proven, serving qualification is NOT. The current ragged panel loop is serial and
-      remains a scheduler/dataflow follow-up.
+      2x6/SMT-off host, the clean source snapshot for `f294fce` at C2/C4 batch-cap=2 had
+      TTFA p95 100/187 ms, STREAM_RTF p50/p95 0.617/0.633 and 1.121/1.130, zero
+      errors/rejects, D rows in the census and non-zero `TDPBSSD` tiles. Both C4 streams
+      still starved in the zero-buffer harness: integration is proven, serving qualification
+      is NOT. The current ragged panel loop is serial and remains a scheduler/dataflow follow-up.
       D4 [x] REAL AMX BF16 decoder arm on the same causal-conv
       shapes, using `TDPBF16PS`, activation-as-A, immutable BF16 B packs and a distinct
       census path. CLI FAST load builds 26 packs / 62.8 MB; the short run reported real
@@ -352,7 +352,7 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       correlation 0.999996.
       D5 [x, initial total-cost arms] D-only and BF16-only were measured with the same short
       streaming workload. At 2x6 per-slot C4, D was STREAM_RTF p95 0.889 versus BF16 1.040;
-      in the real ragged batch path, D C4 p95 was 1.234 while BF16 1x6 cap=4 was 2.260.
+      on the clean 2x6 ragged-batch smoke, D C4 p95 was 1.130 while BF16 was 1.966.
       These totals include prep, tile compute and epilogue, and reject BF16 as the current
       serving default; an exact-shape phase table is still open. D6 [ ] choose production
       policy after panel parallelism and a clean committed server smoke. V1 remains a control.
