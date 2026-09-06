@@ -117,6 +117,7 @@ enum {
     QWEN_PATH_MATMAT_INT8_NATIVE, QWEN_PATH_MATMAT_BF16_NATIVE, QWEN_PATH_MATMAT_INT8_QKV_NATIVE,
     QWEN_PATH_DECODER_SGEMM = 50, QWEN_PATH_DECODER_CONV_INT8, QWEN_PATH_DECODER_CONV_NAIVE,
     QWEN_PATH_DECODER_CONV_AMX_INT8 = 53,
+    QWEN_PATH_DECODER_CONV_AMX_INT8_D = 54,
     QWEN_PATH_COUNT
 };
 /* kind: what a row means for coverage accounting */
@@ -381,6 +382,10 @@ int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, i
 
 int qwen_sd_int8_available(void);
 int qwen_sd_int8_usable(int in_ch, int out_ch);   /* available AND a shape the kernels cover */
+void qwen_sd_int8_cache_reset(void);
+int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
+                                      size_t *bytes_out);
+void qwen_sd_amx_int8_free_weights(int8_t *packed);
 /* B=1 capability: 1 = a native integer GEMV runs, 0 = B=1 dequantises to the f32 twin. */
 int qwen_int8_gemv_native(void);
 int qwen_q4_gemv_native(void);
@@ -443,6 +448,12 @@ void qwen_conv1d_int8(float *out, const float *in,
                       const float *bias,
                       int in_ch, int out_ch, int length, int kernel, int dilation,
                       int Kp, int blk);
+
+void qwen_conv1d_int8_design_d(float *out, const float *in,
+                               const int8_t *Wq, const float *sw, const int32_t *wsum,
+                               const float *bias, const int8_t *Wpack,
+                               int in_ch, int out_ch, int length, int kernel, int dilation,
+                               int Kp, int blk);
 
 void qwen_gemm_int8(float *out, int out_ld,
                     const int8_t *Wq, const float *sw, const int32_t *wsum,

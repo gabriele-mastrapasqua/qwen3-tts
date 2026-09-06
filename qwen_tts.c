@@ -371,6 +371,7 @@ extern int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_
 extern int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *items, int n_items);
 extern void qwen_sd_stream_init(qwen_sd_stream_state_t *st);
 extern void qwen_sd_stream_free(qwen_sd_stream_state_t *st);
+extern void qwen_sd_int8_cache_reset(void);
 extern int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float top_p, float rep_penalty, int *prev_tokens, int n_prev);
 extern void qwen_set_seed(uint32_t seed);
 extern uint32_t qwen_get_seed(void);
@@ -819,6 +820,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     qwen_vnni_row_sums_reset();
     qwen_vnni_weight_cache_reset();
     qwen_amx_weight_cache_reset();
+    qwen_sd_int8_cache_reset();
     for (int i = 0; i < ctx->n_owned_overrides; i++) free(ctx->owned_overrides[i]);
     free(ctx->owned_overrides);
     for (int i = 0; i < ctx->config.num_layers; i++) free(ctx->layers[i].gate_up_fused_bf16);

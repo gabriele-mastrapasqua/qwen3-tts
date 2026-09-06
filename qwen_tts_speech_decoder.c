@@ -205,6 +205,19 @@ static int sd_int8_enabled(void) {
 }
 int qwen_sd_int8_enabled(void) { return sd_int8_enabled(); }
 
+/* Design D is intentionally opt-in until its complete decoder path is qualified.  The
+ * persistent B packs are made during model load, so changing this environment after load is
+ * unsupported just like the existing decoder INT8 policy. */
+static int sd_amx_d_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_AMX_D");
+        int want = e && *e && *e != '0';
+        en = want && sd_int8_enabled() && qwen_amx_int8_available();
+    }
+    return en;
+}
+
 static int sd_phase_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("QWEN_SD_PHASE"); v = (e && *e && *e != '0'); }
@@ -313,6 +326,8 @@ typedef struct {
     int8_t *q;
     float *scales;
     int32_t *wsum;
+    int8_t *amx_d_wpack;
+    size_t amx_d_bytes;
     int Kp;
 } sd_wq_entry_t;
 
@@ -322,6 +337,7 @@ static int sd_wq_n = 0;
 static pthread_mutex_t sd_wq_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static sd_wq_entry_t *sd_wq_get_conv(const float *w, int out_ch, int K) {
+    if (!w || out_ch <= 0 || K <= 0) return NULL;
     pthread_mutex_lock(&sd_wq_mu);
     for (int i = 0; i < sd_wq_n; i++)
         if (sd_wq[i].src == w) { pthread_mutex_unlock(&sd_wq_mu); return &sd_wq[i]; }
@@ -348,9 +364,44 @@ static sd_wq_entry_t *sd_wq_get_conv(const float *w, int out_ch, int K) {
             ws[b] = acc;
         }
     }
+    if (sd_amx_d_enabled())
+        e->amx_d_wpack = qwen_sd_amx_int8_pack_weights(e->q, out_ch, Kp, &e->amx_d_bytes);
     sd_wq_n++;
     pthread_mutex_unlock(&sd_wq_mu);
     return e;
+}
+
+void qwen_sd_int8_cache_reset(void) {
+    pthread_mutex_lock(&sd_wq_mu);
+    for (int i = 0; i < sd_wq_n; i++) {
+        free(sd_wq[i].q);
+        free(sd_wq[i].scales);
+        free(sd_wq[i].wsum);
+        qwen_sd_amx_int8_free_weights(sd_wq[i].amx_d_wpack);
+        memset(&sd_wq[i], 0, sizeof sd_wq[i]);
+    }
+    sd_wq_n = 0;
+    pthread_mutex_unlock(&sd_wq_mu);
+}
+
+static void sd_amx_d_prepack_decoder(const qwen_speech_decoder_t *sd, int silent) {
+    if (!sd_amx_d_enabled()) return;
+    static const int channels[4] = { 768, 384, 192, 96 };
+    int entries = 0;
+    size_t bytes = 0;
+    for (int b = 0; b < 4; b++) {
+        const qwen_sd_upsample_block_t *ub = &sd->upsample_blocks[b];
+        const int ch = channels[b];
+        for (int r = 0; r < 3; r++) {
+            sd_wq_entry_t *e1 = sd_wq_get_conv(ub->res_blocks[r].conv1_weight, ch, ch * 7);
+            sd_wq_entry_t *e2 = sd_wq_get_conv(ub->res_blocks[r].conv2_weight, ch, ch);
+            if (e1 && e1->amx_d_wpack) { entries++; bytes += e1->amx_d_bytes; }
+            if (e2 && e2->amx_d_wpack) { entries++; bytes += e2->amx_d_bytes; }
+        }
+    }
+    if (!silent)
+        fprintf(stderr, "  [SDAMX-D] persistent INT8 B packs: %d (%.1f MB)\n",
+                entries, (double)bytes / 1e6);
 }
 
 #ifdef USE_BLAS
@@ -401,9 +452,14 @@ static void causal_conv1d_blas(float *out, const float *in,
     if (sd_int8_enabled() && qwen_sd_int8_usable(in_ch, out_ch)) {
         sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
         if (e) {
-            qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
-                             in_ch, out_ch, length, kernel, dilation,
-                             e->Kp, sd_int8_blk());
+            if (sd_amx_d_enabled() && e->amx_d_wpack)
+                qwen_conv1d_int8_design_d(out, in, e->q, e->scales, e->wsum, bias,
+                                          e->amx_d_wpack, in_ch, out_ch, length,
+                                          kernel, dilation, e->Kp, sd_int8_blk());
+            else
+                qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
+                                 in_ch, out_ch, length, kernel, dilation,
+                                 e->Kp, sd_int8_blk());
             return;
         }
     }
@@ -751,6 +807,12 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
             fprintf(stderr, "  ConvTranspose weights: repacked once (%.1f MB, shared after fork)\n",
                     (double)packed_bytes / 1e6);
     }
+
+    /* Design D consumes the persistent AMX B representation from every eligible decoder
+     * residual convolution.  Build it while the model is still being loaded, before any
+     * request thread can enter the decoder.  The current INT8 cache remains the control arm;
+     * an entry without a D pack falls back to that exact path. */
+    sd_amx_d_prepack_decoder(sd, ctx->silent);
 
     if (!ctx->silent) {
         fprintf(stderr, "  Codebooks: 16/16 (dequantized from EMA)\n");
