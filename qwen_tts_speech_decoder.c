@@ -19,6 +19,20 @@
 #include <immintrin.h>
 #endif
 
+/* The decoder cache is present in every backend, but the persistent AMX representation is
+ * compiled only in an AMX build.  Keep the non-AMX symbols here so portable/ARM builds link to
+ * the exact existing fallback without making the kernel translation unit's ISA branches part of
+ * the cache ABI. */
+#if !defined(__AMX_INT8__) || !defined(__AMX_TILE__)
+int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
+                                      size_t *bytes_out) {
+    (void)Wq; (void)rows; (void)Kp;
+    if (bytes_out) *bytes_out = 0;
+    return NULL;
+}
+void qwen_sd_amx_int8_free_weights(int8_t *packed) { free(packed); }
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
