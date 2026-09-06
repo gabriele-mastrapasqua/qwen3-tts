@@ -14,7 +14,7 @@ expect_pool() {
         printf '%s\n' "$output" >&2
         exit 1
     fi
-    if ! printf '%s\n' "$output" | rg -q "decoder\.pool.*${expected}"; then
+    if ! printf '%s\n' "$output" | grep -Eq "decoder\.pool.*${expected}"; then
         echo "FAIL: QWEN_SD_POOL=$requested did not resolve to $expected" >&2
         printf '%s\n' "$output" >&2
         exit 1
@@ -25,7 +25,7 @@ for alias in engine qwen q 1; do expect_pool "$alias" engine; done
 for alias in private 0; do expect_pool "$alias" private; done
 
 effective=$(QWEN_SD_POOL=engine "$bin" --effective-config 2>&1)
-if ! printf '%s\n' "$effective" | rg -q 'QWEN_SD_POOL.*requested=engine resolved=engine'; then
+if ! printf '%s\n' "$effective" | grep -Eq 'QWEN_SD_POOL.*requested=engine resolved=engine'; then
     echo "FAIL: effective-config did not report requested/resolved pool" >&2
     printf '%s\n' "$effective" >&2
     exit 1
@@ -38,7 +38,7 @@ if QWEN_SD_POOL=typo "$bin" --dispatch-map >"$tmp" 2>&1; then
     cat "$tmp" >&2
     exit 1
 fi
-if ! rg -q 'FATAL.*QWEN_SD_POOL.*invalid' "$tmp"; then
+if ! grep -Eq 'FATAL.*QWEN_SD_POOL.*invalid' "$tmp"; then
     echo "FAIL: invalid QWEN_SD_POOL did not produce a clear fatal error" >&2
     cat "$tmp" >&2
     exit 1
