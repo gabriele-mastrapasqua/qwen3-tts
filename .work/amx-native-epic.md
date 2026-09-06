@@ -133,7 +133,12 @@ The 14% cross-process drift; the rows>=cols rule; the B>=4 gate; the B=32 protot
 written; the packed-RHS experiment in the same lifetime and layout; citing AVX-512
 `VDPBF16PS` results as AMX-BF16 evidence.
 
-## 8. AMX-0 RESULT (2026-09-06, Emerald Rapids, 1.7B --int8, AMX build, 2x6, C=4)
+## 8. INVALIDATED MEASUREMENT — DO NOT CITE (kept only as a record of the error)
+
+Everything in this section is WRONG. It is retained so the mistake is legible, not as an
+alternate observation. The current truth is section 9 and section 10.
+
+### [INVALIDATED] AMX-0 first pass
 
 `amx_mac_share` **14.0%**, `amx_call_share` 10.2%, over 1212.1 GMAC / 16525 calls
 (CALL rows only; WRAPPER and SLICE rows re-record MACs already counted underneath, and a
@@ -192,3 +197,29 @@ AMX in production is BF16 tiles in the Talker prefill, 2.0% of all MACs.
 
 This strengthens the class-B classification rather than weakening it, since both method errors
 were in AMX's favour.
+
+## 10. THE ARCHITECTURAL LEAD — what ARM does that x86 does not (2026-09-06)
+
+Read from `qwen_tts_kleidi.c`, not theorised. KleidiAI packs the RHS ONCE and ships TWO
+micro-kernels over THE SAME packed layout:
+
+    INT8/Q4:  qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod      M = 1
+              qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm           M larger
+    BF16:     bf16p1x4_bf16p12x4b_1x36_neon_dot                M = 1
+              bf16p8x4_bf16p12x4b_8x12_neon_mmla               M larger
+
+Both consume `qsi4c32p4x8` / `bf16p12x4b`. That is why `QWEN_MMK_KLEIDI_Q4` is the only matrix
+kernel in this engine with `min_b = 1`.
+
+On x86, at B=1 we leave the matrix world entirely and call `matvec_int8` — a separate path
+that re-reads weights in their original form and consumes no packed representation.
+
+**x86 abandons the packed representation at M=1. ARM keeps it and changes only the
+micro-kernel.** This is the structural gap, and it is not a gate threshold. The x86 analogue
+of the ARM design is a packed-RHS layout shared by an M=1 micro-kernel and the wider matrix
+kernel, so that lowering M changes the kernel shape without leaving the representation.
+
+This reframes the previous "persistent packed RHS costs 4.3 GB for +7%" result once more: it
+was measured on a design where only the WIDE kernel could consume the pack, so the pack paid
+for itself on a fraction of calls. If the M=1 path consumed the same pack, the amortisation
+base is every call, not the rare wide ones.
