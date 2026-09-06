@@ -45,14 +45,15 @@ void qwen_exec_budget_engine_owned(const char *who);
  * activation quantisation and a per-thread row block, so a persistent parallel region can
  * run the same kernels between its own barriers.  Same partition and same kernels as the
  * dispatched path: outputs are bit-identical.  Xt is k-major [cols][B]; Y is [rows][B]. */
+/* Prefill-only wide bf16 matmat (16 < B <= 64): separate entry, qwen_matmat_bf16 unchanged. */
+int qwen_matmat_bf16_wide_available(int rows, int cols);
+int qwen_matmat_bf16_wide(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B);
 /* Named for the capability, not for an ISA feature: "can SOME in-region row-block runner
  * execute this shape inside a held team".  It used to be called qwen_i8mm_usable, which
  * stopped being true the moment the AMX tiles became a valid in-region runner too. */
 int   qwen_region_i8_usable(int rows, int cols, int B);
 int   qwen_region_i8_qkv_usable(int q_rows, int kv_rows, int cols, int B);
 float qwen_region_i8_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b);
-/* Same quantiser for one source row; avoids materialising the [cols][B] staging matrix. */
-float qwen_region_i8_quant_row(int8_t *qb, const float *src, int cols);
 void  qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
                     const float *sx, int rows, int cols, int B, size_t tid, size_t nt);
 void  qwen_region_i8_run_qkv(float *q, float *k, float *v,

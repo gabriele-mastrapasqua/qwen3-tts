@@ -826,6 +826,53 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
     return 0;
 }
 
+static int qwen_prefill_qkv_share_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("QWEN_PREFILL_QKV_SHARE"); on = (e && e[0] == '1'); }
+    return on;
+}
+
+/* QWEN_PREFILL_INT8MM=1: run the prefill projections on the SAME int8 weights the decode
+ * step streams, through the batched int8 matmat (16-token chunks).  Half the bytes of the
+ * bf16 pass and the VNNI compute rate; the prefill activations are quantised per token
+ * exactly as every decode token already is.  Opt-in: it changes the prefill numerics, so
+ * it is a measured candidate, not the reference configuration. */
+static int prefill_int8mm_enabled(void) {
+    static atomic_int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("QWEN_PREFILL_INT8MM"); v = (e && e[0] == '1');
+                 atomic_store_explicit(&on, v, memory_order_relaxed); }
+    return v;
+}
+/* QWEN_PREFILL_CHUNK (16..64, default 16): tokens per bf16 prefill matmat call.  Wider
+ * chunks mean fewer traversals of the bf16 weights for a prompt; the AVX-512 driver
+ * sweeps each weight row once per chunk, bit-identical to 16-wide calls. */
+static int prefill_chunk_tokens(void) {
+    static atomic_int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) { const char *e = getenv("QWEN_PREFILL_CHUNK"); c = e ? atoi(e) : 16;
+                 if (c < 16) c = 16; if (c > 64) c = 64;
+                 if (c > 16 && !qwen_matmat_bf16_wide_available(256, 2048)) c = 16;
+                 atomic_store_explicit(&v, c, memory_order_relaxed); }
+    return c;
+}
+
+static void prefill_proj_matmat_i8(float *Y, const int8_t *Wi, const float *Ws, const float *Xn,
+                                   int seq, int in_dim, int out_dim, float *xT, float *yT) {
+    for (int s0 = 0; s0 < seq; s0 += 16) {
+        int B = seq - s0; if (B > 16) B = 16;
+        for (int b = 0; b < B; b++) {
+            const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
+            for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
+        }
+        qwen_matmat_int8(yT, Wi, Ws, xT, out_dim, in_dim, B);
+        for (int b = 0; b < B; b++) {
+            float *yr = Y + (int64_t)(s0 + b) * out_dim;
+            for (int o = 0; o < out_dim; o++) yr[o] = yT[(int64_t)o * B + b];
+        }
+    }
+}
+
 static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
                                 int seq, int in_dim, int out_dim,
                                 float *xT, float *yT) {
@@ -840,15 +887,24 @@ static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
                                    (long long)out_dim * in_dim * seq);
         return;
     }
-    for (int s0 = 0; s0 < seq; s0 += 16) {
-        int B = seq - s0; if (B > 16) B = 16;
-        qwen_region_begin2(QWEN_RGN_TK_PF_LAYOUT_IN);
-        for (int b = 0; b < B; b++) {
-            const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
-            for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
+    const int CH = prefill_chunk_tokens();
+    for (int s0 = 0; s0 < seq; s0 += CH) {
+        int B = seq - s0; if (B > CH) B = CH;
+        /* A1: the AVX-512 bf16 kernel wants [B][in_dim]; Xn already is that.
+         * Going through qwen_matmat_bf16() would transpose to [in_dim][B] and
+         * then undo it while converting, so hand it the rows directly when
+         * that entry accepts the shape.  Returns 0 on every other backend. */
+        if (!qwen_matmat_bf16_rows(yT, W, Xn + (int64_t)s0 * in_dim, in_dim,
+                                   out_dim, in_dim, B)) {
+            qwen_region_begin2(QWEN_RGN_TK_PF_LAYOUT_IN);
+            for (int b = 0; b < B; b++) {
+                const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
+                for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
+            }
+            qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_IN);
+            if (B <= 16 || !qwen_matmat_bf16_wide(yT, W, xT, out_dim, in_dim, B))
+                qwen_matmat_bf16(yT, W, xT, out_dim, in_dim, B);
         }
-        qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_IN);
-        qwen_matmat_bf16(yT, W, xT, out_dim, in_dim, B);
         qwen_region_begin2(QWEN_RGN_TK_PF_LAYOUT_OUT);
         for (int b = 0; b < B; b++) {
             float *yr = Y + (int64_t)(s0 + b) * out_dim;
@@ -856,6 +912,48 @@ static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
         }
         qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_OUT);
     }
+}
+
+/* A2a: Q, K and V all project the SAME pref_x_norm, so the bf16 activation
+ * block is identical for the three.  Build it once per chunk and run the three
+ * GEMMs against it.  Only the pack is shared: the GEMMs stay separate, the
+ * output layout is unchanged.  Falls back to three independent calls whenever
+ * the row-major AVX-512 path is not the one that would run. */
+static void prefill_proj_matmat_qkv(float *Yq, float *Yk, float *Yv,
+                                    const uint16_t *Wq, const uint16_t *Wk,
+                                    const uint16_t *Wv, const float *Xn,
+                                    int seq, int in_dim, int q_dim, int kv_dim,
+                                    float *xT, float *yT) {
+    if (!qwen_prefill_qkv_share_enabled()) goto fallback;
+    for (int s0 = 0; s0 < seq; s0 += 16) {
+        int B = seq - s0; if (B > 16) B = 16;
+        if (!qwen_matmat_bf16_rows_usable(q_dim,  in_dim, B) ||
+            !qwen_matmat_bf16_rows_usable(kv_dim, in_dim, B)) goto fallback;
+    }
+    qwen_census_op(QWEN_PATH_PREFILL_BF16_NATIVE, q_dim + 2 * kv_dim, in_dim, seq);
+    for (int s0 = 0; s0 < seq; s0 += 16) {
+        int B = seq - s0; if (B > 16) B = 16;
+        /* xT is sized for >= 16 * max(in_dim, 2*inter) floats, i.e. at least
+         * 2x the uint16_t elements this needs. */
+        uint16_t *Xb = (uint16_t *)xT;
+        qwen_bf16_pack_rows(Xb, Xn + (int64_t)s0 * in_dim, in_dim, in_dim, B);
+        qwen_census_op(QWEN_PATH_BF16_ROWPACK_SHARED, in_dim, in_dim, B);
+        const struct { float *Y; const uint16_t *W; int rows; } p[3] = {
+            { Yq, Wq, q_dim }, { Yk, Wk, kv_dim }, { Yv, Wv, kv_dim }
+        };
+        for (int i = 0; i < 3; i++) {
+            qwen_matmat_bf16_packed(yT, p[i].W, Xb, p[i].rows, in_dim, B);
+            for (int b = 0; b < B; b++) {
+                float *yr = p[i].Y + (int64_t)(s0 + b) * p[i].rows;
+                for (int o = 0; o < p[i].rows; o++) yr[o] = yT[(int64_t)o * B + b];
+            }
+        }
+    }
+    return;
+fallback:
+    prefill_proj_matmat(Yq, Wq, Xn, seq, in_dim, q_dim,  xT, yT);
+    prefill_proj_matmat(Yk, Wk, Xn, seq, in_dim, kv_dim, xT, yT);
+    prefill_proj_matmat(Yv, Wv, Xn, seq, in_dim, kv_dim, xT, yT);
 }
 
 static int tk_layer_fully_quantized(const qwen_talker_layer_t *l) {
@@ -1324,10 +1422,11 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     if (use_matmat) {
         int need_in = (h > inter ? h : inter);
         int need_out = 2 * inter;
-        int cap = (need_in > need_out ? need_in : need_out) * 16;
+        const int CH = prefill_chunk_tokens();
+        int cap = (need_in > need_out ? need_in : need_out) * CH;
         if (cap > pp_cap) {
-            float *nx = (float *)realloc(pp_xT, (size_t)need_in * 16 * sizeof(float));
-            float *ny = (float *)realloc(pp_yT, (size_t)need_out * 16 * sizeof(float));
+            float *nx = (float *)realloc(pp_xT, (size_t)need_in * CH * sizeof(float));
+            float *ny = (float *)realloc(pp_yT, (size_t)need_out * CH * sizeof(float));
             if (nx) pp_xT = nx;
             if (ny) pp_yT = ny;
             if (!pp_xT || !pp_yT) { use_matmat = 0; } else { pp_cap = cap; }
@@ -1461,12 +1560,16 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         qwen_region_begin(QWEN_RGN_TK_PF_QKV);
         if (use_matmat) {
             double _p = trace ? pfx_now_ms() : 0.0;
-            prefill_proj_matmat(pref_q, PREFW(l, wq), pref_x_norm, n_new, h, q_dim,  pp_xT, pp_yT);
-            if (trace) { pj_q_ms += pfx_now_ms() - _p; _p = pfx_now_ms(); }
-            prefill_proj_matmat(pref_kn, PREFW(l, wk), pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
-            if (trace) { pj_k_ms += pfx_now_ms() - _p; _p = pfx_now_ms(); }
-            prefill_proj_matmat(pref_vn, PREFW(l, wv), pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
-            if (trace) { pj_v_ms += pfx_now_ms() - _p; pj_calls++; }
+            if (prefill_int8mm_enabled() && l->wq_int8 && l->wk_int8 && l->wv_int8) {
+                prefill_proj_matmat_i8(pref_q,  l->wq_int8, l->wq_scale, pref_x_norm, n_new, h, q_dim,  pp_xT, pp_yT);
+                prefill_proj_matmat_i8(pref_kn, l->wk_int8, l->wk_scale, pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
+                prefill_proj_matmat_i8(pref_vn, l->wv_int8, l->wv_scale, pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
+            } else
+            prefill_proj_matmat_qkv(pref_q, pref_kn, pref_vn,
+                                    PREFW(l, wq), PREFW(l, wk), PREFW(l, wv),
+                                    pref_x_norm, n_new, h, q_dim, kv_dim,
+                                    pp_xT, pp_yT);
+            if (trace) { pj_q_ms += pfx_now_ms() - _p; pj_calls++; }
         } else {
 #ifdef USE_BLAS
         qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, q_dim, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
@@ -1550,6 +1653,9 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         qwen_region_begin(QWEN_RGN_TK_PF_OPROJ);
         if (use_matmat) {
             double _p = trace ? pfx_now_ms() : 0.0;
+            if (prefill_int8mm_enabled() && l->wo_int8)
+                prefill_proj_matmat_i8(pref_proj, l->wo_int8, l->wo_scale, pref_attn_out, n_new, q_dim, h, pp_xT, pp_yT);
+            else
             prefill_proj_matmat(pref_proj, PREFW(l, wo), pref_attn_out, n_new, q_dim, h, pp_xT, pp_yT);
             if (trace) pj_o_ms += pfx_now_ms() - _p;
             for (int64_t i = 0; i < (int64_t)n_new * h; i++)
@@ -1586,6 +1692,9 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         PF_ACC(7); PF_T0();
         qwen_region_begin(QWEN_RGN_TK_PF_GATEUP);
         if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->gate_up_fused_int8)
+                prefill_proj_matmat_i8(pref_gate, l->gate_up_fused_int8, l->gate_up_fused_scale, pref_x_norm, n_new, h, 2 * inter, pp_xT, pp_yT);
+            else
             prefill_proj_matmat(pref_gate, PREFW(l, gate_up_fused), pref_x_norm, n_new, h, 2 * inter, pp_xT, pp_yT);
         } else {
 #ifdef USE_BLAS
@@ -1628,6 +1737,9 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 
         qwen_region_begin(QWEN_RGN_TK_PF_DOWN);
         if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->down_int8)
+                prefill_proj_matmat_i8(pref_proj, l->down_int8, l->down_scale, pref_gate, n_new, inter, h, pp_xT, pp_yT);
+            else
             prefill_proj_matmat(pref_proj, l->down_bf16, pref_gate, n_new, inter, h, pp_xT, pp_yT);
             { double _t = trace ? pfx_now_ms() : 0.0;
               for (int64_t i = 0; i < (int64_t)n_new * h; i++)
@@ -2024,8 +2136,9 @@ typedef struct {
 } tk_region_t;
 
 static void tk_region_gather_quant(tk_region_t *r, const float *src, int b, int j, int cols, int srcstride) {
-    const float *s = src + (size_t)b * srcstride;
-    r->sx[j] = qwen_region_i8_quant_row(r->qx + (size_t)j * cols, s, cols);
+    float *Xt = r->bb->Xt; const float *s = src + (size_t)b * srcstride;
+    for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
+    r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
 }
 static void tk_region_scatter(tk_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
     float *d = dst + (size_t)b * rows;

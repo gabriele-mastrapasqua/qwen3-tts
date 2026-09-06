@@ -278,6 +278,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_NO_VNNI_TILE", "QWEN_NO_VNNI_QKV", "QWEN_NO_X86_QKV", "QWEN_NO_VNNI_ROWSUM",
     "QWEN_NO_VNNI_ACT_QUANT", "QWEN_VNNI_PREPACK", "QWEN_VNNI_TILE_N8",
     "QWEN_VNNI_TILE_M4N2", "QWEN_VNNI_GEMV_MR", "QWEN_VNNI_UACT",
+    "QWEN_PREFILL_ROWPACK", "QWEN_PREFILL_QKV_SHARE",
     "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_AMX_PREPACK_KINDS", "QWEN_AMX_B32", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
     "QWEN_NO_BF16_MATMUL", "QWEN_NO_SDOT", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA", "QWEN_ARM_BFDOT",
     "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
@@ -300,7 +301,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
     "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
-    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_SD_SCRATCH_STATS",
+    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
@@ -1008,6 +1009,23 @@ static inline void qwen_acc_wt_bf16_avx2(float *o, const uint16_t *v, float w, i
 
 #if defined(__AVX512BF16__)
 enum { QWEN_BF16DOT_XMAX = 8192 };
+/* A1: opt-in row-major activation entry for the AVX-512 bf16 matmat.
+ * The generic qwen_matmat_bf16() takes X as [cols][B] because AMX and the ARM
+ * kernels want that layout; the AVX-512 branch then immediately builds
+ * Xb[b][k] = bf16(X[k][b]), i.e. it undoes the transpose.  A caller that
+ * already holds row-major activations therefore pays a transpose and an
+ * inverse transpose to produce a plain contiguous convert.  Default off. */
+static int qwen_prefill_rowpack_enabled(void) {
+    static atomic_int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_PREFILL_ROWPACK");
+        v = (e && e[0] == '1');
+        atomic_store_explicit(&on, v, memory_order_relaxed);
+    }
+    return v;
+}
+
 static int qwen_bf16dot_disabled(void) {
     static atomic_int off = -1;
     int v = atomic_load_explicit(&off, memory_order_relaxed);
@@ -1086,7 +1104,7 @@ static inline uint16_t qwen_f32_to_bf16_scalar(float x) {
 }
 
 static void bf16_matmat_avx512_m4(float *Y, const uint16_t *W, const uint16_t *Xb,
-                                  int r, int cols, int B) {
+                                  int r, int cols, int B, int ldy) {
     __m512 acc[4][4];
     for (int m = 0; m < 4; m++)
         for (int b = 0; b < B; b++) acc[m][b] = _mm512_setzero_ps();
@@ -1106,7 +1124,7 @@ static void bf16_matmat_avx512_m4(float *Y, const uint16_t *W, const uint16_t *X
     }
     for (int m = 0; m < 4; m++) {
         const uint16_t *w = W + (size_t)(r + m) * cols;
-        float *y = Y + (size_t)(r + m) * B;
+        float *y = Y + (size_t)(r + m) * ldy;
         for (int b = 0; b < B; b++) {
             float s = _mm512_reduce_add_ps(acc[m][b]);
             const uint16_t *x = Xb + (size_t)b * cols;
@@ -1117,7 +1135,7 @@ static void bf16_matmat_avx512_m4(float *Y, const uint16_t *W, const uint16_t *X
 }
 
 static void bf16_matmat_avx512_m2(float *Y, const uint16_t *W, const uint16_t *Xb,
-                                  int r, int cols, int B) {
+                                  int r, int cols, int B, int ldy) {
     __m512 acc[2][8];
     for (int m = 0; m < 2; m++)
         for (int b = 0; b < B; b++) acc[m][b] = _mm512_setzero_ps();
@@ -1133,7 +1151,7 @@ static void bf16_matmat_avx512_m2(float *Y, const uint16_t *W, const uint16_t *X
     }
     for (int m = 0; m < 2; m++) {
         const uint16_t *w = W + (size_t)(r + m) * cols;
-        float *y = Y + (size_t)(r + m) * B;
+        float *y = Y + (size_t)(r + m) * ldy;
         for (int b = 0; b < B; b++) {
             float s = _mm512_reduce_add_ps(acc[m][b]);
             const uint16_t *x = Xb + (size_t)b * cols;
@@ -1144,7 +1162,7 @@ static void bf16_matmat_avx512_m2(float *Y, const uint16_t *W, const uint16_t *X
 }
 
 static void bf16_matmat_avx512_m1(float *Y, const uint16_t *W, const uint16_t *Xb,
-                                  int r, int cols, int B) {
+                                  int r, int cols, int B, int ldy) {
     __m512 acc[16];
     for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_ps();
     const uint16_t *w = W + (size_t)r * cols;
@@ -1155,7 +1173,7 @@ static void bf16_matmat_avx512_m1(float *Y, const uint16_t *W, const uint16_t *X
             acc[b] = _mm512_dpbf16_ps(acc[b], wv,
                                       qwen_loadu_pbh(Xb + (size_t)b * cols + k));
     }
-    float *y = Y + (size_t)r * B;
+    float *y = Y + (size_t)r * ldy;
     for (int b = 0; b < B; b++) {
         float s = _mm512_reduce_add_ps(acc[b]);
         const uint16_t *x = Xb + (size_t)b * cols;
@@ -1168,12 +1186,24 @@ static void bf16_matmat_avx512_slice(float *Y, const uint16_t *W, const uint16_t
                                      int r0, int r1, int cols, int B) {
     MMSTAT(QWEN_MMK_BF16_AVX512, r1 - r0, cols, B);
     int r = r0;
-    if (B <= 4) {
-        for (; r + 3 < r1; r += 4) bf16_matmat_avx512_m4(Y, W, Xb, r, cols, B);
-    } else if (B <= 8) {
-        for (; r + 1 < r1; r += 2) bf16_matmat_avx512_m2(Y, W, Xb, r, cols, B);
+    if (B > 16) {
+        /* Wider than the register tile: sweep each weight row once and run the 16-column
+         * kernel per column block, so the row leaves DRAM once for all B columns.  Every
+         * (row, column) accumulates in the same k order as a 16-wide call, so the result
+         * is bit-identical to running the blocks as separate matmats. */
+        for (; r < r1; r++)
+            for (int b0 = 0; b0 < B; b0 += 16) {
+                int nb = B - b0 < 16 ? B - b0 : 16;
+                bf16_matmat_avx512_m1(Y + b0, W, Xb + (size_t)b0 * cols, r, cols, nb, B);
+            }
+        return;
     }
-    for (; r < r1; r++) bf16_matmat_avx512_m1(Y, W, Xb, r, cols, B);
+    if (B <= 4) {
+        for (; r + 3 < r1; r += 4) bf16_matmat_avx512_m4(Y, W, Xb, r, cols, B, B);
+    } else if (B <= 8) {
+        for (; r + 1 < r1; r += 2) bf16_matmat_avx512_m2(Y, W, Xb, r, cols, B, B);
+    }
+    for (; r < r1; r++) bf16_matmat_avx512_m1(Y, W, Xb, r, cols, B, B);
 }
 
 typedef struct {
@@ -3213,6 +3243,81 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
 
 qwen_matmat_bf16_timed_done:
     qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, rows, cols, kt_t0);
+}
+
+/* Returns 1 when it handled the call, 0 when the caller must fall back to
+ * qwen_matmat_bf16() with a [cols][B] buffer.  The guard mirrors the AVX-512
+ * branch of qwen_matmat_bf16() AND the four dispatch steps that precede it;
+ * the two must be kept in sync. */
+int qwen_matmat_bf16_rows_usable(int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    if (!qwen_prefill_rowpack_enabled()) return 0;
+    if (g_qwen_matmat_bf16_hook) return 0;           /* GPU hook owns the call */
+    if (qwen_kleidi_bf16_enabled()) return 0;        /* KleidiAI runs first    */
+    if (qwen_q8r_enabled()) return 0;                /* q8 repack runs first   */
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_BF16_AMX, B, rows, cols) && qwen_amx_bf16_ready())
+        return 0;                                    /* AMX branch runs first  */
+#endif
+    return B >= 1 && B <= 16 && cols >= 32 && !qwen_bf16dot_disabled() &&
+           qwen_mm_use(QWEN_MMK_BF16_AVX512, B, rows, cols);
+#else
+    (void)rows; (void)cols; (void)B; return 0;
+#endif
+}
+
+/* [B][cols] f32 rows with stride ldx -> [B][cols] bf16, the layout the AVX-512
+ * kernel consumes.  Depends only on (Xr, ldx, cols, B): callers that run several
+ * projections over the same activation can build this once. */
+void qwen_bf16_pack_rows(uint16_t *Xb, const float *Xr, int ldx, int cols, int B) {
+    for (int b = 0; b < B; b++) {
+        const float *xr = Xr + (size_t)b * (size_t)ldx;
+        uint16_t *dst = Xb + (size_t)b * (size_t)cols;
+#if defined(__AVX512BF16__)
+        for (int k = 0; k < cols; k++) dst[k] = qwen_f32_to_bf16_scalar(xr[k]);
+#else
+        /* qwen_f32_to_bf16_scalar lives in the AVX-512-BF16 section; this entry is never
+           selected elsewhere (qwen_matmat_bf16_rows_usable() returns 0) but it must link. */
+        for (int k = 0; k < cols; k++) {
+            uint32_t u; memcpy(&u, &xr[k], sizeof u);
+            u += 0x7FFFu + ((u >> 16) & 1u);
+            dst[k] = (uint16_t)(u >> 16);
+        }
+#endif
+    }
+}
+
+void qwen_matmat_bf16_packed(float *Y, const uint16_t *W, const uint16_t *Xb,
+                             int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    qwen_census_op(QWEN_PATH_MATMAT_BF16_ROWS, rows, cols, B);
+    MMSTAT(QWEN_MMK_BF16_AVX512, rows, cols, B);
+    bf16_avx512_ctx c = { Y, W, (uint16_t *)Xb, rows, cols, B };
+    const int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) qwen_parallel((size_t)nt, bf16_avx512_task, &c);
+    else                       bf16_avx512_task(0, 1, &c);
+#else
+    (void)Y; (void)W; (void)Xb; (void)rows; (void)cols; (void)B;
+#endif
+}
+
+/* Returns 1 when it handled the call, 0 when the caller must fall back to
+ * qwen_matmat_bf16() with a [cols][B] buffer.  The guard mirrors the AVX-512
+ * branch of qwen_matmat_bf16() AND the four dispatch steps that precede it;
+ * the two must be kept in sync. */
+int qwen_matmat_bf16_rows(float *Y, const uint16_t *W, const float *Xr,
+                          int ldx, int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    if (!qwen_matmat_bf16_rows_usable(rows, cols, B)) return 0;
+    uint16_t *Xb = mm_scratch_packb((size_t)B * cols);
+    if (!Xb) return 0;
+    qwen_bf16_pack_rows(Xb, Xr, ldx, cols, B);
+    qwen_matmat_bf16_packed(Y, W, Xb, rows, cols, B);
+    return 1;
+#else
+    (void)Y; (void)W; (void)Xr; (void)ldx; (void)rows; (void)cols; (void)B;
+    return 0;
+#endif
 }
 
 static void int8_matmat_generic(float *Y, const int8_t *W, const float *scale,
@@ -10416,6 +10521,7 @@ QWEN_MAYBE_UNUSED static void qwen_region_i8_note_backend(const char *what, int 
             what, rows, cols, B);
 }
 
+
 /* A shape is region-usable when SOME in-region row-block runner can execute it, not only
  * the VNNI one.  The AMX tiles are a valid runner too: qwen_region_i8_run below packs the
  * activations per thread and calls the same int8_amx_task the dispatched path calls, so the
@@ -10452,10 +10558,6 @@ int qwen_region_i8_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
  * no second copy of it. */
 float qwen_region_i8_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b) {
     return quantize_act_int8_col(qb, Xt, cols, B, b);
-}
-float qwen_region_i8_quant_row(int8_t *qb, const float *src, int cols) {
-    /* B=1 is the same quantiser and rounding/clamp contract on a contiguous row. */
-    return quantize_act_int8_col(qb, src, cols, 1, 0);
 }
 void qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
                    const float *sx, int rows, int cols, int B, size_t tid, size_t nt) {
@@ -10516,5 +10618,33 @@ void qwen_region_i8_run_qkv(float *q, float *k, float *v,
 #else
     (void)q; (void)k; (void)v; (void)Wq; (void)sq; (void)Wk; (void)sk; (void)Wv; (void)sv;
     (void)qXt; (void)sx; (void)q_rows; (void)kv_rows; (void)cols; (void)B; (void)tid; (void)nt;
+#endif
+}
+
+/* ---- wide bf16 matmat for the prefill only (16 < B <= 64) ------------------------------
+ * A separate entry point, so qwen_matmat_bf16 and every existing caller keep their exact
+ * behaviour.  Same AVX-512 kernels, one weight-row sweep per call for all B columns. */
+int qwen_matmat_bf16_wide_available(int rows, int cols) {
+#if defined(__AVX512BF16__)
+    return cols >= 32 && !qwen_bf16dot_disabled() && qwen_mm_use(QWEN_MMK_BF16_AVX512, 16, rows, cols);
+#else
+    (void)rows; (void)cols; return 0;
+#endif
+}
+int qwen_matmat_bf16_wide(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    if (B <= 16 || B > 64 || !qwen_matmat_bf16_wide_available(rows, cols)) return 0;
+    uint16_t *Xb = mm_scratch_packb((size_t)B * cols);
+    if (!Xb) return 0;
+    for (int b = 0; b < B; b++)
+        for (int k = 0; k < cols; k++)
+            Xb[(size_t)b * cols + k] = qwen_f32_to_bf16_scalar(X[(size_t)k * B + b]);
+    bf16_avx512_ctx c = { Y, W, Xb, rows, cols, B };
+    int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) qwen_parallel((size_t)nt, bf16_avx512_task, &c);
+    else bf16_avx512_task(0, 1, &c);
+    return 1;
+#else
+    (void)Y; (void)W; (void)X; (void)rows; (void)cols; (void)B; return 0;
 #endif
 }

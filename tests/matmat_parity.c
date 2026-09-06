@@ -70,20 +70,7 @@ int main(int argc, char **argv) {
         float *R = (float *)malloc((size_t)rows * B * sizeof(float));
         int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
         float *sx = (float *)malloc((size_t)B * sizeof(float));
-        float *row = (float *)malloc((size_t)cols * sizeof(float));
-        int8_t *qrow = (int8_t *)malloc((size_t)cols);
-        if (!row || !qrow) { fprintf(stderr, "allocation failed for quant parity B=%d\n", B); return 2; }
-        for (int b = 0; b < B; b++) {
-            sx[b] = qcol(qXt + (size_t)b * cols, X, cols, B, b);
-            for (int k = 0; k < cols; k++) row[k] = X[(size_t)k * B + b];
-            float sr = qwen_region_i8_quant_row(qrow, row, cols);
-            if (sr != sx[b] || memcmp(qrow, qXt + (size_t)b * cols, (size_t)cols) != 0) {
-                fprintf(stderr, "FAIL quant row parity B=%d b=%d scale %.9g/%.9g\n",
-                        B, b, sr, sx[b]);
-                free(row); free(qrow); return 1;
-            }
-        }
-        free(row); free(qrow);
+        for (int b = 0; b < B; b++) sx[b] = qcol(qXt + (size_t)b * cols, X, cols, B, b);
 
         for (int r = 0; r < rows; r++)
             for (int b = 0; b < B; b++) {
