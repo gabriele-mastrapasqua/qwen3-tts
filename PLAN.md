@@ -335,14 +335,30 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       D2 parity + exact-shape benchmark. D3 real server path, with the census PROVING the
       decoder actually executes AMX. D4 AMX BF16 arm on the same shape. D5 compare TOTAL cost
       INT8-AMX vs BF16-AMX. D6 only then choose the production policy.
-      MEASURED 2026-09-06, and it corrects an earlier estimate of mine: the real shapes are
+      MEASURED 2026-09-06, correcting an earlier estimate of mine: the real shapes are
       M = out_ch = 96, N = length ~1900, K = in_ch*kernel = 672, kernel 7 in 13 of 14 calls,
-      ~0.125 GMAC per call. NOT the "M = 512-1024" I stated. Two consequences: K=672 is not a
-      multiple of 64 (10*64 + 32) so an AMX INT8 tiling needs a K-tail path; and M=96 is six
-      row-blocks of 16, so `rows/thread >= 256` would REJECT this shape - a heuristic tuned on
-      Talker/CP applied to a problem it was never measured on. The decoder parallelises over
-      column panels, so each thread does all 96 rows of its own panel; N ~1900 gives ~120
-      column tiles, which is well shaped for AMX even though M is small.
+      ~0.125 GMAC per call. NOT the "M = 512-1024" I stated.
+      THE K-TAIL PROBLEM DOES NOT EXIST, and I raised it in error. K=672 is not what the kernel
+      sees: the buffers are padded to `Kp = qwen_int8_kp(672, blk) = 768` with blk=256, and
+      768 % 64 == 0 AND 768 % 32 == 0, so AMX INT8 (kstep 64) and AMX BF16 (kstep 32) are BOTH
+      naturally aligned - 12 K-steps for INT8, 24 for BF16, and nblk = 3 blocks of 4 INT8
+      K-steps each. Verified that the padding is genuinely zero on BOTH operands:
+      `qwen_int8_quant_rows` memsets a block entirely past K, and closes a PARTIAL block with
+      `for (; i < blk; i++) d[k0 + i] = 0;` - a scalar loop, which is why a first grep for
+      memset appeared to show the tail unzeroed. Weights and the activation panel go through
+      the same function, so [672, 768) contributes exactly zero and no tail path is needed.
+      M=96 is six row-blocks of 16, so `rows/thread >= 256` would REJECT this shape - a
+      heuristic tuned on Talker/CP applied to a problem it was never measured on, and it must
+      NOT be imported into the decoder. The decoder parallelises over COLUMN PANELS: each
+      thread does all 96 rows of its own panel, and N ~1900 gives ~120 column tiles. Thread on
+      N, not on rows.
+      NUMERICAL CONTRACT to preserve exactly: per block b, int32 accumulate, then
+      `f += cvtps(acc) * (swb[m][b] * sab[c][b])`, and finally `out = hsum(f) - 128*wsum term
+      + bias`. The 128*wsum correction exists ONLY because VNNI has dpbusd (u8 x s8). AMX has
+      `tdpbssd` (s8 x s8), so that correction term disappears; the integer products are
+      identical, so the AMX result should differ only by removing a cancellation, i.e. be equal
+      or MORE accurate. Parity is therefore "within tolerance and in the accurate direction",
+      not bit-identical - state which when D2 measures it.
       MEASURED phase split (QWEN_SD_PHASE=1, C=4, 112 reports): im2col 30.6%, gemm 66.9%,
       epilogue 2.5% - so a kernel can address about two thirds. CAVEAT: that run showed
       STREAM_RTF 1.198 against ~0.90 uninstrumented, so the timers perturb the hot path and
