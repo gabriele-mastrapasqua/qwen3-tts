@@ -229,6 +229,12 @@ INVALIDATED — DO NOT CITE: the earlier "AMX is 14% of MACs" and "Talker has ~8
 coverage". Both were read off `kmask`, an OR of every kernel a shape ever used, with a
 `t_census_cur` that is never cleared. Superseded by the per-kernel counters in `f6947eb`.
 
+THE BACKEND IS THE DELIVERABLE, NOT A PRECISION CHOICE. We are not choosing between INT8,
+BF16 and W4 now. We are building an AMX backend in which all three can ACTUALLY EXECUTE, so
+that shape and TOTAL cost choose. Do not optimise one datatype so deeply that the backend
+becomes structurally locked to it, and do not let the highest-confidence target of the moment
+turn this into an INT8-decoder project.
+
 SUCCESS METRIC, reported by EVERY major phase - lower RTF alone does not close this epic:
 `amx_int8_mac_share` · `amx_bf16_mac_share` · TOTAL AMX MAC share · AMX wall share ·
 outside-dispatcher MAC share. Baseline today: INT8 0%, BF16 2.0%, outside 75%. If RTF improves
@@ -324,6 +330,44 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       (AMX-B2), or to use the work that ALREADY has real M (AMX-D, the decoder at B=24-96),
       never to force a tile kernel onto a single column. Confidence medium, uarch reasoning;
       falsified only by an actual `tdpbssd` N=1 microbenchmark, which goes last if ever.
+- [ ] AMX-D1..D6 DECODER, in this order. Do NOT assume INT8 wins before D5.
+      D1 AMX INT8 block-wise vertical slice, preserving the current quantization semantics.
+      D2 parity + exact-shape benchmark. D3 real server path, with the census PROVING the
+      decoder actually executes AMX. D4 AMX BF16 arm on the same shape. D5 compare TOTAL cost
+      INT8-AMX vs BF16-AMX. D6 only then choose the production policy.
+      MEASURED 2026-09-06, and it corrects an earlier estimate of mine: the real shapes are
+      M = out_ch = 96, N = length ~1900, K = in_ch*kernel = 672, kernel 7 in 13 of 14 calls,
+      ~0.125 GMAC per call. NOT the "M = 512-1024" I stated. Two consequences: K=672 is not a
+      multiple of 64 (10*64 + 32) so an AMX INT8 tiling needs a K-tail path; and M=96 is six
+      row-blocks of 16, so `rows/thread >= 256` would REJECT this shape - a heuristic tuned on
+      Talker/CP applied to a problem it was never measured on. The decoder parallelises over
+      column panels, so each thread does all 96 rows of its own panel; N ~1900 gives ~120
+      column tiles, which is well shaped for AMX even though M is small.
+      MEASURED phase split (QWEN_SD_PHASE=1, C=4, 112 reports): im2col 30.6%, gemm 66.9%,
+      epilogue 2.5% - so a kernel can address about two thirds. CAVEAT: that run showed
+      STREAM_RTF 1.198 against ~0.90 uninstrumented, so the timers perturb the hot path and
+      im2col (many short calls) is plausibly overstated. Re-derive before quoting 66.9% as
+      settled.
+- [ ] AMX-BF16-1 REAL AMX BF16 EXECUTION - mandatory, not research. We want `TDPBF16PS` to RUN.
+      Historical AVX-512 `VDPBF16PS` results do NOT answer this. On representative REAL shapes
+      from Talker, CP and decoder, make it possible to SELECT and EXECUTE AMX BF16, and to
+      distinguish it in the census from AVX-512 BF16, VNNI INT8 and AMX INT8. Engine-path
+      evidence, not a synthetic kernel: report bf16 AMX call share, MAC share and wall share,
+      and TOTAL operation latency including conversion and packing.
+- [ ] AMX-W4 W4/INT4 EXECUTION FEASIBILITY - design and feasibility only, no AutoRound runtime.
+      AMX provides no arbitrary W4 matmul instruction, so the question is: CAN W4 STORAGE FEED
+      AN AMX EXECUTION FORMAT ECONOMICALLY? Determine for the current engine W4 path: packed
+      format · where dequantisation happens · weight/activation dtype before compute · whether
+      W4 -> BF16 tiles can feed AMX BF16 · whether a W4A8-like path can feed AMX INT8 ·
+      dequant/expand cost · packed footprint · whether the weight-bandwidth saving SURVIVES the
+      expansion cost · which real 1.7B and 0.6B shapes would benefit.
+- [ ] AMX-CENSUS Multi-precision coverage must be visible. Server runs must distinguish
+      AMX_INT8 · AMX_BF16 · VNNI_INT8 · AVX512_BF16 · W4 path · custom decoder INT8 ·
+      other/outside-dispatcher, and later W4_STORAGE->AMX_BF16 vs W4_STORAGE->AMX_INT8.
+      Metrics: `amx_int8_mac_share` · `amx_bf16_mac_share` · `amx_total_mac_share` ·
+      `amx_request_wall_share` · `w4_storage_share` · `outside_amx_addressable_share`.
+      Per-kernel counters at `f6947eb` already separate AMX INT8 from AMX BF16; the W4-derived
+      split is the open part.
 - [ ] AMX-C Low-M AMX architecture — an engineering problem, not a permanent VNNI regime.
       Q: what specifically costs AMX at low M — tile setup · activation packing · thread
       partition · weight layout · tails · barriers · too little work per thread · epilogue ·
