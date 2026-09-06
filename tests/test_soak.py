@@ -22,6 +22,16 @@ class SoakTests(unittest.TestCase):
         self.assertEqual([picker(i)[0] for i in range(6)],
                          ["long", "medium", "short", "long", "medium", "short"])
 
+    def test_stream_kpis_expose_zero_buffer_diagnostic(self):
+        result = soak_client.stream_kpis(
+            [(0.5, 48000), (1.5, 48000), (3.0, 48000)], 3.0
+        )
+        self.assertAlmostEqual(result["stream_rtf"], 1.25)
+        self.assertAlmostEqual(result["underrun_s"], 0.5)
+        self.assertAlmostEqual(result["stall_max_s"], 0.5)
+        self.assertAlmostEqual(result["prebuffer_s"], 0.5)
+        self.assertEqual(result["chunks"], 3)
+
     def test_stable_windows_are_assessed(self):
         fields = [
             "t_end_s", "worker", "i", "ttfa_ms", "total_ms", "bytes",

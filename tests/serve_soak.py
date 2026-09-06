@@ -479,8 +479,9 @@ def merge_requests(out):
     if not fields:
         fields = [
             "t_end_s", "worker", "i", "ttfb_ms", "ttfa_ms", "total_ms", "bytes",
-            "first_chunk_bytes", "audio_s", "stream_rtf", "is_probe", "class",
-            "text_chars", "seed", "schedule", "error",
+            "first_chunk_bytes", "audio_s", "stream_rtf", "underrun_s",
+            "stall_max_s", "prebuffer_s", "gap_ratio_max", "chunks", "is_probe",
+            "class", "text_chars", "seed", "schedule", "error",
         ]
     rows.sort(key=lambda row: float(row.get("t_end_s") or "inf"))
     with open(os.path.join(out, "requests.csv"), "w", newline="", encoding="utf-8") as handle:

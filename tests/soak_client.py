@@ -50,6 +50,60 @@ def make_picker(rows, worker, seed, schedule):
     return pick
 
 
+def stream_kpis(marks, total_s):
+    """Return streaming and zero-buffer playback diagnostics for one response.
+
+    ``marks`` contains ``(seconds_since_send, bytes_received)``.  The playback
+    fields deliberately describe a zero-jitter-buffer diagnostic, not a server
+    queue metric: they show how much prebuffer a client would need before the
+    first chunk to avoid an audible gap.
+    """
+    if len(marks) < 2:
+        return {
+            "stream_rtf": float("nan"), "underrun_s": float("nan"),
+            "stall_max_s": float("nan"), "prebuffer_s": float("nan"),
+            "gap_ratio_max": float("nan"), "chunks": len(marks),
+        }
+
+    first_at = marks[0][0]
+    remaining_s = sum(size for _, size in marks[1:]) / 48000.0
+    stream_rtf = ((total_s - first_at) / remaining_s
+                  if remaining_s > 0 else float("nan"))
+
+    available = marks[0][1] / 48000.0
+    played = 0.0
+    previous = first_at
+    underrun = 0.0
+    stall_max = 0.0
+    prebuffer = 0.0
+    gap_ratio_max = 0.0
+    for timestamp, size in marks[1:]:
+        duration = size / 48000.0
+        gap = timestamp - previous
+        if duration > 0:
+            gap_ratio_max = max(gap_ratio_max, gap / duration)
+        prebuffer = max(prebuffer, (timestamp - first_at) - available)
+        wanted = played + gap
+        if wanted > available:
+            stall = wanted - available
+            underrun += stall
+            stall_max = max(stall_max, stall)
+            played = available
+        else:
+            played = wanted
+        available += duration
+        previous = timestamp
+
+    return {
+        "stream_rtf": stream_rtf,
+        "underrun_s": underrun,
+        "stall_max_s": stall_max,
+        "prebuffer_s": max(0.0, prebuffer),
+        "gap_ratio_max": gap_ratio_max,
+        "chunks": len(marks),
+    }
+
+
 def one(port, text, speaker, language, seed, temperature, out_path, timeout):
     body = json.dumps({
         "text": text,
@@ -67,6 +121,7 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
     received = first = 0
     first_at = None
     header_at = None
+    marks = []
     handle = open(out_path, "wb") if out_path else None
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -78,6 +133,7 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
                 if first_at is None:
                     first_at = time.time() - started
                     first = len(chunk)
+                marks.append((time.time() - started, len(chunk)))
                 received += len(chunk)
                 if handle:
                     handle.write(chunk)
@@ -89,9 +145,7 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
 
     total = time.time() - started
     audio_s = received / 2.0 / 24000.0
-    remaining_s = (received - first) / 2.0 / 24000.0
-    stream_rtf = ((total - first_at) / remaining_s
-                  if first_at is not None and remaining_s > 0 else float("nan"))
+    kpis = stream_kpis(marks, total)
     return {
         "ttfb_ms": (header_at or 0.0) * 1000.0,
         "ttfa_ms": (first_at or 0.0) * 1000.0,
@@ -99,7 +153,7 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
         "bytes": received,
         "first_chunk_bytes": first,
         "audio_s": audio_s,
-        "stream_rtf": stream_rtf,
+        **kpis,
     }, None
 
 
@@ -139,8 +193,9 @@ def main():
         output = csv.writer(handle)
         output.writerow((
             "t_end_s", "worker", "i", "ttfb_ms", "ttfa_ms", "total_ms", "bytes",
-            "first_chunk_bytes", "audio_s", "stream_rtf", "is_probe", "class",
-            "text_chars", "seed", "schedule", "error",
+            "first_chunk_bytes", "audio_s", "stream_rtf", "underrun_s",
+            "stall_max_s", "prebuffer_s", "gap_ratio_max", "chunks", "is_probe",
+            "class", "text_chars", "seed", "schedule", "error",
         ))
         while time.time() < args.deadline:
             elapsed = time.time() - args.t0
@@ -167,7 +222,8 @@ def main():
             if error:
                 output.writerow((
                     f"{end:.3f}", args.worker, index, "", "", "", "", "", "", "",
-                    int(probe), cls, len(text), seed, args.schedule, error,
+                    "", "", "", "", "", int(probe), cls, len(text), seed,
+                    args.schedule, error,
                 ))
             else:
                 output.writerow((
@@ -175,7 +231,10 @@ def main():
                     f"{result['ttfb_ms']:.1f}", f"{result['ttfa_ms']:.1f}", f"{result['total_ms']:.1f}",
                     result["bytes"], result["first_chunk_bytes"],
                     f"{result['audio_s']:.3f}", f"{result['stream_rtf']:.4f}",
-                    int(probe), cls, len(text), seed, args.schedule, "",
+                    f"{result['underrun_s']:.4f}", f"{result['stall_max_s']:.4f}",
+                    f"{result['prebuffer_s']:.4f}", f"{result['gap_ratio_max']:.4f}",
+                    result["chunks"], int(probe), cls, len(text), seed,
+                    args.schedule, "",
                 ))
             index += 1
 

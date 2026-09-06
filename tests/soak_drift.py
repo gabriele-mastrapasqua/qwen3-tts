@@ -79,6 +79,21 @@ def read_requests(path):
                 ttfb = float(raw["ttfb_ms"])
             except (KeyError, TypeError, ValueError):
                 ttfb = None
+            playback = {}
+            for source, target in (
+                ("underrun_s", "underrun"),
+                ("stall_max_s", "stall_max"),
+                ("prebuffer_s", "prebuffer"),
+                ("gap_ratio_max", "gap_ratio_max"),
+            ):
+                try:
+                    playback[target] = float(raw[source])
+                except (KeyError, TypeError, ValueError):
+                    playback[target] = None
+            try:
+                playback["chunks"] = int(raw["chunks"])
+            except (KeyError, TypeError, ValueError):
+                playback["chunks"] = None
             rows.append({
                 "t": end,
                 "class": raw.get("class", "unknown") or "unknown",
@@ -87,6 +102,7 @@ def read_requests(path):
                 "stream": stream,
                 "audio_s": audio_s,
                 "probe": raw.get("is_probe") == "1",
+                **playback,
             })
     return rows, errors
 
@@ -200,6 +216,9 @@ def analyze(directory, args):
             "ttfb": metric(group, "ttfb"),
             "ttfa": metric(group, "ttfa"),
             "stream": metric(group, "stream"),
+            "underrun": metric(group, "underrun"),
+            "prebuffer": metric(group, "prebuffer"),
+            "stall_max": metric(group, "stall_max"),
             "rows": group,
         })
 
@@ -222,6 +241,12 @@ def analyze(directory, args):
               f"{display(ttfa['p50']):>10} {display(ttfa['p95']):>10} "
               f"{display(stream['p50'], 3):>9} {display(stream['p95'], 3):>9} "
               f"{len(window['mix']):>10}")
+        underrun = window["underrun"]
+        prebuffer = window["prebuffer"]
+        print(f"              zero-buffer diagnostic: underrun p50/p95 "
+              f"{display(underrun['p50'], 3)}/{display(underrun['p95'], 3)} s; "
+              f"prebuffer p50/p95 {display(prebuffer['p50'], 3)}/"
+              f"{display(prebuffer['p95'], 3)} s")
 
     hard_failures = ["request errors"] if errors else []
     kpi = {"status": "NOT_ASSESSED", "reason": "insufficient comparable windows"}
@@ -338,6 +363,9 @@ def analyze(directory, args):
         "n": len(usable),
         "ttfa": metric(usable, "ttfa"),
         "stream": metric(usable, "stream"),
+        "underrun": metric(usable, "underrun"),
+        "prebuffer": metric(usable, "prebuffer"),
+        "stall_max": metric(usable, "stall_max"),
         "mix": proportions(usable),
     }
     if kpi["status"] == "FAIL":
