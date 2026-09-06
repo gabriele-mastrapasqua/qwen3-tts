@@ -1,9 +1,12 @@
-# Agents — read this first
+# Agents — repository entrypoint
 
-`ENGINEERING.md` in this directory is normative for every coding agent (Codex, Claude,
-others): small `PLAN.md` (local, untracked), evidence in `.work/`, code over docs,
-backend matrix for every runtime claim, dispatch proven before any benchmark, strict run
-lifecycle, explicit completion report. Never commit `plan_*.md`, `.work/` or `private/`.
+Read `ENGINEERING.md` before changing the repository. It is the single normative source
+for planning, evidence, backend claims, benchmark lifecycle, privacy, staging and
+commits; do not duplicate or override those rules here.
 
-Build: `make blas`. Gates: `./qwen_tts --caps`, `--self-test`, `--dispatch-map`,
-`make test-golden`.
+`PLAN.md` is the concise current task list. Load only the referenced reviewed
+`.work/*.md` addendum when a task needs detail. Raw benchmark/profiler material belongs
+in the private evidence areas described by `ENGINEERING.md`.
+
+Build and gates: `make blas`; `./qwen_tts --caps`, `--self-test`, `--dispatch-map`, and
+`make test-golden` as applicable to the change.
