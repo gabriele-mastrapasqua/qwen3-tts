@@ -251,8 +251,29 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       Q: for every real GEMV/small-M family in Talker and CP, what formulation makes the
       operation suitable for a matrix kernel, and what is the minimum independent matrix work
       AMX needs to win? NOT "at what B does the current gate start winning".
+      CORRECTIONS from the first analyst pass, verified against the source 2026-09-06:
+        (i)  "KLEIDI_Q4 is the only matrix kernel with min_b=1" was WRONG. `QWEN_MMK_BF16_AVX512`
+             (qwen_tts_kernels.c:2307) also has min_b=1, has a dedicated `bf16_matmat_avx512_m1`,
+             and a real production caller at B=1. So x86 already has a min_b=1 MATRIX kernel;
+             what it lacks is a min_b=1 PACKED-RHS kernel. The gap is smaller than stated: on
+             x86, INT8 at B=1 leaves the matrix path, BF16 does not.
+        (ii) The VNNI N16K4 prepack was ALREADY REJECTED - `qwen_tts_dispatch.c:378`,
+             "REJECTED 2026-09-03 on Zen5 (+1.1% Talker, +3.5% CP, +1.4 GB)": it made the
+             BATCHED path slower. AMX-1's archaeology missed this although it is written in a
+             file that pass had read. The prior on the packed idea is therefore small or zero,
+             not "it just was never wired up".
+        (iii) The hot-shape list omitted CP gate/up 6144x1024, the LARGEST B=1 weight consumer
+             in the engine (40% of CP per-group bytes); it is already in
+             `tests/x86_b1_gemv_bench.c:248`. With Talker gate/up 12288x2048 the two gate/up
+             projections are roughly half of all B=1 INT8 weight traffic.
+        (iv) The "+4.3 GB" price is int8 + bf16 together. An INT8-only pack costs ~1.4 GB, which
+             `qwen_tts_dispatch.c:378` already records. Quoting 4.3 GB against an INT8 proposal
+             overstates it 3x.
+        (v)  On 0.6B the Talker shapes COLLAPSE onto the CP shapes
+             {6144x1024, 4096x1024, 1024x3072, 1024x2048}, all 16/64-aligned. A kernel tuned for
+             the CP set covers 100% of 0.6B decode and 100% of CP on both models.
       SCOPE NOTE: the packed B=1 slice below is a CONTROL and a representation experiment, not
-      the destination. Its purpose is (a) validate a shared packed representation, (b) remove
+      the destination. DEMOTED after (ii): it is no longer the first implementation task. Its purpose is (a) validate a shared packed representation, (b) remove
       the representation discontinuity at M=1, (c) establish the baseline AMX must beat,
       (d) understand cold/warm packing economics. ONE vertical slice, then stop optimizing it
       and ask what would make AMX win on the same shape.
@@ -294,6 +315,15 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       AWAY from AMX. If one persistent representation is to exist it must be the AMX one, with
       VNNI as its consumer - not the reverse. Decide this before any packing lifetime work in
       AMX-G.
+- [ ] AMX-B4 DO NOT build an AMX M=1 kernel, and record why so it is not re-proposed.
+      `tdpbssd` at N=1 uses one column of a 16-wide tile: ~64 int8 MAC/cycle against AVX-512
+      VNNI's 2 ports x 64 = ~128, plus a per-call `LDTILECFG`, on a kernel that is DRAM-bound
+      (the four Talker decode shapes stream 1.41 GB per frame, ~22x one CCX's L3). There is no
+      mechanism by which forcing AMX at M=1 wins. This does NOT weaken the AMX-first mission -
+      it sharpens it: the route to AMX is to CREATE real M by finding independent axes
+      (AMX-B2), or to use the work that ALREADY has real M (AMX-D, the decoder at B=24-96),
+      never to force a tile kernel onto a single column. Confidence medium, uarch reasoning;
+      falsified only by an actual `tdpbssd` N=1 microbenchmark, which goes last if ever.
 - [ ] AMX-C Low-M AMX architecture — an engineering problem, not a permanent VNNI regime.
       Q: what specifically costs AMX at low M — tile setup · activation packing · thread
       partition · weight layout · tails · barriers · too little work per thread · epilogue ·
