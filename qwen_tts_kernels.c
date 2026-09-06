@@ -9517,6 +9517,12 @@ static int sd_amx_enabled(void) {
 }
 #else
 static int sd_amx_enabled(void) { return 0; }
+#endif  /* __AMX_INT8__ */
+
+/* The decoder cache is compiled for every backend, while the persistent AMX representation
+ * only exists in an AMX build.  Keep these symbols unconditional so portable/ARM builds retain
+ * the exact non-AMX fallback and still link. */
+#if !defined(__AMX_INT8__) || !defined(__AMX_TILE__)
 int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
                                       size_t *bytes_out) {
     (void)Wq; (void)rows; (void)Kp;
@@ -9524,7 +9530,7 @@ int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
     return NULL;
 }
 void qwen_sd_amx_int8_free_weights(int8_t *packed) { free(packed); }
-#endif  /* __AMX_INT8__ */
+#endif
 
 static void sd_gemm_panel(float *out, int out_ld, int M,
                           const int8_t *Wq, const float *swb, const int32_t *wsum,
