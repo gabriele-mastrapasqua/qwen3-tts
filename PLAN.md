@@ -338,8 +338,14 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       duration identical, correlation 0.99998 and RMS sample delta 3.70e-4; warm decoder phase
       was 425.5 ms vs V1 438.1 ms in the first short A/B. D3 [ ] prove the same path through
       the streaming server/batched decoder at C2/C4. D4 [ ] real AMX BF16 arm on the same
-      shapes. D5 [ ] compare TOTAL cost INT8-AMX vs BF16-AMX. D6 [ ] choose production policy.
-      V1 remains a control; the initial D timing is not a serving qualification.
+      shapes. D3 [x, 7e973dc] FAST real-server smoke on the canonical 2x6/SMT-off host at C2/C4:
+      both prefork workers executed D, each reported 24 persistent packs / 19.3 MB, zero runtime
+      V1 packs, zero rejects and real `TDPBSSD` tiles; the corrected census had D rows and no
+      duplicate `decoder_conv_int8` rows. C4 one-wave short workload: TTFA p95 183 ms,
+      STREAM_RTF p50/p95 0.913/0.929 (margin 0.087/0.071), 0 errors/rejects, but 4/4 streams
+      needed ~427 ms zero-buffer prebuffer, so this is integration evidence, not qualification.
+      D4 [ ] real AMX BF16 arm on the same shapes. D5 [ ] compare TOTAL cost INT8-AMX vs
+      BF16-AMX. D6 [ ] choose production policy. V1 remains a control.
       MEASURED 2026-09-06, correcting an earlier estimate of mine: the real shapes are
       M = out_ch = 96, N = length ~1900, K = in_ch*kernel = 672, kernel 7 in 13 of 14 calls,
       ~0.125 GMAC per call. NOT the "M = 512-1024" I stated.
