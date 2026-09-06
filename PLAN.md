@@ -336,16 +336,30 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       FAST parity and census: 24 persistent packs / 19.3 MB, zero V1 runtime activation packs,
       all real tested decoder rows on `decoder_conv_amx_int8_design_d`, no AMX rejects, WAV
       duration identical, correlation 0.99998 and RMS sample delta 3.70e-4; warm decoder phase
-      was 425.5 ms vs V1 438.1 ms in the first short A/B. D3 [ ] prove the same path through
-      the streaming server/batched decoder at C2/C4. D4 [ ] real AMX BF16 arm on the same
-      shapes. D3 [x, 7e973dc] FAST real-server smoke on the canonical 2x6/SMT-off host at C2/C4:
-      both prefork workers executed D, each reported 24 persistent packs / 19.3 MB, zero runtime
-      V1 packs, zero rejects and real `TDPBSSD` tiles; the corrected census had D rows and no
-      duplicate `decoder_conv_int8` rows. C4 one-wave short workload: TTFA p95 183 ms,
-      STREAM_RTF p50/p95 0.913/0.929 (margin 0.087/0.071), 0 errors/rejects, but 4/4 streams
-      needed ~427 ms zero-buffer prebuffer, so this is integration evidence, not qualification.
-      D4 [ ] real AMX BF16 arm on the same shapes. D5 [ ] compare TOTAL cost INT8-AMX vs
-      BF16-AMX. D6 [ ] choose production policy. V1 remains a control.
+      was 425.5 ms vs V1 438.1 ms in the first short A/B.
+      D3 [x] the same explicit D arm now enters the actual inline
+      continuous-batching decoder path, not only the per-slot/prefork path. On the canonical
+      2x6/SMT-off host, C2/C4 batch-cap=2 had TTFA p95 100/187 ms, STREAM_RTF p50/p95
+      0.615/0.621 and 1.093/1.234, zero errors/rejects, D rows in the census and non-zero
+      `TDPBSSD` tiles. The 1x6 cap=4 FAST arm reached D at C4 but p95 1.607: integration
+      is proven, serving qualification is NOT. The current ragged panel loop is serial and
+      remains a scheduler/dataflow follow-up.
+      D4 [x] REAL AMX BF16 decoder arm on the same causal-conv
+      shapes, using `TDPBF16PS`, activation-as-A, immutable BF16 B packs and a distinct
+      census path. CLI FAST load builds 26 packs / 62.8 MB; the short run reported real
+      `TDPBF16PS` tiles and 1,046 conversion panels / 151.5 MB of BF16 activation prep. BF16
+      audio duration matched the FP32 control; max sample delta 3.24e-3, RMS 1.36e-4,
+      correlation 0.999996.
+      D5 [x, initial total-cost arms] D-only and BF16-only were measured with the same short
+      streaming workload. At 2x6 per-slot C4, D was STREAM_RTF p95 0.889 versus BF16 1.040;
+      in the real ragged batch path, D C4 p95 was 1.234 while BF16 1x6 cap=4 was 2.260.
+      These totals include prep, tile compute and epilogue, and reject BF16 as the current
+      serving default; an exact-shape phase table is still open. D6 [ ] choose production
+      policy after panel parallelism and a clean committed server smoke. V1 remains a control.
+      CURRENT: D and BF16 are explicit opt-in arms; neither changes the default decoder policy.
+      INVALIDATED: the old runtime-activation-pack assumption does not apply to D; BF16 is
+      not AVX-512 `VDPBF16PS` evidence. NEXT: parallelise/measure the ragged batch panels,
+      rerun short clean-commit C2/C4 arms, then decide policy.
       MEASURED 2026-09-06, correcting an earlier estimate of mine: the real shapes are
       M = out_ch = 96, N = length ~1900, K = in_ch*kernel = 672, kernel 7 in 13 of 14 calls,
       ~0.125 GMAC per call. NOT the "M = 512-1024" I stated.

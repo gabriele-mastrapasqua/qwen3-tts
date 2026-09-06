@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -31,6 +32,17 @@ int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
     return NULL;
 }
 void qwen_sd_amx_int8_free_weights(int8_t *packed) { free(packed); }
+#endif
+
+#if !defined(__AMX_BF16__) || !defined(__AMX_TILE__)
+uint16_t *qwen_sd_amx_bf16_pack_weights(const float *W, int rows, int K,
+                                        int *Kp_out, size_t *bytes_out) {
+    (void)W; (void)rows; (void)K;
+    if (Kp_out) *Kp_out = 0;
+    if (bytes_out) *bytes_out = 0;
+    return NULL;
+}
+void qwen_sd_amx_bf16_free_weights(uint16_t *packed) { free(packed); }
 #endif
 
 #ifdef USE_BLAS
@@ -232,6 +244,19 @@ static int sd_amx_d_enabled(void) {
     return en;
 }
 
+/* BF16 is a separate decoder arm.  It does not depend on the INT8 policy: a server can
+ * select BF16 with QWEN_SD_AMX_BF16=1 and QWEN_SD_INT8=0 to measure the two representations
+ * without silently paying for an unused INT8 cache. */
+static int sd_amx_bf16_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_AMX_BF16");
+        int want = e && *e && *e != '0';
+        en = want && qwen_amx_bf16_available();
+    }
+    return en;
+}
+
 static int sd_phase_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("QWEN_SD_PHASE"); v = (e && *e && *e != '0'); }
@@ -342,6 +367,9 @@ typedef struct {
     int32_t *wsum;
     int8_t *amx_d_wpack;
     size_t amx_d_bytes;
+    uint16_t *amx_bf16_wpack;
+    size_t amx_bf16_bytes;
+    int amx_bf16_Kp;
     int Kp;
 } sd_wq_entry_t;
 
@@ -356,29 +384,54 @@ static sd_wq_entry_t *sd_wq_get_conv(const float *w, int out_ch, int K) {
     for (int i = 0; i < sd_wq_n; i++)
         if (sd_wq[i].src == w) { pthread_mutex_unlock(&sd_wq_mu); return &sd_wq[i]; }
     if (sd_wq_n >= SD_WQ_MAX) { pthread_mutex_unlock(&sd_wq_mu); return NULL; }
-    int blk = sd_int8_blk();
-    int Kp = qwen_int8_kp(K, blk);
+    const int want_bf16 = sd_amx_bf16_enabled();
+    const int want_d = sd_amx_d_enabled();
+    /* A BF16-only arm should not allocate the unused INT8 quantized twin.  Keep INT8 when
+     * Design D is also requested so its exact fallback/control arm remains available. */
+    const int want_i8 = sd_int8_enabled() &&
+                        (!want_bf16 || want_d || (out_ch & 15));
+    if (!want_i8 && !want_bf16) {
+        pthread_mutex_unlock(&sd_wq_mu);
+        return NULL;
+    }
+    const int blk = sd_int8_blk();
+    const int Kp = want_i8 ? qwen_int8_kp(K, blk) : 0;
     sd_wq_entry_t *e = &sd_wq[sd_wq_n];
-    int nblk = Kp / blk;
-    e->q = (int8_t *)aligned_malloc((size_t)out_ch * Kp);
-    e->scales = (float *)aligned_malloc((size_t)out_ch * nblk * sizeof(float));
-    e->wsum = (int32_t *)aligned_malloc((size_t)out_ch * nblk * sizeof(int32_t));
-    if (!e->q || !e->scales || !e->wsum) {
+    memset(e, 0, sizeof *e);
+    const int nblk = want_i8 ? Kp / blk : 0;
+    if (want_i8) {
+        e->q = (int8_t *)aligned_malloc((size_t)out_ch * Kp);
+        e->scales = (float *)aligned_malloc((size_t)out_ch * nblk * sizeof(float));
+        e->wsum = (int32_t *)aligned_malloc((size_t)out_ch * nblk * sizeof(int32_t));
+    }
+    if (want_i8 && (!e->q || !e->scales || !e->wsum)) {
         free(e->q); free(e->scales); free(e->wsum);
+        memset(e, 0, sizeof *e);
         pthread_mutex_unlock(&sd_wq_mu); return NULL;
     }
-    e->src = w; e->Kp = Kp;
-    qwen_int8_quant_rows(e->q, e->scales, w, out_ch, K, Kp, blk);
-    for (int r = 0; r < out_ch; r++) {
-        const int8_t *row = e->q + (size_t)r * Kp;
-        int32_t *ws = e->wsum + (size_t)r * nblk;
-        for (int b = 0; b < nblk; b++) {
-            int32_t acc = 0;
-            for (int k = b * blk; k < (b + 1) * blk; k++) acc += (int32_t)row[k];
-            ws[b] = acc;
+    if (want_bf16)
+        e->amx_bf16_wpack = qwen_sd_amx_bf16_pack_weights(
+            w, out_ch, K, &e->amx_bf16_Kp, &e->amx_bf16_bytes);
+    if (want_bf16 && !e->amx_bf16_wpack && !want_i8) {
+        free(e->q); free(e->scales); free(e->wsum);
+        memset(e, 0, sizeof *e);
+        pthread_mutex_unlock(&sd_wq_mu); return NULL;
+    }
+    if (want_i8) {
+        e->src = w; e->Kp = Kp;
+        qwen_int8_quant_rows(e->q, e->scales, w, out_ch, K, Kp, blk);
+        for (int r = 0; r < out_ch; r++) {
+            const int8_t *row = e->q + (size_t)r * Kp;
+            int32_t *ws = e->wsum + (size_t)r * nblk;
+            for (int b = 0; b < nblk; b++) {
+                int32_t acc = 0;
+                for (int k = b * blk; k < (b + 1) * blk; k++) acc += (int32_t)row[k];
+                ws[b] = acc;
+            }
         }
     }
-    if (sd_amx_d_enabled())
+    e->src = w;
+    if (want_d && want_i8)
         e->amx_d_wpack = qwen_sd_amx_int8_pack_weights(e->q, out_ch, Kp, &e->amx_d_bytes);
     sd_wq_n++;
     pthread_mutex_unlock(&sd_wq_mu);
@@ -392,30 +445,52 @@ void qwen_sd_int8_cache_reset(void) {
         free(sd_wq[i].scales);
         free(sd_wq[i].wsum);
         qwen_sd_amx_int8_free_weights(sd_wq[i].amx_d_wpack);
+        qwen_sd_amx_bf16_free_weights(sd_wq[i].amx_bf16_wpack);
         memset(&sd_wq[i], 0, sizeof sd_wq[i]);
     }
     sd_wq_n = 0;
     pthread_mutex_unlock(&sd_wq_mu);
 }
 
-static void sd_amx_d_prepack_decoder(const qwen_speech_decoder_t *sd, int silent) {
-    if (!sd_amx_d_enabled()) return;
+static void sd_amx_prepack_decoder(const qwen_speech_decoder_t *sd, int silent) {
+    if (!sd_amx_d_enabled() && !sd_amx_bf16_enabled()) return;
     static const int channels[4] = { 768, 384, 192, 96 };
-    int entries = 0;
-    size_t bytes = 0;
+    int d_entries = 0, bf16_entries = 0;
+    size_t d_bytes = 0, bf16_bytes = 0;
+
+    /* These two causal convolutions are outside the residual-block loop, but the streaming
+     * decoder reaches them through the same causal_conv1d_blas dispatcher.  Include them here
+     * so a BF16/D server cannot allocate a new execution representation on its first request. */
+    if (sd_amx_bf16_enabled()) {
+        sd_wq_entry_t *ep = sd_wq_get_conv(sd->pre_conv_weight, 1024, 512 * 3);
+        sd_wq_entry_t *ei = sd_wq_get_conv(sd->initial_conv_weight, 1536, 1024 * 7);
+        sd_wq_entry_t *extra[2] = { ep, ei };
+        for (int i = 0; i < 2; i++) {
+            sd_wq_entry_t *e = extra[i];
+            if (!e) continue;
+            if (e->amx_d_wpack) { d_entries++; d_bytes += e->amx_d_bytes; }
+            if (e->amx_bf16_wpack) { bf16_entries++; bf16_bytes += e->amx_bf16_bytes; }
+        }
+    }
+
     for (int b = 0; b < 4; b++) {
         const qwen_sd_upsample_block_t *ub = &sd->upsample_blocks[b];
         const int ch = channels[b];
         for (int r = 0; r < 3; r++) {
             sd_wq_entry_t *e1 = sd_wq_get_conv(ub->res_blocks[r].conv1_weight, ch, ch * 7);
             sd_wq_entry_t *e2 = sd_wq_get_conv(ub->res_blocks[r].conv2_weight, ch, ch);
-            if (e1 && e1->amx_d_wpack) { entries++; bytes += e1->amx_d_bytes; }
-            if (e2 && e2->amx_d_wpack) { entries++; bytes += e2->amx_d_bytes; }
+            if (e1 && e1->amx_d_wpack) { d_entries++; d_bytes += e1->amx_d_bytes; }
+            if (e2 && e2->amx_d_wpack) { d_entries++; d_bytes += e2->amx_d_bytes; }
+            if (e1 && e1->amx_bf16_wpack) { bf16_entries++; bf16_bytes += e1->amx_bf16_bytes; }
+            if (e2 && e2->amx_bf16_wpack) { bf16_entries++; bf16_bytes += e2->amx_bf16_bytes; }
         }
     }
-    if (!silent)
+    if (!silent && sd_amx_d_enabled())
         fprintf(stderr, "  [SDAMX-D] persistent INT8 B packs: %d (%.1f MB)\n",
-                entries, (double)bytes / 1e6);
+                d_entries, (double)d_bytes / 1e6);
+    if (!silent && sd_amx_bf16_enabled())
+        fprintf(stderr, "  [SDAMX-BF16] persistent BF16 B packs: %d (%.1f MB)\n",
+                bf16_entries, (double)bf16_bytes / 1e6);
 }
 
 #ifdef USE_BLAS
@@ -463,21 +538,30 @@ static void causal_conv1d_blas(float *out, const float *in,
                                const float *weight, const float *bias,
                                int in_ch, int out_ch, int length,
                                int kernel, int dilation) {
-    if (sd_int8_enabled() && qwen_sd_int8_usable(in_ch, out_ch)) {
+    const int use_bf16 = sd_amx_bf16_enabled() && (out_ch & 15) == 0;
+    const int use_i8 = sd_int8_enabled() && qwen_sd_int8_usable(in_ch, out_ch);
+    if (use_bf16 || use_i8) {
         sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
         if (e) {
-            if (sd_amx_d_enabled() && e->amx_d_wpack)
+            if (use_bf16 && e->amx_bf16_wpack)
+                qwen_conv1d_bf16_amx(out, in, bias, e->amx_bf16_wpack,
+                                     in_ch, out_ch, length, kernel, dilation,
+                                     e->amx_bf16_Kp);
+            else if (use_i8 && sd_amx_d_enabled() && e->amx_d_wpack)
                 qwen_conv1d_int8_design_d(out, in, e->q, e->scales, e->wsum, bias,
                                           e->amx_d_wpack, in_ch, out_ch, length,
                                           kernel, dilation, e->Kp, sd_int8_blk());
-            else
+            else if (use_i8 && e->q)
                 qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
                                  in_ch, out_ch, length, kernel, dilation,
                                  e->Kp, sd_int8_blk());
+            else
+                goto decoder_conv_float;
             return;
         }
     }
 
+decoder_conv_float:
     if (kernel == 1) {
         SD_GEMM(CblasNoTrans, CblasNoTrans,
                     out_ch, length, in_ch,
@@ -826,7 +910,7 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
      * residual convolution.  Build it while the model is still being loaded, before any
      * request thread can enter the decoder.  The current INT8 cache remains the control arm;
      * an entry without a D pack falls back to that exact path. */
-    sd_amx_d_prepack_decoder(sd, ctx->silent);
+    sd_amx_prepack_decoder(sd, ctx->silent);
 
     if (!ctx->silent) {
         fprintf(stderr, "  Codebooks: 16/16 (dequantized from EMA)\n");
@@ -2648,6 +2732,96 @@ static void rag_save_tail(float *tail, const float *in, int in_ch,
     }
 }
 
+/* The production request-batching path uses rag_conv1d rather than the per-stream
+ * causal_conv1d_blas worker. Keep the same AMX representations alive there: construct a
+ * panel-local [N][K] im2col view, quantise/convert only the activation, and hand it to the
+ * decoder AMX panel entry point with the load-time B pack. */
+static int rag_conv1d_amx(float *out, const float *in, int in_ch, int out_ch,
+                          const sd_rag_t *r, int kernel, int dilation,
+                          const float *w, const float *bias, float * const *tails,
+                          sd_wq_entry_t *e, int use_bf16, int use_d) {
+    const int64_t total64 = r->total;
+    if (!e || total64 <= 0 || total64 > INT_MAX || kernel <= 1) return 0;
+    if ((!use_bf16 || !e->amx_bf16_wpack) && (!use_d || !e->amx_d_wpack)) return 0;
+
+    const int total = (int)total64;
+    const int K = in_ch * kernel;
+    const int blk = sd_int8_blk();
+    const int Kp = use_bf16 ? e->amx_bf16_Kp : e->Kp;
+    const int nblk = (use_d && !use_bf16) ? Kp / blk : 0;
+    int nc_cap = 128;
+    const char *nc_env = getenv("QWEN_SD_CONV_NC");
+    if (nc_env && *nc_env) {
+        int forced = atoi(nc_env);
+        if (forced >= 24 && forced <= 128) nc_cap = forced;
+    }
+    if (nc_cap > total) nc_cap = total;
+    if (nc_cap <= 0 || K <= 0 || Kp < K) return 0;
+
+    float *col = (float *)sd_tmp_alloc((size_t)nc_cap * (size_t)K * sizeof(float));
+    int8_t *colq = NULL;
+    float *sa = NULL;
+    if (use_d && !use_bf16) {
+        colq = (int8_t *)sd_tmp_alloc((size_t)nc_cap * (size_t)Kp);
+        sa = (float *)sd_tmp_alloc((size_t)nc_cap * (size_t)nblk * sizeof(float));
+    }
+    if (!col || (use_d && !use_bf16 && (!colq || !sa))) {
+        sd_tmp_free(col); sd_tmp_free(colq); sd_tmp_free(sa);
+        return 0; /* retain the established BLAS path on an allocation failure */
+    }
+
+    const int tail_cols = (kernel - 1) * dilation;
+    for (int ts = 0; ts < total; ts += nc_cap) {
+        const int nc = total - ts < nc_cap ? total - ts : nc_cap;
+        memset(col, 0, (size_t)nc * (size_t)K * sizeof(float));
+        for (int b = 0; b < r->n; b++) {
+            const int64_t lo64 = r->off[b] > ts ? r->off[b] : ts;
+            const int64_t hi0 = r->off[b] + r->len[b];
+            const int64_t hi1 = (int64_t)ts + nc;
+            const int64_t hi64 = hi0 < hi1 ? hi0 : hi1;
+            if (lo64 >= hi64) continue;
+            const float *tl_base = tails ? tails[b] : NULL;
+            const float *src_base = in + (int64_t)r->off[b];
+            for (int64_t gc = lo64; gc < hi64; gc++) {
+                const int n = (int)(gc - ts);
+                const int frame = (int)(gc - r->off[b]);
+                float *dst = col + (size_t)n * (size_t)K;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float *src = src_base + (int64_t)ic * total;
+                    const float *tl = tl_base ? tl_base + (int64_t)ic * tail_cols : NULL;
+                    for (int k = 0; k < kernel; k++) {
+                        const int p = frame - (tail_cols - k * dilation);
+                        dst[(size_t)ic * kernel + k] = p >= 0
+                            ? src[p] : (tl ? tl[tail_cols + p] : 0.0f);
+                    }
+                }
+            }
+        }
+
+        int ran_amx;
+        if (use_bf16) {
+            ran_amx = qwen_sd_amx_bf16_panel(out, total, out_ch,
+                                             e->amx_bf16_wpack, NULL,
+                                             col, ts, nc, K, Kp);
+        } else {
+            qwen_int8_quant_rows(colq, sa, col, nc, K, Kp, blk);
+            ran_amx = qwen_sd_amx_int8_panel(out, total, out_ch,
+                                             e->amx_d_wpack, e->scales, e->wsum,
+                                             NULL, colq, sa, ts, nc, Kp, blk);
+        }
+        if (!ran_amx)
+            SD_GEMM(CblasNoTrans, CblasTrans, out_ch, nc, K,
+                    1.0f, w, K, col, K, 0.0f, out + ts, total);
+    }
+    conv_add_bias(out, bias, out_ch, total);
+
+    if (tails)
+        for (int b = 0; b < r->n; b++)
+            rag_save_tail(tails[b], in, in_ch, total, r->off[b], r->len[b], tail_cols);
+    sd_tmp_free(col); sd_tmp_free(colq); sd_tmp_free(sa);
+    return 1;
+}
+
 static int rag_conv1d(float *out, const float *in, int in_ch, int out_ch,
                       const sd_rag_t *r, int kernel, int dilation,
                       const float *w, const float *bias, float * const *tails) {
@@ -2657,6 +2831,17 @@ static int rag_conv1d(float *out, const float *in, int in_ch, int out_ch,
                 1.0f, w, in_ch, in, (int)total, 0.0f, out, (int)total);
         conv_add_bias(out, bias, out_ch, (int)total);
         return 0;
+    }
+
+    const int want_bf16 = sd_amx_bf16_enabled() && (out_ch & 15) == 0;
+    const int want_d = sd_amx_d_enabled() && qwen_sd_int8_usable(in_ch, out_ch);
+    if (want_bf16 || want_d) {
+        sd_wq_entry_t *e = sd_wq_get_conv(w, out_ch, in_ch * kernel);
+        if (e && rag_conv1d_amx(out, in, in_ch, out_ch, r, kernel, dilation,
+                                w, bias, tails, e,
+                                want_bf16 && e->amx_bf16_wpack,
+                                want_d && e->amx_d_wpack))
+            return 0;
     }
 
     int tail_cols = (kernel - 1) * dilation;
@@ -2983,7 +3168,12 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     int nb = 0;
     for (int i = 0; i < n_items; i++) if (it[i].nframes > 0) idx[nb++] = i;
     if (nb == 0) { free(idx); return 0; }
-    if (nb == 1 || !sd_exact_stream_enabled() || sd_int8_enabled()) {
+    /* INT8 used to force the per-slot fallback because rag_conv1d was BLAS-only.  The
+     * decoder-specific AMX panel path now covers the real batched conv shapes, so keep the
+     * ragged batch alive when Design D or BF16 is explicitly selected.  Plain INT8/V1 keeps
+     * the old fallback until it has an equivalent batched panel implementation. */
+    const int sd_batch_amx = sd_amx_d_enabled() || sd_amx_bf16_enabled();
+    if (nb == 1 || !sd_exact_stream_enabled() || (sd_int8_enabled() && !sd_batch_amx)) {
         free(idx);
         return sd_batch_fallback(ctx, it, n_items);
     }

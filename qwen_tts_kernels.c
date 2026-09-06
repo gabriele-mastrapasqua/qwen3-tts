@@ -322,7 +322,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
-    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
+    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
@@ -1951,6 +1951,7 @@ static const struct { int id; const char *name; int kind; } g_path_info[] = {
     { QWEN_PATH_DECODER_CONV_INT8, "decoder_conv_int8", QWEN_PATHK_CALL },
     { QWEN_PATH_DECODER_CONV_AMX_INT8, "decoder_conv_amx_int8", QWEN_PATHK_CALL },
     { QWEN_PATH_DECODER_CONV_AMX_INT8_D, "decoder_conv_amx_int8_design_d", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_AMX_BF16, "decoder_conv_amx_bf16", QWEN_PATHK_CALL },
     { QWEN_PATH_DECODER_CONV_NAIVE, "decoder_conv_naive", QWEN_PATHK_CALL },
 };
 const char *qwen_path_name(int path) {
@@ -2102,6 +2103,9 @@ void qwen_census_report(void *out) {
     }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     { void qwen_sd_amx_rej_report(void); qwen_sd_amx_rej_report(); }
+#endif
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    { void qwen_sd_amx_bf16_report(void); qwen_sd_amx_bf16_report(); }
 #endif
     int ov = atomic_load_explicit(&g_census_overflow, memory_order_relaxed);
     if (ov) fprintf(f, "[shape-census] WARNING: %d ops dropped, table full (%d rows)\n",
@@ -3271,6 +3275,7 @@ QWEN_MM_SCRATCH(pack, int8_t)
 QWEN_MM_SCRATCH(packb, uint16_t)
 QWEN_MM_SCRATCH(sdcolf, float)
 QWEN_MM_SCRATCH(sdcolq, int8_t)
+QWEN_MM_SCRATCH(sdcolb, uint16_t)
 QWEN_MM_SCRATCH(sdamxacc, float)
 QWEN_MM_SCRATCH(sdsa, float)
 QWEN_MM_SCRATCH(corr, int)
@@ -9396,6 +9401,7 @@ static int sd_gemm_panel_amx(float *out, int out_ld, int M,
     qwen_amx_finish_config();
     qwen_census_op(QWEN_PATH_DECODER_CONV_AMX_INT8, M, Kp, nc);
     MMSTAT(QWEN_MMK_INT8_AMX, M, Kp, nc);
+    t_census_cur = NULL;
     return 1;
 }
 
@@ -9502,6 +9508,7 @@ static int sd_gemm_panel_amx_d(float *out, int out_ld, int M,
     qwen_amx_finish_config();
     qwen_census_op(QWEN_PATH_DECODER_CONV_AMX_INT8_D, M, Kp, nc);
     MMSTAT(QWEN_MMK_INT8_AMX, M, Kp, nc);
+    t_census_cur = NULL;
     return 1;
 }
 
@@ -9519,6 +9526,219 @@ static int sd_amx_enabled(void) {
 static int sd_amx_enabled(void) { return 0; }
 #endif  /* __AMX_INT8__ */
 
+#endif  /* x86 VNNI / Arm dot-product decoder kernels */
+
+/* ---- decoder AMX BF16 -------------------------------------------------------------
+ *
+ * This is deliberately a decoder-specific representation.  The generic AMX BF16 path
+ * keeps weights in the A operand layout and packs the activation as B.  The decoder has
+ * the opposite useful lifetime: an im2col panel is made for one request, while the
+ * decoder weights live for the model lifetime.  Keep the activation as A, so it can be
+ * loaded directly from the [N][Kp] panel, and persist the transposed B tiles below.
+ *
+ * A tile:  [ncol][32 BF16]       (one row per output time column)
+ * B tile:  [16 K-pairs][16 output rows * 2 BF16]
+ * C tile:  [ncol][16 FP32]
+ *
+ * The B tile is 1024 bytes.  For B row kg and output row m, the two BF16 values for
+ * K=(kt*32 + kg*2) and K+1 are at [kg][m*2].  This is the layout required by
+ * TDPBF16PS when the activation is its first operand.
+ */
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+
+static atomic_llong g_sd_amx_bf16_pack_count;
+static atomic_llong g_sd_amx_bf16_pack_bytes;
+static atomic_llong g_sd_amx_bf16_convert_panels;
+static atomic_llong g_sd_amx_bf16_convert_bytes;
+static atomic_llong g_sd_amx_bf16_kcalls;
+
+static inline uint16_t sd_f32_to_bf16(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof u);
+    /* Round-to-nearest-even, matching the usual float32 -> BF16 conversion. */
+    u += 0x7fffU + ((u >> 16) & 1U);
+    return (uint16_t)(u >> 16);
+}
+
+static inline float sd_bf16_to_f32(uint16_t x) {
+    uint32_t u = (uint32_t)x << 16;
+    float f;
+    memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+uint16_t *qwen_sd_amx_bf16_pack_weights(const float *W, int rows, int K,
+                                        int *Kp_out, size_t *bytes_out) {
+    if (Kp_out) *Kp_out = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (!W || rows <= 0 || K <= 0 || (rows & 15)) return NULL;
+    const int Kp = (K + 31) & ~31;
+    const size_t row_tiles = (size_t)rows / 16;
+    const size_t k_tiles = (size_t)Kp / 32;
+    /* B has 16 K-pair rows and 16 output columns, with two BF16 values per
+     * output column: 16 * 32 uint16_t = 1024 bytes. */
+    const size_t tile_bytes = (size_t)16 * 32 * sizeof(uint16_t);
+    if (row_tiles > SIZE_MAX / k_tiles ||
+        row_tiles * k_tiles > SIZE_MAX / tile_bytes)
+        return NULL;
+    const size_t bytes = row_tiles * k_tiles * tile_bytes;
+    uint16_t *packed = (uint16_t *)aligned_malloc(bytes);
+    if (!packed) return NULL;
+    memset(packed, 0, bytes); /* includes [K,Kp), which must contribute zero */
+
+    for (size_t rb = 0; rb < row_tiles; rb++) {
+        for (size_t kt = 0; kt < k_tiles; kt++) {
+            uint16_t *dst = packed +
+                (rb * k_tiles + kt) * (tile_bytes / sizeof(uint16_t));
+            for (int kg = 0; kg < 16; kg++) {
+                for (int m = 0; m < 16; m++) {
+                    const int k = (int)kt * 32 + kg * 2;
+                    uint16_t *d = dst + (size_t)kg * 32 + (size_t)m * 2;
+                    if (k < K)
+                        d[0] = sd_f32_to_bf16(W[(size_t)(rb * 16 + (size_t)m) * K + k]);
+                    if (k + 1 < K)
+                        d[1] = sd_f32_to_bf16(W[(size_t)(rb * 16 + (size_t)m) * K + k + 1]);
+                }
+            }
+        }
+    }
+    if (Kp_out) *Kp_out = Kp;
+    if (bytes_out) *bytes_out = bytes;
+    atomic_fetch_add(&g_sd_amx_bf16_pack_count, 1);
+    atomic_fetch_add(&g_sd_amx_bf16_pack_bytes, (long long)bytes);
+    return packed;
+}
+
+void qwen_sd_amx_bf16_free_weights(uint16_t *packed) { free(packed); }
+
+static inline const uint16_t *sd_bf16_weight_tile(const uint16_t *Wpack,
+                                                   int Kp, int m, int k) {
+    const int ktiles = Kp / 32;
+    const size_t tile_words = (size_t)16 * 32;
+    return Wpack + (((size_t)(m / 16) * (size_t)ktiles + (size_t)(k / 32)) * tile_words)
+                       + (size_t)((k % 32) / 2) * 32
+                       + (size_t)(m % 16) * 2 + (k & 1);
+}
+
+/* Cold fallback used only if the AMX capability disappears or a malformed shape reaches
+ * this experimental entry point.  It decodes the same persistent B representation, so it
+ * cannot silently use a different weight layout. */
+static void sd_bf16_panel_fallback(float *out, int out_ld, int M,
+                                   const uint16_t *Wpack, const float *bias,
+                                   const uint16_t *Xb, int tcol0, int nc,
+                                   int Kp) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < nc; n++) {
+            float sum = bias ? bias[m] : 0.0f;
+            const uint16_t *x = Xb + (size_t)n * Kp;
+            for (int k = 0; k < Kp; k++)
+                sum += sd_bf16_to_f32(*sd_bf16_weight_tile(Wpack, Kp, m, k)) *
+                       sd_bf16_to_f32(x[k]);
+            out[(size_t)m * out_ld + tcol0 + n] = sum;
+        }
+    }
+}
+
+static int sd_gemm_panel_amx_bf16(float *out, int out_ld, int M,
+                                  const uint16_t *Wpack, const float *bias,
+                                  const uint16_t *Xb, int tcol0, int nc,
+                                  int K, int Kp) {
+    if (M % 16 || Kp % 32 || !Wpack || !Xb || nc <= 0 || M <= 0 || K <= 0)
+        return 0;
+    if (!qwen_amx_bf16_available()) return 0;
+
+    const int ktiles = Kp / 32;
+    float *acc = mm_scratch_sdamxacc((size_t)M * 16);
+    if (!acc) return 0;
+    float cbuf[16 * 16] __attribute__((aligned(64)));
+    const size_t tile_bytes = (size_t)16 * 32 * sizeof(uint16_t);
+
+    for (int c0 = 0; c0 < nc; c0 += 16) {
+        const int ncol = nc - c0 < 16 ? nc - c0 : 16;
+        qwen_amx_tilecfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.palette_id = 1;
+        for (int t = 0; t < 6; t++) {
+            cfg.rows[t] = (uint8_t)ncol;
+            cfg.colsb[t] = 64;                 /* sixteen FP32 output columns */
+        }
+        cfg.rows[6] = (uint8_t)ncol; cfg.colsb[6] = 64;   /* direct BF16 activation A */
+        cfg.rows[7] = 16;             cfg.colsb[7] = 64;  /* persistent BF16 weight B */
+        qwen_amx_prepare_config(&cfg, 0x53444216u | (unsigned)ncol);
+
+        memset(acc, 0, (size_t)M * 16 * sizeof(float));
+        for (int m0 = 0; m0 < M; m0 += 6 * 16) {
+            int mb = (M - m0) / 16;
+            if (mb > 6) mb = 6;
+            for (int t = 0; t < mb; t++) _tile_zero(t);
+
+            for (int kt = 0; kt < ktiles; kt++) {
+                const uint16_t *ap = Xb + (size_t)(c0 * Kp + kt * 32);
+                _tile_loadd(6, ap, (size_t)Kp * sizeof(uint16_t));
+                for (int t = 0; t < mb; t++) {
+                    const int rb = m0 / 16 + t;
+                    const uint16_t *bp = Wpack +
+                        ((size_t)rb * (size_t)ktiles + (size_t)kt) * tile_bytes / sizeof(uint16_t);
+                    _tile_loadd(7, bp, 64);
+                    switch (t) {
+                        case 0: _tile_dpbf16ps(0, 6, 7); break;
+                        case 1: _tile_dpbf16ps(1, 6, 7); break;
+                        case 2: _tile_dpbf16ps(2, 6, 7); break;
+                        case 3: _tile_dpbf16ps(3, 6, 7); break;
+                        case 4: _tile_dpbf16ps(4, 6, 7); break;
+                        default: _tile_dpbf16ps(5, 6, 7); break;
+                    }
+                }
+            }
+            atomic_fetch_add(&g_sd_amx_bf16_kcalls, (long long)mb * ktiles);
+
+            for (int t = 0; t < mb; t++) {
+                switch (t) {
+                    case 0: _tile_stored(0, cbuf, 64); break;
+                    case 1: _tile_stored(1, cbuf, 64); break;
+                    case 2: _tile_stored(2, cbuf, 64); break;
+                    case 3: _tile_stored(3, cbuf, 64); break;
+                    case 4: _tile_stored(4, cbuf, 64); break;
+                    default: _tile_stored(5, cbuf, 64); break;
+                }
+                for (int n = 0; n < ncol; n++) {
+                    for (int m = 0; m < 16; m++) {
+                        const int row = m0 + t * 16 + m;
+                        acc[(size_t)row * 16 + n] += cbuf[n * 16 + m];
+                    }
+                }
+            }
+        }
+
+        for (int m = 0; m < M; m++) {
+            float *o = out + (size_t)m * out_ld + tcol0 + c0;
+            const float bb = bias ? bias[m] : 0.0f;
+            for (int n = 0; n < ncol; n++) o[n] = acc[(size_t)m * 16 + n] + bb;
+        }
+    }
+
+    qwen_amx_finish_config();
+    qwen_census_op(QWEN_PATH_DECODER_CONV_AMX_BF16, M, K, nc);
+    MMSTAT(QWEN_MMK_BF16_AMX, M, K, nc);
+    t_census_cur = NULL;
+    return 1;
+}
+
+void qwen_sd_amx_bf16_report(void) {
+    fprintf(stderr, "[SDAMX-BF16] weight_packs=%lld weight_MB=%.1f conversion_panels=%lld conversion_MB=%.1f tdpbf16_tiles=%lld\n",
+            (long long)atomic_load(&g_sd_amx_bf16_pack_count),
+            (double)atomic_load(&g_sd_amx_bf16_pack_bytes) / 1e6,
+            (long long)atomic_load(&g_sd_amx_bf16_convert_panels),
+            (double)atomic_load(&g_sd_amx_bf16_convert_bytes) / 1e6,
+            (long long)atomic_load(&g_sd_amx_bf16_kcalls));
+}
+
+#endif  /* __AMX_BF16__ && __AMX_TILE__ */
+
+#ifndef SD_INT8_NC
+#define SD_INT8_NC 128
+#endif
+#if defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__)
 static void sd_gemm_panel(float *out, int out_ld, int M,
                           const int8_t *Wq, const float *swb, const int32_t *wsum,
                           const float *bias,
@@ -9540,8 +9760,6 @@ static void sd_gemm_panel(float *out, int out_ld, int M,
                 sd_tile_1xN(out, out_ld, m, tcol0 + c, Wq, swb, wsum, bias, Xq, sab, c, nc - c, Kp, blk, nblk);
     }
 }
-
-#define SD_INT8_NC 128
 
 typedef struct {
     float *out;
@@ -9702,6 +9920,95 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
     qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 
+#endif  /* x86 VNNI / Arm dot-product decoder kernels */
+
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+typedef struct {
+    float *out;
+    const float *in;
+    const float *bias;
+    const uint16_t *Wpack;
+    int in_ch, out_ch, length, kernel, dilation, K, Kp;
+    _Atomic int next_panel;
+    _Atomic int entered;
+    int n_panels;
+    int nc;
+} sd_bf16_conv_job_t;
+
+static void sd_bf16_conv_worker(void *vj) {
+    sd_bf16_conv_job_t *j = (sd_bf16_conv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
+    const int pad_left = (j->kernel - 1) * j->dilation;
+    uint16_t *colb = mm_scratch_sdcolb((size_t)SD_INT8_NC * j->Kp);
+    long long claimed = 0;
+    if (!colb) return;
+
+    for (;;) {
+        const int p = atomic_fetch_add(&j->next_panel, 1);
+        if (p >= j->n_panels) break;
+        claimed++;
+        const int t0 = p * j->nc;
+        const int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
+        for (int c = 0; c < nc; c++) {
+            uint16_t *dst = colb + (size_t)c * j->Kp;
+            const int tt = t0 + c - pad_left;
+            for (int ic = 0; ic < j->in_ch; ic++) {
+                const float *src = j->in + (size_t)ic * j->length;
+                uint16_t *dk = dst + (size_t)ic * j->kernel;
+                for (int kk = 0; kk < j->kernel; kk++) {
+                    const int pos = tt + kk * j->dilation;
+                    dk[kk] = (pos >= 0 && pos < j->length)
+                           ? sd_f32_to_bf16(src[pos]) : 0;
+                }
+            }
+            if (j->Kp > j->K)
+                memset(dst + j->K, 0, (size_t)(j->Kp - j->K) * sizeof(uint16_t));
+        }
+        atomic_fetch_add(&g_sd_amx_bf16_convert_panels, 1);
+        atomic_fetch_add(&g_sd_amx_bf16_convert_bytes,
+                         (long long)nc * j->Kp * (long long)sizeof(uint16_t));
+        if (!sd_gemm_panel_amx_bf16(j->out, j->length, j->out_ch, j->Wpack, j->bias,
+                                    colb, t0, nc, j->K, j->Kp)) {
+            sd_bf16_panel_fallback(j->out, j->length, j->out_ch, j->Wpack, j->bias,
+                                   colb, t0, nc, j->Kp);
+            qwen_census_op(QWEN_PATH_DECODER_CONV_NAIVE, j->out_ch, j->K, nc);
+            qwen_census_leaf(QWEN_LEAF_SCALAR);
+            t_census_cur = NULL;
+        }
+    }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_BF16, claimed);
+}
+
+void qwen_conv1d_bf16_amx(float *out, const float *in,
+                          const float *bias, const uint16_t *Wpack,
+                          int in_ch, int out_ch, int length, int kernel, int dilation,
+                          int Kp) {
+    const int K = in_ch * kernel;
+    if (!out || !in || !Wpack || in_ch <= 0 || out_ch <= 0 || length <= 0 || Kp < K) return;
+    sd_bf16_conv_job_t job = {
+        .out = out, .in = in, .bias = bias, .Wpack = Wpack,
+        .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .kernel = kernel, .dilation = dilation, .K = K, .Kp = Kp,
+    };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    atomic_store(&job.entered, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_BF16, sd_pool_threads(), job.n_panels);
+    sd_pool_run(sd_bf16_conv_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_BF16, atomic_load(&job.entered));
+}
+#else
+void qwen_conv1d_bf16_amx(float *out, const float *in,
+                          const float *bias, const uint16_t *Wpack,
+                          int in_ch, int out_ch, int length, int kernel, int dilation,
+                          int Kp) {
+    (void)out; (void)in; (void)bias; (void)Wpack;
+    (void)in_ch; (void)out_ch; (void)length; (void)kernel; (void)dilation; (void)Kp;
+}
+#endif
+
+#if defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__)
 typedef struct {
     float *out; int out_ld;
     const int8_t *Wq; const float *sw; const int32_t *wsum;
@@ -9823,6 +10130,48 @@ void qwen_gemm_int8(float *out, int out_ld,
 }
 
 #endif
+
+int qwen_sd_amx_int8_panel(float *out, int out_ld, int M,
+                           const int8_t *Wpack, const float *sw,
+                           const int32_t *wsum, const float *bias,
+                           const int8_t *Xq, const float *sa,
+                           int tcol0, int nc, int Kp, int blk) {
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__) && \
+    (defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__))
+    return sd_gemm_panel_amx_d(out, out_ld, M, Wpack, sw, wsum, bias,
+                               Xq, sa, tcol0, nc, Kp, blk);
+#else
+    (void)out; (void)out_ld; (void)M; (void)Wpack; (void)sw; (void)wsum;
+    (void)bias; (void)Xq; (void)sa; (void)tcol0; (void)nc; (void)Kp; (void)blk;
+    return 0;
+#endif
+}
+
+int qwen_sd_amx_bf16_panel(float *out, int out_ld, int M,
+                           const uint16_t *Wpack, const float *bias,
+                           const float *Xf, int tcol0, int nc, int K, int Kp) {
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if (!out || !Wpack || !Xf || nc <= 0 || K <= 0 || Kp < K ||
+        (Kp & 31) || !qwen_amx_bf16_available()) return 0;
+    uint16_t *Xb = mm_scratch_sdcolb((size_t)nc * (size_t)Kp);
+    if (!Xb) return 0;
+    for (int n = 0; n < nc; n++) {
+        uint16_t *dst = Xb + (size_t)n * Kp;
+        const float *src = Xf + (size_t)n * K;
+        for (int k = 0; k < K; k++) dst[k] = sd_f32_to_bf16(src[k]);
+        if (Kp > K) memset(dst + K, 0, (size_t)(Kp - K) * sizeof(*dst));
+    }
+    atomic_fetch_add(&g_sd_amx_bf16_convert_panels, 1);
+    atomic_fetch_add(&g_sd_amx_bf16_convert_bytes,
+                     (long long)nc * Kp * (long long)sizeof(uint16_t));
+    return sd_gemm_panel_amx_bf16(out, out_ld, M, Wpack, bias,
+                                  Xb, tcol0, nc, K, Kp);
+#else
+    (void)out; (void)out_ld; (void)M; (void)Wpack; (void)bias; (void)Xf;
+    (void)tcol0; (void)nc; (void)K; (void)Kp;
+    return 0;
+#endif
+}
 
 #if (defined(__ARM_NEON) || defined(__AVX2__)) && !(defined(__APPLE__) && defined(USE_BLAS))
 #define QWEN_SIN_POLY_MAX 8192.0f

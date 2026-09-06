@@ -118,6 +118,7 @@ enum {
     QWEN_PATH_DECODER_SGEMM = 50, QWEN_PATH_DECODER_CONV_INT8, QWEN_PATH_DECODER_CONV_NAIVE,
     QWEN_PATH_DECODER_CONV_AMX_INT8 = 53,
     QWEN_PATH_DECODER_CONV_AMX_INT8_D = 54,
+    QWEN_PATH_DECODER_CONV_AMX_BF16 = 55,
     QWEN_PATH_COUNT
 };
 /* kind: what a row means for coverage accounting */
@@ -386,6 +387,19 @@ void qwen_sd_int8_cache_reset(void);
 int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
                                       size_t *bytes_out);
 void qwen_sd_amx_int8_free_weights(int8_t *packed);
+uint16_t *qwen_sd_amx_bf16_pack_weights(const float *W, int rows, int K,
+                                        int *Kp_out, size_t *bytes_out);
+void qwen_sd_amx_bf16_free_weights(uint16_t *packed);
+/* Decoder ragged-batch panel entry points.  X is panel-local [N][K] and the output column
+ * offset is global in out[rows][out_ld].  Return 1 only when the real AMX tile path ran. */
+int qwen_sd_amx_int8_panel(float *out, int out_ld, int M,
+                           const int8_t *Wpack, const float *sw,
+                           const int32_t *wsum, const float *bias,
+                           const int8_t *Xq, const float *sa,
+                           int tcol0, int nc, int Kp, int blk);
+int qwen_sd_amx_bf16_panel(float *out, int out_ld, int M,
+                           const uint16_t *Wpack, const float *bias,
+                           const float *Xf, int tcol0, int nc, int K, int Kp);
 /* B=1 capability: 1 = a native integer GEMV runs, 0 = B=1 dequantises to the f32 twin. */
 int qwen_int8_gemv_native(void);
 int qwen_q4_gemv_native(void);
@@ -454,6 +468,11 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
                                const float *bias, const int8_t *Wpack,
                                int in_ch, int out_ch, int length, int kernel, int dilation,
                                int Kp, int blk);
+
+void qwen_conv1d_bf16_amx(float *out, const float *in,
+                          const float *bias, const uint16_t *Wpack,
+                          int in_ch, int out_ch, int length, int kernel, int dilation,
+                          int Kp);
 
 void qwen_gemm_int8(float *out, int out_ld,
                     const int8_t *Wq, const float *sw, const int32_t *wsum,

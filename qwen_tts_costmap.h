@@ -99,7 +99,10 @@ enum {
     QWEN_RGN_CPB_LOTHER,          /* every other barrier interval in the layer    */
     QWEN_RGN_CPB_LMHEAD,          /* the 15 lm_head projections + argmax          */
 
-    QWEN_RGN_MAX = 78
+    /* decoder BF16 AMX panels (append-only; the INT8 panel id above is retained) */
+    QWEN_RGN_SD_CONV_BF16 = 78,
+
+    QWEN_RGN_MAX = 79
 };
 
 #define QWEN_RGN_MULTI (-1)       /* declared parent for legitimately multi-parent regions */

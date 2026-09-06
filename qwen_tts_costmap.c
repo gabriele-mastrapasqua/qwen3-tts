@@ -66,6 +66,7 @@ static const rgn_info_t g_rgn[] = {
     { QWEN_RGN_RT_POOL_WAIT,      "runtime.pool_wait_completion",     QWEN_RGN_RT_POOL_DISPATCH, 1, "runtime" , "stack" },
     { QWEN_RGN_RT_POOL_SUBMIT,    "runtime.pool_submit_wait",         QWEN_RGN_RT_POOL_DISPATCH, 1, "runtime" , "stack" },
     { QWEN_RGN_SD_CONV_INT8,      "decoder.conv_int8.panels",         QWEN_RGN_MULTI,       1, "decoder" , "stack" },
+    { QWEN_RGN_SD_CONV_BF16,      "decoder.conv_bf16.panels",         QWEN_RGN_MULTI,       1, "decoder" , "stack" },
     { QWEN_RGN_MM_REGION_I8,      "region.int8_runner.rows",          QWEN_RGN_MULTI,       1, "runtime" , "stack" },
     { QWEN_RGN_CPB_MTP,           "cp.batch.mtp",                     QWEN_RGN_MULTI,       1, "cp"      , "derived" },
     { QWEN_RGN_CPB_QKV,           "cp.batch.qkv",                     QWEN_RGN_MULTI,       1, "cp"      , "derived" },
