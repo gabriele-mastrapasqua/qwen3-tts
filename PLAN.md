@@ -331,10 +331,15 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       never to force a tile kernel onto a single column. Confidence medium, uarch reasoning;
       falsified only by an actual `tdpbssd` N=1 microbenchmark, which goes last if ever.
 - [ ] AMX-D1..D6 DECODER, in this order. Do NOT assume INT8 wins before D5.
-      D1 AMX INT8 block-wise vertical slice, preserving the current quantization semantics.
-      D2 parity + exact-shape benchmark. D3 real server path, with the census PROVING the
-      decoder actually executes AMX. D4 AMX BF16 arm on the same shape. D5 compare TOTAL cost
-      INT8-AMX vs BF16-AMX. D6 only then choose the production policy.
+      D1 [x, 0cb34ec] AMX INT8 Design D: persistent decoder B packs, direct quantised
+      activation-as-A, M=96/192/384/768, with the existing path as fallback. D2 [x] CLI/GCP
+      FAST parity and census: 24 persistent packs / 19.3 MB, zero V1 runtime activation packs,
+      all real tested decoder rows on `decoder_conv_amx_int8_design_d`, no AMX rejects, WAV
+      duration identical, correlation 0.99998 and RMS sample delta 3.70e-4; warm decoder phase
+      was 425.5 ms vs V1 438.1 ms in the first short A/B. D3 [ ] prove the same path through
+      the streaming server/batched decoder at C2/C4. D4 [ ] real AMX BF16 arm on the same
+      shapes. D5 [ ] compare TOTAL cost INT8-AMX vs BF16-AMX. D6 [ ] choose production policy.
+      V1 remains a control; the initial D timing is not a serving qualification.
       MEASURED 2026-09-06, correcting an earlier estimate of mine: the real shapes are
       M = out_ch = 96, N = length ~1900, K = in_ch*kernel = 672, kernel 7 in 13 of 14 calls,
       ~0.125 GMAC per call. NOT the "M = 512-1024" I stated.
@@ -391,15 +396,11 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       limit is hardware/shape and we record it; if it wins where we lose, our implementation is
       immature; if AMX only wins after changing representation, that is an engine task.
       "tiny-M -> VNNI" may still be the answer, but as a measured conclusion, never a premise.
-- [ ] AMX-D Speech decoder — the largest addressable matrix block, promoted to a major task.
-      76.6% of request MACs, 0.0% AMX, and it bypasses the dispatcher entirely: the fp32 path
-      is `im2col` + `cblas_sgemm`, the int8 path is `sd_gemm_panel` -> `sd_tile_2x4`/`1xN`, a
-      hand-written register tile. Dimensions are matrix-friendly: M = out_ch 512-1024,
-      K = in_ch*kernel, N = panel columns.
-      Compare on the EXACT real conv shapes: current custom INT8 · current fp32/OpenBLAS ·
-      oneDNN INT8 · oneDNN BF16 · native AMX INT8 prototype · native AMX BF16 prototype.
-      Measure the COMPLETE cost — im2col, quantization, packing, kernel, epilogue, TOTAL.
-      Never benchmark the GEMM alone and claim a decoder gain.
+- [x] AMX-D Speech decoder scope is now captured by AMX-D1..D6 above. The real residual-conv
+      shapes are M=96/192/384/768, N=decoder panel columns, K=in_ch*kernel with Kp padded
+      to the INT8 block geometry; the decoder bypasses the generic dispatcher and owns its
+      column-panel parallelism. Keep complete-operation timing (im2col, quantisation or BF16
+      prep, persistent representation, tile compute, epilogue) separate from kernel-only timing.
 - [ ] AMX-E BF16 as a first-class backend. We have ZERO historical AMX-BF16 evidence beyond the
       prefill that runs today: AVX-512 `VDPBF16PS` results are NOT AMX `TDPBF16PS` results.
       Compare TOTAL operation cost — W8A8 pays quant + pack + AMX INT8 + int32 scale/convert;

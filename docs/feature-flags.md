@@ -267,6 +267,8 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
 | `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |
+| `QWEN_SD_AMX` | off | decoder INT8 AMX control path (V1); requires the AMX INT8 build/capability and `QWEN_SD_INT8=1`, otherwise the decoder falls back to its selected INT8/FP32 path |
+| `QWEN_SD_AMX_D` | off | experimental decoder INT8 Design D; prebuilds immutable AMX B weight tiles at model load and loads the quantised im2col panel directly as AMX A. It supports the real M=96/192/384/768 decoder shapes, reports persistent pack bytes and falls back to V1/INT8 if a shape is unsupported. The current implementation is not yet a serving default; server C2/C4 validation is pending |
 | `QWEN_SD_INT8_BLK` | compiled default | block size of the int8 decoder convolution tiles |
 | `QWEN_SD_CONV_NC` | all | auto | output columns per work item in the INT8 decoder conv. Auto sizes the panel from the layer length and the pool so a short layer still fills it; `=128` restores the old fixed panel (the A/B arm). Each column is im2col'd, quantised and scaled independently, so the panel size changes only WHO computes a column, never its value |
 | `QWEN_SD_WINDOWED` | off | windowed decoder evaluation; diagnostic for the streaming boundary |
