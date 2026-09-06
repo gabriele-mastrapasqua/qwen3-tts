@@ -9684,16 +9684,9 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
                                const float *bias, const int8_t *Wpack,
                                int in_ch, int out_ch, int length, int kernel, int dilation,
                                int Kp, int blk) {
-    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, out_ch, in_ch * kernel, length);
-#if defined(__ARM_FEATURE_DOTPROD)
-    qwen_census_leaf(QWEN_LEAF_SDOT);
-#elif defined(__AVX512VNNI__)
-    qwen_census_leaf(QWEN_LEAF_VNNI);
-#elif defined(__AVX512F__)
-    qwen_census_leaf(QWEN_LEAF_AVX512F);
-#else
-    qwen_census_leaf(QWEN_LEAF_SCALAR);
-#endif
+    /* The worker records the actual selected path.  Do not emit the legacy INT8/VNNI wrapper
+     * row here: on AMX Design D it would duplicate the MACs and falsely claim a VNNI fallback. */
+    (void)in_ch; (void)out_ch; (void)length; (void)kernel; (void)dilation;
     sd_conv_job_t job = {
         .out = out, .in = in, .Wq = Wq, .Wpack = Wpack,
         .sw = sw, .wsum = wsum, .bias = bias,
