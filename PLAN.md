@@ -229,6 +229,16 @@ INVALIDATED — DO NOT CITE: the earlier "AMX is 14% of MACs" and "Talker has ~8
 coverage". Both were read off `kmask`, an OR of every kernel a shape ever used, with a
 `t_census_cur` that is never cleared. Superseded by the per-kernel counters in `f6947eb`.
 
+SUCCESS METRIC, reported by EVERY major phase - lower RTF alone does not close this epic:
+`amx_int8_mac_share` · `amx_bf16_mac_share` · TOTAL AMX MAC share · AMX wall share ·
+outside-dispatcher MAC share. Baseline today: INT8 0%, BF16 2.0%, outside 75%. If RTF improves
+while AMX stays near 2%, that is a useful generic x86 win and the AMX epic is STILL OPEN.
+
+VNNI IS NOT THE DESTINATION. It is the current baseline, a correctness oracle, a tiny-M
+fallback IF AMX is proven inferior, and a transitional consumer of a shared layout. Every VNNI
+change must answer: how does this feed, enable or share representation with AMX? If the answer
+is only "VNNI gets faster", it is secondary unless it is needed as a control.
+
 - [ ] AMX-A Trusted current execution map. Q: what does the merged real server execute NOW?
       Validate the fixed census against source invariants, and treat a violated invariant as a
       stop-the-line event, not a footnote: the decoder's custom conv must NEVER appear as a
@@ -241,6 +251,11 @@ coverage". Both were read off `kmask`, an OR of every kernel a shape ever used, 
       Q: for every real GEMV/small-M family in Talker and CP, what formulation makes the
       operation suitable for a matrix kernel, and what is the minimum independent matrix work
       AMX needs to win? NOT "at what B does the current gate start winning".
+      SCOPE NOTE: the packed B=1 slice below is a CONTROL and a representation experiment, not
+      the destination. Its purpose is (a) validate a shared packed representation, (b) remove
+      the representation discontinuity at M=1, (c) establish the baseline AMX must beat,
+      (d) understand cold/warm packing economics. ONE vertical slice, then stop optimizing it
+      and ask what would make AMX win on the same shape.
       Per family: current shape · current GEMV/VNNI path · why the AMX gate rejects it ·
       rows/thread · effective B · weight traffic · activation-prep cost · whether a GEMM-style
       formulation exists · whether ARM already has that transformation · numerical and
@@ -252,6 +267,33 @@ coverage". Both were read off `kmask`, an OR of every kernel a shape ever used, 
       Benchmark the REAL shapes: native GEMV/VNNI · AMX INT8 forced diagnostically ·
       oneDNN AMX INT8 · AMX BF16 · oneDNN AMX BF16. If AMX loses because rows/thread is too
       low, change the DECOMPOSITION before declaring AMX impossible.
+- [ ] AMX-B2 GEMV-to-AMX reformulation. PRODUCTION CODE, one site at a time, not analysis.
+      Q per site: what independent work does the current implementation SERIALIZE? Do not
+      accept "B=1 GEMV" as a final property of an operation - ask why the engine presents it
+      that way. Candidate axes, each to be proven not assumed: output-channel blocks · head
+      groups · fused projections sharing one activation · several independent rows emitted as
+      separate calls · decoder frames available at the same stage · layer-local independent
+      work · blocking axis · thread decomposition · weight-stationary execution · activation
+      layout · panel shape.
+      IMPL: build the SMALLEST real AMX-compatible grouping. Never pad useless work and never
+      misreport dimensions.
+      VALIDATION: numerical equivalence AND an explicit dependency proof
+      (INDEPENDENT_NOW / SEQUENTIAL-AUTOREGRESSIVE / SHARED-WEIGHT-ONLY / ALGORITHM-CHANGING).
+      MEASURE per site, six arms: legacy GEMV · packed VNNI small-M · FORCED AMX INT8 as
+      formulated today · FORCED AMX INT8 with the new decomposition · AMX BF16 · oneDNN oracle.
+      The forced-AMX arm is EXPECTED to lose at first; that is the point. Decompose the loss
+      into tile setup · packing · rows/thread · thread underfill · K/N blocking · epilogue ·
+      memory · effective M, then remove those causes one at a time.
+      Only after no safe restructuring exists may we accept permanent tiny-M VNNI.
+- [ ] AMX-B3 ONE matrix representation, chosen AMX-first. MEASURED FINDING 2026-09-06: the two
+      packed layouts in the tree are INCOMPATIBLE.
+        AMX   `qwen_amx_pack_weights`   [rb][cb][m 0..15][kstep 64 contiguous per row]
+        VNNI  `qwen_vnni_pack_n16_k4`   [r0/16][k step 4][r 0..15][4 bytes]
+      VNNI interleaves the 16 rows every 4 of K; AMX keeps 64 K contiguous per row. So there is
+      NO shared representation today, and building a small-M consumer on the VNNI layout leads
+      AWAY from AMX. If one persistent representation is to exist it must be the AMX one, with
+      VNNI as its consumer - not the reverse. Decide this before any packing lifetime work in
+      AMX-G.
 - [ ] AMX-C Low-M AMX architecture — an engineering problem, not a permanent VNNI regime.
       Q: what specifically costs AMX at low M — tile setup · activation packing · thread
       partition · weight layout · tails · barriers · too little work per thread · epilogue ·
