@@ -272,6 +272,7 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_SD_AMX_BF16` | off | experimental decoder AMX BF16 arm; uses real `TDPBF16PS` with activation-as-A and immutable BF16 B packs on the same decoder shapes. It can run with `QWEN_SD_INT8=0`, reports conversion/persistent-pack/tile counters, and is wired into the continuous ragged-batch path. FAST GCP evidence proves execution and parity, but its current C4 STREAM_RTF is behind Design D, so it is not a production default |
 | `QWEN_SD_INT8_BLK` | compiled default | block size of the int8 decoder convolution tiles |
 | `QWEN_SD_CONV_NC` | all | auto | output columns per work item in the INT8 decoder conv. Auto sizes the panel from the layer length and the pool so a short layer still fills it; `=128` restores the old fixed panel (the A/B arm). Each column is im2col'd, quantised and scaled independently, so the panel size changes only WHO computes a column, never its value |
+| `QWEN_SD_RAG_MIN_PANELS` | 8 | minimum ragged decoder panel count that submits to the engine pool; experimental A/B control only, with worker/kernel/fallback behavior unchanged |
 | `QWEN_SD_WINDOWED` | off | windowed decoder evaluation; diagnostic for the streaming boundary |
 | `QWEN_DEC_FIRSTCHUNK_GROUP` | 0 (off) | `=1` groups the first streaming chunk of several slots into one decoder pass |
 | `QWEN_THREADS_TALKER` · `QWEN_THREADS_DECODER` | unset (both = `-j`) | split the thread budget between the Talker/CP phase and the decoder phase inside one worker |

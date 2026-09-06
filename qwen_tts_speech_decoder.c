@@ -277,6 +277,30 @@ static int sd_rag_stats_on(void) {
     }
     return cached;
 }
+
+/* The ragged decoder's pool unit is an output-column panel. Short queues do
+ * not amortise the engine-pool rendezvous, while the default of eight is a
+ * policy choice rather than an AMX eligibility gate. Keep the experiment at
+ * this one dispatch decision so worker, tiling and fallback code stay intact. */
+static int sd_rag_pool_min_panels(void) {
+    static atomic_int cached = 0;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value > 0) return value;
+
+    value = 8;
+    const char *e = getenv("QWEN_SD_RAG_MIN_PANELS");
+    if (e && *e) {
+        char *end = NULL;
+        long parsed = strtol(e, &end, 10);
+        if (end != e && *end == '\0' && parsed >= 1 && parsed <= 128)
+            value = (int)parsed;
+        else
+            fprintf(stderr, "[SDRAG] invalid QWEN_SD_RAG_MIN_PANELS=%s; using default 8\n", e);
+    }
+    atomic_store_explicit(&cached, value, memory_order_release);
+    return value;
+}
+
 static double sd_ph_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2953,7 +2977,7 @@ static int rag_conv1d_amx(float *out, const float *in, int in_ch, int out_ch,
      * for a full pool rendezvous there costs more than the AMX work.  Keep those jobs on the
      * caller; dispatch only once the panel queue is large enough to give the existing team
      * useful independent work.  This is a scheduler threshold, not a kernel eligibility gate. */
-    if (job.n_panels >= 8) qwen_sd_pool_run(sd_rag_panel_worker, &job);
+    if (job.n_panels >= sd_rag_pool_min_panels()) qwen_sd_pool_run(sd_rag_panel_worker, &job);
     else                    sd_rag_panel_worker(&job);
     if (atomic_load(&job.failed)) return 0; /* caller keeps the established BLAS fallback */
 
