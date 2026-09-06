@@ -322,7 +322,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
-    "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
+    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
@@ -1949,6 +1949,7 @@ static const struct { int id; const char *name; int kind; } g_path_info[] = {
     { QWEN_PATH_MATMAT_INT8_QKV_NATIVE, "matmat_int8_qkv_native", QWEN_PATHK_WRAPPER },
     { QWEN_PATH_DECODER_SGEMM, "decoder_sgemm", QWEN_PATHK_CALL },
     { QWEN_PATH_DECODER_CONV_INT8, "decoder_conv_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_AMX_INT8, "decoder_conv_amx_int8", QWEN_PATHK_CALL },
     { QWEN_PATH_DECODER_CONV_NAIVE, "decoder_conv_naive", QWEN_PATHK_CALL },
 };
 const char *qwen_path_name(int path) {
@@ -2098,6 +2099,9 @@ void qwen_census_report(void *out) {
               : qwen_path_kind(r->path) == QWEN_PATHK_SLICE     ? "slice"
               : qwen_path_kind(r->path) == QWEN_PATHK_WRAPPER   ? "wrapper" : "transform");
     }
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    { void qwen_sd_amx_rej_report(void); qwen_sd_amx_rej_report(); }
+#endif
     int ov = atomic_load_explicit(&g_census_overflow, memory_order_relaxed);
     if (ov) fprintf(f, "[shape-census] WARNING: %d ops dropped, table full (%d rows)\n",
                     ov, QWEN_CENSUS_MAX);
@@ -9183,6 +9187,172 @@ static inline void sd_tile_1xN(float *out, int out_ld, int m, int tcol,
 
 #endif
 
+/* ---- decoder AMX INT8 -------------------------------------------------------------
+ *
+ * The decoder conv is the largest matrix block in a request (76.6% of MACs at C=4) and it
+ * never reached the matmat dispatcher, so it has run at 0% AMX.  Its geometry is already
+ * tile-friendly: M = out_ch = 96 (six 16-row blocks), N = panel columns, and the quantised
+ * buffers are padded to Kp = 768, which is a whole number of both 64-byte INT8 K-steps (12)
+ * and 32-byte BF16 K-steps (24), so NO K-tail path is needed.  qwen_int8_quant_rows zero-fills
+ * the padding on weights and activations alike, so [K, Kp) contributes exactly zero.
+ *
+ * The arithmetic contract of sd_gemm_panel is preserved: per 256-wide quant block accumulate
+ * in int32, convert, apply that block's swb[m][b] * sab[c][b], and accumulate into fp32 in the
+ * same block order.  The one deliberate difference is the zero-point term: VNNI only has
+ * dpbusd (u8 x s8), so the scalar path biases the activation by +128 and subtracts
+ * 128 * wsum[m][b] afterwards.  AMX has tdpbssd (s8 x s8), so both the bias and its correction
+ * disappear.  The integer products are identical; removing the correction removes a
+ * AMX signed x signed avoids the VNNI u8 offset/correction formulation entirely.  Numerical
+ * equivalence against the existing decoder path is established by the parity harness, not
+ * asserted here.
+ *
+ * Tiles: tmm0..5 hold the six 16x16 int32 accumulators (one per row block), tmm6 the 16x64
+ * weight tile, tmm7 the packed activation tile.  Exactly the eight the ISA has.
+ *
+ * The Talker/CP `rows/thread >= 256` rule is deliberately NOT consulted: M=96 would fail it
+ * outright.  This kernel is chosen on decoder geometry, and the parallelism is over column
+ * panels, which the caller already owns.
+ */
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+
+static atomic_llong g_sd_amx_rej[5];
+void qwen_sd_amx_rej_report(void) {
+    fprintf(stderr, "[SDAMX] reject M%%16=%lld Kp%%64=%lld blk%%64=%lld nc=%lld noamx=%lld\n",
+            (long long)atomic_load(&g_sd_amx_rej[0]), (long long)atomic_load(&g_sd_amx_rej[1]),
+            (long long)atomic_load(&g_sd_amx_rej[2]), (long long)atomic_load(&g_sd_amx_rej[3]),
+            (long long)atomic_load(&g_sd_amx_rej[4]));
+}
+#define SD_AMX_MB 6                      /* 16-row accumulator tiles = 96 rows per pass */
+
+/* Pack one 64-K x ncol slab of the activation panel into the AMX B layout:
+ * row i of the tile carries k = 4i..4i+3 for every column, i.e. [i][n*4 + j]. */
+static inline void sd_amx_pack_act(int8_t *dst, const int8_t *Xq, int Kp,
+                                   int c0, int ncol, int k0) {
+    const int cstride = ncol * 4;
+    for (int i = 0; i < 16; i++) {
+        int8_t *d = dst + (size_t)i * cstride;
+        for (int n = 0; n < ncol; n++)
+            memcpy(d + n * 4, Xq + (size_t)(c0 + n) * Kp + k0 + i * 4, 4);
+    }
+}
+
+/* Same inputs as sd_gemm_panel.  Returns 0 when the geometry is not supported, so the caller
+ * falls straight back to the existing path.
+ *
+ * M is covered in groups of 96 rows (six 16-row accumulator tiles), so the same eight-tile
+ * design handles every decoder conv width: 96 is one group, 192 two, 384 four, 768 eight.
+ * The activation slab is packed per K-step inside the quant-block loop: packing every K-step
+ * up front would need 86 KB of stack at the widest real conv (Kp=5376), so the pack is
+ * repeated per row group instead.  That is a memcpy, and v1 buys correctness across every
+ * shape with it; hoisting it is a tuning step once the exact-shape numbers exist. */
+static int sd_gemm_panel_amx(float *out, int out_ld, int M,
+                             const int8_t *Wq, const float *swb, const int32_t *wsum,
+                             const float *bias,
+                             const int8_t *Xq, const float *sab,
+                             int tcol0, int nc, int Kp, int blk) {
+    (void)wsum;                          /* tdpbssd needs no zero-point correction */
+    if (M % 16)            { atomic_fetch_add(&g_sd_amx_rej[0], 1); return 0; }
+    if (Kp % 64)           { atomic_fetch_add(&g_sd_amx_rej[1], 1); return 0; }
+    if (blk % 64)          { atomic_fetch_add(&g_sd_amx_rej[2], 1); return 0; }
+    if (nc <= 0 || M <= 0) { atomic_fetch_add(&g_sd_amx_rej[3], 1); return 0; }
+    if (!qwen_amx_int8_available()) { atomic_fetch_add(&g_sd_amx_rej[4], 1); return 0; }
+
+    const int nblk   = Kp / blk;
+    const int ksteps = blk / 64;         /* 64-byte INT8 K-steps inside one quant block */
+
+    float   acc[SD_AMX_MB * 16][16];
+    int32_t cbuf[16 * 16] __attribute__((aligned(64)));
+    int8_t  bpack[16 * 64] __attribute__((aligned(64)));
+
+    for (int c0 = 0; c0 < nc; c0 += 16) {
+        const int ncol    = nc - c0 < 16 ? nc - c0 : 16;
+        const int cstride = ncol * 4;
+
+        qwen_amx_tilecfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.palette_id = 1;
+        for (int t = 0; t < SD_AMX_MB; t++) { cfg.rows[t] = 16; cfg.colsb[t] = (uint16_t)cstride; }
+        cfg.rows[6] = 16; cfg.colsb[6] = 64;                 /* weights, 64 int8 of K */
+        cfg.rows[7] = 16; cfg.colsb[7] = (uint16_t)cstride;  /* packed activation */
+        qwen_amx_prepare_config(&cfg, 0x53440000u | (unsigned)cstride);
+
+        for (int m0 = 0; m0 < M; m0 += SD_AMX_MB * 16) {
+            const int rows_left = M - m0;
+            const int mb = rows_left / 16 < SD_AMX_MB ? rows_left / 16 : SD_AMX_MB;
+
+            for (int i = 0; i < mb * 16; i++)
+                for (int n = 0; n < ncol; n++) acc[i][n] = 0.0f;
+
+            for (int b = 0; b < nblk; b++) {
+                for (int t = 0; t < mb; t++) _tile_zero(t);
+
+                for (int ks = 0; ks < ksteps; ks++) {
+                    const int k = (b * ksteps + ks) * 64;
+                    sd_amx_pack_act(bpack, Xq, Kp, c0, ncol, k);
+                    _tile_loadd(7, bpack, cstride);
+                    for (int t = 0; t < mb; t++) {
+                        _tile_loadd(6, Wq + (size_t)(m0 + t * 16) * Kp + k, Kp);
+                        switch (t) {
+                            case 0: _tile_dpbssd(0, 6, 7); break;
+                            case 1: _tile_dpbssd(1, 6, 7); break;
+                            case 2: _tile_dpbssd(2, 6, 7); break;
+                            case 3: _tile_dpbssd(3, 6, 7); break;
+                            case 4: _tile_dpbssd(4, 6, 7); break;
+                            default: _tile_dpbssd(5, 6, 7); break;
+                        }
+                    }
+                }
+
+                /* same epilogue order as the scalar path: convert this block, scale by
+                 * swb[m][b] * sab[c][b], accumulate */
+                for (int t = 0; t < mb; t++) {
+                    switch (t) {
+                        case 0: _tile_stored(0, cbuf, cstride); break;
+                        case 1: _tile_stored(1, cbuf, cstride); break;
+                        case 2: _tile_stored(2, cbuf, cstride); break;
+                        case 3: _tile_stored(3, cbuf, cstride); break;
+                        case 4: _tile_stored(4, cbuf, cstride); break;
+                        default: _tile_stored(5, cbuf, cstride); break;
+                    }
+                    for (int r = 0; r < 16; r++) {
+                        const int m = m0 + t * 16 + r;
+                        const float sw = swb[(size_t)m * nblk + b];
+                        for (int n = 0; n < ncol; n++)
+                            acc[t * 16 + r][n] += (float)cbuf[r * ncol + n] *
+                                                  (sw * sab[(size_t)(c0 + n) * nblk + b]);
+                    }
+                }
+            }
+
+            for (int i = 0; i < mb * 16; i++) {
+                const int m = m0 + i;
+                float *o = out + (size_t)m * out_ld + tcol0 + c0;
+                const float bb = bias ? bias[m] : 0.0f;
+                for (int n = 0; n < ncol; n++) o[n] = acc[i][n] + bb;
+            }
+        }
+    }
+
+    qwen_amx_finish_config();
+    qwen_census_op(QWEN_PATH_DECODER_CONV_AMX_INT8, M, Kp, nc);
+    MMSTAT(QWEN_MMK_INT8_AMX, M, Kp, nc);
+    return 1;
+}
+
+static int sd_amx_enabled(void) {
+    static atomic_int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        const char *e = getenv("QWEN_SD_AMX");
+        c = (e && e[0] && e[0] != '0');
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c;
+}
+#else
+static int sd_amx_enabled(void) { return 0; }
+#endif  /* __AMX_INT8__ */
+
 static void sd_gemm_panel(float *out, int out_ld, int M,
                           const int8_t *Wq, const float *swb, const int32_t *wsum,
                           const float *bias,
@@ -9287,6 +9457,11 @@ static void sd_conv1d_worker(void *vj) {
             }
         }
         qwen_int8_quant_rows(colq, sa, colf, nc, K, j->Kp, j->blk);
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+        if (!sd_amx_enabled() ||
+            !sd_gemm_panel_amx(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
+                               colq, sa, t0, nc, j->Kp, j->blk))
+#endif
         sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
                       colq, sa, t0, nc, j->Kp, j->blk);
     }
@@ -9344,6 +9519,14 @@ static void sd_gemm_worker(void *vj) {
         int m1 = m0 + j->rows_per_block < j->M ? m0 + j->rows_per_block : j->M;
         for (int t0 = 0; t0 < j->N; t0 += SD_INT8_NC) {
             int nc = j->N - t0 < SD_INT8_NC ? j->N - t0 : SD_INT8_NC;
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+            if (!sd_amx_enabled() ||
+                !sd_gemm_panel_amx(j->out + (size_t)m0 * j->out_ld, j->out_ld, m1 - m0,
+                          j->Wq + (size_t)m0 * j->Kp, j->sw + (size_t)m0 * nblk,
+                          j->wsum ? j->wsum + (size_t)m0 * nblk : NULL, NULL,
+                          j->Xq + (size_t)t0 * j->Kp, j->sa + (size_t)t0 * nblk,
+                          t0, nc, j->Kp, j->blk))
+#endif
             sd_gemm_panel(j->out + (size_t)m0 * j->out_ld, j->out_ld, m1 - m0,
                           j->Wq + (size_t)m0 * j->Kp, j->sw + (size_t)m0 * nblk,
                           j->wsum ? j->wsum + (size_t)m0 * nblk : NULL, NULL,
