@@ -343,7 +343,16 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       TTFA p95 100/187 ms, STREAM_RTF p50/p95 0.617/0.633 and 1.121/1.130, zero
       errors/rejects, D rows in the census and non-zero `TDPBSSD` tiles. Both C4 streams
       still starved in the zero-buffer harness: integration is proven, serving qualification
-      is NOT. The current ragged panel loop is serial and remains a scheduler/dataflow follow-up.
+      is NOT. The former serial ragged panel loop is now dispatched as independent
+      column-panel jobs on the existing decoder pool when the queue is large enough; bias and
+      causal-tail updates remain post-join, with the established fallback on allocation
+      failure. On a clean 2x6/SMT-off FAST A/B, C2/C4 STREAM_RTF p95 was 0.623/0.907 (zero
+      errors/rejects) versus the clean serial C4 control at 1.338. This was one short
+      synchronized wave, not a qualification campaign. A separate opt-in C4 attribution run
+      covered 4,392/4,392 D panels with 561,408 columns and no fallback: instrumented time
+      was 36.9% panel construction, 9.5% activation quantisation and 53.6% AMX. Serial-vs-
+      pool server quality output was byte-identical across four WAVs; all eight WAV scans
+      were clean.
       D4 [x] REAL AMX BF16 decoder arm on the same causal-conv
       shapes, using `TDPBF16PS`, activation-as-A, immutable BF16 B packs and a distinct
       census path. CLI FAST load builds 26 packs / 62.8 MB; the short run reported real
@@ -358,8 +367,9 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       policy after panel parallelism and a clean committed server smoke. V1 remains a control.
       CURRENT: D and BF16 are explicit opt-in arms; neither changes the default decoder policy.
       INVALIDATED: the old runtime-activation-pack assumption does not apply to D; BF16 is
-      not AVX-512 `VDPBF16PS` evidence. NEXT: parallelise/measure the ragged batch panels,
-      rerun short clean-commit C2/C4 arms, then decide policy.
+      not AVX-512 `VDPBF16PS` evidence. NEXT: validate the committed scheduler with short
+      clean-build C2/C4 arms, sweep decode chunk sizes, then rerun the BF16 comparison before
+      choosing policy.
       MEASURED 2026-09-06, correcting an earlier estimate of mine: the real shapes are
       M = out_ch = 96, N = length ~1900, K = in_ch*kernel = 672, kernel 7 in 13 of 14 calls,
       ~0.125 GMAC per call. NOT the "M = 512-1024" I stated.

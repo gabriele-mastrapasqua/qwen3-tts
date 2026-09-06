@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <stdatomic.h>
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -261,6 +262,20 @@ static int sd_phase_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("QWEN_SD_PHASE"); v = (e && *e && *e != '0'); }
     return v;
+}
+/* Ragged decoder diagnostics are deliberately separate from QWEN_SD_PHASE.  The latter
+ * timestamps the whole decoder pipeline and is useful for a phase report, but it cannot
+ * distinguish panel construction, activation preparation, AMX execution, and the final
+ * scatter in rag_conv1d_amx().  Keep the detailed timers completely cold in serving builds. */
+static int sd_rag_stats_on(void) {
+    static atomic_int v = -1;
+    int cached = atomic_load_explicit(&v, memory_order_acquire);
+    if (cached < 0) {
+        const char *e = getenv("QWEN_SD_RAG_STATS");
+        cached = (e && *e && *e != '0');
+        atomic_store_explicit(&v, cached, memory_order_release);
+    }
+    return cached;
 }
 static double sd_ph_now(void) {
     struct timespec ts;
@@ -2732,6 +2747,171 @@ static void rag_save_tail(float *tail, const float *in, int in_ch,
     }
 }
 
+typedef struct {
+    long long panels, cols, amx_panels, fallback_panels;
+    long long build_bytes, prepared_bytes, items, total_cols;
+    double build_ms, prepare_ms, amx_ms, fallback_ms, post_ms;
+    long long nc_le32, nc_le64, nc_le96, nc_le128, nc_gt128;
+} sd_rag_call_stats_t;
+
+typedef struct {
+    _Atomic long long panels, cols, amx_panels, fallback_panels;
+    _Atomic long long build_ns, prepare_ns, amx_ns, fallback_ns;
+    _Atomic long long build_bytes, prepared_bytes;
+    _Atomic long long nc_le32, nc_le64, nc_le96, nc_le128, nc_gt128;
+} sd_rag_atomic_stats_t;
+
+static void sd_rag_stats_report(const sd_rag_call_stats_t *s, const char *mode,
+                                int in_ch, int out_ch, int total, int kernel, int dilation,
+                                int n_items, int K, int Kp, int nc_cap) {
+    if (!s || !s->panels) return;
+    fprintf(stderr,
+            "[SDRAG] v=1 pid=%d mode=%s items=%d total=%d M=%d K=%d Kp=%d kernel=%d "
+            "dilation=%d nc_cap=%d panels=%lld cols=%lld amx=%lld fallback=%lld "
+            "build_ms=%.3f prepare_ms=%.3f amx_ms=%.3f fallback_ms=%.3f post_ms=%.3f "
+            "build_MB=%.3f prepared_MB=%.3f item_sum=%lld total_sum=%lld "
+            "N_hist=le32:%lld,le64:%lld,le96:%lld,le128:%lld,gt128:%lld\n",
+            (int)getpid(), mode, n_items, total, out_ch, K, Kp, kernel, dilation, nc_cap,
+            s->panels, s->cols, s->amx_panels, s->fallback_panels,
+            s->build_ms, s->prepare_ms, s->amx_ms, s->fallback_ms, s->post_ms,
+            (double)s->build_bytes / 1e6, (double)s->prepared_bytes / 1e6,
+            s->items, s->total_cols,
+            s->nc_le32, s->nc_le64, s->nc_le96, s->nc_le128, s->nc_gt128);
+    (void)in_ch;
+}
+
+static void sd_rag_stats_merge(sd_rag_atomic_stats_t *a, const sd_rag_call_stats_t *s) {
+    atomic_fetch_add(&a->panels, s->panels);
+    atomic_fetch_add(&a->cols, s->cols);
+    atomic_fetch_add(&a->amx_panels, s->amx_panels);
+    atomic_fetch_add(&a->fallback_panels, s->fallback_panels);
+    atomic_fetch_add(&a->build_ns, (long long)(s->build_ms * 1e6));
+    atomic_fetch_add(&a->prepare_ns, (long long)(s->prepare_ms * 1e6));
+    atomic_fetch_add(&a->amx_ns, (long long)(s->amx_ms * 1e6));
+    atomic_fetch_add(&a->fallback_ns, (long long)(s->fallback_ms * 1e6));
+    atomic_fetch_add(&a->build_bytes, s->build_bytes);
+    atomic_fetch_add(&a->prepared_bytes, s->prepared_bytes);
+    atomic_fetch_add(&a->nc_le32, s->nc_le32);
+    atomic_fetch_add(&a->nc_le64, s->nc_le64);
+    atomic_fetch_add(&a->nc_le96, s->nc_le96);
+    atomic_fetch_add(&a->nc_le128, s->nc_le128);
+    atomic_fetch_add(&a->nc_gt128, s->nc_gt128);
+}
+
+typedef struct {
+    float *out;
+    const float *in;
+    int in_ch, out_ch, length, kernel, dilation, K, Kp, blk, nc_cap, n_panels;
+    const sd_rag_t *r;
+    float * const *tails;
+    const float *w;
+    sd_wq_entry_t *e;
+    int use_bf16, use_d, nblk;
+    int stats_on;
+    _Atomic int next_panel;
+    _Atomic int failed;
+    sd_rag_atomic_stats_t stats;
+} sd_rag_panel_job_t;
+
+static void sd_rag_panel_worker(void *vj) {
+    sd_rag_panel_job_t *j = (sd_rag_panel_job_t *)vj;
+    const size_t col_bytes = (size_t)j->nc_cap * (size_t)j->K * sizeof(float);
+    float *col = (float *)aligned_malloc(col_bytes);
+    int8_t *colq = NULL;
+    float *sa = NULL;
+    if (j->use_d && !j->use_bf16) {
+        colq = (int8_t *)aligned_malloc((size_t)j->nc_cap * (size_t)j->Kp);
+        sa = (float *)aligned_malloc((size_t)j->nc_cap * (size_t)j->nblk * sizeof(float));
+    }
+    if (!col || (j->use_d && !j->use_bf16 && (!colq || !sa))) {
+        free(col); free(colq); free(sa);
+        atomic_store(&j->failed, 1);
+        return;
+    }
+
+    sd_rag_call_stats_t local;
+    memset(&local, 0, sizeof(local));
+    for (;;) {
+        const int p = atomic_fetch_add(&j->next_panel, 1);
+        if (p >= j->n_panels || atomic_load(&j->failed)) break;
+        const int ts = p * j->nc_cap;
+        const int nc = j->length - ts < j->nc_cap ? j->length - ts : j->nc_cap;
+        const double panel_t0 = j->stats_on ? sd_ph_now() : 0.0;
+        memset(col, 0, (size_t)nc * (size_t)j->K * sizeof(float));
+        for (int b = 0; b < j->r->n; b++) {
+            const int64_t lo64 = j->r->off[b] > ts ? j->r->off[b] : ts;
+            const int64_t hi0 = j->r->off[b] + j->r->len[b];
+            const int64_t hi1 = (int64_t)ts + nc;
+            const int64_t hi64 = hi0 < hi1 ? hi0 : hi1;
+            if (lo64 >= hi64) continue;
+            const float *tl_base = j->tails ? j->tails[b] : NULL;
+            const float *src_base = j->in + j->r->off[b];
+            for (int64_t gc = lo64; gc < hi64; gc++) {
+                const int n = (int)(gc - ts);
+                const int frame = (int)(gc - j->r->off[b]);
+                float *dst = col + (size_t)n * (size_t)j->K;
+                for (int ic = 0; ic < j->in_ch; ic++) {
+                    const float *src = src_base + (int64_t)ic * j->length;
+                    const float *tl = tl_base ? tl_base + (int64_t)ic * (j->kernel - 1) * j->dilation : NULL;
+                    for (int k = 0; k < j->kernel; k++) {
+                        const int pos = frame - ((j->kernel - 1) * j->dilation - k * j->dilation);
+                        dst[(size_t)ic * j->kernel + k] = pos >= 0
+                            ? src[pos] : (tl ? tl[(j->kernel - 1) * j->dilation + pos] : 0.0f);
+                    }
+                }
+            }
+        }
+        if (j->stats_on) {
+            local.build_ms += sd_ph_now() - panel_t0;
+            local.build_bytes += (long long)nc * j->K * (long long)sizeof(float);
+        }
+
+        int ran_amx;
+        if (j->use_bf16) {
+            const double t0 = j->stats_on ? sd_ph_now() : 0.0;
+            ran_amx = qwen_sd_amx_bf16_panel(j->out, j->length, j->out_ch,
+                                             j->e->amx_bf16_wpack, NULL,
+                                             col, ts, nc, j->K, j->Kp);
+            if (j->stats_on) {
+                local.amx_ms += sd_ph_now() - t0;
+                local.prepared_bytes += (long long)nc * j->Kp * (long long)sizeof(uint16_t);
+            }
+        } else {
+            const double t0 = j->stats_on ? sd_ph_now() : 0.0;
+            qwen_int8_quant_rows(colq, sa, col, nc, j->K, j->Kp, j->blk);
+            if (j->stats_on) {
+                local.prepare_ms += sd_ph_now() - t0;
+                local.prepared_bytes += (long long)nc * j->Kp +
+                                        (long long)nc * j->nblk * (long long)sizeof(float);
+            }
+            const double t1 = j->stats_on ? sd_ph_now() : 0.0;
+            ran_amx = qwen_sd_amx_int8_panel(j->out, j->length, j->out_ch,
+                                             j->e->amx_d_wpack, j->e->scales, j->e->wsum,
+                                             NULL, colq, sa, ts, nc, j->Kp, j->blk);
+            if (j->stats_on) local.amx_ms += sd_ph_now() - t1;
+        }
+        if (!ran_amx) {
+            const double t0 = j->stats_on ? sd_ph_now() : 0.0;
+            SD_GEMM(CblasNoTrans, CblasTrans, j->out_ch, nc, j->K,
+                    1.0f, j->w, j->K, col, j->K, 0.0f,
+                    j->out + ts, j->length);
+            if (j->stats_on) local.fallback_ms += sd_ph_now() - t0;
+        }
+        if (j->stats_on) {
+            local.panels++;
+            local.cols += nc;
+            if (ran_amx) local.amx_panels++; else local.fallback_panels++;
+            if (nc <= 32) local.nc_le32++;
+            else if (nc <= 64) local.nc_le64++;
+            else if (nc <= 96) local.nc_le96++;
+            else if (nc <= 128) local.nc_le128++;
+            else local.nc_gt128++;
+        }
+    }
+    if (j->stats_on) sd_rag_stats_merge(&j->stats, &local);
+    free(col); free(colq); free(sa);
+}
+
 /* The production request-batching path uses rag_conv1d rather than the per-stream
  * causal_conv1d_blas worker. Keep the same AMX representations alive there: construct a
  * panel-local [N][K] im2col view, quantise/convert only the activation, and hand it to the
@@ -2758,67 +2938,58 @@ static int rag_conv1d_amx(float *out, const float *in, int in_ch, int out_ch,
     if (nc_cap > total) nc_cap = total;
     if (nc_cap <= 0 || K <= 0 || Kp < K) return 0;
 
-    float *col = (float *)sd_tmp_alloc((size_t)nc_cap * (size_t)K * sizeof(float));
-    int8_t *colq = NULL;
-    float *sa = NULL;
-    if (use_d && !use_bf16) {
-        colq = (int8_t *)sd_tmp_alloc((size_t)nc_cap * (size_t)Kp);
-        sa = (float *)sd_tmp_alloc((size_t)nc_cap * (size_t)nblk * sizeof(float));
-    }
-    if (!col || (use_d && !use_bf16 && (!colq || !sa))) {
-        sd_tmp_free(col); sd_tmp_free(colq); sd_tmp_free(sa);
-        return 0; /* retain the established BLAS path on an allocation failure */
-    }
+    sd_rag_panel_job_t job;
+    memset(&job, 0, sizeof(job));
+    job.out = out; job.in = in; job.in_ch = in_ch; job.out_ch = out_ch;
+    job.length = total; job.kernel = kernel; job.dilation = dilation;
+    job.K = K; job.Kp = Kp; job.blk = blk; job.nc_cap = nc_cap;
+    job.n_panels = (total + nc_cap - 1) / nc_cap;
+    job.r = r; job.tails = tails; job.w = w; job.e = e;
+    job.use_bf16 = use_bf16; job.use_d = use_d; job.nblk = nblk;
+    job.stats_on = sd_rag_stats_on();
+    atomic_store(&job.next_panel, 0);
+    atomic_store(&job.failed, 0);
+    /* A ragged decode has many short early/up-sampling shapes (one to three panels).  Paying
+     * for a full pool rendezvous there costs more than the AMX work.  Keep those jobs on the
+     * caller; dispatch only once the panel queue is large enough to give the existing team
+     * useful independent work.  This is a scheduler threshold, not a kernel eligibility gate. */
+    if (job.n_panels >= 8) qwen_sd_pool_run(sd_rag_panel_worker, &job);
+    else                    sd_rag_panel_worker(&job);
+    if (atomic_load(&job.failed)) return 0; /* caller keeps the established BLAS fallback */
 
+    sd_rag_call_stats_t rs;
+    memset(&rs, 0, sizeof(rs));
+    if (job.stats_on) {
+        rs.panels = atomic_load(&job.stats.panels);
+        rs.cols = atomic_load(&job.stats.cols);
+        rs.amx_panels = atomic_load(&job.stats.amx_panels);
+        rs.fallback_panels = atomic_load(&job.stats.fallback_panels);
+        rs.build_ms = (double)atomic_load(&job.stats.build_ns) / 1e6;
+        rs.prepare_ms = (double)atomic_load(&job.stats.prepare_ns) / 1e6;
+        rs.amx_ms = (double)atomic_load(&job.stats.amx_ns) / 1e6;
+        rs.fallback_ms = (double)atomic_load(&job.stats.fallback_ns) / 1e6;
+        rs.build_bytes = atomic_load(&job.stats.build_bytes);
+        rs.prepared_bytes = atomic_load(&job.stats.prepared_bytes);
+        rs.items = r->n;
+        rs.total_cols = total;
+        rs.nc_le32 = atomic_load(&job.stats.nc_le32);
+        rs.nc_le64 = atomic_load(&job.stats.nc_le64);
+        rs.nc_le96 = atomic_load(&job.stats.nc_le96);
+        rs.nc_le128 = atomic_load(&job.stats.nc_le128);
+        rs.nc_gt128 = atomic_load(&job.stats.nc_gt128);
+    }
     const int tail_cols = (kernel - 1) * dilation;
-    for (int ts = 0; ts < total; ts += nc_cap) {
-        const int nc = total - ts < nc_cap ? total - ts : nc_cap;
-        memset(col, 0, (size_t)nc * (size_t)K * sizeof(float));
-        for (int b = 0; b < r->n; b++) {
-            const int64_t lo64 = r->off[b] > ts ? r->off[b] : ts;
-            const int64_t hi0 = r->off[b] + r->len[b];
-            const int64_t hi1 = (int64_t)ts + nc;
-            const int64_t hi64 = hi0 < hi1 ? hi0 : hi1;
-            if (lo64 >= hi64) continue;
-            const float *tl_base = tails ? tails[b] : NULL;
-            const float *src_base = in + (int64_t)r->off[b];
-            for (int64_t gc = lo64; gc < hi64; gc++) {
-                const int n = (int)(gc - ts);
-                const int frame = (int)(gc - r->off[b]);
-                float *dst = col + (size_t)n * (size_t)K;
-                for (int ic = 0; ic < in_ch; ic++) {
-                    const float *src = src_base + (int64_t)ic * total;
-                    const float *tl = tl_base ? tl_base + (int64_t)ic * tail_cols : NULL;
-                    for (int k = 0; k < kernel; k++) {
-                        const int p = frame - (tail_cols - k * dilation);
-                        dst[(size_t)ic * kernel + k] = p >= 0
-                            ? src[p] : (tl ? tl[tail_cols + p] : 0.0f);
-                    }
-                }
-            }
-        }
-
-        int ran_amx;
-        if (use_bf16) {
-            ran_amx = qwen_sd_amx_bf16_panel(out, total, out_ch,
-                                             e->amx_bf16_wpack, NULL,
-                                             col, ts, nc, K, Kp);
-        } else {
-            qwen_int8_quant_rows(colq, sa, col, nc, K, Kp, blk);
-            ran_amx = qwen_sd_amx_int8_panel(out, total, out_ch,
-                                             e->amx_d_wpack, e->scales, e->wsum,
-                                             NULL, colq, sa, ts, nc, Kp, blk);
-        }
-        if (!ran_amx)
-            SD_GEMM(CblasNoTrans, CblasTrans, out_ch, nc, K,
-                    1.0f, w, K, col, K, 0.0f, out + ts, total);
-    }
+    const double post_t0 = job.stats_on ? sd_ph_now() : 0.0;
     conv_add_bias(out, bias, out_ch, total);
 
     if (tails)
         for (int b = 0; b < r->n; b++)
             rag_save_tail(tails[b], in, in_ch, total, r->off[b], r->len[b], tail_cols);
-    sd_tmp_free(col); sd_tmp_free(colq); sd_tmp_free(sa);
+    if (job.stats_on) {
+        rs.post_ms += sd_ph_now() - post_t0;
+        sd_rag_stats_report(&rs, use_bf16 ? "bf16" : (use_d ? "int8-d" : "fallback"),
+                            in_ch, out_ch, total, kernel, dilation, r->n, K, Kp, nc_cap);
+    }
     return 1;
 }
 

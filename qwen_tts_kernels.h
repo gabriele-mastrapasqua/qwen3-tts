@@ -37,6 +37,10 @@ int  qwen_blas_threads_now(void);       /* openblas_get_num_threads(), -1 if una
  * 0 = the decoder's private worker team.  QWEN_SD_POOL=qwen|private overrides the default. */
 void qwen_sd_pool_default(int mode);
 int  qwen_sd_pool_mode(void);
+/* Run one decoder job on the existing decoder/engine pool.  The callback must partition
+ * its work with its own atomic cursor; this wrapper preserves the no-nested-pool rule used
+ * by the established decoder workers. */
+void qwen_sd_pool_run(void (*fn)(void *), void *ctx);
 /* Claim the engine pool as the single owner of this process's compute budget:
  * decoder tiles on the engine pool, BLAS serial and its GEMMs partitioned there.
  * No-op at one thread; explicit QWEN_SD_POOL / QWEN_BLAS_OWN still win. */
