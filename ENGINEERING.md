@@ -185,6 +185,34 @@ seen in practice: PLAN integrity (no dangling references, §2b), repository inte
 (this rule), benchmark integrity (no qualifying run without proven commit, binary, env
 and dispatch, §5 and §13).
 
+## 13c. One implementation owner; parallel agents are evidence providers
+
+**Parallel agents are never parallel sources of truth.** One agent owns the source, the
+commits, `PLAN.md`, the implementation order and the final reading of the evidence. Every
+other agent is a bounded analyst that answers a question and returns evidence.
+
+Why this is a rule and not a preference: on 2026-09-06 two trees evolved independently for a
+day. One held ~60 commits the user's own branch did not, so a plan they were told existed was
+invisible in the checkout they were reading; the other accumulated ~1261 lines of uncommitted
+work that any fast-forward would have destroyed. Nothing was technically lost, and the day was
+still lost.
+
+- **Canonical state is a HASH, never "roughly the latest branch".** Before delegating any
+  analysis, emit `CANONICAL_HEAD=$(git rev-parse HEAD)` and require the analyst to prove
+  `HEAD == CANONICAL_HEAD`, a clean tree, and a zero source diff. Hash equality is the
+  contract.
+- **Bound the question so the answer is directly consumable.** "At HEAD abc123, for these six
+  N/K shapes, can an M=1 consumer reuse the packed RHS without repacking?" is a question.
+  "Optimize the decoder" is not.
+- **Analysts return EVIDENCE / INTERPRETATION / CONFIDENCE / CONTRADICTIONS / RECOMMENDATION.**
+  Read the evidence before the recommendation, and check it against the source and the runtime
+  before it reaches `PLAN.md`. A contradiction an analyst surfaces is priority evidence.
+- **Never block on an analyst when the hypothesis is narrow, reversible, parity-testable and
+  cheap to benchmark.** Implement it and let the analysis run beside it. Wait only when the
+  answer changes whether a large implementation is worth starting.
+- Analyst files are disposable supporting evidence. They never own a plan, a roadmap or a
+  branch, and they never write the canonical tree.
+
 ## 14. Completion rule
 
 A task is complete only when the final report contains:
