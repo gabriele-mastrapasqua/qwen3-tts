@@ -22,7 +22,7 @@ def registry(src):
     m = REG_RE.search(src)
     if not m:
         sys.exit("FAIL: g_qwen_reported_flags[] not found in qwen_tts_kernels.c")
-    return set(re.findall(r'"(QWEN_[A-Z0-9_]+)"', m.group(1)))
+    return set(re.findall(r'"(QWEN_[A-Z0-9_]*[A-Z0-9])"', m.group(1)))
 
 
 def read_by_engine():
@@ -32,7 +32,7 @@ def read_by_engine():
         src = open(path, errors="replace").read()
         if os.path.basename(path) == "qwen_tts_kernels.c":
             src = REG_RE.sub("", src)          # the register itself is not a read
-        for name in re.findall(r'"(QWEN_[A-Z0-9_]+)"', src):
+        for name in re.findall(r'"(QWEN_[A-Z0-9_]*[A-Z0-9])"', src):
             names.setdefault(name, set()).add(os.path.basename(path))
     return names
 

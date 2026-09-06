@@ -1113,9 +1113,18 @@ static void qwen_amx_prepack_one(const void *w, int rows, int cols, int kind) {
     if (w) (void)qwen_amx_prepack_weight(w, rows, cols, kind);
 }
 
-void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx) {
+/* Pack a weight only if the INT8 AMX gate could ever select it.  The gate judges a fused QKV
+ * member on the combined height q+2kv, so pass that as gate_rows for wq/wk/wv. */
+static int g_amx_prepack_threads = 0;
+static void qwen_amx_prepack_i8(const int8_t *w, int rows, int cols, int gate_rows) {
+    if (w && qwen_amx_int8_pack_worth(rows, cols, gate_rows, g_amx_prepack_threads))
+        qwen_amx_prepack_one(w, rows, cols, QWEN_AMX_WEIGHT_INT8);
+}
+
+void qwen_amx_prepack_model_nt(qwen_tts_ctx_t *ctx, int serving_threads) {
     const char *e = getenv("QWEN_AMX_PREPACK");
     if (!ctx || !e || e[0] != '1') return;
+    g_amx_prepack_threads = serving_threads > 0 ? serving_threads : qwen_get_threads();
 
     const qwen_tts_config_t *c = &ctx->config;
     const int h = c->hidden_size;
@@ -1130,12 +1139,13 @@ void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx) {
         qwen_amx_prepack_one(l->wo_bf16, h, q_dim, QWEN_AMX_WEIGHT_BF16);
         qwen_amx_prepack_one(l->gate_up_fused_bf16, 2 * inter, h, QWEN_AMX_WEIGHT_BF16);
         qwen_amx_prepack_one(l->down_bf16, h, inter, QWEN_AMX_WEIGHT_BF16);
-        qwen_amx_prepack_one(l->wq_int8, q_dim, h, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->wk_int8, kv_dim, h, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->wv_int8, kv_dim, h, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->wo_int8, h, q_dim, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->gate_up_fused_int8, 2 * inter, h, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->down_int8, h, inter, QWEN_AMX_WEIGHT_INT8);
+        const int qkv_rows = q_dim + 2 * kv_dim;
+        qwen_amx_prepack_i8(l->wq_int8, q_dim, h, qkv_rows);
+        qwen_amx_prepack_i8(l->wk_int8, kv_dim, h, qkv_rows);
+        qwen_amx_prepack_i8(l->wv_int8, kv_dim, h, qkv_rows);
+        qwen_amx_prepack_i8(l->wo_int8, h, q_dim, h);
+        qwen_amx_prepack_i8(l->gate_up_fused_int8, 2 * inter, h, 2 * inter);
+        qwen_amx_prepack_i8(l->down_int8, h, inter, h);
     }
 
     const int ch = c->cp_hidden_size;
@@ -1150,21 +1160,25 @@ void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx) {
         qwen_amx_prepack_one(l->wo_bf16, ch, cq, QWEN_AMX_WEIGHT_BF16);
         qwen_amx_prepack_one(l->gate_up_fused_bf16, 2 * ci, ch, QWEN_AMX_WEIGHT_BF16);
         qwen_amx_prepack_one(l->down_bf16, ch, ci, QWEN_AMX_WEIGHT_BF16);
-        qwen_amx_prepack_one(l->wq_int8, cq, ch, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->wk_int8, ckv, ch, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->wv_int8, ckv, ch, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->wo_int8, ch, cq, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->gate_up_fused_int8, 2 * ci, ch, QWEN_AMX_WEIGHT_INT8);
-        qwen_amx_prepack_one(l->down_int8, ch, ci, QWEN_AMX_WEIGHT_INT8);
+        const int cp_qkv_rows = cq + 2 * ckv;
+        qwen_amx_prepack_i8(l->wq_int8, cq, ch, cp_qkv_rows);
+        qwen_amx_prepack_i8(l->wk_int8, ckv, ch, cp_qkv_rows);
+        qwen_amx_prepack_i8(l->wv_int8, ckv, ch, cp_qkv_rows);
+        qwen_amx_prepack_i8(l->wo_int8, ch, cq, ch);
+        qwen_amx_prepack_i8(l->gate_up_fused_int8, 2 * ci, ch, 2 * ci);
+        qwen_amx_prepack_i8(l->down_int8, ch, ci, ch);
     }
 
     int n = 0;
     size_t bytes = 0;
     qwen_amx_prepack_stats(&n, &bytes);
     if (n > 0)
-        fprintf(stderr, "[amx-prepack] parent: %d matrices, %.0f MB; inherited by prefork workers\n",
-                n, (double)bytes / (1024.0 * 1024.0));
+        fprintf(stderr, "[amx-prepack] parent: %d matrices, %.0f MB; inherited by prefork workers "
+                        "(INT8 packed only where the gate can select it, at %d threads)\n",
+                n, (double)bytes / (1024.0 * 1024.0), g_amx_prepack_threads);
 }
+
+void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx) { qwen_amx_prepack_model_nt(ctx, 0); }
 
 static void qwen_vnni_prepack_one(const int8_t *w, int rows, int cols) {
     if (w) (void)qwen_vnni_prepack_weight(w, rows, cols);

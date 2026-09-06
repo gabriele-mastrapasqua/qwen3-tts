@@ -44,7 +44,11 @@ def main():
         print("no cost-map JSON found"); return 1
 
     # ---- merge: (role, region id) -> counters -------------------------------
-    rows = defaultdict(lambda: {"calls": 0, "ns": 0, "child_ns": 0, "nest_mismatch": 0})
+    occ_by_rid = defaultdict(lambda: {"units": 0, "tasks": 0, "dispatches": 0,
+                                      "pool_threads": 0, "useful_threads": 0, "entered": 0})
+    rows = defaultdict(lambda: {"calls": 0, "ns": 0, "child_ns": 0, "nest_mismatch": 0,
+                                "units": 0, "tasks": 0, "dispatches": 0,
+                                "pool_threads": 0, "useful_threads": 0})
     meta = {}
     requests = 0
     level = 0
@@ -69,6 +73,23 @@ def main():
                 acc["ns"] += r.get("ns", 0)
                 acc["child_ns"] += r.get("child_ns", 0)
                 acc["nest_mismatch"] += r.get("nest_mismatch", 0)
+                acc["units"] += r.get("units", 0)
+                acc["tasks"] += r.get("tasks", 0)
+                acc["dispatches"] += r.get("dispatches", 0)
+                acc["pool_threads"] = max(acc.get("pool_threads", 0), r.get("pool_threads", 0))
+                if r.get("units", 0) > 0:
+                    acc["useful_threads"] = acc.get("useful_threads", 0) + 1
+                # Occupancy is a property of the REGION, not of a role: the thread that opens
+                # the dispatch and the workers that claim panels have different roles, so a
+                # per-role key split the two halves of the same measurement apart.
+                o = occ_by_rid[rid]
+                o["units"] += r.get("units", 0)
+                o["tasks"] += r.get("tasks", 0)
+                o["dispatches"] += r.get("dispatches", 0)
+                o["entered"] += r.get("entered", 0)
+                o["pool_threads"] = max(o["pool_threads"], r.get("pool_threads", 0))
+                if r.get("units", 0) > 0:
+                    o["useful_threads"] += 1
 
     nreq = requests if requests > 0 else 0
     print("COST MAP — profiler V1 step 2 (coarse semantic regions)")
@@ -214,6 +235,43 @@ def main():
     print(f"    nesting mismatches (dynamic parent != declared)   {nm}")
     print(f"    region stack overflows                           {integrity['stack_overflow']}")
     print(f"    unbalanced ends                                  {integrity['unbalanced']}")
+    occ = [(None, rid, acc) for rid, acc in occ_by_rid.items() if acc.get("pool_threads", 0) > 0]
+    if occ:
+        print()
+        print("  --- POOL OCCUPANCY — who actually did the work -------------------------------")
+        print("             (a region can be fast per call and still leave most of the pool idle)")
+        print("  %-28s %8s %8s %8s %8s  %s" %
+              ("region", "threads", "tasks", "entered", "occup.", "verdict"))
+        for role, rid, acc in sorted(occ, key=lambda x: -x[2].get("units", 0)):
+            name = meta.get(rid, {}).get("name", "region/%d" % rid)
+            nt = acc.get("pool_threads", 0)
+            useful = acc.get("useful_threads", 0)
+            tasks = acc.get("tasks", 0)
+            disp = acc.get("dispatches", 0) or 1
+            per = tasks / disp if disp else 0
+            units = acc.get("units", 0)
+            entered = acc.get("entered", 0)
+            # `entered` is counted by the job itself, so it is the honest participation
+            # measure; `units` only covers workers whose thread-local block reached the dump.
+            per_disp = entered / disp if disp else 0.0
+            pct = 100.0 * per_disp / nt if nt else 0.0
+            # Order matters, and getting it wrong made this tool assert a false underfill:
+            # ACCOUNTING COMPLETENESS IS CHECKED FIRST.  Only a region whose units are nearly
+            # all recorded has a trustworthy participation count; where they are not, `entered`
+            # may itself be under-recorded and no underfill claim may be made from it.
+            verdict = "ok"
+            if tasks and units < tasks * 0.9:
+                # Do not call this underfill: a worker that never touches a costmap marker
+                # leaves no record, so missing units can equally mean an instrumentation gap.
+                verdict = ("workers OK (%.1f/%d entered), but only %d of %d units recorded — "
+                           "UNACCOUNTED instrumentation, not underfill"
+                           % (per_disp, nt, units, tasks))
+            elif entered and nt and per_disp < nt * 0.7:
+                verdict = ("!!! POOL UNDERFILLED: %.1f of %d workers entered the body per dispatch"
+                           % (per_disp, nt))
+            elif nt > 1 and per < nt:
+                verdict = "thin: %.1f tasks per dispatch for %d workers" % (per, nt)
+            print("  %-28s %8d %8.1f %8.1f %7.0f%%  %s" % (name, nt, per, per_disp, pct, verdict))
     print(f"    regions closed by unwind on an early return      {integrity['leaked']}")
     verdict = "PASS" if bad == 0 else "FAIL"
     print(f"    COST MAP GATE: {verdict}"

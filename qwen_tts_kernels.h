@@ -388,6 +388,10 @@ int qwen_q4_gemv_native(void);
 const char *qwen_matmat_family_int8(void);
 const char *qwen_matmat_family_q4(void);
 const char *qwen_matmat_family_bf16(void);
+int qwen_matmat_int8_max_b(void);
+int qwen_amx_int8_pack_worth(int rows, int cols, int gate_rows, int threads);
+void qwen_mm_force(int mmk);   /* bench hook: pin the batched dispatcher; 0 = normal */
+const char *qwen_region_i8_backend(void);
 
 int qwen_int8_kp(int K, int blk);
 
@@ -423,6 +427,9 @@ int qwen_sd_int8_enabled(void);
 int qwen_pool_spin_value(void);
 int qwen_pool_narrow_value(void);
 int qwen_dispatch_map_report(void *out, const char *json_path);
+int qwen_effective_config_report(void *out);
+int qwen_flag_gate_status(const char *flag, int *compiled, const char **kernel);
+int qwen_blas_env_overridden(void);   /* requested vs effective, per declared flag */
 int qwen_matmat_bf16_rows(float *Y, const uint16_t *W, const float *Xr,
                           int ldx, int rows, int cols, int B);
 int qwen_matmat_bf16_rows_usable(int rows, int cols, int B);

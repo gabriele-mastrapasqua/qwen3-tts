@@ -80,7 +80,26 @@ enum {
     QWEN_RGN_RT_POOL_WAIT,        /* caller done, waiting for workers to finish   */
     QWEN_RGN_RT_POOL_SUBMIT,      /* waiting to acquire the submit lock           */
 
-    QWEN_RGN_MAX = 72
+    /* ---- parallel work decomposition (appended; ids are append-only) ------- */
+    QWEN_RGN_SD_CONV_INT8 = 66,   /* decoder INT8 conv: panels claimed per worker */
+    QWEN_RGN_MM_REGION_I8,        /* in-region INT8 runner: row blocks per worker */
+
+    /* ---- batched CP, the path the production server actually runs ---------
+     * The single-request CP has level-2 regions; the SERVER uses
+     * qwen_batch_cp_predict, whose whole frame runs inside one held region, so
+     * cp.decode had no children at all.  These are accumulated as plain
+     * nanoseconds inside the region body and submitted ONCE per frame per
+     * worker: no begin/end pair per layer or per step. */
+    QWEN_RGN_CPB_MTP = 68,        /* MTP projection + gather                      */
+    QWEN_RGN_CPB_QKV,             /* fused QKV projection ONLY (gate: q+2kv)      */
+    QWEN_RGN_CPB_ATTN,            /* rope + causal attention + the norms between  */
+    QWEN_RGN_CPB_WO,              /* out projection                               */
+    QWEN_RGN_CPB_GATEUP,          /* fused gate/up projection                     */
+    QWEN_RGN_CPB_DOWN,            /* down projection                              */
+    QWEN_RGN_CPB_LOTHER,          /* every other barrier interval in the layer    */
+    QWEN_RGN_CPB_LMHEAD,          /* the 15 lm_head projections + argmax          */
+
+    QWEN_RGN_MAX = 78
 };
 
 #define QWEN_RGN_MULTI (-1)       /* declared parent for legitimately multi-parent regions */
@@ -110,6 +129,56 @@ static inline int qwen_region_begin_unique(int id) {
     return qwen_costmap_level_v ? qwen_region_begin_unique_(id) : 0;
 }
 
+/* ---- pool occupancy: who actually did the work ---------------------------------
+ *
+ * Wall time alone cannot say that a region ran on two of six workers.  The decoder INT8
+ * conv did exactly that for months -- its parallel unit was a fixed 128-column panel, so
+ * the most expensive layer had two panels and four workers idled -- and finding it took a
+ * manual dissection.  These record the decomposition itself:
+ *
+ *   qwen_region_pool_at(id, threads, tasks)   the dispatch: workers asked for, units offered
+ *   qwen_region_units_at(id, n)               a worker claiming n units of that region
+ *
+ * The id is explicit because a pool worker runs on its own thread with its own region
+ * stack: it is not "inside" the caller's region and cannot infer the attribution.
+ * Accumulation stays thread-local; occupancy is derived at dump time as
+ * (threads that claimed at least one unit) / (threads the dispatch asked for). */
+void qwen_region_pool_at_(int id, int threads, long long tasks);
+void qwen_region_units_at_(int id, long long n);
+/* Workers that actually ENTERED the job body, counted by the job itself rather than inferred
+ * from which threads happened to touch a marker: a thread that never reaches a marker leaves
+ * no record, and turning that silence into an underfill claim would be a lie. */
+void qwen_region_workers_at_(int id, int entered);
+/* Count an event WITHOUT reading the clock.  FAST uses this where the event is frequent but
+ * its duration is already inside a coarse region: the pool dispatch happens tens of thousands
+ * of times in one request, and timestamping all three of its regions was 88% of all profiler
+ * events and doubled TTFA.  DEEP still times them. */
+void qwen_region_tick_at_(int id, long long n);
+static inline void qwen_region_tick_at(int id, long long n) {
+    if (qwen_costmap_level_v) qwen_region_tick_at_(id, n);
+}
+static inline void qwen_region_pool_at(int id, int threads, long long tasks) {
+    if (qwen_costmap_level_v) qwen_region_pool_at_(id, threads, tasks);
+}
+static inline void qwen_region_units_at(int id, long long n) {
+    if (qwen_costmap_level_v) qwen_region_units_at_(id, n);
+}
+/* DEEP-only variants.  Row-block and per-projection accounting is a micro-event: on x86 the
+ * in-region runner alone produced 813k of these in one request, dwarfing everything else.
+ * FAST keeps the coarse dispatch summary; DEEP gets the per-worker detail. */
+static inline void qwen_region_units_at2(int id, long long n) {
+    if (qwen_costmap_level_v > 1) qwen_region_units_at_(id, n);
+}
+static inline void qwen_region_workers_at2(int id, int entered) {
+    if (qwen_costmap_level_v > 1) qwen_region_workers_at_(id, entered);
+}
+static inline void qwen_region_pool_at2(int id, int threads, long long tasks) {
+    if (qwen_costmap_level_v > 1) qwen_region_pool_at_(id, threads, tasks);
+}
+static inline void qwen_region_workers_at(int id, int entered) {
+    if (qwen_costmap_level_v) qwen_region_workers_at_(id, entered);
+}
+
 /* Label the calling thread for attribution ("main", "decoder", "prefill_helper", ...).
  * Purely descriptive; regions are accumulated per OS thread regardless. */
 void qwen_region_thread_role(const char *role);
@@ -120,6 +189,9 @@ void qwen_region_thread_role(const char *role);
  * marked mode="derived" in the JSON so nobody reads them as if they were measured
  * the same way as the rest. */
 void qwen_region_add_ns(int id, unsigned long long ns);
+/* The same clock the regions use, for a caller that accumulates phase durations itself and
+ * submits them once (see the batched CP frame region). */
+unsigned long long qwen_costmap_now_ns(void);
 
 /* One completed request, so the report can print ms/request. */
 void qwen_costmap_request_done(void);

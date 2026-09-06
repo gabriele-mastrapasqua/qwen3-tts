@@ -5,6 +5,53 @@ Normative through `ENGINEERING.md`. Derived from the tree as of 2026-09-05 (Make
 `tools/`, `tests/`, `configs/perf/`), not from memory. When a canonical tool, profile or
 procedure changes, the same commit updates this file (§10). No results live here.
 
+## 0. INVARIANT — resolve the host topology before every performance experiment
+
+Non-negotiable, and it comes before choosing a profile. Never inherit a topology from another
+host silently: `make cpu-check` (§1) reads all of this from the machine, and its `topology.json`
+is what a run manifest must carry.
+
+Record, from THIS machine, before any server-performance run:
+
+| | |
+|---|---|
+| CPU model · sockets · NUMA nodes | |
+| physical cores · **SMT: on/off, threads per core** · logical CPUs online | |
+| worker count · **CPU mask per worker** · threads per worker | |
+| CPUs intentionally unused, and why | |
+
+Then sanity-check the chain, and FIX THE EXPERIMENT before interpreting any number if two
+links contradict each other:
+
+    actual host -> actual topology -> selected masks -> threads/worker
+                -> observed B/worker -> backend actually selected -> profile provenance
+
+A profile is named for the host it was qualified on. **AWS c8a canonical 2x8 is an AWS
+profile; it is NOT automatically the profile for any other box.** Running 2x8 elsewhere is
+allowed as a deliberate comparison, but it must then be labelled an AWS-equivalent SUBSET
+topology and must state which CPUs are unused — and any conclusion ABOUT that host also needs
+a run on the host-native topology.
+
+This matters more than it used to: INT8 AMX dispatch now depends on **rows per thread**
+(`QWEN_AMX_INT8_MIN_ROWS_PER_THREAD`, docs/feature-flags.md), so changing the worker/thread
+layout changes the AMX/VNNI crossover itself. A topology mistake does not just shift a number,
+it can silently select a different kernel.
+
+**SMT is part of the experiment, not part of the host description.** Check it on every box and
+decide deliberately: for a measurement either disable it
+(`echo off | sudo tee /sys/devices/system/cpu/smt/control`, then re-read `nproc`) or give each
+worker one thread per physical core. Pinning workers while SMT is on and unaccounted for does
+not isolate anything — it hands two workers the same execution units and the same per-core AMX
+tile unit — and the resulting numbers look like isolation while measuring contention. Record
+the SMT state in the run manifest either way; a result measured with SMT on is not comparable
+with one measured with it off.
+
+Worked example of why (GCP AMX box, 2026-09-05): Xeon 8581C, 1 socket, 1 NUMA node, **12
+physical cores, SMT 2, 24 logical**, siblings `cpu N` and `cpu N+12`. `--prefork 2` slices
+logical CPUs contiguously, so worker 0 got cpus 0-11 and worker 1 got cpus 12-23 — the SAME 12
+physical cores, one worker on each hyperthread. The two workers were never isolated, and since
+the AMX tile unit is per physical core they also serialised on it.
+
 ## 1. Canonical tools — CURRENT ONLY
 
 | need | current tool | when | status |

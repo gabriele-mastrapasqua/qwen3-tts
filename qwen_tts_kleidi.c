@@ -1153,3 +1153,20 @@ void qwen_kleidi_stats_by_kind(int *a, size_t *b, int *c, size_t *d, int *e, siz
 }
 
 #endif
+
+/* Owner-declared inertness for --effective-config, same contract as qwen_pool_flag_inert().
+ *
+ * KleidiAI is excluded at the MAKEFILE level on non-Arm targets, not with an #if the flag
+ * scanner can see, so every QWEN_KAI_* knob looked reachable everywhere. On a build without
+ * the kernels these parse and steer nothing. */
+const char *qwen_kleidi_flag_inert(const char *flag) {
+#if QWEN_KLEIDI_BUILD
+    (void)flag;
+    return NULL;
+#else
+    if (!flag) return NULL;
+    if (!strncmp(flag, "QWEN_KAI_", 9) || !strcmp(flag, "QWEN_NO_KLEIDI"))
+        return "KleidiAI is not compiled into this build (needs an Arm i8mm target)";
+    return NULL;
+#endif
+}

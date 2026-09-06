@@ -14,6 +14,7 @@
     } while (0)
 
 #include "qwen_tts_thread.h"
+#include "qwen_tts_costmap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,8 +90,11 @@ void qwen_blas_own(int on) {
  * engine pool would run on top of the BLAS's own team instead of replacing it. */
 int qwen_blas_own_effective(void) {
 #if defined(__GNUC__) && !defined(__APPLE__)
-    return qwen_blas_own_get() && openblas_set_num_threads != NULL &&
-           !getenv("OPENBLAS_NUM_THREADS");
+    /* An OPENBLAS_NUM_THREADS in the environment used to mean "we are not really in control",
+     * which was true while qwen_blas_set_threads() returned early on seeing it.  It no longer
+     * does: ownership overrides the variable and holds BLAS at one thread, so counting the env
+     * as a loss of control made this report the opposite of what the engine was doing. */
+    return qwen_blas_own_get() && openblas_set_num_threads != NULL;
 #else
     return 0;
 #endif
@@ -103,10 +107,28 @@ int qwen_blas_threads_now(void) {
 #endif
 }
 
+/* Set when an OPENBLAS_NUM_THREADS in the environment was overridden because the engine owns
+ * the budget, so --effective-config can say so instead of leaving it to be discovered. */
+static atomic_int g_blas_env_overridden;
+int qwen_blas_env_overridden(void) {
+    return atomic_load_explicit(&g_blas_env_overridden, memory_order_relaxed);
+}
+
 void qwen_blas_set_threads(int n) {
 #if defined(__GNUC__) && !defined(__APPLE__)
-    if (getenv("OPENBLAS_NUM_THREADS")) return;
-    if (qwen_blas_own_get()) n = 1;   /* the engine pool owns parallelism; BLAS stays serial */
+    const char *env = getenv("OPENBLAS_NUM_THREADS");
+    if (qwen_blas_own_get()) {
+        /* Engine ownership is structural, not advisory.  This used to RETURN when the variable
+         * was present, so an exported OPENBLAS_NUM_THREADS silently left OpenBLAS with its own
+         * compute team while the engine believed it owned the budget -- two schedulers in one
+         * process, decided by whether someone remembered a variable.  The engine now wins and
+         * the override is reported. */
+        if (env && *env && atoi(env) != 1)
+            atomic_store_explicit(&g_blas_env_overridden, 1, memory_order_relaxed);
+        if (openblas_set_num_threads) openblas_set_num_threads(1);
+        return;
+    }
+    if (env) return;                  /* not owned: an explicit control experiment may set it */
     if (openblas_set_num_threads) openblas_set_num_threads(n > 0 ? n : 1);
 #else
     (void)n;
@@ -286,7 +308,7 @@ static const char *const g_qwen_reported_flags[] = {
     /* kernel gates and tiling — when a kernel may run, and how it tiles */
     "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B", "QWEN_AMX_MIN_ROWS",
     "QWEN_AMX_BF16_MIN_COLS", "QWEN_AMX_INT8_MIN_COLS", "QWEN_AMX_Q4_MIN_COLS",
-    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_VNNI_MIN_B",
+    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_AMX_INT8_MIN_ROWS_PER_THREAD", "QWEN_VNNI_MIN_B",
     "QWEN_AVX2MM_MIN_B", "QWEN_BF16_MATMUL_MIN_B", "QWEN_BFMMLA_MIN_B", "QWEN_SMMLA_MIN_B",
     "QWEN_INT8_SDOT_MIN_B", "QWEN_KLEIDI_MIN_B", "QWEN_X86_NCHUNK", "QWEN_AMX_NCHUNK",
     "QWEN_VNNI_NCHUNK", "QWEN_AVX512_NCHUNK", "QWEN_KAI_NCHUNK",
@@ -300,7 +322,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
-    "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
+    "QWEN_SD_INT8", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
@@ -451,10 +473,25 @@ void qwen_caps_report(void *out) {
             __builtin_cpu_supports("avx512vnni") ? " avx512vnni"   : "",
             __builtin_cpu_supports("avx512bf16") ? " avx512bf16"   : "",
             amx_str);
-    fprintf(f, "  lever (x86):      %s\n",
-            __builtin_cpu_supports("avx512vnni") ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
-          : __builtin_cpu_supports("avx2")       ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
-          :                                        "no AVX2 — scalar; rebuild SIMD=scalar");
+    /* The lever is a property of THIS BINARY, not of the CPU: a SIMD=avx512 or SIMD=portable
+     * build running on a VNNI host has no VNNI dot to recommend, and used to advertise one. */
+    {
+#if defined(__AVX512VNNI__)
+        const int vnni_built = 1;
+#else
+        const int vnni_built = 0;
+#endif
+        const int vnni_cpu = __builtin_cpu_supports("avx512vnni") ? 1 : 0;
+        fprintf(f, "  lever (x86):      %s\n",
+                (vnni_built && vnni_cpu)
+                  ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
+              : (vnni_cpu && !vnni_built)
+                  ? "this CPU has VNNI but this build does NOT — rebuild SIMD=avx512vnni "
+                    "(or avx512bf16/amx) to get the native int8 dot"
+              : __builtin_cpu_supports("avx2")
+                  ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
+                  : "no AVX2 — scalar; rebuild SIMD=scalar");
+    }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     fprintf(f, "  x86 amx int8:     %s\n",
             qwen_amx_int8_ready()
@@ -2245,7 +2282,14 @@ static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_BF16_BFMMLA] = { "QWEN_NO_BFMMLA",   NULL,                "QWEN_BFMMLA_MIN_B",  NULL,                NULL,                     2, 64,  0,  0, 0, 1 },
     [QWEN_MMK_BF16_AVX512] = { "QWEN_NO_BF16_MATMUL", NULL,              "QWEN_BF16_MATMUL_MIN_B", NULL,             NULL,                     1, 16,  0,  0, 0, 0 },
     [QWEN_MMK_BF16_AMX]    = { "QWEN_NO_AMX_BF16", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_BF16_MIN_COLS", 4, 16, 32, 32, 1, 0 },
-    [QWEN_MMK_INT8_AMX]    = { "QWEN_NO_AMX_INT8", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_INT8_MIN_COLS", 4, 16, 32, 64, 1, 0 },
+    /* INT8 AMX starts at B=3, not 4: the batched server measured B 0.9-3.8 per prefork worker
+     * across C=1..8, so a B>=4 gate left the tile path essentially unused in production.  At
+     * B=3 with the rows-per-thread rule below, the paired measurement gives CP Gate/Up -14.5%,
+     * TK Gate/Up -12.4%, TK Down -4.4%, TK WO -3.0% and QKV neutral, while the two projections
+     * that lose there (CP WO +19.9%, CP Down +7.0%) are the ones the rule already excludes.
+     * B=2 stays VNNI: the wins shrink to -3..-5% and more shapes turn negative.  BF16 AMX
+     * keeps its own default. */
+    [QWEN_MMK_INT8_AMX]    = { "QWEN_NO_AMX_INT8", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_INT8_MIN_COLS", 3, 16, 32, 64, 1, 0 },
     [QWEN_MMK_INT8_VNNI]   = { "QWEN_NO_VNNI",     NULL,                "QWEN_VNNI_MIN_B",    NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_INT8_AVX2]   = { "QWEN_NO_AVX2MM",   NULL,                "QWEN_AVX2MM_MIN_B",  NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_INT8_SMMLA]  = { "QWEN_NO_SMMLA",    NULL,                "QWEN_SMMLA_MIN_B",   NULL,                NULL,                     2, 16,  0,  0, 0, 1 },
@@ -2263,12 +2307,62 @@ static atomic_int g_mm_gate_mincols[QWEN_MMK_COUNT];
 
 static atomic_int g_mm_force;
 static void qwen_mm_force_kernel(int mmk) QWEN_MAYBE_UNUSED;
+/* Bench hook: pin the batched dispatcher to ONE kernel so two arms can be interleaved inside
+ * a single process.  Comparing arms across processes on a shared box measured 14% swings on an
+ * unchanged configuration -- larger than the effect under test -- so a paired design is the
+ * only honest way to time these. 0 restores normal dispatch. */
+void qwen_mm_force(int mmk) { qwen_mm_force_kernel(mmk); }
 static void qwen_mm_force_kernel(int mmk) {
     atomic_store_explicit(&g_mm_force, mmk, memory_order_relaxed);
 }
 
+/* AMX INT8 needs a WORK-PER-THREAD condition, not only a batch one.  Measured on a Xeon
+ * Platinum 8581C (Emerald Rapids, 12 physical cores, SMT off) with the complete in-region contract (activation pack + packed RHS + matmul + scale)
+ * against the VNNI row blocks, on the real 1.7B projections, paired and interleaved inside one
+ * process, median of 7 rounds, B=4.  The AMX arm is the winner marked (+ means AMX is slower):
+ *
+ *   rows/thread   projection (threads)              AMX vs VNNI
+ *          85     CP WO (12), CP Down (12)          +38.3%, +13.4%   VNNI
+ *         128     CP WO  (8), CP Down  (8)           +9.6%,  +1.3%   VNNI
+ *         170     TK WO (12), TK Down (12)           +1.1%,  +1.2%   VNNI
+ *         170     CP QKV(12), TK QKV  (12)           -7.9%,  -6.0%   AMX (fused, see below)
+ *         256     CP QKV (8), TK QKV (8), TK WO (8), TK Down (8), CP Down (4)
+ *                                                    -16.4% .. -5.2% AMX
+ *         512+    QKV/WO/Down (4), Gate/Up (all)     -28.2% .. -3.8% AMX
+ *
+ * The tile path needs enough output rows PER WORKER to amortise its tile setup and its
+ * activation pack; below roughly 256 it cannot, and the same projection flips sign purely by
+ * changing the thread count -- CP Down is -17.3% at 4 threads and +1.3% at 8.  A rows-vs-cols
+ * rule looked convincing on unpaired numbers and was wrong: TK Down (2048x6144) is AMX -5.2%
+ * at 8 threads despite being three times deeper than tall.  rows/thread >= 256 agrees with 23
+ * of the 24 measured cells (the exception is CP WO at 4 threads, +4.4%).
+ *
+ * 0 disables the rule.  Thread count is the engine's, which in a prefork worker is that
+ * worker's slice -- the same workers that will split these rows. */
+static int qwen_amx_int8_rows_ok_nt(long long rows, int nt) QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_rows_ok_nt(long long rows, int nt) {
+    static atomic_int rpt = 0;
+    int v = atomic_load_explicit(&rpt, memory_order_relaxed);
+    if (v == 0) {
+        v = qwen_mm_env_int("QWEN_AMX_INT8_MIN_ROWS_PER_THREAD", 256, 0, 1 << 20) + 1;
+        atomic_store_explicit(&rpt, v, memory_order_relaxed);
+    }
+    v -= 1;
+    if (v <= 0) return 1;
+    if (nt < 1) nt = 1;
+    return rows >= (long long)v * nt;
+}
+static int qwen_amx_int8_rows_ok(long long rows) QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_rows_ok(long long rows) {
+    return qwen_amx_int8_rows_ok_nt(rows, qwen_get_threads());
+}
+
+static int qwen_mm_use_(int mmk, int B, int rows, int cols, int amx_shape) QWEN_MAYBE_UNUSED;
 static int qwen_mm_use(int mmk, int B, int rows, int cols) QWEN_MAYBE_UNUSED;
 static int qwen_mm_use(int mmk, int B, int rows, int cols) {
+    return qwen_mm_use_(mmk, B, rows, cols, 1);
+}
+static int qwen_mm_use_(int mmk, int B, int rows, int cols, int amx_shape) {
     if (mmk <= 0 || mmk >= QWEN_MMK_COUNT) return 0;
     const qwen_mm_gate_t *g = &g_mm_gate[mmk];
     if (g->max_b == 0) return 0;
@@ -2303,7 +2397,13 @@ static int qwen_mm_use(int mmk, int B, int rows, int cols) {
         minc = qwen_mm_env_int(g->mincols_env, g->min_cols, 0, 1 << 20) + 1;
         atomic_store_explicit(&g_mm_gate_mincols[mmk], minc, memory_order_relaxed);
     }
-    return B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1;
+    if (!(B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1)) return 0;
+#if defined(__x86_64__) || defined(_M_X64)
+    if (amx_shape && mmk == QWEN_MMK_INT8_AMX && !qwen_amx_int8_rows_ok(rows)) return 0;
+#else
+    (void)amx_shape;
+#endif
+    return 1;
 }
 
 /* --dispatch-map: which gate rows are compiled into THIS binary.  Mirrors the
@@ -3476,9 +3576,12 @@ static int qwen_vnni_col_quant_enabled(void) {
     return v;
 }
 
+/* |x| via an integer AND, not _mm512_andnot_ps: the float-domain logic ops are AVX512DQ,
+ * and the plain AVX-512F profile (SIMD=avx512: F/BW/VL, no DQ, no VNNI) must build too.
+ * Same bits, same kernel -- 0x7FFFFFFF clears the sign exactly as andnot(-0.0f, v) does. */
 static float quantize_act_int8_col_avx512(int8_t *qb, const float *X,
                                          int cols, int B, int b) {
-    const __m512 sign = _mm512_set1_ps(-0.0f);
+    const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
     const __m512i offsets = _mm512_setr_epi32(
         0 * B, 1 * B, 2 * B, 3 * B, 4 * B, 5 * B, 6 * B, 7 * B,
         8 * B, 9 * B, 10 * B, 11 * B, 12 * B, 13 * B, 14 * B, 15 * B);
@@ -3489,7 +3592,8 @@ static float quantize_act_int8_col_avx512(int8_t *qb, const float *X,
         const __m512 v = B == 1
             ? _mm512_loadu_ps(X + b + k)
             : _mm512_i32gather_ps(idx, X + b, 4);
-        vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+        vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
     }
     float amax = _mm512_reduce_max_ps(vmax);
     for (; k < cols; k++) {
@@ -4783,8 +4887,13 @@ static int qwen_x86_qkv_disabled(void) {
 static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim)
     QWEN_MAYBE_UNUSED;
 static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim) {
-    if (!qwen_mm_use(QWEN_MMK_INT8_AMX, B, q_dim, in_dim) ||
-        !qwen_mm_use(QWEN_MMK_INT8_AMX, B, kv_dim, in_dim)) return 0;
+    if (!qwen_mm_use_(QWEN_MMK_INT8_AMX, B, q_dim, in_dim, 0) ||
+        !qwen_mm_use_(QWEN_MMK_INT8_AMX, B, kv_dim, in_dim, 0)) return 0;
+    /* Q, K and V share ONE activation pack and one tile configuration here, so the work-per-
+     * thread rule belongs to their combined height, not to k and v on their own.  That is also
+     * what the measurement shows: at 12 threads both QKV projections are AMX wins (-7.9% and
+     * -6.0%) while the plain 2048-row projections at the same rows/thread are VNNI. */
+    if (!qwen_amx_int8_rows_ok((long long)q_dim + 2LL * (long long)kv_dim)) return 0;
 
     /* QKV has a different working set from the other projections.  This is an
      * additional lower bound for that fused path; the general AMX INT8 gate
@@ -6057,12 +6166,13 @@ static float quantize_act_int8_x86_scalar(int8_t *qx, const float *x, int n) {
 static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if (qwen_vnni_act_quant_enabled() && n >= 16) {
-        const __m512 sign = _mm512_set1_ps(-0.0f);
+        const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
         __m512 vmax = _mm512_setzero_ps();
         int i = 0;
         for (; i + 16 <= n; i += 16) {
             __m512 v = _mm512_loadu_ps(x + i);
-            vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+            vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
         }
         float amax = _mm512_reduce_max_ps(vmax);
         for (; i < n; i++) {
@@ -6115,12 +6225,13 @@ static int qwen_vnni_uact_enabled(void) {
 static float quantize_act_u8_x86(uint8_t *ux, const float *x, int n) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if (qwen_vnni_act_quant_enabled() && n >= 16) {
-        const __m512 sign = _mm512_set1_ps(-0.0f);
+        const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
         __m512 vmax = _mm512_setzero_ps();
         int i = 0;
         for (; i + 16 <= n; i += 16) {
             __m512 v = _mm512_loadu_ps(x + i);
-            vmax = _mm512_max_ps(vmax, _mm512_andnot_ps(sign, v));
+            vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
         }
         float amax = _mm512_reduce_max_ps(vmax);
         for (; i < n; i++) {
@@ -8430,32 +8541,148 @@ int qwen_sd_int8_available(void) {
  * on a build where every gate is off (AVX2 and AVX-512F for bf16, any non-VNNI x86 for the
  * integer paths) the map used to say nothing about what runs.  Evaluated at a representative
  * large shape so the thresholds in g_mm_gate[] are applied rather than duplicated here. */
-static const char *mmk_first_available(const int *cand, int n, const char *none) {
-    enum { RB = 4, RR = 4096, RC = 4096 };
+/* One probe shape, so say which: a family row answers "who serves this dtype at a batched
+ * shape", not "who serves every shape".  A gate with a higher min_b or a rows/cols floor can
+ * still decline the real projection, and the per-gate table below carries those numbers. */
+#define QWEN_MMK_PROBE_B    4
+#define QWEN_MMK_PROBE_ROWS 4096
+#define QWEN_MMK_PROBE_COLS 4096
+static const char *mmk_first_available(const int *cand, int n, const char *none,
+                                       char *buf, size_t bsz) {
+    enum { RB = QWEN_MMK_PROBE_B, RR = QWEN_MMK_PROBE_ROWS, RC = QWEN_MMK_PROBE_COLS };
     for (int i = 0; i < n; i++) {
         int k = cand[i];
-        if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) && qwen_mm_use(k, RB, RR, RC))
-            return g_mmk_info[k].name;
+        if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) && qwen_mm_use(k, RB, RR, RC)) {
+            snprintf(buf, bsz, "%s (probe B=%d %dx%d)", g_mmk_info[k].name, RB, RR, RC);
+            return buf;
+        }
     }
-    return none;
+    snprintf(buf, bsz, "%s (probe B=%d %dx%d)", none, RB, RR, RC);
+    return buf;
 }
 const char *qwen_matmat_family_int8(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
                                 QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };
+    static char buf[96];
     return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
-                               "int8 f32-accum twin (no int8 GEMM gate on this build)");
+                               "int8 f32-accum twin (no int8 GEMM gate on this build)",
+                               buf, sizeof buf);
 }
 const char *qwen_matmat_family_q4(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_Q4, QWEN_MMK_Q4_AMX, QWEN_MMK_Q4_VNNI,
                                 QWEN_MMK_Q4_AVX2, QWEN_MMK_Q4_SMMLA, QWEN_MMK_Q4_BMATVEC };
+    static char buf[96];
     return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
-                               "q4 generic twin (no q4 GEMM gate on this build)");
+                               "q4 generic twin (no q4 GEMM gate on this build)",
+                               buf, sizeof buf);
 }
+/* Largest B the int8 matmat family still accepts, probed at the same shape as the family
+ * rows.  It matters because --batch-size is NOT clamped to it: every batched int8 gate has
+ * max_b = 16, and above that they all decline, so a server started with --batch-size 24
+ * steps its slots through one GEMV each -- exactly the work batching was asked to avoid --
+ * without a word.  Prefill already chunks itself to 16 (prefill_proj_matmat); the batched
+ * decode path passes the live slot count straight through, and chunking it here would move
+ * a remainder column onto the B=1 dequant twin, i.e. change its arithmetic.  So this is
+ * reported, not silently corrected. */
+/* Which in-region int8 runner a build/host can hold, named.  The persistent CP and Talker
+ * regions are the largest backend difference we have -- present on VNNI and AMX, absent on
+ * AVX2/AVX-512F and (until the gather shape lands) on Arm -- and until now the only place
+ * that said so was a one-shot stderr line printed by the engine at the first batched step,
+ * i.e. after traffic.  The model's own shapes still decide; this answers the prior question
+ * of whether the runner exists at all. */
+static const char *region_i8_backend_at(int B) {
+    enum { RR = QWEN_MMK_PROBE_ROWS, RC = QWEN_MMK_PROBE_COLS };
+#if defined(__AVX512VNNI__)
+    if (!qwen_region_i8_usable(RR, RC, B)) return "none";
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, RR, RC) && qwen_amx_int8_ready())
+        return "AMX int8 tiles";
+#endif
+    return "VNNI row blocks";
+#else
+    (void)B; return "none";
+#endif
+}
+
+const char *qwen_region_i8_backend(void) {
+    /* Report BOTH batch widths: the AMX gate starts at B=4, so an AMX host answers "VNNI row
+     * blocks" at B=2 and "AMX int8 tiles" at B=4, and a single-B row would hide half of that. */
+    static char buf[112];
+    const char *b2 = region_i8_backend_at(2), *b4 = region_i8_backend_at(4);
+    if (!strcmp(b2, "none") && !strcmp(b4, "none")) {
+#if defined(__AVX512VNNI__)
+        return "none: the int8 gate declines at the probe shape for B=2 and B=4";
+#else
+        return "none: no in-region int8 runner in this build (needs VNNI or AMX; Arm wiring open)";
+#endif
+    }
+    if (!strcmp(b2, b4)) snprintf(buf, sizeof buf, "%s (B=2 and B=4)", b2);
+    else                 snprintf(buf, sizeof buf, "%s at B=2, %s at B=4", b2, b4);
+    return buf;
+}
+
+/* Would the INT8 AMX gate ever select this projection on this host?  Prepacking a weight the
+ * gate can never choose costs its whole size in RAM and buys nothing: `gate_rows` is the height
+ * the gate actually judges, which for a fused QKV member is q+2kv, not that member's own rows. */
+int qwen_amx_int8_pack_worth(int rows, int cols, int gate_rows, int threads) {
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (!qwen_amx_int8_ready()) return 0;
+    if (gate_rows <= 0) gate_rows = rows;
+    /* threads is the SERVING worker's count, not the packing process's: the parent prepacks
+     * before it forks, and a prefork worker runs with --prefork-threads, so asking
+     * qwen_get_threads() here would judge the gate with the wrong denominator. */
+    if (!qwen_amx_int8_rows_ok_nt(gate_rows, threads)) return 0;
+    /* B is irrelevant to the shape half of the gate; probe at the kernel's own minimum. */
+    return qwen_mm_use_(QWEN_MMK_INT8_AMX, qwen_mm_minb_value(QWEN_MMK_INT8_AMX,
+                                                              &g_mm_gate[QWEN_MMK_INT8_AMX]),
+                        rows, cols, 0);
+#else
+    (void)rows; (void)cols; (void)gate_rows; (void)threads; return 0;
+#endif
+}
+
+/* Ground truth for --effective-config, better than any static inference: the gate table
+ * already maps a flag name to the kernel it controls, and qwen_mmk_compiled() knows whether
+ * that kernel exists in this build.  A QWEN_NO_VNNI on an Arm binary is not "honoured", it
+ * controls a kernel that was never compiled.  Returns 1 when the flag belongs to a gate,
+ * writing 1/0 into *compiled; 0 when the flag is not a gate flag at all. */
+int qwen_flag_gate_status(const char *flag, int *compiled, const char **kernel) {
+    if (!flag || !*flag) return 0;
+    for (int k = 1; k < QWEN_MMK_COUNT; k++) {
+        const qwen_mm_gate_t *g = &g_mm_gate[k];
+        const char *names[5] = { g->off_env, g->on_env, g->minb_env, g->minrows_env, g->mincols_env };
+        for (int i = 0; i < 5; i++) {
+            if (names[i] && !strcmp(names[i], flag)) {
+                if (compiled) *compiled = qwen_mmk_compiled(k);
+                if (kernel) *kernel = g_mmk_info[k].name;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int qwen_matmat_int8_max_b(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
+                                QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };
+    const int n = (int)(sizeof cand / sizeof cand[0]);
+    int best = 0;
+    for (int B = 1; B <= 64; B++)
+        for (int i = 0; i < n; i++) {
+            int k = cand[i];
+            if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) &&
+                qwen_mm_use(k, B, QWEN_MMK_PROBE_ROWS, QWEN_MMK_PROBE_COLS)) { best = B; break; }
+        }
+    return best;
+}
+
 const char *qwen_matmat_family_bf16(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_BF16, QWEN_MMK_BF16_AMX,
                                 QWEN_MMK_BF16_AVX512, QWEN_MMK_BF16_BFMMLA };
+    static char buf[96];
     return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
-                               "bf16 fixed-B twin (no bf16 GEMM gate on this build)");
+                               "bf16 fixed-B twin (no bf16 GEMM gate on this build)",
+                               buf, sizeof buf);
 }
 
 /* Does B=1 reach a native integer kernel on this build, or the f32 fused twin?
@@ -8503,11 +8730,23 @@ int qwen_int8_kp(int K, int blk) { return (K + blk - 1) / blk * blk; }
  * every value that lands on a .5 boundary.  amax is a max reduction, which is
  * order-independent, so vectorising it is exact by construction.
  *
- * (The NEON path above rounds half to EVEN and saturates to [-128, 127]; that divergence
- * predates this change and is recorded in PLAN, not silently "fixed" here.  The -128 case
- * is unreachable anyway: inv = 127/amax bounds |q| by 127.)
+ * The NEON body rounds half to EVEN (vcvtnq_s32_f32) and saturates to [-128, 127].  So the
+ * two platforms have DIFFERENT rounding contracts, and normalising them is a separate
+ * decision -- ARM audio was qualified with half-to-even, x86 with half-away.  What is not
+ * defensible is the body and the TAIL of the same kernel disagreeing, which is what
+ * quant_round_i32() below fixes: each platform now rounds one way everywhere, so a value
+ * quantises the same whether its index lands in the vector body or the remainder.  (The
+ * -128 saturation is unreachable either way: inv = 127/amax bounds |q| by 127.)
  *
- * QWEN_NO_SIMD_QUANT=1 forces the scalar path; the self-test uses it to compare the two. */
+ * QWEN_NO_SIMD_QUANT=1 forces the scalar path on both x86 and ARM; the self-test uses it to
+ * compare the two, which is only a real comparison because the tail follows the platform. */
+static inline int quant_round_i32(float q) {
+#ifdef __ARM_NEON
+    return (int)vcvtns_s32_f32(q);              /* nearest, ties to even: what the body does */
+#else
+    return (int)(q >= 0 ? q + 0.5f : q - 0.5f); /* nearest, ties away: what x86 always did */
+#endif
+}
 static int g_quant_simd_off = -1;
 static int quant_simd_off(void) {
     if (g_quant_simd_off < 0) {
@@ -8542,10 +8781,12 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
             }
 #endif
 #ifdef __ARM_NEON
-            float32x4_t vmax = vdupq_n_f32(0.0f);
-            for (; i + 3 < kn; i += 4)
-                vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(s + k0 + i)));
-            amax = vmaxvq_f32(vmax);
+            if (!quant_simd_off()) {
+                float32x4_t vmax = vdupq_n_f32(0.0f);
+                for (; i + 3 < kn; i += 4)
+                    vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(s + k0 + i)));
+                amax = vmaxvq_f32(vmax);
+            }
 #endif
             for (; i < kn; i++) { float a = fabsf(s[k0 + i]); if (a > amax) amax = a; }
             float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
@@ -8570,6 +8811,7 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
             }
 #endif
 #ifdef __ARM_NEON
+            if (!quant_simd_off()) {
             float32x4_t vinv = vdupq_n_f32(inv);
             for (; i + 15 < kn; i += 16) {
                 int32x4_t q0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(s + k0 + i),      vinv));
@@ -8580,10 +8822,11 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
                 int16x8_t p1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
                 vst1q_s8(d + k0 + i, vcombine_s8(vqmovn_s16(p0), vqmovn_s16(p1)));
             }
+            }
 #endif
             for (; i < kn; i++) {
                 float q = s[k0 + i] * inv;
-                int v = (int)(q >= 0 ? q + 0.5f : q - 0.5f);
+                int v = quant_round_i32(q);
                 if (v > 127) v = 127;
                 if (v < -127) v = -127;
                 d[k0 + i] = (int8_t)v;
@@ -8946,11 +9189,50 @@ typedef struct {
     const int8_t *Wq; const float *sw; const int32_t *wsum; const float *bias;
     int in_ch, out_ch, length, kernel, dilation, Kp, blk;
     _Atomic int next_panel;
+    _Atomic int entered;      /* workers that reached the body: the honest denominator */
     int n_panels;
+    int nc;                 /* output columns per panel: the parallel unit, see sd_conv_nc() */
 } sd_conv_job_t;
+
+/* The decoder conv parallelises over OUTPUT COLUMNS only, one panel per work item, so a short
+ * layer cannot fill the pool: measured on the real 1.7B decoder, the first upsample block runs
+ * 256 columns (M=768, K=5376, 1057 MMAC -- a quarter of all conv1 work) which is TWO panels of
+ * 128, so four of six workers sat idle on the most expensive layer, and at one frame per chunk
+ * it was a single panel running single-threaded. Size the panel from the work instead: each
+ * column is im2col'd and quantised exactly once whatever the panel size, and its scale is
+ * per column, so this changes only who computes what, never a single output byte -- proven at
+ * one thread, where forcing four different panel widths gives one md5. Keep a floor so the
+ * panel GEMM stays wide enough to be worth its setup. */
+#define SD_INT8_NC_MIN 24
+static int sd_conv_nc(int length, int nt) {
+    static atomic_int forced = 0;                 /* QWEN_SD_CONV_NC=128 restores the old fixed
+                                                   * panel, which is how this is A/B'd */
+    int f = atomic_load_explicit(&forced, memory_order_relaxed);
+    if (f == 0) {
+        const char *e = getenv("QWEN_SD_CONV_NC");
+        int v = e && *e ? atoi(e) : 0;
+        f = (v >= SD_INT8_NC_MIN && v <= SD_INT8_NC) ? v + 1 : 1;
+        atomic_store_explicit(&forced, f, memory_order_relaxed);
+    }
+    if (f > 1) return f - 1;
+    if (nt < 2 || length <= SD_INT8_NC) return SD_INT8_NC;
+    int want = (length + nt - 1) / nt;
+    if (want >= SD_INT8_NC) return SD_INT8_NC;
+    if (want < SD_INT8_NC_MIN) want = SD_INT8_NC_MIN;
+    /* Round up to a multiple of 4 for SPEED, not for correctness: sd_gemm_panel walks a panel
+     * in groups of four columns (sd_tile_2x4) and sends the remainder to the narrower
+     * sd_tile_1xN, so an unaligned width pays that tail once per panel instead of once per
+     * layer.  Correctness does not depend on it -- forcing 128, 124, 44 and 24 at one thread
+     * gives the same WAV md5, and the differences seen at -j6 were the multi-thread float
+     * ordering the engine already has, not the panel width. */
+    want = (want + 3) & ~3;
+    if (want > SD_INT8_NC) want = SD_INT8_NC;
+    return want;
+}
 
 static void sd_conv1d_worker(void *vj) {
     sd_conv_job_t *j = (sd_conv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     int K = j->in_ch * j->kernel;
     int nblk = j->Kp / j->blk;
     int pad_left = (j->kernel - 1) * j->dilation;
@@ -8959,11 +9241,15 @@ static void sd_conv1d_worker(void *vj) {
     float *colf = mm_scratch_sdcolf((size_t)SD_INT8_NC * K);
     int8_t *colq = mm_scratch_sdcolq((size_t)SD_INT8_NC * j->Kp);
     float *sa = mm_scratch_sdsa((size_t)SD_INT8_NC * nblk);
+    long long claimed = 0;      /* accumulate locally: ONE profiler hook per worker, not
+                                 * one per panel -- the per-unit call was 20% of all
+                                 * instrumentation events and buys nothing a sum cannot give */
     for (;;) {
         int p = atomic_fetch_add(&j->next_panel, 1);
         if (p >= j->n_panels) break;
-        int t0 = p * SD_INT8_NC;
-        int nc = j->length - t0 < SD_INT8_NC ? j->length - t0 : SD_INT8_NC;
+        claimed++;
+        int t0 = p * j->nc;
+        int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
         for (int c = 0; c < nc; c++) {
             float *dst = colf + (size_t)c * K;
             int tt = t0 + c - pad_left;
@@ -8980,6 +9266,7 @@ static void sd_conv1d_worker(void *vj) {
         sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
                       colq, sa, t0, nc, j->Kp, j->blk);
     }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
 
 void qwen_conv1d_int8(float *out, const float *in,
@@ -9001,10 +9288,17 @@ void qwen_conv1d_int8(float *out, const float *in,
         .out = out, .in = in, .Wq = Wq, .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = length,
         .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
-        .n_panels = (length + SD_INT8_NC - 1) / SD_INT8_NC,
     };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
     atomic_store(&job.next_panel, 0);
+    /* The decomposition itself, so a report can say 2 of 6 workers instead of only a
+     * wall time: this layer's panels are the parallel unit, and a short layer cannot
+     * fill the pool no matter how fast the kernel is. */
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
     sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 
 typedef struct {
@@ -9754,15 +10048,16 @@ int qwen_kernel_selftest(void *out) {
             {768,  768, 64, "decoder panel 768x1"   },
         };
         const int ncase = (int)(sizeof qcase / sizeof qcase[0]);
-#if !defined(__AVX512F__)
-        /* Honest instead of a green tautology: without the AVX-512 path both runs execute
-         * the same code here, so the comparison would prove nothing.  (The NEON path is a
-         * separate question -- it rounds half to EVEN where the scalar rounds half AWAY,
-         * a divergence that predates this work and is tracked in the plan, not hidden by
-         * making this gate compare NEON against itself.) */
-        fprintf(f, "  [quant_rows] SIMD/scalar parity: n/a, this build has no x86 SIMD "
+#if !defined(__AVX512F__) && !defined(__ARM_NEON)
+        /* Honest instead of a green tautology: with no SIMD path at all both runs execute
+         * the same code here, so the comparison would prove nothing. */
+        fprintf(f, "  [quant_rows] SIMD/scalar parity: n/a, this build has no SIMD "
                    "quantiser (%d cases skipped)\n", ncase);
 #else
+        /* Real on both sides now: QWEN_NO_SIMD_QUANT gates the NEON body as well as the
+         * AVX-512 one, and the scalar tail follows the platform's rounding contract, so
+         * this compares the vector body against the scalar reference instead of comparing
+         * a half-to-even body against a half-away tail (PLAN P3.11). */
         for (int c = 0; c < ncase; c++) {
             const int rows = qcase[c].rows, K = qcase[c].K, blk = qcase[c].blk;
             const int Kp = qwen_int8_kp(K, blk), nblk = Kp / blk;
@@ -10581,6 +10876,13 @@ void qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int
     }
 #endif
     if (tid == 0) qwen_region_i8_note_backend("VNNI row blocks", rows, cols, B);
+    if (tid == 0) qwen_region_pool_at2(QWEN_RGN_MM_REGION_I8, (int)nt, rows);
+    {   /* Every thread that reaches the runner counts as an entry, and reports the rows it
+         * owns: the split is by tid/nt, so a thread with r1 == r0 entered but had nothing to
+         * do -- which is the difference between an idle worker and an unrecorded one. */
+        int r0 = (int)(tid * (size_t)rows / nt), r1 = (int)((tid + 1) * (size_t)rows / nt);
+        qwen_region_workers_at2(QWEN_RGN_MM_REGION_I8, 1);
+        if (r1 > r0) qwen_region_units_at2(QWEN_RGN_MM_REGION_I8, r1 - r0); }
     int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
     int8_vmm_task(tid, nt, &c);
 #else

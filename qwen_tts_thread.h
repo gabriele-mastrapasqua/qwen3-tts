@@ -62,4 +62,6 @@ void qwen_barrier_wait(qwen_barrier_t *b);
 }
 #endif
 
+const char *qwen_pool_flag_inert(const char *flag);
+
 #endif

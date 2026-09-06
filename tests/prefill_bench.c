@@ -222,7 +222,16 @@ int main(int argc, char **argv) {
     }
 
 #if HAVE_AMX
-    if (nt == 1) {
+    /* Opt-in, because this prototype is not in a shippable state and does not fail cleanly.
+     * Measured on a Granite Rapids host, AMX build, one thread: it reports "MISMATCH - the
+     * prototype is wrong" against the shipped path (worst relative 2.18), and when the
+     * engine's own AMX path is ALSO live in the same process it dies with SIGILL before the
+     * first line of output -- QWEN_NO_AMX=1 makes the same binary run to completion, and a
+     * dedicated probe on that host showed the engine's AMX matmat itself is healthy in both
+     * pool orderings, so the fault is this prototype's tile handling, not the runtime.
+     * Leaving it on by default made `make prefill-bench` -- which measures the real per-call
+     * fixed cost -- die on exactly the machines it exists for. PLAN X86-5 owns the prototype. */
+    if (nt == 1 && getenv("QWEN_PB_AMX_PROTO")) {
         printf("\n  B=32 prototype (one weight pass per 32 positions) vs two B=16 calls\n");
         int kfull = cols & ~31;
         uint16_t *Xb = (uint16_t *)malloc((size_t)32 * cols * sizeof(uint16_t));

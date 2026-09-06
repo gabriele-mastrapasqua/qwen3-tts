@@ -141,7 +141,138 @@ static void json_str(FILE *j, const char *s) {
     fputc('"', j);
 }
 
-#define NFEAT 40
+#define NFEAT 64
+
+#include "qwen_flag_scope.h"
+
+/* --effective-config: what the engine is ACTUALLY doing, per flag.
+ *
+ * The dispatch map answers "which kernel runs"; this answers the question that kept biting us
+ * one level below it -- an operator sets a variable, the engine parses it, and nothing happens
+ * because this build or this CPU cannot reach the code it controls.  QWEN_NO_SIMD_QUANT was
+ * inert on ARM for exactly that reason and nothing said so.  For every declared flag this
+ * prints requested / default / effective and, when they differ, WHY.
+ *
+ * The scope table is generated from the sources by tools/flag_parity.py, so it cannot drift
+ * from the guards the code actually has. */
+static unsigned qwen_build_scope(void) {
+    unsigned s = 0;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    s |= QWEN_FSCOPE_ARM;
+#endif
+#if defined(__APPLE__)
+    s |= QWEN_FSCOPE_APPLE;
+#endif
+#if defined(__AVX2__) || defined(__x86_64__)
+    s |= QWEN_FSCOPE_AVX2;
+#endif
+#if defined(__AVX512F__)
+    s |= QWEN_FSCOPE_AVX512F;
+#endif
+#if defined(__AVX512VNNI__)
+    s |= QWEN_FSCOPE_VNNI;
+#endif
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    s |= QWEN_FSCOPE_AMX;
+#endif
+#if defined(QWEN_HAVE_CUDA) || defined(QWEN_HAVE_METAL)
+    s |= QWEN_FSCOPE_GPU;
+#endif
+    return s ? s : QWEN_FSCOPE_ALL;
+}
+
+static const char *qwen_scope_names(unsigned sc, char *buf, size_t n) {
+    struct { unsigned bit; const char *name; } m[] = {
+        { QWEN_FSCOPE_ARM, "arm" }, { QWEN_FSCOPE_AVX2, "avx2" },
+        { QWEN_FSCOPE_AVX512F, "avx512f" }, { QWEN_FSCOPE_VNNI, "vnni" },
+        { QWEN_FSCOPE_AMX, "amx" }, { QWEN_FSCOPE_APPLE, "apple" },
+        { QWEN_FSCOPE_GPU, "gpu" },
+    };
+    size_t k = 0; buf[0] = 0;
+    for (size_t i = 0; i < sizeof m / sizeof m[0]; i++)
+        if (sc & m[i].bit)
+            k += (size_t)snprintf(buf + k, k < n ? n - k : 0, "%s%s", k ? "," : "", m[i].name);
+    if (!buf[0]) snprintf(buf, n, "none");
+    return buf;
+}
+
+int qwen_effective_config_report(void *out) {
+    FILE *f = out ? (FILE *)out : stdout;
+    const unsigned build = qwen_build_scope();
+    char sb[96], bb[96];
+    const int n = (int)(sizeof g_qwen_flag_scope / sizeof g_qwen_flag_scope[0]);
+    int set_n = 0, inert_n = 0;
+
+    fprintf(f, "[EFFECTIVE-CONFIG] v=1 build_scope=%s flags=%d\n",
+            qwen_scope_names(build, bb, sizeof bb), n);
+    fprintf(f, "  %-34s %-10s %-9s %s\n", "flag", "requested", "effective", "scope / reason");
+    for (int i = 0; i < n; i++) {
+        const char *name = g_qwen_flag_scope[i].name;
+        const unsigned sc = g_qwen_flag_scope[i].scope;
+        const char *req = getenv(name);
+        const int reachable = (sc & build) != 0;
+        if (req && *req) set_n++;
+        if (!req || !*req) {
+            /* Only the flags an operator actually set are worth a line here; the rest are
+             * their documented defaults and live in docs/feature-flags.md. */
+            continue;
+        }
+        const char *inert = qwen_pool_flag_inert(name);
+        if (!inert) inert = qwen_kleidi_flag_inert(name);
+        if (inert) {
+            inert_n++;
+            fprintf(f, "  %-34s %-10s %-9s IGNORED: %s\n", name, req, "ignored", inert);
+            continue;
+        }
+        /* A gate flag has a better answer than any static scope: is its kernel compiled? */
+        int gate_compiled = 0; const char *kernel = NULL;
+        if (qwen_flag_gate_status(name, &gate_compiled, &kernel)) {
+            if (!gate_compiled) {
+                inert_n++;
+                fprintf(f, "  %-34s %-10s %-9s IGNORED: \"%s\" is not compiled into this build\n",
+                        name, req, "ignored", kernel ? kernel : "?");
+            } else {
+                fprintf(f, "  %-34s %-10s %-9s gate: %s\n", name, req, "honoured",
+                        kernel ? kernel : "?");
+            }
+            continue;
+        }
+        if (reachable) {
+            fprintf(f, "  %-34s %-10s %-9s %s\n", name, req, "honoured",
+                    qwen_scope_names(sc, sb, sizeof sb));
+        } else {
+            inert_n++;
+            fprintf(f, "  %-34s %-10s %-9s %s -- IGNORED: this build reaches %s\n",
+                    name, req, "ignored", qwen_scope_names(sc, sb, sizeof sb),
+                    qwen_scope_names(build, bb, sizeof bb));
+        }
+    }
+    {   /* Not a QWEN_ flag, but the one env that can put a second compute scheduler in this
+         * process.  Engine ownership now overrides it; say so rather than leaving it silent. */
+        const char *ob = getenv("OPENBLAS_NUM_THREADS");
+        if (ob && *ob) {
+            set_n++;
+            if (qwen_blas_own_effective() || qwen_blas_env_overridden()) {
+                inert_n++;
+                fprintf(f, "  %-34s %-10s %-9s OVERRIDDEN: the engine owns the compute budget; "
+                           "BLAS is forced to 1 thread\n", "OPENBLAS_NUM_THREADS", ob, "1");
+            } else {
+                fprintf(f, "  %-34s %-10s %-9s BLAS runs its own team by request\n",
+                        "OPENBLAS_NUM_THREADS", ob, ob);
+            }
+        }
+        fprintf(f, "  %-34s %-10s %-9s %s\n", "blas.ownership", "-",
+                qwen_blas_own_effective() ? "engine" : "blas",
+                qwen_blas_own_effective()
+                  ? "engine owns the budget: BLAS is held at one thread and cannot escape it"
+                  : "BLAS keeps its own team (no thread control here, or ownership not claimed)");
+    }
+    fprintf(f, "  %d flag%s set in the environment, %d of them IGNORED by this build\n",
+            set_n, set_n == 1 ? "" : "s", inert_n);
+    if (inert_n)
+        fprintf(f, "  WARNING: an ignored flag is a configuration that is not being applied.\n");
+    return inert_n;
+}
 
 int qwen_dispatch_map_report(void *out, const char *json_path) {
     FILE *f = out ? (FILE *)out : stderr;
@@ -262,6 +393,16 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_matmat_family_q4());
         row(&feats[n++], "matmat.bf16.family", "-", "-", NULL, "see reason",
             qwen_matmat_family_bf16());
+        {
+            /* --batch-size is not clamped to this: above it every batched int8 gate declines
+             * and the step runs one GEMV per slot instead (prefill chunks itself to 16). */
+            char mb[24]; int ceil_b = qwen_matmat_int8_max_b();
+            snprintf(mb, sizeof mb, "%d", ceil_b);
+            row(&feats[n++], "matmat.int8.batch_ceiling", "-", "-", NULL, mb,
+                ceil_b ? "largest B the int8 matmat family accepts; --batch-size above it falls "
+                         "back to one GEMV per slot, silently"
+                       : "no batched int8 kernel here at all: every B runs per-slot GEMV");
+        }
         row(&feats[n++], "matvec.q4.native", yn(qwen_q4_gemv_native()),
             yn(qwen_q4_gemv_native()), NULL, onoff(qwen_q4_gemv_native()),
             qwen_q4_gemv_native() ? "native q4 GEMV"
@@ -376,6 +517,32 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_pool_priority_ok() ? "a submitter can step aside for the frame loop (LOW)"
                                     : "no submit priority here: QWEN_PREFILL_LOW_MS is ignored");
         row(&feats[n++], "pool.threads", "-", "-", NULL, tmp, "matvec threads in this process (-j)");
+    }
+
+    /* ---- Persistent execution regions ------------------------------------------------
+     * The engine prints the resolved answer, with the model's own shapes, at the first
+     * batched step ("[cp] transformer step as one parallel region: ..."). These rows are
+     * what can be known BEFORE traffic: whether an in-region runner exists at all, whether
+     * the pool can hold a team, and which knobs are set. */
+    {
+        const char *rb = qwen_region_i8_backend();
+        int held = qwen_parallel_team();
+        char tb[24]; snprintf(tb, sizeof tb, "%d", held);
+        row(&feats[n++], "region.int8_runner", "-", "-", NULL,
+            (rb[0] == 'n' && rb[1] == 'o') ? "OFF" : "ON", rb);
+        row(&feats[n++], "region.team", "-", "-", NULL, tb,
+            held >= 2 ? "holdable team: a region can keep its workers between phases"
+                      : "no holdable team (needs >= 2): every region predicate is off");
+        row(&feats[n++], "region.cp", "-", "-", "QWEN_CP_REGION", "see reason",
+            "CP transformer step as one parallel region; needs int8 weights (no q4), B in 2..16 "
+            "and the runner above. QWEN_CP_REGION=0 restores the dispatched path");
+        row(&feats[n++], "region.cp_frame", "-", "-", "QWEN_CP_FRAME_REGION", "see reason",
+            "all 16 CP steps in one pool entry; also needs the batched heads");
+        row(&feats[n++], "region.cp_batch_head", "-", "-", "QWEN_CP_BATCH_HEAD", "see reason",
+            "MTP projection and lm_heads once for all active slots");
+        row(&feats[n++], "region.talker", "-", "-", "QWEN_TK_REGION", "see reason",
+            "batched Talker step as one parallel region, same conditions as region.cp. "
+            "QWEN_TK_REGION=0 restores the dispatched path");
     }
 
     /* ---- Print ---------------------------------------------------------------------- */

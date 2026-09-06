@@ -191,6 +191,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_AMX_MIN_B` · `QWEN_VNNI_MIN_B` · `QWEN_AVX2MM_MIN_B` | x86 | 4 · 2 · 2 | smallest batch width that may take that matmat |
 | `QWEN_AMX_BF16_MIN_B` · `QWEN_AMX_INT8_MIN_B` | x86 | fall back to `QWEN_AMX_MIN_B` | split the AMX gate when one threshold does not suit both datatypes; each overrides the shared one for its type only |
 | `QWEN_AMX_INT8_QKV_MIN_B` | x86 | inherits `QWEN_AMX_INT8_MIN_B` | additional lower bound for the fused INT8 QKV path only; other INT8 projections keep the normal AMX gate |
+| `QWEN_AMX_INT8_MIN_ROWS_PER_THREAD` | x86 | 256 | AMX INT8 also needs enough output rows PER WORKER (`rows >= N * threads`; the fused QKV counts `q+2kv`). Measured: below ~256 the tile setup and activation pack are not amortised and VNNI wins, and the same projection flips sign with the thread count. 0 disables the rule |
 | `QWEN_BFMMLA_MIN_B` · `QWEN_SMMLA_MIN_B` · `QWEN_KLEIDI_MIN_B` | ARM | 2 · 2 · 1 | the same thresholds on the ARM kernels |
 
 The batch gates say *when* a kernel is allowed; these say *how it tiles the output rows* once it is:
@@ -267,6 +268,7 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
 | `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |
 | `QWEN_SD_INT8_BLK` | compiled default | block size of the int8 decoder convolution tiles |
+| `QWEN_SD_CONV_NC` | all | auto | output columns per work item in the INT8 decoder conv. Auto sizes the panel from the layer length and the pool so a short layer still fills it; `=128` restores the old fixed panel (the A/B arm). Each column is im2col'd, quantised and scaled independently, so the panel size changes only WHO computes a column, never its value |
 | `QWEN_SD_WINDOWED` | off | windowed decoder evaluation; diagnostic for the streaming boundary |
 | `QWEN_DEC_FIRSTCHUNK_GROUP` | 0 (off) | `=1` groups the first streaming chunk of several slots into one decoder pass |
 | `QWEN_THREADS_TALKER` · `QWEN_THREADS_DECODER` | unset (both = `-j`) | split the thread budget between the Talker/CP phase and the decoder phase inside one worker |

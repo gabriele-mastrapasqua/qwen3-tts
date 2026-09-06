@@ -745,8 +745,10 @@ server-soak: bench-soak
 bench-suite-full: bench-suite
 	@$(MAKE) bench-soak
 
+# qwen_tts_costmap.c is not optional: qwen_tts_thread.c calls qwen_region_begin_/end_, so
+# leaving it out breaks the link, not the measurement.
 PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c \
-             qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+             qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I. -I$(INGOT_DIR)/include $(KAI_INC)
 check-matmat-parity: $(INGOT_LIB)
 	@echo "=== matmat parity — native ISA ==="
@@ -884,6 +886,17 @@ cpu-check: $(TARGET) $(MEMBW_BIN)
 	  CPU_MODEL=$(CPU_MODEL) bash tools/cpu_check.sh
 dispatch-map: $(TARGET)
 	@./$(TARGET) --dispatch-map
+
+# PARITY-2: what the engine is ACTUALLY doing, per declared flag.  The scope table it embeds is
+# generated from the sources, so `check-flag-parity` regenerates and diffs it: a new backend
+# guard around a flag's effect cannot drift away from what the engine reports.
+effective-config: $(TARGET)
+	@./$(TARGET) --effective-config
+check-flag-parity:
+	@python3 tools/flag_parity.py --emit-c /tmp/qwen_flag_scope.gen.h >/dev/null
+	@diff -u qwen_flag_scope.h /tmp/qwen_flag_scope.gen.h \
+	  || { echo "FAIL: qwen_flag_scope.h is stale — run tools/flag_parity.py --emit-c qwen_flag_scope.h"; exit 1; }
+	@python3 tools/flag_parity.py --check | tail -8
 profile-cpu-check: $(TARGET)
 	@python3 tools/profile_check.py --profiles $(PROFILES_DIR) --bin ./$(TARGET) $(if $(CPU_MODEL),--model $(CPU_MODEL),)
 
@@ -920,7 +933,7 @@ mini-bench-17b: $(TARGET)
 	  --port 9601 --label mini17b
 
 PREFILL_BENCH_SRC = tests/prefill_bench.c qwen_tts_kernels.c qwen_tts_thread.c \
-                    qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+                    qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 prefill-bench: $(INGOT_LIB)
 	@echo "=== prefill cost: what the per-call fixed cost actually is ==="
 ifeq ($(UNAME_S),Darwin)
@@ -970,19 +983,25 @@ test-golden: $(TARGET)
 	@echo "=== Golden-reference correctness test (mel-corr + duration) ==="
 	@if ! python3 -c "import librosa" 2>/dev/null; then echo "SKIP: python3 librosa not installed (pip install librosa)"; exit 0; fi
 	@mkdir -p $(TEST_DIR)
-	@FAIL=0; \
-	 ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_06b_en.wav >/dev/null 2>&1; \
-	 python3 tests/compare_audio.py tests/golden/golden_06b_en.wav $(TEST_DIR)/gold_06b_en.wav --label "0.6B en" || FAIL=1; \
-	 ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l Italian --text "$(GOLDEN_IT)" -o $(TEST_DIR)/gold_06b_it.wav >/dev/null 2>&1; \
-	 python3 tests/compare_audio.py tests/golden/golden_06b_it.wav $(TEST_DIR)/gold_06b_it.wav --label "0.6B it" || FAIL=1; \
-	 ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --int8 --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_06b_en_int8.wav >/dev/null 2>&1; \
-	 python3 tests/compare_audio.py tests/golden/golden_06b_en_int8.wav $(TEST_DIR)/gold_06b_en_int8.wav --label "0.6B en int8" || FAIL=1; \
-	 if [ -d $(MODEL_LARGE) ]; then \
+# MODEL_SMALL is guarded like MODEL_LARGE: a rented box usually carries ONE checkpoint, and a
+# missing model is not a numerical regression.  RAN counts what actually ran, so "everything
+# skipped" cannot be reported as PASS.
+	@FAIL=0; RAN=0; \
+	 if [ -d $(MODEL_SMALL) ]; then RAN=1; \
+	   ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_06b_en.wav >/dev/null 2>&1; \
+	   python3 tests/compare_audio.py tests/golden/golden_06b_en.wav $(TEST_DIR)/gold_06b_en.wav --label "0.6B en" || FAIL=1; \
+	   ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l Italian --text "$(GOLDEN_IT)" -o $(TEST_DIR)/gold_06b_it.wav >/dev/null 2>&1; \
+	   python3 tests/compare_audio.py tests/golden/golden_06b_it.wav $(TEST_DIR)/gold_06b_it.wav --label "0.6B it" || FAIL=1; \
+	   ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --int8 --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_06b_en_int8.wav >/dev/null 2>&1; \
+	   python3 tests/compare_audio.py tests/golden/golden_06b_en_int8.wav $(TEST_DIR)/gold_06b_en_int8.wav --label "0.6B en int8" || FAIL=1; \
+	 else echo "SKIP: 0.6B (model absent)"; fi; \
+	 if [ -d $(MODEL_LARGE) ]; then RAN=1; \
 	   ./$(TARGET) -d $(MODEL_LARGE) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o $(TEST_DIR)/gold_17b_en.wav >/dev/null 2>&1; \
 	   python3 tests/compare_audio.py tests/golden/golden_17b_en.wav $(TEST_DIR)/gold_17b_en.wav --label "1.7B en" || FAIL=1; \
 	 else echo "SKIP: 1.7B (model absent)"; fi; \
+	 if [ "$$RAN" -eq 0 ]; then echo "FAIL: no golden model present, nothing was checked"; exit 1; fi; \
 	 if [ "$$FAIL" -ne 0 ]; then echo "FAIL: golden-reference mismatch (numerical regression?)"; exit 1; fi; \
-	 echo "PASS: all golden references match"
+	 echo "PASS: all golden references present matched"
 	@echo ""
 
 golden-update: $(TARGET)

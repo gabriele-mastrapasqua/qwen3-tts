@@ -1836,6 +1836,16 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     fprintf(stderr, "[serve] %d slots · %d may wait (%d in the system) · queue deadline %s\n",
             max_batch, jq.cap, max_batch + jq.cap,
             g_srv.queue_timeout_ms > 0 ? "on" : "none");
+    {
+        /* Say it once at start instead of letting the throughput quietly not happen: above
+         * the batched int8 ceiling every gate declines and a step runs one GEMV per slot. */
+        int ceil_b = qwen_matmat_int8_max_b();
+        if (ceil_b > 0 && max_batch > ceil_b)
+            fprintf(stderr, "[serve] WARNING --batch-size %d is above the batched int8 ceiling "
+                            "(B<=%d on this build): a fuller batch runs one GEMV per slot "
+                            "instead of the batched kernel. See matmat.int8.batch_ceiling in "
+                            "--dispatch-map.\n", max_batch, ceil_b);
+    }
     job_queue_t jq_single; jq_init(&jq_single);
 
     pthread_t *readers = (pthread_t *)calloc(n_readers, sizeof(pthread_t));
@@ -1857,6 +1867,9 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     if (getenv("QWEN_DISPATCH_MAP") || getenv("QWEN_SERVE_PROFILE") ||
         getenv("QWEN_SHAPE_CENSUS") || getenv("QWEN_COST_MAP"))
         qwen_dispatch_map_report(stderr, NULL);   /* engagement proof inside this run's log */
+    /* Always: an artifact must open with what the engine is ACTUALLY doing, not with what was
+     * in the environment.  Silent when nothing is set, one line per flag that is. */
+    (void)qwen_effective_config_report(stderr);
     fprintf(stderr, "Server listening on http://0.0.0.0:%d (continuous request-batching: max_batch=%d, %d readers%s)\n",
             port, max_batch, n_readers, single_ctx ? ", +1 single-job clone" : "");
     fprintf(stderr, "Endpoints:\n"
@@ -1958,7 +1971,6 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
      * before it.  Neither reproduces on the batched/prefork server, which isolates workers by
      * process and is the production path. */
     g_serialize_synth = 1;
-    (void)qwen_pool_concurrent_submit_ok();
 
     qwen_tts_ctx_t **ctxs = (qwen_tts_ctx_t **)calloc(n_workers, sizeof(*ctxs));
     pthread_t *threads = (pthread_t *)calloc(n_workers, sizeof(pthread_t));
@@ -2060,7 +2072,7 @@ static void elastic_plan(int workers, int ncpu, const int *active, int *slice) {
 }
 
 static int elastic_apply(int workers, int ncpu, const int *slice, const pid_t *kids,
-                         int *base_out) {
+                         int *base_out, const int *order) {
     int changed = 0, next = 0;
     for (int w = 0; w < workers; w++) {
         if (kids[w] <= 0) continue;
@@ -2070,7 +2082,7 @@ static int elastic_apply(int workers, int ncpu, const int *slice, const pid_t *k
         if (hi >= ncpu) hi = ncpu - 1;
         if (base_out[2 * w] == lo && base_out[2 * w + 1] == hi) continue;
         cpu_set_t set; CPU_ZERO(&set);
-        for (int c = lo; c <= hi; c++) CPU_SET(c, &set);
+        for (int c = lo; c <= hi; c++) CPU_SET(order[c], &set);
         if (sched_setaffinity(kids[w], sizeof set, &set) != 0) {
             perror("sched_setaffinity(child)");
             continue;
@@ -2081,6 +2093,55 @@ static int elastic_apply(int workers, int ncpu, const int *slice, const pid_t *k
     return changed;
 }
 
+/* Order the logical CPUs CORE-MAJOR: core 0's threads, then core 1's, ...
+ *
+ * Prefork slices this order contiguously, so the slice model stays a range -- but a range over
+ * PHYSICAL cores instead of over Linux's logical numbering.  It matters because Linux numbers
+ * every core's first thread before any sibling: on the 12-core SMT-2 host we measure on
+ * (siblings cpu N and cpu N+12), `--prefork 2` used to give worker 0 cpus 0-11 and worker 1
+ * cpus 12-23 -- the SAME twelve physical cores, one worker per hyperthread.  The workers were
+ * not isolated at all, and the AMX tile unit is per physical core, so they serialised on it too.
+ * Core-major ordering gives worker 0 cores 0-5 (both threads) and worker 1 cores 6-11.
+ *
+ * Falls back to the identity order when sysfs is unavailable or inconsistent; on a host without
+ * SMT the two orders are the same anyway. */
+static int qwen_cpu_core_major_order(int *order, int ncpu) {
+    for (int i = 0; i < ncpu; i++) order[i] = i;
+#if defined(__linux__)
+    int *pkg = (int *)malloc((size_t)ncpu * sizeof(int));
+    int *core = (int *)malloc((size_t)ncpu * sizeof(int));
+    if (!pkg || !core) { free(pkg); free(core); return 0; }
+    for (int c = 0; c < ncpu; c++) {
+        char path[128]; FILE *f; long v;
+        pkg[c] = core[c] = -1;
+        snprintf(path, sizeof path,
+                 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
+        if ((f = fopen(path, "r"))) { if (fscanf(f, "%ld", &v) == 1) pkg[c] = (int)v; fclose(f); }
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+        if ((f = fopen(path, "r"))) { if (fscanf(f, "%ld", &v) == 1) core[c] = (int)v; fclose(f); }
+        if (pkg[c] < 0 || core[c] < 0) { free(pkg); free(core); return 0; }
+    }
+    int n = 0;
+    for (int c = 0; c < ncpu; c++) {          /* first thread of each core, in first-seen order */
+        int seen = 0;
+        for (int d = 0; d < c; d++) if (pkg[d] == pkg[c] && core[d] == core[c]) { seen = 1; break; }
+        if (seen) continue;
+        if (n >= ncpu) { free(pkg); free(core); for (int i = 0; i < ncpu; i++) order[i] = i; return 0; }
+        order[n++] = c;
+        for (int d = c + 1; d < ncpu; d++)     /* then that core's siblings, next to it */
+            if (pkg[d] == pkg[c] && core[d] == core[c]) {
+                if (n >= ncpu) { free(pkg); free(core); for (int i = 0; i < ncpu; i++) order[i] = i; return 0; }
+                order[n++] = d;
+            }
+    }
+    free(pkg); free(core);
+    if (n != ncpu) { for (int i = 0; i < ncpu; i++) order[i] = i; return 0; }
+    return 1;
+#else
+    (void)ncpu; return 0;
+#endif
+}
+
 int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                            int threads_per, int max_batch) {
     const int elastic = getenv("QWEN_PREFORK_ELASTIC") &&
@@ -2088,6 +2149,9 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
     if (workers < 1) workers = 1;
     const int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
     const int per = ncpu / workers > 0 ? ncpu / workers : 1;
+    int *cpu_order = (int *)malloc((size_t)(ncpu > 0 ? ncpu : 1) * sizeof(int));
+    if (!cpu_order) return -1;
+    const int core_major = qwen_cpu_core_major_order(cpu_order, ncpu);
     if (threads_per < 1) threads_per = per;
     const int cap = max_batch >= 1 ? max_batch : 1;
 
@@ -2106,6 +2170,44 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
     if (cur) for (int w = 0; w < 2 * workers; w++) cur[w] = -1;
     if (!sp || !kids || !assigned || !completed || !active || !slice || !cur) return -1;
 
+    {
+        /* Say the host topology out loud before any measurement starts.  A benchmark that does
+         * not know whether SMT is on is not a benchmark: with siblings enumerated N and N+12,
+         * a contiguous logical slice hands two workers the same physical cores, and the AMX
+         * tile unit is per CORE, so they serialise on it while the numbers look like isolation. */
+        int cores = 0, smt = 1;
+#if defined(__linux__)
+        for (int c = 0; c < ncpu; c++) {
+            char path[128]; FILE *f; long v = -1;
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+            if ((f = fopen(path, "r"))) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); }
+            if (v < 0) { cores = 0; break; }
+            int dup = 0;
+            for (int d = 0; d < c; d++) {
+                char p2[128]; FILE *g; long v2 = -1;
+                snprintf(p2, sizeof p2, "/sys/devices/system/cpu/cpu%d/topology/core_id", d);
+                if ((g = fopen(p2, "r"))) { if (fscanf(g, "%ld", &v2) != 1) v2 = -1; fclose(g); }
+                if (v2 == v) { dup = 1; break; }
+            }
+            if (!dup) cores++;
+        }
+#endif
+        if (cores > 0) smt = ncpu / cores;
+        fprintf(stderr, "prefork topology: %d logical cpus", ncpu);
+        if (cores > 0) fprintf(stderr, " = %d physical cores x %d SMT", cores, smt);
+        fprintf(stderr, " · %d workers x %d threads · %d cpus per worker (%s)\n",
+                workers, threads_per, per,
+                core_major ? "core-major masks" : "logical masks, sysfs topology unavailable");
+        if (cores > 0 && smt > 1)
+            fprintf(stderr, "prefork: ⚠️  SMT is ON (%d threads per core). Each worker's mask "
+                            "covers %d physical cores, both siblings each; the AMX tile unit is "
+                            "PER CORE, so two busy threads on one core share it. For a clean "
+                            "measurement disable SMT on the host or give each worker one thread "
+                            "per core.\n", smt, per / smt > 0 ? per / smt : 1);
+        if (cores > 0 && workers * per > ncpu)
+            fprintf(stderr, "prefork: ⚠️  worker masks OVERLAP (%d workers x %d cpus > %d)\n",
+                    workers, per, ncpu);
+    }
     fprintf(stderr, "prefork: %d workers x %d threads, %d cpus (%d per worker), "
                     "cap %d in flight each, port %d%s\n",
             workers, threads_per, ncpu, per, cap, port,
@@ -2126,16 +2228,25 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             g_conn_chan_fd = sp[w][1];
             g_conn_done_fd = sp[w][1];
             cpu_set_t set; CPU_ZERO(&set);
-            for (int c = w * per; c < (w + 1) * per && c < ncpu; c++) CPU_SET(c, &set);
+            char cpulist[128]; int cl = 0; cpulist[0] = 0;
+            for (int c = w * per; c < (w + 1) * per && c < ncpu; c++) {
+                int lc = cpu_order[c];
+                CPU_SET(lc, &set);
+                if (cl < (int)sizeof cpulist - 8)
+                    cl += snprintf(cpulist + cl, sizeof cpulist - (size_t)cl,
+                                   "%s%d", cl ? "," : "", lc);
+            }
             if (sched_setaffinity(0, sizeof(set), &set) != 0) perror("sched_setaffinity");
             qwen_threadpool_after_fork();
             qwen_costmap_after_fork();
             qwen_set_threads(threads_per);
-            fprintf(stderr, "prefork: worker %d pid %d cpus %d-%d threads %d\n",
-                    w, (int)getpid(), w * per, w * per + per - 1, threads_per);
-            { char cfg[64];
-              snprintf(cfg, sizeof cfg, "%d-%d", w * per, w * per + per - 1);
-              qwen_topology_emit(w, threads_per, cfg, "prefork"); }
+            /* Print the mask that was actually SET, not the slice indices: on an SMT host
+             * those are no longer the same thing, and the mask is what a run manifest needs. */
+            fprintf(stderr, "prefork: worker %d pid %d cpus %s threads %d (%s)\n",
+                    w, (int)getpid(), cpulist, threads_per,
+                    core_major ? "core-major slice, siblings kept together"
+                               : "logical slice, no sysfs topology");
+            qwen_topology_emit(w, threads_per, cpulist, "prefork");
             int rc = (max_batch >= 2) ? qwen_tts_serve_batched(ctx, port, max_batch)
                                       : qwen_tts_serve_ex(ctx, port, 1);
             qwen_worker_dump_counters();
@@ -2230,7 +2341,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                 if (active[w] < 0) active[w] = 0;
                 if (elastic) {
                     elastic_plan(workers, ncpu, active, slice);
-                    replans += elastic_apply(workers, ncpu, slice, kids, cur);
+                    replans += elastic_apply(workers, ncpu, slice, kids, cur, cpu_order);
                 }
             } else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
                 fprintf(stderr, "prefork: worker %d (pid %d) channel closed\n", w, (int)kids[w]);
@@ -2258,7 +2369,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         if (elastic) {
             active[best]++;
             elastic_plan(workers, ncpu, active, slice);
-            replans += elastic_apply(workers, ncpu, slice, kids, cur);
+            replans += elastic_apply(workers, ncpu, slice, kids, cur, cpu_order);
             active[best]--;
         }
         if (srv_send_fd(sp[best][0], cfd) != 0) {
@@ -2297,7 +2408,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         fprintf(stderr, "  worker %d: assigned=%lld completed=%lld still-active=%d\n",
                 w, assigned[w], completed[w], active[w]);
     free(pfd); free(sp); free(kids); free(assigned); free(completed); free(active);
-    free(act_area_w); free(slice); free(cur);
+    free(act_area_w); free(slice); free(cur); free(cpu_order);
     close(listen_fd);
     return 0;
 }

@@ -65,6 +65,16 @@ static const rgn_info_t g_rgn[] = {
     { QWEN_RGN_RT_POOL_DISPATCH,  "runtime.pool_dispatch",            QWEN_RGN_MULTI,       1, "runtime" , "stack" },
     { QWEN_RGN_RT_POOL_WAIT,      "runtime.pool_wait_completion",     QWEN_RGN_RT_POOL_DISPATCH, 1, "runtime" , "stack" },
     { QWEN_RGN_RT_POOL_SUBMIT,    "runtime.pool_submit_wait",         QWEN_RGN_RT_POOL_DISPATCH, 1, "runtime" , "stack" },
+    { QWEN_RGN_SD_CONV_INT8,      "decoder.conv_int8.panels",         QWEN_RGN_MULTI,       1, "decoder" , "stack" },
+    { QWEN_RGN_MM_REGION_I8,      "region.int8_runner.rows",          QWEN_RGN_MULTI,       1, "runtime" , "stack" },
+    { QWEN_RGN_CPB_MTP,           "cp.batch.mtp",                     QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_QKV,           "cp.batch.qkv",                     QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_ATTN,          "cp.batch.attn",                    QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_WO,            "cp.batch.out_proj",                QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_GATEUP,        "cp.batch.gate_up",                 QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_DOWN,          "cp.batch.down",                    QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_LOTHER,        "cp.batch.layer_other",             QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_LMHEAD,        "cp.batch.lm_head",                 QWEN_RGN_MULTI,       1, "cp"      , "derived" },
 };
 static const int g_rgn_n = (int)(sizeof g_rgn / sizeof g_rgn[0]);
 
@@ -87,6 +97,13 @@ typedef struct rgn_tls_s {
     uint64_t child_ns[QWEN_RGN_MAX];
     uint64_t calls[QWEN_RGN_MAX];
     uint32_t nest_mismatch[QWEN_RGN_MAX];
+    uint64_t units[QWEN_RGN_MAX];        /* work units this thread claimed        */
+    uint64_t tasks[QWEN_RGN_MAX];        /* units offered by dispatches it opened */
+    uint32_t pool_nt[QWEN_RGN_MAX];      /* widest dispatch seen for this region  */
+    uint64_t dispatches[QWEN_RGN_MAX];
+    uint64_t entered[QWEN_RGN_MAX];      /* workers that entered the job body   */
+    uint64_t ticks[QWEN_RGN_MAX];        /* counted, not timed (FAST)            */
+    uint64_t hook_calls[6];              /* self-accounting: begin,end,units,pool,workers */
     int      stack_id[RGN_STACK_MAX];
     uint64_t stack_t0[RGN_STACK_MAX];
     int      depth;
@@ -136,6 +153,40 @@ void qwen_costmap_init(void) {
 }
 int qwen_costmap_level(void) { return qwen_costmap_level_v; }
 
+void qwen_region_pool_at_(int id, int threads, long long tasks) {
+    rgn_tls_t *t = rgn_self();
+    if (!t) return;
+    t->hook_calls[3]++;
+    if (id <= 0 || id >= QWEN_RGN_MAX) return;
+    t->dispatches[id]++;
+    t->tasks[id] += (uint64_t)(tasks > 0 ? tasks : 0);
+    if (threads > 0 && (uint32_t)threads > t->pool_nt[id]) t->pool_nt[id] = (uint32_t)threads;
+}
+
+void qwen_region_tick_at_(int id, long long n) {
+    rgn_tls_t *t = rgn_self();
+    if (!t) return;
+    t->hook_calls[5]++;
+    if (id <= 0 || id >= QWEN_RGN_MAX || n <= 0) return;
+    t->ticks[id] += (uint64_t)n;
+}
+
+void qwen_region_workers_at_(int id, int entered) {
+    rgn_tls_t *t = rgn_self();
+    if (!t) return;
+    t->hook_calls[4]++;
+    if (id <= 0 || id >= QWEN_RGN_MAX || entered <= 0) return;
+    t->entered[id] += (uint64_t)entered;
+}
+
+void qwen_region_units_at_(int id, long long n) {
+    rgn_tls_t *t = rgn_self();
+    if (!t) return;
+    t->hook_calls[2]++;
+    if (id <= 0 || id >= QWEN_RGN_MAX || n <= 0) return;
+    t->units[id] += (uint64_t)n;
+}
+
 void qwen_region_thread_role(const char *role) {
     if (!qwen_costmap_level_v || !role) return;
     rgn_tls_t *t = rgn_self();
@@ -144,7 +195,9 @@ void qwen_region_thread_role(const char *role) {
 
 void qwen_region_begin_(int id) {
     rgn_tls_t *t = rgn_self();
-    if (!t || id <= 0 || id >= QWEN_RGN_MAX) return;
+    if (!t) return;
+    t->hook_calls[0]++;
+    if (id <= 0 || id >= QWEN_RGN_MAX) return;
     if (t->depth >= RGN_STACK_MAX) { t->overflow++; return; }
     /* Verify the declared nesting instead of trusting it. */
     const int decl = qwen_region_parent(id);
@@ -159,7 +212,9 @@ void qwen_region_begin_(int id) {
 
 void qwen_region_end_(int id) {
     rgn_tls_t *t = t_rgn;
-    if (!t || id <= 0 || id >= QWEN_RGN_MAX) return;
+    if (!t) return;
+    t->hook_calls[1]++;
+    if (id <= 0 || id >= QWEN_RGN_MAX) return;
     if (t->depth <= 0 || t->stack_id[t->depth - 1] != id) { t->unbalanced++; return; }
     const uint64_t dt = rgn_now_ns() - t->stack_t0[t->depth - 1];
     t->depth--;
@@ -210,6 +265,8 @@ void qwen_costmap_after_fork(void) {
     pthread_mutex_init(&g_req_mtx, NULL);
 }
 
+unsigned long long qwen_costmap_now_ns(void) { return rgn_now_ns(); }
+
 void qwen_region_add_ns(int id, unsigned long long ns) {
     if (!qwen_costmap_level_v) return;
     rgn_tls_t *t = rgn_self();
@@ -257,26 +314,39 @@ int qwen_costmap_dump(const char *path) {
     int first_t = 1;
     for (rgn_tls_t *t = g_rgn_list; t; t = t->next) {
         int any = 0;
-        for (int i = 0; i < QWEN_RGN_MAX; i++) if (t->calls[i]) { any = 1; break; }
+        for (int i = 0; i < QWEN_RGN_MAX; i++)
+            if (t->calls[i] || t->units[i] || t->entered[i] || t->ticks[i]) { any = 1; break; }
+        for (int i = 0; i < 5 && !any; i++) if (t->hook_calls[i]) any = 1;
         if (!any) continue;
         if (!first_t) fprintf(f, ",\n");
         first_t = 0;
         fprintf(f, "  { \"role\": \"%s\", \"tid\": %ld, \"stack_overflow\": %llu, "
-                   "\"unbalanced\": %llu, \"leaked\": %llu, \"regions\": [\n",
+                   "\"unbalanced\": %llu, \"leaked\": %llu, "
+                   "\"hooks\": { \"begin\": %llu, \"end\": %llu, \"units\": %llu, "
+                   "\"pool\": %llu, \"workers\": %llu, \"tick\": %llu }, \"regions\": [\n",
                 t->role, t->tid, (unsigned long long)t->overflow,
-                (unsigned long long)t->unbalanced, (unsigned long long)t->leaked);
+                (unsigned long long)t->unbalanced, (unsigned long long)t->leaked,
+                (unsigned long long)t->hook_calls[0], (unsigned long long)t->hook_calls[1],
+                (unsigned long long)t->hook_calls[2], (unsigned long long)t->hook_calls[3],
+                (unsigned long long)t->hook_calls[4], (unsigned long long)t->hook_calls[5]);
         int first_r = 1;
         for (int i = 0; i < QWEN_RGN_MAX; i++) {
-            if (!t->calls[i]) continue;
+            if (!t->calls[i] && !t->units[i] && !t->dispatches[i] && !t->entered[i]
+                && !t->ticks[i]) continue;
             if (!first_r) fprintf(f, ",\n");
             first_r = 0;
             fprintf(f, "   { \"id\": %d, \"name\": \"%s\", \"component\": \"%s\", "
                        "\"parent\": %d, \"level\": %d, \"mode\": \"%s\", \"calls\": %llu, "
-                       "\"ns\": %llu, \"child_ns\": %llu, \"nest_mismatch\": %u }",
+                       "\"ns\": %llu, \"child_ns\": %llu, \"nest_mismatch\": %u, "
+                       "\"units\": %llu, \"tasks\": %llu, \"dispatches\": %llu, "
+                       "\"pool_threads\": %u, \"entered\": %llu, \"ticks\": %llu }",
                     i, qwen_region_name(i), qwen_region_component(i),
                     qwen_region_parent(i), qwen_region_level(i), rgn_mode(i),
                     (unsigned long long)t->calls[i], (unsigned long long)t->ns[i],
-                    (unsigned long long)t->child_ns[i], t->nest_mismatch[i]);
+                    (unsigned long long)t->child_ns[i], t->nest_mismatch[i],
+                    (unsigned long long)t->units[i], (unsigned long long)t->tasks[i],
+                    (unsigned long long)t->dispatches[i], t->pool_nt[i],
+                    (unsigned long long)t->entered[i], (unsigned long long)t->ticks[i]);
         }
         fprintf(f, "\n  ] }");
     }

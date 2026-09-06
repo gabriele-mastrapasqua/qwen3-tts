@@ -1033,7 +1033,14 @@ static void cp_region_scatter(cp_region_t *r, float *dst, const float *Yt, int b
     for (int i = 0; i < rows; i++) d[i] = Yt[(size_t)i * r->BW + j];
 }
 
-static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
+/* ph[] = {qkv, attn, out_proj, gate_up, down, other}, or NULL when profiling is off.
+ * The four projections are the four DISTINCT AMX gate decisions in this loop (the fused
+ * QKV is judged on q+2kv), so lumping them hides exactly what the AMX census must see.
+ * 'other' catches every remaining barrier interval so the six always sum to the whole. */
+static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos, uint64_t *ph) {
+    uint64_t lmark = ph ? qwen_costmap_now_ns() : 0;
+#define CPL_ACC(k) do { if (ph) { uint64_t _n = qwen_costmap_now_ns(); \
+                                  ph[(k)] += _n - lmark; lmark = _n; } } while (0)
     qwen_tts_ctx_t *ctx = r->ctx; qwen_batch_t *bb = r->bb; qwen_tts_config_t *c = &ctx->config;
     const int BW = r->BW, ch = bb->cp_h, cqd = bb->cp_q_dim, ckvd = bb->cp_kv_dim, cint = bb->cp_inter;
     const float eps = c->rms_norm_eps, ascale = 1.0f / sqrtf((float)c->cp_head_dim);
@@ -1046,6 +1053,7 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
         qwen_region_i8_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
                           l->wv_int8, l->wv_scale, r->qx, r->sx, cqd, ckvd, ch, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(0);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
             cp_region_scatter(r, bb->cp_q, Yt, b, j, cqd);
@@ -1065,8 +1073,10 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
             cp_region_gather_quant(r, bb->cp_attn, b, j, cqd, cqd);
         }
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(1);
         qwen_region_i8_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, ch, cqd, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(2);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
             cp_region_scatter(r, bb->cp_proj, Yt, b, j, ch);
@@ -1075,8 +1085,10 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
             cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
         }
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(5);
         qwen_region_i8_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * cint, ch, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(3);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
             cp_region_scatter(r, bb->cp_gate, Yt, b, j, 2 * cint);
@@ -1084,8 +1096,10 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
             cp_region_gather_quant(r, bb->cp_gate, b, j, cint, 2 * cint);
         }
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(5);
         qwen_region_i8_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, ch, cint, BW, tid, nt);
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(4);
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
             cp_region_scatter(r, bb->cp_proj, Yt, b, j, ch);
@@ -1099,10 +1113,12 @@ static void cp_region_layers(cp_region_t *r, size_t tid, size_t nt, int pos) {
             }
         }
         qwen_barrier_wait(&r->bar);
+        CPL_ACC(5);
     }
 #undef RSLOT
 #undef RMINE
 }
+#undef CPL_ACC
 
 static void cp_region_task(size_t tid, size_t nt, void *v) {
     cp_region_t *r = (cp_region_t *)v;
@@ -1111,7 +1127,7 @@ static void cp_region_task(size_t tid, size_t nt, void *v) {
         if ((size_t)j % nt == tid)
             cp_region_gather_quant(r, r->x_norm, r->idx ? r->idx[j] : j, j, ch, ch);
     qwen_barrier_wait(&r->bar);
-    cp_region_layers(r, tid, nt, r->pos);
+    cp_region_layers(r, tid, nt, r->pos, NULL);
 }
 
 /* Can this step run as one region?  Decided once per process for the CP shapes (they never
@@ -1260,7 +1276,19 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
     float *Xt = bb->cp_Xt, *Yt = bb->cp_Yt, *embs = bb->cp_gate;
 #define RSLOT(j) (r->idx ? r->idx[j] : (j))
 #define RMINE(j) ((size_t)(j) % nt == tid)
+    /* Phase attribution for the path the SERVER actually runs.  The whole frame lives inside
+     * one held region, so cp.decode had no children at all.  Accumulate plain nanoseconds in
+     * locals across the 16 steps and submit FOUR derived durations once per frame per worker:
+     * no begin/end pair per step or per layer, which is what made the pool markers unaffordable.
+     * Cost is 5 clock reads per step per worker -- ~0.02% of a frame. */
+    const int prof = qwen_costmap_level() != 0;
+    uint64_t ph_mtp = 0, ph_head = 0, tmark = 0;
+    uint64_t phl[6] = { 0, 0, 0, 0, 0, 0 };   /* qkv, attn, out_proj, gate_up, down, other */
+#define CPB_T0() do { if (prof) tmark = qwen_costmap_now_ns(); } while (0)
+#define CPB_ACC(acc) do { if (prof) { uint64_t _n = qwen_costmap_now_ns(); (acc) += _n - tmark; \
+                                      tmark = _n; } } while (0)
     for (int s = 0; s < 16; s++) {
+        CPB_T0();
         /* MTP projection: this step's source row per slot, quantised, then one matmat. */
         for (int j = 0; j < BW; j++) if (RMINE(j)) {
             int b = RSLOT(j);
@@ -1295,7 +1323,9 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
             cp_region_gather_quant(r, r->x_norm, b, j, ch, ch);
         }
         qwen_barrier_wait(&r->bar);
-        cp_region_layers(r, tid, nt, s);
+        CPB_ACC(ph_mtp);
+        cp_region_layers(r, tid, nt, s, prof ? phl : NULL);
+        CPB_T0();                 /* cp_region_layers accounts for its own interval in phl[] */
         if (s == 0) continue;                        /* the first step has no head */
         {
             const int g = s - 1;
@@ -1316,8 +1346,22 @@ static void cp_region_frame_task(size_t tid, size_t nt, void *v) {
                 }
                 r->out_codes[(size_t)b * 15 + g] = best;
             }
+            CPB_ACC(ph_head);
         }
     }
+    if (prof) {
+        /* ONE submission per worker per frame, four derived durations. */
+        qwen_region_add_ns(QWEN_RGN_CPB_MTP, ph_mtp);
+        qwen_region_add_ns(QWEN_RGN_CPB_QKV,    phl[0]);
+        qwen_region_add_ns(QWEN_RGN_CPB_ATTN,   phl[1]);
+        qwen_region_add_ns(QWEN_RGN_CPB_WO,     phl[2]);
+        qwen_region_add_ns(QWEN_RGN_CPB_GATEUP, phl[3]);
+        qwen_region_add_ns(QWEN_RGN_CPB_DOWN,   phl[4]);
+        qwen_region_add_ns(QWEN_RGN_CPB_LOTHER, phl[5]);
+        qwen_region_add_ns(QWEN_RGN_CPB_LMHEAD, ph_head);
+    }
+#undef CPB_T0
+#undef CPB_ACC
 #undef RSLOT
 #undef RMINE
 }

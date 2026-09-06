@@ -76,4 +76,6 @@ int qwen_kleidi_bf16_enabled(void);
 void qwen_kleidi_stats_by_kind(int *n_q4, size_t *b_q4, int *n_i8, size_t *b_i8,
                                int *n_bf, size_t *b_bf);
 
+const char *qwen_kleidi_flag_inert(const char *flag);
+
 #endif
