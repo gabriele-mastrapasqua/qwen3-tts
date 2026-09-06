@@ -91,11 +91,15 @@ enum {
      * nanoseconds inside the region body and submitted ONCE per frame per
      * worker: no begin/end pair per layer or per step. */
     QWEN_RGN_CPB_MTP = 68,        /* MTP projection + gather                      */
-    QWEN_RGN_CPB_QKV,             /* fused QKV + attention                        */
-    QWEN_RGN_CPB_PROJ,            /* out proj + gate/up + down                    */
+    QWEN_RGN_CPB_QKV,             /* fused QKV projection ONLY (gate: q+2kv)      */
+    QWEN_RGN_CPB_ATTN,            /* rope + causal attention + the norms between  */
+    QWEN_RGN_CPB_WO,              /* out projection                               */
+    QWEN_RGN_CPB_GATEUP,          /* fused gate/up projection                     */
+    QWEN_RGN_CPB_DOWN,            /* down projection                              */
+    QWEN_RGN_CPB_LOTHER,          /* every other barrier interval in the layer    */
     QWEN_RGN_CPB_LMHEAD,          /* the 15 lm_head projections + argmax          */
 
-    QWEN_RGN_MAX = 76
+    QWEN_RGN_MAX = 78
 };
 
 #define QWEN_RGN_MULTI (-1)       /* declared parent for legitimately multi-parent regions */

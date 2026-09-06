@@ -68,8 +68,12 @@ static const rgn_info_t g_rgn[] = {
     { QWEN_RGN_SD_CONV_INT8,      "decoder.conv_int8.panels",         QWEN_RGN_MULTI,       1, "decoder" , "stack" },
     { QWEN_RGN_MM_REGION_I8,      "region.int8_runner.rows",          QWEN_RGN_MULTI,       1, "runtime" , "stack" },
     { QWEN_RGN_CPB_MTP,           "cp.batch.mtp",                     QWEN_RGN_MULTI,       1, "cp"      , "derived" },
-    { QWEN_RGN_CPB_QKV,           "cp.batch.qkv_attn",                QWEN_RGN_MULTI,       1, "cp"      , "derived" },
-    { QWEN_RGN_CPB_PROJ,          "cp.batch.proj_ffn",                QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_QKV,           "cp.batch.qkv",                     QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_ATTN,          "cp.batch.attn",                    QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_WO,            "cp.batch.out_proj",                QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_GATEUP,        "cp.batch.gate_up",                 QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_DOWN,          "cp.batch.down",                    QWEN_RGN_MULTI,       1, "cp"      , "derived" },
+    { QWEN_RGN_CPB_LOTHER,        "cp.batch.layer_other",             QWEN_RGN_MULTI,       1, "cp"      , "derived" },
     { QWEN_RGN_CPB_LMHEAD,        "cp.batch.lm_head",                 QWEN_RGN_MULTI,       1, "cp"      , "derived" },
 };
 static const int g_rgn_n = (int)(sizeof g_rgn / sizeof g_rgn[0]);
