@@ -387,6 +387,9 @@ is only "VNNI gets faster", it is secondary unless it is needed as a control.
       NOT be imported into the decoder. The decoder parallelises over COLUMN PANELS: each
       thread does all 96 rows of its own panel, and N ~1900 gives ~120 column tiles. Thread on
       N, not on rows.
+      Review of the scheduler commit: SAFE TO CONTINUE QUALIFICATION; concise record and
+      deferred LOW findings: `.work/amx-ragged-scheduler-review-3f7e0df.md`. Next is clean
+      C4 qualification, then the bounded decode-chunk sweep if steady-state margin holds.
       NUMERICAL CONTRACT to preserve exactly: per block b, int32 accumulate, then
       `f += cvtps(acc) * (swb[m][b] * sab[c][b])`, and finally `out = hsum(f) - 128*wsum term
       + bias`. The 128*wsum correction exists ONLY because VNNI has dpbusd (u8 x s8). AMX has
