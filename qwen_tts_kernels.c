@@ -3270,6 +3270,7 @@ QWEN_MM_SCRATCH(pack, int8_t)
 QWEN_MM_SCRATCH(packb, uint16_t)
 QWEN_MM_SCRATCH(sdcolf, float)
 QWEN_MM_SCRATCH(sdcolq, int8_t)
+QWEN_MM_SCRATCH(sdamxacc, float)
 QWEN_MM_SCRATCH(sdsa, float)
 QWEN_MM_SCRATCH(corr, int)
 QWEN_MM_SCRATCH(xb,   uint16_t)
@@ -9216,12 +9217,17 @@ static inline void sd_tile_1xN(float *out, int out_ld, int m, int tcol,
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
 
 static atomic_llong g_sd_amx_rej[5];
+static atomic_llong g_sd_amx_packs, g_sd_amx_pack_bytes, g_sd_amx_kcalls;
 void qwen_sd_amx_rej_report(void) {
-    fprintf(stderr, "[SDAMX] reject M%%16=%lld Kp%%64=%lld blk%%64=%lld nc=%lld noamx=%lld\n",
+    fprintf(stderr, "[SDAMX] packs=%lld pack_MB=%.1f tdpbssd_tiles=%lld | reject M%%16=%lld Kp%%64=%lld blk%%64=%lld nc=%lld noamx=%lld\n",
+            (long long)atomic_load(&g_sd_amx_packs),
+            (double)atomic_load(&g_sd_amx_pack_bytes) / 1e6,
+            (long long)atomic_load(&g_sd_amx_kcalls),
             (long long)atomic_load(&g_sd_amx_rej[0]), (long long)atomic_load(&g_sd_amx_rej[1]),
             (long long)atomic_load(&g_sd_amx_rej[2]), (long long)atomic_load(&g_sd_amx_rej[3]),
             (long long)atomic_load(&g_sd_amx_rej[4]));
 }
+#define SD_AMX_MAX_KS 16            /* K-steps per quant block; blk=256 gives 4 */
 #define SD_AMX_MB 6                      /* 16-row accumulator tiles = 96 rows per pass */
 
 /* Pack one 64-K x ncol slab of the activation panel into the AMX B layout:
@@ -9260,9 +9266,14 @@ static int sd_gemm_panel_amx(float *out, int out_ld, int M,
     const int nblk   = Kp / blk;
     const int ksteps = blk / 64;         /* 64-byte INT8 K-steps inside one quant block */
 
-    float   acc[SD_AMX_MB * 16][16];
+    if (ksteps > SD_AMX_MAX_KS) { atomic_fetch_add(&g_sd_amx_rej[3], 1); return 0; }
+
+    /* fp32 running sum for the whole panel column tile, [M][16]; on scratch because M reaches
+     * 768 and 49 KB does not belong on the stack. */
+    float *acc = mm_scratch_sdamxacc((size_t)M * 16);
+    if (!acc) return 0;
     int32_t cbuf[16 * 16] __attribute__((aligned(64)));
-    int8_t  bpack[16 * 64] __attribute__((aligned(64)));
+    int8_t  bpack[SD_AMX_MAX_KS][16 * 64] __attribute__((aligned(64)));
 
     for (int c0 = 0; c0 < nc; c0 += 16) {
         const int ncol    = nc - c0 < 16 ? nc - c0 : 16;
@@ -9276,20 +9287,26 @@ static int sd_gemm_panel_amx(float *out, int out_ld, int M,
         cfg.rows[7] = 16; cfg.colsb[7] = (uint16_t)cstride;  /* packed activation */
         qwen_amx_prepare_config(&cfg, 0x53440000u | (unsigned)cstride);
 
-        for (int m0 = 0; m0 < M; m0 += SD_AMX_MB * 16) {
-            const int rows_left = M - m0;
-            const int mb = rows_left / 16 < SD_AMX_MB ? rows_left / 16 : SD_AMX_MB;
+        memset(acc, 0, (size_t)M * 16 * sizeof(float));
 
-            for (int i = 0; i < mb * 16; i++)
-                for (int n = 0; n < ncol; n++) acc[i][n] = 0.0f;
+        for (int b = 0; b < nblk; b++) {
+            /* The activation tile depends on (column tile, K), NOT on the row group, so it is
+             * packed ONCE per quant block and reused by every 96-row group.  Packing inside the
+             * row loop would repeat this eight times at M=768 for no reason. */
+            for (int ks = 0; ks < ksteps; ks++)
+                sd_amx_pack_act(bpack[ks], Xq, Kp, c0, ncol, (b * ksteps + ks) * 64);
+            atomic_fetch_add(&g_sd_amx_packs, ksteps);
+            atomic_fetch_add(&g_sd_amx_pack_bytes, (long long)ksteps * 16 * cstride);
 
-            for (int b = 0; b < nblk; b++) {
+            for (int m0 = 0; m0 < M; m0 += SD_AMX_MB * 16) {
+                const int rows_left = M - m0;
+                const int mb = rows_left / 16 < SD_AMX_MB ? rows_left / 16 : SD_AMX_MB;
+
                 for (int t = 0; t < mb; t++) _tile_zero(t);
 
                 for (int ks = 0; ks < ksteps; ks++) {
                     const int k = (b * ksteps + ks) * 64;
-                    sd_amx_pack_act(bpack, Xq, Kp, c0, ncol, k);
-                    _tile_loadd(7, bpack, cstride);
+                    _tile_loadd(7, bpack[ks], cstride);
                     for (int t = 0; t < mb; t++) {
                         _tile_loadd(6, Wq + (size_t)(m0 + t * 16) * Kp + k, Kp);
                         switch (t) {
@@ -9302,6 +9319,7 @@ static int sd_gemm_panel_amx(float *out, int out_ld, int M,
                         }
                     }
                 }
+                atomic_fetch_add(&g_sd_amx_kcalls, (long long)mb * ksteps);
 
                 /* same epilogue order as the scalar path: convert this block, scale by
                  * swb[m][b] * sab[c][b], accumulate */
@@ -9318,18 +9336,17 @@ static int sd_gemm_panel_amx(float *out, int out_ld, int M,
                         const int m = m0 + t * 16 + r;
                         const float sw = swb[(size_t)m * nblk + b];
                         for (int n = 0; n < ncol; n++)
-                            acc[t * 16 + r][n] += (float)cbuf[r * ncol + n] *
-                                                  (sw * sab[(size_t)(c0 + n) * nblk + b]);
+                            acc[(size_t)m * 16 + n] += (float)cbuf[r * ncol + n] *
+                                                       (sw * sab[(size_t)(c0 + n) * nblk + b]);
                     }
                 }
             }
+        }
 
-            for (int i = 0; i < mb * 16; i++) {
-                const int m = m0 + i;
-                float *o = out + (size_t)m * out_ld + tcol0 + c0;
-                const float bb = bias ? bias[m] : 0.0f;
-                for (int n = 0; n < ncol; n++) o[n] = acc[i][n] + bb;
-            }
+        for (int m = 0; m < M; m++) {
+            float *o = out + (size_t)m * out_ld + tcol0 + c0;
+            const float bb = bias ? bias[m] : 0.0f;
+            for (int n = 0; n < ncol; n++) o[n] = acc[(size_t)m * 16 + n] + bb;
         }
     }
 
