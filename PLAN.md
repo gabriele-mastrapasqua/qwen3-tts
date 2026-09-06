@@ -25,18 +25,21 @@ trade steady-state playback safety for headline TTFA.
 - [x] AMX-5 Decoder AMX BF16: real `TDPBF16PS`, persistent BF16 B packs and
       separate census path; serving policy remains undecided.
 - [ ] AMX-6 C4 qualification and scheduler review. Detail:
-      `.work/amx-ragged-scheduler-review-3f7e0df.md`.
+      `.work/amx-ragged-scheduler-review-3f7e0df.md` and
+      `.work/amx-c4-chunk-sweep-20260906.md`.
 - [ ] AMX-7 Explain the remaining C4 loss with bounded, low-overhead panel,
-      batch, pool-wait and starvation/underrun attribution.
-- [ ] AMX-8 After C4 has margin, sweep decode chunk and only then test topology
-      or higher concurrency.
+      batch, pool-wait and starvation/underrun attribution. Detail:
+      `.work/amx-c4-chunk-sweep-20260906.md`.
+- [x] AMX-8 Bounded C4 decode-chunk sweep completed for 8/12/16/24/32;
+      no mixed-bank candidate has a stable useful margin. Detail:
+      `.work/amx-c4-chunk-sweep-20260906.md`.
 - [ ] AMX-9 Final 1.7B/0.6B capacity model and sustainable-stream comparison.
 - [ ] AMX-10 W4 storage to AMX execution feasibility; no AutoRound runtime yet.
 
 Current checkpoint: Design D is integrated and reaches the engine-owned server
-pool, but the valid C4 SOAK has `STREAM_RTF p50/p95 = 0.942/1.035`; AMX-6 is
-therefore open and AMX-8/C5/C6 are deferred. No production decoder default has
-changed.
+pool. The valid C4 SOAK remains `STREAM_RTF p50/p95 = 0.942/1.035`; the chunk
+screen ranked 32 best on the mixed bank at `0.910/0.986`, but without useful
+margin. AMX-6/7 remain open, no chunk default changed, and C5/C6 are deferred.
 
 ## Controls and backend parity
 
@@ -71,6 +74,9 @@ changed.
 - [x] P3.3a Pool capability parity.
 - [x] P3.4 Decoder capability/policy split.
 - [x] P3.5 Effective AMX/x86 decoder knobs and region observability.
+- [x] P3.6 Decoder-pool configuration now has explicit values, resolved startup
+      reporting and fail-fast unknown-value handling; detail is preserved in
+      `.work/amx-c4-chunk-sweep-20260906.md`.
 
 ## Deferred follow-ups
 
