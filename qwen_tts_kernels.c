@@ -8932,11 +8932,53 @@ static void sd_gcd_task(size_t tid, size_t nt, void *vj) {
 }
 
 static int g_sd_pool_mode = -1;
-void qwen_sd_pool_default(int mode) { if (!getenv("QWEN_SD_POOL")) g_sd_pool_mode = mode ? 1 : 0; }
+
+/* Keep the historical spellings that were actually used by the runtime/documentation, but
+ * do not keep the old "anything else means private" behaviour: a typo in a qualification
+ * command must never silently select a different scheduler. */
+static int qwen_sd_pool_parse(const char *value, int *mode) {
+    if (!value || !*value) return -1;
+    if (!strcmp(value, "engine") || !strcmp(value, "qwen") || !strcmp(value, "q") ||
+        !strcmp(value, "1")) {
+        if (mode) *mode = 1;
+        return 0;
+    }
+    if (!strcmp(value, "private") || !strcmp(value, "0")) {
+        if (mode) *mode = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static void qwen_sd_pool_fatal(const char *value) {
+    fprintf(stderr,
+            "qwen-tts: FATAL — QWEN_SD_POOL=%s is invalid; expected engine or private "
+            "(legacy aliases: qwen, q, 1, 0)\n",
+            value && *value ? value : "<empty>");
+    exit(2);
+}
+
+void qwen_sd_pool_validate(void) {
+    const char *e = getenv("QWEN_SD_POOL");
+    if (e && qwen_sd_pool_parse(e, NULL) != 0) qwen_sd_pool_fatal(e);
+}
+
+void qwen_sd_pool_default(int mode) {
+    if (getenv("QWEN_SD_POOL")) {
+        qwen_sd_pool_validate();
+    } else {
+        g_sd_pool_mode = mode ? 1 : 0;
+    }
+}
+
 int qwen_sd_pool_mode(void) {
     if (g_sd_pool_mode < 0) {
         const char *e = getenv("QWEN_SD_POOL");
-        g_sd_pool_mode = (e && (e[0] == '1' || e[0] == 'q')) ? 1 : 0;
+        if (e) {
+            if (qwen_sd_pool_parse(e, &g_sd_pool_mode) != 0) qwen_sd_pool_fatal(e);
+        } else {
+            g_sd_pool_mode = 0;
+        }
     }
     return g_sd_pool_mode;
 }
@@ -8954,6 +8996,7 @@ int qwen_sd_pool_mode(void) {
  * survives.  With one thread there is no budget to own and this does nothing.  Idempotent:
  * a prefork child calls it again after its own qwen_set_threads(). */
 void qwen_exec_budget_engine_owned(const char *who) {
+    qwen_sd_pool_validate();
     if (qwen_get_threads() <= 1) return;
     qwen_sd_pool_default(1);
     qwen_blas_own(1);
@@ -8962,8 +9005,9 @@ void qwen_exec_budget_engine_owned(const char *who) {
     static pid_t reported = 0;
     if (reported == getpid()) return;
     reported = getpid();
-    fprintf(stderr, "[%s] execution budget: decoder pool=%s · blas=%s · openblas threads now %d\n",
+    fprintf(stderr, "[%s] execution budget: decoder pool requested=%s resolved=%s · blas=%s · openblas threads now %d\n",
             who ? who : "engine",
+            getenv("QWEN_SD_POOL") ? getenv("QWEN_SD_POOL") : "unset",
             qwen_sd_pool_mode() ? "engine" : "private",
             qwen_blas_own_effective() ? "serial+partitioned"
                                       : (qwen_blas_own_get() ? "claimed but no thread control"

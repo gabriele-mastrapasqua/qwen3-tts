@@ -224,6 +224,12 @@ int qwen_effective_config_report(void *out) {
             fprintf(f, "  %-34s %-10s %-9s IGNORED: %s\n", name, req, "ignored", inert);
             continue;
         }
+        if (!strcmp(name, "QWEN_SD_POOL")) {
+            const char *resolved = qwen_sd_pool_mode() ? "engine" : "private";
+            fprintf(f, "  %-34s %-10s %-9s requested=%s resolved=%s; explicit pool policy\n",
+                    name, req, "honoured", req, resolved);
+            continue;
+        }
         /* A gate flag has a better answer than any static scope: is its kernel compiled? */
         int gate_compiled = 0; const char *kernel = NULL;
         if (qwen_flag_gate_status(name, &gate_compiled, &kernel)) {
@@ -499,10 +505,17 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
                        ? "requested, but this build has no BLAS thread control: NOT partitioned, "
                          "so the vendor BLAS keeps its own team and no nesting is created"
                        : "BLAS runs its own team by request"));
+        char pool_reason[160];
+        const char *pool_requested = getenv("QWEN_SD_POOL");
+        const char *pool_resolved = qwen_sd_pool_mode() ? "engine" : "private";
+        snprintf(pool_reason, sizeof pool_reason,
+                 "requested=%s resolved=%s; %s",
+                 pool_requested ? pool_requested : "unset", pool_resolved,
+                 pool_resolved[0] == 'e'
+                     ? "decoder tiles run on the engine pool (inline inside a region)"
+                     : "decoder raises its own worker team");
         row(&feats[n++], "decoder.pool", "-", "-", "QWEN_SD_POOL",
-            qwen_sd_pool_mode() ? "engine" : "private",
-            qwen_sd_pool_mode() ? "decoder tiles run on the engine pool (inline inside a region)"
-                                : "decoder raises its own worker team");
+            pool_resolved, pool_reason);
         row(&feats[n++], "pool.nested_dispatch", "-", "-", NULL,
             onoff(qwen_pool_nested_dispatch_ok()),
             qwen_pool_nested_dispatch_ok() ? "a task on the pool may dispatch again"

@@ -892,6 +892,8 @@ dispatch-map: $(TARGET)
 # guard around a flag's effect cannot drift away from what the engine reports.
 effective-config: $(TARGET)
 	@./$(TARGET) --effective-config
+test-sd-pool-config: $(TARGET)
+	@bash tests/test_sd_pool_config.sh ./$(TARGET)
 check-flag-parity:
 	@python3 tools/flag_parity.py --emit-c /tmp/qwen_flag_scope.gen.h >/dev/null
 	@diff -u qwen_flag_scope.h /tmp/qwen_flag_scope.gen.h \
@@ -1320,7 +1322,7 @@ test-it-ryan: test-small-it
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden test-sd-pool-config golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
         emotion-para-demo para-demo \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all \
         test-clone test-voice-design \

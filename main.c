@@ -1209,6 +1209,10 @@ int main(int argc, char **argv) {
         if (threads > 0) qwen_set_threads(threads); else qwen_init_threads(); \
     } while (0)
 
+    /* Validate operator-selected scheduler policy before any diagnostic or serving path.
+     * An invalid pool value must not be silently interpreted as the private fallback. */
+    qwen_sd_pool_validate();
+
     if (show_caps) {
         QWEN_DIAG_INIT_THREADS();
         qwen_caps_report(stdout);

@@ -34,8 +34,10 @@ int  qwen_blas_own_get(void);
 int  qwen_blas_own_effective(void);   /* own AND the platform really has BLAS thread control */
 int  qwen_blas_threads_now(void);       /* openblas_get_num_threads(), -1 if unavailable */
 /* Decoder parallel tiles: 1 = run on the engine pool (inline when already inside a region),
- * 0 = the decoder's private worker team.  QWEN_SD_POOL=qwen|private overrides the default. */
+ * 0 = the decoder's private worker team.  QWEN_SD_POOL=engine|private overrides the default;
+ * legacy qwen/q/1 and 0 aliases remain accepted. */
 void qwen_sd_pool_default(int mode);
+void qwen_sd_pool_validate(void);
 int  qwen_sd_pool_mode(void);
 /* Run one decoder job on the existing decoder/engine pool.  The callback must partition
  * its work with its own atomic cursor; this wrapper preserves the no-nested-pool rule used
