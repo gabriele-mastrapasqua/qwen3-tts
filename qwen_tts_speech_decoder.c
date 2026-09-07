@@ -3016,6 +3016,7 @@ static void rag_save_tail(float *tail, const float *in, int in_ch,
 typedef struct {
     long long panels, cols, amx_panels, fallback_panels;
     long long build_bytes, prepared_bytes, items, total_cols;
+    long long scratch_allocs, scratch_bytes;
     double build_ms, prepare_ms, amx_ms, fallback_ms, post_ms;
     long long nc_le32, nc_le64, nc_le96, nc_le128, nc_gt128;
 } sd_rag_call_stats_t;
@@ -3024,6 +3025,7 @@ typedef struct {
     _Atomic long long panels, cols, amx_panels, fallback_panels;
     _Atomic long long build_ns, prepare_ns, amx_ns, fallback_ns;
     _Atomic long long build_bytes, prepared_bytes;
+    _Atomic long long scratch_allocs, scratch_bytes;
     _Atomic long long nc_le32, nc_le64, nc_le96, nc_le128, nc_gt128;
 } sd_rag_atomic_stats_t;
 
@@ -3035,12 +3037,14 @@ static void sd_rag_stats_report(const sd_rag_call_stats_t *s, const char *mode,
             "[SDRAG] v=1 pid=%d mode=%s items=%d total=%d M=%d K=%d Kp=%d kernel=%d "
             "dilation=%d nc_cap=%d panels=%lld cols=%lld amx=%lld fallback=%lld "
             "build_ms=%.3f prepare_ms=%.3f amx_ms=%.3f fallback_ms=%.3f post_ms=%.3f "
-            "build_MB=%.3f prepared_MB=%.3f item_sum=%lld total_sum=%lld "
+            "build_MB=%.3f prepared_MB=%.3f scratch_allocs=%lld scratch_MB=%.3f "
+            "item_sum=%lld total_sum=%lld "
             "N_hist=le32:%lld,le64:%lld,le96:%lld,le128:%lld,gt128:%lld\n",
             (int)getpid(), mode, n_items, total, out_ch, K, Kp, kernel, dilation, nc_cap,
             s->panels, s->cols, s->amx_panels, s->fallback_panels,
             s->build_ms, s->prepare_ms, s->amx_ms, s->fallback_ms, s->post_ms,
             (double)s->build_bytes / 1e6, (double)s->prepared_bytes / 1e6,
+            s->scratch_allocs, (double)s->scratch_bytes / 1e6,
             s->items, s->total_cols,
             s->nc_le32, s->nc_le64, s->nc_le96, s->nc_le128, s->nc_gt128);
     (void)in_ch;
@@ -3057,6 +3061,8 @@ static void sd_rag_stats_merge(sd_rag_atomic_stats_t *a, const sd_rag_call_stats
     atomic_fetch_add(&a->fallback_ns, (long long)(s->fallback_ms * 1e6));
     atomic_fetch_add(&a->build_bytes, s->build_bytes);
     atomic_fetch_add(&a->prepared_bytes, s->prepared_bytes);
+    atomic_fetch_add(&a->scratch_allocs, s->scratch_allocs);
+    atomic_fetch_add(&a->scratch_bytes, s->scratch_bytes);
     atomic_fetch_add(&a->nc_le32, s->nc_le32);
     atomic_fetch_add(&a->nc_le64, s->nc_le64);
     atomic_fetch_add(&a->nc_le96, s->nc_le96);
@@ -3082,24 +3088,40 @@ typedef struct {
 static void sd_rag_panel_worker(void *vj) {
     sd_rag_panel_job_t *j = (sd_rag_panel_job_t *)vj;
     const size_t col_bytes = (size_t)j->nc_cap * (size_t)j->K * sizeof(float);
-    float *col = (float *)aligned_malloc(col_bytes);
+    float *col = NULL;
     int8_t *colq = NULL;
     float *sa = NULL;
-    if (j->use_d && !j->use_bf16) {
-        colq = (int8_t *)aligned_malloc((size_t)j->nc_cap * (size_t)j->Kp);
-        sa = (float *)aligned_malloc((size_t)j->nc_cap * (size_t)j->nblk * sizeof(float));
-    }
-    if (!col || (j->use_d && !j->use_bf16 && (!colq || !sa))) {
-        free(col); free(colq); free(sa);
-        atomic_store(&j->failed, 1);
-        return;
-    }
-
     sd_rag_call_stats_t local;
     memset(&local, 0, sizeof(local));
     for (;;) {
+        if (atomic_load(&j->failed)) break;
         const int p = atomic_fetch_add(&j->next_panel, 1);
-        if (p >= j->n_panels || atomic_load(&j->failed)) break;
+        if (p >= j->n_panels) break;
+        if (atomic_load(&j->failed)) break;
+        /* Claim first.  A pool team may be wider than a short ragged job; workers that
+         * did not claim a real panel must not allocate large panel scratch and then
+         * discover that the cursor was already drained.  Once a worker owns its first
+         * panel, it keeps the scratch and drains more claims without another setup. */
+        if (!col) {
+            col = (float *)aligned_malloc(col_bytes);
+            if (j->use_d && !j->use_bf16) {
+                colq = (int8_t *)aligned_malloc((size_t)j->nc_cap * (size_t)j->Kp);
+                sa = (float *)aligned_malloc((size_t)j->nc_cap * (size_t)j->nblk * sizeof(float));
+            }
+            if (!col || (j->use_d && !j->use_bf16 && (!colq || !sa))) {
+                free(col); free(colq); free(sa);
+                col = NULL; colq = NULL; sa = NULL;
+                atomic_store(&j->failed, 1);
+                break;
+            }
+            if (j->stats_on) {
+                local.scratch_allocs++;
+                local.scratch_bytes += (long long)col_bytes;
+                if (j->use_d && !j->use_bf16)
+                    local.scratch_bytes += (long long)j->nc_cap * j->Kp
+                        + (long long)j->nc_cap * j->nblk * (long long)sizeof(float);
+            }
+        }
         const int ts = p * j->nc_cap;
         const int nc = j->length - ts < j->nc_cap ? j->length - ts : j->nc_cap;
         const double panel_t0 = j->stats_on ? sd_ph_now() : 0.0;
