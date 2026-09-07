@@ -68,6 +68,30 @@ need to preserve the inline decoder's useful batch semantics and expose separate
 operation-call, pool-submit and pool-wait counters; that is a new hypothesis, not a
 reason to keep this flag active.
 
+## Bounded diagnostic follow-up (not KPI evidence)
+
+A separate one-wave C4 diagnostic rebuilt the same clean source with
+`QWEN_POOL_STATS` and enabled `QWEN_SERVE_PROFILE`/`QWEN_SD_PHASE`.  It is not a
+qualification number because the diagnostic flags add timing and logging overhead.
+The control process totals were:
+
+| process role | pool dispatches | worker chunks | worker parks | main parks | serial qwen_parallel calls |
+|---|---:|---:|---:|---:|---:|
+| control worker 0 | 23,633 | 141,778 | 11,261 | 971 | 0 |
+| control worker 1 | 67,760 | 406,460 | 16,331 | 386 | 0 |
+| consumer worker 0 | 15,574 | 93,432 | 11,059 | 1,400 | 0 |
+| consumer worker 1 | 79,579 | 477,382 | 38,239 | 6,041 | 0 |
+
+The phase trace confirms the treatment's decoder calls were still `path=per-slot
+group=1` or `path=ragged group=2`; it did not create a wider decoder group.  The
+consumer's long calls reached roughly 1.4 s for a one-frame call in the sample,
+whereas matched control calls were tens of milliseconds.  The aggregate pool
+counters show substantially more parking in the treatment, but they do not separate
+decoder operation calls from Talker/CP work or provide a clean pool-wait denominator.
+Therefore operation-call count, pool-submit count and pool-wait time remain
+**UNKNOWN** as independent decoder quantities; no causal claim stronger than the
+serving rejection above is supported.
+
 ## Next action
 
 Move to the remaining P4 structural decoder-cost work only where existing phase
