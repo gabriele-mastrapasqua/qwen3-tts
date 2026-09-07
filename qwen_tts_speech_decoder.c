@@ -258,11 +258,11 @@ static int sd_stream_strip_enabled(void) {
     return en;
 }
 
-/* SQ-2 decoder preparation experiment.  Ragged transposed convolution normally builds
- * a full [out_ch][input*stride+carry] buffer, then copies the useful range and the carry
- * out of it.  The direct form keeps the same per-tap GEMM and accumulation order but
- * writes those two destinations directly.  It is independent from the causal range
- * slice above so either source of improvement can be measured on its own. */
+/* SQ-2 decoder preparation experiment.  Streaming and ragged transposed convolution
+ * normally build a full [out_ch][input*stride+carry] buffer, then copy the useful range
+ * and the carry out of it.  The direct form keeps the same per-tap GEMM and accumulation
+ * order but writes those two destinations directly.  It is independent from the causal
+ * range slice above so either source of improvement can be measured on its own. */
 static int sd_direct_convt_enabled(void) {
     static int en = -1;
     if (en < 0) {
@@ -2036,12 +2036,80 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
     return out;
 }
 
+#ifdef USE_BLAS
+/* SQ-2: the per-slot streaming path has the same overlap shape as the ragged path,
+ * but its control arm materializes [out_ch][out_len + carry].  Keep the existing
+ * per-tap GEMM and summation order while writing useful output and the request-local
+ * carry separately.  This is deliberately a preparation/dataflow experiment: it
+ * does not change the arithmetic or require a new kernel. */
+static float *cs_convt_direct(const float *in, int in_ch, int out_ch, int len,
+                              int kernel, int stride,
+                              const float *w, const float *b, float *carry) {
+    const int cs = kernel - stride;
+    const int out_len = len * stride;
+    if (!in || !w || in_ch <= 0 || out_ch <= 0 || len <= 0 || stride <= 0 || cs < 0)
+        return NULL;
+
+    float *rk = (float *)sd_tmp_alloc((int64_t)out_ch * len * sizeof(float));
+    float *out = (float *)sd_tmp_calloc((int64_t)out_ch * out_len, sizeof(float));
+    float *carry_work = (carry && cs > 0)
+        ? (float *)sd_tmp_calloc((int64_t)out_ch * cs, sizeof(float)) : NULL;
+    if (!rk || !out || (carry && cs > 0 && !carry_work)) {
+        sd_tmp_free(rk); sd_tmp_free(out); sd_tmp_free(carry_work);
+        return NULL;
+    }
+
+    for (int k = 0; k < kernel; k++) {
+        const float *wk = w + (int64_t)k * in_ch * out_ch;
+        SD_GEMM(CblasTrans, CblasNoTrans, out_ch, len, in_ch,
+                1.0f, wk, out_ch, in, len, 0.0f, rk, len);
+        for (int oc = 0; oc < out_ch; oc++) {
+            const float *src = rk + (int64_t)oc * len;
+            float *dst = out + (int64_t)oc * out_len;
+            float *cw = carry_work ? carry_work + (int64_t)oc * cs : NULL;
+            for (int t = 0; t < len; t++) {
+                const int pos = t * stride + k;
+                if (pos < out_len) dst[pos] += src[t];
+                else if (cw && pos < out_len + cs) cw[pos - out_len] += src[t];
+            }
+        }
+    }
+
+    /* Match cs_convt(): per-tap contributions, then old carry, then bias; the
+     * newly produced overlap contains contributions only, never old carry/bias. */
+    if (carry && cs > 0) {
+        const int nold = out_len < cs ? out_len : cs;
+        for (int oc = 0; oc < out_ch; oc++) {
+            float *dst = out + (int64_t)oc * out_len;
+            float *cr = carry + (int64_t)oc * cs;
+            const float *cw = carry_work + (int64_t)oc * cs;
+            for (int i = 0; i < nold; i++) dst[i] += cr[i];
+            memcpy(cr, cw, (size_t)cs * sizeof(float));
+        }
+    }
+    conv_add_bias(out, b, out_ch, out_len);
+    sd_tmp_free(rk);
+    sd_tmp_free(carry_work);
+    if (sd_phase_on()) sd_direct_convt_calls++;
+    return out;
+}
+#endif
+
 static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
                        int kernel, int stride,
                        const float *w, const float *b, float *carry) {
     int cs = kernel - stride;
     int full_len = (len - 1) * stride + kernel;
     int out_len = len * stride;
+
+#ifdef USE_BLAS
+    if (sd_direct_convt_enabled()) {
+        float *direct = cs_convt_direct(in, in_ch, out_ch, len, kernel, stride,
+                                        w, b, carry);
+        if (direct) return direct;
+    }
+#endif
+
     float *full = (float *)sd_tmp_calloc((int64_t)out_ch * full_len, sizeof(float));
     if (!full) return NULL;
     causal_conv_transpose1d(full, in, w, NULL, in_ch, out_ch, len, full_len,
