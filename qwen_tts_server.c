@@ -2566,6 +2566,13 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                            int threads_per, int max_batch) {
     const int elastic = getenv("QWEN_PREFORK_ELASTIC") &&
                         atoi(getenv("QWEN_PREFORK_ELASTIC")) != 0;
+    /* With --max-queue 0, a full prefork parent must still accept the connection so it can
+     * return the documented immediate 503.  Previously the parent stopped polling the
+     * listening socket while every child slot was occupied; the client then waited in the
+     * kernel backlog and the child's queue deadline could never see that wait.  Keep the
+     * historical backlog behaviour for the default grace queue and for the explicit old
+     * unbounded A/B override. */
+    const int reject_full_at_parent = (g_cfg_max_queue == 0 && !getenv("QWEN_QUEUE_UNBOUNDED"));
     if (workers < 1) workers = 1;
     const int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
     const int per = ncpu / workers > 0 ? ncpu / workers : 1;
@@ -2632,6 +2639,9 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                     "cap %d in flight each, port %d%s\n",
             workers, threads_per, ncpu, per, cap, port,
             elastic ? " · ELASTIC core allocation" : "");
+    if (reject_full_at_parent)
+        fprintf(stderr, "prefork: --max-queue 0 -> accept and return 503 immediately when all "
+                        "worker slots are occupied\n");
     if (elastic && threads_per < ncpu / 2)
         fprintf(stderr, "prefork: ⚠️  elastic wants --prefork-threads >= %d (the widest "
                         "slice); the soft budget can only shrink, never grow past the "
@@ -2706,7 +2716,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         }
         if (nf == 0) break;
         int li = -1;
-        if (free_slots > 0) {
+        if (free_slots > 0 || reject_full_at_parent) {
             li = nf;
             pfd[nf].fd = listen_fd; pfd[nf].events = POLLIN; pfd[nf].revents = 0;
             nf++;
