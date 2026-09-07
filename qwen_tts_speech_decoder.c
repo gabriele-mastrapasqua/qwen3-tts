@@ -258,6 +258,20 @@ static int sd_stream_strip_enabled(void) {
     return en;
 }
 
+/* SQ-2 decoder preparation experiment.  Ragged transposed convolution normally builds
+ * a full [out_ch][input*stride+carry] buffer, then copies the useful range and the carry
+ * out of it.  The direct form keeps the same per-tap GEMM and accumulation order but
+ * writes those two destinations directly.  It is independent from the causal range
+ * slice above so either source of improvement can be measured on its own. */
+static int sd_direct_convt_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_DIRECT_CONVT");
+        en = e && *e && *e != '0';
+    }
+    return en;
+}
+
 /* BF16 is a separate decoder arm.  It does not depend on the INT8 policy: a server can
  * select BF16 with QWEN_SD_AMX_BF16=1 and QWEN_SD_INT8=0 to measure the two representations
  * without silently paying for an unused INT8 cache. */
@@ -324,6 +338,7 @@ static double sd_p6a, sd_p6b, sd_p6c;
 static int sd_up_warm;
 static double sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake,
               sd_up_resadd, sd_up_alloc, sd_up_final;
+static long long sd_direct_convt_calls;
 static double sd_up_t0;
 extern long long qwen_snake_expf_calls, qwen_snake_vec_poly, qwen_snake_vec_libm,
                  qwen_snake_scalar_tail;
@@ -358,10 +373,10 @@ static double sd_c1_t0;
                        sd_up_resadd + sd_up_alloc + sd_up_final;                      \
           fprintf(stderr, "[SDUP] v=2 pid=%d seq=%lld path=%s group=%d frames=%d warm=%d "     \
                   "convt=%.3f res1=%.3f res2=%.3f snake=%.3f resadd=%.3f "            \
-                  "alloc=%.3f final=%.3f sum=%.3f conv_up=%.3f unacc=%.3f\n",         \
+                  "alloc=%.3f final=%.3f sum=%.3f conv_up=%.3f direct_convt=%lld unacc=%.3f\n", \
                   (int)getpid(), sd_call_seq, (path_), (group_), (frames_), sd_up_warm,            \
                   sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake, sd_up_resadd,     \
-                  sd_up_alloc, sd_up_final, _us, sd_p6c, sd_p6c - _us);                 \
+                  sd_up_alloc, sd_up_final, _us, sd_p6c, sd_direct_convt_calls, sd_p6c - _us); \
           fprintf(stderr, "[SDRES1] v=1 pid=%d group=%d frames=%d calls=%lld "             \
                   "ext=%.3f conv=%.3f cut=%.3f sum=%.3f res1=%.3f "                        \
                   "cols_kept=%lld cols_convolved=%lld strip_calls=%lld discarded=%.1f%%\n", \
@@ -2291,6 +2306,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
     if (_ph) { sd_p6a = sd_p6b = sd_p6c = 0.0;
                sd_up_convt = sd_up_res1 = sd_up_res2 = sd_up_snake =
                sd_up_resadd = sd_up_alloc = sd_up_final = 0.0;
+               sd_direct_convt_calls = 0;
                sd_up_warm = st->cs_warm;
                sd_c1_ext = sd_c1_conv = sd_c1_cut = sd_c1_tail = 0.0;
                sd_c1_calls = sd_c1_cols_kept = sd_c1_cols_conv = sd_c1_strip_calls = 0;
@@ -3134,6 +3150,75 @@ static int rag_conv1d(float *out, const float *in, int in_ch, int out_ch,
     return 0;
 }
 
+static float *rag_convt_direct(const float *in, int in_ch, int out_ch,
+                               const sd_rag_t *rin, int kernel, int stride,
+                               const float *w, const float *bias, float * const *carries,
+                               sd_rag_t *rout) {
+    const int cs = kernel - stride;
+    const int64_t total_in = rin->total;
+    const int64_t total_out = rout->total;
+    if (total_in <= 0 || total_out <= 0 || in_ch <= 0 || out_ch <= 0 || kernel <= 0 || stride <= 0)
+        return NULL;
+
+    /* `rk` is the same panel-sized GEMM result used by the control.  The large full
+     * transposed-convolution buffer is intentionally absent: output contributions are
+     * accumulated in logical request-local ranges and carry_work holds only the small
+     * overlap that must survive the call. */
+    float *rk = (float *)aligned_malloc((int64_t)out_ch * total_in * sizeof(float));
+    float *out = (float *)aligned_malloc((int64_t)out_ch * total_out * sizeof(float));
+    float *carry_work = (carries && cs > 0)
+        ? (float *)aligned_calloc((int64_t)rin->n * out_ch * cs, sizeof(float)) : NULL;
+    if (!rk || !out || (carries && cs > 0 && !carry_work)) {
+        free(rk); free(out); free(carry_work);
+        return NULL;
+    }
+    memset(out, 0, (int64_t)out_ch * total_out * sizeof(float));
+
+    for (int k = 0; k < kernel; k++) {
+        const float *wk = w + (int64_t)k * in_ch * out_ch;
+        SD_GEMM(CblasTrans, CblasNoTrans, out_ch, (int)total_in, in_ch,
+                1.0f, wk, out_ch, in, (int)total_in, 0.0f, rk, (int)total_in);
+        for (int b = 0; b < rin->n; b++) {
+            const int ilen = rin->len[b];
+            const int olen = rout->len[b];
+            for (int oc = 0; oc < out_ch; oc++) {
+                const float *src = rk + (int64_t)oc * total_in + rin->off[b];
+                float *dst = out + (int64_t)oc * total_out + rout->off[b];
+                float *cw = (carry_work && cs > 0)
+                    ? carry_work + ((int64_t)b * out_ch + oc) * cs : NULL;
+                for (int t = 0; t < ilen; t++) {
+                    const int pos = t * stride + k;
+                    if (pos < olen)
+                        dst[pos] += src[t];
+                    else if (cw && pos < olen + cs)
+                        cw[pos - olen] += src[t];
+                }
+            }
+        }
+    }
+
+    /* Match the control's order: all per-tap contributions first, then the old carry,
+     * then bias; only after that replace the request-local carry with the new overlap. */
+    if (carries && cs > 0) {
+        for (int b = 0; b < rin->n; b++) {
+            const int olen = rout->len[b];
+            for (int oc = 0; oc < out_ch; oc++) {
+                float *dst = out + (int64_t)oc * total_out + rout->off[b];
+                float *cw = carry_work + ((int64_t)b * out_ch + oc) * cs;
+                float *cr = carries[b] + (int64_t)oc * cs;
+                const int nold = olen < cs ? olen : cs;
+                for (int i = 0; i < nold; i++) dst[i] += cr[i];
+                memcpy(cr, cw, (size_t)cs * sizeof(float));
+            }
+        }
+    }
+    conv_add_bias(out, bias, out_ch, (int)total_out);
+    free(rk);
+    free(carry_work);
+    if (sd_phase_on()) sd_direct_convt_calls++;
+    return out;
+}
+
 static float *rag_convt(const float *in, int in_ch, int out_ch,
                         const sd_rag_t *rin, int kernel, int stride,
                         const float *w, const float *bias, float * const *carries,
@@ -3147,6 +3232,15 @@ static float *rag_convt(const float *in, int in_ch, int out_ch,
     }
     rag_recompute(rout);
     rag_recompute(&rfull);
+
+    if (sd_direct_convt_enabled()) {
+        float *direct = rag_convt_direct(in, in_ch, out_ch, rin, kernel, stride,
+                                         w, bias, carries, rout);
+        if (direct) {
+            rag_free(&rfull);
+            return direct;
+        }
+    }
 
     float *full = (float *)aligned_calloc((int64_t)out_ch * rfull.total, sizeof(float));
     float *rk   = (float *)aligned_malloc((int64_t)out_ch * rin->total * sizeof(float));
@@ -3409,6 +3503,7 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     const int  _ph    = sd_phase_on();
     const double _ph_call0 = _ph ? sd_ph_now() : 0.0;
     double _ph_p[6] = {0,0,0,0,0,0}, _ph_mark = 0.0;
+    if (_ph) sd_direct_convt_calls = 0;
     for (int i = 0; i < n_items; i++) { it[i].audio = NULL; it[i].n_samples = 0; it[i].rc = 0; }
 
     int *idx = (int *)calloc((size_t)(n_items > 0 ? n_items : 1), sizeof(int));
