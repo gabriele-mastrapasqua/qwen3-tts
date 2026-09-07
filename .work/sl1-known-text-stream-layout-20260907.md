@@ -74,6 +74,29 @@ output and equal generated frame counts. The streaming schedule is a model-visib
 change, so audio quality and upstream-layout comparison remain required before
 promotion.
 
+## Known-text prefill scaling gate
+
+A bounded sequential CLI run on the same GCP 8581C reference used the SL-1 binary
+(`f490d65`, SHA-256 prefix `db5b79e6eaed2929`), the available 1.7B model, English
+`ryan`, temperature 0, seed 4242 and `--max-tokens 4`. The remote host remained
+SMT-off with CPUs `0-11`. This was a CLI timing gate, not a serving qualification;
+the wall-clock wrapper was not used as evidence because the host `date` implementation
+did not provide a reliable millisecond format. The program's own prefill trace is the
+measurement.
+
+| text content tokens | full-layout prefill positions / ms | SL-1 positions / ms | SL-1 trailing text | generated frames | output/errors |
+|---:|---:|---:|---:|---:|---|
+| 4 | 15 / 85 | 10 / 73 | 4 | 4 | valid / none |
+| 22 | 33 / 212 | 10 / 73 | 22 | 4 | valid / none |
+| 34 | 45 / 228 | 10 / 73 | 34 | 4 | valid / none |
+
+The observed known-text prefill term therefore flattened over this input range while
+the remaining text was represented as request-owned trailing hidden vectors. This
+supports the intended SL-1 mechanism and closes its prefill-scaling gate for non-ICL
+known text. It does not establish semantic quality or ICL/clone parity: the available
+host has no `.qvoice` profile or official Python reference runtime. SL-1 remains
+default-off until those gates are available.
+
 The local server bind smoke could not run in the managed macOS sandbox
 (bind: Operation not permitted). This was covered by a short continuous-server
 run on the GCP AMX host below.
@@ -124,8 +147,8 @@ The run did not have the official Python model/runtime or ICL reference audio
 installed, so it cannot establish upstream audio equivalence for clone/ICL.
 The control-vs-SL-1 waveform is not a semantic oracle: the prompt layout is
 intentionally model-visible. Therefore SL-1 remains default-off pending an
-upstream-layout quality gate, ICL/clone coverage and text-length prefill/TTFA
-scaling evidence.
+upstream-layout quality gate and ICL/clone coverage; the bounded known-text
+prefill-scaling gate is recorded above.
 
 ## Current decision
 
@@ -136,7 +159,8 @@ testing. KEEP default-off pending:
   Tier-A path gate above; broader serving qualification is still pending);
 - ICL/clone validation where the base model and reference assets are available;
 - established audio-quality/quality-bank gates;
-- prefill and TTFA scaling evidence versus the unchanged non-streaming control.
+- upstream-layout quality comparison is still required; known-text prefill scaling
+  against the unchanged non-streaming control is now PASS for the bounded CLI gate.
 
 Live incremental text, append-after-generation, fixed-prompt resumable prefill and
 output/scheduler redesign remain separate P3 work.
