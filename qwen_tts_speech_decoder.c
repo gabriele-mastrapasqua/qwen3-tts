@@ -272,6 +272,18 @@ static int sd_direct_convt_enabled(void) {
     return en;
 }
 
+/* SQ-2b: the ragged depthwise stage already receives one global column-major
+ * workset.  Keep that layout through the per-request depthwise operation instead
+ * of copying each item to a temporary buffer and copying its result back. */
+static int sd_direct_dwconv_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_DIRECT_DWCONV");
+        en = e && *e && *e != '0';
+    }
+    return en;
+}
+
 /* BF16 is a separate decoder arm.  It does not depend on the INT8 policy: a server can
  * select BF16 with QWEN_SD_AMX_BF16=1 and QWEN_SD_INT8=0 to measure the two representations
  * without silently paying for an unused INT8 cache. */
@@ -338,7 +350,7 @@ static double sd_p6a, sd_p6b, sd_p6c;
 static int sd_up_warm;
 static double sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake,
               sd_up_resadd, sd_up_alloc, sd_up_final;
-static long long sd_direct_convt_calls;
+static long long sd_direct_convt_calls, sd_direct_dwconv_calls;
 static double sd_up_t0;
 extern long long qwen_snake_expf_calls, qwen_snake_vec_poly, qwen_snake_vec_libm,
                  qwen_snake_scalar_tail;
@@ -373,10 +385,12 @@ static double sd_c1_t0;
                        sd_up_resadd + sd_up_alloc + sd_up_final;                      \
           fprintf(stderr, "[SDUP] v=2 pid=%d seq=%lld path=%s group=%d frames=%d warm=%d "     \
                   "convt=%.3f res1=%.3f res2=%.3f snake=%.3f resadd=%.3f "            \
-                  "alloc=%.3f final=%.3f sum=%.3f conv_up=%.3f direct_convt=%lld unacc=%.3f\n", \
+                  "alloc=%.3f final=%.3f sum=%.3f conv_up=%.3f direct_convt=%lld "       \
+                  "direct_dwconv=%lld unacc=%.3f\n",                                  \
                   (int)getpid(), sd_call_seq, (path_), (group_), (frames_), sd_up_warm,            \
                   sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake, sd_up_resadd,     \
-                  sd_up_alloc, sd_up_final, _us, sd_p6c, sd_direct_convt_calls, sd_p6c - _us); \
+                  sd_up_alloc, sd_up_final, _us, sd_p6c, sd_direct_convt_calls,       \
+                  sd_direct_dwconv_calls, sd_p6c - _us);                               \
           fprintf(stderr, "[SDRES1] v=1 pid=%d group=%d frames=%d calls=%lld "             \
                   "ext=%.3f conv=%.3f cut=%.3f sum=%.3f res1=%.3f "                        \
                   "cols_kept=%lld cols_convolved=%lld strip_calls=%lld discarded=%.1f%%\n", \
@@ -2307,6 +2321,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                sd_up_convt = sd_up_res1 = sd_up_res2 = sd_up_snake =
                sd_up_resadd = sd_up_alloc = sd_up_final = 0.0;
                sd_direct_convt_calls = 0;
+               sd_direct_dwconv_calls = 0;
                sd_up_warm = st->cs_warm;
                sd_c1_ext = sd_c1_conv = sd_c1_cut = sd_c1_tail = 0.0;
                sd_c1_calls = sd_c1_cols_kept = sd_c1_cols_conv = sd_c1_strip_calls = 0;
@@ -3313,6 +3328,37 @@ static int rag_dwconv(float *out, const float *in, int ch, const sd_rag_t *r,
     return 0;
 }
 
+static int rag_dwconv_direct(float *out, const float *in, int ch, const sd_rag_t *r,
+                             const float *w, const float *b, float * const *tails) {
+    const int64_t total = r->total;
+    for (int i = 0; i < r->n; i++) {
+        const int len = r->len[i];
+        if (len <= 0) continue;
+        const int64_t off = r->off[i];
+        for (int c = 0; c < ch; c++) {
+            const float *src = in + (int64_t)c * total + off;
+            float *dst = out + (int64_t)c * total + off;
+            float *tl = tails[i] + (int64_t)c * 6;
+            const float bb = b ? b[c] : 0.0f;
+            const float *wc = w + (int64_t)c * 7;
+            for (int t = 0; t < len; t++) {
+                float sum = bb;
+                for (int k = 0; k < 7; k++) {
+                    const int p = t - 6 + k;
+                    sum += wc[k] * (p >= 0 ? src[p] : tl[6 + p]);
+                }
+                dst[t] = sum;
+            }
+            if (len >= 6) memcpy(tl, src + len - 6, 6 * sizeof(float));
+            else
+                for (int j = 0; j < 6; j++)
+                    tl[j] = (j + len < 6) ? tl[j + len] : src[j + len - 6];
+        }
+    }
+    if (sd_phase_on()) sd_direct_dwconv_calls++;
+    return 0;
+}
+
 static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
                                                 qwen_sd_stream_state_t **sts, int nb,
                                                 float *signal, sd_rag_t *rg,
@@ -3342,7 +3388,14 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
         float *dw = (float *)aligned_malloc((int64_t)cur_ch * rg->total * sizeof(float));
         if (!dw) { free(up); goto done; }
         for (int b = 0; b < nb; b++) tails[b] = sts[b]->cs_cn_dw_tail[blk];
-        if (rag_dwconv(dw, up, cur_ch, rg, cn->dwconv_weight, cn->dwconv_bias, tails) != 0) {
+        int dwrc = -1;
+        if (sd_direct_dwconv_enabled())
+            dwrc = rag_dwconv_direct(dw, up, cur_ch, rg,
+                                     cn->dwconv_weight, cn->dwconv_bias, tails);
+        if (dwrc != 0)
+            dwrc = rag_dwconv(dw, up, cur_ch, rg,
+                              cn->dwconv_weight, cn->dwconv_bias, tails);
+        if (dwrc != 0) {
             free(up); free(dw); signal = NULL; goto done;
         }
         convnext_mlp(cn, dw, up, cur_ch, (int)rg->total);
