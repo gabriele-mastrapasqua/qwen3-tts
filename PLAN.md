@@ -87,10 +87,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 - [x] OUT-1/OUT-2 Bounded per-stream PCM queue, detached non-blocking writer, byte/memory
       cap, timeout, cancellation/disconnect semantics and slow/stopped-reader tests are
-      implemented behind `QWEN_SERVER_ASYNC_OUTPUT=1`; C1/C2 Tier-A path, byte-identical
-      audio and slow-reader gates pass. Remains default-off pending longer C3/C4 resource
-      qualification. Engine enqueue and transport-write timestamps remain distinct.
-      Detail: `.work/stream-output-isolation-20260907.md`.
+      implemented behind `QWEN_SERVER_ASYNC_OUTPUT=1`; C1/C2 path, matched C3/C4 Tier-A
+      integration, byte-identical audio and slow-reader gates pass. It remains default-off:
+      the C3/C4 wave shows no material KPI change, and longer-concurrency thread/memory
+      qualification is still open. Engine enqueue and transport-write timestamps remain
+      distinct. Detail: `.work/stream-output-isolation-20260907.md`.
 - [x] SL-1 Known-text official dual-track layout implemented behind
       QWEN_TTS_STREAM_LAYOUT=1 and carried through CLI, batch and continuous-server
       admission paths. Local structural smoke and a short GCP 2x6/batch-2 server
