@@ -297,19 +297,6 @@ static int sd_direct_input_enabled(void) {
     return en;
 }
 
-/* SQ-2e: ragged INT8 panels normally materialize an [N][K] FP32 im2col buffer and
- * quantise it in a second pass.  The AMX path only needs the quantised rows, so an
- * experimental arm can gather one row into a small worker-local buffer and quantise it
- * immediately.  Keep the full panel available as the exact fallback if AMX rejects. */
-static int sd_direct_quant_enabled(void) {
-    static int en = -1;
-    if (en < 0) {
-        const char *e = getenv("QWEN_SD_DIRECT_QUANT");
-        en = e && *e && *e != '0';
-    }
-    return en;
-}
-
 /* SQ-2d: residual blocks end with a same-width 1x1 projection followed by a full
  * residual add.  Keep the output buffer separate for fallback safety, but let the
  * Design-D AMX epilogue add the residual while it stores the projection result. */
@@ -3029,7 +3016,6 @@ static void rag_save_tail(float *tail, const float *in, int in_ch,
 typedef struct {
     long long panels, cols, amx_panels, fallback_panels;
     long long build_bytes, prepared_bytes, items, total_cols;
-    int direct_quant;
     double build_ms, prepare_ms, amx_ms, fallback_ms, post_ms;
     long long nc_le32, nc_le64, nc_le96, nc_le128, nc_gt128;
 } sd_rag_call_stats_t;
@@ -3049,13 +3035,13 @@ static void sd_rag_stats_report(const sd_rag_call_stats_t *s, const char *mode,
             "[SDRAG] v=1 pid=%d mode=%s items=%d total=%d M=%d K=%d Kp=%d kernel=%d "
             "dilation=%d nc_cap=%d panels=%lld cols=%lld amx=%lld fallback=%lld "
             "build_ms=%.3f prepare_ms=%.3f amx_ms=%.3f fallback_ms=%.3f post_ms=%.3f "
-            "build_MB=%.3f prepared_MB=%.3f direct_quant=%d item_sum=%lld total_sum=%lld "
+            "build_MB=%.3f prepared_MB=%.3f item_sum=%lld total_sum=%lld "
             "N_hist=le32:%lld,le64:%lld,le96:%lld,le128:%lld,gt128:%lld\n",
             (int)getpid(), mode, n_items, total, out_ch, K, Kp, kernel, dilation, nc_cap,
             s->panels, s->cols, s->amx_panels, s->fallback_panels,
             s->build_ms, s->prepare_ms, s->amx_ms, s->fallback_ms, s->post_ms,
             (double)s->build_bytes / 1e6, (double)s->prepared_bytes / 1e6,
-            s->direct_quant, s->items, s->total_cols,
+            s->items, s->total_cols,
             s->nc_le32, s->nc_le64, s->nc_le96, s->nc_le128, s->nc_gt128);
     (void)in_ch;
 }
@@ -3087,53 +3073,24 @@ typedef struct {
     const float *w;
     sd_wq_entry_t *e;
     int use_bf16, use_d, nblk;
-    int direct_quant;
     int stats_on;
     _Atomic int next_panel;
     _Atomic int failed;
     sd_rag_atomic_stats_t stats;
 } sd_rag_panel_job_t;
 
-static void sd_rag_gather_row(float *dst, const sd_rag_panel_job_t *j,
-                              int ts, int n) {
-    memset(dst, 0, (size_t)j->K * sizeof(float));
-    const int64_t gc = (int64_t)ts + n;
-    for (int b = 0; b < j->r->n; b++) {
-        const int64_t off = j->r->off[b];
-        if (gc < off || gc >= off + j->r->len[b]) continue;
-        const int frame = (int)(gc - off);
-        const float *tl_base = j->tails ? j->tails[b] : NULL;
-        const float *src_base = j->in + off;
-        const int pad_left = (j->kernel - 1) * j->dilation;
-        for (int ic = 0; ic < j->in_ch; ic++) {
-            const float *src = src_base + (int64_t)ic * j->length;
-            const float *tl = tl_base
-                ? tl_base + (int64_t)ic * pad_left : NULL;
-            for (int k = 0; k < j->kernel; k++) {
-                const int pos = frame - (pad_left - k * j->dilation);
-                dst[(size_t)ic * j->kernel + k] = pos >= 0
-                    ? src[pos] : (tl ? tl[pad_left + pos] : 0.0f);
-            }
-        }
-        return; /* rag_recompute() makes request ranges contiguous and disjoint */
-    }
-}
-
 static void sd_rag_panel_worker(void *vj) {
     sd_rag_panel_job_t *j = (sd_rag_panel_job_t *)vj;
     const size_t col_bytes = (size_t)j->nc_cap * (size_t)j->K * sizeof(float);
-    float *col = j->direct_quant ? NULL : (float *)aligned_malloc(col_bytes);
-    float *row = j->direct_quant
-        ? (float *)aligned_malloc((size_t)j->K * sizeof(float)) : NULL;
+    float *col = (float *)aligned_malloc(col_bytes);
     int8_t *colq = NULL;
     float *sa = NULL;
     if (j->use_d && !j->use_bf16) {
         colq = (int8_t *)aligned_malloc((size_t)j->nc_cap * (size_t)j->Kp);
         sa = (float *)aligned_malloc((size_t)j->nc_cap * (size_t)j->nblk * sizeof(float));
     }
-    if ((!j->direct_quant && !col) || (j->direct_quant && !row) ||
-        (j->use_d && !j->use_bf16 && (!colq || !sa))) {
-        free(col); free(row); free(colq); free(sa);
+    if (!col || (j->use_d && !j->use_bf16 && (!colq || !sa))) {
+        free(col); free(colq); free(sa);
         atomic_store(&j->failed, 1);
         return;
     }
@@ -3146,29 +3103,33 @@ static void sd_rag_panel_worker(void *vj) {
         const int ts = p * j->nc_cap;
         const int nc = j->length - ts < j->nc_cap ? j->length - ts : j->nc_cap;
         const double panel_t0 = j->stats_on ? sd_ph_now() : 0.0;
-        if (j->direct_quant) {
-            /* The quantiser needs a complete K-row to determine each block scale.  The
-             * row buffer is reused for every column, so the large FP32 [N][K] panel is
-             * never written/read between gather and quantisation. */
-            for (int n = 0; n < nc; n++) {
-                sd_rag_gather_row(row, j, ts, n);
-                qwen_int8_quant_rows(colq + (size_t)n * j->Kp,
-                                     sa + (size_t)n * j->nblk,
-                                     row, 1, j->K, j->Kp, j->blk);
+        memset(col, 0, (size_t)nc * (size_t)j->K * sizeof(float));
+        for (int b = 0; b < j->r->n; b++) {
+            const int64_t lo64 = j->r->off[b] > ts ? j->r->off[b] : ts;
+            const int64_t hi0 = j->r->off[b] + j->r->len[b];
+            const int64_t hi1 = (int64_t)ts + nc;
+            const int64_t hi64 = hi0 < hi1 ? hi0 : hi1;
+            if (lo64 >= hi64) continue;
+            const float *tl_base = j->tails ? j->tails[b] : NULL;
+            const float *src_base = j->in + j->r->off[b];
+            for (int64_t gc = lo64; gc < hi64; gc++) {
+                const int n = (int)(gc - ts);
+                const int frame = (int)(gc - j->r->off[b]);
+                float *dst = col + (size_t)n * (size_t)j->K;
+                for (int ic = 0; ic < j->in_ch; ic++) {
+                    const float *src = src_base + (int64_t)ic * j->length;
+                    const float *tl = tl_base ? tl_base + (int64_t)ic * (j->kernel - 1) * j->dilation : NULL;
+                    for (int k = 0; k < j->kernel; k++) {
+                        const int pos = frame - ((j->kernel - 1) * j->dilation - k * j->dilation);
+                        dst[(size_t)ic * j->kernel + k] = pos >= 0
+                            ? src[pos] : (tl ? tl[(j->kernel - 1) * j->dilation + pos] : 0.0f);
+                    }
+                }
             }
-            if (j->stats_on) {
-                local.prepare_ms += sd_ph_now() - panel_t0;
-                local.prepared_bytes += (long long)nc * j->Kp +
-                                        (long long)nc * j->nblk * (long long)sizeof(float);
-            }
-        } else {
-            memset(col, 0, (size_t)nc * (size_t)j->K * sizeof(float));
-            for (int n = 0; n < nc; n++)
-                sd_rag_gather_row(col + (size_t)n * j->K, j, ts, n);
-            if (j->stats_on) {
-                local.build_ms += sd_ph_now() - panel_t0;
-                local.build_bytes += (long long)nc * j->K * (long long)sizeof(float);
-            }
+        }
+        if (j->stats_on) {
+            local.build_ms += sd_ph_now() - panel_t0;
+            local.build_bytes += (long long)nc * j->K * (long long)sizeof(float);
         }
 
         int ran_amx;
@@ -3182,14 +3143,12 @@ static void sd_rag_panel_worker(void *vj) {
                 local.prepared_bytes += (long long)nc * j->Kp * (long long)sizeof(uint16_t);
             }
         } else {
-            if (!j->direct_quant) {
-                const double t0 = j->stats_on ? sd_ph_now() : 0.0;
-                qwen_int8_quant_rows(colq, sa, col, nc, j->K, j->Kp, j->blk);
-                if (j->stats_on) {
-                    local.prepare_ms += sd_ph_now() - t0;
-                    local.prepared_bytes += (long long)nc * j->Kp +
-                                            (long long)nc * j->nblk * (long long)sizeof(float);
-                }
+            const double t0 = j->stats_on ? sd_ph_now() : 0.0;
+            qwen_int8_quant_rows(colq, sa, col, nc, j->K, j->Kp, j->blk);
+            if (j->stats_on) {
+                local.prepare_ms += sd_ph_now() - t0;
+                local.prepared_bytes += (long long)nc * j->Kp +
+                                        (long long)nc * j->nblk * (long long)sizeof(float);
             }
             const double t1 = j->stats_on ? sd_ph_now() : 0.0;
             ran_amx = qwen_sd_amx_int8_panel(j->out, j->length, j->out_ch,
@@ -3198,15 +3157,6 @@ static void sd_rag_panel_worker(void *vj) {
             if (j->stats_on) local.amx_ms += sd_ph_now() - t1;
         }
         if (!ran_amx) {
-            if (!col) {
-                col = (float *)aligned_malloc(col_bytes);
-                if (!col) {
-                    atomic_store(&j->failed, 1);
-                    break;
-                }
-                for (int n = 0; n < nc; n++)
-                    sd_rag_gather_row(col + (size_t)n * j->K, j, ts, n);
-            }
             const double t0 = j->stats_on ? sd_ph_now() : 0.0;
             SD_GEMM(CblasNoTrans, CblasTrans, j->out_ch, nc, j->K,
                     1.0f, j->w, j->K, col, j->K, 0.0f,
@@ -3225,7 +3175,7 @@ static void sd_rag_panel_worker(void *vj) {
         }
     }
     if (j->stats_on) sd_rag_stats_merge(&j->stats, &local);
-    free(col); free(row); free(colq); free(sa);
+    free(col); free(colq); free(sa);
 }
 
 /* The production request-batching path uses rag_conv1d rather than the per-stream
@@ -3262,7 +3212,6 @@ static int rag_conv1d_amx(float *out, const float *in, int in_ch, int out_ch,
     job.n_panels = (total + nc_cap - 1) / nc_cap;
     job.r = r; job.tails = tails; job.w = w; job.e = e;
     job.use_bf16 = use_bf16; job.use_d = use_d; job.nblk = nblk;
-    job.direct_quant = use_d && !use_bf16 && sd_direct_quant_enabled();
     job.stats_on = sd_rag_stats_on();
     atomic_store(&job.next_panel, 0);
     atomic_store(&job.failed, 0);
@@ -3289,7 +3238,6 @@ static int rag_conv1d_amx(float *out, const float *in, int in_ch, int out_ch,
         rs.prepared_bytes = atomic_load(&job.stats.prepared_bytes);
         rs.items = r->n;
         rs.total_cols = total;
-        rs.direct_quant = job.direct_quant;
         rs.nc_le32 = atomic_load(&job.stats.nc_le32);
         rs.nc_le64 = atomic_load(&job.stats.nc_le64);
         rs.nc_le96 = atomic_load(&job.stats.nc_le96);
