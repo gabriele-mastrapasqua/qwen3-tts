@@ -16,12 +16,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 - Host: GCP c4-standard-24 (12 physical cores, SMT off), 1.7B INT8, decoder Design D
   INT8 AMX with persistent packs, 2x6 prefork, engine-owned pool, batch cap 2.
-- Best short C4 control (ragged threshold 2, chunk 32): STREAM_RTF p50/p95
-  0.900/0.954, TTFA p95 ~565 ms, zero errors, but zero-buffer required prebuffer p95
-  ~2.4 s and stall_max ~2.0 s. `STREAM_RTF < 1` is a capacity fact, NOT a continuous
-  playback proof; that older interpretation is superseded.
-- Prebuffer follows the audio quantum (chunk 8 → 0.45 s, chunk 32 → 1.2-2.5 s) while
-  STREAM_RTF barely moves. Chunk 32 is an RTF artifact and is not a production winner.
+- Current short q8/threshold2 envelope: C2/C3 are GOOD; C4 is MARGINAL
+  (`STREAM_RTF` p50/p95 0.793/0.856, required-prebuffer p95 596 ms, stall@500 25%).
+  `STREAM_RTF < 1` is capacity, not a continuous playback proof.
+- CT-1 confirms prebuffer follows quantum (q8 ~0.7 s p95 in short SOAK; q32 ~2.5 s)
+  while RTF changes less. q32 is rejected as a production streaming policy.
 - Decoder MACs already run on real AMX with wide N; its wall is glue (im2col, quantization,
   ~41 rendezvous and ~110 BLAS calls per call, snake, tails). AMX can touch at most
   ~10-20 % of request wall; more tile tasks regressed (M split rejected).
@@ -50,26 +49,18 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       TTFB is a real event, `TCP_NODELAY` or one `writev` per chunk, optional per-chunk
       server flush timestamp trace for a direct server-vs-client mark comparison.
 
-### P1 Cadence truth (current binary, Tier A only)
+### P1 Cadence truth (current binary, Tier A only) — detail: `.work/p1-cadence-truth-20260907.md`
 
-- [ ] CT-1 Chunk-quantum discriminator at C3 and C4 on 2x6: chunk 8, chunk 32, chunk 8
-      with gang join disabled; `[DECODE] dur_ms` and `[ITER]` traces on
-      (`QWEN_TTFA_TRACE=1`). Pass = required_prebuffer p95 tracks rho_f x quantum and
-      stall_rate@500 separates the arms; also yields CT-2 and CT-4 data.
-- [ ] CT-2 Decoder fixed intercept and per-frame slope from dur_ms vs frames, plus
-      `[SDPHASE]` attribution (tile vs glue). Intercept < 10 ms and slope < 8 ms/frame
-      demotes SQ-1.
-- [ ] CT-3 Quantify inline decoder blocking and admission/prefill interference on
-      established-stream cadence (new scenario: established streams + new arrival).
-- [ ] CT-4 Talker step wall at B=1 vs 2 in one process from `[ITER]`; > 1.6x kills EO-2.
-- [ ] CT-5 C2/C3/C4 playback envelope on the current architecture with the MT metrics;
-      classify each as GOOD / MARGINAL / NOT STREAMABLE.
+- [x] CT-1 Quantum discriminator at C3/C4, including gang-off control; q32 is rejected.
+- [x] CT-2 Decoder intercept/slope and `[SDPHASE]` attribution; SQ-1 remains GO.
+- [x] CT-3 Inline admission interference measured with matched control; LS-4 remains P3.
+- [x] CT-4 Talker B1/B2 measured; EO-2 remains viable (B2/B1 step ratio ~1.10).
+- [x] CT-5 C2/C3/C4 playback envelope: GOOD / GOOD / MARGINAL.
 
 ### P2 Small-quantum decoder — detail: `.work/professional-streaming-architecture.md` E3, E4
 
-- [ ] SQ-1 Streaming strip executor design note: strip → snake → conv1 → snake → conv2 →
-      residual, direct INT8 A preparation, packed transposed conv, few rendezvous; go/no-go
-      from CT-2.
+- [ ] SQ-1 Streaming strip executor: strip → snake → conv1 → snake → conv2 → residual,
+      direct INT8 A preparation, packed transposed conv, few rendezvous. CT-2 = GO.
 - [ ] SQ-2 Remove fixed per-call work that grows badly as chunks shrink (materialized
       im2col, separate quantization pass, per-tap BLAS scatter, per-call scratch, whole-chunk
       rendezvous), bit-parity or mel-corr gated, measured by CT-2 re-run.
@@ -85,8 +76,8 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       startup, grows with lead, bounded lead window, no giant bursts.
 - [ ] LS-3 Bounded decoder slices that cannot stop codec generation for unrelated streams
       (same pool first; dedicated lane only with evidence).
-- [ ] LS-4 Deadline-aware admission: prefill deferred or interleaved when an established
-      stream is near underrun; new requests cannot starve; measured by CT-3 scenario.
+- [ ] LS-4 Deadline-aware admission: prefill deferred/interleaved near underrun; CT-3
+      found a ~309 ms inline prefill and one potentially enlarged overlapping gap.
 
 ## Later
 
@@ -94,7 +85,7 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 - [ ] EO-1 Clean comparison of prefork/local batching vs single-engine global ready set,
       only after LS-3 controls decode bursts; small mechanism experiments, not a matrix.
-- [ ] EO-2 Single-engine Talker/CP batching with bounded decoder slices (gated by CT-4).
+- [ ] EO-2 Single-engine Talker/CP batching with bounded decoder slices; CT-4 retained.
 - [ ] EO-3 Dynamic core allocation instead of fixed 2x6/2x8; asymmetric lanes only if EO-2
       shows a compute-bound Talker at B >= 3.
 - [ ] AMX-0 Trusted execution map with useful AMX wall share (demoted from P0; detail:
@@ -121,11 +112,7 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 - Superseded by the envelope: AMX-1, AMX-3, AMX-6, AMX-7, AMX-9 (C4 qualification and
   cross-request decoder aggregation are no longer the next bet; aggregate only for
   isolation/cadence, never for width).
-- Controls: P0.1 profiler, P0.2 manifests (`docs/BENCHMARKING.md`), P1.1
-  (`.work/config-control-plane.md`), P1.2, P1.3, P1.4 (`.work/p1-4-amx-runtime.md`),
-  CTRL-1 (`docs/backend-matrix.md`), CTRL-2, CTRL-3, CTRL-4. Deferred: X86-2, X86-3,
-  X86-4, X86-5 (`.work/x86-dataflow-research.md`), X86-6, X86-7, X86-8, LATER-1,
-  LATER-2, LATER-3, LATER-4.
+- Controls: P0.1/P0.2, P1.1–P1.4, CTRL-1–CTRL-4; deferred X86-2–X86-8 and LATER-1–4.
 - Closed: AMX-4, AMX-5, AMX-8, P3.1, P3.2, P3.6, ragged scheduler review
   (`.work/amx-ragged-scheduler-review-3f7e0df.md`), and the ids below.
 - [x] P2.1 Runtime parity — `.work/p2-cross-backend-runtime.md`
@@ -150,12 +137,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 | stall_rate@500ms | -> 0 at the operating point | stall_rate@250ms -> 0 |
 | admission / slow client | no induced stall on established streams | |
 
-Never: promote chunk 32 for its RTF; trade cadence for TTFA or RTF for cadence;
-manufacture AMX tasks; treat 2x6 as truth; reopen BF16/W4 as the fix; hide negatives.
+Never promote q32 for RTF, trade cadence for TTFA, manufacture AMX work, or reopen
+BF16/W4 as the P1 fix.
 
 ## Evidence
 
 `.work/professional-streaming-architecture.md` (cadence law, AMX accounting, candidates,
-envelope, historical classification); `.work/amx-c4-cross-request-20260907.md`,
+envelope, historical classification); `.work/p1-cadence-truth-20260907.md`,
+`.work/amx-c4-cross-request-20260907.md`,
 `.work/amx-c4-chunk-sweep-20260906.md`, `.work/amx-c4-ragged-threshold-20260906.md`,
 `.work/amx-native-epic.md`, `docs/reference-gcp-c4-standard-24.md`, `docs/runtime-map-c8a-c4.md`.
