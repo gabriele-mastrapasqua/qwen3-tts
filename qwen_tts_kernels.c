@@ -322,7 +322,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
-    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
+    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_STREAM_STRIP", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
@@ -9839,7 +9839,8 @@ typedef struct {
     const float *in;
     const int8_t *Wq; const int8_t *Wpack;
     const float *sw; const int32_t *wsum; const float *bias;
-    int in_ch, out_ch, length, kernel, dilation, Kp, blk;
+    int in_ch, out_ch, length, input_length, input_offset;
+    int kernel, dilation, Kp, blk;
     _Atomic int next_panel;
     _Atomic int entered;      /* workers that reached the body: the honest denominator */
     int n_panels;
@@ -9854,7 +9855,8 @@ static void sd_conv1d_worker(void *vj) {
     sd_conv_job_t *j = (sd_conv_job_t *)vj;
     if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     int K = j->in_ch * j->kernel;
-    int nblk = j->Kp / j->blk;
+    const int nblk = j->Kp / j->blk;
+    const int input_length = j->input_length > 0 ? j->input_length : j->length;
     int pad_left = (j->kernel - 1) * j->dilation;
     /* per-thread, grow-once: the worker runs one panel at a time, so the column scratch is
      * reused across panels, conv layers and chunks instead of being re-allocated per call */
@@ -9872,13 +9874,13 @@ static void sd_conv1d_worker(void *vj) {
         int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
         for (int c = 0; c < nc; c++) {
             float *dst = colf + (size_t)c * K;
-            int tt = t0 + c - pad_left;
+            int tt = j->input_offset + t0 + c - pad_left;
             for (int ic = 0; ic < j->in_ch; ic++) {
-                const float *src = j->in + (size_t)ic * j->length;
+                const float *src = j->in + (size_t)ic * input_length;
                 float *dk = dst + (size_t)ic * j->kernel;
                 for (int kk = 0; kk < j->kernel; kk++) {
                     int pos = tt + kk * j->dilation;
-                    dk[kk] = (pos >= 0 && pos < j->length) ? src[pos] : 0.0f;
+                    dk[kk] = (pos >= 0 && pos < input_length) ? src[pos] : 0.0f;
                 }
             }
         }
@@ -9924,6 +9926,7 @@ void qwen_conv1d_int8(float *out, const float *in,
         .out = out, .in = in, .Wq = Wq, .Wpack = NULL,
         .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .input_length = length, .input_offset = 0,
         .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
     };
     job.nc = sd_conv_nc(length, sd_pool_threads());
@@ -9950,6 +9953,7 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
         .out = out, .in = in, .Wq = Wq, .Wpack = Wpack,
         .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .input_length = length, .input_offset = 0,
         .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
     };
     job.nc = sd_conv_nc(length, sd_pool_threads());
@@ -9959,6 +9963,34 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
     atomic_store(&job.entered, 0);
     sd_pool_run(sd_conv1d_worker, &job);
     qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+
+int qwen_conv1d_int8_design_d_range(float *out, const float *in,
+                                    const int8_t *Wq, const float *sw,
+                                    const int32_t *wsum, const float *bias,
+                                    const int8_t *Wpack,
+                                    int in_ch, int out_ch, int input_length,
+                                    int input_offset, int output_length,
+                                    int kernel, int dilation, int Kp, int blk) {
+    if (!out || !in || !Wq || !Wpack || in_ch <= 0 || out_ch <= 0 ||
+        input_length <= 0 || input_offset < 0 || output_length <= 0 ||
+        kernel <= 0 || dilation <= 0 || Kp <= 0 || blk <= 0)
+        return 0;
+    sd_conv_job_t job = {
+        .out = out, .in = in, .Wq = Wq, .Wpack = Wpack,
+        .sw = sw, .wsum = wsum, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = output_length,
+        .input_length = input_length, .input_offset = input_offset,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+    };
+    job.nc = sd_conv_nc(output_length, sd_pool_threads());
+    job.n_panels = (output_length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+    return 1;
 }
 
 #endif  /* x86 VNNI / Arm dot-product decoder kernels */
@@ -10155,6 +10187,19 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
     (void)Wpack;
     qwen_conv1d_int8(out, in, Wq, sw, wsum, bias, in_ch, out_ch, length,
                      kernel, dilation, Kp, blk);
+}
+
+int qwen_conv1d_int8_design_d_range(float *out, const float *in,
+                                    const int8_t *Wq, const float *sw,
+                                    const int32_t *wsum, const float *bias,
+                                    const int8_t *Wpack,
+                                    int in_ch, int out_ch, int input_length,
+                                    int input_offset, int output_length,
+                                    int kernel, int dilation, int Kp, int blk) {
+    (void)out; (void)in; (void)Wq; (void)sw; (void)wsum; (void)bias; (void)Wpack;
+    (void)in_ch; (void)out_ch; (void)input_length; (void)input_offset;
+    (void)output_length; (void)kernel; (void)dilation; (void)Kp; (void)blk;
+    return 0;
 }
 
 void qwen_gemm_int8(float *out, int out_ld,

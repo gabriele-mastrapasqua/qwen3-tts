@@ -475,6 +475,19 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
                                int in_ch, int out_ch, int length, int kernel, int dilation,
                                int Kp, int blk);
 
+/* Streaming causal slice: `in` has input_length columns, while the output buffer has
+ * output_length columns corresponding to logical output columns [input_offset,
+ * input_offset + output_length).  The AMX B pack and per-column quantisation contract
+ * are identical to qwen_conv1d_int8_design_d(); return 1 when the backend accepted the
+ * range, 0 when the caller must use its complete-path fallback. */
+int qwen_conv1d_int8_design_d_range(float *out, const float *in,
+                                    const int8_t *Wq, const float *sw,
+                                    const int32_t *wsum, const float *bias,
+                                    const int8_t *Wpack,
+                                    int in_ch, int out_ch, int input_length,
+                                    int input_offset, int output_length,
+                                    int kernel, int dilation, int Kp, int blk);
+
 void qwen_conv1d_bf16_amx(float *out, const float *in,
                           const float *bias, const uint16_t *Wpack,
                           int in_ch, int out_ch, int length, int kernel, int dilation,
