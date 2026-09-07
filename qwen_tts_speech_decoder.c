@@ -309,19 +309,6 @@ static int sd_fused_residual_enabled(void) {
     return en;
 }
 
-/* A ragged 1x1 residual can also keep the existing FP32 BLAS arithmetic while
- * using the residual buffer as GEMM's C operand (beta=1).  This is a separate
- * experiment because it trades the AMX execution representation for a lower
- * total-cost epilogue on shapes where the AMX c2 probe is slower than BLAS. */
-static int sd_rag_fused_residual_blas_enabled(void) {
-    static int en = -1;
-    if (en < 0) {
-        const char *e = getenv("QWEN_SD_RAG_FUSED_RESIDUAL_BLAS");
-        en = e && *e && *e != '0';
-    }
-    return en;
-}
-
 /* BF16 is a separate decoder arm.  It does not depend on the INT8 policy: a server can
  * select BF16 with QWEN_SD_AMX_BF16=1 and QWEN_SD_INT8=0 to measure the two representations
  * without silently paying for an unused INT8 cache. */
@@ -3357,23 +3344,6 @@ static int rag_conv1d_fused_residual(float *out, const float *in,
     return 1;
 }
 
-/* Keep the residual as the GEMM destination.  `out` is the caller-owned residual
- * copy, so beta=1 performs the add without a second full-size loop or c2 output
- * allocation.  This preserves the existing FP32 BLAS projection/accumulation
- * contract and is intentionally independent from the AMX fused arm above. */
-static int rag_conv1d_fused_residual_blas(float *out, const float *in,
-                                          int channels, const sd_rag_t *r,
-                                          const float *w, const float *bias) {
-    if (!sd_rag_fused_residual_blas_enabled() || !r ||
-        r->total <= 0 || r->total > INT_MAX)
-        return 0;
-    SD_GEMM(CblasNoTrans, CblasNoTrans, channels, (int)r->total, channels,
-            1.0f, w, channels, in, (int)r->total,
-            1.0f, out, (int)r->total);
-    conv_add_bias(out, bias, channels, (int)r->total);
-    return 1;
-}
-
 static float *rag_convt_direct(const float *in, int in_ch, int out_ch,
                                const sd_rag_t *rin, int kernel, int stride,
                                const float *w, const float *bias, float * const *carries,
@@ -3688,47 +3658,37 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
                     snake_activation(signal, cur_ch, (int)rg->total,
                                      ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
 
+                float *c2_out = (float *)aligned_calloc(nel, sizeof(float));
+                if (!c2_out) { free(res); goto done; }
                 {
                     char _nm[32]; snprintf(_nm, sizeof _nm, "blk%d_res%d_conv2", blk, r);
                     sd_shape_emit(_nm, "ragged", nb, frames_in, cur_ch, cur_ch,
                                   (long)rg->total, 1, 1);
                 }
                 UP_T0();
-                const int fused_residual_blas = rag_conv1d_fused_residual_blas(
-                    res, signal, cur_ch, rg,
+                const int fused_residual = rag_conv1d_fused_residual(
+                    c2_out, signal, res, cur_ch, rg,
                     ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias);
-                if (fused_residual_blas) {
-                    UP_ACC(sd_up_res2);
-                    free(signal);
-                    signal = res;
-                    res = NULL;
-                } else {
-                    float *c2_out = (float *)aligned_calloc(nel, sizeof(float));
-                    if (!c2_out) { free(res); goto done; }
-                    const int fused_residual = rag_conv1d_fused_residual(
-                        c2_out, signal, res, cur_ch, rg,
-                        ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias);
-                    if (!fused_residual)
-                        rag_conv1d(c2_out, signal, cur_ch, cur_ch, rg, 1, 1,
-                                   ub->res_blocks[r].conv2_weight,
-                                   ub->res_blocks[r].conv2_bias, NULL);
-                    UP_ACC(sd_up_res2);
+                if (!fused_residual)
+                    rag_conv1d(c2_out, signal, cur_ch, cur_ch, rg, 1, 1,
+                               ub->res_blocks[r].conv2_weight,
+                               ub->res_blocks[r].conv2_bias, NULL);
+                UP_ACC(sd_up_res2);
 
-                    if (fused_residual) {
-                        /* Design-D already wrote residual + projection into c2_out.
-                         * Keep that separate result as the next signal so the input
-                         * remains valid until the AMX call has completed. */
-                        free(signal);
-                        signal = c2_out;
-                        c2_out = NULL;
-                        free(res);
-                    } else {
-                        { UP_T0();
-                          for (int64_t i = 0; i < nel; i++) signal[i] = res[i] + c2_out[i];
-                          UP_ACC(sd_up_resadd); }
-                        free(c2_out);
-                        free(res);
-                    }
+                if (fused_residual) {
+                    /* Design-D already wrote residual + projection into c2_out.
+                     * Keep that separate result as the next signal so the input
+                     * remains valid until the AMX call has completed. */
+                    free(signal);
+                    signal = c2_out;
+                    c2_out = NULL;
+                    free(res);
+                } else {
+                    { UP_T0();
+                      for (int64_t i = 0; i < nel; i++) signal[i] = res[i] + c2_out[i];
+                      UP_ACC(sd_up_resadd); }
+                    free(c2_out);
+                    free(res);
                 }
                 { UP_T0(); UP_ACC(sd_up_alloc); }
             }
