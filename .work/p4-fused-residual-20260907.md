@@ -66,15 +66,45 @@ stream p95 and safe-start p95, but request rate and measured cores are lower in 
 short sequence.  Therefore this is not evidence that fused residual universally
 improves every concurrency or workload.
 
+## C4 mixed-bank SOAK
+
+The treatment then ran alone through the canonical five-minute closed-loop C4 SOAK on
+the same host, binary, topology and runtime flags, with the full 21-entry mixed bank
+(short, medium, long, conversational and Italian), temperature `0`, 60 s warm-up and
+four 60 s analysis windows.  The run produced 119 completed KPI requests over 313.9 s;
+all errors, queue rejects and server timeouts were zero, and receive coalescing was 0%.
+The binary remained `a536c8b:clean` with the SHA above.  `soak_summary.json` reported
+overall latency/resource/drift status `PASS`.
+
+| metric | pooled sustained result |
+|---|---:|
+| TTFA p50/p95 | 197.7 / 526.2 ms |
+| STREAM_RTF p50/p95 | 0.8304 / 0.8933 |
+| required prebuffer p50/p95 | 300.3 / 554.5 ms |
+| safe play start p50/p95 | 535.3 / 916.8 ms |
+| max gap p95 | 966.9 ms |
+| stall@100 / @250 / @500 / @1000 | 97.5% / 50.4% / 0.84% / 0% |
+| total requests / coalesced reads | 119 / 0% |
+
+The four window STREAM p95 values were `0.8987`, `0.9045`, `0.8617` and `0.8838`.
+Thus the pooled hard realtime gate (`p95 < 1`) holds across every window and the
+pooled aggregate reaches the preferred `<=0.90` target, but the preferred target is
+not a per-window guarantee.  The one @500 ms stall is a single client-observed event;
+the zero-buffer prebuffer and @250 ms rates remain stricter playback diagnostics, not
+proof of audible starvation with a larger application buffer.  Per-class p95 drift was
+not assessable because each class contributed only 5–7 samples per window, below the
+20-sample analyzer requirement.
+
 ## Verdict
 
-**PROMOTE AS AN ISOLATED, DEFAULT-OFF P4 CANDIDATE.**  The path is numerically clean in
-the tested CLI contract, executes in both per-slot and ragged server forms, and shows a
-material C4 playback/RTF improvement without a TTFA regression.  Keep
-`QWEN_SD_FUSED_RESIDUAL` default-off until a longer mixed/realistic C4 comparison or
-Tier-B SOAK confirms the short-bank result and checks playback regularity.  Do not claim
-that decoder intercept or AMX coverage is solved: this path removes only the same-width
-1x1 residual-add pass where its Design-D conditions hold.
+**PROMOTE AS AN ISOLATED, DEFAULT-OFF P4 CANDIDATE; C4 POOLED HARD GATE PASSED.**  The
+path is numerically clean in the tested CLI contract, executes in both per-slot and
+ragged server forms, and the mixed-bank SOAK confirms `STREAM_RTF p95 < 1` in every
+window without a TTFA regression.  Keep `QWEN_SD_FUSED_RESIDUAL` default-off until a
+deployment policy explicitly selects it and the remaining per-class/longer playback
+coverage is desired.  Do not claim that decoder intercept or AMX coverage is solved:
+this path removes only the same-width 1x1 residual-add pass where its Design-D
+conditions hold.
 
 ## Remaining gates and constraints
 

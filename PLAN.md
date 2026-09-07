@@ -16,9 +16,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 - Host: GCP c4-standard-24 (12 physical cores, SMT off), 1.7B INT8, decoder Design D
   INT8 AMX with persistent packs, 2x6 prefork, engine-owned pool, batch cap 2.
-- Current short q8/threshold2 envelope: C2/C3 are GOOD; C4 is MARGINAL
+- Current conservative short q8/threshold2 control: C2/C3 are GOOD; C4 is MARGINAL
   (`STREAM_RTF` p50/p95 0.793/0.856, required-prebuffer p95 596 ms, stall@500 25%).
   `STREAM_RTF < 1` is capacity, not a continuous playback proof.
+- Fused-residual Design-D candidate: pooled five-minute C4 SOAK passed the hard stream
+  gate in all four windows (`STREAM_RTF` p50/p95 0.8304/0.8933, TTFA p95 526 ms,
+  safe-play-start p95 917 ms, zero errors/rejects/timeouts); preferred `<=0.90` was
+  missed in one window and per-class p95 was under-sampled. The flag remains default-off.
 - CT-1 confirms prebuffer follows quantum (q8 ~0.7 s p95 in short SOAK; q32 ~2.5 s)
   while RTF changes less. q32 is rejected as a production streaming policy.
 - Decoder MACs already run on real AMX with wide N; its wall is glue (im2col, quantization,
@@ -125,13 +129,14 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       and max-gap p95 `511 -> 1286 ms`; it observed `group=1` and did not preserve the
       inline decoder batching path. Keep default-off; detail:
       `.work/p4-same-pool-decoder-20260907.md`.
-- [x] Fused residual Design-D epilogue passed the CLI byte/audio gate and a short server
-      A/B in both per-slot and ragged forms: C4 STREAM_RTF p95 `0.831 -> 0.788`,
-      prebuffer p95 `389 -> 266 ms`, stall@250 `17% -> 0%`, with zero errors. Promote as
-      an isolated **default-off** candidate pending a longer C4 qualification; detail:
+- [x] Fused residual Design-D epilogue passed the CLI byte/audio gate, a short server
+      A/B in both per-slot and ragged forms, and a pooled five-minute mixed-bank C4 SOAK:
+      short A/B STREAM_RTF p95 `0.831 -> 0.788`; SOAK p95 `0.8933` with zero errors and
+      hard p95 `<1` in every window. Promote as an isolated **default-off** candidate;
+      per-class p95 remains under-sampled. Detail:
       `.work/p4-fused-residual-20260907.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
-      retain fused residual as a longer-qualification candidate and consider a strip executor only for proven
+      retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving
       optimization; claim-first allocation hygiene is retained but KPI-neutral. Details:
       `.work/p4-rag-panel-scratch-20260907.md`, `.work/p4-rag-claim-first-20260907.md`.
