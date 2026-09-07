@@ -127,7 +127,8 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       `.work/p4-same-pool-decoder-20260907.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as quality-gated and consider a strip executor only for proven
-      small-call/intercept work.
+      small-call/intercept work. Ragged worker scratch reuse was tested and rejected at C4;
+      detail: `.work/p4-rag-panel-scratch-20260907.md`.
 - [ ] No speculative completed-stage resumability or dedicated core lanes without evidence.
 
 ### P5 Ownership and batching
