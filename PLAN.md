@@ -63,8 +63,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       direct INT8 A preparation, packed transposed conv, few rendezvous. CT-2 = GO.
 - [ ] SQ-2 Remove fixed per-call work that grows badly as chunks shrink (materialized
       im2col, separate quantization pass, per-tap BLAS scatter, per-call scratch, whole-chunk
-      rendezvous); the first direct ragged transposed-conv slice is implemented
-      default-off — detail: `.work/p2-sq2-direct-convt-20260907.md`.
+      rendezvous); default-off slices now include direct streaming/ragged ConvT and depthwise
+      copy elimination — details: `.work/p2-sq2-direct-convt-stream-20260907.md`,
+      `.work/p2-sq2-direct-convt-20260907.md`, `.work/p2-sq2-direct-dwconv-20260907.md`,
+      `.work/p2-sq2-direct-input-20260907.md` (input materialization removed, serving not
+      promoted); one-row direct gather/quantization was measured and rejected — detail:
+      `.work/p2-sq2-direct-quant-20260907.md`.
 - [ ] SQ-3 Report amx_dispatch_share, amx_matrix_mac_share, amx_addressable_mac_share and
       amx_request_wall_share separately after each SQ change; never optimize task count.
 
@@ -81,6 +85,8 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ### P3 Lead-aware streaming scheduler — detail: `.work/professional-streaming-architecture.md` E2, E7
 
+- [ ] PF-1 Bounded/incremental prefill: first playable audio must not scale with the full
+      long input; length-scaling evidence: `.work/p2-input-length-scaling-20260907.md`.
 - [ ] LS-1 Per-stream playback state (delivered audio, lead, time-to-underrun, first-audio
       deadline, admission state) and a design for deadline/slack ordering; not a fixed
       priority ladder.
@@ -159,6 +165,6 @@ BF16/W4 as the P1 fix.
 ## Evidence
 
 `.work/professional-streaming-architecture.md` (cadence law, AMX accounting, candidates, envelope, historical classification); `.work/p1-cadence-truth-20260907.md`,
-`.work/p2-sq2-direct-convt-20260907.md`, `.work/amx-c4-cross-request-20260907.md`,
+`.work/p2-sq2-direct-convt-20260907.md`, `.work/p2-sq2-direct-dwconv-20260907.md`, `.work/p2-sq2-direct-input-20260907.md`, `.work/p2-sq2-direct-quant-20260907.md`, `.work/p2-input-length-scaling-20260907.md`, `.work/amx-c4-cross-request-20260907.md`,
 `.work/amx-c4-chunk-sweep-20260906.md`, `.work/amx-c4-ragged-threshold-20260906.md`,
 `.work/amx-native-epic.md`, `docs/reference-gcp-c4-standard-24.md`, `docs/runtime-map-c8a-c4.md`.
