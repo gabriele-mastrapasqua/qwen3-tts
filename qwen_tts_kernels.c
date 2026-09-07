@@ -317,7 +317,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_KAI_LHS", "QWEN_KAI_REPEAT",
     /* prefill */
     "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_PREFILL_HELPER", "QWEN_GGUF_QUANT_PREFILL",
-    "QWEN_PREFIX_CACHE",
+    "QWEN_PREFIX_CACHE", "QWEN_TTS_STREAM_LAYOUT",
     /* code predictor */
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",

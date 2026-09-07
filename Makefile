@@ -187,6 +187,7 @@ help:
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
+	@echo "  make test-stream-layout - Known-text dual-track layout smoke (default-off)"
 	@echo "  make test-all        - Run everything (0.6B + 1.7B + regression)"
 	@echo ""
 	@echo "Benchmark:"
@@ -1006,6 +1007,9 @@ test-golden: $(TARGET)
 	 echo "PASS: all golden references present matched"
 	@echo ""
 
+test-stream-layout: $(TARGET)
+	@bash tests/stream_layout_smoke.sh
+
 golden-update: $(TARGET)
 	@echo "=== Regenerating golden references (review the diff before committing!) ==="
 	@mkdir -p tests/golden
@@ -1322,7 +1326,7 @@ test-it-ryan: test-small-it
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden test-sd-pool-config golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden test-stream-layout test-sd-pool-config golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
         emotion-para-demo para-demo \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all \
         test-clone test-voice-design \

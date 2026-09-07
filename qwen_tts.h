@@ -450,6 +450,16 @@ typedef struct qwen_tts_ctx {
     int prefill_only;
     int bg_text_content_len;
 
+    /* Known-text streaming layout (SL-1).  The prefill contains only the
+     * aligned prefix; the remaining text projections are consumed once per
+     * generated codec frame.  Ownership is the context unless a caller
+     * explicitly transfers the pointer into its request slot. */
+    int   stream_layout_active;
+    int   stream_layout_prefill_len;
+    float *stream_trailing_text;
+    int   stream_trailing_len;
+    int   stream_trailing_pos;
+
     uint16_t *cp_kv_k;
     uint16_t *cp_kv_v;
     int cp_kv_max;

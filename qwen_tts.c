@@ -473,6 +473,36 @@ static void embed_one_text_token(qwen_tts_ctx_t *ctx, int tid, float *out) {
     embed_one_text_token_compute(ctx, tid, out);
 }
 
+static int qwen_stream_layout_enabled(void) {
+    const char *e = getenv("QWEN_TTS_STREAM_LAYOUT");
+    return e && e[0] && e[0] != '0';
+}
+
+static void qwen_stream_trailing_clear(qwen_tts_ctx_t *ctx) {
+    if (!ctx) return;
+    free(ctx->stream_trailing_text);
+    ctx->stream_trailing_text = NULL;
+    ctx->stream_trailing_len = 0;
+    ctx->stream_trailing_pos = 0;
+}
+
+static int qwen_stream_trailing_alloc(qwen_tts_ctx_t *ctx, int n) {
+    if (!ctx || n < 0) return -1;
+    qwen_stream_trailing_clear(ctx);
+    if (n == 0) return 0;
+    size_t h = (size_t)ctx->config.hidden_size;
+    if ((size_t)n > SIZE_MAX / (h * sizeof(float))) return -1;
+    ctx->stream_trailing_text = (float *)aligned_malloc((size_t)n * h * sizeof(float));
+    if (!ctx->stream_trailing_text) return -1;
+    ctx->stream_trailing_len = n;
+    return 0;
+}
+
+static void qwen_stream_add_text_token(qwen_tts_ctx_t *ctx, int tid,
+                                        float *dst) {
+    embed_one_text_token(ctx, tid, dst);
+}
+
 #define DT_CHUNK_FRAMES 10
 
 typedef struct {
@@ -858,6 +888,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     free(ctx->prev_input_embeds); free(ctx->cached_ref_codes);
+    free(ctx->stream_trailing_text);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
 }
@@ -925,6 +956,8 @@ qwen_tts_ctx_t *qwen_tts_clone_for_worker(const qwen_tts_ctx_t *base) {
     w->codec_codes = NULL; w->codec_frames = 0; w->codec_frames_cap = 0;
     w->prev_tokens = NULL; w->n_prev_tokens = 0; w->prev_tokens_cap = 0;
     w->prev_input_embeds = NULL; w->prev_prefill_len = 0;
+    w->stream_trailing_text = NULL; w->stream_trailing_len = 0; w->stream_trailing_pos = 0;
+    w->stream_layout_prefill_len = 0;
     w->audio_buf = NULL; w->audio_samples = 0;
     memset(&w->sd_stream, 0, sizeof(w->sd_stream));
 
@@ -956,6 +989,7 @@ void qwen_tts_free_clone(qwen_tts_ctx_t *ctx) {
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     free(ctx->prev_input_embeds);
+    free(ctx->stream_trailing_text);
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].down_q2_rough);
     free(ctx->instruct);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
@@ -1011,6 +1045,9 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     qwen_exec_budget_engine_owned("cli");
     double t_start = time_ms();
     int h = ctx->config.hidden_size;
+    qwen_stream_trailing_clear(ctx);
+    ctx->stream_layout_active = qwen_stream_layout_enabled();
+    ctx->stream_layout_prefill_len = 0;
     qwen_set_seed(ctx->seed);
 
     int32_t *instruct_tokens = NULL;
@@ -1199,7 +1236,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     int inst_len = instruct_tokens ? instruct_token_len : 0;
 
     int sec3_len, sec4_len;
-    if (icl_mode) {
+    int stream_text_len = 0, stream_codec_len = 0;
+    if (ctx->stream_layout_active) {
+        stream_text_len = (icl_mode ? ref_text_token_len : 0) + text_content_len + 1;
+        stream_codec_len = icl_mode ? ref_n_frames + 1 : 1;
+        sec3_len = 0;
+        sec4_len = stream_codec_len;
+    } else if (icl_mode) {
         sec3_len = ref_text_token_len + text_content_len + 1;
         sec4_len = ref_n_frames + 1;
     } else {
@@ -1280,7 +1323,87 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         pos++;
     }
 
-    if (icl_mode) {
+    if (ctx->stream_layout_active) {
+        int trailing_len = stream_text_len > stream_codec_len
+                         ? stream_text_len - stream_codec_len : 0;
+        if (qwen_stream_trailing_alloc(ctx, trailing_len) != 0) {
+            fprintf(stderr, "Error: streaming layout trailing text allocation failed\n");
+            free(all_tokens);
+            free(tmp_embed);
+            free(ref_text_tokens);
+            if (ref_codes_owned) free(ref_codes);
+            free(codec_pad_embed);
+            free(codec_bos_embed);
+            free(input_embeds);
+            return -1;
+        }
+
+        if (icl_mode) {
+            /* Official non_streaming_mode=False ICL layout: the common
+             * text/codec prefix is aligned column by column.  Text beyond
+             * the reference-code prefix is kept as one hidden vector per
+             * subsequent generation step. */
+            for (int i = 0; i < stream_codec_len; i++) {
+                float *dst = input_embeds + (int64_t)pos * h;
+                if (i < ref_text_token_len) {
+                    qwen_stream_add_text_token(ctx, ref_text_tokens[i], dst);
+                } else if (i < ref_text_token_len + text_content_len) {
+                    qwen_stream_add_text_token(ctx,
+                                               all_tokens[role_len + (i - ref_text_token_len)], dst);
+                } else if (i == ref_text_token_len + text_content_len) {
+                    memcpy(dst, tts_eos_embed, (size_t)h * sizeof(float));
+                } else {
+                    memcpy(dst, tts_pad_embed, (size_t)h * sizeof(float));
+                }
+
+                if (i == 0) {
+                    for (int j = 0; j < h; j++) dst[j] += codec_bos_embed[j];
+                } else {
+                    int frame = i - 1;
+                    int code0 = ref_codes[frame * 16];
+                    lookup_codec_embed(ctx, code0, tmp_embed);
+                    for (int j = 0; j < h; j++) dst[j] += tmp_embed[j];
+                    for (int g = 0; g < 15; g++) {
+                        int code_g = ref_codes[frame * 16 + g + 1];
+                        if (ctx->cp_codec_emb_bf16[g] && code_g >= 0
+                            && code_g < ctx->config.codebook_size) {
+                            const uint16_t *emb = ctx->cp_codec_emb_bf16[g]
+                                                  + (int64_t)code_g * h;
+                            qwen_bf16_accum_f32(dst, emb, h);
+                        }
+                    }
+                }
+                pos++;
+            }
+            for (int i = stream_codec_len; i < stream_text_len; i++) {
+                float *dst = ctx->stream_trailing_text
+                           + (size_t)(i - stream_codec_len) * h;
+                if (i < ref_text_token_len) {
+                    qwen_stream_add_text_token(ctx, ref_text_tokens[i], dst);
+                } else if (i < ref_text_token_len + text_content_len) {
+                    qwen_stream_add_text_token(ctx,
+                                               all_tokens[role_len + (i - ref_text_token_len)], dst);
+                } else {
+                    memcpy(dst, tts_eos_embed, (size_t)h * sizeof(float));
+                }
+            }
+        } else {
+            /* Official non-ICL streaming layout: first text token + codec
+             * BOS are prefetched, then the remaining text and tts_eos are
+             * supplied alongside successive generated codec frames. */
+            float *dst = input_embeds + (int64_t)pos * h;
+            qwen_stream_add_text_token(ctx, all_tokens[role_len], dst);
+            for (int j = 0; j < h; j++) dst[j] += codec_bos_embed[j];
+            pos++;
+            for (int i = 1; i < stream_text_len; i++) {
+                dst = ctx->stream_trailing_text + (size_t)(i - 1) * h;
+                if (i < text_content_len)
+                    qwen_stream_add_text_token(ctx, all_tokens[role_len + i], dst);
+                else
+                    memcpy(dst, tts_eos_embed, (size_t)h * sizeof(float));
+            }
+        }
+    } else if (icl_mode) {
         for (int i = 0; i < sec3_len; i++) {
             float *dst = input_embeds + (int64_t)pos * h;
             if (i < ref_text_token_len) {
@@ -1344,6 +1467,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(codec_pad_embed);
     free(codec_bos_embed);
 
+    ctx->stream_layout_prefill_len = prefill_len;
+
     if (!ctx->silent) {
         if (ctx->voice_clone)
             fprintf(stderr, "Voice clone: %s (x-vector%s)\n",
@@ -1351,7 +1476,12 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     ctx->xvector_only ? " only" : " + ICL");
         else
             fprintf(stderr, "Speaker: %d, Language: %d\n", ctx->speaker_id, ctx->language_id);
-        if (icl_mode)
+        if (ctx->stream_layout_active)
+            fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, "
+                    "stream_common=%d, trailing_text=%d)\n",
+                    prefill_len, inst_len, role_len, sec2_len,
+                    stream_codec_len, ctx->stream_trailing_len);
+        else if (icl_mode)
             fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, "
                     "icl_text=%d, icl_codes=%d)\n",
                     prefill_len, inst_len, role_len, sec2_len, sec3_len, sec4_len);
@@ -1403,6 +1533,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "Error: prompt too long (%d tokens > RoPE cache %d); shorten the text.\n",
                 prefill_len, ctx->rope_cache_len);
         free(input_embeds);
+        qwen_stream_trailing_clear(ctx);
         return -1;
     }
 
@@ -1412,14 +1543,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             float *dummy_hidden = (float *)malloc(h * sizeof(float));
             for (int t = delta_start; t < prefill_len; t++) {
                 if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
-                    free(input_embeds); free(dummy_hidden);
+                    free(input_embeds); free(dummy_hidden); qwen_stream_trailing_clear(ctx);
                     return -1;
                 }
             }
             free(dummy_hidden);
         } else {
             if (qwen_talker_prefill(ctx, input_embeds, prefill_len) != 0) {
-                free(input_embeds);
+                free(input_embeds); qwen_stream_trailing_clear(ctx);
                 return -1;
             }
         }
@@ -1686,7 +1817,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             }
         }
 
-        for (int j = 0; j < h; j++) step_embed[j] += tts_pad_embed[j];
+        if (ctx->stream_layout_active && frame < ctx->stream_trailing_len) {
+            const float *tail = ctx->stream_trailing_text + (size_t)frame * h;
+            for (int j = 0; j < h; j++) step_embed[j] += tail[j];
+            ctx->stream_trailing_pos = frame + 1;
+        } else {
+            for (int j = 0; j < h; j++) step_embed[j] += tts_pad_embed[j];
+        }
         t_embed_total += time_ms() - t_embed_start;
 
         if (ctx->debug && frame < 2) {
@@ -1710,6 +1847,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
             qwen_blas_set_threads(qwen_get_threads());
             qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
+            qwen_stream_trailing_clear(ctx);
             return -1;
         }
         t_talker_step_total += time_ms() - t_step_start;
@@ -1744,6 +1882,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         qwen_blas_set_threads(qwen_get_threads());
         qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
         *out_samples = NULL; *out_n_samples = 0;
+        qwen_stream_trailing_clear(ctx);
         return 0;
     }
 
@@ -1787,6 +1926,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     ttfa_ms, dt_state.chunk_frames);
     }
 
+    qwen_stream_trailing_clear(ctx);
     qwen_costmap_request_done();
     return 0;
 }
@@ -1845,6 +1985,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
 
         int *prompt_len = (int *)calloc(B, sizeof(int));
         int *tcl = (int *)calloc(B, sizeof(int));
+        float **stream_tail = (float **)calloc(B, sizeof(float *));
+        int *stream_tail_len = (int *)calloc(B, sizeof(int));
         float *seed_hidden = (float *)malloc((size_t)B * h * sizeof(float));
         uint16_t **tk = (uint16_t **)calloc(B, sizeof(uint16_t *));
         uint16_t **tv = (uint16_t **)calloc(B, sizeof(uint16_t *));
@@ -1854,6 +1996,9 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
             ctx->prev_prefill_len = 0;
             if (qwen_tts_generate(ctx, chunks[g0 + b], NULL, NULL) != 0) { ok = 0; break; }
             int pl = ctx->kv_len; prompt_len[b] = pl; tcl[b] = ctx->bg_text_content_len;
+            stream_tail[b] = ctx->stream_trailing_text;
+            stream_tail_len[b] = ctx->stream_trailing_len;
+            ctx->stream_trailing_text = NULL; ctx->stream_trailing_len = 0; ctx->stream_trailing_pos = 0;
             qwen_rms_norm(seed_hidden + (size_t)b * h, ctx->dec_x, ctx->talker_norm, 1, h, eps);
             size_t bytes = (size_t)num_layers * pl * kvd * sizeof(uint16_t);
             tk[b] = (uint16_t *)malloc(bytes); tv[b] = (uint16_t *)malloc(bytes);
@@ -1869,6 +2014,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
         ctx->prefill_only = 0;
         if (!ok) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden); free(out);
             return -1;
         }
@@ -1878,6 +2025,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
         if (bb && getenv("QWEN_BATCH_FORCE_MATVEC")) bb->force_matvec = 1;
         if (!bb) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden); free(out);
             return -1;
         }
@@ -1948,7 +2097,12 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                     if (ctx->cp_codec_emb_bf16[g] && cg >= 0 && cg < cb)
                         qwen_bf16_accum_f32(se, ctx->cp_codec_emb_bf16[g] + (size_t)cg * h, h);
                 }
-                for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                if (stream_tail[b] && frame < stream_tail_len[b]) {
+                    const float *tail = stream_tail[b] + (size_t)frame * h;
+                    for (int j = 0; j < h; j++) se[j] += tail[j];
+                } else {
+                    for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                }
             }
 
             if (qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, active, last_hidden) != 0) break;
@@ -1969,6 +2123,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
         free(pos); free(active); free(nprev); free(chframes); free(prev_tok); free(chcodes);
         free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
         free(prompt_len); free(tcl); free(seed_hidden);
+        for (int b = 0; b < B; b++) free(stream_tail[b]);
+        free(stream_tail); free(stream_tail_len);
         qwen_batch_free(bb);
     }
 
@@ -2001,6 +2157,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
 
         int *prompt_len = (int *)calloc(B, sizeof(int));
         int *tcl = (int *)calloc(B, sizeof(int));
+        float **stream_tail = (float **)calloc(B, sizeof(float *));
+        int *stream_tail_len = (int *)calloc(B, sizeof(int));
         float *seed_hidden = (float *)malloc((size_t)B * h * sizeof(float));
         uint16_t **tk = (uint16_t **)calloc(B, sizeof(uint16_t *));
         uint16_t **tv = (uint16_t **)calloc(B, sizeof(uint16_t *));
@@ -2020,6 +2178,9 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
             ctx->prev_prefill_len = 0;
             if (qwen_tts_generate(ctx, rq->text, NULL, NULL) != 0) { ok = 0; break; }
             int pl = ctx->kv_len; prompt_len[b] = pl; tcl[b] = ctx->bg_text_content_len;
+            stream_tail[b] = ctx->stream_trailing_text;
+            stream_tail_len[b] = ctx->stream_trailing_len;
+            ctx->stream_trailing_text = NULL; ctx->stream_trailing_len = 0; ctx->stream_trailing_pos = 0;
             qwen_rms_norm(seed_hidden + (size_t)b * h, ctx->dec_x, ctx->talker_norm, 1, h, eps);
             p_temp[b] = rq->temperature; p_topk[b] = rq->top_k; p_topp[b] = rq->top_p;
             p_rep[b]  = rq->rep_penalty; p_gw[b] = rq->greedy_warmup; rng[b] = rq->seed;
@@ -2038,6 +2199,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
         ctx->speaker_id = sv_spk; ctx->language_id = sv_lang;
         if (!ok) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden);
             free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
             return -1;
@@ -2048,6 +2211,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
         if (bb && getenv("QWEN_BATCH_FORCE_MATVEC")) bb->force_matvec = 1;
         if (!bb) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden);
             free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
             return -1;
@@ -2121,7 +2286,12 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
                     if (ctx->cp_codec_emb_bf16[g] && cg >= 0 && cg < cb)
                         qwen_bf16_accum_f32(se, ctx->cp_codec_emb_bf16[g] + (size_t)cg * h, h);
                 }
-                for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                if (stream_tail[b] && frame < stream_tail_len[b]) {
+                    const float *tail = stream_tail[b] + (size_t)frame * h;
+                    for (int j = 0; j < h; j++) se[j] += tail[j];
+                } else {
+                    for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                }
             }
 
             if (qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, active, last_hidden) != 0) break;
@@ -2143,6 +2313,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
         free(pos); free(active); free(nprev); free(chframes); free(prev_tok); free(chcodes);
         free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
         free(prompt_len); free(tcl); free(seed_hidden);
+        for (int b = 0; b < B; b++) free(stream_tail[b]);
+        free(stream_tail); free(stream_tail_len);
         free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
         qwen_batch_free(bb);
     }
@@ -2159,6 +2331,8 @@ typedef struct prefilled_s {
     int tcl;
     uint16_t *kv_k, *kv_v;
     float *last_hidden;
+    float *stream_trailing_text;
+    int stream_trailing_len;
     double ts_admitted;
     double ts_prefill_start;
     double ts_prefill_done;
@@ -2212,7 +2386,8 @@ static void pfq_shutdown(prefill_q_t *q) {
 }
 static void prefilled_free(prefilled_t *p) {
     if (!p) return;
-    free(p->kv_k); free(p->kv_v); free(p->last_hidden); free(p);
+    free(p->kv_k); free(p->kv_v); free(p->last_hidden);
+    free(p->stream_trailing_text); free(p);
 }
 
 typedef struct {
@@ -2268,8 +2443,11 @@ static void *prefill_helper_main(void *arg) {
         pf->prefill_only = 0;
         int pl = pf->kv_len;
         prefilled_t *p = (prefilled_t *)calloc(1, sizeof(prefilled_t));
-        if (!p) { a->sink->on_done(a->sink->ud, tag, NULL, 0); continue; }
+        if (!p) { qwen_stream_trailing_clear(pf); a->sink->on_done(a->sink->ud, tag, NULL, 0); continue; }
         p->tag = tag; p->req = req;
+        p->stream_trailing_text = pf->stream_trailing_text;
+        p->stream_trailing_len = pf->stream_trailing_len;
+        pf->stream_trailing_text = NULL; pf->stream_trailing_len = 0; pf->stream_trailing_pos = 0;
         p->reject_reason = (prc != 0) ? "prefill failed"
                          : (pl <= 0)  ? "prefill produced nothing"
                          : (pl > a->MAXPROMPT) ? "prompt too long for a batch slot"
@@ -2521,6 +2699,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     void **tag = (void **)calloc(B, sizeof(void *));
     int *pos = (int *)calloc(B, sizeof(int));
     int *tcl = (int *)calloc(B, sizeof(int));
+    float **stream_tail = (float **)calloc(B, sizeof(float *));
+    int *stream_tail_len = (int *)calloc(B, sizeof(int));
+    int *stream_tail_pos = (int *)calloc(B, sizeof(int));
     float *p_temp = (float *)malloc((size_t)B * sizeof(float));
     int *p_topk = (int *)malloc((size_t)B * sizeof(int));
     float *p_topp = (float *)malloc((size_t)B * sizeof(float));
@@ -2710,6 +2891,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     #define PF_END(acc) do { if (prof_on) (acc) += time_ms() - pf_mark; } while (0)
 
     #define RELEASE_SLOT(b) do {                                                   \
+        free(stream_tail[b]); stream_tail[b] = NULL;                                \
+        stream_tail_len[b] = 0; stream_tail_pos[b] = 0;                             \
         active[b] = 0; tag[b] = NULL; n_active--;                                  \
     } while (0)
 
@@ -2834,6 +3017,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         p_temp[(b_)] = (req_).temperature; p_topk[(b_)] = (req_).top_k;                    \
         p_topp[(b_)] = (req_).top_p; p_rep[(b_)] = (req_).rep_penalty;                     \
         p_gw[(b_)] = (req_).greedy_warmup; rng[(b_)] = (req_).seed;                        \
+        stream_tail[(b_)] = ctx->stream_trailing_text;                                    \
+        stream_tail_len[(b_)] = ctx->stream_trailing_len;                                 \
+        stream_tail_pos[(b_)] = 0;                                                        \
+        ctx->stream_trailing_text = NULL; ctx->stream_trailing_len = 0;                   \
+        ctx->stream_trailing_pos = 0;                                                     \
         nprev[(b_)] = 0; chframes[(b_)] = 0; sframe[(b_)] = 0; decpos[(b_)] = 0;           \
         if (rq_trace) { rq_seed[(b_)] = (req_).seed; rq_tok[(b_)] = (pl_);                 \
                         rq_t0[(b_)] = time_ms(); }                                         \
@@ -2885,7 +3073,13 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             if (ctx->cp_codec_emb_bf16[_g] && _cg >= 0 && _cg < cb)                          \
                 qwen_bf16_accum_f32(_se, ctx->cp_codec_emb_bf16[_g] + (size_t)_cg * h, h);   \
         }                                                                                    \
-        for (int _j = 0; _j < h; _j++) _se[_j] += tts_pad[_j];                               \
+        if (stream_tail[(b_)] && stream_tail_pos[(b_)] < stream_tail_len[(b_)]) {            \
+            const float *_tail = stream_tail[(b_)] + (size_t)stream_tail_pos[(b_)] * h;       \
+            for (int _j = 0; _j < h; _j++) _se[_j] += _tail[_j];                               \
+            stream_tail_pos[(b_)]++;                                                          \
+        } else {                                                                               \
+            for (int _j = 0; _j < h; _j++) _se[_j] += tts_pad[_j];                             \
+        }                                                                                     \
     } while (0)
 
     /* The helper submits from its own thread beside the frame loop, so it needs concurrent
@@ -2974,6 +3168,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 memcpy(last_hidden + (size_t)b * h, p->last_hidden, (size_t)h * sizeof(float));
                 tcl[b] = p->tcl; pos[b] = p->pl;
+                stream_tail[b] = p->stream_trailing_text;
+                stream_tail_len[b] = p->stream_trailing_len;
+                stream_tail_pos[b] = 0;
+                p->stream_trailing_text = NULL; p->stream_trailing_len = 0;
 #ifdef QWEN_HAVE_CUDA
                 if (cuda_batch) qwen_cuda_talker_batch_upload_slot(g_cuda_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
 #endif
@@ -3021,6 +3219,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                                                    : "prefill failed";
                 if (sink->on_reject) sink->on_reject(sink->ud, t, why);
                 else sink->on_done(sink->ud, t, NULL, 0);
+                qwen_stream_trailing_clear(ctx);
                 continue;
             }
             ADMIT_INSTALL(b, req, t, pl);
@@ -3169,6 +3368,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                                                        : "prefill failed";
                     if (sink->on_reject) sink->on_reject(sink->ud, jt, why);
                     else sink->on_done(sink->ud, jt, NULL, 0);
+                    qwen_stream_trailing_clear(ctx);
                     m1_rejected++;
                     if (prof_on) { double _d = time_ms() - _mf0; pf_m1 += _d; pf_mark += _d; }
                     break;
@@ -3300,6 +3500,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         if (pf_rc != 0) {
             for (int b = 0; b < B; b++) if (active[b]) {
                 if (want_stream[b]) { qwen_sd_stream_free(&sstate[b]); want_stream[b] = 0; }
+                free(stream_tail[b]); stream_tail[b] = NULL;
                 sink->on_done(sink->ud, tag[b], NULL, 0); active[b] = 0; tag[b] = NULL; n_active--;
             }
             break;
@@ -3412,9 +3613,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         qwen_tts_free_clone(pf_ctx);
     }
 
-    for (int b = 0; b < B; b++) { if (active[b] && (want_stream[b] || amort)) qwen_sd_stream_free(&sstate[b]); free(prev_tok[b]); free(chcodes[b]); free(acc_aud[b]); }
+    for (int b = 0; b < B; b++) { if (active[b] && (want_stream[b] || amort)) qwen_sd_stream_free(&sstate[b]); free(stream_tail[b]); free(prev_tok[b]); free(chcodes[b]); free(acc_aud[b]); }
     free(want_stream); free(sstate); free(acc_aud); free(acc_n); free(acc_cap);
-    free(active); free(tag); free(pos); free(tcl);
+    free(active); free(tag); free(pos); free(tcl); free(stream_tail); free(stream_tail_len); free(stream_tail_pos);
     free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
     free(nprev); free(chframes); free(sframe); free(decpos); free(prev_tok); free(chcodes);
     free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
