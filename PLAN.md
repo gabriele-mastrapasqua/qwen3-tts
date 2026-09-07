@@ -97,8 +97,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       path+census gate pass for short/medium/long text; it remains default-off pending
       ICL/clone, quality and prefill-scaling gates. Detail:
       `.work/sl1-known-text-stream-layout-20260907.md`.
-- [ ] LS-1 Credit-gated per-stream lead/deadline state: playable audio lead is the currency;
-      never suppress first audio; EDF order only among eligible work.
+- [x] LS-1 Minimal credit-gate skeleton implemented and falsified at C3/C4 behind
+      `QWEN_STREAM_LEAD_GATE=1`: first audio remains eligible, but hard suppression at a
+      250 ms target parks ~95.8% of checks, lowers useful worker work and does not improve
+      stall rates. Keep default-off; do not add EDF/LS-2 on this realization without a new
+      mechanism. Detail: `.work/playback-lead-gate-fc-20260907.md`.
 - [x] LS-3' Small complete decoder calls at safe existing boundaries; q1/q2/q4/q8 floor
       established in a Tier-A C3/C4 screen. q1 is rejected; q2/q4/q8 remain policy
       candidates and no intra-call preemption is claimed. Detail:
