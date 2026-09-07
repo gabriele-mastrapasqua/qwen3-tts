@@ -110,7 +110,9 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 - [ ] LS-2 Lead-feedback steady-state quantum: first chunk remains one frame, bounded lead
       window, explicit minimum efficient quantum; q8 remains the upper control until proven.
 - [ ] PF-1 Residual fixed-prompt chunked prefill only where SL-1 leaves a genuinely long
-      prefix (ICL/reference or retained non-streaming modes); do not confuse it with live text.
+      prefix (ICL/reference or retained non-streaming modes); the existing cloned-context
+      helper/LOW falsifier is rejected as a serving substitute. Detail:
+      `.work/prefill-helper-c34-20260907.md`; do not confuse it with live text.
 - [ ] LS-4 Deadline-aware admission: protect established streams and reject overload rather
       than queue indefinitely.
 
