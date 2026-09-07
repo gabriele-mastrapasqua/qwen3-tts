@@ -25,7 +25,9 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   missed in one window and per-class p95 was under-sampled. The flag remains default-off.
 - Post-C4 capacity screen: C5 is the first NOT STREAMABLE point under the complete
   envelope (STREAM p95 0.852 but TTFA p95 4.44 s and safe-play-start p95 4.60 s); C6
-  shows the same admission/startup failure. Do not advertise either as realtime capacity.
+  shows the same failure. Child queue/pre-service traces stayed below about 200 ms;
+  the multi-second tail is primarily prefork parent accept/backlog, before child `t_recv`.
+  Do not advertise either as realtime capacity. Detail: `.work/p4-prefork-admission-bound-20260907.md`.
 - CT-1 confirms prebuffer follows quantum (q8 ~0.7 s p95 in short SOAK; q32 ~2.5 s)
   while RTF changes less. q32 is rejected as a production streaming policy.
 - Decoder MACs already run on real AMX with wide N; its wall is glue (im2col, quantization,
@@ -123,7 +125,9 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       helper/LOW falsifier is rejected as a serving substitute. Detail:
       `.work/prefill-helper-c34-20260907.md`; do not confuse it with live text.
 - [ ] LS-4 Deadline-aware admission: protect established streams and reject overload rather
-      than queue indefinitely.
+      than queue indefinitely. A bounded prefork sub-result now makes explicit
+      `--max-queue 0` fail fast with parent-side 503; lead-aware admission remains open.
+      Detail: `.work/p4-prefork-admission-bound-20260907.md`.
 
 ### P4 Overlap and decoder structural cost
 

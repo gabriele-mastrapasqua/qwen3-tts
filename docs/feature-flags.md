@@ -109,7 +109,7 @@ QWEN_STREAM_DECODE_CHUNK_BUSY=0 \
 | `--prefork 2` | two worker processes, each pinned to 8 contiguous CPUs, weights shared copy-on-write | one process shares one pool across every request; measured worse for first audio here, and the sweep is what said so |
 | `--prefork-threads 8` | pool size inside each slice | the pool is sized from the machine, not from the slice, and threads cross the pinning |
 | `--batch-size 8` | per-worker in-flight cap **and** the continuous-batching scheduler | at `1` each worker serves one request at a time and never reaches the GEMM path, so concurrency turns into queueing |
-| `--max-queue 1` | one request may wait beyond the slots | unbounded waiting: a caller sees latency instead of a refusal, which is the worse failure |
+| `--max-queue 1` | one request may wait beyond the slots; with prefork, `--max-queue 0` keeps the parent accepting a full listener and returns immediate `503` instead of hiding the wait in the kernel backlog | unbounded waiting: a caller sees latency instead of a refusal, which is the worse failure |
 | `--queue-timeout-ms 0` | no deadline on that wait | — (0 is the deliberate choice here, recorded so a later change is visible) |
 | `--max-request-seconds 60` | generation cap per request, from which a text-length limit is derived | one pathological text can hold a slot for minutes |
 | `OPENBLAS_THREAD_TIMEOUT=1` | OpenBLAS parks instead of spinning | the two pools fight for the same cores: 108 ms against 66 ms for first audio at C=1, bimodally |
