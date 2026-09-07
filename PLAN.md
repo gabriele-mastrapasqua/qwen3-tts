@@ -120,8 +120,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ### P4 Overlap and decoder structural cost
 
-- [ ] Test a same-pool decoder consumer first; promote only if playback and throughput both
-      improve. Instrument operation calls, actual pool submissions and pool wait separately.
+- [x] Same-pool decoder consumer tested and rejected: `QWEN_DECODER_THREAD=1` on the
+      engine pool caused C4 STREAM_RTF p95 `0.847 -> 1.296`, TTFA p95 `174 -> 1126 ms`
+      and max-gap p95 `511 -> 1286 ms`; it observed `group=1` and did not preserve the
+      inline decoder batching path. Keep default-off; detail:
+      `.work/p4-same-pool-decoder-20260907.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as quality-gated and consider a strip executor only for proven
       small-call/intercept work.
