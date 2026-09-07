@@ -265,6 +265,9 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_SD_SGEMM_CENSUS` | off | diagnostic: prints every decoder SGEMM shape with its wall time (every 100 calls and at exit) |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |
+| `QWEN_SERVER_ASYNC_OUTPUT` | off | experimental stream transport isolation: a bounded per-stream PCM queue and detached writer keep inference callbacks off the socket; queue overflow/disconnect fails and closes the stream rather than dropping PCM silently |
+| `QWEN_STREAM_OUTPUT_MAX_BYTES` | 1048576 | byte cap for the experimental per-stream output queue; invalid values fall back to the 1 MiB default |
+| `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS` | 5000 | socket send timeout used by the experimental stream writer; a stalled reader is terminated after the timeout |
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
 | `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |

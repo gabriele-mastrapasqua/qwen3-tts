@@ -383,7 +383,11 @@ int qwen_compose_render_stream(qwen_tts_ctx_t *ctx, qwen_cspan_t *spans, int nsp
                 int pn = (int)(spans[i].pause_s * SR);
                 if (pn > 0) {
                     float *sil = (float *)calloc((size_t)pn, sizeof(float));
-                    if (sil) { cb(sil, pn, user); free(sil); }
+                    if (sil) {
+                        int stop = cb(sil, pn, user);
+                        free(sil);
+                        if (stop) return -2;
+                    }
                 }
             }
             if (!silent) fprintf(stderr, "  [pause %.2fs]\n", spans[i].pause_s);
@@ -394,12 +398,19 @@ int qwen_compose_render_stream(qwen_tts_ctx_t *ctx, qwen_cspan_t *spans, int nsp
             int pn = (int)(default_pause * SR);
             if (pn > 0) {
                 float *sil = (float *)calloc((size_t)pn, sizeof(float));
-                if (sil) { cb(sil, pn, user); free(sil); }
+                if (sil) {
+                    int stop = cb(sil, pn, user);
+                    free(sil);
+                    if (stop) return -2;
+                }
             }
         }
         float *seg = NULL; int seg_n = 0;
         if (synth_one_span(ctx, &spans[i], language, idx, silent, &seg, &seg_n) != 0) return -1;
-        if (seg_n > 0) cb(seg, seg_n, user);
+        if (seg_n > 0 && cb(seg, seg_n, user) != 0) {
+            free(seg);
+            return -2;
+        }
         free(seg);
         spoken++; idx++; last_spoken = 1;
     }

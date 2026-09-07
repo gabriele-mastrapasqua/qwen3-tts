@@ -36,6 +36,7 @@
 #define QWEN_HAVE_RDHUP 1
 #endif
 #include <sys/time.h>
+#include <time.h>
 #include <stdatomic.h>
 
 #if defined(__SANITIZE_ADDRESS__)
@@ -57,6 +58,15 @@
 #define QWEN_CHARS_PER_CAP_SECOND 30
 
 static void srv_conn_close(int fd);
+static void qwen_thread_name(const char *prefix);
+
+typedef struct stream_output stream_output_t;
+static int stream_output_enqueue(stream_output_t *out, const float *samples,
+                                 int n_samples, float gain);
+static stream_output_t *stream_output_start(int fd, unsigned int seed);
+static void stream_output_finish(stream_output_t *out);
+static void stream_output_release(stream_output_t *out);
+static int stream_output_failed(stream_output_t *out);
 
 static pthread_mutex_t g_synth_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -210,6 +220,7 @@ typedef struct {
     int fd;
     int total_samples;
     float volume;
+    stream_output_t *out;
 } stream_http_state_t;
 
 static int qwen_cancel_on_disconnect(void) {
@@ -231,7 +242,10 @@ static int write_all_or_gone(int fd, const void *buf, size_t n) {
     while (left > 0) {
         ssize_t w = write(fd, p, left);
         if (w > 0) { p += w; left -= (size_t)w; continue; }
-        if (w < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (w < 0 && errno == EINTR) continue;
+        /* A socket SO_SNDTIMEO expiry is reported as EAGAIN/EWOULDBLOCK.  Do not
+         * spin forever: the output owner turns it into a stream cancellation. */
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return -1;
         if (w < 0 && (errno == EPIPE || errno == ECONNRESET ||
                       errno == ENOTCONN || errno == EBADF)) return -1;
         return -1;
@@ -239,7 +253,7 @@ static int write_all_or_gone(int fd, const void *buf, size_t n) {
     return 0;
 }
 
-static void send_chunked_header(int fd) {
+static int send_chunked_header(int fd) {
     const char *header =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: audio/pcm\r\n"
@@ -250,11 +264,16 @@ static void send_chunked_header(int fd) {
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n"
         "\r\n";
-    write(fd, header, strlen(header));
+    return write_all_or_gone(fd, header, strlen(header));
 }
 
 static int stream_http_callback(const float *samples, int n_samples, void *userdata) {
     stream_http_state_t *st = (stream_http_state_t *)userdata;
+    if (st->out) {
+        int rc = stream_output_enqueue(st->out, samples, n_samples, st->volume);
+        if (rc == 0) st->total_samples += n_samples;
+        return rc;
+    }
     float g = st->volume;
     int16_t *pcm = (int16_t *)malloc(n_samples * sizeof(int16_t));
     for (int i = 0; i < n_samples; i++) {
@@ -274,12 +293,273 @@ static int stream_http_callback(const float *samples, int n_samples, void *userd
     return 0;
 }
 
-static void send_chunked_end(int fd) {
-    write(fd, "0\r\n\r\n", 5);
+static int send_chunked_end(int fd) {
+    return write_all_or_gone(fd, "0\r\n\r\n", 5);
 }
 
-static void compose_stream_emit(const float *pcm, int n, void *user) {
-    stream_http_callback(pcm, n, user);
+typedef struct stream_output_chunk {
+    int16_t *pcm;
+    int n_samples;
+    size_t bytes;
+    struct stream_output_chunk *next;
+} stream_output_chunk_t;
+
+struct stream_output {
+    int fd;
+    unsigned int seed;
+    size_t max_bytes;
+    int send_timeout_ms;
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+    stream_output_chunk_t *head;
+    stream_output_chunk_t *tail;
+    size_t queued_bytes;
+    size_t peak_bytes;
+    unsigned long enqueued_chunks;
+    unsigned long failed_enqueues;
+    int producer_done;
+    int failed;
+    int total_samples;
+    double enqueue_first_ms;
+    double write_attempt_ms;
+    double write_complete_ms;
+    _Atomic int refs;       /* producer + detached writer */
+};
+
+static double stream_output_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static int stream_output_enabled(void) {
+    const char *e = getenv("QWEN_SERVER_ASYNC_OUTPUT");
+    return e && e[0] && e[0] != '0';
+}
+
+static size_t stream_output_max_bytes(void) {
+    const char *e = getenv("QWEN_STREAM_OUTPUT_MAX_BYTES");
+    if (!e || !e[0]) return (size_t)1 << 20;
+    char *end = NULL;
+    unsigned long long v = strtoull(e, &end, 10);
+    if (end == e || *end != '\0' || v < 4096 || v > ((unsigned long long)1 << 30))
+        return (size_t)1 << 20;
+    return (size_t)v;
+}
+
+static int stream_output_timeout_ms(void) {
+    const char *e = getenv("QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS");
+    if (!e || !e[0]) return 5000;
+    char *end = NULL;
+    long v = strtol(e, &end, 10);
+    if (end == e || *end != '\0' || v < 1 || v > 120000) return 5000;
+    return (int)v;
+}
+
+static void stream_output_free_chunks_locked(stream_output_t *out) {
+    stream_output_chunk_t *p = out->head;
+    while (p) {
+        stream_output_chunk_t *next = p->next;
+        free(p->pcm);
+        free(p);
+        p = next;
+    }
+    out->head = out->tail = NULL;
+    out->queued_bytes = 0;
+}
+
+static void stream_output_release(stream_output_t *out) {
+    if (!out || atomic_fetch_sub(&out->refs, 1) != 1) return;
+    pthread_cond_destroy(&out->cv);
+    pthread_mutex_destroy(&out->mtx);
+    free(out);
+}
+
+static int stream_output_send_pcm(stream_output_t *out,
+                                  const int16_t *pcm, int n_samples) {
+    int data_len = n_samples * (int)sizeof(int16_t);
+    char ch[32];
+    int chlen = snprintf(ch, sizeof ch, "%x\r\n", data_len);
+    if (write_all_or_gone(out->fd, ch, (size_t)chlen) < 0) return -1;
+    if (write_all_or_gone(out->fd, pcm, (size_t)data_len) < 0) return -1;
+    return write_all_or_gone(out->fd, "\r\n", 2);
+}
+
+static void stream_output_mark_failed(stream_output_t *out) {
+    pthread_mutex_lock(&out->mtx);
+    out->failed = 1;
+    out->producer_done = 1;
+    stream_output_free_chunks_locked(out);
+    pthread_cond_broadcast(&out->cv);
+    pthread_mutex_unlock(&out->mtx);
+}
+
+static void *stream_output_writer_main(void *arg) {
+    stream_output_t *out = (stream_output_t *)arg;
+    qwen_thread_name("srv-output");
+
+    pthread_mutex_lock(&out->mtx);
+    out->write_attempt_ms = stream_output_now_ms();
+    pthread_mutex_unlock(&out->mtx);
+    if (send_chunked_header(out->fd) < 0) {
+        stream_output_mark_failed(out);
+    } else {
+        for (;;) {
+            pthread_mutex_lock(&out->mtx);
+            while (!out->head && !out->producer_done)
+                pthread_cond_wait(&out->cv, &out->mtx);
+            stream_output_chunk_t *chunk = out->head;
+            if (chunk) {
+                out->head = chunk->next;
+                if (!out->head) out->tail = NULL;
+                out->queued_bytes -= chunk->bytes;
+            }
+            int done = out->producer_done && !chunk;
+            int failed = out->failed;
+            pthread_mutex_unlock(&out->mtx);
+
+            if (!chunk) {
+                if (done || failed) break;
+                continue;
+            }
+            int rc = failed ? -1 : stream_output_send_pcm(out, chunk->pcm, chunk->n_samples);
+            if (rc < 0) {
+                free(chunk->pcm); free(chunk);
+                stream_output_mark_failed(out);
+                break;
+            }
+            pthread_mutex_lock(&out->mtx);
+            out->total_samples += chunk->n_samples;
+            if (out->write_complete_ms == 0.0)
+                out->write_complete_ms = stream_output_now_ms();
+            pthread_mutex_unlock(&out->mtx);
+            free(chunk->pcm); free(chunk);
+        }
+    }
+
+    pthread_mutex_lock(&out->mtx);
+    int failed = out->failed;
+    if (failed) stream_output_free_chunks_locked(out);
+    pthread_mutex_unlock(&out->mtx);
+    int end_rc = 0;
+    if (!failed) end_rc = send_chunked_end(out->fd);
+    if (end_rc < 0) {
+        pthread_mutex_lock(&out->mtx);
+        out->failed = 1;
+        pthread_mutex_unlock(&out->mtx);
+    }
+    srv_conn_close(out->fd);
+
+    pthread_mutex_lock(&out->mtx);
+    fprintf(stderr, "[OUT] v=1 pid=%d seed=%u async=1 queued_cap_bytes=%zu "
+                    "peak_bytes=%zu enqueued_chunks=%lu failed_enqueues=%lu "
+                    "samples=%d failed=%d enqueue_first_ms=%.3f "
+                    "write_attempt_ms=%.3f write_complete_ms=%.3f "
+                    "send_timeout_ms=%d\n",
+            (int)getpid(), out->seed, out->max_bytes, out->peak_bytes,
+            out->enqueued_chunks, out->failed_enqueues, out->total_samples,
+            out->failed, out->enqueue_first_ms, out->write_attempt_ms,
+            out->write_complete_ms, out->send_timeout_ms);
+    pthread_mutex_unlock(&out->mtx);
+    stream_output_release(out); /* detached writer reference */
+    return NULL;
+}
+
+static stream_output_t *stream_output_start(int fd, unsigned int seed) {
+    stream_output_t *out = (stream_output_t *)calloc(1, sizeof(*out));
+    if (!out) return NULL;
+    out->fd = fd;
+    out->seed = seed;
+    out->max_bytes = stream_output_max_bytes();
+    out->send_timeout_ms = stream_output_timeout_ms();
+    atomic_init(&out->refs, 2);
+    pthread_mutex_init(&out->mtx, NULL);
+    pthread_cond_init(&out->cv, NULL);
+    struct timeval tv = {
+        .tv_sec = out->send_timeout_ms / 1000,
+        .tv_usec = (out->send_timeout_ms % 1000) * 1000
+    };
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    pthread_t thr;
+    if (pthread_create(&thr, NULL, stream_output_writer_main, out) != 0) {
+        pthread_cond_destroy(&out->cv);
+        pthread_mutex_destroy(&out->mtx);
+        free(out);
+        return NULL;
+    }
+    pthread_detach(thr);
+    return out;
+}
+
+static int stream_output_enqueue(stream_output_t *out, const float *samples,
+                                  int n_samples, float gain) {
+    if (!out || !samples || n_samples <= 0) return -1;
+    stream_output_chunk_t *chunk = (stream_output_chunk_t *)calloc(1, sizeof(*chunk));
+    if (!chunk) {
+        stream_output_mark_failed(out);
+        pthread_mutex_lock(&out->mtx);
+        out->failed_enqueues++;
+        pthread_mutex_unlock(&out->mtx);
+        return -1;
+    }
+    chunk->n_samples = n_samples;
+    chunk->bytes = (size_t)n_samples * sizeof(int16_t);
+    chunk->pcm = (int16_t *)malloc(chunk->bytes);
+    if (!chunk->pcm) {
+        free(chunk);
+        stream_output_mark_failed(out);
+        pthread_mutex_lock(&out->mtx);
+        out->failed_enqueues++;
+        pthread_mutex_unlock(&out->mtx);
+        return -1;
+    }
+    for (int i = 0; i < n_samples; i++) {
+        float s = samples[i] * gain;
+        if (s < -1.0f) s = -1.0f;
+        if (s > 1.0f) s = 1.0f;
+        chunk->pcm[i] = (int16_t)(s * 32767);
+    }
+
+    pthread_mutex_lock(&out->mtx);
+    if (out->failed || out->producer_done ||
+        chunk->bytes > out->max_bytes || out->queued_bytes > out->max_bytes - chunk->bytes) {
+        out->failed_enqueues++;
+        out->failed = 1;
+        out->producer_done = 1;
+        pthread_cond_broadcast(&out->cv);
+        pthread_mutex_unlock(&out->mtx);
+        free(chunk->pcm); free(chunk);
+        return -1;
+    }
+    if (out->tail) out->tail->next = chunk; else out->head = chunk;
+    out->tail = chunk;
+    out->queued_bytes += chunk->bytes;
+    if (out->queued_bytes > out->peak_bytes) out->peak_bytes = out->queued_bytes;
+    out->enqueued_chunks++;
+    if (out->enqueue_first_ms == 0.0) out->enqueue_first_ms = stream_output_now_ms();
+    pthread_cond_signal(&out->cv);
+    pthread_mutex_unlock(&out->mtx);
+    return 0;
+}
+
+static void stream_output_finish(stream_output_t *out) {
+    if (!out) return;
+    pthread_mutex_lock(&out->mtx);
+    out->producer_done = 1;
+    pthread_cond_signal(&out->cv);
+    pthread_mutex_unlock(&out->mtx);
+}
+
+static int stream_output_failed(stream_output_t *out) {
+    if (!out) return 0;
+    pthread_mutex_lock(&out->mtx);
+    int failed = out->failed;
+    pthread_mutex_unlock(&out->mtx);
+    return failed;
+}
+
+static int compose_stream_emit(const float *pcm, int n, void *user) {
+    return stream_http_callback(pcm, n, user);
 }
 
 static void *build_wav(const float *samples, int n_samples, int *out_size) {
@@ -832,7 +1112,7 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
             wav_size, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs);
 }
 
-static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
+static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     float volume = 1.0f, rate = 1.0f;
     char *text = parse_tts_request(ctx, body, &volume, &rate);
     (void)rate;
@@ -840,19 +1120,20 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         send_error(fd, 400, g_req_err[0] ? g_req_err
                                          : "missing, empty, or oversized 'text' (max "
                                            QWEN_STR(MAX_TTS_TEXT) " characters)");
-        return;
+        return 0;
     }
     if (ctx->voice_design && ctx->config.hidden_size < 2048) {
         send_error(fd, 400, "voice_design requires the 1.7B VoiceDesign model");
         free(text);
-        return;
+        return 0;
     }
 
     fprintf(stderr, "[HTTP] TTS stream: \"%s\" (speaker=%d, lang=%d, seed=%u)\n",
             text, ctx->speaker_id, ctx->language_id, ctx->seed);
     double t0 = server_time_ms();
 
-    stream_http_state_t state = { .fd = fd, .total_samples = 0, .volume = volume };
+    stream_http_state_t state = { .fd = fd, .total_samples = 0, .volume = volume, .out = NULL };
+    state.out = stream_output_enabled() ? stream_output_start(fd, ctx->seed) : NULL;
     ctx->stream = 1;
     int chunk_frames = (int)json_extract_number(body, "chunk_frames", 10);
     if (chunk_frames < 2)   chunk_frames = 2;
@@ -860,7 +1141,7 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     ctx->stream_chunk_frames = chunk_frames;
     qwen_tts_set_audio_callback(ctx, stream_http_callback, &state);
 
-    send_chunked_header(fd);
+    if (!state.out) (void)send_chunked_header(fd);
 
     if (qwen_compose_has_markup(text)) {
         char *language = json_extract_string(body, "language");
@@ -883,7 +1164,13 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     free(text);
     }
 
-    send_chunked_end(fd);
+    int stream_fd_owned = state.out != NULL;
+    if (state.out) {
+        stream_output_finish(state.out);
+        stream_output_release(state.out); /* release the producer reference */
+    } else {
+        (void)send_chunked_end(fd);
+    }
 
     ctx->stream = 0;
     ctx->audio_cb = NULL;
@@ -892,6 +1179,7 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     float audio_secs = (float)state.total_samples / QWEN_TTS_SAMPLE_RATE;
     fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio) in %.1fs (RTF %.2f)\n",
             state.total_samples, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs);
+    return stream_fd_owned;
 }
 
 static int http_precheck(int fd, const char *method, const char *path,
@@ -944,6 +1232,7 @@ static int http_precheck(int fd, const char *method, const char *path,
 
 static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
                               struct sockaddr_in client_addr) {
+    int stream_fd_owned = 0;
     char *buf = (char *)malloc(1024 * 1024);
     if (!buf) { srv_conn_close(client_fd); return; }
     int total = read_request(client_fd, buf, 1024 * 1024);
@@ -987,7 +1276,7 @@ static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
     }
     else if (strcmp(path, "/v1/tts/stream") == 0 && strcmp(method, "POST") == 0) {
         if (g_serialize_synth) pthread_mutex_lock(&g_synth_lock);
-        handle_tts_stream(ctx, client_fd, body);
+        stream_fd_owned = handle_tts_stream(ctx, client_fd, body);
         if (g_serialize_synth) pthread_mutex_unlock(&g_synth_lock);
     }
     else if (strcmp(path, "/v1/audio/speech") == 0 && strcmp(method, "POST") == 0) {
@@ -1000,7 +1289,7 @@ static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
     }
 
     free(buf);
-    srv_conn_close(client_fd);
+    if (!stream_fd_owned) srv_conn_close(client_fd);
 }
 
 #define CONN_QUEUE_CAP 256
@@ -1216,6 +1505,7 @@ typedef struct batch_job {
     int kind;
     int is_stream;
     int header_sent;
+    stream_output_t *out;       /* detached writer owns the socket when non-NULL */
     char *text;
     char *body;
     qwen_batch_req_t req;
@@ -1486,6 +1776,10 @@ static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block)
     atomic_fetch_add(&g_srv.admitted, 1);
     j->t_admit = srv_now_ms();
     j->life_seed = j->req.seed;
+    if (j->is_stream && stream_output_enabled()) {
+        j->out = stream_output_start(j->fd, j->life_seed);
+        if (j->out) j->header_sent = 1; /* header is owned by the writer */
+    }
     *req = j->req;
     *tag = j;
     sc->admitted++;
@@ -1517,6 +1811,14 @@ static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
     batch_job_t *j = (batch_job_t *)tag;
     if (n_samples <= 0 || !samples) return;
     if (j->t_first == 0.0) j->t_first = srv_now_ms();
+    if (j->out) {
+        if (stream_output_enqueue(j->out, samples, n_samples, 1.0f) < 0) {
+            j->client_gone = 1;
+            j->cancelled = 1;
+            if (j->t_abort_detected == 0.0) j->t_abort_detected = srv_now_ms();
+        }
+        return;
+    }
     if (j->t_write_attempt == 0.0) j->t_write_attempt = srv_now_ms();
     if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
     if (!j->client_gone && peer_hung_up(j->fd)) {
@@ -1542,6 +1844,15 @@ static int sink_cancelled(void *ud, void *tag) {
                 j->life_seed, g_srv.max_request_ms);
     }
     if (j->timed_out) return 1;
+    if (j->cancelled || (j->out && stream_output_failed(j->out))) {
+        j->cancelled = 1;
+        if (!j->client_gone) {
+            j->client_gone = 1;
+            if (j->t_abort_detected == 0.0) j->t_abort_detected = srv_now_ms();
+        }
+        if (j->t_cancel_stop == 0.0) j->t_cancel_stop = srv_now_ms();
+        return 1;
+    }
     if (!qwen_cancel_on_disconnect()) return 0;
     if (!j->client_gone && j->fd >= 0 && peer_hung_up(j->fd)) {
         j->client_gone = 1; j->t_abort_detected = srv_now_ms();
@@ -1634,16 +1945,21 @@ static void qwen_life_emit(batch_job_t *j) {
 static void sink_on_reject(void *ud, void *tag, const char *reason) {
     sink_ctx_t *sc = (sink_ctx_t *)ud;
     batch_job_t *j = (batch_job_t *)tag;
+    int async_output = j->out != NULL;
     char m[220];
     snprintf(m, sizeof(m),
              "%s - this server accepts at most %d prompt tokens per request "
              "(roughly %ld characters); split the text or raise QWEN_BATCH_MAX_PROMPT",
              reason ? reason : "request rejected",
              qwen_tts_batch_max_prompt(), (long)qwen_tts_batch_max_prompt() * 7 / 2);
-    if (j->is_stream && j->header_sent) send_chunked_end(j->fd);
+    if (j->out) {
+        stream_output_finish(j->out);
+        stream_output_release(j->out);
+        j->out = NULL;
+    } else if (j->is_stream && j->header_sent) (void)send_chunked_end(j->fd);
     else send_api_error(j->fd, 400, m, "text");
     fprintf(stderr, "[server] rejected seed=%u: %s\n", j->life_seed, reason ? reason : "?");
-    srv_conn_close(j->fd);
+    if (!async_output) srv_conn_close(j->fd);
     job_free(j);
     sc->done++;
     atomic_fetch_add(&g_srv.done, 1);
@@ -1653,22 +1969,31 @@ static void sink_on_reject(void *ud, void *tag, const char *reason) {
 static void sink_on_done(void *ud, void *tag, float *samples, int n_samples) {
     sink_ctx_t *sc = (sink_ctx_t *)ud;
     batch_job_t *j = (batch_job_t *)tag;
-    qwen_life_emit(j);
-    if (j->is_stream) {
+    int async_output = j->is_stream && j->out != NULL;
+    if (async_output) {
+        stream_output_finish(j->out);
+        stream_output_release(j->out); /* writer drains and closes the socket */
+        j->out = NULL;
+        qwen_life_emit(j);
+        free(samples);
+    } else {
+        qwen_life_emit(j);
+        if (j->is_stream) {
         if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
-        send_chunked_end(j->fd);
-    } else if (j->timed_out && (!samples || n_samples <= 0)) {
+        (void)send_chunked_end(j->fd);
+        } else if (j->timed_out && (!samples || n_samples <= 0)) {
         char m[160];
         snprintf(m, sizeof(m),
                  "request exceeded the server's %d ms generation limit and was stopped",
                  g_srv.max_request_ms);
         send_error(j->fd, 503, m);
         free(samples);
-    } else {
-        respond_wav(j->fd, samples, n_samples);
-        free(samples);
+        } else {
+            respond_wav(j->fd, samples, n_samples);
+            free(samples);
+        }
     }
-    srv_conn_close(j->fd);
+    if (!async_output) srv_conn_close(j->fd);
     int streamed = j->is_stream;
     job_free(j);
     sc->done++;
@@ -1736,9 +2061,11 @@ static void *single_worker_main(void *arg) {
             continue;
         }
         sw->ctx->stream = 0; sw->ctx->audio_cb = NULL;
-        if (j->is_stream) handle_tts_stream(sw->ctx, j->fd, j->body);
+        int stream_fd_owned = 0;
+        if (j->is_stream) stream_fd_owned = handle_tts_stream(sw->ctx, j->fd, j->body);
         else handle_tts(sw->ctx, j->fd, j->body);
-        srv_conn_close(j->fd); job_free(j);
+        if (!stream_fd_owned) srv_conn_close(j->fd);
+        job_free(j);
     }
     return NULL;
 }
