@@ -375,7 +375,7 @@ static double sd_p6a, sd_p6b, sd_p6c;
 static int sd_up_warm;
 static double sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake,
               sd_up_resadd, sd_up_alloc, sd_up_final;
-static long long sd_direct_convt_calls, sd_direct_dwconv_calls;
+static long long sd_direct_convt_calls, sd_direct_dwconv_calls, sd_fused_residual_calls;
 static double sd_up_t0;
 extern long long qwen_snake_expf_calls, qwen_snake_vec_poly, qwen_snake_vec_libm,
                  qwen_snake_scalar_tail;
@@ -412,11 +412,11 @@ static double sd_c1_t0;
           fprintf(stderr, "[SDUP] v=2 pid=%d seq=%lld path=%s group=%d frames=%d warm=%d "     \
                   "convt=%.3f res1=%.3f res2=%.3f snake=%.3f resadd=%.3f "            \
                   "alloc=%.3f final=%.3f sum=%.3f conv_up=%.3f direct_convt=%lld "       \
-                  "direct_dwconv=%lld unacc=%.3f\n",                                  \
+                  "direct_dwconv=%lld fused_residual=%lld unacc=%.3f\n",                \
                   (int)getpid(), sd_call_seq, (path_), (group_), (frames_), sd_up_warm,            \
                   sd_up_convt, sd_up_res1, sd_up_res2, sd_up_snake, sd_up_resadd,     \
                   sd_up_alloc, sd_up_final, _us, sd_p6c, sd_direct_convt_calls,       \
-                  sd_direct_dwconv_calls, sd_p6c - _us);                               \
+                  sd_direct_dwconv_calls, sd_fused_residual_calls, sd_p6c - _us);     \
           fprintf(stderr, "[SDRES1] v=1 pid=%d group=%d frames=%d calls=%lld "             \
                   "ext=%.3f conv=%.3f cut=%.3f sum=%.3f res1=%.3f "                        \
                   "cols_kept=%lld cols_convolved=%lld strip_calls=%lld split_input_calls=%lld " \
@@ -2391,6 +2391,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
             const int fused_residual = cs_conv1d_fused_residual(
                 c2_out, signal, res, cur_ch, cur_ch, cur_len, 1, 1,
                 ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias);
+            if (_ph && fused_residual) sd_fused_residual_calls++;
             if (!fused_residual)
                 causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight,
                               ub->res_blocks[r].conv2_bias,
@@ -2483,6 +2484,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                sd_c1_ext = sd_c1_conv = sd_c1_cut = sd_c1_tail = 0.0;
                sd_c1_calls = sd_c1_cols_kept = sd_c1_cols_conv = sd_c1_strip_calls = 0;
                sd_c1_split_input_calls = 0;
+               sd_fused_residual_calls = 0;
                sd_c1_t0 = 0.0;
                qwen_snake_expf_calls = qwen_snake_vec_poly = qwen_snake_vec_libm =
                qwen_snake_scalar_tail = 0;
@@ -3693,6 +3695,7 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
                 const int fused_residual = rag_conv1d_fused_residual(
                     c2_out, signal, res, cur_ch, rg,
                     ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias);
+                if (_ph && fused_residual) sd_fused_residual_calls++;
                 if (!fused_residual)
                     rag_conv1d(c2_out, signal, cur_ch, cur_ch, rg, 1, 1,
                                ub->res_blocks[r].conv2_weight,
@@ -3776,7 +3779,10 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     const int  _ph    = sd_phase_on();
     const double _ph_call0 = _ph ? sd_ph_now() : 0.0;
     double _ph_p[6] = {0,0,0,0,0,0}, _ph_mark = 0.0;
-    if (_ph) sd_direct_convt_calls = 0;
+    if (_ph) {
+        sd_direct_convt_calls = 0;
+        sd_fused_residual_calls = 0;
+    }
     for (int i = 0; i < n_items; i++) { it[i].audio = NULL; it[i].n_samples = 0; it[i].rc = 0; }
 
     int *idx = (int *)calloc((size_t)(n_items > 0 ? n_items : 1), sizeof(int));
