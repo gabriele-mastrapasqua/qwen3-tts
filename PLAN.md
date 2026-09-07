@@ -57,25 +57,25 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 - [x] CT-4 Talker B1/B2 measured; EO-2 remains viable (B2/B1 step ratio ~1.10).
 - [x] CT-5 C2/C3/C4 playback envelope: GOOD / GOOD / MARGINAL.
 
-### P2 Small-quantum decoder — detail: `.work/professional-streaming-architecture.md` E3, E4
+### P2 Small-quantum decoder — CLOSED checkpoint: `.work/p2-checkpoint-20260907.md`
 
-- [ ] SQ-1 Streaming strip executor: strip → snake → conv1 → snake → conv2 → residual,
-      direct INT8 A preparation, packed transposed conv, few rendezvous. CT-2 = GO.
-- [ ] SQ-2 Remove fixed per-call work that grows badly as chunks shrink (materialized
-      im2col, separate quantization pass, per-tap BLAS scatter, per-call scratch, whole-chunk
-      rendezvous); default-off slices now include direct streaming/ragged ConvT and depthwise
-      copy elimination — details: `.work/p2-sq2-direct-convt-stream-20260907.md`,
-      `.work/p2-sq2-direct-convt-20260907.md`, `.work/p2-sq2-direct-dwconv-20260907.md`,
-      `.work/p2-sq2-direct-input-20260907.md` (input materialization removed, serving not
-      promoted); one-row direct gather/quantization was measured and rejected — detail:
-      `.work/p2-sq2-direct-quant-20260907.md`.
-- [ ] SQ-3 Report amx_dispatch_share, amx_matrix_mac_share, amx_addressable_mac_share and
-      amx_request_wall_share separately after each SQ change; never optimize task count.
+- [x] SQ-1 Bounded warm range slice: newly produced columns use direct INT8 A preparation
+      and persistent Design-D B packs in the serving reference. The complete
+      strip → snake → conv1 → snake → conv2 → residual executor is not implemented and
+      moves to AR-1 as an architectural candidate.
+- [x] SQ-2 Bounded fixed-cost audit: default-off slices cover direct streaming/ragged
+      ConvT, depthwise and warm-input preparation; fused residual remains a candidate.
+      Direct one-row gather/quantization and BLAS-C residual were rejected and reverted.
+      Details: `.work/p2-checkpoint-20260907.md` and the linked experiment addenda.
+- [x] SQ-3 Decoder AMX reachability and scoped accounting recorded; the four whole-request
+      quantities are not fabricated where the current evidence has no valid denominator.
+      Detail: `.work/p2-checkpoint-20260907.md`.
+
 
 ### P2 -> P3 gate: post-P2 architecture review — detail: `.work/post-p2-streaming-research-agenda.md`
 
-- [ ] AR-1 BLOCKED on the Codex P2 checkpoint (runtime committed, evidence addendum,
-      stable HEAD). Then a read-only architecture review of THAT HEAD: input-length-
+- [ ] AR-1 is READY after the frozen P2 checkpoint (runtime committed, evidence addendum,
+      stable HEAD). A separate read-only review of THAT HEAD must cover input-length-
       independent first play, incremental/preemptible prefill, bounded-window continuity,
       staged serving (vLLM-Omni mechanisms on CPU), decoupled pipeline, lead as the
       cross-stage currency, long-input qualification; one coherent target architecture
@@ -164,7 +164,7 @@ BF16/W4 as the P1 fix.
 
 ## Evidence
 
-`.work/professional-streaming-architecture.md` (cadence law, AMX accounting, candidates, envelope, historical classification); `.work/p1-cadence-truth-20260907.md`,
+`.work/professional-streaming-architecture.md` (cadence law, AMX accounting, candidates, envelope, historical classification); `.work/p2-checkpoint-20260907.md`, `.work/p1-cadence-truth-20260907.md`,
 `.work/p2-sq2-direct-convt-20260907.md`, `.work/p2-sq2-direct-dwconv-20260907.md`, `.work/p2-sq2-direct-input-20260907.md`, `.work/p2-sq2-direct-quant-20260907.md`, `.work/p2-input-length-scaling-20260907.md`, `.work/amx-c4-cross-request-20260907.md`,
 `.work/amx-c4-chunk-sweep-20260906.md`, `.work/amx-c4-ragged-threshold-20260906.md`,
 `.work/amx-native-epic.md`, `docs/reference-gcp-c4-standard-24.md`, `docs/runtime-map-c8a-c4.md`.
