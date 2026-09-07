@@ -23,6 +23,9 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   gate in all four windows (`STREAM_RTF` p50/p95 0.8304/0.8933, TTFA p95 526 ms,
   safe-play-start p95 917 ms, zero errors/rejects/timeouts); preferred `<=0.90` was
   missed in one window and per-class p95 was under-sampled. The flag remains default-off.
+- Post-C4 capacity screen: C5 is the first NOT STREAMABLE point under the complete
+  envelope (STREAM p95 0.852 but TTFA p95 4.44 s and safe-play-start p95 4.60 s); C6
+  shows the same admission/startup failure. Do not advertise either as realtime capacity.
 - CT-1 confirms prebuffer follows quantum (q8 ~0.7 s p95 in short SOAK; q32 ~2.5 s)
   while RTF changes less. q32 is rejected as a production streaming policy.
 - Decoder MACs already run on real AMX with wide N; its wall is glue (im2col, quantization,
@@ -133,7 +136,8 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       A/B in both per-slot and ragged forms, and a pooled five-minute mixed-bank C4 SOAK:
       short A/B STREAM_RTF p95 `0.831 -> 0.788`; SOAK p95 `0.8933` with zero errors and
       hard p95 `<1` in every window. Promote as an isolated **default-off** candidate;
-      per-class p95 remains under-sampled. Detail:
+      per-class p95 remains under-sampled. C5/C6 screens fail startup/safe-start despite
+      STREAM p95 <1. Detail:
       `.work/p4-fused-residual-20260907.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven

@@ -95,6 +95,26 @@ proof of audible starvation with a larger application buffer.  Per-class p95 dri
 not assessable because each class contributed only 5–7 samples per window, below the
 20-sample analyzer requirement.
 
+## Post-C4 capacity screen
+
+After the C4 SOAK, the same fused-on binary/configuration was screened sequentially at
+C5 and C6 on the full mixed bank, `2x6`, batch cap 2 and three true simultaneous waves.
+Both cells had zero errors, rejects and timeouts and 0% receive coalescing. The stream
+portion stayed below one, but admission/startup latency made both cells fail the complete
+interactive streaming envelope at the first step above C4:
+
+| C | TTFA p50/p95 ms | TTFB p50/p95 ms | STREAM_RTF p50/p95 | TOTAL_RTF p50/p95 | prebuffer p95 ms | safe start p95 ms | max gap p95 ms | stall@250 / @500 | req/s | B |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| 5 | 537 / 4441 | 112 / 4280 | 0.751 / 0.852 | 0.792 / 3.538 | 366 | 4604 | 562 | 7% / 0% | 0.32 | 2.38 |
+| 6 | 432 / 4774 | 108 / 4281 | 0.752 / 0.802 | 0.826 / 1.649 | 323 | 4959 | 676 | 22% / 0% | 0.35 | 2.44 |
+
+The high p95 TTFA/TTFB and multi-second safe-play-start are admission/queue effects in
+this synchronized wave, not a decoder arithmetic failure. They are sufficient to stop
+the capacity probe: C4 is the highest currently demonstrated GOOD operating point, while
+C5 is the first `NOT STREAMABLE` point under the complete envelope despite its internal
+steady-state STREAM_RTF. No topology, batch cap or scheduler knob was changed to rescue
+these cells.
+
 ## Verdict
 
 **PROMOTE AS AN ISOLATED, DEFAULT-OFF P4 CANDIDATE; C4 POOLED HARD GATE PASSED.**  The
@@ -119,7 +139,8 @@ conditions hold.
 
 ## Next action
 
-Use this candidate as the treatment for a longer C4 qualification arm.  If it holds the
-playback-aware envelope, retain the flag only if deployment policy explicitly selects it;
-otherwise leave the default conservative and move to a separately justified structural
-decoder-intercept hypothesis.
+Use this candidate as the C4 serving reference. C5/C6 are capacity-screen evidence only
+and must not be advertised as interactive concurrency because startup/safe-start fails.
+Retain the flag only if deployment policy explicitly selects it; otherwise leave the
+default conservative and move to a separately justified structural-intercept or admission
+hypothesis. Do not reopen the rejected P2 experiments merely to improve C5/C6.
