@@ -3258,6 +3258,8 @@ static int rag_conv1d_amx(float *out, const float *in, int in_ch, int out_ch,
         rs.fallback_ms = (double)atomic_load(&job.stats.fallback_ns) / 1e6;
         rs.build_bytes = atomic_load(&job.stats.build_bytes);
         rs.prepared_bytes = atomic_load(&job.stats.prepared_bytes);
+        rs.scratch_allocs = atomic_load(&job.stats.scratch_allocs);
+        rs.scratch_bytes = atomic_load(&job.stats.scratch_bytes);
         rs.items = r->n;
         rs.total_cols = total;
         rs.nc_le32 = atomic_load(&job.stats.nc_le32);
