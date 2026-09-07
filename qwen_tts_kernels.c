@@ -9878,23 +9878,44 @@ static void sd_conv1d_worker(void *vj) {
         for (int c = 0; c < nc; c++) {
             float *dst = colf + (size_t)c * K;
             int tt = j->input_offset + t0 + c - pad_left;
-            for (int ic = 0; ic < j->in_ch; ic++) {
-                float *dk = dst + (size_t)ic * j->kernel;
-                for (int kk = 0; kk < j->kernel; kk++) {
-                    int pos = tt + kk * j->dilation;
-                    if (pos < 0 || pos >= input_length) {
-                        dk[kk] = 0.0f;
-                    } else if (j->split_prefix) {
-                        if (pos < j->split_prefix_length)
-                            dk[kk] = j->split_prefix[(size_t)ic * j->split_prefix_length + pos];
-                        else if (pos - j->split_prefix_length < j->split_suffix_length)
-                            dk[kk] = j->split_suffix[(size_t)ic * j->split_suffix_length
-                                                     + pos - j->split_prefix_length];
-                        else
-                            dk[kk] = 0.0f;
-                    } else {
-                        const float *src = j->in + (size_t)ic * input_length;
-                        dk[kk] = src[pos];
+            if (j->split_prefix) {
+                /* Positions increase with kk.  Derive the source intervals once per
+                 * output column, then keep the inner channel/tap loops branch-free.
+                 * The first implementation selected prefix/suffix for every scalar;
+                 * that erased much of the copy saved by the split representation. */
+                int k_valid = tt < 0 ? (-tt + j->dilation - 1) / j->dilation : 0;
+                int k_prefix = tt < j->split_prefix_length
+                             ? (j->split_prefix_length - tt + j->dilation - 1) / j->dilation
+                             : 0;
+                int k_suffix = tt < input_length
+                             ? (input_length - tt + j->dilation - 1) / j->dilation
+                             : 0;
+                if (k_valid < 0) k_valid = 0;
+                if (k_valid > j->kernel) k_valid = j->kernel;
+                if (k_prefix < k_valid) k_prefix = k_valid;
+                if (k_prefix > j->kernel) k_prefix = j->kernel;
+                if (k_suffix < k_prefix) k_suffix = k_prefix;
+                if (k_suffix > j->kernel) k_suffix = j->kernel;
+                for (int ic = 0; ic < j->in_ch; ic++) {
+                    float *dk = dst + (size_t)ic * j->kernel;
+                    for (int kk = 0; kk < k_valid; kk++) dk[kk] = 0.0f;
+                    for (int kk = k_valid; kk < k_prefix; kk++) {
+                        int pos = tt + kk * j->dilation;
+                        dk[kk] = j->split_prefix[(size_t)ic * j->split_prefix_length + pos];
+                    }
+                    for (int kk = k_prefix; kk < k_suffix; kk++) {
+                        int pos = tt + kk * j->dilation - j->split_prefix_length;
+                        dk[kk] = j->split_suffix[(size_t)ic * j->split_suffix_length + pos];
+                    }
+                    for (int kk = k_suffix; kk < j->kernel; kk++) dk[kk] = 0.0f;
+                }
+            } else {
+                for (int ic = 0; ic < j->in_ch; ic++) {
+                    const float *src = j->in + (size_t)ic * input_length;
+                    float *dk = dst + (size_t)ic * j->kernel;
+                    for (int kk = 0; kk < j->kernel; kk++) {
+                        int pos = tt + kk * j->dilation;
+                        dk[kk] = (pos >= 0 && pos < input_length) ? src[pos] : 0.0f;
                     }
                 }
             }
