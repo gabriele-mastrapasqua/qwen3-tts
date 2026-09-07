@@ -99,8 +99,10 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       `.work/sl1-known-text-stream-layout-20260907.md`.
 - [ ] LS-1 Credit-gated per-stream lead/deadline state: playable audio lead is the currency;
       never suppress first audio; EDF order only among eligible work.
-- [ ] LS-3' Small complete decoder calls at safe existing boundaries; q1/q2/q4/q8 floor
-      established empirically. Do not claim intra-call preemption.
+- [x] LS-3' Small complete decoder calls at safe existing boundaries; q1/q2/q4/q8 floor
+      established in a Tier-A C3/C4 screen. q1 is rejected; q2/q4/q8 remain policy
+      candidates and no intra-call preemption is claimed. Detail:
+      `.work/decoder-quantum-floor-20260907.md`.
 - [ ] LS-2 Lead-feedback steady-state quantum: first chunk remains one frame, bounded lead
       window, explicit minimum efficient quantum; q8 remains the upper control until proven.
 - [ ] PF-1 Residual fixed-prompt chunked prefill only where SL-1 leaves a genuinely long
