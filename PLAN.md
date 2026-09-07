@@ -20,6 +20,7 @@ trade steady-state playback safety for headline TTFA.
       VNNI, AMX INT8 and AMX BF16 without locking the backend to one datatype.
 - [ ] AMX-3 Dataflow reformulation: implement only a dependency-proven grouping
       that creates useful matrix work; no speculative autoregressive fusion.
+      Detail: `.work/amx-c4-cross-request-20260907.md`.
 - [x] AMX-4 Decoder AMX INT8 Design D: persistent B packs, direct activation A,
       real decoder shapes and server batching path.
 - [x] AMX-5 Decoder AMX BF16: real `TDPBF16PS`, persistent BF16 B packs and
@@ -31,8 +32,9 @@ trade steady-state playback safety for headline TTFA.
       `.work/amx-c4-ragged-threshold-20260906.md`.
 - [ ] AMX-7 Explain the remaining C4 loss with bounded, low-overhead panel,
       batch, pool-wait and starvation/underrun attribution. Threshold `2` is
-      the best short control, not a qualification; detail:
-      `.work/amx-c4-ragged-threshold-20260906.md`.
+      the best short control, not a qualification; the cross-request and low-N
+      result is in `.work/amx-c4-cross-request-20260907.md` and the prior
+      attribution is in `.work/amx-c4-ragged-threshold-20260906.md`.
 - [x] AMX-8 Bounded C4 decode-chunk sweep completed for 8/12/16/24/32;
       no mixed-bank candidate has a stable useful margin. Detail:
       `.work/amx-c4-chunk-sweep-20260906.md`.
@@ -40,11 +42,12 @@ trade steady-state playback safety for headline TTFA.
 - [ ] AMX-10 W4 storage to AMX execution feasibility; no AutoRound runtime yet.
 
 Current checkpoint: Design D is integrated and reaches the engine-owned server
-pool. The valid C4 SOAK remains `STREAM_RTF p50/p95 = 0.942/1.035`; chunk 32
-was the best earlier mixed-bank screen at `0.910/0.986`. The ragged threshold
-screen now ranks `QWEN_SD_RAG_MIN_PANELS=2` at `0.900/0.954`, still without the
-requested margin. The default remains 8, AMX-6/7 remain open, and C5/C6 are
-deferred.
+pool. The valid C4 SOAK remains `STREAM_RTF p50/p95 = 0.942/1.035`; threshold
+`2` is the best short mixed-bank control at about `0.900/0.954`, still without
+the requested margin. The tested low-N M split regressed targeted streaming
+and was rejected; safe cross-request fusion already exists within each worker,
+while crossing prefork workers requires a new scheduler/ownership design. The
+default remains 8, AMX-6/7 remain open, and C5/C6 are deferred.
 
 ## Controls and backend parity
 
