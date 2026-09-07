@@ -627,6 +627,11 @@ typedef struct {
     int (*running)(void *ud);
     int (*cancelled)(void *ud, void *tag);
     void (*on_reject)(void *ud, void *tag, const char *reason);
+    /* Optional serving policy hook.  Return non-zero when this slot may perform
+     * one more Talker/CP frame.  first_step is true for a newly admitted slot;
+     * callers must use it to preserve first-audio progress.  This is a policy
+     * gate at an existing complete-frame boundary, not decoder preemption. */
+    int (*step_allowed)(void *ud, void *tag, int first_step);
 } qwen_batch_sink_t;
 
 int qwen_tts_batch_max_prompt(void);

@@ -268,6 +268,8 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_SERVER_ASYNC_OUTPUT` | off | experimental stream transport isolation: a bounded per-stream PCM queue and detached writer keep inference callbacks off the socket; queue overflow/disconnect fails and closes the stream rather than dropping PCM silently |
 | `QWEN_STREAM_OUTPUT_MAX_BYTES` | 1048576 | byte cap for the experimental per-stream output queue; invalid values fall back to the 1 MiB default |
 | `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS` | 5000 | socket send timeout used by the experimental stream writer; a stalled reader is terminated after the timeout |
+| `QWEN_STREAM_LEAD_GATE` | off | experimental server policy gate: after first audio, suppresses a stream's next complete Talker/CP frame while estimated delivered-audio lead exceeds the target; this is not decoder preemption |
+| `QWEN_STREAM_LEAD_TARGET_MS` | 250 (range 50–2000) | estimated audio lead target used by `QWEN_STREAM_LEAD_GATE` |
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
 | `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |

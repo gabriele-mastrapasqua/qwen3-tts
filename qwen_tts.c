@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <time.h>
 
 int qwen_verbose = 0;
 
@@ -2721,6 +2722,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int *cpcodes = (int *)malloc((size_t)B * 15 * sizeof(int));
     uint8_t *want_stream = (uint8_t *)calloc(B, 1);
     qwen_sd_stream_state_t *sstate = (qwen_sd_stream_state_t *)calloc(B, sizeof(qwen_sd_stream_state_t));
+    uint8_t *lead_mask = sink->step_allowed ? (uint8_t *)calloc(B, 1) : NULL;
+    int lead_gate = (sink->step_allowed && lead_mask) ? 1 : 0;
+    if (sink->step_allowed && !lead_mask)
+        fprintf(stderr, "[serve] step policy allocation failed; lead gate disabled\n");
     int amort = (cuda_batch || getenv("QWEN_AMORT_CPU")) && !getenv("QWEN_NO_AMORT");
     float **acc_aud = (float **)calloc(B, sizeof(float *));
     int *acc_n = (int *)calloc(B, sizeof(int));
@@ -3240,10 +3245,30 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         }
 
         uint8_t *step_active = active;
-        if (ttfa_prio && n_active > 1) {
-            int newest = -1, starving = 0, established = 0;
+        int n_eligible = n_active;
+        if (lead_gate) {
+            memset(lead_mask, 0, (size_t)B);
+            n_eligible = 0;
             for (int b = 0; b < B; b++) {
                 if (!active[b]) continue;
+                if (sink->step_allowed(sink->ud, tag[b], sframe[b] == 0)) {
+                    lead_mask[b] = 1;
+                    n_eligible++;
+                }
+            }
+            if (n_eligible == 0) {
+                /* A policy may intentionally park every stream while its queued
+                 * audio lead drains.  Do not turn that state into a hot spin. */
+                struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+                nanosleep(&pause, NULL);
+                continue;
+            }
+            step_active = lead_mask;
+        }
+        if (ttfa_prio && n_eligible > 1) {
+            int newest = -1, starving = 0, established = 0;
+            for (int b = 0; b < B; b++) {
+                if (!step_active[b]) continue;
                 if (frozen[b] >= freeze_cap) starving = 1;
                 if (sframe[b] >= ttfa_prio) established = 1;
                 if (sframe[b] < ttfa_prio && (newest < 0 || sframe[b] < sframe[newest])) newest = b;
@@ -3254,12 +3279,14 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 step_active = prio_mask;
             }
         }
-        if (st_bt && step_active == active && n_active > st_bt) {
+        int n_step = 0;
+        for (int b = 0; b < B; b++) if (step_active[b]) n_step++;
+        if (st_bt && step_active != prio_mask && n_step > st_bt) {
             memset(width_mask, 0, (size_t)B);
             int picked = 0;
             for (int k = 0; k < B && picked < st_bt; k++) {
                 int b = (rr_cursor + k) % B;
-                if (!active[b]) continue;
+                if (!step_active[b]) continue;
                 width_mask[b] = 1; picked++;
                 rr_cursor = (b + 1) % B;
             }
@@ -3267,7 +3294,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         }
         if (ttfa_prio) {
             for (int b = 0; b < B; b++)
-                frozen[b] = (active[b] && !step_active[b]) ? frozen[b] + 1 : 0;
+                frozen[b] = (active[b] && (!lead_gate || lead_mask[b]) && !step_active[b])
+                           ? frozen[b] + 1 : 0;
         }
         if (st_tt) qwen_set_threads_soft(st_tt);
 
@@ -3593,6 +3621,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     free(t2_qdepth_at_pop); free(t2_emitted); free(t2_adm_seq);
     free(width_mask);
     free(m1_mask);
+    free(lead_mask);
     free(prio_mask); free(frozen);
 
     #undef PF_START

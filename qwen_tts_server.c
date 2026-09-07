@@ -1520,6 +1520,8 @@ typedef struct batch_job {
     int client_gone;
     int cancelled;
     int timed_out;
+    _Atomic long long audio_ready_samples;
+    _Atomic long long first_audio_ready_us;
     double t_abort_detected;
     double t_cancel_stop;
     struct batch_job *next;
@@ -1713,6 +1715,12 @@ static void *reader_main(void *arg) {
             int is_stream = (strcmp(path, "/v1/tts/stream") == 0);
             double _t_recv = srv_now_ms();
             batch_job_t *j = (batch_job_t *)calloc(1, sizeof(batch_job_t));
+            if (!j) {
+                send_error(fd, 503, "server allocation failure");
+                srv_conn_close(fd); free(buf); continue;
+            }
+            atomic_init(&j->audio_ready_samples, 0);
+            atomic_init(&j->first_audio_ready_us, 0);
             j->fd = fd;
             int needs_single = 0;
             char rerr[256] = {0};
@@ -1755,7 +1763,38 @@ typedef struct {
     job_queue_t *jq;
     volatile sig_atomic_t *running;
     int admitted, done;
+    int lead_target_ms;
+    unsigned long long lead_checks;
+    unsigned long long lead_suppressed;
+    unsigned long long lead_cancelled;
 } sink_ctx_t;
+
+static void sink_mark_audio_ready(batch_job_t *j, int n_samples) {
+    if (!j || n_samples <= 0) return;
+    long long now_us = (long long)(srv_now_ms() * 1000.0);
+    long long zero = 0;
+    atomic_compare_exchange_strong_explicit(&j->first_audio_ready_us, &zero, now_us,
+                                            memory_order_relaxed, memory_order_relaxed);
+    atomic_fetch_add_explicit(&j->audio_ready_samples, n_samples, memory_order_relaxed);
+}
+
+static int stream_lead_gate_enabled(void) {
+    const char *e = getenv("QWEN_STREAM_LEAD_GATE");
+    return e && e[0] && e[0] != '0';
+}
+
+static int stream_lead_target_ms(void) {
+    const int def = 250;
+    const char *e = getenv("QWEN_STREAM_LEAD_TARGET_MS");
+    if (!e || !e[0]) return def;
+    char *end = NULL;
+    long v = strtol(e, &end, 10);
+    if (end == e || *end != '\0' || v < 50 || v > 2000) {
+        fprintf(stderr, "[serve] invalid QWEN_STREAM_LEAD_TARGET_MS=%s; using %d ms\n", e, def);
+        return def;
+    }
+    return (int)v;
+}
 
 static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block) {
     sink_ctx_t *sc = (sink_ctx_t *)ud;
@@ -1816,7 +1855,7 @@ static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
             j->client_gone = 1;
             j->cancelled = 1;
             if (j->t_abort_detected == 0.0) j->t_abort_detected = srv_now_ms();
-        }
+        } else sink_mark_audio_ready(j, n_samples);
         return;
     }
     if (j->t_write_attempt == 0.0) j->t_write_attempt = srv_now_ms();
@@ -1826,6 +1865,7 @@ static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
     }
     int _gone = send_pcm_chunk(j->fd, samples, n_samples);
     if (j->t_write_complete == 0.0 && !_gone) j->t_write_complete = srv_now_ms();
+    if (!_gone) sink_mark_audio_ready(j, n_samples);
     if (_gone && !j->client_gone) {
         j->client_gone = 1; j->t_abort_detected = srv_now_ms();
     }
@@ -1859,6 +1899,29 @@ static int sink_cancelled(void *ud, void *tag) {
     }
     if (j->client_gone && j->t_cancel_stop == 0.0) j->t_cancel_stop = srv_now_ms();
     return j->client_gone;
+}
+
+static int sink_step_allowed(void *ud, void *tag, int first_step) {
+    sink_ctx_t *sc = (sink_ctx_t *)ud;
+    batch_job_t *j = (batch_job_t *)tag;
+    if (!sc || !j || !j->is_stream || first_step) return 1;
+    sc->lead_checks++;
+    /* Let cancellation through even while a stream is parked above its lead
+     * target.  The normal cancellation callback owns disconnect/timeout
+     * semantics and the next frame boundary remains the safe stop point. */
+    if (sink_cancelled(ud, tag)) {
+        sc->lead_cancelled++;
+        return 1;
+    }
+    long long first_us = atomic_load_explicit(&j->first_audio_ready_us, memory_order_relaxed);
+    long long samples = atomic_load_explicit(&j->audio_ready_samples, memory_order_relaxed);
+    if (first_us <= 0 || samples <= 0) return 1;
+    double elapsed_ms = srv_now_ms() - (double)first_us / 1000.0;
+    double audio_ms = (double)samples * 1000.0 / (double)QWEN_TTS_SAMPLE_RATE;
+    double lead_ms = audio_ms - elapsed_ms;
+    if (lead_ms <= (double)sc->lead_target_ms) return 1;
+    sc->lead_suppressed++;
+    return 0;
 }
 
 void qwen_topology_emit(int worker, int threads, const char *configured_mask,
@@ -2012,15 +2075,25 @@ typedef struct { qwen_tts_ctx_t *ctx; job_queue_t *jq; int max_batch; } sched_ar
 static void *scheduler_main(void *arg) {
     qwen_thread_name("srv-sched");
     sched_arg_t *sa = (sched_arg_t *)arg;
-    sink_ctx_t sc = { .jq = sa->jq, .running = &server_running, .admitted = 0, .done = 0 };
+    int lead_gate = stream_lead_gate_enabled();
+    int lead_target = lead_gate ? stream_lead_target_ms() : 0;
+    sink_ctx_t sc = { .jq = sa->jq, .running = &server_running, .admitted = 0, .done = 0,
+                      .lead_target_ms = lead_target };
     qwen_batch_sink_t sink = {
         .ud = &sc, .next_job = sink_next_job, .on_done = sink_on_done,
         .on_chunk = sink_on_chunk, .running = sink_running,
         .cancelled = sink_cancelled,
         .on_reject = sink_on_reject,
+        .step_allowed = lead_gate ? sink_step_allowed : NULL,
     };
+    if (lead_gate)
+        fprintf(stderr, "[serve] playback lead gate ENABLED target=%d ms (first frame always eligible)\n",
+                lead_target);
     atomic_store(&g_srv.sched_alive, 1);
     int rc = qwen_tts_serve_continuous(sa->ctx, sa->max_batch, &sink);
+    if (lead_gate)
+        fprintf(stderr, "[lead] checks=%llu suppressed=%llu cancellation_passthrough=%llu target_ms=%d\n",
+                sc.lead_checks, sc.lead_suppressed, sc.lead_cancelled, lead_target);
     atomic_store(&g_srv.sched_alive, 0);
     if (rc != 0 && server_running) {
         fprintf(stderr, "[BATCH] FATAL: continuous scheduler failed (rc=%d) — "
