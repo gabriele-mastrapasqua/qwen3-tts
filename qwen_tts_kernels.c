@@ -322,7 +322,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
-    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
+    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_FUSED_RESIDUAL", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
@@ -9460,6 +9460,7 @@ static int sd_gemm_panel_amx_d(float *out, int out_ld, int M,
                                const int8_t *Wpack, const float *swb,
                                const int32_t *wsum, const float *bias,
                                const int8_t *Xq, const float *sab,
+                               const float *residual,
                                int tcol0, int nc, int Kp, int blk) {
     (void)wsum;
     if (M % 16)            { atomic_fetch_add(&g_sd_amx_rej[0], 1); return 0; }
@@ -9549,7 +9550,9 @@ static int sd_gemm_panel_amx_d(float *out, int out_ld, int M,
         for (int m = 0; m < M; m++) {
             float *o = out + (size_t)m * out_ld + tcol0 + c0;
             const float bb = bias ? bias[m] : 0.0f;
-            for (int n = 0; n < ncol; n++) o[n] = acc[(size_t)m * 16 + n] + bb;
+            const float *rr = residual ? residual + (size_t)m * out_ld + tcol0 + c0 : NULL;
+            for (int n = 0; n < ncol; n++)
+                o[n] = acc[(size_t)m * 16 + n] + bb + (rr ? rr[n] : 0.0f);
         }
     }
 
@@ -9837,6 +9840,7 @@ static void sd_gemm_panel(float *out, int out_ld, int M,
 typedef struct {
     float *out;
     const float *in;
+    const float *residual;
     const float *split_prefix;
     const float *split_suffix;
     const int8_t *Wq; const int8_t *Wpack;
@@ -9921,11 +9925,13 @@ static void sd_conv1d_worker(void *vj) {
             }
         }
         qwen_int8_quant_rows(colq, sa, colf, nc, K, j->Kp, j->blk);
+        int amx_fused = 0;
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
         if (j->Wpack) {
-            if (!sd_gemm_panel_amx_d(j->out, j->length, j->out_ch, j->Wpack,
-                                     j->sw, j->wsum, j->bias, colq, sa,
-                                     t0, nc, j->Kp, j->blk))
+            amx_fused = sd_gemm_panel_amx_d(j->out, j->length, j->out_ch, j->Wpack,
+                                            j->sw, j->wsum, j->bias, colq, sa,
+                                            j->residual, t0, nc, j->Kp, j->blk);
+            if (!amx_fused)
                 if (!sd_amx_enabled() ||
                     !sd_gemm_panel_amx(j->out, j->length, j->out_ch, j->Wq, j->sw,
                                        j->wsum, j->bias, colq, sa, t0, nc,
@@ -9939,6 +9945,13 @@ static void sd_conv1d_worker(void *vj) {
 #endif
             sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
                           colq, sa, t0, nc, j->Kp, j->blk);
+        if (j->residual && !amx_fused) {
+            for (int m = 0; m < j->out_ch; m++) {
+                float *dst = j->out + (size_t)m * j->length + t0;
+                const float *src = j->residual + (size_t)m * j->length + t0;
+                for (int n = 0; n < nc; n++) dst[n] += src[n];
+            }
+        }
     }
     qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
@@ -9987,6 +10000,29 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
     (void)in_ch; (void)out_ch; (void)length; (void)kernel; (void)dilation;
     sd_conv_job_t job = {
         .out = out, .in = in, .Wq = Wq, .Wpack = Wpack,
+        .sw = sw, .wsum = wsum, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .input_length = length, .input_offset = 0,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+    };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+
+void qwen_conv1d_int8_design_d_residual(float *out, const float *in,
+                                        const float *residual,
+                                        const int8_t *Wq, const float *sw,
+                                        const int32_t *wsum, const float *bias,
+                                        const int8_t *Wpack,
+                                        int in_ch, int out_ch, int length, int kernel,
+                                        int dilation, int Kp, int blk) {
+    sd_conv_job_t job = {
+        .out = out, .in = in, .residual = residual, .Wq = Wq, .Wpack = Wpack,
         .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = length,
         .input_length = length, .input_offset = 0,
@@ -10259,6 +10295,21 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
                      kernel, dilation, Kp, blk);
 }
 
+void qwen_conv1d_int8_design_d_residual(float *out, const float *in,
+                                        const float *residual,
+                                        const int8_t *Wq, const float *sw,
+                                        const int32_t *wsum, const float *bias,
+                                        const int8_t *Wpack,
+                                        int in_ch, int out_ch, int length, int kernel,
+                                        int dilation, int Kp, int blk) {
+    qwen_conv1d_int8_design_d(out, in, Wq, sw, wsum, bias, Wpack,
+                              in_ch, out_ch, length, kernel, dilation, Kp, blk);
+    if (out && residual)
+        for (int m = 0; m < out_ch; m++)
+            for (int n = 0; n < length; n++)
+                out[(size_t)m * length + n] += residual[(size_t)m * length + n];
+}
+
 int qwen_conv1d_int8_design_d_range(float *out, const float *in,
                                     const int8_t *Wq, const float *sw,
                                     const int32_t *wsum, const float *bias,
@@ -10310,7 +10361,7 @@ int qwen_sd_amx_int8_panel(float *out, int out_ld, int M,
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__) && \
     (defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__))
     return sd_gemm_panel_amx_d(out, out_ld, M, Wpack, sw, wsum, bias,
-                               Xq, sa, tcol0, nc, Kp, blk);
+                               Xq, sa, NULL, tcol0, nc, Kp, blk);
 #else
     (void)out; (void)out_ld; (void)M; (void)Wpack; (void)sw; (void)wsum;
     (void)bias; (void)Xq; (void)sa; (void)tcol0; (void)nc; (void)Kp; (void)blk;

@@ -475,6 +475,18 @@ void qwen_conv1d_int8_design_d(float *out, const float *in,
                                int in_ch, int out_ch, int length, int kernel, int dilation,
                                int Kp, int blk);
 
+/* Decoder-only experimental epilogue: compute the same Design-D convolution and add
+ * `residual` before storing each output element.  The caller keeps separate input and
+ * output buffers, so an unsupported/failing backend can fall back without corrupting
+ * the convolution input. */
+void qwen_conv1d_int8_design_d_residual(float *out, const float *in,
+                                        const float *residual,
+                                        const int8_t *Wq, const float *sw,
+                                        const int32_t *wsum, const float *bias,
+                                        const int8_t *Wpack,
+                                        int in_ch, int out_ch, int length, int kernel,
+                                        int dilation, int Kp, int blk);
+
 /* Streaming causal slice: `in` has input_length columns, while the output buffer has
  * output_length columns corresponding to logical output columns [input_offset,
  * input_offset + output_length).  The AMX B pack and per-column quantisation contract

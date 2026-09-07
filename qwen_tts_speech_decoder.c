@@ -297,6 +297,18 @@ static int sd_direct_input_enabled(void) {
     return en;
 }
 
+/* SQ-2d: residual blocks end with a same-width 1x1 projection followed by a full
+ * residual add.  Keep the output buffer separate for fallback safety, but let the
+ * Design-D AMX epilogue add the residual while it stores the projection result. */
+static int sd_fused_residual_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_FUSED_RESIDUAL");
+        en = e && *e && *e != '0';
+    }
+    return en;
+}
+
 /* BF16 is a separate decoder arm.  It does not depend on the INT8 policy: a server can
  * select BF16 with QWEN_SD_AMX_BF16=1 and QWEN_SD_INT8=0 to measure the two representations
  * without silently paying for an unused INT8 cache. */
@@ -2081,6 +2093,21 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
     return out;
 }
 
+static int cs_conv1d_fused_residual(float *out, const float *in, const float *residual,
+                                    int in_ch, int out_ch, int len,
+                                    int kernel, int dilation,
+                                    const float *w, const float *b) {
+    if (!sd_fused_residual_enabled() || kernel != 1 || in_ch != out_ch ||
+        !sd_amx_d_enabled() || !qwen_sd_int8_usable(in_ch, out_ch)) return 0;
+    sd_wq_entry_t *e = sd_wq_get_conv(w, out_ch, in_ch * kernel);
+    if (!e || !e->amx_d_wpack) return 0;
+    qwen_conv1d_int8_design_d_residual(out, in, residual, e->q, e->scales,
+                                       e->wsum, b, e->amx_d_wpack,
+                                       in_ch, out_ch, len, kernel, dilation,
+                                       e->Kp, sd_int8_blk());
+    return 1;
+}
+
 #ifdef USE_BLAS
 /* SQ-2: the per-slot streaming path has the same overlap shape as the ragged path,
  * but its control arm materializes [out_ch][out_len + carry].  Keep the existing
@@ -2361,15 +2388,32 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
                 sd_shape_emit(_nm, "per-slot", 1, m, cur_ch, cur_ch, (long)cur_len, 1, 1);
             }
             UP_T0();
-            causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias,
-                          cur_ch, cur_ch, cur_len, 1, 1);
+            const int fused_residual = cs_conv1d_fused_residual(
+                c2_out, signal, res, cur_ch, cur_ch, cur_len, 1, 1,
+                ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias);
+            if (!fused_residual)
+                causal_conv1d(c2_out, signal, ub->res_blocks[r].conv2_weight,
+                              ub->res_blocks[r].conv2_bias,
+                              cur_ch, cur_ch, cur_len, 1, 1);
             UP_ACC(sd_up_res2);
 
-            { UP_T0();
-              for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
-                  signal[i] = res[i] + c2_out[i];
-              UP_ACC(sd_up_resadd); }
-            { UP_T0(); sd_tmp_free(c2_out); sd_tmp_free(res); UP_ACC(sd_up_alloc); }
+            if (fused_residual) {
+                /* The Design-D epilogue has already produced residual + conv2.  Keep
+                 * the result buffer as the next block's signal and avoid a second
+                 * full-size read/write pass. */
+                sd_tmp_free(signal);
+                signal = c2_out;
+                c2_out = NULL;
+                sd_tmp_free(res);
+            } else {
+                { UP_T0();
+                  for (int64_t i = 0; i < (int64_t)cur_ch * cur_len; i++)
+                      signal[i] = res[i] + c2_out[i];
+                  UP_ACC(sd_up_resadd); }
+                sd_tmp_free(c2_out);
+                sd_tmp_free(res);
+            }
+            { UP_T0(); UP_ACC(sd_up_alloc); }
         }
     }
 
