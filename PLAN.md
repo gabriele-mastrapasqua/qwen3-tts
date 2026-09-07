@@ -72,49 +72,57 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       Detail: `.work/p2-checkpoint-20260907.md`.
 
 
-### P2 -> P3 gate: post-P2 architecture review — detail: `.work/post-p2-streaming-research-agenda.md`
+### AR-2 reviewed order — CLOSED docs checkpoint
 
-- [ ] AR-1 is READY after the frozen P2 checkpoint (runtime committed, evidence addendum,
-      stable HEAD). A separate read-only review of THAT HEAD must cover input-length-
-      independent first play, incremental/preemptible prefill, bounded-window continuity,
-      staged serving (vLLM-Omni mechanisms on CPU), decoupled pipeline, lead as the
-      cross-stage currency, long-input qualification; one coherent target architecture
-      with falsifiers and a do-not-implement list.
-- [ ] AR-2 Freeze the revised P3/P4 ordering from AR-1 before Codex resumes; the P3 tasks
-      below are retained but subject to refinement/reordering by AR-1.
+- [x] AR-1 implementation audit and AR-1b external/model supplement are frozen against
+      the P2 HEAD: `.work/ar1-post-p2-architecture-review-20260907.md`,
+      `.work/ar1-codex-implementation-audit-20260907.md`,
+      `.work/ar1b-external-research-supplement-20260907.md`.
+- [x] AR-2 verified the official known-text dual-track layout against the C prompt/step
+      path and froze the implementation order: `.work/ar2-sl1-semantics-20260907.md`.
+      Prefix-cache reuse is not resumable prefill; q1/q2/q4 are smaller complete decoder
+      calls, not intra-call preemption; whole-request AMX wall remains UNKNOWN.
 
-### P3 Lead-aware streaming scheduler — detail: `.work/professional-streaming-architecture.md` E2, E7
+### P3 Serving cadence and first-play
 
-- [ ] PF-1 Bounded/incremental prefill: first playable audio must not scale with the full
-      long input; length-scaling evidence: `.work/p2-input-length-scaling-20260907.md`.
-- [ ] LS-1 Per-stream playback state (delivered audio, lead, time-to-underrun, first-audio
-      deadline, admission state) and a design for deadline/slack ordering; not a fixed
-      priority ladder.
-- [ ] LS-2 Lead-controlled decode/output quantum replacing the static chunk ramp: tiny at
-      startup, grows with lead, bounded lead window, no giant bursts.
-- [ ] LS-3 Bounded decoder slices that cannot stop codec generation for unrelated streams
-      (same pool first; dedicated lane only with evidence).
-- [ ] LS-4 Deadline-aware admission: prefill deferred/interleaved near underrun; CT-3
-      found a ~309 ms inline prefill and one potentially enlarged overlapping gap.
+- [ ] OUT-1/OUT-2 Bounded per-stream PCM queue, non-blocking writer, byte/memory cap,
+      timeout, cancellation/disconnect semantics and slow/stopped-reader tests. Engine
+      enqueue and transport-write timestamps must remain distinct.
+- [ ] SL-1 Known-text official dual-track streaming layout, initially default-off and
+      flag-gated: first text token + codec BOS in prefill, trailing text hidden one per
+      Talker step, then `tts_eos`/`tts_pad`; CLI/parity/quality first, no live network text.
+- [ ] LS-1 Credit-gated per-stream lead/deadline state: playable audio lead is the currency;
+      never suppress first audio; EDF order only among eligible work.
+- [ ] LS-3' Small complete decoder calls at safe existing boundaries; q1/q2/q4/q8 floor
+      established empirically. Do not claim intra-call preemption.
+- [ ] LS-2 Lead-feedback steady-state quantum: first chunk remains one frame, bounded lead
+      window, explicit minimum efficient quantum; q8 remains the upper control until proven.
+- [ ] PF-1 Residual fixed-prompt chunked prefill only where SL-1 leaves a genuinely long
+      prefix (ICL/reference or retained non-streaming modes); do not confuse it with live text.
+- [ ] LS-4 Deadline-aware admission: protect established streams and reject overload rather
+      than queue indefinitely.
 
-## Later
+### P4 Overlap and decoder structural cost
 
-### P4 Execution ownership / topology — detail: `.work/professional-streaming-architecture.md` E6
+- [ ] Test a same-pool decoder consumer first; promote only if playback and throughput both
+      improve. Instrument operation calls, actual pool submissions and pool wait separately.
+- [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
+      retain fused residual as quality-gated and consider a strip executor only for proven
+      small-call/intercept work.
+- [ ] No speculative completed-stage resumability or dedicated core lanes without evidence.
 
-- [ ] EO-1 Clean comparison of prefork/local batching vs single-engine global ready set,
-      only after LS-3 controls decode bursts; small mechanism experiments, not a matrix.
-- [ ] EO-2 Single-engine Talker/CP batching with bounded decoder slices; CT-4 retained.
-- [ ] EO-3 Dynamic core allocation instead of fixed 2x6/2x8; asymmetric lanes only if EO-2
-      shows a compute-bound Talker at B >= 3.
-- [ ] AMX-0 Trusted execution map with useful AMX wall share (demoted from P0; detail:
-      `.work/amx-native-epic.md`).
+### P5 Ownership and batching
 
-### P5 Professional output / backpressure
+- [ ] EO-1/EO-2 Single-engine/global Talker/CP ready set only after P3/P4 coupling is controlled;
+      form deadline-compatible cohorts without waiting solely to create B.
+- [ ] AMX Talker/CP only when real B >= 4 work exists. CP stateless re-prefill remains dropped
+      unless new local evidence invalidates the reviewed cost model.
+- [ ] Later ownership/topology changes only if the bounded overlap evidence justifies them.
 
-- [ ] OUT-1 Bounded per-stream PCM queue and non-blocking writer; slow/stopped/disconnected
-      client cannot stall other streams.
-- [ ] OUT-2 Tests: slow reader, stopped reader, disconnect, cancellation/barge-in, queue
-      overflow policy.
+### Research-only (not current implementation scope)
+
+- [ ] SL-2 live incremental text / park-not-pad; long-form segmentation with decoder-state
+      carry; bounded Talker memory; own-codes re-prompt negative arm.
 
 ### P6 Qualification and backend comparison
 
