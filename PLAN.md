@@ -1,112 +1,159 @@
 # Current Plan
 
-`ENGINEERING.md` is normative. This file is only the short task queue; detailed
-reasoning and reviewed evidence live in the linked `.work/*.md` addenda.
+`ENGINEERING.md` is normative. This file is the short task queue; reasoning and reviewed
+evidence live in the linked `.work/*.md` addenda.
 
-## Product objective
+## Mission
 
-Serve concurrent streaming TTS correctly, with zero errors/rejects/underruns,
-`STREAM_RTF p95 < 1` with useful margin, then acceptable TTFA and cost. Do not
-trade steady-state playback safety for headline TTFA.
+Build a CPU TTS server that starts quickly, continuously feeds a real 1x player without
+repeated starvation, keeps realtime headroom, protects established streams from new
+arrivals and from unrelated slow clients, and only then maximizes sustainable concurrency
+and cost per stream. The qualification process discovers the highest concurrency that
+satisfies the complete streaming envelope; C4 is not a required operating point.
+Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
-## Active AMX sequence
+## Current trusted state
 
-- [ ] AMX-0 Trusted execution map: reconcile source invariants, effective flags,
-      per-kernel census and the real server denominator. Detail:
-      `.work/amx-native-epic.md`.
-- [ ] AMX-1 GEMV/small-M feasibility: identify real independent matrix work and
-      keep irreducible tiny work on the measured fallback.
-- [ ] AMX-2 Shared AMX-first representation: decide how persistent weights serve
-      VNNI, AMX INT8 and AMX BF16 without locking the backend to one datatype.
-- [ ] AMX-3 Dataflow reformulation: implement only a dependency-proven grouping
-      that creates useful matrix work; no speculative autoregressive fusion.
-      Detail: `.work/amx-c4-cross-request-20260907.md`.
-- [x] AMX-4 Decoder AMX INT8 Design D: persistent B packs, direct activation A,
-      real decoder shapes and server batching path.
-- [x] AMX-5 Decoder AMX BF16: real `TDPBF16PS`, persistent BF16 B packs and
-      separate census path; serving policy remains undecided.
-- [ ] AMX-6 C4 qualification and scheduler review. Threshold A/B is material
-      but still marginal; detail:
-      `.work/amx-ragged-scheduler-review-3f7e0df.md`,
-      `.work/amx-c4-chunk-sweep-20260906.md`, and
-      `.work/amx-c4-ragged-threshold-20260906.md`.
-- [ ] AMX-7 Explain the remaining C4 loss with bounded, low-overhead panel,
-      batch, pool-wait and starvation/underrun attribution. Threshold `2` is
-      the best short control, not a qualification; the cross-request and low-N
-      result is in `.work/amx-c4-cross-request-20260907.md` and the prior
-      attribution is in `.work/amx-c4-ragged-threshold-20260906.md`.
-- [x] AMX-8 Bounded C4 decode-chunk sweep completed for 8/12/16/24/32;
-      no mixed-bank candidate has a stable useful margin. Detail:
-      `.work/amx-c4-chunk-sweep-20260906.md`.
-- [ ] AMX-9 Final 1.7B/0.6B capacity model and sustainable-stream comparison.
-- [ ] AMX-10 W4 storage to AMX execution feasibility; no AutoRound runtime yet.
+- Host: GCP c4-standard-24 (12 physical cores, SMT off), 1.7B INT8, decoder Design D
+  INT8 AMX with persistent packs, 2x6 prefork, engine-owned pool, batch cap 2.
+- Best short C4 control (ragged threshold 2, chunk 32): STREAM_RTF p50/p95
+  0.900/0.954, TTFA p95 ~565 ms, zero errors, but zero-buffer required prebuffer p95
+  ~2.4 s and stall_max ~2.0 s. `STREAM_RTF < 1` is a capacity fact, NOT a continuous
+  playback proof; that older interpretation is superseded.
+- Prebuffer follows the audio quantum (chunk 8 → 0.45 s, chunk 32 → 1.2-2.5 s) while
+  STREAM_RTF barely moves. Chunk 32 is an RTF artifact and is not a production winner.
+- Decoder MACs already run on real AMX with wide N; its wall is glue (im2col, quantization,
+  ~41 rendezvous and ~110 BLAS calls per call, snake, tails). AMX can touch at most
+  ~10-20 % of request wall; more tile tasks regressed (M split rejected).
+- Per-worker effective batch ~1.1-1.3 at C4: Talker/CP run as DRAM-bound B=1 GEMV, weights
+  read per worker. The 1x12/batch-4 probe measured decode-burst coupling, not Talker
+  batching, and is not evidence against a single engine.
+- Inline prefill stalls every established stream 108-240 ms per admission; a slow client
+  blocks its worker's engine thread (blocking writes, no send timeout).
+- Harness: TTFB/TTFA, STREAM_RTF, zero-buffer prebuffer/underrun/stall_max only; no
+  per-request safe_play_start, no fixed-buffer stall rates, transport unaudited (no
+  `TCP_NODELAY`; header travels with the first audio chunk, so TTFB = TTFA today).
 
-Current checkpoint: Design D is integrated and reaches the engine-owned server
-pool. The valid C4 SOAK remains `STREAM_RTF p50/p95 = 0.942/1.035`; threshold
-`2` is the best short mixed-bank control at about `0.900/0.954`, still without
-the requested margin. The tested low-N M split regressed targeted streaming
-and was rejected; safe cross-request fusion already exists within each worker,
-while crossing prefork workers requires a new scheduler/ownership design. The
-default remains 8, AMX-6/7 remain open, and C5/C6 are deferred.
+## Immediate priorities
 
-## Controls and backend parity
+### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11
 
-- [ ] P0.1 Runtime profiler with execution tree, pool occupancy, memory traffic
-      and resolved backend; detail: `.work/amx-native-epic.md`.
-- [ ] P0.2 Canonical benchmark manifests/runbook and clean-commit qualification;
-      see `docs/BENCHMARKING.md`.
-- [ ] P1.1 Server configuration control plane; detail:
-      `.work/config-control-plane.md`.
-- [ ] P1.2 ARM i8mm shape/region validation when an ARM host is available.
-- [ ] P1.3 VNNI GEMV/GEMM shape coverage and q4 weak-shape follow-up.
-- [ ] P1.4 Keep the AMX B>=4 runtime evidence current; detail:
-      `.work/p1-4-amx-runtime.md`.
-- [ ] CTRL-1 Common-path parity matrix: implemented, selectable and actually
-      effective for each backend; see `docs/backend-matrix.md`.
-- [ ] CTRL-2 Feature-flag parity and effective/default semantics across backends.
-- [ ] CTRL-3 Cloud A/B only for unresolved topology or pool differences.
-- [ ] CTRL-4 Module boundaries and one capability/fallback table.
+- [ ] MT-1 Audit receive-mark semantics (server flush vs socket vs HTTP buffering,
+      Nagle, header timing); define TTFB independently of TTFA; keep prebuffer labelled
+      "client-observed" until proven.
+- [ ] MT-2 Per-request `safe_play_start` from the actual timeline (earliest 1x start
+      that finishes without underrun), aggregated p50/p95; add stall_rate@100/250/500/
+      1000 ms and total_stall_ms@buffer to `tests/playback_sim.py` with self-tests in
+      `tests/test_soak.py`; standard summaries in `tests/serve_soak.py` and
+      `tests/serve_parallel_wave.py`.
+- [ ] MT-3 Correct superseded interpretations non-destructively: `docs/serving-operations.md`
+      section 5, `docs/BENCHMARKING.md` sections 7-8, annotate the AWS/GCP reference notes.
 
-### Closed control-plane work
+### P1 Cadence truth (current binary, Tier A only)
 
-- [x] P2.1 Common runtime parity and region ownership; detail:
-      `.work/p2-cross-backend-runtime.md`.
-- [x] P2.2 CP/Talker region and head parity.
-- [x] P2.3 Batched-head and execution-budget parity.
-- [x] P2.4 Hot-path allocation and pool-interface fixes.
-- [x] P2.5 One engine-owned execution budget.
-- [x] P2.6 Truthful pool reentrancy/ownership reporting.
-- [x] P3.1 Authoritative runtime-knob inventory; detail:
-      `.work/p3-runtime-knob-parity.md`.
-- [x] P3.2 Backend runtime-knob mapping.
-- [x] P3.3a Pool capability parity.
-- [x] P3.4 Decoder capability/policy split.
-- [x] P3.5 Effective AMX/x86 decoder knobs and region observability.
-- [x] P3.6 Decoder-pool configuration now has explicit values, resolved startup
-      reporting and fail-fast unknown-value handling; detail is preserved in
-      `.work/amx-c4-chunk-sweep-20260906.md`.
+- [ ] CT-1 Chunk-quantum discriminator at C3 and C4 on 2x6: chunk 8, chunk 32, chunk 8
+      with gang join disabled; `[DECODE] dur_ms` and `[ITER]` traces on. Pass = prebuffer
+      tracks rho_f x quantum; also yields CT-2 and CT-4 data.
+- [ ] CT-2 Decoder fixed intercept and per-frame slope from dur_ms vs frames, plus
+      `[SDPHASE]` attribution (tile vs glue). Intercept < 10 ms and slope < 8 ms/frame
+      demotes SQ-1.
+- [ ] CT-3 Quantify inline decoder blocking and admission/prefill interference on
+      established-stream cadence (new scenario: established streams + new arrival).
+- [ ] CT-4 Talker step wall at B=1 vs 2 in one process from `[ITER]`; > 1.6x kills EO-2.
+- [ ] CT-5 C2/C3/C4 playback envelope on the current architecture with the MT metrics;
+      classify each as GOOD / MARGINAL / NOT STREAMABLE.
 
-## Deferred follow-ups
+### P2 Small-quantum decoder — detail: `.work/professional-streaming-architecture.md` E3, E4
 
-- [ ] X86-2 Revisit low-B AMX/VNNI crossover only after the serving dataflow
-      presents enough useful work.
-- [ ] X86-3 Keep persistent packed-RHS consumption opt-in until serving cost is
-      requalified with the current dataflow.
-- [ ] X86-4 Remove remaining decoder activation gather/pack/scatter overhead.
-- [ ] X86-5 Revisit duplicated AMX activation packing only when useful per-worker
-      matrix width is established.
-- [ ] X86-6 Qualify the 0.6B server on the same C1/C2/C4 methodology.
-- [ ] X86-7 Compare 0.6B and 1.7B shape-family and serving shifts.
-- [ ] X86-8 Define latency-first and streaming-safe operating profiles.
-- [ ] LATER-1 Qualify INT8 prefill separately from the production path.
-- [ ] LATER-2 Decide the two unreviewed GCP reference notes and stray local object.
-- [ ] LATER-3 Audit BLAS replacement only after structural parity is closed.
-- [ ] LATER-4 Rename legacy CLI batch aliases without changing behavior.
+- [ ] SQ-1 Streaming strip executor design note: strip → snake → conv1 → snake → conv2 →
+      residual, direct INT8 A preparation, packed transposed conv, few rendezvous; go/no-go
+      from CT-2.
+- [ ] SQ-2 Remove fixed per-call work that grows badly as chunks shrink (materialized
+      im2col, separate quantization pass, per-tap BLAS scatter, per-call scratch, whole-chunk
+      rendezvous), bit-parity or mel-corr gated, measured by CT-2 re-run.
+- [ ] SQ-3 Report amx_dispatch_share, amx_matrix_mac_share, amx_addressable_mac_share and
+      amx_request_wall_share separately after each SQ change; never optimize task count.
 
-## Closed checkpoints
+### P3 Lead-aware streaming scheduler — detail: `.work/professional-streaming-architecture.md` E2, E7
 
-- Backend matrix, effective-config reporting and the major x86/ARM parity audit
-  are landed; remaining ARM items are hardware-blocked.
-- Decoder Design D and real AMX BF16 are implemented with parity/census evidence.
-- Ragged-panel scheduler review is safe to qualify; low findings and targeted
-  tests remain explicitly deferred in the linked addendum.
+- [ ] LS-1 Per-stream playback state (delivered audio, lead, time-to-underrun, first-audio
+      deadline, admission state) and a design for deadline/slack ordering; not a fixed
+      priority ladder.
+- [ ] LS-2 Lead-controlled decode/output quantum replacing the static chunk ramp: tiny at
+      startup, grows with lead, bounded lead window, no giant bursts.
+- [ ] LS-3 Bounded decoder slices that cannot stop codec generation for unrelated streams
+      (same pool first; dedicated lane only with evidence).
+- [ ] LS-4 Deadline-aware admission: prefill deferred or interleaved when an established
+      stream is near underrun; new requests cannot starve; measured by CT-3 scenario.
+
+## Later
+
+### P4 Execution ownership / topology — detail: `.work/professional-streaming-architecture.md` E6
+
+- [ ] EO-1 Clean comparison of prefork/local batching vs single-engine global ready set,
+      only after LS-3 controls decode bursts; small mechanism experiments, not a matrix.
+- [ ] EO-2 Single-engine Talker/CP batching with bounded decoder slices (gated by CT-4).
+- [ ] EO-3 Dynamic core allocation instead of fixed 2x6/2x8; asymmetric lanes only if EO-2
+      shows a compute-bound Talker at B >= 3.
+- [ ] AMX-0 Trusted execution map with useful AMX wall share (demoted from P0; detail:
+      `.work/amx-native-epic.md`).
+
+### P5 Professional output / backpressure
+
+- [ ] OUT-1 Bounded per-stream PCM queue and non-blocking writer; slow/stopped/disconnected
+      client cannot stall other streams.
+- [ ] OUT-2 Tests: slow reader, stopped reader, disconnect, cancellation/barge-in, queue
+      overflow policy.
+
+### P6 Qualification and backend comparison
+
+- [ ] QL-1 Tier B qualification per `.work/professional-streaming-architecture.md` E9;
+      discover the maximum GOOD concurrency with margin; publish GOOD streams per cost unit.
+- [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
+      playback-aware harness only after QL-1 has one trusted reference.
+
+### Retained, demoted or deferred (ids kept for addenda; none is a current priority)
+
+- Multi-precision waits behind P0-P3: AMX-2 shared representation, AMX-5 BF16 serving
+  policy, AMX-10 W4 feasibility; INT8 is the serving reference.
+- Superseded by the envelope: AMX-1, AMX-3, AMX-6, AMX-7, AMX-9 (C4 qualification and
+  cross-request decoder aggregation are no longer the next bet; aggregate only for
+  isolation/cadence, never for width).
+- Controls: P0.1 profiler, P0.2 manifests (`docs/BENCHMARKING.md`), P1.1
+  (`.work/config-control-plane.md`), P1.2, P1.3, P1.4 (`.work/p1-4-amx-runtime.md`),
+  CTRL-1 (`docs/backend-matrix.md`), CTRL-2, CTRL-3, CTRL-4. Deferred: X86-2, X86-3,
+  X86-4, X86-5 (`.work/x86-dataflow-research.md`), X86-6, X86-7, X86-8, LATER-1,
+  LATER-2, LATER-3, LATER-4.
+- Closed: AMX-4, AMX-5, AMX-8, P3.1, P3.2, P3.6, ragged scheduler review
+  (`.work/amx-ragged-scheduler-review-3f7e0df.md`), and the ids below.
+- [x] P2.1 Runtime parity — `.work/p2-cross-backend-runtime.md`
+- [x] P2.2 CP/Talker region parity — same addendum
+- [x] P2.3 Batched-head/budget parity — same addendum
+- [x] P2.4 Hot-path allocation fixes — same addendum
+- [x] P2.5 One engine-owned budget — same addendum
+- [x] P2.6 Pool reentrancy reporting — same addendum
+- [x] P3.3a Pool capability parity — `.work/p3-runtime-knob-parity.md`
+- [x] P3.4 Decoder capability/policy split — same addendum
+- [x] P3.5 Effective AMX/x86 decoder knobs — same addendum
+
+## Qualification gates (provisional, become hard only after MT-1)
+
+| dimension | mandatory | preferred |
+|---|---|---|
+| correctness | parity PASS; errors = rejects = timeouts = 0 | |
+| TTFB / TTFA p95 | measured independently | < 100 ms / < 500 ms (<= 700 ms only for better continuity) |
+| STREAM_RTF p95 | < 1 | <= 0.90 (<= 0.85 strong) |
+| required_prebuffer p95 | reported | <= 500 ms (<= 250-300 ms strong) |
+| safe_play_start p95 | reported | <= ~1 s (<= ~800 ms strong) |
+| stall_rate@500ms | -> 0 at the operating point | stall_rate@250ms -> 0 |
+| admission / slow client | no induced stall on established streams | |
+
+Never: promote chunk 32 for its RTF; trade cadence for TTFA or RTF for cadence;
+manufacture AMX tasks; treat 2x6 as truth; reopen BF16/W4 as the fix; hide negatives.
+
+## Evidence
+
+`.work/professional-streaming-architecture.md` (cadence law, AMX accounting, candidates,
+envelope, historical classification); `.work/amx-c4-cross-request-20260907.md`,
+`.work/amx-c4-chunk-sweep-20260906.md`, `.work/amx-c4-ragged-threshold-20260906.md`,
+`.work/amx-native-epic.md`, `docs/reference-gcp-c4-standard-24.md`, `docs/runtime-map-c8a-c4.md`.
