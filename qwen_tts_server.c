@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <errno.h>
@@ -1372,6 +1373,10 @@ static void sigint_handler(int sig) {
 static void set_client_timeout(int fd) {
     struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#ifdef TCP_NODELAY
+    int one = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
 }
 
 static int g_conn_chan_fd = -1;
@@ -1818,6 +1823,21 @@ static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block)
     if (j->is_stream && stream_output_enabled()) {
         j->out = stream_output_start(j->fd, j->life_seed);
         if (j->out) j->header_sent = 1; /* header is owned by the writer */
+    } else if (j->is_stream) {
+        /* The batched synchronous path used to wait for the first generated
+         * audio before sending the response headers.  That made TTFB equal
+         * TTFA and hid admission/prefill latency from the client metric.  A
+         * valid stream request is already admitted here, so publish the
+         * chunked response before entering the engine loop. */
+        j->t_write_attempt = srv_now_ms();
+        if (send_chunked_header(j->fd) == 0) {
+            j->header_sent = 1;
+            j->t_write_complete = srv_now_ms();
+        } else {
+            j->client_gone = 1;
+            j->cancelled = 1;
+            j->t_abort_detected = srv_now_ms();
+        }
     }
     *req = j->req;
     *tag = j;
