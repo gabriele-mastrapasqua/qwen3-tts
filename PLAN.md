@@ -90,9 +90,10 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       enqueue and transport-write timestamps must remain distinct.
 - [x] SL-1 Known-text official dual-track layout implemented behind
       QWEN_TTS_STREAM_LAYOUT=1 and carried through CLI, batch and continuous-server
-      admission paths. Local structural smoke passes for short/medium/long text; it
-      remains default-off pending GCP batching, ICL/clone and quality/prefill-scaling
-      gates. Detail: .work/sl1-known-text-stream-layout-20260907.md.
+      admission paths. Local structural smoke and a short GCP 2x6/batch-2 server
+      path+census gate pass for short/medium/long text; it remains default-off pending
+      ICL/clone, quality and prefill-scaling gates. Detail:
+      `.work/sl1-known-text-stream-layout-20260907.md`.
 - [ ] LS-1 Credit-gated per-stream lead/deadline state: playable audio lead is the currency;
       never suppress first audio; EDF order only among eligible work.
 - [ ] LS-3' Small complete decoder calls at safe existing boundaries; q1/q2/q4/q8 floor
