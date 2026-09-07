@@ -68,6 +68,17 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 - [ ] SQ-3 Report amx_dispatch_share, amx_matrix_mac_share, amx_addressable_mac_share and
       amx_request_wall_share separately after each SQ change; never optimize task count.
 
+### P2 -> P3 gate: post-P2 architecture review — detail: `.work/post-p2-streaming-research-agenda.md`
+
+- [ ] AR-1 BLOCKED on the Codex P2 checkpoint (runtime committed, evidence addendum,
+      stable HEAD). Then a read-only architecture review of THAT HEAD: input-length-
+      independent first play, incremental/preemptible prefill, bounded-window continuity,
+      staged serving (vLLM-Omni mechanisms on CPU), decoupled pipeline, lead as the
+      cross-stage currency, long-input qualification; one coherent target architecture
+      with falsifiers and a do-not-implement list.
+- [ ] AR-2 Freeze the revised P3/P4 ordering from AR-1 before Codex resumes; the P3 tasks
+      below are retained but subject to refinement/reordering by AR-1.
+
 ### P3 Lead-aware streaming scheduler — detail: `.work/professional-streaming-architecture.md` E2, E7
 
 - [ ] LS-1 Per-stream playback state (delivered audio, lead, time-to-underrun, first-audio
@@ -103,6 +114,8 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 - [ ] QL-1 Tier B qualification per `.work/professional-streaming-architecture.md` E9;
       discover the maximum GOOD concurrency with margin; publish GOOD streams per cost unit.
+      Qualification dimensions must include short/medium/long/mixed inputs and
+      long-request arrival scenarios (`.work/post-p2-streaming-research-agenda.md` R8).
 - [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
       playback-aware harness only after QL-1 has one trusted reference.
 
@@ -110,6 +123,8 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 - Multi-precision waits behind P0-P3: AMX-2 shared representation, AMX-5 BF16 serving
   policy, AMX-10 W4 feasibility; INT8 is the serving reference.
+  PREFILL-Q (calibration-aware prefill quantization) is a deferred research arm behind
+  the architecture work; detail: `.work/post-p2-streaming-research-agenda.md` R9.
 - Superseded by the envelope: AMX-1, AMX-3, AMX-6, AMX-7, AMX-9 (C4 qualification and
   cross-request decoder aggregation are no longer the next bet; aggregate only for
   isolation/cadence, never for width).
