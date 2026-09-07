@@ -387,7 +387,7 @@ QWEN_SOURCE_COMMIT=<revision-or-build-id> make bench-soak \
 
 | | what it is | why it is the one |
 |---|---|---|
-| **TTFB** | send → status line + headers parsed by the client | the number every TTS server benchmark quotes; printed by every harness (wave, poisson, soak) next to TTFA and stamped independently of it. On the batched server the `200` header is written together with the first audio chunk, so TTFB and TTFA are the same event today; the non-batched path sends headers before synthesis. The harness reports `header_to_audio_ms` so the gap is visible the day headers go out early |
+| **TTFB** | send → status line + headers parsed by the client | the number every TTS server benchmark quotes; printed by every harness (wave, poisson, soak) next to TTFA and stamped independently of it. The batched path now sends the `200` header at admission, before synthesis; the non-batched path already did so. The harness reports `header_to_audio_ms` for the remaining header-to-audio interval |
 | **TTFA** | send → first audio chunk | what a caller hears as responsiveness |
 | **STREAM_RTF** | `(t_done − t_first_chunk) / (audio after the first chunk)`, **per request** | the steady-state capacity metric: below 1.0 the server produces audio faster than it is played, on average over the stream. **Superseded reading (2026-09-07): it does NOT prove that a player starting at the first chunk never stalls** — it is a mean rate and hides delivery in large quanta; use the playback metrics below for continuity |
 | **required_prebuffer** | per request, `max(0, max_i[(t_i − t_first) − audio held before chunk i])` | the smallest delay after first audio at which a 1x player that then never pauses finishes without underrun |

@@ -31,8 +31,9 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   blocks its worker's engine thread (blocking writes, no send timeout).
 - Harness (2026-09-07): one metric core `tests/playback_sim.py` with per-request
   safe_play_start, fixed-buffer stall rates, max_gap, coalesced-read share; marks are
-  client-observed. Batched server still writes the header with the first audio chunk
-  (TTFB = TTFA) via three blocking writes per chunk, no `TCP_NODELAY`: see MT-4.
+  client-observed. Batched synchronous streams now publish the header at admission and
+  accepted sockets set `TCP_NODELAY`; PCM writes remain synchronous unless OUT is enabled.
+  Detail: `.work/mt4-transport-boundary-20260907.md`.
 
 ## Immediate priorities
 
@@ -45,9 +46,10 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       max_gap; summaries in the wave and soak analyzers; `tests/test_playback_sim.py`.
 - [x] MT-3 Superseded readings corrected in `docs/serving-operations.md` section 5,
       `docs/BENCHMARKING.md` sections 7-8, `ENGINEERING.md` section 9, AWS reference notes.
-- [ ] MT-4 Runtime transport fix (no engine change): send the header before synthesis so
-      TTFB is a real event, `TCP_NODELAY` or one `writev` per chunk, optional per-chunk
-      server flush timestamp trace for a direct server-vs-client mark comparison.
+- [x] MT-4 Runtime transport boundary: batched streams send the header before synthesis and
+      accepted sockets use `TCP_NODELAY`; server/client event ordering is proven on the
+      continuous path. Per-chunk flush tracing remains optional and client marks remain
+      client-observed. Detail: `.work/mt4-transport-boundary-20260907.md`.
 
 ### P1 Cadence truth (current binary, Tier A only) — detail: `.work/p1-cadence-truth-20260907.md`
 

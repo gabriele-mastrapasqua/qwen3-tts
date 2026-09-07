@@ -48,10 +48,10 @@ threads, engine-owned decoder pool, decoder batching on, server batch cap 2.
 
 ## Unknowns
 
-- Whether client receive marks track server flushes closely enough: the server does not
-  set `TCP_NODELAY`, the `200` header travels with the first audio chunk (so TTFB and
-  TTFA are currently the same event), and the harness reads through Python HTTP
-  buffering. Until audited, prebuffer/stall are "client-observed" quantities.
+- Whether client receive marks track server flushes closely enough: the harness reads
+  through Python HTTP buffering, so prebuffer/stall remain "client-observed" quantities.
+  MT-4 now sends the batched-stream header at admission and sets `TCP_NODELAY`; the
+  synchronous PCM callback still uses blocking writes. See the MT-4 addendum.
 - The decoder's fixed per-call intercept and per-frame slope have not been measured
   directly; they are inferred from the chunk sweep (see Evidence, E3).
 - Whether a single-engine Talker step at B=2..4 actually amortizes the weight read on this
@@ -248,15 +248,15 @@ allowed to invalidate latency-drift interpretation (fix the schedule, report the
 
 Transport audit, read from `qwen_tts_server.c` and CPython 3.10 `http.client`:
 
-- Batched server: the `200` header is written lazily by `sink_on_chunk` together with the
-  first non-empty audio chunk; nothing reaches the socket before synthesis. Non-batched
-  `handle_tts_stream` writes the header before any model work. TTFB therefore equals TTFA
-  on the batched path today; the harness stamps both independently and reports
-  `header_to_audio_ms` so the gap becomes visible once headers go out early (MT-4).
-- Each chunk is three blocking `write(2)` calls (size line, payload, CRLF); no
-  `TCP_NODELAY`, `writev`, `MSG_MORE`, `SO_SNDTIMEO` or non-blocking mode anywhere; no
-  server-side PCM accumulation on the streaming path; the terminator and `close()` are
-  synchronous from the engine thread. Chunk boundaries are the engine's decode quanta.
+- Batched server: MT-4 sends the `200` header from `sink_next_job` immediately after
+  admission, before the continuous engine loop. Non-batched `handle_tts_stream` already
+  sends the header before model work. The harness stamps TTFB and TTFA independently and
+  reports `header_to_audio_ms`; the short AMX server screen observed zero coalesced reads.
+- Each PCM chunk remains three blocking `write(2)` calls (size line, payload, CRLF); MT-4
+  sets `TCP_NODELAY` on accepted sockets but does not add `writev`, `MSG_MORE`, a synchronous
+  send timeout or non-blocking mode. There is no server-side PCM accumulation on the
+  synchronous path; the terminator and `close()` remain synchronous from the engine thread.
+  Chunk boundaries are the engine's decode quanta.
 - Client mark = the instant `HTTPResponse.read1()` returns one HTTP chunk (or part of one)
   to the harness, after the GIL is reacquired. `read1` never spans two chunks and does not
   wait for the chunk's trailing CRLF (consumed lazily at the next call). A late reader finds
@@ -272,10 +272,9 @@ Transport audit, read from `qwen_tts_server.c` and CPython 3.10 `http.client`:
   decodes framing by hand and reads the CRLF before stamping, so its per-chunk stamps
   differ by exactly that CRLF wait; it remains the C=1 TTFA oracle.
 - Verdict: transport buffering does not destroy cadence fidelity; it biases marks late by
-  a measurable, per-run-reported amount. No runtime change was required to proceed. The
-  smallest transport fix, kept as MT-4 (runtime): send the header before synthesis,
-  `TCP_NODELAY` or one `writev` per chunk, and a per-chunk server flush timestamp trace
-  for a direct server-versus-client mark comparison.
+  a measurable, per-run-reported amount. MT-4 is now implemented: the batched header is a
+  pre-synthesis event and accepted sockets use `TCP_NODELAY`. A per-chunk server flush
+  timestamp remains optional; the async output feature, not MT-4, owns slow-client isolation.
 
 Metric definitions now implemented once in `tests/playback_sim.py` and consumed by
 `tests/soak_client.py`, `tests/serve_parallel_wave.py`, `tests/soak_drift.py`:
