@@ -109,6 +109,46 @@ static void sd_tmp_free(void *p) {
 }
 int qwen_sd_stream_scratch_grows(const qwen_sd_stream_state_t *st) { return st && st->scratch ? ((sd_arena_t *)st->scratch)->grows : 0; }
 
+/* The ragged AMX worker is a separate path from the per-stream arena: its task can run on
+ * any engine-pool worker and its panel scratch is valid only until that task returns.  Keep
+ * the same grow-once ownership rule as the generic decoder workers, but leave it opt-in until
+ * the server-level allocation/latency trade-off is measured.  The capacity is in bytes and is
+ * per pthread, not per decoder call. */
+typedef struct {
+    float  *col;  size_t col_bytes;
+    int8_t *colq; size_t colq_bytes;
+    float  *sa;   size_t sa_bytes;
+} sd_rag_panel_tls_t;
+static __thread sd_rag_panel_tls_t g_sd_rag_panel_tls;
+
+static int sd_rag_panel_scratch_enabled(void) {
+    static atomic_int en = -1;
+    int v = atomic_load_explicit(&en, memory_order_acquire);
+    if (v < 0) {
+        const char *e = getenv("QWEN_SD_RAG_PANEL_SCRATCH");
+        int want = e && *e && *e != '0';
+        int expected = -1;
+        if (!atomic_compare_exchange_strong_explicit(&en, &expected, want,
+                                                     memory_order_release,
+                                                     memory_order_relaxed))
+            want = expected;
+        v = want;
+    }
+    return v;
+}
+
+static void *sd_rag_panel_reserve(void **slot, size_t *capacity, size_t bytes) {
+    if (bytes == 0) return NULL;
+    if (bytes > *capacity) {
+        void *p = aligned_malloc(bytes);
+        if (!p) return NULL;
+        free(*slot);
+        *slot = p;
+        *capacity = bytes;
+    }
+    return *slot;
+}
+
 #ifdef QWEN_HAVE_CUDA
 #include "qwen_tts_cuda.h"
 static inline void SD_GEMM(int ta,int tb,int M,int N,int K,float al,const float *A,int lda,
@@ -3082,15 +3122,27 @@ typedef struct {
 static void sd_rag_panel_worker(void *vj) {
     sd_rag_panel_job_t *j = (sd_rag_panel_job_t *)vj;
     const size_t col_bytes = (size_t)j->nc_cap * (size_t)j->K * sizeof(float);
-    float *col = (float *)aligned_malloc(col_bytes);
+    const int reuse = sd_rag_panel_scratch_enabled();
+    float *col = reuse
+        ? (float *)sd_rag_panel_reserve((void **)&g_sd_rag_panel_tls.col,
+                                        &g_sd_rag_panel_tls.col_bytes, col_bytes)
+        : (float *)aligned_malloc(col_bytes);
     int8_t *colq = NULL;
     float *sa = NULL;
     if (j->use_d && !j->use_bf16) {
-        colq = (int8_t *)aligned_malloc((size_t)j->nc_cap * (size_t)j->Kp);
-        sa = (float *)aligned_malloc((size_t)j->nc_cap * (size_t)j->nblk * sizeof(float));
+        const size_t colq_bytes = (size_t)j->nc_cap * (size_t)j->Kp;
+        const size_t sa_bytes = (size_t)j->nc_cap * (size_t)j->nblk * sizeof(float);
+        colq = reuse
+            ? (int8_t *)sd_rag_panel_reserve((void **)&g_sd_rag_panel_tls.colq,
+                                              &g_sd_rag_panel_tls.colq_bytes, colq_bytes)
+            : (int8_t *)aligned_malloc(colq_bytes);
+        sa = reuse
+            ? (float *)sd_rag_panel_reserve((void **)&g_sd_rag_panel_tls.sa,
+                                            &g_sd_rag_panel_tls.sa_bytes, sa_bytes)
+            : (float *)aligned_malloc(sa_bytes);
     }
     if (!col || (j->use_d && !j->use_bf16 && (!colq || !sa))) {
-        free(col); free(colq); free(sa);
+        if (!reuse) { free(col); free(colq); free(sa); }
         atomic_store(&j->failed, 1);
         return;
     }
@@ -3175,7 +3227,7 @@ static void sd_rag_panel_worker(void *vj) {
         }
     }
     if (j->stats_on) sd_rag_stats_merge(&j->stats, &local);
-    free(col); free(colq); free(sa);
+    if (!reuse) { free(col); free(colq); free(sa); }
 }
 
 /* The production request-batching path uses rag_conv1d rather than the per-stream
