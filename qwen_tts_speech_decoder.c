@@ -3323,6 +3323,27 @@ static int rag_conv1d(float *out, const float *in, int in_ch, int out_ch,
     return 0;
 }
 
+/* SQ-2d: the ragged residual blocks have no causal tail on the final 1x1
+ * projection.  Keep the global column-major workset and use the same AMX
+ * Design-D epilogue as the per-slot path: output = residual + W*input + bias.
+ * The caller retains the old BLAS projection plus explicit add when this
+ * experimental arm is disabled or the shape/cache is unavailable. */
+static int rag_conv1d_fused_residual(float *out, const float *in,
+                                     const float *residual, int channels,
+                                     const sd_rag_t *r,
+                                     const float *w, const float *bias) {
+    if (!sd_fused_residual_enabled() || !sd_amx_d_enabled() ||
+        !qwen_sd_int8_usable(channels, channels) || !r ||
+        r->total <= 0 || r->total > INT_MAX)
+        return 0;
+    sd_wq_entry_t *e = sd_wq_get_conv(w, channels, channels);
+    if (!e || !e->amx_d_wpack) return 0;
+    qwen_conv1d_int8_design_d_residual(
+        out, in, residual, e->q, e->scales, e->wsum, bias, e->amx_d_wpack,
+        channels, channels, (int)r->total, 1, 1, e->Kp, sd_int8_blk());
+    return 1;
+}
+
 static float *rag_convt_direct(const float *in, int in_ch, int out_ch,
                                const sd_rag_t *rin, int kernel, int stride,
                                const float *w, const float *bias, float * const *carries,
@@ -3645,14 +3666,31 @@ static int conv_decoder_forward_streaming_batch(qwen_tts_ctx_t *ctx,
                                   (long)rg->total, 1, 1);
                 }
                 UP_T0();
-                rag_conv1d(c2_out, signal, cur_ch, cur_ch, rg, 1, 1,
-                           ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias, NULL);
+                const int fused_residual = rag_conv1d_fused_residual(
+                    c2_out, signal, res, cur_ch, rg,
+                    ub->res_blocks[r].conv2_weight, ub->res_blocks[r].conv2_bias);
+                if (!fused_residual)
+                    rag_conv1d(c2_out, signal, cur_ch, cur_ch, rg, 1, 1,
+                               ub->res_blocks[r].conv2_weight,
+                               ub->res_blocks[r].conv2_bias, NULL);
                 UP_ACC(sd_up_res2);
 
-                { UP_T0();
-                  for (int64_t i = 0; i < nel; i++) signal[i] = res[i] + c2_out[i];
-                  UP_ACC(sd_up_resadd); }
-                { UP_T0(); free(c2_out); free(res); UP_ACC(sd_up_alloc); }
+                if (fused_residual) {
+                    /* Design-D already wrote residual + projection into c2_out.
+                     * Keep that separate result as the next signal so the input
+                     * remains valid until the AMX call has completed. */
+                    free(signal);
+                    signal = c2_out;
+                    c2_out = NULL;
+                    free(res);
+                } else {
+                    { UP_T0();
+                      for (int64_t i = 0; i < nel; i++) signal[i] = res[i] + c2_out[i];
+                      UP_ACC(sd_up_resadd); }
+                    free(c2_out);
+                    free(res);
+                }
+                { UP_T0(); UP_ACC(sd_up_alloc); }
             }
         }
     }
