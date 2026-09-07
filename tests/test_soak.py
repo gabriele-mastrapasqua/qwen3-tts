@@ -32,6 +32,26 @@ class SoakTests(unittest.TestCase):
         self.assertAlmostEqual(result["prebuffer_s"], 0.5)
         self.assertEqual(result["chunks"], 3)
 
+    def test_stream_kpis_playback_fields_and_csv_layout(self):
+        # 48000 bytes = 1.0 s of audio.  Third mark field = seconds blocked in the read;
+        # the last read returned already-queued data (coalesced).
+        marks = [(0.5, 48000, 0.5), (1.5, 48000, 1.0), (3.0, 48000, 1.5), (3.0001, 48000, 0.0001)]
+        result = soak_client.stream_kpis(marks, 3.1)
+        self.assertAlmostEqual(result["safe_play_start_ms"], 1000.0)   # 3.0 − 2.0 s held
+        self.assertAlmostEqual(result["prebuffer_s"], 0.5)
+        self.assertAlmostEqual(result["max_gap_s"], 1.5, places=3)
+        self.assertEqual(result["coalesced_reads"], 1)
+        # A 250 ms or 1 s buffer starts at 0.5 (1.0 s held), runs dry at 2.5, resumes at 3.0.
+        self.assertEqual(result["stalls_at_250"], 1)
+        self.assertAlmostEqual(result["stall_ms_at_250"], 500.0, places=1)
+        self.assertEqual(result["stalls_at_1000"], 1)
+        for column in soak_client.PLAYBACK_COLUMNS:
+            self.assertIn(column, soak_client.CSV_COLUMNS)
+            if column != "header_to_audio_ms":
+                self.assertIn(column, result)
+        self.assertEqual(soak_client.CSV_COLUMNS[-1], "error")
+        self.assertEqual(soak_client.CSV_COLUMNS[-6], "is_probe")
+
     def test_stable_windows_are_assessed(self):
         fields = [
             "t_end_s", "worker", "i", "ttfa_ms", "total_ms", "bytes",

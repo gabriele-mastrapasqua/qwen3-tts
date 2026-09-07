@@ -134,8 +134,10 @@ actually receive the change (rule 4). Common-looking code is not common behaviou
 
 WAVE (screening) · SOAK (the production gate) · POISSON (overload) · DIAGNOSTIC
 (profiling, never a number). Never a bare "RTF". Report separately: STREAM_RTF
-p50/p95, TOTAL_RTF when relevant, TTFA p50/p95, request count, errors/rejects/timeouts,
-wall duration, artifact path.
+p50/p95, TOTAL_RTF when relevant, TTFB and TTFA p50/p95, required_prebuffer and
+safe_play_start p50/p95, stall_rate@250/@500, request count, errors/rejects/timeouts,
+wall duration, artifact path. STREAM_RTF below one is capacity, not continuity
+(`docs/serving-operations.md` §5).
 
 ## 10. Run lifecycle is strict
 

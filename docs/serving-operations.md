@@ -387,17 +387,25 @@ QWEN_SOURCE_COMMIT=<revision-or-build-id> make bench-soak \
 
 | | what it is | why it is the one |
 |---|---|---|
-| **TTFB** | send → first byte of the HTTP response (status line + headers) | the number every TTS server benchmark quotes; printed by every harness (wave, poisson, soak) next to TTFA. On this server the `200` header travels with the first audio chunk, so TTFB ≈ TTFA today — the day headers go out early (an "accepted" reply before synthesis) the gap becomes queue + admission, and it must already be on the page |
+| **TTFB** | send → status line + headers parsed by the client | the number every TTS server benchmark quotes; printed by every harness (wave, poisson, soak) next to TTFA and stamped independently of it. On the batched server the `200` header is written together with the first audio chunk, so TTFB and TTFA are the same event today; the non-batched path sends headers before synthesis. The harness reports `header_to_audio_ms` so the gap is visible the day headers go out early |
 | **TTFA** | send → first audio chunk | what a caller hears as responsiveness |
-| **STREAM_RTF** | `(t_done − t_first_chunk) / (audio after the first chunk)`, **per request** | below 1.0 a player starting at the first chunk never stalls |
+| **STREAM_RTF** | `(t_done − t_first_chunk) / (audio after the first chunk)`, **per request** | the steady-state capacity metric: below 1.0 the server produces audio faster than it is played, on average over the stream. **Superseded reading (2026-09-07): it does NOT prove that a player starting at the first chunk never stalls** — it is a mean rate and hides delivery in large quanta; use the playback metrics below for continuity |
+| **required_prebuffer** | per request, `max(0, max_i[(t_i − t_first) − audio held before chunk i])` | the smallest delay after first audio at which a 1x player that then never pauses finishes without underrun |
+| **safe_play_start** | per request, `max_i (t_i − audio held before chunk i)`, then p50/p95 over requests | the earliest time after the request at which playback can begin and finish without underrun; computed from each request's own timeline, never as TTFA plus a prebuffer percentile |
+| **stall_rate@B** | share of requests with at least one stall under a B ms audio jitter buffer (100/250/500/1000), with re-buffering after an underrun | the production question: what fraction of streams play continuously with a realistic buffer |
 | **rejects / errors** | refused or failed requests | a fast server that drops requests is not fast |
 
 `STREAM_RTF` is computed per request and then aggregated. Percentiles are taken over requests,
 **never as a ratio of percentiles** — that is how a "part" once came out larger than the "whole"
 in a table nobody could explain for a day.
 
-Everything else the harnesses print — total RTF, engine service time, queue decomposition,
-prebuffer and underrun simulation — is **diagnostic**. It explains a KPI; it does not become one.
+All playback quantities are **client-observed**: a mark is the return of the client's chunked
+read, which does not wait for the chunk's trailing CRLF but can return already-queued data
+when the reader is late (several chunks then carry near-identical timestamps). The harness
+counts those `coalesced reads`; when the share is small the cadence numbers are tight upper
+bounds on server lateness, when it is large the run is a diagnostic. Detail and the transport
+audit: `.work/professional-streaming-architecture.md` (MT-1). Total RTF, engine service time
+and queue decomposition remain diagnostics that explain a KPI.
 
 ---
 

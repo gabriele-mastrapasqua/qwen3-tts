@@ -158,6 +158,12 @@ never stall.
 
 ## 4b. The latency a listener actually feels
 
+> Reading note (2026-09-07): the prebuffer in this section is the zero-buffer client
+> diagnostic of the harness at the time; fixed-buffer stall rates and per-request
+> `safe_play_start` were not measured, so "never stall"/"gapless" here means "under the
+> observed arrival timeline with exactly that delay", not a qualified continuity claim.
+> Definitions: `docs/serving-operations.md` §5.
+
 TTFA is when the first chunk arrives, not when playback can begin. A player that starts at TTFA
 and then stalls is worse than one that waits. The harness reports the prebuffer that would make
 a stream gapless, so the honest single number is **TTFA + prebuffer**:

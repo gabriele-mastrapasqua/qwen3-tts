@@ -6,6 +6,7 @@ RUN_DATE = datetime.date.today().isoformat()
 import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import serve_procstats as PS
+import playback_sim as PB
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 try:
     import topology as TOPO                       # execution-domain identity for each cell
@@ -126,37 +127,19 @@ def _write_wav(path, pcm):
         f.write(hdr); f.write(pcm)
 
 def stream_kpis(marks, total_s):
-    """marks = [(t_rel_s, nbytes)] in arrival order, t_rel measured from request send.
+    """marks = [(t_rel_s, nbytes[, blocked_s])] in arrival order, t_rel from request send.
 
-    underrun_s simulates a zero-jitter-buffer player that starts the instant the first
-    chunk lands and never pauses on purpose: between two chunk arrivals it plays what
-    it holds, and any wall time it spends with an empty buffer is counted. Reported
-    both as a total and as the worst single stall.
+    All definitions live in tests/playback_sim.py (single source).  The legacy keys are
+    kept for the JSON consumers (tools/envelope_report.py, profile_cpu.sh, costmap_ab.sh);
+    the ``playback`` sub-dict carries the full client-observed set: required prebuffer,
+    per-request safe_play_start, zero-buffer and fixed-buffer (100/250/500/1000 ms)
+    stalls, raw cadence and the coalesced-read count that bounds receive fidelity.
     """
-    if len(marks) < 2:
-        return {"stream_rtf": float("nan"), "underrun_s": float("nan"),
-                "stall_max_s": float("nan"), "chunks": len(marks), "ratios": []}
-    t_first = marks[0][0]
-    rest_bytes = sum(nb for _, nb in marks[1:])
-    rest_s = rest_bytes / 2.0 / 24000.0
-    stream_rtf = (total_s - t_first) / rest_s if rest_s > 0 else float("nan")
-
-    ratios, avail, play, prev_t, stall, stall_max = [], marks[0][1] / 48000.0, 0.0, t_first, 0.0, 0.0
-    prebuf = 0.0
-    for t, nb in marks[1:]:
-        dur = nb / 2.0 / 24000.0
-        gap = t - prev_t
-        if dur > 0: ratios.append(gap / dur)
-        prebuf = max(prebuf, (t - t_first) - avail)
-        want = play + gap
-        if want > avail:
-            d = want - avail
-            stall += d; stall_max = max(stall_max, d); play = avail
-        else:
-            play = want
-        avail += dur; prev_t = t
-    return {"stream_rtf": stream_rtf, "underrun_s": stall, "stall_max_s": stall_max,
-            "prebuffer_s": max(0.0, prebuf), "chunks": len(marks), "ratios": ratios}
+    k = PB.timeline_kpis(marks, total_s)
+    return {"stream_rtf": k["stream_rtf"], "underrun_s": k["underrun_total_s"],
+            "stall_max_s": k["stall_max_s"], "prebuffer_s": k["required_prebuffer_s"],
+            "chunks": k["chunks"], "ratios": k.get("gap_ratios", []),
+            "playback": {kk: vv for kk, vv in k.items() if kk != "gap_ratios"}}
 
 def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed=42):
     if not TEXTS:
@@ -171,11 +154,15 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
         with urllib.request.urlopen(req, timeout=1200) as r:
             ttfb = time.time() - t0          # urlopen returns once the status line + headers are in
             while True:
+                # One read1 = at most one HTTP chunk; the third mark field is the time
+                # spent blocked in the call (near zero = data was already queued, so the
+                # mark overstates that chunk's lateness; counted as a coalesced read).
+                t_call = time.time()
                 ch = r.read1(65536)
                 if not ch: break
                 tnow = time.time() - t0
                 if ttfa is None: ttfa = tnow
-                marks.append((tnow, len(ch)))
+                marks.append((tnow, len(ch), tnow + t0 - t_call))
                 n += len(ch)
                 if SAVE_AUDIO_DIR is not None: chunks.append(ch)
     except Exception as e:
@@ -640,6 +627,7 @@ def main():
                     "prebuf_p50": pct([r["prebuffer_s"] for r in ok], 50),
                     "prebuf_p95": pct([r["prebuffer_s"] for r in ok], 95),
                     "prebuf_max": max((r["prebuffer_s"] for r in ok), default=float("nan")),
+                    "playback": PB.summarize([r["playback"] for r in ok if "playback" in r]),
                     "gap_ratio_p50": pct([x for r in ok for x in r.get("ratios", [])], 50),
                     "gap_ratio_p95": pct([x for r in ok for x in r.get("ratios", [])], 95),
                     "gap_ratio_max": max((x for r in ok for x in r.get("ratios", [])),
@@ -699,11 +687,9 @@ def main():
                       f" p95 {row['gap_ratio_p95']:.2f} max {row['gap_ratio_max']:.2f}"
                       f"  |  {row['chunks_p50']:.0f} chunks, {row['audio_p50']:.2f} s audio",
                       flush=True)
-                print(f"     PREBUFFER needed for zero stall: p50 {row['prebuf_p50']*1000:.0f} ms"
-                      f" p95 {row['prebuf_p95']*1000:.0f} ms max {row['prebuf_max']*1000:.0f} ms"
-                      f"  ->  playback can start at TTFA+prebuf ="
-                      f" {row['ttfa_p50'] + row['prebuf_p50']*1000:.0f} ms (p50),"
-                      f" {row['ttfa_p95'] + row['prebuf_p95']*1000:.0f} ms (p95)", flush=True)
+                # safe_play_start is computed PER REQUEST from its own timeline and then
+                # aggregated; it is never TTFA plus a prebuffer percentile.
+                print(PB.format_summary(row["playback"], indent="     "), flush=True)
                 with open(os.path.join(a.out,
                           f"{RUN_DATE}_{result_slug(workload_class(a.text_file, a.classes), ARRIVAL_TRUE_WAVE, topo, C, label, a.precision)}_requests.jsonl"), "w") as rf:
                     for r in ok: rf.write(json.dumps(r) + "\n")

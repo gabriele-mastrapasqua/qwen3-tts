@@ -30,30 +30,32 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   batching, and is not evidence against a single engine.
 - Inline prefill stalls every established stream 108-240 ms per admission; a slow client
   blocks its worker's engine thread (blocking writes, no send timeout).
-- Harness: TTFB/TTFA, STREAM_RTF, zero-buffer prebuffer/underrun/stall_max only; no
-  per-request safe_play_start, no fixed-buffer stall rates, transport unaudited (no
-  `TCP_NODELAY`; header travels with the first audio chunk, so TTFB = TTFA today).
+- Harness (2026-09-07): one metric core `tests/playback_sim.py` with per-request
+  safe_play_start, fixed-buffer stall rates, max_gap, coalesced-read share; marks are
+  client-observed. Batched server still writes the header with the first audio chunk
+  (TTFB = TTFA) via three blocking writes per chunk, no `TCP_NODELAY`: see MT-4.
 
 ## Immediate priorities
 
-### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11
+### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11, E12
 
-- [ ] MT-1 Audit receive-mark semantics (server flush vs socket vs HTTP buffering,
-      Nagle, header timing); define TTFB independently of TTFA; keep prebuffer labelled
-      "client-observed" until proven.
-- [ ] MT-2 Per-request `safe_play_start` from the actual timeline (earliest 1x start
-      that finishes without underrun), aggregated p50/p95; add stall_rate@100/250/500/
-      1000 ms and total_stall_ms@buffer to `tests/playback_sim.py` with self-tests in
-      `tests/test_soak.py`; standard summaries in `tests/serve_soak.py` and
-      `tests/serve_parallel_wave.py`.
-- [ ] MT-3 Correct superseded interpretations non-destructively: `docs/serving-operations.md`
-      section 5, `docs/BENCHMARKING.md` sections 7-8, annotate the AWS/GCP reference notes.
+- [x] MT-1 Receive-mark semantics audited; TTFB stamped independently of TTFA
+      (`header_to_audio_ms`); coalesced-read share reported per run — detail:
+      `.work/professional-streaming-architecture.md` E12.
+- [x] MT-2 Per-request `safe_play_start`, stall_rate/stall_ms @100/250/500/1000 ms,
+      max_gap; summaries in the wave and soak analyzers; `tests/test_playback_sim.py`.
+- [x] MT-3 Superseded readings corrected in `docs/serving-operations.md` section 5,
+      `docs/BENCHMARKING.md` sections 7-8, `ENGINEERING.md` section 9, AWS reference notes.
+- [ ] MT-4 Runtime transport fix (no engine change): send the header before synthesis so
+      TTFB is a real event, `TCP_NODELAY` or one `writev` per chunk, optional per-chunk
+      server flush timestamp trace for a direct server-vs-client mark comparison.
 
 ### P1 Cadence truth (current binary, Tier A only)
 
 - [ ] CT-1 Chunk-quantum discriminator at C3 and C4 on 2x6: chunk 8, chunk 32, chunk 8
-      with gang join disabled; `[DECODE] dur_ms` and `[ITER]` traces on. Pass = prebuffer
-      tracks rho_f x quantum; also yields CT-2 and CT-4 data.
+      with gang join disabled; `[DECODE] dur_ms` and `[ITER]` traces on
+      (`QWEN_TTFA_TRACE=1`). Pass = required_prebuffer p95 tracks rho_f x quantum and
+      stall_rate@500 separates the arms; also yields CT-2 and CT-4 data.
 - [ ] CT-2 Decoder fixed intercept and per-frame slope from dur_ms vs frames, plus
       `[SDPHASE]` attribution (tile vs glue). Intercept < 10 ms and slope < 8 ms/frame
       demotes SQ-1.

@@ -244,6 +244,62 @@ allowed to invalidate latency-drift interpretation (fix the schedule, report the
 | AWS/GCP reference docs (c8a, c8i, c4) | hardware/backend performance evidence; continuity claims there rest on zero-buffer prebuffer, fixed-buffer stall rates not measured |
 | `.work/amx-ragged-scheduler-review-3f7e0df.md` | correctness review, still valid |
 
+### E12. MT-1/MT-2 result (2026-09-07): receive-marker semantics and metric definitions
+
+Transport audit, read from `qwen_tts_server.c` and CPython 3.10 `http.client`:
+
+- Batched server: the `200` header is written lazily by `sink_on_chunk` together with the
+  first non-empty audio chunk; nothing reaches the socket before synthesis. Non-batched
+  `handle_tts_stream` writes the header before any model work. TTFB therefore equals TTFA
+  on the batched path today; the harness stamps both independently and reports
+  `header_to_audio_ms` so the gap becomes visible once headers go out early (MT-4).
+- Each chunk is three blocking `write(2)` calls (size line, payload, CRLF); no
+  `TCP_NODELAY`, `writev`, `MSG_MORE`, `SO_SNDTIMEO` or non-blocking mode anywhere; no
+  server-side PCM accumulation on the streaming path; the terminator and `close()` are
+  synchronous from the engine thread. Chunk boundaries are the engine's decode quanta.
+- Client mark = the instant `HTTPResponse.read1()` returns one HTTP chunk (or part of one)
+  to the harness, after the GIL is reacquired. `read1` never spans two chunks and does not
+  wait for the chunk's trailing CRLF (consumed lazily at the next call). A late reader finds
+  several chunks in the 8 KiB buffer or the kernel queue and returns them microseconds
+  apart, so N server emissions can appear as N marks at one instant: the earlier ones are
+  stamped LATE, and prebuffer/stall are upper bounds on server lateness. Each mark now
+  carries the time blocked in the read; a value under 1 ms is a `coalesced read` and the
+  share is reported per run (`coalesced reads x%`). The soak runs one client process per
+  stream; the wave uses threads in one interpreter and is more exposed.
+- Nagle: with three writes per chunk the 2-byte CRLF can be held for a delayed ACK on a
+  real network, which shifts to the NEXT chunk's inter-arrival gap (the CRLF is read
+  lazily). All harnesses use loopback, where this is not observable. `tests/load_test.py`
+  decodes framing by hand and reads the CRLF before stamping, so its per-chunk stamps
+  differ by exactly that CRLF wait; it remains the C=1 TTFA oracle.
+- Verdict: transport buffering does not destroy cadence fidelity; it biases marks late by
+  a measurable, per-run-reported amount. No runtime change was required to proceed. The
+  smallest transport fix, kept as MT-4 (runtime): send the header before synthesis,
+  `TCP_NODELAY` or one `writev` per chunk, and a per-chunk server flush timestamp trace
+  for a direct server-versus-client mark comparison.
+
+Metric definitions now implemented once in `tests/playback_sim.py` and consumed by
+`tests/soak_client.py`, `tests/serve_parallel_wave.py`, `tests/soak_drift.py`:
+
+| metric | definition (per request, marks `(t_i, bytes_i)` from request send, audio `d_i`) |
+|---|---|
+| TTFB | status line + headers parsed by the client |
+| TTFA | `t_0`, first non-empty audio chunk |
+| STREAM_RTF | `(t_done − t_0) / Σ_{i>=1} d_i` |
+| required_prebuffer | `max(0, max_{i>=1} [(t_i − t_0) − Σ_{j<i} d_j])` |
+| safe_play_start | `max_{i>=0} (t_i − Σ_{j<i} d_j)`, direct scan; equals TTFA + required_prebuffer per request, aggregated p50/p95 over requests |
+| zero-buffer player | starts at `t_0`, pauses only when empty: `underrun_total`, `stall_max`, `stall_count` |
+| fixed-buffer player @B | starts when B s of audio is buffered (or the stream ended), re-buffers B after an underrun: `stall_ms@B`, `stalls@B`, `stall_max_ms@B`, `start_delay_ms@B`, B in {100, 250, 500, 1000}; @0 reproduces the zero-buffer player |
+| stall_rate@B | share of requests with `stalls@B > 0`; `prebuffer_le_rate@B` = share with required_prebuffer <= B (a time-based start delay of B is stall-free exactly for those) |
+| max_gap | largest inter-arrival gap after `t_0`; `gap_ratio_max` = max gap / chunk audio |
+| coalesced reads | reads that returned in under 1 ms (already-queued data) over all reads |
+
+Tests: `python3 tests/playback_sim.py` (known-answer self-test), `python3
+tests/test_playback_sim.py` (smooth, bursty quanta, late-first-chunk, repeated-gap,
+degenerate, summaries), `python3 tests/test_soak.py` (CSV layout, drift analyzer with and
+without the new columns). CSV columns appended: `safe_play_start_ms, header_to_audio_ms,
+max_gap_s, coalesced_reads, stall_ms_at_{100,250,500,1000}, stalls_at_{...}`; older CSVs
+still analyze (absent columns read as n/a, never NaN).
+
 ### E11. Documentation that needs semantic correction (under MT-1, non-destructive)
 
 - `docs/serving-operations.md` section 5: STREAM_RTF row ("below 1.0 a player starting

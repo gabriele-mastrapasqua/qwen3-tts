@@ -477,12 +477,9 @@ def merge_requests(out):
                 fields = reader.fieldnames
             rows.extend(reader)
     if not fields:
-        fields = [
-            "t_end_s", "worker", "i", "ttfb_ms", "ttfa_ms", "total_ms", "bytes",
-            "first_chunk_bytes", "audio_s", "stream_rtf", "underrun_s",
-            "stall_max_s", "prebuffer_s", "gap_ratio_max", "chunks", "is_probe",
-            "class", "text_chars", "seed", "schedule", "error",
-        ]
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import soak_client  # the client owns the column list
+        fields = list(soak_client.CSV_COLUMNS)
     rows.sort(key=lambda row: float(row.get("t_end_s") or "inf"))
     with open(os.path.join(out, "requests.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)

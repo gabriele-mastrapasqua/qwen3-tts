@@ -163,14 +163,24 @@ WAVE: finite screening run. SOAK: sustained fixed-concurrency production qualifi
 POISSON: open-arrival queue/overload characterisation. DIAGNOSTIC: profiling or
 instrumented run; its numbers never substitute qualification numbers. The CLI paragraph
 splitter is never called "batching" in a server report.
+Two tiers (2026-09-07): TIER A, development bench, usually C3 + C4, one architectural
+question per run, never published; TIER B, qualification, the full envelope below on a
+stationary stratified workload. Playback terms: `required_prebuffer`, `safe_play_start`,
+`stall_rate@B`, `max_gap` are defined in `docs/serving-operations.md` §5 and computed by
+`tests/playback_sim.py`; they are client-observed (see the coalesced-read share).
 
 ## 8. Canonical server metrics
 
 Always: requests started, completed, failed, rejected, timeout, outstanding/killed;
-STREAM_RTF p50/p95; TOTAL_RTF p50/p95 when relevant; TTFA p50/p95; throughput (req/s);
-wall duration; artifact path; survivors after teardown. Never a bare "RTF".
-Gate for C=N realtime: errors=rejects=0, no starvation or drift (`soak_drift`),
-TTFA p50 < 500 ms and p95 < 700 ms, STREAM_RTF p50 and p95 < 1 (prefer p95 <= 0.97).
+STREAM_RTF p50/p95; TOTAL_RTF p50/p95 when relevant; TTFB and TTFA p50/p95 (stamped
+independently); required_prebuffer p50/p95; safe_play_start p50/p95; stall_rate@250 and
+@500 with total stall ms; max_gap p95; coalesced-read share; throughput (req/s); wall
+duration; artifact path; survivors after teardown. Never a bare "RTF".
+Gate for C=N (provisional envelope, `PLAN.md`): errors=rejects=0, no starvation or drift
+(`soak_drift`), STREAM_RTF p95 < 1 (prefer <= 0.90), TTFA p95 preferably < 500 ms,
+required_prebuffer p95 preferably <= 500 ms, safe_play_start p95 preferably <= 1 s,
+stall_rate@500 approaching zero. Superseded (2026-09-07): the old gate "STREAM_RTF p50 and
+p95 < 1" alone; RTF below one is a capacity fact, not a continuous-playback proof.
 
 ## 9. Run lifecycle
 

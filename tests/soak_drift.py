@@ -36,10 +36,51 @@ def metric(rows, key):
     }
 
 
+BUFFERS_MS = (100, 250, 500, 1000)
+
+
+def playback_summary(rows):
+    """Client-observed playback block for a window or the sustained set: per-request
+    safe_play_start and required prebuffer percentiles, plus the fixed-buffer stall
+    rates (share of requests with at least one stall under a B ms jitter buffer).
+    Absent columns (older CSVs) yield None, never NaN, so the JSON stays strict."""
+    out = {
+        "safe_play_start": metric(rows, "safe_play_start"),
+        "prebuffer": metric(rows, "prebuffer"),
+        "stall_max": metric(rows, "stall_max"),
+        "max_gap": metric(rows, "max_gap"),
+    }
+    for b in BUFFERS_MS:
+        known = [row for row in rows if row.get(f"stalls_{b}") is not None]
+        stalled = sum(1 for row in known if row[f"stalls_{b}"] > 0)
+        out[f"stall_rate_{b}"] = (stalled / len(known)) if known else None
+        out[f"stall_ms_{b}"] = metric(rows, f"stall_ms_{b}")
+    known = [row for row in rows if row.get("coalesced_reads") is not None
+             and row.get("chunks")]
+    out["coalesced_read_share"] = (
+        sum(row["coalesced_reads"] for row in known) / sum(row["chunks"] for row in known)
+        if known else None)
+    return out
+
+
 def drift_percent(first, last):
     if first is None or last is None or first == 0:
         return None
     return 100.0 * (last - first) / first
+
+
+def format_playback(pb):
+    """One line: safe_play_start, fixed-buffer stall rates, receive fidelity."""
+    sps = pb["safe_play_start"]
+    parts = []
+    for b in BUFFERS_MS:
+        rate = pb[f"stall_rate_{b}"]
+        parts.append(f"@{b}ms " + ("n/a" if rate is None else f"{100 * rate:.0f}%"))
+    rates = " ".join(parts)
+    coal = pb["coalesced_read_share"]
+    return (f"safe_play_start p50/p95 {display(sps['p50'], 0)}/{display(sps['p95'], 0)} ms; "
+            f"max_gap p95 {display(pb['max_gap']['p95'], 3)} s; stall_rate {rates}; "
+            f"coalesced reads {'n/a' if coal is None else f'{100 * coal:.1f}%'}")
 
 
 def drift_pairs(args, has_ttfb):
@@ -85,6 +126,11 @@ def read_requests(path):
                 ("stall_max_s", "stall_max"),
                 ("prebuffer_s", "prebuffer"),
                 ("gap_ratio_max", "gap_ratio_max"),
+                ("safe_play_start_ms", "safe_play_start"),
+                ("max_gap_s", "max_gap"),
+                ("coalesced_reads", "coalesced_reads"),
+                *((f"stall_ms_at_{b}", f"stall_ms_{b}") for b in BUFFERS_MS),
+                *((f"stalls_at_{b}", f"stalls_{b}") for b in BUFFERS_MS),
             ):
                 try:
                     playback[target] = float(raw[source])
@@ -219,6 +265,7 @@ def analyze(directory, args):
             "underrun": metric(group, "underrun"),
             "prebuffer": metric(group, "prebuffer"),
             "stall_max": metric(group, "stall_max"),
+            "playback": playback_summary(group),
             "rows": group,
         })
 
@@ -243,10 +290,11 @@ def analyze(directory, args):
               f"{len(window['mix']):>10}")
         underrun = window["underrun"]
         prebuffer = window["prebuffer"]
-        print(f"              zero-buffer diagnostic: underrun p50/p95 "
+        print(f"              zero-buffer player: underrun p50/p95 "
               f"{display(underrun['p50'], 3)}/{display(underrun['p95'], 3)} s; "
-              f"prebuffer p50/p95 {display(prebuffer['p50'], 3)}/"
+              f"required_prebuffer p50/p95 {display(prebuffer['p50'], 3)}/"
               f"{display(prebuffer['p95'], 3)} s")
+        print("              " + format_playback(window["playback"]))
 
     hard_failures = ["request errors"] if errors else []
     kpi = {"status": "NOT_ASSESSED", "reason": "insufficient comparable windows"}
@@ -366,8 +414,11 @@ def analyze(directory, args):
         "underrun": metric(usable, "underrun"),
         "prebuffer": metric(usable, "prebuffer"),
         "stall_max": metric(usable, "stall_max"),
+        "playback": playback_summary(usable),
         "mix": proportions(usable),
     }
+    print()
+    print("SUSTAINED PLAYBACK (client-observed): " + format_playback(sustained["playback"]))
     if kpi["status"] == "FAIL":
         hard_failures.extend(kpi.get("failures", ["pooled KPI drift"]))
     if any(result["status"] == "FAIL" for result in class_results.values()):

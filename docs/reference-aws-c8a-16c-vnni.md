@@ -126,6 +126,11 @@ half the machine idle while each request runs on four threads.
 
 ### The latency a listener actually feels
 
+> Reading note (2026-09-07): the prebuffer below is the zero-buffer client diagnostic of the
+> harness at the time; fixed-buffer stall rates and per-request `safe_play_start` were not
+> measured, so "never stall"/"gapless" in this section is not a qualified continuity claim.
+> Definitions: `docs/serving-operations.md` §5.
+
 TTFA plus the prebuffer that makes the stream gapless:
 
 | C | `1x16` | `2x8` | `4x4` |
