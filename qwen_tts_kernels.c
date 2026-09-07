@@ -322,7 +322,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
     "QWEN_CP_Q2_FFN",
     /* speech decoder and streaming */
-    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
+    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
     "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
@@ -9837,9 +9837,12 @@ static void sd_gemm_panel(float *out, int out_ld, int M,
 typedef struct {
     float *out;
     const float *in;
+    const float *split_prefix;
+    const float *split_suffix;
     const int8_t *Wq; const int8_t *Wpack;
     const float *sw; const int32_t *wsum; const float *bias;
     int in_ch, out_ch, length, input_length, input_offset;
+    int split_prefix_length, split_suffix_length;
     int kernel, dilation, Kp, blk;
     _Atomic int next_panel;
     _Atomic int entered;      /* workers that reached the body: the honest denominator */
@@ -9876,11 +9879,23 @@ static void sd_conv1d_worker(void *vj) {
             float *dst = colf + (size_t)c * K;
             int tt = j->input_offset + t0 + c - pad_left;
             for (int ic = 0; ic < j->in_ch; ic++) {
-                const float *src = j->in + (size_t)ic * input_length;
                 float *dk = dst + (size_t)ic * j->kernel;
                 for (int kk = 0; kk < j->kernel; kk++) {
                     int pos = tt + kk * j->dilation;
-                    dk[kk] = (pos >= 0 && pos < input_length) ? src[pos] : 0.0f;
+                    if (pos < 0 || pos >= input_length) {
+                        dk[kk] = 0.0f;
+                    } else if (j->split_prefix) {
+                        if (pos < j->split_prefix_length)
+                            dk[kk] = j->split_prefix[(size_t)ic * j->split_prefix_length + pos];
+                        else if (pos - j->split_prefix_length < j->split_suffix_length)
+                            dk[kk] = j->split_suffix[(size_t)ic * j->split_suffix_length
+                                                     + pos - j->split_prefix_length];
+                        else
+                            dk[kk] = 0.0f;
+                    } else {
+                        const float *src = j->in + (size_t)ic * input_length;
+                        dk[kk] = src[pos];
+                    }
                 }
             }
         }
@@ -9981,6 +9996,40 @@ int qwen_conv1d_int8_design_d_range(float *out, const float *in,
         .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = output_length,
         .input_length = input_length, .input_offset = input_offset,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+    };
+    job.nc = sd_conv_nc(output_length, sd_pool_threads());
+    job.n_panels = (output_length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+    return 1;
+}
+
+int qwen_conv1d_int8_design_d_range_split(float *out,
+                                          const float *prefix, int prefix_length,
+                                          const float *suffix, int suffix_length,
+                                          const int8_t *Wq, const float *sw,
+                                          const int32_t *wsum, const float *bias,
+                                          const int8_t *Wpack,
+                                          int in_ch, int out_ch, int output_length,
+                                          int kernel, int dilation, int Kp, int blk) {
+    if (!out || !prefix || !suffix || prefix_length < 0 || suffix_length <= 0 ||
+        Wq == NULL || Wpack == NULL || in_ch <= 0 || out_ch <= 0 || output_length <= 0 ||
+        kernel <= 0 || dilation <= 0 || Kp <= 0 || blk <= 0 ||
+        output_length != suffix_length)
+        return 0;
+    sd_conv_job_t job = {
+        .out = out, .in = NULL,
+        .split_prefix = prefix, .split_suffix = suffix,
+        .Wq = Wq, .Wpack = Wpack, .sw = sw, .wsum = wsum, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = output_length,
+        .input_length = prefix_length + suffix_length,
+        .input_offset = prefix_length,
+        .split_prefix_length = prefix_length,
+        .split_suffix_length = suffix_length,
         .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
     };
     job.nc = sd_conv_nc(output_length, sd_pool_threads());
@@ -10199,6 +10248,21 @@ int qwen_conv1d_int8_design_d_range(float *out, const float *in,
     (void)out; (void)in; (void)Wq; (void)sw; (void)wsum; (void)bias; (void)Wpack;
     (void)in_ch; (void)out_ch; (void)input_length; (void)input_offset;
     (void)output_length; (void)kernel; (void)dilation; (void)Kp; (void)blk;
+    return 0;
+}
+
+int qwen_conv1d_int8_design_d_range_split(float *out,
+                                          const float *prefix, int prefix_length,
+                                          const float *suffix, int suffix_length,
+                                          const int8_t *Wq, const float *sw,
+                                          const int32_t *wsum, const float *bias,
+                                          const int8_t *Wpack,
+                                          int in_ch, int out_ch, int output_length,
+                                          int kernel, int dilation, int Kp, int blk) {
+    (void)out; (void)prefix; (void)prefix_length; (void)suffix; (void)suffix_length;
+    (void)Wq; (void)sw; (void)wsum; (void)bias; (void)Wpack;
+    (void)in_ch; (void)out_ch; (void)output_length; (void)kernel; (void)dilation;
+    (void)Kp; (void)blk;
     return 0;
 }
 

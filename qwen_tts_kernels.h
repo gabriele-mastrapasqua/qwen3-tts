@@ -488,6 +488,18 @@ int qwen_conv1d_int8_design_d_range(float *out, const float *in,
                                     int input_offset, int output_length,
                                     int kernel, int dilation, int Kp, int blk);
 
+/* Streaming causal slice with a split [prefix tail | suffix new-input] source.  The
+ * output is exactly the suffix range, so the caller can avoid materialising the
+ * concatenated fp32 activation buffer.  Return 1 when the backend accepted it. */
+int qwen_conv1d_int8_design_d_range_split(float *out,
+                                          const float *prefix, int prefix_length,
+                                          const float *suffix, int suffix_length,
+                                          const int8_t *Wq, const float *sw,
+                                          const int32_t *wsum, const float *bias,
+                                          const int8_t *Wpack,
+                                          int in_ch, int out_ch, int output_length,
+                                          int kernel, int dilation, int Kp, int blk);
+
 void qwen_conv1d_bf16_amx(float *out, const float *in,
                           const float *bias, const uint16_t *Wpack,
                           int in_ch, int out_ch, int length, int kernel, int dilation,

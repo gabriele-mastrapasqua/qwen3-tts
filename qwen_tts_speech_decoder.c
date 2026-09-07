@@ -284,6 +284,19 @@ static int sd_direct_dwconv_enabled(void) {
     return en;
 }
 
+/* SQ-2c: when the warm Design-D slice only needs the new suffix columns, keep the
+ * causal tail and new input as separate read-only sources.  This removes the per-call
+ * fp32 [tail | input] materialisation; the unchanged concatenated path remains the
+ * fallback if the split backend rejects the shape. */
+static int sd_direct_input_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("QWEN_SD_DIRECT_INPUT");
+        en = e && *e && *e != '0';
+    }
+    return en;
+}
+
 /* BF16 is a separate decoder arm.  It does not depend on the INT8 policy: a server can
  * select BF16 with QWEN_SD_AMX_BF16=1 and QWEN_SD_INT8=0 to measure the two representations
  * without silently paying for an unused INT8 cache. */
@@ -363,6 +376,7 @@ static double sd_cv_t0;
 #define CV_ACC(a_)   do { if (sd_phase_on() && sd_cv_t0 > 0.0) (a_) += sd_ph_now() - sd_cv_t0; } while (0)
 static double sd_c1_ext, sd_c1_conv, sd_c1_cut, sd_c1_tail;
 static long long sd_c1_calls, sd_c1_cols_kept, sd_c1_cols_conv, sd_c1_strip_calls;
+static long long sd_c1_split_input_calls;
 static double sd_c1_t0;
 #define C1_T0()      (sd_c1_t0 = sd_phase_on() ? sd_ph_now() : 0.0)
 #define C1_ACC(a_)   do { if (sd_phase_on() && sd_c1_t0 > 0.0) (a_) += sd_ph_now() - sd_c1_t0; } while (0)
@@ -393,11 +407,13 @@ static double sd_c1_t0;
                   sd_direct_dwconv_calls, sd_p6c - _us);                               \
           fprintf(stderr, "[SDRES1] v=1 pid=%d group=%d frames=%d calls=%lld "             \
                   "ext=%.3f conv=%.3f cut=%.3f sum=%.3f res1=%.3f "                        \
-                  "cols_kept=%lld cols_convolved=%lld strip_calls=%lld discarded=%.1f%%\n", \
+                  "cols_kept=%lld cols_convolved=%lld strip_calls=%lld split_input_calls=%lld " \
+                  "discarded=%.1f%%\n", \
                   (int)getpid(), (group_), (frames_), sd_c1_calls,                         \
                   sd_c1_ext, sd_c1_conv, sd_c1_cut,                                        \
                   sd_c1_ext + sd_c1_conv + sd_c1_cut, sd_up_res1,                          \
                   sd_c1_cols_kept, sd_c1_cols_conv, sd_c1_strip_calls,                       \
+                  sd_c1_split_input_calls,                                                   \
                   sd_c1_cols_conv ? 100.0 * (double)(sd_c1_cols_conv - sd_c1_cols_kept)    \
                                     / (double)sd_c1_cols_conv : 0.0);                     \
           fprintf(stderr, "[SDCONV] v=2 pid=%d seq=%lld frames=%d im2col=%.3f gemm=%.3f "  \
@@ -1978,6 +1994,35 @@ static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
     }
 
     int ext_len = tail_cols + len;
+
+    if (sd_direct_input_enabled() && sd_stream_strip_enabled() &&
+        qwen_sd_int8_usable(in_ch, out_ch)) {
+        float *out = (float *)sd_tmp_alloc((int64_t)out_ch * len * sizeof(float));
+        C1_T0();
+        if (out) {
+            sd_wq_entry_t *e = sd_wq_get_conv(w, out_ch, in_ch * kernel);
+            if (e && e->amx_d_wpack &&
+                qwen_conv1d_int8_design_d_range_split(
+                    out, tail, tail_cols, in, len,
+                    e->q, e->scales, e->wsum, b, e->amx_d_wpack,
+                    in_ch, out_ch, len, kernel, dilation, e->Kp, sd_int8_blk())) {
+                C1_ACC(sd_c1_conv);
+                if (sd_phase_on()) {
+                    sd_c1_calls++;
+                    sd_c1_strip_calls++;
+                    sd_c1_split_input_calls++;
+                    sd_c1_cols_kept += len;
+                    sd_c1_cols_conv += len;
+                }
+                C1_T0();
+                cs_save_tail(tail, in, in_ch, len, tail_cols);
+                C1_ACC(sd_c1_cut);
+                return out;
+            }
+        }
+        sd_tmp_free(out);
+    }
+
     C1_T0();
     float *ext = (float *)sd_tmp_alloc((int64_t)in_ch * ext_len * sizeof(float));
     if (!ext) return NULL;
@@ -2393,6 +2438,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                sd_up_warm = st->cs_warm;
                sd_c1_ext = sd_c1_conv = sd_c1_cut = sd_c1_tail = 0.0;
                sd_c1_calls = sd_c1_cols_kept = sd_c1_cols_conv = sd_c1_strip_calls = 0;
+               sd_c1_split_input_calls = 0;
                sd_c1_t0 = 0.0;
                qwen_snake_expf_calls = qwen_snake_vec_poly = qwen_snake_vec_libm =
                qwen_snake_scalar_tail = 0;
