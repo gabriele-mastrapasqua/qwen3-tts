@@ -167,6 +167,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ### P5 Ownership and batching
 
+- [x] F3 cross-worker cohort coincidence (2026-09-08): in the cap-2 C4 reference,
+      useful natural B>=3 opportunities covered only `2.7%` of steady ready events
+      within ±1 ms, `3.6%` within ±2 ms and `11.7%` within ±8 ms. Global batching is
+      not justified as the next implementation on this 2x6 host; no state consolidation
+      or deliberate batch wait was added. Detail:
+      `.work/f3-cross-worker-cohort-coincidence-20260908.md`.
 - [ ] EO-1/EO-2 Single-engine/global Talker/CP ready set only after P3/P4 coupling is controlled;
       form deadline-compatible cohorts without waiting solely to create B.
 - [ ] AMX Talker/CP only when real B >= 4 work exists. CP stateless re-prefill remains dropped
