@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small LS-4 falsifier: four established streams, then one fifth arrival.
+"""Small admission falsifier: established streams, then one arrival.
 
 The server is started by the caller.  This intentionally keeps the workload
 separate from server startup and records accepted/rejected fifth requests
@@ -93,12 +93,13 @@ def local_gap_stats(rec, inject_ms, window_ms=2000.0):
             "window_max_gap_ms": max(around) if around else None}
 
 
-def run_rep(port, rows, base_seed, settle_ms, speaker, language, rep):
+def run_rep(port, rows, base_seed, settle_ms, speaker, language, rep,
+            established_count=4):
     out, lock = [], threading.Lock()
-    events = [threading.Event() for _ in range(4)]
-    barrier = threading.Barrier(5)
+    events = [threading.Event() for _ in range(established_count)]
+    barrier = threading.Barrier(established_count + 1)
     threads = []
-    for i in range(4):
+    for i in range(established_count):
         t = threading.Thread(
             target=request_one,
             args=(port, rows[i % len(rows)], base_seed + rep * 100 + i,
@@ -113,7 +114,7 @@ def run_rep(port, rows, base_seed, settle_ms, speaker, language, rep):
     fifth_ref = {}
     fifth = threading.Thread(
         target=request_one,
-        args=(port, rows[4 % len(rows)], base_seed + rep * 100 + 4,
+        args=(port, rows[established_count % len(rows)], base_seed + rep * 100 + established_count,
               threading.Event(), threading.Barrier(1), out, lock, "fifth", fifth_ref),
         kwargs={"speaker": speaker, "language": language})
     inject_ms = time.monotonic() * 1000.0
@@ -150,12 +151,16 @@ def main():
     rows = SP.load_texts(a.text_file, only)
     if len(rows) < 1:
         raise SystemExit("no text rows selected")
+    if a.established_count < 1:
+        raise SystemExit("--established-count must be positive")
     result = {"port": a.port, "repeats": a.repeats, "settle_ms": a.settle_ms,
+              "established_count": a.established_count,
               "text_file": os.path.basename(a.text_file), "classes": sorted(only or []),
               "rows": len(rows), "repetitions": []}
     for rep in range(a.repeats):
         result["repetitions"].append(run_rep(
-            a.port, rows, a.seed, a.settle_ms, a.speaker, a.language, rep))
+            a.port, rows, a.seed, a.settle_ms, a.speaker, a.language, rep,
+            a.established_count))
         time.sleep(0.5)
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
