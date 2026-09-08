@@ -41,6 +41,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   batching, and is not evidence against a single engine.
 - Inline prefill stalls every established stream 108-240 ms per admission; a slow client
   blocks its worker's engine thread (blocking writes, no send timeout).
+- LS-4 utilization-aware admission was falsified on the same host: thresholds 40/60/80 ms
+  admitted all tested fifth arrivals, but established STREAM_RTF p95 stayed 0.985-1.004,
+  stall@250 was 50%, and post-admission max-gap p95 reached 653-704 ms. Keep the
+  diagnostic default-off; cap2/q4 remains the reference. Detail:
+  `.work/ls4-utilization-aware-admission-20260908.md`.
 - Harness (2026-09-07): one metric core `tests/playback_sim.py` with per-request
   safe_play_start, fixed-buffer stall rates, max_gap, coalesced-read share; marks are
   client-observed. Batched synchronous streams now publish the header at admission and
@@ -127,10 +132,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       prefix (ICL/reference or retained non-streaming modes); the existing cloned-context
       helper/LOW falsifier is rejected as a serving substitute. Detail:
       `.work/prefill-helper-c34-20260907.md`; do not confuse it with live text.
-- [ ] LS-4 Deadline-aware admission: protect established streams and reject overload rather
-      than queue indefinitely. A bounded prefork sub-result now makes explicit
-      `--max-queue 0` fail fast with parent-side 503; lead-aware admission remains open.
-      Detail: `.work/p4-prefork-admission-bound-20260907.md`.
+- [x] LS-4 Bounded utilization-aware third-slot admission falsifier: the parent health
+      predicate was implemented behind `QWEN_ADMIT_UTIL`, but all predeclared 40/60/80 ms
+      thresholds damaged the established-four playback envelope despite making the fifth
+      request interactive. Keep default-off; do not run a local threshold qualification.
+      Cap2/q4 fail-fast remains the control. Detail:
+      `.work/ls4-utilization-aware-admission-20260908.md`.
 
 ### P4 Overlap and decoder structural cost
 
