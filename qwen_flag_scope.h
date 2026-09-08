@@ -162,6 +162,7 @@ static const qwen_flag_scope_t g_qwen_flag_scope[] = {
     { "QWEN_SERVE_BLAS", 127u },
     { "QWEN_SERVE_BLAS_BUSY", 127u },
     { "QWEN_SERVE_PROFILE", 127u },
+    { "QWEN_STAGE_TRACE", 127u },
     { "QWEN_SHAPE_CENSUS", 127u },
     { "QWEN_SMMLA_MIN_B", 127u },
     { "QWEN_SPK_DEBUG", 127u },

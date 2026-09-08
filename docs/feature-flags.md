@@ -308,7 +308,7 @@ not be present, and the benchmark suite refuses to run when one is.
 ## 7. Diagnostics — never in a run that produces a number
 
 `QWEN_TTFA_TRACE`, `QWEN_SD_PHASE`, `QWEN_LIFE_TRACE`, `QWEN_REQ_TRACE`, `QWEN_BATCH_STATS`,
-`QWEN_SERVE_PROFILE`, `QWEN_TF_CODES`, `QWEN_TF_PREFIX`.
+`QWEN_SERVE_PROFILE`, `QWEN_STAGE_TRACE`, `QWEN_TF_CODES`, `QWEN_TF_PREFIX`.
 
 They print phase tables, per-request lifecycles and kernel censuses, and every one of them
 costs time inside the region being timed. A deployment profile declares them `null` for that
@@ -326,6 +326,12 @@ Used for **attribution** rather than timing, two of them answer questions the wa
   active slots, and — the line to read before trusting anything about batching —
   `decoder batch: calls / mean` with `max slots`. A mean of 1.00 means the batch never formed,
   whatever the flag says.
+- `QWEN_STAGE_TRACE=1` prints one `[STAGE]` line per completed active engine iteration with
+  monotonic absolute start/end and phase times, active/stepped slots, decoder group
+  information, whether the decoder ran per-item or ragged, and synchronous output time.
+  `tools/stage_pressure.py --client-jsonl ...` can perform a receive-gap overlap join when
+  both sides carry the same host monotonic clock; the result remains diagnostic-only and
+  does not prove client-gap causality by itself.
 
 ### Which kernel actually ran, and whether a fix can reach it
 

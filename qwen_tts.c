@@ -2805,7 +2805,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     { const char *e = getenv("QWEN_TTFA_FREEZE_CAP"); if (e && atoi(e) >= 0) freeze_cap = atoi(e); }
     int prio_strict = getenv("QWEN_TTFA_PRIO_STRICT") ? 1 : 0;
 
-    int prof_on = (getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_BATCH_STATS")) ? 1 : 0;
+    int stage_trace = (getenv("QWEN_STAGE_TRACE") && atoi(getenv("QWEN_STAGE_TRACE")) != 0);
+    int prof_on = (getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_BATCH_STATS") || stage_trace) ? 1 : 0;
 
     int dec_batch = (getenv("QWEN_DECODER_BATCH") &&
                      atoi(getenv("QWEN_DECODER_BATCH")) != 0) ? 1 : 0;
@@ -2928,14 +2929,15 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int *rq_tok = (int *)calloc((size_t)B, sizeof(int));
     double *rq_t0 = (double *)calloc((size_t)B, sizeof(double));
     int *rq_capped = (int *)calloc((size_t)B, sizeof(int));   /* 1 = ended at the frame/KV cap, not at EOS */
-    double pf_t0_loop = time_ms(), pf_mark = 0;
+    double pf_t0_loop = stage_trace ? qwen_mono_ms() : time_ms(), pf_mark = 0;
     long long pf_frames = 0, pf_slotframes = 0, pf_stepframes = 0;
     /* Decode-occupancy census: how often the batch actually holds >1 slot, and
      * when it does not, whether that is because the worker's queue was empty. */
     long long occ_hist[9] = { 0 };
     long long occ_free_empty = 0, occ_free_decbusy = 0, occ_admits = 0;
-    #define PF_START() do { if (prof_on) pf_mark = time_ms(); } while (0)
-    #define PF_END(acc) do { if (prof_on) (acc) += time_ms() - pf_mark; } while (0)
+    #define PF_CLOCK() (stage_trace ? qwen_mono_ms() : time_ms())
+    #define PF_START() do { if (prof_on) pf_mark = PF_CLOCK(); } while (0)
+    #define PF_END(acc) do { if (prof_on) (acc) += PF_CLOCK() - pf_mark; } while (0)
 
     #define RELEASE_SLOT(b) do {                                                   \
         free(stream_tail[b]); stream_tail[b] = NULL;                                \
@@ -3032,8 +3034,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         ctx->speaker_id = (req_).speaker_id; ctx->language_id = (req_).language_id;        \
         ctx->prev_prefill_len = 0; ctx->prefill_only = 1;                                  \
         double _tt0 = ttfa_trace ? qwen_mono_ms() : 0;                                     \
+        double _st_pf0 = stage_trace ? qwen_mono_ms() : 0;                                 \
         (prc_) = qwen_tts_generate(ctx, (req_).text, NULL, NULL);                          \
         double _tt1 = ttfa_trace ? qwen_mono_ms() : 0;                                     \
+        if (stage_trace) st_prefill_ms += qwen_mono_ms() - _st_pf0;                         \
         ctx->prefill_only = 0;                                                             \
         if (ttfa_trace) {                                                                  \
                         \
@@ -3202,6 +3206,13 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                         m1_first_audio, m1_rejected, m1_cancelled, m1_scan, m1_noslot,
                         m1_nojob, pf_m1);
         }
+        double st_iter_start = stage_trace ? qwen_mono_ms() : 0;
+        double st_admit0 = pf_admit, st_head0 = pf_head, st_samp0 = pf_samp;
+        double st_cp0 = pf_cp, st_decode0 = pf_decode, st_talker0 = pf_talker;
+        double st_wait0 = pf_wait, st_prefill_ms = 0, st_write_ms = 0;
+        int st_dec_calls = 0, st_dec_group_max = 0, st_dec_frames = 0;
+        int st_dec_ragged = 0, st_dec_per_item = 0, st_dec_external = 0;
+        int st_n_active = n_active, st_n_step = 0;
         PF_START();
         for (int b = 0; b < B; b++) {
             if (active[b]) continue;
@@ -3413,6 +3424,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 if (pending < target) continue;
                 if (dec_on && want_stream[b]) {
+                    if (stage_trace) {
+                        st_dec_calls++; st_dec_group_max = 1;
+                        st_dec_frames += pending; st_dec_external = 1;
+                    }
                     if (ttfa_trace && t2_decode1[b] == 0.0) t2_decode1[b] = qwen_mono_ms();
                     dec_enqueue(&dpool, b, chcodes[b] + (size_t)decpos[b] * 16, pending,
                                 tag[b], 0, 1, decpos[b] == 0);
@@ -3420,13 +3435,21 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     continue;
                 }
                 float *aud = NULL; int an = 0;
+                if (stage_trace) {
+                    st_dec_calls++; st_dec_group_max = 1;
+                    st_dec_frames += pending; st_dec_per_item = 1;
+                }
                 if (ttfa_trace && t2_decode1[b] == 0.0) t2_decode1[b] = qwen_mono_ms();
                 if (qwen_speech_decoder_decode_streaming_st(ctx, &sstate[b],
                         chcodes[b] + (size_t)decpos[b] * 16, pending, &aud, &an) == 0
                     && aud && an > 0) {
                     decpos[b] = chframes[b];
                     T2_FIRST_AUDIO(b);
-                    if (want_stream[b]) sink->on_chunk(sink->ud, tag[b], aud, an);
+                    if (want_stream[b]) {
+                        double _st_w0 = stage_trace ? qwen_mono_ms() : 0;
+                        sink->on_chunk(sink->ud, tag[b], aud, an);
+                        if (stage_trace) st_write_ms += qwen_mono_ms() - _st_w0;
+                    }
                     else {
                         if (acc_n[b] + an > acc_cap[b]) {
                             acc_cap[b] = (acc_n[b] + an) * 2;
@@ -3539,6 +3562,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 nit++;
             }
             if (nit > 0) {
+                if (stage_trace) {
+                    st_dec_calls++; st_dec_group_max = nit;
+                    st_dec_ragged = nit > 1;
+                    for (int _i = 0; _i < nit; _i++)
+                        st_dec_frames += db_items[_i].nframes;
+                }
                 int _di_first = 0;
                 for (int _i = 0; _i < nit; _i++) if (decpos[db_slot[_i]] == 0) { _di_first = 1; break; }
                 if (ttfa_trace)
@@ -3560,7 +3589,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     if (db_items[i].rc == 0 && aud && an > 0) {
                         T2_FIRST_AUDIO(b);
                         decpos[b] += db_items[i].nframes;
-                        if (want_stream[b]) sink->on_chunk(sink->ud, tag[b], aud, an);
+                        if (want_stream[b]) {
+                            double _st_w0 = stage_trace ? qwen_mono_ms() : 0;
+                            sink->on_chunk(sink->ud, tag[b], aud, an);
+                            if (stage_trace) st_write_ms += qwen_mono_ms() - _st_w0;
+                        }
                         else {
                             if (acc_n[b] + an > acc_cap[b]) {
                                 acc_cap[b] = (acc_n[b] + an) * 2;
@@ -3613,10 +3646,37 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             break;
         }
         for (int b = 0; b < B; b++) if (step_active[b]) { pos[b]++; sframe[b]++; }
+        if (stage_trace) {
+            st_n_step = n_step;
+            double st_end = qwen_mono_ms();
+            double st_admit = pf_admit - st_admit0;
+            double st_head = pf_head - st_head0;
+            double st_samp = pf_samp - st_samp0;
+            double st_cp = pf_cp - st_cp0;
+            double st_decode = pf_decode - st_decode0;
+            double st_talker = pf_talker - st_talker0;
+            double st_wait = pf_wait - st_wait0;
+            double st_wall = st_end - st_iter_start;
+            double st_serial = st_wall - st_admit - st_head - st_samp - st_cp - st_decode - st_talker;
+            if (st_serial < 0) st_serial = 0;
+            fprintf(stderr,
+                    "[STAGE] v=1 pid=%d seq=%llu clock=CLOCK_MONOTONIC domain=S "
+                    "start_ms=%.3f end_ms=%.3f active=%d step=%d admit_ms=%.3f prefill_ms=%.3f head_ms=%.3f "
+                    "sample_ms=%.3f cp_ms=%.3f decode_ms=%.3f talker_ms=%.3f "
+                    "output_ms=%.3f queue_wait_ms=%.3f serial_ms=%.3f wall_ms=%.3f "
+                    "dec_calls=%d dec_group_max=%d dec_frames=%d dec_ragged=%d "
+                    "dec_per_item=%d dec_external=%d\n",
+                    (int)getpid(),
+                    (unsigned long long)atomic_load_explicit(&g_admit_seq, memory_order_relaxed),
+                    st_iter_start, st_end, st_n_active, st_n_step, st_admit, st_prefill_ms, st_head, st_samp,
+                    st_cp, st_decode, st_talker, st_write_ms, st_wait, st_serial, st_wall,
+                    st_dec_calls, st_dec_group_max, st_dec_frames, st_dec_ragged,
+                    st_dec_per_item, st_dec_external);
+        }
     }
 
     if (prof_on && pf_frames > 0) {
-        double wall = time_ms() - pf_t0_loop;
+        double wall = (stage_trace ? qwen_mono_ms() : time_ms()) - pf_t0_loop;
         double acc = pf_admit + pf_talker + pf_head + pf_samp + pf_cp + pf_decode + pf_final;
         fprintf(stderr,
             "\n[serve-profile] %lld frames, %lld slot-frames (mean %.2f active slots), loop %.1f s\n",
