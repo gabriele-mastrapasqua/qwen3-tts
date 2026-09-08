@@ -25,9 +25,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   missed in one window and per-class p95 was under-sampled. The flag remains default-off.
 - Post-C4 capacity screen: C5 is the first NOT STREAMABLE point under the complete
   envelope (STREAM p95 0.852 but TTFA p95 4.44 s and safe-play-start p95 4.60 s); C6
-  shows the same failure. Child queue/pre-service traces stayed below about 200 ms;
-  the multi-second tail is primarily prefork parent accept/backlog, before child `t_recv`.
-  Do not advertise either as realtime capacity. Detail: `.work/p4-prefork-admission-bound-20260907.md`.
+  shows the same failure. F2 causally decomposed the C5 tail: under cap 2, three full-wave
+  requests waited 3.6–4.9 s before parent `accept()` and >97% of client-to-first-PCM
+  elapsed before engine admission; `--max-queue 0` converted the same overload to 3
+  immediate parent-side 503s. A secondary child/engine queue + prefill term remains, but
+  is sub-second. Do not advertise C5/C6 as realtime capacity. Detail:
+  `.work/p4-prefork-admission-bound-20260907.md`, `.work/f2-c5-startup-decomposition-20260908.md`.
 - CT-1 confirms prebuffer follows quantum (q8 ~0.7 s p95 in short SOAK; q32 ~2.5 s)
   while RTF changes less. q32 is rejected as a production streaming policy.
 - Decoder MACs already run on real AMX with wide N; its wall is glue (im2col, quantization,
