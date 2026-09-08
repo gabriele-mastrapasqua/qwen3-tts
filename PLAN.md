@@ -207,8 +207,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       4-thread STEP side inflated Talker+CP by +27-29 % (per-slot region sections, ~8 ms per
       slot) and the 2 s clip pays the pipeline's fixed latency (+0.05 STREAM, +30-64 ms
       TTFA). Kept default-off; no host screen. Next lever per the split: the step side
-      (5+3 / 6+2 split, long-bank A/B), not res1. Detail:
-      `.work/dl1-decoder-lane-split-20260909.md`.
+      (5+3 / 6+2 split, long-bank A/B), not res1. **5+3 and 6+2 run 2026-09-09: both
+      worse than 4+4 (fixed B4 1.113 / 1.364; long B4 1.015 / 1.263) — the decoder needs
+      >= 4 cores to stay hidden at B4 and the step side gains only 3-7 ms from 5-6
+      threads; no host screen; 4+4 is the allocation of record, architecture promoted,
+      allocation not.** Detail: `.work/dl1-decoder-lane-split-20260909.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving

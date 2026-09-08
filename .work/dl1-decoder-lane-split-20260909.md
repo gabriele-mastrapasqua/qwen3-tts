@@ -133,3 +133,33 @@ What changed: code (`qwen_tts_thread.{c,h}`, `qwen_tts_kernels.c`, `qwen_tts_sd_
 `qwen_tts.c`, `qwen_tts_server.c`, `main.c`, `qwen_tts_dispatch.c`), profiles
 (`vnni-product.json` spin, new `vnni-bf16-product.json`, schema, README, tests), PLAN DL-1
 (A/B done, not promoted). Raw runs: `~/bench/lane/`, `~/bench/lane_ab.log` on the host.
+
+## 7. Resource-allocation A/B: 5+3 and 6+2 (2026-09-09 23:33-23:38, same setup as §5)
+
+DL-1 architecture promoted by the owner; the 4+4 allocation was not. Only the two other
+splits were run, bounded: fixed text B2/B3/B4, long bank B4, plus the inline long-B4 control.
+Gate for the host screen: B4 STREAM p95 ≤ 0.92 on the fixed text AND ≤ 0.90 on the long
+bank with stall@250 = 0.
+
+| split (step+dec) | fixed B2 | fixed B3 | fixed B4 | long B4 | stall@250 long B4 | B4 iteration wall mean / p95 | B4 Talker+CP | B4 mailbox wait /frame | dec core-eq (of N) |
+|---|---|---|---|---|---|---|---|---|---|
+| 4+4 (§5) | 0.774 | 0.871 | **0.997** | not run here | — | 72.3 / 77 | 69.8 | 3.6 ms | 0.82 / 4 |
+| 5+3 | 0.761 | 0.894 | 1.113 | 1.015 | 75 % | 80.1 / 136 | 66.9 | 8.0 ms | 0.77 / 3 |
+| 6+2 | 0.801 | 1.069 | 1.364 | 1.263 (prebuffer 5.9 s) | 100 % | 97.3 / 215 | 62.9 | 16.6 ms | 0.65 / 2 |
+| inline 8T | 0.866 | 1.020 | 1.203 | 1.107 (prebuffer 2.5 s) | 100 % | 92.4 / 192 | 54.0 | — | — |
+
+**Verdict: NO host screen — neither split meets the gate, both are worse than 4+4 at B4.**
+What the split says (MEASURED):
+
+* The decoder needs ≥ 4 cores to stay hidden at B4 with q4: on 3 cores the producer starts
+  blocking on its slot's mailbox (8 ms/frame, `decode_ms` 12.9 on the loop), on 2 cores it
+  blocks 17 ms/frame and the lane is slower than inline. The decoder team is not idle by
+  choice at 4+4 (0.82 core-eq): it is idle because units arrive in bursts and are served FIFO.
+* Returning threads to the step side buys little: Talker+CP at B4 is 69.8 ms on 4 threads,
+  66.9 on 5, 62.9 on 6, 54.0 on 8 inline. The step inflation is roughly half thread count
+  and half contention with the decoder team (the inline 8-thread figure is the floor).
+* 4+4 stays the allocation of record for this architecture on this host; the remaining
+  gap to the gate at B4 is ~0.08 of STREAM p95 on a 2 s clip, i.e. the pipeline latency
+  plus the per-slot step work, not the decoder.
+
+No further runs. What changed: this section; PLAN DL-1 line.
