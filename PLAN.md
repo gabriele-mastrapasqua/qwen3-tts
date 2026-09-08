@@ -226,6 +226,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       fallbacks and embed the resolved preflight in WAVE/SOAK artifacts. No hardware
       comparison is closed by this task. Detail:
       `.work/cross-isa-operational-parity-20260908.md`.
+- [x] QL-2c Local AMD/Turin campaign preparation: known-text SL-1 is pinned across the
+  comparable VNNI/Arm/control lanes, the default-off stage-pressure trace has an
+  offline receive-gap overlap helper, and the claim audit/runbook preserve
+  MEASURED/DERIVED/PREDICTED boundaries. No host was benchmarked. Detail:
+  `.work/post-8core-codex-review-20260908.md` and
+  `.work/turin-vnni-campaign-plan-20260908.md`.
 - [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
   playback-aware harness only after QL-1 has one trusted reference and the QL-2a
   + QL-2b dispatch/quality gates are applied; do not present AMX-only decoder work as
