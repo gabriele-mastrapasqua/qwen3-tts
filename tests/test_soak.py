@@ -131,6 +131,21 @@ class SoakTests(unittest.TestCase):
                 {"QWEN_POOL_SPIN": "4096", "QWEN_DECODER_BATCH": "0"},
             )
 
+    def test_profile_explicit_server_shape_overrides_profile_cli(self):
+        args = types.SimpleNamespace(
+            profile="amx-product", no_profile="", server_env="",
+            bin="./qwen_tts", model="/tmp/qwen3-tts-1.7b", port=9922,
+            precision="int8", batch_size=3, prefork=1, prefork_threads=8,
+        )
+        argv, _environment, _forbidden = serve_soak.profile_command(args)
+        for option, expected in (
+            ("--batch-size", "3"),
+            ("--prefork", "1"),
+            ("--prefork-threads", "8"),
+        ):
+            self.assertEqual(argv.count(option), 1)
+            self.assertEqual(argv[argv.index(option) + 1], expected)
+
     def test_identity_accepts_tarball_source_revision(self):
         with tempfile.NamedTemporaryFile() as handle:
             handle.write(b"binary")

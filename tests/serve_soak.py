@@ -50,6 +50,34 @@ def parse_env(text):
     return values
 
 
+def override_server_option(tokens, option, value):
+    """Apply an explicit harness-owned server option to a profile command.
+
+    Profiles own the runtime environment, but topology/capacity is deliberately
+    supplied by the benchmark invocation.  Replacing an existing option avoids
+    duplicate argv values whose effective meaning would depend on the C parser.
+    """
+    if value is None:
+        return tokens
+    value = str(value)
+    for index, token in enumerate(tokens[:-1]):
+        if token == option:
+            tokens[index + 1] = value
+            return tokens
+    tokens.extend((option, value))
+    return tokens
+
+
+def apply_server_overrides(tokens, args):
+    for option, value in (
+        ("--batch-size", args.batch_size),
+        ("--prefork", args.prefork),
+        ("--prefork-threads", args.prefork_threads),
+    ):
+        override_server_option(tokens, option, value)
+    return tokens
+
+
 def profile_command(args):
     if args.profile and args.no_profile:
         raise SystemExit("--profile and --no-profile are mutually exclusive")
@@ -64,9 +92,10 @@ def profile_command(args):
             argv.append("--int4")
         argv += [
             "--serve", str(args.port),
-            "--batch-size", str(args.batch_size),
-            "--prefork", str(args.prefork),
-            "--prefork-threads", str(args.prefork_threads),
+            "--batch-size", str(args.batch_size if args.batch_size is not None else 1),
+            "--prefork", str(args.prefork if args.prefork is not None else 1),
+            "--prefork-threads",
+            str(args.prefork_threads if args.prefork_threads is not None else 1),
         ]
         return argv, explicit, []
     if not args.profile:
@@ -94,6 +123,7 @@ def profile_command(args):
     if not tokens:
         raise SystemExit("profile resolved to an empty server command")
     tokens[0] = args.bin
+    apply_server_overrides(tokens, args)
 
     forbidden_result = subprocess.run(
         [sys.executable, PROFILE_TOOL, "forbidden-env", args.profile],
@@ -509,9 +539,9 @@ def main():
     parser.add_argument("--language", default="English")
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--precision", choices=("default", "int8", "int4"), default="int8")
-    parser.add_argument("--prefork", type=int, default=1)
-    parser.add_argument("--prefork-threads", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--prefork", type=int, default=None)
+    parser.add_argument("--prefork-threads", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--minutes", type=float, default=10.0)
     parser.add_argument("--request-timeout", type=float, default=180.0)
