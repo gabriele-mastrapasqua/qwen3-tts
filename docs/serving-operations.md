@@ -115,6 +115,10 @@ so beside the numbers; what you must not do is let a `2x8` slice quietly mean fo
 
 ```bash
 # 0. the preflight, and the artifact directory every later number refers to
+make doctor                       # <1 min, no model: identity, bandwidth, the engine's own int8
+                                  # GEMV roof on the candidate worker mask, resolved dispatch,
+                                  # shape probe -> a PREDICTED W x K / cap / quantum / env set and
+                                  # a draft profile, every number labelled; start the sweep from it
 make cpu-check                    # provenance + hardware + self-test + RESOLVED dispatch map vs
                                   # what this ISA class should select; fails on a silent fallback
 

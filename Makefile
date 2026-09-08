@@ -198,6 +198,8 @@ help:
 	@echo "CPU profiling gate (docs/cpu-profiling.md) — run BEFORE any CPU optimisation:"
 	@echo "  make cpu-check             - 15 s preflight: provenance, hardware, RESOLVED dispatch map, self-test,"
 	@echo "                               expected-vs-observed per ISA class -> profiles/<date>_<host>_<sha8>/"
+	@echo "  make doctor                - <1 min, no model: box identity + bandwidth + dispatch + shape probe ->"
+	@echo "                               PREDICTED W x K / batch cap / quantum / env set + draft profile (labels on every number)"
 	@echo "  make dispatch-map          - just the resolved dispatch table (./qwen_tts --dispatch-map)"
 	@echo "  make profile-cpu-check     - is the last profile still valid for THIS binary/source/env/host?"
 	@echo "  make cost-map              - coarse cost map: where the wall time goes AROUND the kernels."
@@ -885,6 +887,30 @@ CPU_MODEL    ?=
 cpu-check: $(TARGET) $(MEMBW_BIN)
 	@MEMBW_BIN=$(MEMBW_BIN) PROFILES_DIR=$(PROFILES_DIR) CPU_PROFILE=$(CPU_PROFILE) \
 	  CPU_MODEL=$(CPU_MODEL) bash tools/cpu_check.sh
+# doctor: the under-a-minute, model-free FIRST look at a box for the streaming server.
+# Identity + bandwidth (cached per hardware fingerprint in profiles/roofs) + caps + RESOLVED
+# dispatch + model-free matmat shapes, then a PREDICTED W x K / batch cap / quantum / env set
+# with a label on every number and a schema-valid draft profile.  It never replaces cpu-check
+# (the qualification preflight) or a wave; it tells the next agent where to start.
+#   make doctor                                 # ~10-40 s
+#   make doctor DOCTOR_ARGS="--full"            # + --self-test and the quick --matmat-tune grid
+#   make doctor DOCTOR_ARGS="--no-measure"      # cached roofs only, never runs membw
+DOCTOR_ARGS ?=
+# The int8 GEMV roof (tests/roof_matvec_int8.c): the Talker's own kernel streaming 28 distinct
+# weight matrices per shape from DRAM, linked against the built engine objects so it runs the
+# same code the server does.  membw's read loop under-reports what this kernel achieves
+# (35 vs 58 GB/s at 4T on an 8-core Emerald Rapids), so the doctor uses THIS for the Talker
+# term and `--layers 2` (a CP-sized working set) for the cache-resident one.
+ROOF_MATVEC_BIN ?= /tmp/qwen_roof_matvec
+$(ROOF_MATVEC_BIN): tests/roof_matvec_int8.c $(filter-out main.o,$(OBJS)) $(INGOT_LIB)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+roof-matvec: $(ROOF_MATVEC_BIN)
+	@$(ROOF_MATVEC_BIN) --threads $(or $(ROOF_THREADS),4) --reps $(or $(ROOF_REPS),3)
+doctor: $(TARGET) $(MEMBW_BIN) $(ROOF_MATVEC_BIN)
+	@python3 tools/doctor.py --bin ./$(TARGET) --membw $(MEMBW_BIN) --roof $(ROOF_MATVEC_BIN) \
+	  --store $(PROFILES_DIR)/roofs $(DOCTOR_ARGS)
+test-doctor:
+	@python3 tests/test_doctor.py
 dispatch-map: $(TARGET)
 	@./$(TARGET) --dispatch-map
 
@@ -1322,7 +1348,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench \
-	cpu-check dispatch-map profile-cpu-check profile-cpu tune-archive
+	cpu-check doctor test-doctor roof-matvec dispatch-map profile-cpu-check profile-cpu tune-archive
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench
