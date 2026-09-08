@@ -238,6 +238,11 @@ int qwen_gpu_selftest(qwen_backend_kind_t kind, void *out) {
     fprintf(f, "  matmat_bf16: max|abs|=%.3e  rel=%.3e  %s\n", mm_abs, mm_rel, mm_ok ? "PASS" : "FAIL");
     if (!mm_ok) fails++;
 
+#ifdef QWEN_HAVE_CUDA
+    if (kind == QWEN_BACKEND_CUDA && gpu->kind == QWEN_BACKEND_CUDA)
+        fails += qwen_cuda_decoder_convt_selftest(out);
+#endif
+
     const int iters = 20;
     double t0 = now_ms();
     for (int it = 0; it < iters; ++it) cpu->matmat_bf16(cpu, Y_cpu, W, X, rows, cols, B);
