@@ -211,7 +211,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       worse than 4+4 (fixed B4 1.113 / 1.364; long B4 1.015 / 1.263) — the decoder needs
       >= 4 cores to stay hidden at B4 and the step side gains only 3-7 ms from 5-6
       threads; no host screen; 4+4 is the allocation of record, architecture promoted,
-      allocation not.** Detail: `.work/dl1-decoder-lane-split-20260909.md`.
+      allocation not. DL-2 elastic 8<->4+4 (`QWEN_SD_LANE_ELASTIC=1`, pool width capped only
+      while a decoder unit is in flight, preallocated per-slot handoff) run the same day:
+      fixed B4 0.987 vs static 0.997, long B4 0.895 vs 0.906, Talker+CP 69.5 vs 69.8 ms —
+      the static-partition tax is NOT the cause; the step is slowed ~2x only while the
+      decoder unit runs (CP loses L3 residency to the decoder's f32 activations). Next
+      lever: the decoder unit's cache footprint, measured by CP ms during overlap.**
+      Detail: `.work/dl1-decoder-lane-split-20260909.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving

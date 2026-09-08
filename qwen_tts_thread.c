@@ -108,6 +108,9 @@ int  qwen_lane_team_size(void) { return 0; }
 void qwen_lane_thread_join(void) {}
 int  qwen_lane_thread_here(void) { return 0; }
 void qwen_lane_masks(const char **step, const char **dec) { if (step) *step = ""; if (dec) *dec = ""; }
+int  qwen_lane_elastic(void) { return 0; }
+void qwen_pool_set_width(int width) { (void)width; }
+int  qwen_pool_width(void) { return 0; }
 /* 0 = this backend cannot hold a fixed team of workers inside a spin barrier, so the
  * persistent regions stay off here.  It is a capability answer, not a thread count. */
 int qwen_parallel_team(void) { return 0; }
@@ -255,6 +258,9 @@ int  qwen_lane_team_size(void) { return 0; }
 void qwen_lane_thread_join(void) {}
 int  qwen_lane_thread_here(void) { return 0; }
 void qwen_lane_masks(const char **step, const char **dec) { if (step) *step = ""; if (dec) *dec = ""; }
+int  qwen_lane_elastic(void) { return 0; }
+void qwen_pool_set_width(int width) { (void)width; }
+int  qwen_pool_width(void) { return 0; }
 
 
 #else
@@ -512,6 +518,7 @@ void qwen_threadpool_start(int n_threads) {
 }
 
 static __thread int g_lane_tls = 0;
+static _Atomic int g_pool_width = 0;   /* elastic lane: 0 = full team, N = at most N participants */
 static void lane_parallel(size_t nt, qwen_task_fn fn, void *ctx);
 
 void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
@@ -552,6 +559,11 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     if (need > P.nworkers) need = P.nworkers;
     if (need < 0) need = 0;
     if (!qwen_pool_narrow()) need = P.nworkers;
+    {   /* elastic lane: while a decoder unit runs on the last cpus, only the STEP workers take
+         * engine work (worker i < width-1 lives on cpu i+1 of the mask) */
+        int w = atomic_load_explicit(&g_pool_width, memory_order_acquire);
+        if (w > 0 && need > w - 1) need = w - 1;
+    }
 
     P.job = &job;
     atomic_store_explicit(&P.completed, 0, memory_order_relaxed);
@@ -596,7 +608,10 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 }
 
 int qwen_parallel_team(void) {
-    return (g_inited && P.nworkers > 0) ? P.nworkers + 1 : 1;
+    int t = (g_inited && P.nworkers > 0) ? P.nworkers + 1 : 1;
+    int w = atomic_load_explicit(&g_pool_width, memory_order_acquire);
+    if (w > 0 && w < t) t = w;
+    return t;
 }
 
 /* A worker inside run_chunks() cannot take submit_mtx: the outer submitter holds it until
@@ -633,9 +648,14 @@ static struct {
     _Atomic int stop;
 #if defined(__linux__)
     cpu_set_t step_set, dec_set;
+    int cpus[CPU_SETSIZE]; int ncpus;
 #endif
+    int elastic;
     char step_list[160], dec_list[160];
 } L;
+int  qwen_lane_elastic(void) { return L.elastic; }
+void qwen_pool_set_width(int width) { atomic_store_explicit(&g_pool_width, width < 0 ? 0 : width, memory_order_release); }
+int  qwen_pool_width(void) { return atomic_load_explicit(&g_pool_width, memory_order_acquire); }
 
 static void lane_list(const int *cpus, int n, char *out, size_t cap) {
     size_t o = 0; out[0] = 0;
@@ -668,10 +688,21 @@ int qwen_lane_split_prepare(int *engine_threads) {
     for (int i = n - dec; i < n; i++) CPU_SET(cpus[i], &L.dec_set);
     lane_list(cpus, n - dec, L.step_list, sizeof L.step_list);
     lane_list(cpus + (n - dec), dec, L.dec_list, sizeof L.dec_list);
+    memcpy(L.cpus, cpus, sizeof(int) * (size_t)n); L.ncpus = n;
+    { const char *el = getenv("QWEN_SD_LANE_ELASTIC"); L.elastic = (el && atoi(el) != 0) ? 1 : 0; }
+    L.step_cpus = n - dec; L.dec_cpus = dec; L.prepared = 1;
+    if (L.elastic) {
+        /* the engine keeps every cpu; the pool is pinned one worker per cpu at team start and
+         * narrowed to the STEP cpus only while a decoder unit is in flight */
+        if (engine_threads) *engine_threads = n;
+        fprintf(stderr, "[lane] ELASTIC split prepared: %d cpus, engine pool %d threads pinned one per cpu; "
+                        "step cpus %s (%d) keep the engine while a decoder unit runs on %s (%d)\n",
+                n, n, L.step_list, L.step_cpus, L.dec_list, L.dec_cpus);
+        return 1;
+    }
     /* pthreads inherit the creating thread's mask: confine this (engine) thread now, before
      * qwen_set_threads() spawns the pool. */
     if (sched_setaffinity(0, sizeof L.step_set, &L.step_set) != 0) { perror("lane: sched_setaffinity(step)"); return 0; }
-    L.step_cpus = n - dec; L.dec_cpus = dec; L.prepared = 1;
     if (engine_threads) *engine_threads = n - dec;
     fprintf(stderr, "[lane] split prepared: step cpus %s (%d, engine pool) · decoder cpus %s (%d, private team)\n",
             L.step_list, L.step_cpus, L.dec_list, L.dec_cpus);
@@ -696,7 +727,9 @@ static void *lane_worker_main(void *arg) {
     unsigned long seen = wa->seen0;
     for (;;) {
         unsigned long gw = atomic_load_explicit(&L.generation, memory_order_acquire);
-        int budget = qwen_pool_spin();
+        /* between the dispatches of one unit the workers stay hot; between units, in
+         * elastic mode, the engine wants these cpus back, so the budget is short */
+        int budget = L.elastic ? (qwen_pool_spin() < 4096 ? qwen_pool_spin() : 4096) : qwen_pool_spin();
         while (budget-- > 0 && !L.stop && !(gw != seen && QWEN_GW_NEED(gw) > my_idx)) {
             qwen_cpu_relax();
             gw = atomic_load_explicit(&L.generation, memory_order_acquire);
@@ -731,6 +764,19 @@ static void *lane_worker_main(void *arg) {
 int qwen_lane_team_start(void) {
     if (!L.prepared) return 0;
     if (L.started) return L.nworkers + 1;
+#if defined(__linux__)
+    if (L.elastic && g_inited) {
+        /* worker i takes cpu i+1 of the mask, the caller (engine loop) cpu 0: the first
+         * step_cpus-1 workers plus the caller ARE the step team when the width is capped */
+        cpu_set_t one;
+        for (int i = 0; i < P.nworkers && i + 1 < L.ncpus; i++) {
+            CPU_ZERO(&one); CPU_SET(L.cpus[i + 1], &one);
+            pthread_setaffinity_np(P.threads[i], sizeof one, &one);
+        }
+        CPU_ZERO(&one); CPU_SET(L.cpus[0], &one);
+        pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+    }
+#endif
     pthread_mutex_init(&L.submit_mtx, NULL); pthread_mutex_init(&L.mtx, NULL);
     pthread_cond_init(&L.wake, NULL); pthread_cond_init(&L.complete, NULL);
     atomic_store(&L.stop, 0);

@@ -67,6 +67,14 @@ int  qwen_lane_team_size(void);                         /* 0 when there is no la
 void qwen_lane_thread_join(void);                       /* the decoder thread: pin to the DECODER cpus, mark TLS */
 int  qwen_lane_thread_here(void);                       /* 1 on the decoder thread or a lane worker */
 void qwen_lane_masks(const char **step, const char **dec);
+/* Elastic lane (QWEN_SD_LANE_ELASTIC=1 with QWEN_SD_LANE_SPLIT=N): the engine pool keeps
+ * every cpu of the worker, its workers are pinned one per cpu, and while a decoder unit is
+ * in flight the pool's dispatch WIDTH is capped so that only the STEP cpus take engine work;
+ * the lane team on the DECODER cpus runs the unit.  When the decoder queue drains the width
+ * returns to the full team.  Regions re-read qwen_parallel_team() per frame, so they follow. */
+int  qwen_lane_elastic(void);                           /* 1 when the elastic mode was prepared */
+void qwen_pool_set_width(int width);                    /* 0 = full team; N = at most N participants (caller + N-1 workers) */
+int  qwen_pool_width(void);
 typedef struct { volatile int arrived; volatile int phase; int nt; } qwen_barrier_t;
 void qwen_barrier_init(qwen_barrier_t *b, int nt);
 void qwen_barrier_wait(qwen_barrier_t *b);

@@ -163,3 +163,50 @@ What the split says (MEASURED):
   plus the per-slot step work, not the decoder.
 
 No further runs. What changed: this section; PLAN DL-1 line.
+
+## 8. DL-2 — elastic 8 ↔ 4+4 and fast handoff (2026-09-09 23:54, same single-CCX setup)
+
+Built (`QWEN_SD_LANE_ELASTIC=1` with `QWEN_SD_LANE_SPLIT=4`, default-off): the engine pool
+keeps all 8 cpus with one worker pinned per cpu (caller on cpu 0); while at least one decoder
+unit is queued or running the pool's dispatch width is capped to the 4 STEP cpus
+(`qwen_pool_set_width`, honoured by `qwen_parallel` and by `qwen_parallel_team()`, which the
+Talker/CP regions re-read every frame), and the width returns to 8 as soon as the decoder
+queue drains; both transitions happen under the mailbox mutex. The lane workers park
+quickly between units (they share cpus 4-7 with pool workers 3-6). Handoff: one
+preallocated job and codes buffer per slot, no heap allocation per unit, the only copy is
+the ≤ 2 KB of codes; the wake-up stays a condvar (one per unit, ~30 ms apart). Smoke B1
+clean, overruns 0.
+
+| B | inline | static 4+4 | **elastic** | Talker+CP ms inline / static / elastic | decoder in flight (elastic) |
+|---|---|---|---|---|---|
+| 1 | 0.674 | 0.613 | 0.615 | 44.3 / 47.9 / 47.8 | 14 % |
+| 2 | 0.866 | 0.774 | 0.747 | 48.0 / 58.4 / 56.3 | 18 % |
+| 3 | 1.020 | 0.871 | 0.859 | 50.1 / 63.5 / 62.6 | 22 % |
+| 4 | 1.203 | 0.997 | **0.987** | 54.0 / 69.8 / **69.5** | 31 % |
+| long B4 | 1.107 | 0.906 | **0.895** | 54.5 / 71.3 / 70.5 | 50 % |
+
+(STREAM p95; stall@250 = 0 % on every lane row; long-bank static 4+4 B4 measured in this
+batch too: 0.906, TOTAL 0.917, prebuffer 466 ms.)
+
+**The static-partition tax is falsified as the cause of the step inflation.** With the
+engine on 8 threads for 69-86 % of the loop, Talker+CP at B4 is 69.5 ms against 69.8 ms
+static: identical. Thread count was already known to be irrelevant for the weight stream
+(bandwidth-bound at 2-4 threads) and the 5+3/6+2 runs had shown 5-6 threads buy 3-7 ms; the
+elastic run closes the question. The inflation is concentrated in the windows where the
+decoder team is actually running: with the decoder in flight 31 % of the time and a mean
+inflation of +15.5 ms per iteration, the step runs ~50 ms slower during those windows
+(INFERRED from the shares); at B1 (14 %) the same arithmetic gives ~+25 ms. CP carries most
+of it (+10 ms mean at B4, i.e. its L3-resident rows are being evicted by the decoder's
+activations while a unit runs), the Talker the rest (+6). This is the L3-pollution term the
+contention falsifier (§10 of the fast-screen addendum) under-estimated with the standalone
+decoder bench: the real per-item decoder pollutes more.
+
+Gate: fixed B4 0.987 > 0.92 → no host screen; long B4 0.895 meets its half (≤ 0.90,
+stall@250 0). Not promoted; both lane modes stay default-off.
+
+What the split now says the lever is: not threads, not the handoff (mailbox wait 0.1-3.4
+ms/frame, no allocation), not the decoder's compute, but **the cache footprint of the
+decoder unit while it runs next to the CP** — the f32 im2col/ConvT activations of the
+per-item path. The next falsifier is a decoder unit with a smaller working set (direct
+ConvT / no im2col materialisation, int8 activations, or `res1` on int8 panels that do not
+materialise f32), measured by CP ms during overlap, not by STREAM.

@@ -2570,6 +2570,13 @@ typedef struct {
     int trace;
     int lane;                 /* QWEN_SD_LANE_SPLIT: pinned private team, one unit in flight per slot */
     pthread_cond_t done_cv;   /* broadcast when a slot's busy count drops (the bounded mailbox) */
+    int elastic;              /* width full <-> step_width while a unit is queued or running */
+    int step_width;
+    int queued;               /* units enqueued and not yet finished (under m) */
+    dec_job_t *slot_job;      /* lane: one preallocated job per slot, no heap job per unit */
+    int *slot_codes;          /* lane: per-slot codes buffer, 32 frames x 16 */
+    double overlap_ms;        /* time with the width capped (decoder in flight), for the report */
+    double overlap_t0;
 } dec_pool_t;
 
 /* The bounded mailbox: block THIS slot's producer until its unit in flight has completed.
@@ -2681,13 +2688,19 @@ static void *dec_worker_main(void *arg) {
                 qwen_sd_stream_free(&dp->sstate[g->slot]);
                 dp->sink->on_done(dp->sink->ud, g->tag, NULL, 0);
             }
-            free(g->codes);
+            int prealloc = dp->slot_job && g == &dp->slot_job[g->slot];
+            if (!prealloc) free(g->codes);
             if (g->is_final) atomic_store(&dp->busy[g->slot], 0);
             else atomic_fetch_sub(&dp->busy[g->slot], 1);
-            free(g);
+            if (!prealloc) free(g);
         }
         if (dp->lane) {
             pthread_mutex_lock(&dp->m);
+            dp->queued -= ng;
+            if (dp->elastic && dp->queued <= 0 && !dp->head) {
+                qwen_pool_set_width(0);          /* decoder idle: the whole team steps again */
+                dp->overlap_ms += qwen_mono_ms() - dp->overlap_t0;
+            }
             pthread_cond_broadcast(&dp->done_cv);
             pthread_mutex_unlock(&dp->m);
         }
@@ -2703,16 +2716,31 @@ static void dec_enqueue(dec_pool_t *dp, int slot, const int *codes, int nframes,
         fprintf(stderr, "[lane] MAILBOX OVERRUN slot %d (busy=%d): the bounded contract was violated\n",
                 slot, atomic_load(&dp->busy[slot]));
     }
-    dec_job_t *j = (dec_job_t *)calloc(1, sizeof(dec_job_t));
-    if (!j) return;
+    dec_job_t *j;
+    if (dp->slot_job && nframes <= 32 && atomic_load(&dp->busy[slot]) == 0) {
+        /* one unit in flight per slot: the slot's own job and codes buffer are free here */
+        j = &dp->slot_job[slot];
+        memset(j, 0, sizeof *j);
+        j->codes = dp->slot_codes + (size_t)slot * 32 * 16;
+        if (nframes > 0) memcpy(j->codes, codes, (size_t)nframes * 16 * sizeof(int));   /* <= 2 KB */
+    } else {
+        j = (dec_job_t *)calloc(1, sizeof(dec_job_t));
+        if (!j) return;
+        if (nframes > 0) {
+            j->codes = (int *)malloc((size_t)nframes * 16 * sizeof(int));
+            if (!j->codes) { free(j); return; }
+            memcpy(j->codes, codes, (size_t)nframes * 16 * sizeof(int));
+        }
+    }
     j->slot = slot; j->nframes = nframes; j->tag = tag;
     j->is_final = is_final; j->stream = stream; j->first = first;
-    if (nframes > 0) {
-        j->codes = (int *)malloc((size_t)nframes * 16 * sizeof(int));
-        if (!j->codes) { free(j); return; }
-        memcpy(j->codes, codes, (size_t)nframes * 16 * sizeof(int));
-    }
     atomic_fetch_add(&dp->busy[slot], 1);
+    if (dp->lane) {
+        pthread_mutex_lock(&dp->m);
+        if (dp->elastic && dp->queued == 0) { qwen_pool_set_width(dp->step_width); dp->overlap_t0 = qwen_mono_ms(); }
+        dp->queued++;
+        pthread_mutex_unlock(&dp->m);
+    }
     dec_push(dp, j);
 }
 
@@ -2842,6 +2870,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         pthread_cond_init(&dpool.done_cv, NULL);
         dpool.running = 1; dpool.sink = sink; dpool.sstate = sstate; dpool.busy = dec_busy;
         dpool.lane = lane_team > 0;
+        dpool.elastic = dpool.lane && qwen_lane_elastic();
+        dpool.step_width = qwen_get_threads() - lane_team;   /* the STEP cpus: caller + step_width-1 workers */
+        if (dpool.lane) {
+            dpool.slot_job = (dec_job_t *)calloc((size_t)B, sizeof(dec_job_t));
+            dpool.slot_codes = (int *)calloc((size_t)B * 32 * 16, sizeof(int));
+        }
         dpool.batch = (!dpool.lane && getenv("QWEN_DECODER_BATCH") &&
                        atoi(getenv("QWEN_DECODER_BATCH")) != 0) ? 1 : 0;
         dpool.first_group = (getenv("QWEN_DEC_FIRSTCHUNK_GROUP") &&
@@ -2853,9 +2887,15 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             dec_on = 1;
             if (dpool.lane) {
                 const char *lm_step, *lm_dec; qwen_lane_masks(&lm_step, &lm_dec);
-                fprintf(stderr, "[serve] decoder LANE ENABLED: step cpus %s (engine pool %d threads) · "
-                                "decoder cpus %s (private team %d) · mailbox 1 unit/slot, lead <= 1 quantum\n",
-                        lm_step, qwen_get_threads(), lm_dec, lane_team);
+                if (dpool.elastic)
+                    fprintf(stderr, "[serve] decoder LANE ENABLED (ELASTIC): engine pool %d threads on all cpus; while a "
+                                    "decoder unit runs on %s (team %d) the engine narrows to %s (%d threads) · "
+                                    "mailbox 1 unit/slot, preallocated, lead <= 1 quantum\n",
+                            qwen_get_threads(), lm_dec, lane_team, lm_step, dpool.step_width);
+                else
+                    fprintf(stderr, "[serve] decoder LANE ENABLED: step cpus %s (engine pool %d threads) · "
+                                    "decoder cpus %s (private team %d) · mailbox 1 unit/slot, lead <= 1 quantum\n",
+                            lm_step, qwen_get_threads(), lm_dec, lane_team);
             } else
                 fprintf(stderr, "[serve] decoder thread ENABLED (decode leaves the frame loop)\n");
         } else {
@@ -3769,6 +3809,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     pf_decwait, pf_decwait / (double)pf_frames);
             fprintf(stderr, "  [lane-contract] mailbox overruns %lld (must be 0) · max in flight per slot 1 · lead <= 1 quantum\n",
                     (long long)atomic_load(&g_lane_overrun));
+            if (dpool.elastic)
+                fprintf(stderr, "  [lane-elastic] engine narrowed to %d threads for %.1f s = %.1f %% of the loop (decoder in flight); full team otherwise\n",
+                        dpool.step_width, dpool.overlap_ms / 1000.0, wall > 0 ? 100.0 * dpool.overlap_ms / wall : 0.0);
         }
         {
             fprintf(stderr, "  decode occupancy:");
@@ -3840,7 +3883,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         pthread_mutex_destroy(&dpool.m); pthread_cond_destroy(&dpool.cv);
         pthread_cond_destroy(&dpool.done_cv);
         if (dpool.ctx) qwen_tts_free_clone(dpool.ctx);
-        if (dpool.lane) qwen_lane_team_stop();
+        if (dpool.lane) { qwen_pool_set_width(0); qwen_lane_team_stop(); free(dpool.slot_job); free(dpool.slot_codes); }
         dec_on = 0;
     }
     free(dec_busy);
