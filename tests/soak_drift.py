@@ -99,11 +99,17 @@ def drift_pairs(args, has_ttfb):
 def read_requests(path):
     rows = []
     errors = []
+    rejects = []
     with open(path, newline="", encoding="utf-8", errors="replace") as handle:
         for raw in csv.DictReader(handle):
             try:
                 end = float(raw["t_end_s"])
             except (KeyError, TypeError, ValueError):
+                continue
+            status = raw.get("status", "").strip()
+            outcome = raw.get("outcome", "").strip()
+            if status == "503" or outcome == "intentional_reject":
+                rejects.append({"t": end, "status": status or "503"})
                 continue
             error = raw.get("error", "").strip()
             if error:
@@ -150,7 +156,7 @@ def read_requests(path):
                 "probe": raw.get("is_probe") == "1",
                 **playback,
             })
-    return rows, errors
+    return rows, errors, rejects
 
 
 def read_resources(path, warmup):
@@ -237,7 +243,7 @@ def analyze(directory, args):
         print(f"FAIL: missing {request_path}")
         return 1
 
-    rows, errors = read_requests(request_path)
+    rows, errors, rejects = read_requests(request_path)
     usable_all = [row for row in rows if row["t"] >= args.warmup_s]
     usable = [row for row in usable_all if not row["probe"]]
     if not usable:
@@ -272,7 +278,8 @@ def analyze(directory, args):
     has_ttfb = any(row.get("ttfb") is not None for row in usable)
     print("### CLOSED-LOOP SOAK")
     print(f"completed={len(usable_all)} kpi_samples={len(usable)} "
-          f"audio_probes={len(usable_all) - len(usable)} errors={len(errors)} duration_s={end:.1f} "
+          f"audio_probes={len(usable_all) - len(usable)} errors={len(errors)} "
+          f"intentional_rejects={len(rejects)} duration_s={end:.1f} "
           f"warmup_s={args.warmup_s:.0f}")
     print(f"windows={len(windows)} window_s={args.window_s:.0f} "
           f"min_per_window={args.min_per_window}")
@@ -400,8 +407,10 @@ def analyze(directory, args):
     rejected = max((row.get("queue_rejected", 0) for row in resource_rows), default=0)
     queue_timeouts = max((row.get("queue_timeout", 0) for row in resource_rows), default=0)
     request_timeouts = max((row.get("request_timeout", 0) for row in resource_rows), default=0)
-    if rejected > 0:
-        hard_failures.append("queue rejections")
+    # With the production fail-fast contract, a full-capacity 503 is an intentional
+    # admission outcome, not an inference failure.  Keep it visible in the summary,
+    # but do not turn a correctly rejected overload request into a SOAK FAIL.  Actual
+    # queue/request timeouts remain hard failures below.
     if queue_timeouts > 0:
         hard_failures.append("queue timeouts")
     if request_timeouts > 0:
@@ -444,6 +453,8 @@ def analyze(directory, args):
         "audio_probes": len(usable_all) - len(usable),
         "errors": len(errors),
         "error_examples": errors[:5],
+        "intentional_rejects": len(rejects),
+        "reject_examples": rejects[:5],
         "queue_rejected": rejected,
         "queue_timeout": queue_timeouts,
         "request_timeout": request_timeouts,

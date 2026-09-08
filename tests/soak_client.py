@@ -7,6 +7,7 @@ import os
 import random
 import sys
 import time
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +94,7 @@ CSV_COLUMNS = (
     "first_chunk_bytes", "audio_s", "stream_rtf", "underrun_s",
     "stall_max_s", "prebuffer_s", "gap_ratio_max", "chunks",
     *PLAYBACK_COLUMNS,
+    "status", "outcome",
     "is_probe", "class", "text_chars", "seed", "schedule", "error",
 )
 
@@ -139,6 +141,17 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
                 received += len(chunk)
                 if handle:
                     handle.write(chunk)
+    except urllib.error.HTTPError as error:
+        # --max-queue 0 deliberately turns overload into an immediate 503.  That is
+        # an admission outcome, not an inference/client error; the caller records it
+        # separately and backs off before retrying the closed-loop worker.
+        if error.code == 503:
+            try:
+                error.read()
+            except Exception:
+                pass
+            return {"status": 503, "outcome": "intentional_reject"}, None
+        return None, f"HTTP {error.code}: {error.reason}"
     except Exception as error:
         return None, str(error)
     finally:
@@ -154,6 +167,8 @@ def one(port, text, speaker, language, seed, temperature, out_path, timeout):
         "ttfa_ms": (first_at or 0.0) * 1000.0,
         "total_ms": total * 1000.0,
         "bytes": received,
+        "status": 200,
+        "outcome": "completed",
         "first_chunk_bytes": first,
         "audio_s": audio_s,
         **kpis,
@@ -192,6 +207,7 @@ def main():
     probe_cls, probe_text = rows[(args.worker + args.schedule_seed) % len(rows)]
     ticked = set()
     index = 0
+    reject_streak = 0
     with open(args.csv, "w", newline="", buffering=1, encoding="utf-8") as handle:
         output = csv.writer(handle)
         output.writerow(CSV_COLUMNS)
@@ -218,9 +234,21 @@ def main():
             )
             end = time.time() - args.t0
             tail = (int(probe), cls, len(text), seed, args.schedule)
+            # These two fields sit before the five request-identifying tail fields so
+            # older consumers that rely on the final `error` column remain compatible.
+            blanks = len(CSV_COLUMNS) - 3 - len(tail) - 1 - 2
             if error:
-                blanks = [""] * (len(CSV_COLUMNS) - 3 - len(tail) - 1)
-                output.writerow((f"{end:.3f}", args.worker, index, *blanks, *tail, error))
+                output.writerow((f"{end:.3f}", args.worker, index,
+                                 *([""] * blanks), "", "error", *tail, error))
+                reject_streak = 0
+            elif result.get("status") == 503:
+                output.writerow((f"{end:.3f}", args.worker, index,
+                                 *([""] * blanks), "503", "intentional_reject", *tail, ""))
+                reject_streak += 1
+                # A fail-fast server must not be hammered by a closed-loop client.  The
+                # cap is deliberately short so admission remains responsive while the
+                # trace reflects the offered workload rather than a retry storm.
+                time.sleep(min(0.5, 0.05 * (2 ** min(reject_streak - 1, 3))))
             else:
                 output.writerow((
                     f"{end:.3f}", args.worker, index,
@@ -234,8 +262,10 @@ def main():
                     f"{result['max_gap_s']:.4f}", result["coalesced_reads"],
                     *(f"{result[f'stall_ms_at_{b}']:.1f}" if i == 0 else result[f"stalls_at_{b}"]
                       for b in playback_sim.BUFFERS_MS for i in (0, 1)),
+                    result["status"], result["outcome"],
                     *tail, "",
                 ))
+                reject_streak = 0
             index += 1
 
 

@@ -102,6 +102,22 @@ class SoakTests(unittest.TestCase):
             self.assertTrue(all(item["status"] == "PARTIAL"
                                 for item in summary["per_class"].values()))
 
+    def test_intentional_503_is_not_an_inference_error(self):
+        fields = list(soak_client.CSV_COLUMNS)
+        with tempfile.TemporaryDirectory() as directory:
+            request_path = os.path.join(directory, "requests.csv")
+            with open(request_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                row = {field: "" for field in fields}
+                row.update({"t_end_s": "1.0", "status": "503",
+                            "outcome": "intentional_reject", "error": ""})
+                writer.writerow(row)
+            rows, errors, rejects = soak_drift.read_requests(request_path)
+            self.assertEqual(rows, [])
+            self.assertEqual(errors, [])
+            self.assertEqual(len(rejects), 1)
+
     def test_profile_flag_check_uses_resolved_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             log_path = os.path.join(directory, "server.log")
