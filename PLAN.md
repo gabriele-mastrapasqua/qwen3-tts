@@ -152,6 +152,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       the preferred STREAM p95 target. Three-wave screen only; not a qualification, and
       no causal fused-vs-off frontier shift was isolated. Detail:
       `.work/f1-fused-quantum-20260908.md`.
+- [x] F-cap3 C5 capacity screen (2026-09-08): cap 3 accepted the fifth-request
+      wave without the multi-second parent-backlog tail, but cap-3 C5 failed the
+      realtime promotion gate (`STREAM_RTF` p95 `0.969`, fifth-launch proxy `1.028`,
+      stall@250 `13.3%`). Cap 2/q4 remains the reference; established-four causal
+      impact is UNKNOWN because the short run used true simultaneous waves. No C6.
+      Detail: `.work/f-cap3-c5-capacity-20260908.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving
