@@ -147,9 +147,15 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
     cls, txt = TEXTS[idx % len(TEXTS)]
     body = json.dumps({"text": txt, "speaker": speaker, "language": language,
                        "temperature": 0.0, "seed": seed + idx}).encode()
+    t0 = time.time(); t0_mono_ms = time.monotonic() * 1000.0
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("QWEN_TTFA_TRACE"):
+        # F2 aligns the client request origin with the server's CLOCK_MONOTONIC domain.
+        # Ordinary runs send no diagnostic header.
+        headers["X-Qwen-F2-Client-Start-Monotonic-Ms"] = f"{t0_mono_ms:.3f}"
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/tts/stream", data=body,
-                                 headers={"Content-Type": "application/json"})
-    t0 = time.time(); ttfa = None; ttfb = None; n = 0; chunks = []; marks = []
+                                 headers=headers)
+    ttfa = None; ttfb = None; n = 0; chunks = []; marks = []
     try:
         with urllib.request.urlopen(req, timeout=1200) as r:
             ttfb = time.time() - t0          # urlopen returns once the status line + headers are in
@@ -178,7 +184,7 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
         rec = {"cls": cls, "ttfa_ms": (ttfa or 0) * 1000.0, "ttfb_ms": (ttfb or 0) * 1000.0,
                "total_s": total,
                "audio_s": secs, "seed": seed + idx, "idx": idx,
-               "t_send": t0, "marks": marks,
+               "t_send": t0, "t_send_mono_ms": t0_mono_ms, "marks": marks,
                "rtf": total / secs if secs > 0 else float("nan")}
         rec.update(stream_kpis(marks, total))
         out.append(rec)
@@ -301,6 +307,7 @@ def result_header(a, model_path, extra_env):
     print(f"### backend=           {backend}")
     print(f"### precision=         {a.precision}")
     print(f"### runtime_profile=   {a.server_env or '(compiled defaults)'}")
+    print(f"### server_args=       {' '.join(a.server_args) if a.server_args else '(none)'}")
     print(f"### text_bank=         {os.path.basename(a.text_file)}"
           f"{'   classes= ' + a.classes if a.classes else ''}")
     print(f"### runtime_flags=  {flags}")
@@ -316,6 +323,7 @@ def result_header(a, model_path, extra_env):
         "arrival_model": ARRIVAL_TRUE_WAVE, "topology": a.topo, "concurrency": a.conc,
         "waves": a.waves, "backend": backend, "precision": a.precision,
         "runtime_profile": a.server_env or "(compiled defaults)",
+        "server_args": list(a.server_args),
         "runtime_flags": {k: env.get(k, "(default)") for k in watched},
         "text_bank": os.path.basename(a.text_file), "classes": a.classes,
         "harness": os.path.basename(__file__), "run_date": RUN_DATE,
@@ -426,6 +434,9 @@ def main():
     ap.add_argument("--server-env", default="", metavar="K=V,K=V",
                     help="env applied to the SERVER process only (A/B arms). Merged ON TOP "
                          "of --profile, and every override is announced.")
+    ap.add_argument("--server-arg", action="append", default=[], dest="server_args", metavar="ARG",
+                    help="one extra server argv token; repeat for a diagnostic arm such as "
+                         "--server-arg=--max-queue --server-arg=0")
     ap.add_argument("--profile", default="", metavar="NAME",
                     help="deployment profile from configs/perf; supplies the server env")
     ap.add_argument("--no-profile", default="", metavar="REASON",
@@ -488,6 +499,7 @@ def main():
         if elastic:
             cmd += ["--prefork-elastic"]
         cmd += getattr(a, "profile_argv", [])
+        cmd += a.server_args
         log = os.path.join(a.out, f"{label}_{topo}.log")
         f = open(log, "wb")
         senv = dict(os.environ)

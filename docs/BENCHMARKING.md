@@ -169,6 +169,13 @@ stationary stratified workload. Playback terms: `required_prebuffer`, `safe_play
 `stall_rate@B`, `max_gap` are defined in `docs/serving-operations.md` §5 and computed by
 `tests/playback_sim.py`; they are client-observed (see the coalesced-read share).
 
+`tests/serve_parallel_wave.py` accepts repeated `--server-arg=ARG` tokens for a bounded
+diagnostic arm that must vary an actual server command-line option (for example
+`--server-arg=--max-queue --server-arg=0`). The option is printed in the result identity
+and is not a replacement for a named deployment profile. When `QWEN_TTFA_TRACE` is enabled,
+the harness also sends a monotonic client-start header consumed only by the server's
+diagnostic timeline; such runs are DIAGNOSTIC evidence, not qualification numbers.
+
 ## 8. Canonical server metrics
 
 Always: requests started, completed, failed, rejected, timeout, outstanding/killed;

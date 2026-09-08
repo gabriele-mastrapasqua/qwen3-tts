@@ -2780,6 +2780,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     double *t2_admitted   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pf_start   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pf_done    = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
+    double *t2_step1     = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
+    double *t2_talker1   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
+    double *t2_decode1   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_state_rdy  = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pfq_push   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pfq_pop    = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
@@ -2799,11 +2802,13 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         fprintf(stderr,                                                                      \
             "[TTFA2] v=2 seed=%u path=%s slot=%d clock=CLOCK_MONOTONIC domain=S "            \
             "dec_thread=%d dec_batch=%d admitted=%.3f prefill_start=%.3f prefill_done=%.3f " \
-            "state_ready=%.3f pfq_push=%.3f pfq_pop=%.3f installed=%.3f frame1=%.3f "        \
+            "state_ready=%.3f step1=%.3f talker1=%.3f decode1=%.3f "                         \
+            "pfq_push=%.3f pfq_pop=%.3f installed=%.3f frame1=%.3f "                        \
             "audio1=%.3f batch_at_install=%d pfq_depth_at_pop=%d adm_seq=%llu\n",  \
             t2_seed[(bb_)], t2_helper[(bb_)] ? "HELPER" : "INLINE", (bb_),                   \
             dec_on, dec_batch,                                                               \
             t2_admitted[(bb_)], t2_pf_start[(bb_)], t2_pf_done[(bb_)], t2_state_rdy[(bb_)],  \
+            t2_step1[(bb_)], t2_talker1[(bb_)], t2_decode1[(bb_)],                         \
             t2_pfq_push[(bb_)], t2_pfq_pop[(bb_)], t2_installed[(bb_)], t2_frame1[(bb_)],    \
             t2_audio1[(bb_)], t2_batch_at_inst[(bb_)], t2_qdepth_at_pop[(bb_)],  \
             t2_adm_seq[(bb_)]);  \
@@ -2999,6 +3004,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             t2_admitted[(b_)] = _tt0;       t2_pf_start[(b_)]  = _tt0;                     \
             t2_pf_done[(b_)]  = _tt1;       t2_state_rdy[(b_)] = _tt1;                     \
             t2_pfq_push[(b_)] = 0;          t2_pfq_pop[(b_)]   = 0;                        \
+            t2_step1[(b_)] = 0; t2_talker1[(b_)] = 0; t2_decode1[(b_)] = 0;                  \
             t2_frame1[(b_)] = 0; t2_audio1[(b_)] = 0; t2_emitted[(b_)] = 0;                \
             t2_batch_at_inst[(b_)] = n_active; t2_qdepth_at_pop[(b_)] = -1;                \
             t2_adm_seq[(b_)] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);   \
@@ -3193,6 +3199,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     t2_admitted[b] = p->ts_admitted;    t2_pf_start[b]  = p->ts_prefill_start;
                     t2_pf_done[b]  = p->ts_prefill_done; t2_state_rdy[b] = p->ts_state_ready;
                     t2_pfq_push[b] = p->ts_pfq_push;    t2_pfq_pop[b]   = _t_pop;
+                    t2_step1[b] = 0; t2_talker1[b] = 0; t2_decode1[b] = 0;
                     t2_frame1[b] = 0; t2_audio1[b] = 0; t2_emitted[b] = 0;
                     t2_batch_at_inst[b] = n_active;     t2_qdepth_at_pop[b] = pfq.count;
                     t2_adm_seq[b] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
@@ -3299,6 +3306,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         }
         if (st_tt) qwen_set_threads_soft(st_tt);
 
+        if (ttfa_trace) {
+            for (int b = 0; b < B; b++)
+                if (step_active[b] && t2_step1[b] == 0.0) t2_step1[b] = qwen_mono_ms();
+        }
         qwen_batch_pack_active(bb, step_active);
         PF_START();
         qwen_batch_proj(logits, ctx->codec_head_bf16, last_hidden, vocab, h, h,
@@ -3350,12 +3361,14 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 if (pending < target) continue;
                 if (dec_on && want_stream[b]) {
+                    if (ttfa_trace && t2_decode1[b] == 0.0) t2_decode1[b] = qwen_mono_ms();
                     dec_enqueue(&dpool, b, chcodes[b] + (size_t)decpos[b] * 16, pending,
                                 tag[b], 0, 1, decpos[b] == 0);
                     decpos[b] = chframes[b];
                     continue;
                 }
                 float *aud = NULL; int an = 0;
+                if (ttfa_trace && t2_decode1[b] == 0.0) t2_decode1[b] = qwen_mono_ms();
                 if (qwen_speech_decoder_decode_streaming_st(ctx, &sstate[b],
                         chcodes[b] + (size_t)decpos[b] * 16, pending, &aud, &an) == 0
                     && aud && an > 0) {
@@ -3476,6 +3489,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             if (nit > 0) {
                 int _di_first = 0;
                 for (int _i = 0; _i < nit; _i++) if (decpos[db_slot[_i]] == 0) { _di_first = 1; break; }
+                if (ttfa_trace)
+                    for (int _i = 0; _i < nit; _i++)
+                        if (t2_decode1[db_slot[_i]] == 0.0)
+                            t2_decode1[db_slot[_i]] = qwen_mono_ms();
                 double _di_t0 = ttfa_trace ? qwen_mono_ms() : 0.0;
                 qwen_speech_decoder_decode_streaming_batch(ctx, db_items, nit);
                 if (ttfa_trace)
@@ -3523,6 +3540,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         PF_END(pf_decode);
 
         PF_START();
+        if (ttfa_trace) {
+            for (int b = 0; b < B; b++)
+                if (step_active[b] && t2_talker1[b] == 0.0) t2_talker1[b] = qwen_mono_ms();
+        }
         int pf_rc = qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, step_active, last_hidden);
         PF_END(pf_talker);
         if (pf_rc != 0) {
@@ -3616,6 +3637,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     free(dec_busy);
     free(db_pending); free(db_target); free(db_slot); free(db_items);
     free(t2_admitted); free(t2_pf_start); free(t2_pf_done); free(t2_state_rdy);
+    free(t2_step1); free(t2_talker1); free(t2_decode1);
     free(t2_pfq_push); free(t2_pfq_pop); free(t2_installed); free(t2_frame1);
     free(t2_audio1); free(t2_seed); free(t2_helper); free(t2_batch_at_inst);
     free(t2_qdepth_at_pop); free(t2_emitted); free(t2_adm_seq);

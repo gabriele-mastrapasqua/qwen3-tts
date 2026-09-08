@@ -1296,7 +1296,20 @@ static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
 #define CONN_QUEUE_CAP 256
 
 typedef struct {
+    double parent_accept_ms;
+    double parent_slot_ms;
+    double parent_dispatch_ms;
+    double child_receive_ms;
+    unsigned long long parent_seq;
+    int parent_worker;
+    int free_slots_before;
+    int free_slots_at_accept;
+    int cap;
+} server_handoff_t;
+
+typedef struct {
     int fds[CONN_QUEUE_CAP];
+    server_handoff_t handoff[CONN_QUEUE_CAP];
     int head, tail, count;
     pthread_mutex_t mtx;
     pthread_cond_t not_empty;
@@ -1312,24 +1325,28 @@ static void cq_init(conn_queue_t *q) {
     pthread_cond_init(&q->not_full, NULL);
 }
 
-static void cq_push(conn_queue_t *q, int fd) {
+static void cq_push(conn_queue_t *q, int fd, const server_handoff_t *handoff) {
     pthread_mutex_lock(&q->mtx);
     while (q->count == CONN_QUEUE_CAP && !q->shutdown)
         pthread_cond_wait(&q->not_full, &q->mtx);
     if (q->shutdown) { pthread_mutex_unlock(&q->mtx); srv_conn_close(fd); return; }
     q->fds[q->tail] = fd;
+    if (handoff) q->handoff[q->tail] = *handoff;
+    else memset(&q->handoff[q->tail], 0, sizeof(q->handoff[q->tail]));
     q->tail = (q->tail + 1) % CONN_QUEUE_CAP;
     q->count++;
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->mtx);
 }
 
-static int cq_pop(conn_queue_t *q) {
+static int cq_pop(conn_queue_t *q, server_handoff_t *handoff) {
     pthread_mutex_lock(&q->mtx);
     while (q->count == 0 && !q->shutdown)
         pthread_cond_wait(&q->not_empty, &q->mtx);
     if (q->count == 0 && q->shutdown) { pthread_mutex_unlock(&q->mtx); return -1; }
-    int fd = q->fds[q->head];
+    int head = q->head;
+    int fd = q->fds[head];
+    if (handoff) *handoff = q->handoff[head];
     q->head = (q->head + 1) % CONN_QUEUE_CAP;
     q->count--;
     pthread_cond_signal(&q->not_full);
@@ -1356,7 +1373,7 @@ static void *worker_main(void *arg) {
     qwen_thread_name("srv-slot");
     worker_arg_t *wa = (worker_arg_t *)arg;
     for (;;) {
-        int fd = cq_pop(wa->q);
+        int fd = cq_pop(wa->q, NULL);
         if (fd < 0) break;
         handle_connection(wa->ctx, fd, (struct sockaddr_in){0});
     }
@@ -1392,9 +1409,10 @@ static void srv_conn_close(int fd) {
 }
 
 #if defined(__linux__)
-static int srv_send_fd(int chan, int fd) {
+static int srv_send_fd(int chan, int fd, const server_handoff_t *handoff) {
     char dummy = 'F';
-    struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
+    struct iovec iov = { .iov_base = handoff ? (void *)handoff : (void *)&dummy,
+                         .iov_len = handoff ? sizeof(*handoff) : 1 };
     char cbuf[CMSG_SPACE(sizeof(int))];
     memset(cbuf, 0, sizeof cbuf);
     struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
@@ -1405,12 +1423,13 @@ static int srv_send_fd(int chan, int fd) {
     memcpy(CMSG_DATA(cm), &fd, sizeof(int));
     ssize_t n;
     do { n = sendmsg(chan, &msg, 0); } while (n < 0 && errno == EINTR);
-    return n > 0 ? 0 : -1;
+    return n == (ssize_t)iov.iov_len ? 0 : -1;
 }
 
-static int srv_recv_fd(int chan) {
+static int srv_recv_fd(int chan, server_handoff_t *handoff) {
     char dummy;
-    struct iovec iov = { .iov_base = &dummy, .iov_len = 1 };
+    struct iovec iov = { .iov_base = handoff ? (void *)handoff : (void *)&dummy,
+                         .iov_len = handoff ? sizeof(*handoff) : 1 };
     char cbuf[CMSG_SPACE(sizeof(int))];
     memset(cbuf, 0, sizeof cbuf);
     struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
@@ -1418,6 +1437,7 @@ static int srv_recv_fd(int chan) {
     ssize_t n = recvmsg(chan, &msg, 0);
     if (n < 0 && errno == EINTR) return -3;
     if (n <= 0) return -1;
+    if (handoff && n != (ssize_t)sizeof(*handoff)) return -2;
     struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
     if (!cm || cm->cmsg_type != SCM_RIGHTS) return -2;
     int fd; memcpy(&fd, CMSG_DATA(cm), sizeof(int));
@@ -1516,6 +1536,11 @@ typedef struct batch_job {
     qwen_batch_req_t req;
     double enq_ms;
     double t_recv, t_parsed, t_admit, t_first;
+    double t_client_start;
+    double t_parent_accept, t_parent_slot, t_parent_dispatch, t_child_receive;
+    unsigned long long parent_seq;
+    int parent_worker;
+    int free_slots_before, free_slots_at_accept, parent_cap;
     double t_write_attempt;
     double t_write_complete;
     unsigned long long enq_adm_seq;
@@ -1547,6 +1572,17 @@ static double srv_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+/* F2 reuses the existing TTFA diagnostic switch.  When it is disabled, no handoff
+ * metadata is sent over the prefork channel and no extra request timestamps are read. */
+static int qwen_f2_trace(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("QWEN_TTFA_TRACE");
+        enabled = e && e[0] && atoi(e) != 0;
+    }
+    return enabled;
 }
 
 typedef struct {
@@ -1687,11 +1723,23 @@ static void respond_wav(int fd, const float *audio, int n_samples) {
 typedef struct { qwen_tts_ctx_t *ctx; conn_queue_t *cq; job_queue_t *jq; job_queue_t *jq_single;
                  int def_speaker_id; int def_language_id; } reader_arg_t;
 
+static double f2_client_start_ms(const char *request) {
+    static const char key[] = "X-Qwen-F2-Client-Start-Monotonic-Ms:";
+    const char *p = strstr(request, key);
+    if (!p) return 0.0;
+    p += sizeof(key) - 1;
+    while (*p == ' ' || *p == '\t') p++;
+    char *end = NULL;
+    double v = strtod(p, &end);
+    return (end != p && v > 0.0) ? v : 0.0;
+}
+
 static void *reader_main(void *arg) {
     qwen_thread_name("srv-read");
     reader_arg_t *ra = (reader_arg_t *)arg;
     for (;;) {
-        int fd = cq_pop(ra->cq);
+        server_handoff_t handoff;
+        int fd = cq_pop(ra->cq, &handoff);
         if (fd < 0) break;
         char *buf = (char *)malloc(1024 * 1024);
         if (!buf) { srv_conn_close(fd); continue; }
@@ -1727,6 +1775,16 @@ static void *reader_main(void *arg) {
             atomic_init(&j->audio_ready_samples, 0);
             atomic_init(&j->first_audio_ready_us, 0);
             j->fd = fd;
+            j->t_client_start = f2_client_start_ms(buf);
+            j->t_parent_accept = handoff.parent_accept_ms;
+            j->t_parent_slot = handoff.parent_slot_ms;
+            j->t_parent_dispatch = handoff.parent_dispatch_ms;
+            j->t_child_receive = handoff.child_receive_ms;
+            j->parent_seq = handoff.parent_seq;
+            j->parent_worker = handoff.parent_worker;
+            j->free_slots_before = handoff.free_slots_before;
+            j->free_slots_at_accept = handoff.free_slots_at_accept;
+            j->parent_cap = handoff.cap;
             int needs_single = 0;
             char rerr[256] = {0};
             char *text = parse_batch_req(ra->ctx, ra->def_speaker_id, ra->def_language_id, body, &j->req, &needs_single, rerr, sizeof(rerr));
@@ -2005,13 +2063,21 @@ static void qwen_life_emit(batch_job_t *j) {
                 j->t_abort_detected > 0 ? j->t_abort_detected : -1.0);
     if (getenv("QWEN_TTFA_TRACE"))
         fprintf(stderr, "[PATH] v=2 seed=%u pid=%d clock=CLOCK_MONOTONIC domain=S "
-                        "boot_id=%s recv=%.3f parsed=%.3f enqueued=%.3f admitted=%.3f "
+                        "boot_id=%s client_start=%.3f parent_accept=%.3f parent_slot=%.3f "
+                        "parent_dispatch=%.3f child_receive=%.3f recv=%.3f parsed=%.3f "
+                        "enqueued=%.3f admitted=%.3f first_pcm=%.3f "
                         "write_attempt=%.3f write_complete=%.3f enq_adm_seq=%llu "
-                        "enq_adm_ts=%.3f enq_last_iter_ms=%.3f\n",
+                        "enq_adm_ts=%.3f enq_last_iter_ms=%.3f parent_seq=%llu "
+                        "parent_worker=%d free_slots_before=%d free_slots_at_accept=%d "
+                        "parent_cap=%d\n",
                 j->life_seed, (int)getpid(), qwen_boot_id(),
-                j->t_recv, j->t_parsed, j->enq_ms, j->t_admit,
+                j->t_client_start, j->t_parent_accept, j->t_parent_slot,
+                j->t_parent_dispatch, j->t_child_receive, j->t_recv, j->t_parsed,
+                j->enq_ms, j->t_admit, j->t_first,
                 j->t_write_attempt, j->t_write_complete,
-                j->enq_adm_seq, j->enq_adm_ts, j->enq_last_iter_ms);
+                j->enq_adm_seq, j->enq_adm_ts, j->enq_last_iter_ms,
+                j->parent_seq, j->parent_worker, j->free_slots_before,
+                j->free_slots_at_accept, j->parent_cap);
     fprintf(stderr, "[LIFE] pid=%d seed=%u parse=%.1f queue=%.1f pre_service=%.1f "
                     "ttfa_after_admit=%.1f service=%.1f worker_total=%.1f%s\n",
             (int)getpid(), j->life_seed,
@@ -2302,11 +2368,13 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
 
     while (server_running) {
         int client_fd;
+        server_handoff_t handoff = {0};
         if (g_conn_chan_fd >= 0) {
 #if defined(__linux__)
-            client_fd = srv_recv_fd(g_conn_chan_fd);
+            client_fd = srv_recv_fd(g_conn_chan_fd, qwen_f2_trace() ? &handoff : NULL);
             if (client_fd == -1) break;
             if (client_fd < 0) continue;
+            if (qwen_f2_trace()) handoff.child_receive_ms = srv_now_ms();
             {
                 cpu_set_t got; CPU_ZERO(&got);
                 if (sched_getaffinity(0, sizeof got, &got) == 0) {
@@ -2326,7 +2394,8 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
             }
         }
         set_client_timeout(client_fd);
-        cq_push(&cq, client_fd);
+        cq_push(&cq, client_fd,
+                (g_conn_chan_fd >= 0 && qwen_f2_trace()) ? &handoff : NULL);
     }
 
     if (server_fd >= 0) close(server_fd);
@@ -2431,7 +2500,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
             continue;
         }
         set_client_timeout(client_fd);
-        cq_push(&q, client_fd);
+        cq_push(&q, client_fd, NULL);
     }
 
     close(server_fd);
@@ -2702,6 +2771,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
     struct pollfd *pfd = (struct pollfd *)calloc((size_t)workers + 1, sizeof(struct pollfd));
     if (!pfd) return -1;
     long long dispatched = 0;
+    unsigned long long f2_parent_seq = 0;
     double act_area = 0.0, act_time = 0.0;
     double *act_area_w = (double *)calloc((size_t)workers, sizeof(double));
     if (!act_area_w) return -1;
@@ -2784,6 +2854,14 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         int cfd = accept(listen_fd, (struct sockaddr *)&ca, &cl);
         if (cfd < 0) { if (errno == EINTR || errno == EAGAIN) continue; perror("accept"); continue; }
 
+        const double f2_accept_ms = qwen_f2_trace() ? srv_now_ms() : 0.0;
+        const double f2_slot_ms = qwen_f2_trace() ? srv_now_ms() : 0.0;
+        int f2_free_at_accept = 0;
+        if (qwen_f2_trace())
+            for (int w = 0; w < workers; w++)
+                if (kids[w] > 0 && active[w] < cap) f2_free_at_accept++;
+        const unsigned long long f2_seq = qwen_f2_trace() ? ++f2_parent_seq : 0;
+
         int best = -1;
         for (int w = 0; w < workers; w++) {
             if (kids[w] <= 0 || active[w] >= cap) continue;
@@ -2791,6 +2869,12 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         }
         if (best < 0) {
             rejected++;
+            if (qwen_f2_trace())
+                fprintf(stderr, "[F2REJECT] v=1 seq=%llu reason=all_workers_full "
+                                "clock=CLOCK_MONOTONIC accept=%.3f slot=%.3f "
+                                "free_slots_before=%d free_slots_at_accept=%d cap=%d\n",
+                        f2_seq, f2_accept_ms, f2_slot_ms, free_slots,
+                        f2_free_at_accept, cap);
             send_error(cfd, 503, "all workers at capacity");
             close(cfd);
             continue;
@@ -2802,8 +2886,25 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             replans += elastic_apply(workers, ncpu, slice, kids, cur, cpu_order);
             active[best]--;
         }
-        if (srv_send_fd(sp[best][0], cfd) != 0) {
+        server_handoff_t handoff = {0};
+        if (qwen_f2_trace()) {
+            handoff.parent_accept_ms = f2_accept_ms;
+            handoff.parent_slot_ms = f2_slot_ms;
+            handoff.parent_dispatch_ms = srv_now_ms();
+            handoff.parent_seq = f2_seq;
+            handoff.parent_worker = best;
+            handoff.free_slots_before = free_slots;
+            handoff.free_slots_at_accept = f2_free_at_accept;
+            handoff.cap = cap;
+        }
+        if (srv_send_fd(sp[best][0], cfd, qwen_f2_trace() ? &handoff : NULL) != 0) {
             rejected++;
+            if (qwen_f2_trace())
+                fprintf(stderr, "[F2REJECT] v=1 seq=%llu reason=fd_dispatch_failed "
+                                "clock=CLOCK_MONOTONIC accept=%.3f slot=%.3f "
+                                "free_slots_before=%d free_slots_at_accept=%d cap=%d\n",
+                        f2_seq, f2_accept_ms, f2_slot_ms, free_slots,
+                        f2_free_at_accept, cap);
             close(cfd);
             continue;
         }
