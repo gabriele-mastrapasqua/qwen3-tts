@@ -237,6 +237,9 @@ both belong before any number.
 | `QWEN_SERVE_BLAS_BUSY` | 0 (same) | BLAS threads from two busy slots up |
 | `QWEN_TTFA_PRIORITY` | 0 (off) | N > 0 lets N prefilling requests take priority over decoding ones, clamped to 8 |
 | `QWEN_ADMIT_M1` | off | admits a new request one step earlier in the scheduler; opt-in, measured per box |
+| `QWEN_ADMIT_UTIL` | off | Linux prefork diagnostic only: keeps the parent admission cap at 2, but may dispatch one transient third request when a worker's recent service-loop interval is below `QWEN_ADMIT_UTIL_LIMIT_MS`; otherwise it uses the immediate overload response. It provisions child B=3 only while enabled; it is not a permanent cap-3 policy |
+| `QWEN_ADMIT_UTIL_LIMIT_MS` | 60 | recent service-loop interval limit in milliseconds for the transient third-slot predicate; benchmark thresholds must be fixed before an A/B run |
+| `QWEN_ADMIT_UTIL_TRACE` | off | diagnostic `[ADMITUTIL]` decisions: worker, active slots, sample age, recent interval, threshold and admit/reject reason |
 | `QWEN_THP` | off | `=1` advises transparent huge pages over the mapped weights (Linux) |
 
 Note that `OPENBLAS_NUM_THREADS` is not in this table because it must be **absent**: the engine

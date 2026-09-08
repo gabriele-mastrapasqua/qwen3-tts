@@ -7,6 +7,7 @@
 #include "qwen_tts_server.h"
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #endif
 #include "qwen_tts_costmap.h"
 #include "qwen_tts_kernels.h"
@@ -21,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -621,6 +623,26 @@ static int g_cfg_max_queue = -1;
 static int g_cfg_queue_timeout_ms = 0;
 static int g_cfg_max_request_ms = 60000;
 static int g_cfg_max_text_chars = 0;
+
+static int qwen_admit_util_requested(void) {
+    const char *e = getenv("QWEN_ADMIT_UTIL");
+    return e && *e && atoi(e) != 0;
+}
+
+static double qwen_admit_util_limit_ms(void) {
+    const double fallback = 60.0;
+    const char *e = getenv("QWEN_ADMIT_UTIL_LIMIT_MS");
+    if (!e || !*e) return fallback;
+    char *end = NULL;
+    double v = strtod(e, &end);
+    if (end == e || *end != '\0' || !isfinite(v) || v <= 0.0) return fallback;
+    return v;
+}
+
+static int qwen_admit_util_trace(void) {
+    const char *e = getenv("QWEN_ADMIT_UTIL_TRACE");
+    return e && *e && atoi(e) != 0;
+}
 
 static _Thread_local char g_req_err[256];
 static int g_cfg_strict = 1;
@@ -1572,6 +1594,32 @@ static double srv_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+/* LS-4 deliberately uses a recent service-loop interval, not aggregate CPU
+ * utilization.  The child publishes this through the shared health page; a
+ * stale or incomplete sample is never a reason to admit the temporary slot. */
+static int qwen_admit_util_sample_ok(const qwen_admission_health_t *health, int worker,
+                                     double now_ms, double limit_ms,
+                                     double *last_iter_ms, double *age_ms,
+                                     const char **reason) {
+    const qwen_admission_health_t *h = &health[worker];
+    const unsigned long long seq = atomic_load_explicit(&h->seq, memory_order_acquire);
+    const double ts = atomic_load_explicit(&h->ts_ms, memory_order_relaxed);
+    const double iter = atomic_load_explicit(&h->last_iter_ms, memory_order_relaxed);
+    const double age = ts > 0.0 ? now_ms - ts : 1.0e300;
+    const double stale_limit = limit_ms * 2.0 > 100.0 ? limit_ms * 2.0 : 100.0;
+    if (last_iter_ms) *last_iter_ms = iter;
+    if (age_ms) *age_ms = age;
+    if (!seq || ts <= 0.0) { if (reason) *reason = "no_sample"; return 0; }
+    if (!isfinite(age) || age < 0.0 || age > stale_limit) {
+        if (reason) *reason = "stale_sample";
+        return 0;
+    }
+    if (!isfinite(iter) || iter <= 0.0) { if (reason) *reason = "warmup"; return 0; }
+    if (iter >= limit_ms) { if (reason) *reason = "iteration_over_limit"; return 0; }
+    if (reason) *reason = "headroom";
+    return 1;
 }
 
 /* F2 reuses the existing TTFA diagnostic switch.  When it is disabled, no handoff
@@ -2650,6 +2698,37 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
     const int core_major = qwen_cpu_core_major_order(cpu_order, ncpu);
     if (threads_per < 1) threads_per = per;
     const int cap = max_batch >= 1 ? max_batch : 1;
+    int admit_util = qwen_admit_util_requested() && cap == 2;
+    const double admit_util_limit = qwen_admit_util_limit_ms();
+    const int admit_util_trace = qwen_admit_util_trace();
+    qwen_admission_health_t *admit_health = NULL;
+    if (qwen_admit_util_requested() && cap != 2) {
+        fprintf(stderr, "[serve] QWEN_ADMIT_UTIL requires --batch-size 2; disabled\n");
+        admit_util = 0;
+    }
+#if defined(__linux__)
+    if (admit_util) {
+        size_t bytes = (size_t)workers * sizeof(*admit_health);
+        admit_health = (qwen_admission_health_t *)mmap(NULL, bytes,
+                            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (admit_health == MAP_FAILED) {
+            fprintf(stderr, "[serve] QWEN_ADMIT_UTIL shared health allocation failed; disabled\n");
+            admit_health = NULL;
+            admit_util = 0;
+        } else {
+            for (int w = 0; w < workers; w++) {
+                atomic_init(&admit_health[w].seq, 0);
+                atomic_init(&admit_health[w].ts_ms, 0.0);
+                atomic_init(&admit_health[w].last_iter_ms, 0.0);
+            }
+        }
+    }
+#else
+    if (admit_util) {
+        fprintf(stderr, "[serve] QWEN_ADMIT_UTIL is Linux-prefork-only; disabled\n");
+        admit_util = 0;
+    }
+#endif
 
     qwen_provenance_report(stderr);
     int listen_fd = setup_listen_socket(port);
@@ -2708,6 +2787,10 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                     "cap %d in flight each, port %d%s\n",
             workers, threads_per, ncpu, per, cap, port,
             elastic ? " · ELASTIC core allocation" : "");
+    if (admit_util)
+        fprintf(stderr, "prefork: QWEN_ADMIT_UTIL ON · parent cap=%d · one transient extra slot "
+                        "· iteration limit %.1f ms · child batch=%d%s\n",
+                cap, admit_util_limit, cap + 1, admit_util_trace ? " · trace ON" : "");
     if (reject_full_at_parent)
         fprintf(stderr, "prefork: --max-queue 0 -> accept and return 503 immediately when all "
                         "worker slots are occupied\n");
@@ -2746,7 +2829,10 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                     core_major ? "core-major slice, siblings kept together"
                                : "logical slice, no sysfs topology");
             qwen_topology_emit(w, threads_per, cpulist, "prefork");
-            int rc = (max_batch >= 2) ? qwen_tts_serve_batched(ctx, port, max_batch)
+            if (admit_util)
+                qwen_admission_health_bind(admit_health, w);
+            const int child_batch = admit_util ? cap + 1 : max_batch;
+            int rc = (child_batch >= 2) ? qwen_tts_serve_batched(ctx, port, child_batch)
                                       : qwen_tts_serve_ex(ctx, port, 1);
             qwen_worker_dump_counters();
 #ifdef QWEN_ASAN
@@ -2771,6 +2857,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
     struct pollfd *pfd = (struct pollfd *)calloc((size_t)workers + 1, sizeof(struct pollfd));
     if (!pfd) return -1;
     long long dispatched = 0;
+    unsigned long long admit_parent_seq = 0;
     unsigned long long f2_parent_seq = 0;
     double act_area = 0.0, act_time = 0.0;
     double *act_area_w = (double *)calloc((size_t)workers, sizeof(double));
@@ -2786,7 +2873,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         }
         if (nf == 0) break;
         int li = -1;
-        if (free_slots > 0 || reject_full_at_parent) {
+        if (free_slots > 0 || reject_full_at_parent || admit_util) {
             li = nf;
             pfd[nf].fd = listen_fd; pfd[nf].events = POLLIN; pfd[nf].revents = 0;
             nf++;
@@ -2861,11 +2948,65 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             for (int w = 0; w < workers; w++)
                 if (kids[w] > 0 && active[w] < cap) f2_free_at_accept++;
         const unsigned long long f2_seq = qwen_f2_trace() ? ++f2_parent_seq : 0;
+        const unsigned long long admit_seq = admit_util ? ++admit_parent_seq : 0;
 
         int best = -1;
+        int temporary_extra = 0;
         for (int w = 0; w < workers; w++) {
             if (kids[w] <= 0 || active[w] >= cap) continue;
             if (best < 0 || active[w] < active[best]) best = w;
+        }
+        if (best < 0 && admit_util) {
+            int extra_in_use = 0;
+            for (int w = 0; w < workers; w++)
+                if (kids[w] > 0 && active[w] > cap) extra_in_use = 1;
+            if (!extra_in_use) {
+                const double now_ms = srv_now_ms();
+                double best_iter = 1.0e300;
+                int saw_full = 0;
+                for (int w = 0; w < workers; w++) {
+                    if (kids[w] <= 0 || active[w] != cap) continue;
+                    saw_full = 1;
+                    double iter = 0.0, age = 1.0e300;
+                    const char *reason = "unavailable";
+                    int ok = qwen_admit_util_sample_ok(admit_health, w, now_ms,
+                                                       admit_util_limit, &iter, &age, &reason);
+                    if (admit_util_trace)
+                        fprintf(stderr,
+                                "[ADMITUTIL] v=1 clock=CLOCK_MONOTONIC worker=%d active=%d "
+                                "cap=%d last_iter_ms=%.3f age_ms=%.3f limit_ms=%.3f "
+                                "decision=%s reason=%s request_seq=%llu\n",
+                                w, active[w], cap, iter, age, admit_util_limit,
+                                ok ? "candidate" : "reject", reason, admit_seq);
+                    if (ok && (best < 0 || iter < best_iter)) {
+                        best = w; best_iter = iter;
+                    }
+                }
+                if (best >= 0) {
+                    temporary_extra = 1;
+                    if (admit_util_trace)
+                        fprintf(stderr,
+                                "[ADMITUTIL] v=1 clock=CLOCK_MONOTONIC worker=%d active=%d "
+                                "cap=%d last_iter_ms=%.3f age_ms=%.3f limit_ms=%.3f "
+                                "decision=admit3 reason=headroom request_seq=%llu\n",
+                                best, active[best], cap, best_iter,
+                                now_ms - atomic_load_explicit(&admit_health[best].ts_ms,
+                                                               memory_order_relaxed),
+                                admit_util_limit, admit_seq);
+                } else if (admit_util_trace && saw_full) {
+                    fprintf(stderr,
+                            "[ADMITUTIL] v=1 clock=CLOCK_MONOTONIC worker=-1 active=%d "
+                            "cap=%d last_iter_ms=-1 age_ms=-1 limit_ms=%.3f "
+                            "decision=reject reason=no_healthy_worker request_seq=%llu\n",
+                            cap, cap, admit_util_limit, admit_seq);
+                }
+            } else if (admit_util_trace) {
+                fprintf(stderr,
+                        "[ADMITUTIL] v=1 clock=CLOCK_MONOTONIC worker=-1 active=%d "
+                        "cap=%d last_iter_ms=-1 age_ms=-1 limit_ms=%.3f "
+                        "decision=reject reason=extra_slot_in_use request_seq=%llu\n",
+                        cap, cap, admit_util_limit, admit_seq);
+            }
         }
         if (best < 0) {
             rejected++;
@@ -2910,6 +3051,11 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         }
         close(cfd);
         active[best]++; assigned[best]++; dispatched++;
+        if (admit_util_trace && temporary_extra)
+            fprintf(stderr, "[ADMITUTIL] v=1 clock=CLOCK_MONOTONIC worker=%d active=%d "
+                            "cap=%d last_iter_ms=-1 age_ms=-1 limit_ms=%.3f "
+                            "decision=dispatched reason=temporary_slot request_seq=%llu\n",
+                    best, active[best], cap, admit_util_limit, admit_seq);
         if (getenv("QWEN_LIFE_TRACE")) {
             fprintf(stderr, "[DISP] seq=%lld w=%d free_slots_before=%d cap=%d act=",
                     dispatched, best, free_slots, cap);
@@ -2940,6 +3086,10 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                 w, assigned[w], completed[w], active[w]);
     free(pfd); free(sp); free(kids); free(assigned); free(completed); free(active);
     free(act_area_w); free(slice); free(cur); free(cpu_order);
+#if defined(__linux__)
+    if (admit_health)
+        munmap(admit_health, (size_t)workers * sizeof(*admit_health));
+#endif
     close(listen_fd);
     return 0;
 }

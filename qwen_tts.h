@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_voice_clone.h"
@@ -638,6 +639,17 @@ int qwen_tts_batch_max_prompt(void);
 int qwen_tts_batch_max_frames(void);
 
 void qwen_admit_probe_read(unsigned long long *seq, double *ts_ms, double *last_iter_ms);
+
+/* Prefork admission health exported through a MAP_SHARED page.  The parent only
+ * reads this small signal; the child updates it at the existing iteration
+ * boundary.  A NULL binding leaves the normal/default path unchanged. */
+typedef struct {
+    _Atomic unsigned long long seq;
+    _Atomic double ts_ms;
+    _Atomic double last_iter_ms;
+} qwen_admission_health_t;
+
+void qwen_admission_health_bind(qwen_admission_health_t *health, int worker_id);
 
 int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int max_batch, qwen_batch_sink_t *sink);
 

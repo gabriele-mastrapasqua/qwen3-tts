@@ -53,11 +53,18 @@ static double time_ms(void) {
 static _Atomic unsigned long long g_admit_seq = 0;
 static _Atomic double g_admit_ts = 0.0;
 static _Atomic double g_admit_last_iter = 0.0;
+static qwen_admission_health_t *g_admission_health = NULL;
+static int g_admission_worker = -1;
 
 void qwen_admit_probe_read(unsigned long long *seq, double *ts_ms, double *last_iter_ms) {
     if (seq)          *seq          = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
     if (ts_ms)        *ts_ms        = atomic_load_explicit(&g_admit_ts, memory_order_relaxed);
     if (last_iter_ms) *last_iter_ms = atomic_load_explicit(&g_admit_last_iter, memory_order_relaxed);
+}
+
+void qwen_admission_health_bind(qwen_admission_health_t *health, int worker_id) {
+    g_admission_health = health;
+    g_admission_worker = worker_id;
 }
 
 double qwen_mono_ms(void) {
@@ -3123,9 +3130,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 
     double _t2_prev_iter = 0.0;
     while (sink->running(sink->ud) || n_active > 0) {
-        if (ttfa_trace) {
+        if (ttfa_trace || g_admission_health) {
             double _now = qwen_mono_ms();
-            {
+            if (ttfa_trace) {
                 long long _fr = 0; for (int _b = 0; _b < B; _b++) _fr += chframes[_b];
                 fprintf(stderr,
                     "[ITER] v=2 pid=%d seq=%llu ts=%.3f clock=CLOCK_MONOTONIC domain=S prof=%d "
@@ -3139,7 +3146,17 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             atomic_store_explicit(&g_admit_last_iter,
                 _t2_prev_iter > 0 ? _now - _t2_prev_iter : 0.0, memory_order_relaxed);
             atomic_store_explicit(&g_admit_ts, _now, memory_order_relaxed);
-            atomic_fetch_add_explicit(&g_admit_seq, 1, memory_order_relaxed);
+            unsigned long long _seq = atomic_fetch_add_explicit(&g_admit_seq, 1,
+                                                                 memory_order_relaxed) + 1;
+            if (g_admission_health && g_admission_worker >= 0) {
+                qwen_admission_health_t *h = &g_admission_health[g_admission_worker];
+                atomic_store_explicit(&h->last_iter_ms,
+                    _t2_prev_iter > 0 ? _now - _t2_prev_iter : 0.0, memory_order_relaxed);
+                atomic_store_explicit(&h->ts_ms, _now, memory_order_relaxed);
+                /* Publish the sequence last so the parent can reject a partially
+                 * refreshed sample as stale without any lock or rendezvous. */
+                atomic_store_explicit(&h->seq, _seq, memory_order_release);
+            }
             _t2_prev_iter = _now;
             if ((m1_tick++ % 1000) == 0)
                 fprintf(stderr, "[M1STAT] v=1 pid=%d ts=%.3f clock=CLOCK_MONOTONIC domain=S "
