@@ -207,9 +207,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       comparison is closed by this task. Detail:
       `.work/cross-isa-operational-parity-20260908.md`.
 - [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
-      playback-aware harness only after QL-1 has one trusted reference and the QL-2a
-      + QL-2b dispatch/quality gates are applied; do not present AMX-only decoder work as
-      parity.
+  playback-aware harness only after QL-1 has one trusted reference and the QL-2a
+  + QL-2b dispatch/quality gates are applied; do not present AMX-only decoder work as
+  parity.
+  Completed slot: GCP C4 highcpu-16 / 8 physical AMX cores. `1x8` is the best
+  topology and is GOOD through C3; C4 is NOT QUALIFIED (`STREAM_RTF` p95 `0.974`),
+  while `2x4` is GOOD only through C2. No 4+1 probe or SOAK was authorized. Detail:
+  `.work/ql2-gcp-c4-highcpu16-amx-20260908.md`.
 
 ### Retained, demoted or deferred (ids kept for addenda; none is a current priority)
 
