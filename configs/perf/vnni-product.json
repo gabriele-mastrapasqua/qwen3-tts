@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "vnni-product",
+    "description": "Operational x86 AVX-512/VNNI product lane with explicit per-item decoder fallback.",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [1, 4],
+      "preferred_concurrency": "unspecified",
+      "quality_changes_allowed": false
+    }
+  },
+  "parity": {
+    "lane": "vnni-product",
+    "isa_classes": ["x86_avx512vnni", "x86_avx512bf16"],
+    "decoder": {
+      "requested_batch": 1,
+      "expected_modes": ["per-item-int8-vnni"],
+      "precision": "int8",
+      "fallback_status": "VALID FALLBACK"
+    },
+    "backends": {
+      "talker_cp": "vnni",
+      "prefill": "f32",
+      "q4": "vnni"
+    },
+    "features": {
+      "design_d": "UNSUPPORTED",
+      "fused_residual": "UNSUPPORTED",
+      "kleidi": "UNSUPPORTED"
+    },
+    "quality_gate": {
+      "required": true,
+      "command": "make test-golden",
+      "audio_gate": "existing per-ISA audio/WER/SIM/ear gate on the fixed bank",
+      "reject_on": ["ragged decoder claimed", "FP32 decoder fallback", "wrong prefill policy", "quality regression"]
+    },
+    "tunable_flags": ["QWEN_POOL_SPIN", "QWEN_VNNI_NCHUNK"],
+    "notes": "QWEN_DECODER_BATCH=1 is a server request, not a ragged decoder claim: the resolved leaf must be per-item INT8 VNNI."
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "cpu_family": "host-specific AVX-512/VNNI; measured topology must be supplied by the campaign",
+    "logical_cpus": "unspecified",
+    "physical_cores": "unspecified",
+    "threads_per_core": "unspecified",
+    "numa_nodes": "unspecified",
+    "notes": "No AMX-only request is allowed in this lane."
+  },
+  "build": {
+    "target": "SIMD=avx512vnni",
+    "requirements": {
+      "isa": "AVX-512 VNNI runtime support; AVX-512 BF16 is not required by this lane",
+      "decoder": "per-item INT8 VNNI decoder leaf"
+    }
+  },
+  "server": {
+    "prefork_workers": "unspecified",
+    "threads_per_worker": "unspecified",
+    "batch_size": 2,
+    "max_queue": 0,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": "unspecified",
+    "max_text_chars": "unspecified"
+  },
+  "streaming": {
+    "first_chunk_ramp": [1, 2, 4],
+    "decode_chunk": 4,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8",
+      "code_predictor_weights": "int8",
+      "speech_decoder_weights": "int8 per-item VNNI",
+      "activations": "fp32 with INT8 decoder panels",
+      "gemm_backend": "AVX-512 VNNI; prefill is explicit FP32/BLAS on this no-BF16 lane"
+    },
+    "environment": {
+      "QWEN_BLAS_OWN": {"value": "1", "why": "engine owns the decoder/BLAS compute budget"},
+      "OPENBLAS_THREAD_TIMEOUT": {"value": "1", "why": "keep the external BLAS pool from spinning against the engine pool"},
+      "OPENBLAS_NUM_THREADS": {"value": null, "why": "must be absent so engine-owned BLAS sizing is effective"},
+      "OMP_NUM_THREADS": {"value": null, "why": "must be absent; the engine profile owns the CPU budget"},
+      "QWEN_CP_PREC": {"value": "int8", "why": "pin CP precision"},
+      "QWEN_CP_PREFILL2": {"value": "1", "why": "pin the VNNI CP prefill2 policy"},
+      "QWEN_DECODER_BATCH": {"value": "1", "why": "keep server batching semantics; preflight verifies per-item fallback"},
+      "QWEN_KAI_LHS": {"value": null, "why": "Arm-only; must be absent on x86"},
+      "QWEN_KAI_QKV_FUSED": {"value": null, "why": "Arm-only; must be absent on x86"},
+      "QWEN_KAI_NCHUNK": {"value": null, "why": "Arm-only; must be absent on x86"},
+      "QWEN_NO_AMX": {"value": "1", "why": "make the non-AMX product contract explicit"},
+      "QWEN_NO_AMX_BF16": {"value": "1", "why": "no AMX/BF16 decoder or prefill request in this lane"},
+      "QWEN_NO_AMX_INT8": {"value": "1", "why": "no Design-D/AMX INT8 request in this lane"},
+      "QWEN_NO_AMX_Q4": {"value": "1", "why": "force the VNNI Q4 family"},
+      "QWEN_NO_KLEIDI": {"value": "1", "why": "not an Arm lane"},
+      "QWEN_NO_VNNI": {"value": "0", "why": "require native VNNI paths"},
+      "QWEN_NO_VNNI_TILE": {"value": "0", "why": "require native VNNI tile path where gated"},
+      "QWEN_NO_VNNI_QKV": {"value": "0", "why": "do not disable the VNNI QKV path"},
+      "QWEN_NO_X86_QKV": {"value": "0", "why": "do not disable the x86 QKV path"},
+      "QWEN_NO_VNNI_ROWSUM": {"value": "0", "why": "retain cached VNNI GEMV row sums"},
+      "QWEN_NO_VNNI_ACT_QUANT": {"value": "0", "why": "retain VNNI activation quantization"},
+      "QWEN_NO_BF16DOT": {"value": "1", "why": "make the no-BF16 product policy explicit"},
+      "QWEN_VNNI_MIN_B": {"value": "2", "why": "pin the VNNI matmat gate"},
+      "QWEN_VNNI_NCHUNK": {"value": null, "why": "experimental VNNI row chunking; must remain absent"},
+      "QWEN_X86_NCHUNK": {"value": null, "why": "experimental generic x86 row chunking; must remain absent"},
+      "QWEN_AMX_MIN_B": {"value": null, "why": "AMX-only threshold; must not be inherited in this lane"},
+      "QWEN_AMX_BF16_MIN_B": {"value": null, "why": "AMX-only threshold; must not be inherited in this lane"},
+      "QWEN_AMX_INT8_MIN_B": {"value": null, "why": "AMX-only threshold; must not be inherited in this lane"},
+      "QWEN_AMX_INT8_QKV_MIN_B": {"value": null, "why": "AMX-only threshold; must not be inherited in this lane"},
+      "QWEN_AMX_MIN_ROWS": {"value": null, "why": "AMX-only shape gate; must not be inherited in this lane"},
+      "QWEN_AMX_BF16_MIN_COLS": {"value": null, "why": "AMX-only shape gate; must not be inherited in this lane"},
+      "QWEN_AMX_INT8_MIN_COLS": {"value": null, "why": "AMX-only shape gate; must not be inherited in this lane"},
+      "QWEN_AMX_Q4_MIN_COLS": {"value": null, "why": "AMX-only shape gate; must not be inherited in this lane"},
+      "QWEN_AMX_INT8_MIN_ROWS_PER_THREAD": {"value": null, "why": "AMX-only work-per-thread gate; must not be inherited in this lane"},
+      "QWEN_AMX_NCHUNK": {"value": null, "why": "AMX-only row chunking; must not be inherited in this lane"},
+      "QWEN_POOL_SPIN": {"value": "4096", "why": "x86 pthread reference; requalify per host"},
+      "QWEN_PREFIX_CACHE": {"value": "1", "why": "same server semantics as AMX product"},
+      "QWEN_PREFILL_MATMAT": {"value": "0", "why": "this lane intentionally does not claim native AVX-512 BF16 prefill"},
+      "QWEN_Q4_NAIVE": {"value": "0", "why": "do not select scalar Q4"},
+      "QWEN_SD_AMX": {"value": null, "why": "legacy decoder switch; must be absent"},
+      "QWEN_SD_AMX_BF16": {"value": "0", "why": "decoder precision is INT8 VNNI"},
+      "QWEN_SD_AMX_D": {"value": "0", "why": "Design-D is unsupported on VNNI"},
+      "QWEN_SD_DIRECT_CONVT": {"value": "0", "why": "AMX-only experiment; not a VNNI claim"},
+      "QWEN_SD_DIRECT_DWCONV": {"value": "0", "why": "AMX-only experiment; not a VNNI claim"},
+      "QWEN_SD_DIRECT_INPUT": {"value": "0", "why": "AMX-only experiment; not a VNNI claim"},
+      "QWEN_SD_FUSED_RESIDUAL": {"value": "0", "why": "no VNNI fused residual implementation exists"},
+      "QWEN_SD_INT8": {"value": "1", "why": "require the explicit per-item INT8 VNNI decoder"},
+      "QWEN_SD_INT8_BLK": {"value": "256", "why": "pin the x86 decoder quantization block"},
+      "QWEN_SD_POOL": {"value": "engine", "why": "same engine-owned decoder pool semantics"},
+      "QWEN_SD_RAG_MIN_PANELS": {"value": "2", "why": "same logical ragged threshold; it cannot create VNNI ragged decoding"},
+      "QWEN_SD_STREAM_STRIP": {"value": "0", "why": "Design-D warm strip is unavailable"},
+      "QWEN_SD_WINDOWED": {"value": "1", "why": "pin the exact known streaming decoder window semantics"},
+      "QWEN_SERVER_ASYNC_OUTPUT": {"value": "0", "why": "same synchronous output contract"},
+      "QWEN_SERVER_NO_DECODER_BATCH": {"value": null, "why": "presence flag must remain absent; decoder request is explicit"},
+      "QWEN_TTS_STREAM_LAYOUT": {"value": "0", "why": "SL-1 remains default-off"},
+      "QWEN_NO_BF16_MATMUL": {"value": "1", "why": "prevent an accidental BF16-prefill interpretation in a VNNI-only build"}
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "unqualified",
+    "workload": "Operational lane contract; no new hardware result is claimed by this file.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "notes": "The per-item decoder fallback is intentional and must be recorded, never mistaken for ragged parity."
+  }
+}

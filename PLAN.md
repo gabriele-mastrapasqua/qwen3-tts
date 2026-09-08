@@ -201,9 +201,15 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       AMX Design-D/fused ragged decoder execution is not shared by VNNI or Arm; freeze
       a common-control lane plus a separately labelled best-per-ISA lane before spend.
       Detail: `.work/cross-isa-serving-parity-audit-20260908.md`.
+- [x] QL-2b Operational cross-ISA profiles and strict resolved-dispatch gates: AMX,
+      VNNI, Arm and common-control profiles pin the relevant flags, reject invalid
+      fallbacks and embed the resolved preflight in WAVE/SOAK artifacts. No hardware
+      comparison is closed by this task. Detail:
+      `.work/cross-isa-operational-parity-20260908.md`.
 - [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
       playback-aware harness only after QL-1 has one trusted reference and the QL-2a
-      dispatch/quality gates are applied; do not present AMX-only decoder work as parity.
+      + QL-2b dispatch/quality gates are applied; do not present AMX-only decoder work as
+      parity.
 
 ### Retained, demoted or deferred (ids kept for addenda; none is a current priority)
 

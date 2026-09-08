@@ -21,6 +21,7 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_TOOL = os.path.join(ROOT, "tools", "perf_profile.py")
+PROFILE_GATE = os.path.join(ROOT, "tools", "serving_profile.py")
 CLIENT = os.path.join(ROOT, "tests", "soak_client.py")
 ANALYZER = os.path.join(ROOT, "tests", "soak_drift.py")
 OPEN_MODELS = {
@@ -568,6 +569,38 @@ def main():
     argv, server_env, forbidden = profile_command(args)
     environment = os.environ.copy()
     environment.update(server_env)
+    profile_preflight = None
+    if args.profile:
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import perf_profile as profile_lib
+        profile_doc, _ = profile_lib.load(args.profile)
+        if profile_doc.get("parity"):
+            preflight_path = os.path.join(out, "profile-preflight.json")
+            profile_env = ",".join(f"{key}={value}" for key, value in sorted(server_env.items()))
+            preflight = subprocess.run(
+                [sys.executable, PROFILE_GATE, "preflight", args.profile,
+                 "--binary", args.bin, "--server-env", profile_env,
+                 "--out", preflight_path],
+                cwd=ROOT, capture_output=True, text=True,
+            )
+            if preflight.stdout:
+                print(preflight.stdout.rstrip())
+            if preflight.stderr:
+                print(preflight.stderr.rstrip(), file=sys.stderr)
+            try:
+                with open(preflight_path, encoding="utf-8") as handle:
+                    profile_preflight = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                profile_preflight = {
+                    "profile": args.profile,
+                    "profile_valid": False,
+                    "errors": ["profile preflight produced no JSON"],
+                }
+            if preflight.returncode != 0 or not profile_preflight.get("profile_valid"):
+                raise RuntimeError(
+                    "refusing to run: resolved serving profile is invalid; see "
+                    + preflight_path
+                )
     command_for_manifest = safe_command(argv, args.model, args.bin)
     run_identity = identity(args.bin, args.source_commit)
     manifest = {
@@ -601,6 +634,7 @@ def main():
         "server_argv": command_for_manifest,
         "server_env": server_env,
         "forbidden_env": forbidden,
+        "profile_preflight": profile_preflight,
         "identity": run_identity,
     }
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as handle:

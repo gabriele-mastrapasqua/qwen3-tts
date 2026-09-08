@@ -162,6 +162,15 @@ def semantic(prof, path, engine=None):
                 if spec["value"] is not None and k.startswith("QWEN_") and k not in known:
                     errs.append(f"{k} is not a variable this engine reports; it would be "
                                 f"set but never declared, so no run could verify it")
+    parity = prof.get("parity")
+    if parity:
+        dec = parity["decoder"]
+        requested = env.get("QWEN_DECODER_BATCH", {}).get("value")
+        expected = str(dec["requested_batch"])
+        if requested != expected:
+            errs.append("parity.decoder.requested_batch=%s but QWEN_DECODER_BATCH=%r; "
+                        "the lane contract must pin the request explicitly" %
+                        (expected, requested))
     return errs
 
 def engine_known_flags(binary):
@@ -179,11 +188,13 @@ def argv(prof, model, port):
     a = [prof["launch"]["executable"], "-d", model]
     if "int8" in prof["runtime"]["precision"].get("talker_weights", ""):
         a.append("--int8")
-    a += ["--serve", str(port), "--batch-size", str(sv["batch_size"])]
-    if sv["prefork_workers"] > 1:
+    a += ["--serve", str(port)]
+    if isinstance(sv.get("batch_size"), int):
+        a += ["--batch-size", str(sv["batch_size"])]
+    if isinstance(sv.get("prefork_workers"), int) and sv["prefork_workers"] > 1:
         a += ["--prefork", str(sv["prefork_workers"]),
               "--prefork-threads", str(sv["threads_per_worker"])]
-    else:
+    elif isinstance(sv.get("threads_per_worker"), int):
         a += ["-j", str(sv["threads_per_worker"])]
     for key, flag in (("max_queue", "--max-queue"),
                       ("queue_timeout_ms", "--queue-timeout-ms"),

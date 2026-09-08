@@ -2450,6 +2450,40 @@ static int sd_exact_stream_enabled(void) {
     return !(e && *e && *e != '0');
 }
 
+int qwen_sd_amx_d_active(void) { return sd_amx_d_enabled(); }
+int qwen_sd_amx_bf16_active(void) { return sd_amx_bf16_enabled(); }
+int qwen_sd_stream_strip_active(void) { return sd_stream_strip_enabled(); }
+int qwen_sd_fused_residual_active(void) {
+    /* This is the resolved eligibility of the fused residual implementation.  Individual
+     * calls still require a same-width 1x1 residual shape, which is deliberately left to the
+     * decoder's shape gate rather than represented as a false global claim here. */
+    return sd_fused_residual_enabled() && sd_amx_d_enabled();
+}
+
+static int sd_decoder_batch_requested(void) {
+    const char *e = getenv("QWEN_DECODER_BATCH");
+    return e && atoi(e) != 0;
+}
+
+const char *qwen_sd_decoder_mode(void) {
+    const int batch = sd_decoder_batch_requested();
+    const int exact = sd_exact_stream_enabled();
+    if (batch && exact && sd_amx_d_enabled()) return "ragged-design-d-int8";
+    if (batch && exact && sd_amx_bf16_enabled()) return "ragged-amx-bf16";
+    if (sd_amx_d_enabled()) return "per-item-design-d-int8";
+    if (sd_amx_bf16_enabled()) return "per-item-amx-bf16";
+    if (sd_int8_enabled()) {
+#if defined(__AVX512VNNI__)
+        return "per-item-int8-vnni";
+#elif defined(__ARM_FEATURE_DOTPROD)
+        return "per-item-int8-dotprod";
+#else
+        return "per-item-int8";
+#endif
+    }
+    return "per-item-fp32";
+}
+
 static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                              const int *new_codes, int new_frames,
                              float **audio_out, int *n_samples);

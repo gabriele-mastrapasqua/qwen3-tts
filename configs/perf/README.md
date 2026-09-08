@@ -23,6 +23,45 @@ tools/perf_profile.py check-flags recommended --log server.log     # what the en
 python3 tests/test_perf_profile.py
 ```
 
+## Operational ISA parity lanes (2026-09-08)
+
+The four `*-product.json`/`common-control.json` profiles are strict serving contracts,
+not qualification claims:
+
+| profile | question | decoder contract |
+|---|---|---|
+| `amx-product` | best current AMX implementation | ragged Design-D INT8; AMX/fused requested |
+| `vnni-product` | best current VNNI implementation | per-item INT8 VNNI; Design-D is an explicit valid fallback |
+| `arm-product` | best current KleidiAI implementation | per-item INT8 DOTPROD; KAI covers generic Talker/CP/Q4 |
+| `common-control` | same serving/decoder shape across ISAs | `QWEN_DECODER_BATCH=0`, per-item INT8 |
+
+The product lanes answer “best supported implementation per ISA”; the common lane answers
+“same serving architecture, different hardware”. They must never be pooled into one result.
+The product profiles explicitly pin decoder, prefill/CP, pool, quantum, backend gates and
+relevant threshold/absence settings. Host topology remains `unspecified` until that host is
+preflighted and requalified.
+
+For a new box, run `make doctor` after the final target build and before choosing a
+campaign topology. It is useful here as a fast, model-free starting point: its measured
+identity/roofs and labelled predictions can suggest `W x K`, cap and candidate flags.
+Treat the generated draft as a hypothesis only; reconcile it with one of these parity
+profiles, then run `tools/serving_profile.py preflight` and the quality gate. Doctor does
+not authorize a fallback or turn a prediction into a qualification.
+
+Before a parity-lane run, apply the profile environment and run the in-process gate:
+
+```bash
+tools/serving_profile.py preflight amx-product --binary ./qwen_tts \
+  --out RUN/profile-preflight.json
+```
+
+The gate records the ISA class, source/binary identity, requested decoder batch, resolved
+decoder leaf, precision, Talker/CP/prefill/Q4 families, Design-D/fused/KAI status and all
+profile flags. It exits non-zero for an invalid requested path or missing capability. The
+parallel-wave and SOAK harnesses run this gate automatically for these parity profiles and
+embed the resulting JSON in their artifacts. A profile's `VALID FALLBACK` is intentional and
+must remain visible; it is not an AMX-equivalent result.
+
 ## The separation that makes this worth having
 
 | | contains | example |

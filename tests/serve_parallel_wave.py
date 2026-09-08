@@ -253,9 +253,13 @@ def result_slug(workload, arrival, topo, conc, model_label, precision):
     return f"{w}_{a}_{model_label}-{precision}_{topo}_c{conc}"
 
 def result_header(a, model_path, extra_env):
-    def sh(cmd, default="UNKNOWN"):
+    env = dict(os.environ)
+    env.update(extra_env)
+
+    def sh(cmd, default="UNKNOWN", command_env=None):
         try:
-            out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10,
+                                 env=command_env)
             v = out.stdout.strip()
             return v if v else default
         except Exception:
@@ -288,7 +292,6 @@ def result_header(a, model_path, extra_env):
                     "QWEN_NO_BF16_MATMUL", "QWEN_X86_NCHUNK"]
     else:
         watched += ["QWEN_KAI_QKV_FUSED", "QWEN_KAI_NCHUNK", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA"]
-    env = dict(os.environ); env.update(extra_env)
     flags = " ".join(f"{k}={env.get(k, '(default)')}" for k in watched)
     print("### ─────────── RESULT IDENTITY ───────────")
     print(f"### machine_type=   {mt}    cpu_model= {cpu}  vcpu= {ncpu}")
@@ -303,7 +306,8 @@ def result_header(a, model_path, extra_env):
     print(f"### arrival_model=     {ARRIVAL_TRUE_WAVE}  (C requests at t=0, wait for ALL,"
           f" then the next wave)")
     print(f"### topology=          {a.topo}   concurrency= {a.conc}   waves= {a.waves}")
-    backend = sh(a.bin + " --caps 2>/dev/null | sed -n 's/^  int8 dot: *//p'")
+    backend = sh(a.bin + " --caps 2>/dev/null | sed -n 's/^  int8 dot: *//p'",
+                 command_env=env)
     print(f"### backend=           {backend}")
     print(f"### precision=         {a.precision}")
     print(f"### runtime_profile=   {a.server_env or '(compiled defaults)'}")
@@ -322,9 +326,11 @@ def result_header(a, model_path, extra_env):
         "benchmark_family": ARRIVAL_TRUE_WAVE, "workload_class": wl,
         "arrival_model": ARRIVAL_TRUE_WAVE, "topology": a.topo, "concurrency": a.conc,
         "waves": a.waves, "backend": backend, "precision": a.precision,
+        "profile_name": a.profile or None,
         "runtime_profile": a.server_env or "(compiled defaults)",
         "server_args": list(a.server_args),
         "runtime_flags": {k: env.get(k, "(default)") for k in watched},
+        "profile_preflight": getattr(a, "profile_preflight", None),
         "text_bank": os.path.basename(a.text_file), "classes": a.classes,
         "harness": os.path.basename(__file__), "run_date": RUN_DATE,
     }
@@ -333,6 +339,8 @@ PROFILE_DIR  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
                             "configs", "perf")
 PROFILE_TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "tools", "perf_profile.py")
+PROFILE_GATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "serving_profile.py")
 
 def resolve_profile(a):
     """Compose the server environment from the named profile, then apply explicit overrides.
@@ -445,10 +453,42 @@ def main():
                     help="write one WAV per request into DIR (quality gate; perturbs timing)")
     a = ap.parse_args()
     a.server_env = resolve_profile(a)
+    os.makedirs(a.out, exist_ok=True)
+    profile_has_parity = False
+    if a.profile:
+        profile_doc = subprocess.run(
+            [sys.executable, PROFILE_TOOL, "show", a.profile],
+            capture_output=True, text=True,
+        )
+        if profile_doc.returncode != 0:
+            raise SystemExit("REFUSING TO RUN: profile show failed for %r" % a.profile)
+        try:
+            profile_has_parity = bool(json.loads(profile_doc.stdout).get("parity"))
+        except json.JSONDecodeError:
+            raise SystemExit("REFUSING TO RUN: profile show returned invalid JSON")
+    if profile_has_parity:
+        # A parity profile is a gate, not a label.  Run the engine's own caps/dispatch
+        # probes with the exact merged environment before starting any server process.
+        preflight_path = os.path.join(a.out, "profile-preflight.json")
+        pf = subprocess.run(
+            [sys.executable, PROFILE_GATE, "preflight", a.profile,
+             "--binary", a.bin, "--server-env", a.server_env,
+             "--out", preflight_path], capture_output=True, text=True)
+        if pf.stdout:
+            print(pf.stdout.rstrip())
+        if pf.stderr:
+            print(pf.stderr.rstrip(), file=sys.stderr)
+        try:
+            a.profile_preflight = json.load(open(preflight_path))
+        except (OSError, json.JSONDecodeError):
+            a.profile_preflight = {"profile": a.profile, "profile_valid": False,
+                                   "errors": ["profile preflight produced no JSON"]}
+        if pf.returncode != 0 or not a.profile_preflight.get("profile_valid"):
+            raise SystemExit("REFUSING TO RUN: resolved serving profile is invalid; see "
+                             + preflight_path)
     global TEXTS
     TEXTS = load_texts(a.text_file,
                        set(x.strip() for x in a.classes.split(",") if x.strip()) or None)
-    os.makedirs(a.out, exist_ok=True)
     label = a.label or os.path.basename(a.model.rstrip("/"))
     concs = [int(x) for x in a.conc.split(",")]
     hz = os.sysconf("SC_CLK_TCK")

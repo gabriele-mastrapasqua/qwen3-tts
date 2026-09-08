@@ -362,6 +362,32 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             "opt-in on this ISA (measured slower on the first frame elsewhere)"
 #endif
             );
+        row(&feats[n++], "decoder.mode", "yes", "yes", "QWEN_DECODER_BATCH",
+            qwen_sd_decoder_mode(),
+            "resolved decoder leaf: ragged AMX only when batch+exact-stream+AMX decoder support all hold; otherwise per-item");
+        row(&feats[n++], "decoder.design_d",
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+            "yes",
+#else
+            "no",
+#endif
+            yn(qwen_amx_int8_available()), "QWEN_SD_AMX_D", onoff(qwen_sd_amx_d_active()),
+            qwen_sd_amx_d_active() ? "persistent AMX INT8 Design-D decoder representation is active"
+                                   : "Design-D unavailable or not requested; decoder uses its resolved fallback");
+        row(&feats[n++], "decoder.fused_residual",
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+            "yes",
+#else
+            "no",
+#endif
+            yn(qwen_amx_int8_available()), "QWEN_SD_FUSED_RESIDUAL",
+            onoff(qwen_sd_fused_residual_active()),
+            qwen_sd_fused_residual_active() ? "AMX Design-D fused residual is shape-gated at 1x1 same-width projections"
+                                            : "not active; ordinary projection plus residual/fallback remains available");
+        row(&feats[n++], "decoder.stream_strip", "yes", yn(qwen_amx_int8_available()),
+            "QWEN_SD_STREAM_STRIP", onoff(qwen_sd_stream_strip_active()),
+            qwen_sd_stream_strip_active() ? "warm Design-D range slice is active"
+                                          : "warm strip unavailable or not requested");
     }
 
     /* ---- Prepacks (persistent weight layouts) ----------------------------------- */
@@ -614,7 +640,32 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             fprintf(j, ", \"reason\": "); json_str(j, feats[i].reason);
             fprintf(j, "}%s\n", i + 1 < n ? "," : "");
         }
-        fprintf(j, "  ],\n  \"gates\": [\n");
+        {
+            const char *prefill_why = NULL;
+            const int prefill_on = qwen_prefill_matmat_resolved(&prefill_why);
+            const char *batch_env = getenv("QWEN_DECODER_BATCH");
+            const int batch_requested = batch_env && atoi(batch_env) != 0;
+            fprintf(j, "  ],\n  \"serving\": {\n");
+            fprintf(j, "    \"decoder_batch_requested\": %s,\n", batch_requested ? "true" : "false");
+            fprintf(j, "    \"decoder_mode\": "); json_str(j, qwen_sd_decoder_mode());
+            fprintf(j, ",\n    \"design_d_active\": %s,\n", qwen_sd_amx_d_active() ? "true" : "false");
+            fprintf(j, "    \"fused_residual_active\": %s,\n",
+                    qwen_sd_fused_residual_active() ? "true" : "false");
+            fprintf(j, "    \"stream_strip_active\": %s,\n",
+                    qwen_sd_stream_strip_active() ? "true" : "false");
+            fprintf(j, "    \"decoder_pool\": ");
+            json_str(j, qwen_sd_pool_mode() ? "engine" : "private");
+            fprintf(j, ",\n    \"talker_cp_int8_backend\": ");
+            json_str(j, qwen_matmat_family_int8());
+            fprintf(j, ",\n    \"q4_backend\": ");
+            json_str(j, qwen_matmat_family_q4());
+            fprintf(j, ",\n    \"bf16_backend\": ");
+            json_str(j, qwen_matmat_family_bf16());
+            fprintf(j, ",\n    \"prefill_matmat_active\": %s,\n", prefill_on ? "true" : "false");
+            fprintf(j, "    \"prefill_reason\": "); json_str(j, prefill_why ? prefill_why : "unknown");
+            fprintf(j, ",\n    \"kleidi_active\": %s\n", qwen_kleidi_enabled() ? "true" : "false");
+            fprintf(j, "  },\n  \"gates\": [\n");
+        }
         for (int i = 0; i < ng; i++) {
             qwen_mm_gate_desc_t *g = &gates[i];
             fprintf(j, "    {\"id\": "); json_str(j, gate_id(g->mmk));

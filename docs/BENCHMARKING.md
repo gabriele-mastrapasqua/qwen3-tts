@@ -64,7 +64,7 @@ the AMX tile unit is per physical core they also serialised on it.
 | build | `make blas` (`SIMD=auto`), or explicit `make blas SIMD=avx512bf16` / `amx` / `avx512vnni` / `portable`; `make info` | every box; explicit `SIMD=` for a qualification build | authoritative; the chosen target is printed by `[simd]` and `--caps` |
 | kernel correctness | `make test-selftest` (`--self-test`, native and forced-fallback), `make test-golden` (mel-corr + duration, quiet box), `make check-matmat-parity` | after build, before any number | authoritative gates |
 | dispatch / capability inspection | `./qwen_tts --dispatch-map` (`QWEN_DISPATCH_JSON=path` for JSON), `tools/dispatch_gate.py dispatch.json --expect tools/dispatch_expect.json`, `make profile-cpu-check`, `make check-flag-registry` | in the profile's env, from cpu-check; again whenever env, binary or source change | authoritative for resolved gates; not a substitute for the in-process census (§5) |
-| performance profile (server argv + env) | `configs/perf/*.json`, `tools/perf_profile.py validate | show | command | server-env | forbidden-env | check-flags`, `python3 tests/test_perf_profile.py` | every server launch in a measurement | authoritative; the profile's status (qualified / provisional / unqualified) is in `configs/perf/README.md` |
+| performance profile (server argv + env) | `configs/perf/*.json`, `tools/perf_profile.py validate | show | command | server-env | forbidden-env | check-flags`, `tools/serving_profile.py preflight/check`, `python3 tests/test_perf_profile.py` | every server launch in a measurement | authoritative; parity profiles additionally refuse an invalid resolved decoder/backend leaf and write `profile-preflight.json` |
 | server launch for measurement | `tools/perf_profile.py command <profile> --model DIR --port N` (prints the exact `./qwen_tts … --prefork W --prefork-threads K --cpu-mask … --batch-size B` line); the harnesses below launch it themselves from `--profile` | never hand-typed from memory | authoritative |
 | WAVE (finite screening) | `tests/serve_parallel_wave.py --profile P --topo WxK --conc 1,4 --waves N …`; wrappers `make bench-topo`, `make bench-suite` (rungs realistic / fast / short-diverse / long-diverse, identity gate `tests/serve_identity_gate.py`) | topology and knob screening, A/B arms | canonical WAVE; screening only |
 | SOAK (sustained, fixed concurrency) | `make bench-soak SOAK_PROFILE=P SOAK_CONCURRENCY=C SOAK_MINUTES=M …` → `tests/serve_soak.py` (+ `tests/soak_client.py`), analysed by `tests/soak_drift.py` → `soak_summary.json`; `--strict-kpi` for the production gate | the production qualification | **canonical SOAK; the only production gate** |
@@ -140,6 +140,7 @@ NON-QUALIFYING and the report says so.
 Before measurement, obtain the dispatch from the serving process after its environment is
 applied: the `[FLAGS]` line the server prints (checked by `perf_profile.py check-flags` and
 by both harnesses), `--dispatch-map` run under `profile_env.txt` (cpu-check does this), and
+for a parity lane the strict `tools/serving_profile.py preflight` JSON gate,
 for DIAGNOSTIC runs the shape census (`make profile-cpu`, `tools/census_report.py`) which
 counts the leaf that actually executed. Record requested AND resolved for: Talker prefill,
 Talker GEMV, Talker GEMM/matmat, CP GEMV, CP GEMM/matmat, CP heads, codec head, speech
@@ -200,7 +201,7 @@ phase printed at every step. The harnesses own the server; do not start a second
 ## 10. Updating the benchmark system
 
 A change to any canonical benchmark script, profile, server invocation, dispatch gate,
-capability checker, topology tool, bandwidth tool or result parser updates this runbook in
+capability checker, parity preflight, topology tool, bandwidth tool or result parser updates this runbook in
 the same task and commit, or states that the canonical procedure did not change. No tool
 becomes canonical because an agent created it: this file names the current canonical tool
 and the one it supersedes. Competing tools without a proven winner are a PLAN task, not a

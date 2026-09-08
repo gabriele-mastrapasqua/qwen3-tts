@@ -90,6 +90,153 @@
         }
       }
     },
+    "parity": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Operational ISA-lane contract. This is not a qualification claim: it declares the requested and expected resolved leaves that a preflight must verify before a benchmark can run.",
+      "required": [
+        "lane",
+        "isa_classes",
+        "decoder",
+        "backends",
+        "features",
+        "quality_gate"
+      ],
+      "properties": {
+        "lane": {
+          "enum": [
+            "amx-product",
+            "vnni-product",
+            "arm-product",
+            "common-control"
+          ]
+        },
+        "isa_classes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "decoder": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requested_batch",
+            "expected_modes",
+            "precision",
+            "fallback_status"
+          ],
+          "properties": {
+            "requested_batch": {
+              "enum": [
+                0,
+                1
+              ]
+            },
+            "expected_modes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            },
+            "precision": {
+              "enum": [
+                "int8",
+                "bf16",
+                "fp32"
+              ]
+            },
+            "fallback_status": {
+              "enum": [
+                "ACTIVE",
+                "VALID FALLBACK",
+                "UNSUPPORTED"
+              ]
+            }
+          }
+        },
+        "backends": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "talker_cp",
+            "prefill",
+            "q4"
+          ],
+          "properties": {
+            "talker_cp": {
+              "type": "string"
+            },
+            "prefill": {
+              "type": "string"
+            },
+            "q4": {
+              "type": "string"
+            }
+          }
+        },
+        "features": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "design_d",
+            "fused_residual",
+            "kleidi"
+          ],
+          "properties": {
+            "design_d": {
+              "$ref": "#/definitions/featureStatus"
+            },
+            "fused_residual": {
+              "$ref": "#/definitions/featureStatus"
+            },
+            "kleidi": {
+              "$ref": "#/definitions/featureStatus"
+            }
+          },
+          "description": "Expected status, or an allowed status set when a common-control profile spans ISAs with different compiled capabilities."
+        },
+        "tunable_flags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          },
+          "description": "ISA/host-specific knobs that are intentionally not pinned by this semantic lane; a campaign must still record their resolved values."
+        },
+        "quality_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required",
+            "command",
+            "audio_gate"
+          ],
+          "properties": {
+            "required": {
+              "const": true
+            },
+            "command": {
+              "type": "string"
+            },
+            "audio_gate": {
+              "type": "string"
+            },
+            "reject_on": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
     "hardware": {
       "type": "object",
       "additionalProperties": false,
@@ -103,27 +250,24 @@
         "architecture": {
           "enum": [
             "arm64",
-            "x86_64"
+            "x86_64",
+            "any"
           ]
         },
         "cpu_family": {
           "type": "string"
         },
         "logical_cpus": {
-          "type": "integer",
-          "minimum": 1
+          "$ref": "#/definitions/intOrUnspecified"
         },
         "physical_cores": {
-          "type": "integer",
-          "minimum": 1
+          "$ref": "#/definitions/intOrUnspecified"
         },
         "threads_per_core": {
-          "type": "integer",
-          "minimum": 1
+          "$ref": "#/definitions/intOrUnspecified"
         },
         "numa_nodes": {
-          "type": "integer",
-          "minimum": 1
+          "$ref": "#/definitions/intOrUnspecified"
         },
         "l3_mib": {
           "type": [
@@ -411,6 +555,28 @@
     }
   },
   "definitions": {
+    "featureStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "ACTIVE",
+            "VALID FALLBACK",
+            "UNSUPPORTED"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "enum": [
+              "ACTIVE",
+              "VALID FALLBACK",
+              "UNSUPPORTED"
+            ]
+          },
+          "minItems": 1
+        }
+      ]
+    },
     "intOrUnspecified": {
       "oneOf": [
         {

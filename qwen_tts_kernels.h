@@ -390,6 +390,14 @@ int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, i
 int qwen_sd_int8_available(void);
 int qwen_sd_int8_usable(int in_ch, int out_ch);   /* available AND a shape the kernels cover */
 void qwen_sd_int8_cache_reset(void);
+/* Resolved speech-decoder policy used by the operational serving-profile gate.  These
+ * answers are capability/policy answers, not benchmark claims: the exact convolution
+ * shape still gates individual calls. */
+int qwen_sd_amx_d_active(void);
+int qwen_sd_amx_bf16_active(void);
+int qwen_sd_stream_strip_active(void);
+int qwen_sd_fused_residual_active(void);
+const char *qwen_sd_decoder_mode(void);
 int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
                                       size_t *bytes_out);
 void qwen_sd_amx_int8_free_weights(int8_t *packed);
