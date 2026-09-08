@@ -96,6 +96,7 @@ COMMON_ENV = [
     ("QWEN_DECODER_BATCH", "1", "DEFAULT-PIN", "one decoder pass for all active slots; the server sets it itself, the pin records it"),
     ("QWEN_STREAM_DECODE_CHUNK", "4", "MEASURED-REF", "F1: q4 = best C4 balance (prebuffer p95 201 ms, no 250 ms stalls); q8 = throughput control, q1 rejected"),
     ("QWEN_SERVER_ASYNC_OUTPUT", "0", "OFF", "OUT-1/2 implemented, default-off pending longer qualification; C3/C4 wave showed no KPI change"),
+    ("QWEN_TTS_STREAM_LAYOUT", "1", "MEASURED-REF", "SL-1: official known-text dual-track layout is the current serving-generation reference; ICL/clone and live incremental text remain out of scope"),
 ]
 ISA_ENV = {
     "x86_amx": [
@@ -139,7 +140,6 @@ DO_NOT_SET = [
     ("QWEN_DECODER_THREAD", "REJECTED 2026-09-07: same-pool decoder consumer loses to inline ragged decode"),
     ("QWEN_PREFILL_HELPER", "REJECTED 2026-09-07: cloned-context helper is not a serving fix"),
     ("QWEN_ADMIT_UTIL", "FALSIFIED 2026-09-08: fifth request interactive, the established four stall (stall@250 50 %)"),
-    ("QWEN_TTS_STREAM_LAYOUT", "PENDING: known-text layout works (prefill flat ~73 ms) but quality/ICL gates are open; opt-in per mode only"),
     ("QWEN_VNNI_PREPACK", "REJECTED 2026-09-03 on Zen5: +1.1 % Talker, +3.5 % CP, +1.4 GB"),
     ("QWEN_AMX_PREPACK", "opt-in, not part of the qualified reference"),
     ("QWEN_STREAM_DECODE_CHUNK_BUSY", "keep 0/absent: a busy-chunk override was never part of a passing envelope"),

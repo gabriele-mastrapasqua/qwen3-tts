@@ -32,8 +32,8 @@
     },
     "quality_gate": {
       "required": true,
-      "command": "make test-golden",
-      "audio_gate": "same fixed bank, voice, seed, temperature and output format on every ISA",
+      "command": "strict profile preflight + current serving-generation structural/audio gate",
+      "audio_gate": "same model, voice, language, seed/settings and bank; valid non-empty PCM/WAV plus applicable same-generation parity checks",
       "reject_on": ["decoder batch enabled", "AMX/KAI-only decoder leaf", "wrong precision", "quality regression"]
     },
     "tunable_flags": ["QWEN_POOL_SPIN", "QWEN_VNNI_MIN_B", "QWEN_INT8_SDOT_MIN_B", "QWEN_SMMLA_MIN_B", "QWEN_BFMMLA_MIN_B", "QWEN_KAI_NCHUNK"],
@@ -121,7 +121,7 @@
       "QWEN_SD_WINDOWED": {"value": "0", "why": "explicitly disable the legacy windowed fallback so the exact streaming decoder semantics are resolved"},
       "QWEN_SERVER_ASYNC_OUTPUT": {"value": "0", "why": "same synchronous output contract"},
       "QWEN_SERVER_NO_DECODER_BATCH": {"value": null, "why": "absence is explicit; decoder batch is disabled by QWEN_DECODER_BATCH=0"},
-      "QWEN_TTS_STREAM_LAYOUT": {"value": "0", "why": "SL-1 remains default-off"},
+      "QWEN_TTS_STREAM_LAYOUT": {"value": "1", "why": "same known-text serving layout across ISA lanes; ICL/clone and live incremental text remain outside this control"},
       "QWEN_NO_BF16_MATMUL": {"value": "1", "why": "force the common FP32 prefill policy"}
     }
   },

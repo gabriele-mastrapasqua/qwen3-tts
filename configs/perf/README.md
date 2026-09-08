@@ -171,10 +171,11 @@ copying any profile to a new box:
 - **`QWEN_POOL_SPIN` does not port.** The Arm profile pins 65536 because it was measured there;
   the x86 profiles pin 4096, which is the x86 compiled default, because 0, 1024 and 65536 all
   measured worse on 8 cores. "Explicitly disable it" would have cost 13% of stream RTF.
-- **`QWEN_DECODER_BATCH` is pinned to 0 on x86**, against the engine's own server default,
-  because on a box that splits 8 cores into narrow workers the decoder gang never exceeds two
-  slots and the wait costs tail latency. It is pinned rather than omitted precisely because the
-  server would otherwise turn it on and the run would not record that it had.
+- **`QWEN_DECODER_BATCH` is explicit per profile**, not a portable default: the current
+  `amx-product` and `vnni-product` lanes request `1` and the preflight records whether that
+  resolves to AMX ragged or the intentional per-item VNNI leaf; `common-control` pins `0`.
+  Older qualified x86 profiles may pin `0` for their own measured topology, but must not be
+  copied into the Turin campaign without requalification.
 - **The `*_NCHUNK` family is `null` with the numbers that say why.** They are experimental, and
   a profile is not the place to park an unproven lever.
 
