@@ -81,6 +81,28 @@ CAL = {
     "model_error": "±10-20 % on rho; C4 on the reference host (2x6, GEMV 66 GB/s, cache set 81 GB/s): predicted 0.83, measured p50/p95 0.83/0.87",
 }
 
+# Measured points the cost model is checked against, per ISA family (STREAM_RTF p95 of the
+# wave vs the rho predict() gives for that W x K x B).  Rendered under 8. CEILING so a reader
+# sees how far to trust the model on THIS family before renting the next box.
+CAL_POINTS = {
+    "x86_amx": [
+        ("GCP c4-standard-24 2x6 B2 C4", 0.87, 0.83, "reference host; 2026-09-07"),
+    ],
+    "x86_avx512bf16": [
+        ("AWS c8a.8xlarge Zen5 4x8 B2 C8", 0.87, 1.05, "model pessimistic ~15 %; TOTAL p95 0.95-1.00 (2026-09-08)"),
+        ("AWS c8a.8xlarge Zen5 2x16 B4 C8", 0.84, 0.74, "model optimistic ~12 %; TOTAL p95 0.94"),
+        ("AWS c8a.8xlarge Zen5 2x16 B5 C10", 1.05, 0.80, "over the line where the model still says OK"),
+        ("AWS c8a.8xlarge Zen5 1x32 B8 C8", 1.40, 0.50, "FALSIFIED: one 32-thread pool collapses; model blind to it"),
+        ("AWS c8a.8xlarge Zen5 0.6B 4x8 B3 C12", 0.72, 1.00, "model pessimistic ~30 % on the small model"),
+        ("AWS c8a.8xlarge Zen5 0.6B 2x16 B8 C16", 1.22, 0.75, "wide pool collapses on 0.6B too"),
+        # one CCX, one worker pinned 0-7, ONE fixed short text, STAGE trace (2026-09-09): the lane law
+        ("c8a one CCX 1x8@0-7 1.7B B1/B2/B3/B4", 1.172, 1.05, "STREAM p95 .674/.861/.991/1.172 = 40 ms + 13.5 ms x B: decoder 9.7 ms per decoded slot-frame (72 %), Talker +1.6, CP +1.8 per slot"),
+        ("c8a one CCX 1x8@0-7 0.6B B1/B2/B3/B4", 0.889, 0.80, "STREAM p95 .433/.592/.737/.889 = 23 ms + 12.3 ms x B: same decoder, Talker stream 17 ms smaller"),
+        ("c8a one CCX 1x2@0-1 1.7B B1", 0.858, None, "Talker 26.4 + CP 20.8 ms on TWO threads = the 8-thread cost: the weight stream saturates the CCX at 2 threads"),
+        ("c8a two 1x4 lanes on one CCX, 1.7B B2 each", 1.28, 0.97, "two weight streams on one CCX halve each other (Talker 27.8 -> 63.7 ms/step): a CCX holds ONE step-lane"),
+    ],
+}
+
 # ---------------------------------------------------------------------------------------
 # Per-ISA serving sets.  Every entry: value, label, why.  None value = must be ABSENT.
 # label: MEASURED-REF (a win measured on a reference host of this ISA), DEFAULT-PIN (already
@@ -144,8 +166,8 @@ DO_NOT_SET = [
     ("QWEN_AMX_PREPACK", "opt-in, not part of the qualified reference"),
     ("QWEN_STREAM_DECODE_CHUNK_BUSY", "keep 0/absent: a busy-chunk override was never part of a passing envelope"),
 ]
-CANDIDATES = [
-    ("QWEN_AMX_MIN_B", "2", "measured +10 % RTF at C=4 on the old 8c AMX profile (pre Design-D); NOT re-validated on the streaming reference — A/B it"),
+CANDIDATES = [  # (key, value, why, isa_class it applies to; None = every ISA)
+    ("QWEN_AMX_MIN_B", "2", "measured +10 % RTF at C=4 on the old 8c AMX profile (pre Design-D); NOT re-validated on the streaming reference — A/B it", "x86_amx"),
 ]
 
 # ---------------------------------------------------------------------------------------
@@ -544,6 +566,58 @@ def predict(model, K, B, q, gemv_gbs, llc_share_mb, amx, l3_gbs=None, kcal=CAL):
             "rho": frame / FRAME_MS, "cp_fits_llc": fits, "B": B, "K": K, "q": q}
 
 
+B_MATMAT_MAX = 16   # the int8 matmat family accepts B<=16 (dispatch-map matmat.int8.batch_ceiling)
+
+
+def ceiling(model, W, K, gemv_gbs, llc_share_mb, amx, l3_gbs=None, q=4, kcal=CAL):
+    """Three concurrency ceilings for one W x K shape, per worker then x W.
+
+    physics : weights stream only — Talker + CP bytes at the measured GEMV roof, perfect
+              batching (B2/B1 = 1.10 per extra slot), decoder free.  Nothing on this shape can
+              stream more than W x B_physics; the gap to the next number is decoder + glue.
+    model   : the full cost model (Talker + CP + decoder) at rho <= 1.0.  On a non-AMX ISA the
+              decoder term is the [GUESS] x1.5 factor, so this number is the weakest.
+    floor   : W x 1 — what the shape gives if the effective per-worker batch stays ~1 (short,
+              desynchronised requests): the wave's `B` column says which ceiling applies.
+    Every number is PREDICTED; B is capped at the matmat ceiling (16).
+    """
+    if not gemv_gbs:
+        return None
+    b_phys = b_model = 0
+    for B in range(1, B_MATMAT_MAX + 1):
+        p = predict(model, K, B, q, gemv_gbs, llc_share_mb, amx, l3_gbs=l3_gbs, kcal=kcal)
+        if p["talker_ms"] + p["cp_ms"] <= FRAME_MS:
+            b_phys = B
+        if p["rho"] <= 1.0:
+            b_model = B
+    p1 = predict(model, K, 1, q, gemv_gbs, llc_share_mb, amx, l3_gbs=l3_gbs, kcal=kcal)
+    pm = predict(model, K, max(b_model, 1), q, gemv_gbs, llc_share_mb, amx, l3_gbs=l3_gbs, kcal=kcal)
+    return {"W": W, "K": K, "bw_gbs": gemv_gbs,
+            "B_physics": b_phys, "C_physics": W * b_phys,
+            "B_model": b_model, "C_model": W * b_model,
+            "C_floor": W if p1["rho"] <= 1.0 else 0, "rho_B1": p1["rho"],
+            "stream_ms_at_model": pm["talker_ms"] + pm["cp_ms"], "dec_ms_at_model": pm["dec_ms"],
+            "dec_share": pm["dec_ms"] / pm["frame_ms"] if pm["frame_ms"] else 0.0}
+
+
+def ceilings(ident, bwres, isa_class, roofs=None, q=4):
+    roofs = roofs or {}
+    cands, _ = candidate_topologies(ident)
+    llc_per_core = ident.get("llc_per_core_mb") or 0.0
+    amx = isa_class == "x86_amx"
+    out = {}
+    for model in ("1.7b", "0.6b"):
+        rows = []
+        for W, K in cands:
+            g, l3, src = roof_at(roofs, bwres, K)
+            c = ceiling(model, W, K, g, llc_per_core * K, amx, l3_gbs=l3, q=q)
+            if c:
+                c["bw_src"] = src
+                rows.append(c)
+        out[model] = rows
+    return out
+
+
 def candidate_topologies(ident):
     cores = ident.get("perf_cores") or ident.get("online_cpus") or ident.get("physical_cores") or 1
     doms = [d for d in (ident.get("llc_domains") or []) if d.get("cpus")]
@@ -865,7 +939,9 @@ def render(rep):
     for k, why in DO_NOT_SET:
         L.append(f"     {k:<32} {why[:90]}")
     L.append("   candidates to A/B, not to pin:")
-    for k, v, why in CANDIDATES:
+    for k, v, why, isa_only in CANDIDATES:
+        if isa_only and isa_only != (rep["binary"].get("isa_class")):
+            continue
         L.append(f"     {k}={v:<6} {why[:90]}")
     if rec.get("undeclared"):
         L.append(f"   WARN this binary does not declare: {', '.join(rec['undeclared'])} (older/newer build than the flag set; drop them)")
@@ -879,7 +955,54 @@ def render(rep):
     L.append("7. VERIFY NEXT (in this order; each replaces a [PREDICTED] with a [MEASURED])")
     for c in rec["verify"]:
         L.append(f"   {c}")
+    L.append("")
+    L.append("8. CEILING [PREDICTED]  how many streams this host can hold at most, per shape, and what stands between the numbers")
+    L.append("   physics = Talker+CP bytes at the measured GEMV roof with perfect batching and a free decoder: nothing on the shape streams more")
+    L.append("   model   = the same plus the decoder term at rho <= 1.0" + ("  (decoder NOT calibrated on this ISA: [GUESS] x1.5, the weakest term)" if not (rep.get('topology') or {}).get('amx') else ""))
+    L.append("   floor   = W x 1: what you get if the effective per-worker batch stays ~1 (short or desynchronised requests); the wave's B column decides which applies")
+    L.append("   model  W x K   GEMV GB/s   physics C (B)   model C (B)   floor C   at model B: stream ms  dec ms  dec share")
+    for model in ("1.7b", "0.6b"):
+        for c in (rep.get("ceiling") or {}).get(model, []):
+            L.append(f"   {model:<5}  {c['W']}x{c['K']:<3}  {c['bw_gbs'] or 0:8.1f}    {c['C_physics']:3d} ({c['B_physics']:2d})        {c['C_model']:3d} ({c['B_model']:2d})      {c['C_floor']:3d}        {c['stream_ms_at_model']:6.1f}   {c['dec_ms_at_model']:6.1f}   {c['dec_share']*100:4.0f} %")
+    pts = CAL_POINTS.get((rep.get("binary") or {}).get("isa_class") or "", [])
+    if pts:
+        L.append("   [MEASURED] calibration on this ISA family (STREAM_RTF p95 measured vs rho predicted; the model's trust boundary):")
+        for name, meas, pred, note in pts:
+            L.append(f"     {name:<40} measured {meas:.2f}  predicted {(f'{pred:.2f}' if pred is not None else '  -  ')}   {note}")
+    if rep.get("ceiling"):
+        L.append("   reading: physics >> model means the decoder/glue is the wall, not bandwidth (the P4 structural cost); physics ~ model means the shape is bandwidth-bound")
+        L.append("            and only a smaller weight stream (fewer CP re-reads, cache-resident CP, lower precision) raises it.  Past the model C the wave measures, the model guesses.")
     return "\n".join(L) + "\n"
+
+
+def wave_plan(topo, preds17, others, draft_path, isa=None, candidates=CANDIDATES,
+              models=("qwen3-tts-1.7b", "qwen3-tts-0.6b")):
+    """The grid the doctor recommends, as DATA: tools/doctor_wave.py runs it in order.
+
+    One run per (model, shape): concurrency [C, C, C+2] on the same server — the first level
+    is the cold one, the second the warm repeat, the third one step past the prediction.
+    Shapes = the recommended W x K plus the best alternative family, each at its predicted cap.
+    Then the A/B candidates on the recommended shape at [C, C].  No pgrep, no waiting on
+    another process: the runner executes the list sequentially and that is the whole gate.
+    """
+    shapes = [{"topo": f"{topo['W']}x{topo['K']}", "cap": int(topo["B"]), "C": int(topo["C"]), "why": topo.get("rule", "")}]
+    for o in others[:1]:
+        shapes.append({"topo": f"{o['W']}x{o['K']}", "cap": int(o["B"]), "C": int(o["C"]),
+                       "why": f"alternative family, predicted rho {o['rho']:.2f}"})
+    runs = []
+    for m in models:
+        short = m.replace("qwen3-tts-", "")
+        for sh_ in shapes:
+            runs.append({"label": f"{short}-{sh_['topo']}-cap{sh_['cap']}", "model": m, "topo": sh_["topo"],
+                         "cap": sh_["cap"], "conc": [sh_["C"], sh_["C"], sh_["C"] + 2], "env": {}, "why": sh_["why"]})
+    rec = shapes[0]
+    for k, v, why, isa_only in candidates:
+        if isa_only and isa_only != isa:
+            continue   # an A/B for another ISA is noise here, not a run
+        runs.append({"label": f"1.7b-{rec['topo']}-ab-{k.lower()}", "model": models[0], "topo": rec["topo"],
+                     "cap": rec["cap"], "conc": [rec["C"], rec["C"]], "env": {k: v}, "why": f"A/B candidate: {why}"})
+    return {"tool": "tools/doctor.py", "profile": draft_path, "waves": 1, "classes": "short",
+            "runner": "python3 tools/doctor_wave.py <this file>", "runs": runs}
 
 
 # ---------------------------------------------------------------------------------------
@@ -932,6 +1055,12 @@ def main():
     sizes = {pre_topo["K"]: worker_mask or ident["online_mask"]}
     if pre_topo["W"] > 1:
         sizes[cores] = ident["online_mask"]
+    # every candidate worker width gets ITS OWN measured roof: scaling the 8T roof to 16T by
+    # the membw sweep predicted 198 GB/s on a 4-CCX Zen5 where 2x16 measured as if 87; a
+    # roof belongs to one mask (2026-09-08, c8a.8xlarge)
+    for W_, K_ in candidate_topologies(ident)[0]:
+        if K_ not in sizes and K_ >= 2:
+            sizes[K_] = first_n(ident["online_mask"], K_)
     roofs, roof_notes = ({}, ["--no-roof"]) if a.no_roof else step_gemv_roofs(a.roof, ident, sizes, out, reps=a.reps + 1)
     bw["notes"] = (bw.get("notes") or []) + roof_notes
     bw["gemv"] = roofs
@@ -972,8 +1101,13 @@ def main():
         json.dump(prof, f, indent=2)
     topos = ",".join(sorted({f"{r['W']}x{r['K']}" for r in preds['1.7b'] if r['rho'] <= 1.0} | {f"{topo['W']}x{topo['K']}"}))
     concs = sorted({1, topo["C"], topo["C"] + 1} | ({others[0]["C"]} if others else set()))
+    plan = wave_plan(topo, preds["1.7b"], others, relp(dpath), isa=isa)
+    ppath = os.path.join(out, "wave-plan.json")
+    with open(ppath, "w") as f:
+        json.dump(plan, f, indent=2)
     verify = [
         f"make cpu-check                                   # qualification preflight (self-test, roofs @5 reps, dispatch gate)",
+        f"python3 tools/doctor_wave.py {relp(ppath)}   # THE grid above as one sequential run ({len(plan['runs'])} runs, `make doctor-wave` = LATEST); the lines below are what it does by hand",
         f"make roofs ROOF_MASKS={worker_mask or ident['online_mask']}                 # the worker roof for every mask the wave will use",
         f"make bench-topo BENCH_MODEL=qwen3-tts-1.7b BENCH_PROFILE=<copy of {relp(dpath)}> BENCH_TOPO={topos} BENCH_CONC={','.join(str(c) for c in concs)}",
         f"python3 tests/serve_parallel_wave.py --profile <id> --topo {topo['W']}x{topo['K']} --conc {','.join(str(c) for c in concs)} --waves 3   # playback envelope: safe_play_start, stall@250/500",
@@ -985,6 +1119,7 @@ def main():
     rep = {"tool": "tools/doctor.py", "utc": utc, "elapsed_s": time.time() - t0, "out": relp(out),
            "identity": ident, "bandwidth": bw, "binary": binr, "shapes": shp,
            "topology": {k: v for k, v in topo.items() if k != "rows"}, "predictions": preds,
+           "ceiling": ceilings(ident, bw, isa, roofs=roofs),
            "calibration": CAL, "recommendation": rec}
     with open(os.path.join(out, "doctor.json"), "w") as f:
         json.dump(rep, f, indent=1, default=str)

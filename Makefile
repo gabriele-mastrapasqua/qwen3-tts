@@ -911,6 +911,13 @@ doctor: $(TARGET) $(MEMBW_BIN) $(ROOF_MATVEC_BIN)
 	  --store $(PROFILES_DIR)/roofs $(DOCTOR_ARGS)
 test-doctor:
 	@python3 tests/test_doctor.py
+# doctor-wave: run the grid the doctor recommended (profiles/doctor/LATEST/wave-plan.json)
+# sequentially from ONE python file: no shell chain, no pgrep, one log per run, a summary
+# table at the end.  WAVE_ARGS="--dry-run" prints the commands; --only <label,...> a subset.
+WAVE_PLAN ?= $(PROFILES_DIR)/doctor/LATEST/wave-plan.json
+WAVE_ARGS ?=
+doctor-wave: $(TARGET)
+	@python3 tools/doctor_wave.py $(WAVE_PLAN) --bin ./$(TARGET) $(WAVE_ARGS)
 dispatch-map: $(TARGET)
 	@./$(TARGET) --dispatch-map
 

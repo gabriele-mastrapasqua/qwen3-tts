@@ -175,9 +175,53 @@ rep = {"utc": "t", "elapsed_s": 0.1, "out": "x", "identity": idn, "bandwidth": {
        "predictions": {"1.7b": [], "0.6b": []},
        "recommendation": {"argv": argv, "env": D.env_set("x86_amx", set()), "undeclared": [], "draft_path": "d", "draft_errors": [], "verify": ["v"], "alt": None}}
 txt = D.render(rep)
-check("report renders all seven sections and says UNKNOWN when there is no roof",
-      all(f"{i}." in txt for i in range(1, 8)) and "[UNKNOWN] no GEMV roof" in txt)
+check("report renders all eight sections and says UNKNOWN when there is no roof",
+      all(f"{i}." in txt for i in range(1, 9)) and "[UNKNOWN] no GEMV roof" in txt)
+# ---- ceilings: physics (bandwidth only) >= model (with decoder) >= floor (B=1), all from the same terms
+c8 = D.ceiling("1.7b", 4, 8, 55.6, 4.0 * 8, False, l3_gbs=69.4)
+check("c8a 4x8 (55.6 GB/s per CCX): physics (perfect batching, free decoder) far above the model ceiling B1..2; floor 4",
+      c8["B_physics"] >= 4 and c8["B_model"] in (1, 2) and c8["C_floor"] == 4 and c8["C_physics"] >= c8["C_model"] >= c8["C_floor"], c8)
+c16 = D.ceiling("1.7b", 2, 16, 87.5, 4.0 * 16, False, l3_gbs=109.0)
+check("c8a 2x16 (87.5 GB/s): physics far above model -> the decoder is the wall on the wide shape",
+      c16["C_physics"] >= 2 * c16["C_model"] and c16["dec_share"] > 0.4, c16)
+c06 = D.ceiling("0.6b", 4, 8, 55.6, 4.0 * 8, False, l3_gbs=69.4)
+check("0.6B has a higher ceiling than 1.7B on the same shape", c06["C_model"] > c8["C_model"] and c06["C_physics"] > c8["C_physics"], (c06, c8))
+check("no roof -> no ceiling", D.ceiling("1.7b", 4, 8, None, 32, False) is None)
+rep["ceiling"] = {"1.7b": [c8, c16], "0.6b": [c06]}
+txt2 = D.render(rep)
+rep_v = dict(rep, binary=dict(rep["binary"], isa_class="x86_avx512bf16"))
+check("ceiling section lists the measured calibration points of the binary's ISA family",
+      "calibration on this ISA family" in D.render(rep_v) and "FALSIFIED" in D.render(rep_v) and "1x32 B8 C8" in D.render(rep_v))
+check("ceiling section renders one row per shape with the three numbers", txt2.count("1.7b   4x8") == 1 and txt2.count("1.7b   2x16") == 1 and txt2.count("0.6b   4x8") == 1 and "physics C (B)" in txt2 and "dec share" in txt2)
 check("report explains its labels in a legend", "legend:" in txt and "[TRANSFERRED]" in txt)
+
+# ---- the wave plan: the recommendation as DATA a runner executes in order, no shell chain
+plan = D.wave_plan({"W": 4, "K": 8, "B": 1, "C": 4, "rule": "one worker per LLC domain"},
+                   [], [{"W": 1, "K": 32, "B": 4, "C": 4, "rho": 0.37}], "profiles/doctor/x/profile-draft.json", isa="x86_amx")
+labels = [r["label"] for r in plan["runs"]]
+check("wave plan: both shapes x both models, then the A/B candidates on the recommended shape",
+      [r["topo"] for r in plan["runs"][:4]] == ["4x8", "1x32", "4x8", "1x32"]
+      and [r["model"] for r in plan["runs"][:4]] == ["qwen3-tts-1.7b"] * 2 + ["qwen3-tts-0.6b"] * 2
+      and all(r["env"] for r in plan["runs"][4:]) and len(plan["runs"]) == 4 + len(D.CANDIDATES), labels)
+check("wave plan: cold, warm, one past the prediction; cap = the predicted B of that shape",
+      plan["runs"][0]["conc"] == [4, 4, 6] and plan["runs"][0]["cap"] == 1 and plan["runs"][1]["cap"] == 4, plan["runs"][0])
+check("wave plan: labels unique", len(set(labels)) == len(labels), labels)
+plan_vnni = D.wave_plan({"W": 4, "K": 8, "B": 1, "C": 4, "rule": "r"}, [], [], "d", isa="x86_avx512bf16")
+check("wave plan: an A/B candidate for another ISA is not a run", len(plan_vnni["runs"]) == 2 and not any(r["env"] for r in plan_vnni["runs"]), plan_vnni["runs"])
+import subprocess, tempfile
+with tempfile.TemporaryDirectory() as td:
+    pp = os.path.join(td, "wave-plan.json")
+    with open(pp, "w") as f:
+        json.dump(plan, f)
+    dry = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "doctor_wave.py"), pp, "--dry-run"],
+                         capture_output=True, text=True)
+    check("doctor_wave --dry-run prints one serve_parallel_wave command per run and touches no server",
+          dry.returncode == 0 and dry.stdout.count("serve_parallel_wave.py") == len(plan["runs"])
+          and "--batch-cap 1" in dry.stdout and "--conc 4,4,6" in dry.stdout and "--profile profiles/doctor/x/profile-draft.json" in dry.stdout
+          and "pgrep" not in dry.stdout, dry.stdout[-600:] + dry.stderr[-300:])
+    dry2 = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "doctor_wave.py"), pp, "--dry-run", "--only", labels[1]],
+                          capture_output=True, text=True)
+    check("doctor_wave --only selects by label", dry2.stdout.count("serve_parallel_wave.py") == 1 and labels[1] in dry2.stdout, dry2.stdout[-300:])
 
 print()
 if FAILURES:
