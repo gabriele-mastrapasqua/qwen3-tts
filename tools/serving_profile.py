@@ -128,7 +128,8 @@ def run_binary(binary, env, dispatch_path):
     return dispatch, caps, probe_env
 
 
-def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None):
+def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
+             process_env=None):
     errors = list(errors or [])
     parity = prof.get("parity")
     if not parity:
@@ -218,19 +219,22 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None):
         if not expected_backend_ok(wanted, actual, prefill_active if name == "prefill" else False):
             errors.append("%s backend=%s (%s), expected %s" % (name, actual, raw, wanted))
 
-    # Explicitly requested profile values must be visible in the engine's own [FLAGS].
-    # This catches a typo, a server-side default override, and a profile env that was not
-    # inherited by the process.  Check non-QWEN controls too (notably
-    # OPENBLAS_THREAD_TIMEOUT); null entries are checked by the caller against the parent
-    # environment and deliberately must not appear here.
+    # Explicitly requested QWEN values must be visible in the engine's own [FLAGS].
+    # Non-QWEN controls such as OPENBLAS_THREAD_TIMEOUT are process-environment settings,
+    # not engine flags, so validate them against the exact probe environment instead of
+    # incorrectly requiring them in [FLAGS]. Null entries are checked by the caller.
     if profile_env is not None:
         # Include streaming settings injected by perf_profile.environ(), not only the
         # runtime.environment map.  Otherwise decode quantum could drift while the
         # backend contract looked pinned.
         for key, value in P.environ(prof).items():
-            if flags.get(key) != value:
+            if key.startswith("QWEN_") and flags.get(key) != value:
                 errors.append("engine [FLAGS] %s=%r, profile requested %r" %
                               (key, flags.get(key), value))
+            elif not key.startswith("QWEN_") and process_env is not None \
+                    and process_env.get(key) != value:
+                errors.append("process environment %s=%r, profile requested %r" %
+                              (key, process_env.get(key), value))
 
     summary = {
         "profile": prof["profile"]["id"],
@@ -337,7 +341,8 @@ def preflight(args):
         if caps_run is not None and caps_run.returncode != 0:
             errors.append("--caps failed: %s" % (caps_run.stderr or caps_run.stdout).strip()[-500:])
         flags = parse_flags((caps_run.stdout + "\n" + caps_run.stderr) if caps_run else "")
-        summary = evaluate(prof, dispatch, flags, args.binary, base, errors)
+        summary = evaluate(prof, dispatch, flags, args.binary, base, errors,
+                           process_env=probe_env)
         summary["host_env_overrides"] = sorted(overrides)
         summary["flags_observed"] = flags
         summary["source_fingerprint"] = dispatch.get("source_fp")

@@ -117,7 +117,7 @@
       "QWEN_SD_POOL": {"value": "engine", "why": "same engine-owned decoder pool semantics"},
       "QWEN_SD_RAG_MIN_PANELS": {"value": "2", "why": "same logical threshold; no Arm ragged decoder implementation is implied"},
       "QWEN_SD_STREAM_STRIP": {"value": "0", "why": "Design-D warm strip unavailable on Arm"},
-      "QWEN_SD_WINDOWED": {"value": "1", "why": "pin the exact known streaming decoder window semantics"},
+      "QWEN_SD_WINDOWED": {"value": "0", "why": "explicitly disable the legacy windowed fallback so the exact streaming decoder semantics are resolved"},
       "QWEN_SERVER_ASYNC_OUTPUT": {"value": "0", "why": "same synchronous output contract"},
       "QWEN_SERVER_NO_DECODER_BATCH": {"value": null, "why": "presence flag must remain absent; decoder request is explicit"},
       "QWEN_TTS_STREAM_LAYOUT": {"value": "0", "why": "SL-1 remains default-off"}

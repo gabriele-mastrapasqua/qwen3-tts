@@ -130,7 +130,7 @@
       "QWEN_SD_POOL": {"value": "engine", "why": "decoder work uses the engine-owned pool"},
       "QWEN_SD_RAG_MIN_PANELS": {"value": "2", "why": "frozen AMX ragged threshold"},
       "QWEN_SD_STREAM_STRIP": {"value": "1", "why": "frozen warm Design-D range slice"},
-      "QWEN_SD_WINDOWED": {"value": "1", "why": "pin the exact known streaming decoder window semantics"},
+      "QWEN_SD_WINDOWED": {"value": "0", "why": "explicitly disable the legacy windowed fallback so the exact streaming/ragged decoder path is resolved"},
       "QWEN_SERVER_ASYNC_OUTPUT": {"value": "0", "why": "synchronous output is the reference contract"},
       "QWEN_SERVER_NO_DECODER_BATCH": {"value": null, "why": "presence flag must remain absent when decoder batching is requested"},
       "QWEN_TTS_STREAM_LAYOUT": {"value": "0", "why": "SL-1 remains default-off in the frozen reference"},
