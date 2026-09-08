@@ -3541,8 +3541,14 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 
         PF_START();
         if (ttfa_trace) {
-            for (int b = 0; b < B; b++)
-                if (step_active[b] && t2_talker1[b] == 0.0) t2_talker1[b] = qwen_mono_ms();
+            for (int b = 0; b < B; b++) {
+                if (step_active[b] && t2_talker1[b] == 0.0) {
+                    t2_talker1[b] = qwen_mono_ms();
+                    fprintf(stderr, "[F2STAGE] v=1 stage=first_talker seed=%u slot=%d "
+                                    "ts=%.3f clock=CLOCK_MONOTONIC domain=S\n",
+                            t2_seed[b], b, t2_talker1[b]);
+                }
+            }
         }
         int pf_rc = qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, step_active, last_hidden);
         PF_END(pf_talker);
