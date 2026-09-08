@@ -185,12 +185,37 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       stall@250 `13.3%`). Cap 2/q4 remains the reference; established-four causal
       impact is UNKNOWN because the short run used true simultaneous waves. No C6.
       Detail: `.work/f-cap3-c5-capacity-20260908.md`.
+- [ ] DL-1 4+4 intra-CCX decoder lane, default-off `QWEN_SD_LANE_SPLIT=N` (2026-09-09):
+      the worker mask is split into a STEP part (engine pool: Talker/CP/prefill) and a
+      DECODER part (private pinned team, never the engine pool or its submit lock); the
+      frame loop enqueues one bounded decoder unit per slot and blocks only when that
+      slot needs another quantum while its unit is in flight (lead <= 1 quantum). Built
+      from the single-CCX lane law (`T(B) = 40 + 13.5·B` ms, decoder 9.7 ms per slot,
+      Talker+CP saturate the CCX at 2-4 threads) and the L3 contention falsifier (+12 %).
+      A/B: one worker on one CCX, 1.7B, fixed text, q4, SL-1, inline vs lane at B2/B3/B4
+      (+B5 if B4 is healthy). **GO**: B3 STREAM p95 <= 0.85, B4 <= 0.92, stall@250 = 0,
+      no lifecycle/correctness issue; **strong GO**: B4 <= 0.90 without TTFA/prebuffer
+      regression; **FAIL**: < 10 % better than inline at B3/B4, or Talker/CP inflation
+      erases the overlap, or the mailbox recreates equivalent blocking, or lifecycle is
+      unsafe. PASS -> 4x8 host screen at C8/C12/C16; FAIL -> stop, use the measured
+      split to decide whether res1/VNNI decoder work is the next lever. Same task:
+      `vnni-bf16-product` lane (native bf16 prefill; the f32 pin of `vnni-product` is a
+      backend-selection defect) and `QWEN_POOL_SPIN=65536` promoted in the VNNI product
+      lanes (measured 2x16 C8 0.893 -> 0.808). **A/B done 2026-09-09: NOT GO, not FAIL** —
+      iteration wall matched the prediction (B3 64 ms, B4 72 ms; decoder-call spikes gone,
+      stall@250 at B4 100 % -> 0 %) but STREAM p95 B3 0.871 / B4 0.997 miss the gate: the
+      4-thread STEP side inflated Talker+CP by +27-29 % (per-slot region sections, ~8 ms per
+      slot) and the 2 s clip pays the pipeline's fixed latency (+0.05 STREAM, +30-64 ms
+      TTFA). Kept default-off; no host screen. Next lever per the split: the step side
+      (5+3 / 6+2 split, long-bank A/B), not res1. Detail:
+      `.work/dl1-decoder-lane-split-20260909.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving
       optimization; claim-first allocation hygiene is retained but KPI-neutral. Details:
       `.work/p4-rag-panel-scratch-20260907.md`, `.work/p4-rag-claim-first-20260907.md`.
-- [ ] No speculative completed-stage resumability or dedicated core lanes without evidence.
+- [ ] No speculative completed-stage resumability or dedicated core lanes without evidence
+      (DL-1 is the evidence-gated exception: it is an A/B, not a promotion).
 
 ### P5 Ownership and batching
 
@@ -232,6 +257,20 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   MEASURED/DERIVED/PREDICTED boundaries. No host was benchmarked. Detail:
   `.work/post-8core-codex-review-20260908.md` and
   `.work/turin-vnni-campaign-plan-20260908.md`.
+- [x] QL-2d Turin fast screen on AWS c8a.8xlarge (32 Zen5 cores, 4 CCX, 2026-09-08):
+  1.7B holds C8 and not C10 (`2x16` cap 4 STREAM p95 0.79-0.84 at C8, C10 1.05; `4x8`
+  cap 2 0.87; `1x32` collapses at 1.4); 0.6B `4x8` cap 4 holds C12 at 250 ms and C16
+  at 500 ms, `2x16` collapses at C16. Screen only: provisional profile, 1 wave, short
+  texts. Detail: `.work/turin-c8a-32c-fast-screen-20260908.md`.
+- [ ] QL-2e Turin ceiling calibration: the doctor's physics ceiling is C28-32 for 1.7B
+  where the host delivers 8; measure the three named gaps (wide-pool collapse incl. the
+  40 GB/s cross-CCX cache rate, the VNNI decoder term now a ×1.5 GUESS, batch scaling
+  past B2) with the stage trace at C8/C10 on `2x16`, then run the pre-registered Phase 4
+  on `2x16` cap 4 and `4x8` cap 2 only. Same addendum, §5-6.
+- [x] DR-1 Doctor wave plan + ceiling: `wave-plan.json` + `tools/doctor_wave.py`
+  (`make doctor-wave`) run the recommended grid from one file; every candidate K gets its
+  own measured GEMV roof; section 8 CEILING prints physics / model / floor per shape with
+  the measured calibration points of the ISA family. Same addendum, §7.
 - [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
   playback-aware harness only after QL-1 has one trusted reference and the QL-2a
   + QL-2b dispatch/quality gates are applied; do not present AMX-only decoder work as
