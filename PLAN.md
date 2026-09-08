@@ -52,6 +52,24 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   accepted sockets set `TCP_NODELAY`; PCM writes remain synchronous unless OUT is enabled.
   Detail: `.work/mt4-transport-boundary-20260907.md`.
 
+### Current 8-core AMX product decision
+
+- The current 8-physical-core reference is `1x8@0-7`, SMT off, Design-D INT8,
+  fused residual, warm strip, q4, engine pool and fail-fast admission. The
+  strict `amx-product` profile now explicitly enables the official known-text
+  SL-1 layout (`QWEN_TTS_STREAM_LAYOUT=1`); ICL/clone and live incremental text
+  are outside this lane.
+- 1.7B: **C2/cap2 is the highest full-envelope GOOD point**. C3 is a healthy
+  short/isolated-bank screen but not a full production point because the
+  corrected C3 SOAK still has tail drift and pooled STREAM_RTF p95 just over
+  one. Detail: `.work/ql1-gcp-c4-highcpu16-17b-final-20260908.md`.
+- 0.6B: **C3/cap3 is the highest full-envelope GOOD point** on this host. C4 is
+  a non-promoted screen; C5 is the first clearly bad short-bank point. Detail:
+  `.work/gcp-c4-highcpu16-amx-product-capacity-20260908.md`.
+- These are playback-aware product points, not a claim that the 8-core host can
+  sustain C4 or that low-rate Poisson probes establish an economic rate. Cost
+  per good stream remains UNKNOWN without grounded pricing.
+
 ## Immediate priorities
 
 ### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11, E12
@@ -113,10 +131,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       distinct. Detail: `.work/stream-output-isolation-20260907.md`.
 - [x] SL-1 Known-text official dual-track layout implemented behind
       QWEN_TTS_STREAM_LAYOUT=1 and carried through CLI, batch and continuous-server
-      admission paths. Local structural smoke and a short GCP 2x6/batch-2 server
-      path+census gate pass for short/medium/long text; it remains default-off pending
-      ICL/clone, quality and prefill-scaling gates. Detail:
-      `.work/sl1-known-text-stream-layout-20260907.md`.
+      admission paths. The known-text Ryan/English lane passed current-generation
+      structural/audio, prefill-scaling and 8-core server interference gates and is
+      explicit in `amx-product`; ICL/clone and live incremental text remain outside
+      the lane. Detail: `.work/sl1-known-text-stream-layout-20260907.md` and
+      `.work/ql1-gcp-c4-highcpu16-17b-final-20260908.md`.
 - [x] LS-1 Minimal credit-gate skeleton implemented and falsified at C3/C4 behind
       `QWEN_STREAM_LEAD_GATE=1`: first audio remains eligible, but hard suppression at a
       250 ms target parks ~95.8% of checks, lowers useful worker work and does not improve
@@ -128,8 +147,9 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       `.work/decoder-quantum-floor-20260907.md`.
 - [ ] LS-2 Lead-feedback steady-state quantum: first chunk remains one frame, bounded lead
       window, explicit minimum efficient quantum; q8 remains the upper control until proven.
-- [ ] PF-1 Residual fixed-prompt chunked prefill only where SL-1 leaves a genuinely long
-      prefix (ICL/reference or retained non-streaming modes); the existing cloned-context
+- [ ] PF-1 Residual fixed-prompt chunked prefill only if a retained ICL/reference or
+      non-streaming mode still leaves a genuinely long prefix after SL-1. It is not a
+      blocker for the current known-text 1.7B product point; the cloned-context
       helper/LOW falsifier is rejected as a serving substitute. Detail:
       `.work/prefill-helper-c34-20260907.md`; do not confuse it with live text.
 - [x] LS-4 Bounded utilization-aware third-slot admission falsifier: the parent health
@@ -193,11 +213,10 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ### P6 Qualification and backend comparison
 
-- [x] QL-1 Tier-B C3 qualification completed on GCP C4 highcpu-16: `1x8` is the
-      strongest 8-core point and the corrected pooled SOAK passes, but long-input
-      startup and accepted long-prefill arrival prevent full C3 production qualification;
-      the full-envelope result is NOT QUALIFIED. Detail:
-      `.work/ql1-gcp-c4-highcpu16-c3-full-qualification-20260908.md`.
+- [x] QL-1 1.7B final decision on GCP C4 highcpu-16: known-text SL-1 removes the
+      dominant long-prefill startup term, but full C3 still lacks sufficient sustained
+      tail margin. C2/cap2 is the highest full-envelope GOOD point; C3 is screen-only.
+      Detail: `.work/ql1-gcp-c4-highcpu16-17b-final-20260908.md`.
 - [x] QL-2a Cross-ISA serving parity audit: common server semantics are portable, but
       AMX Design-D/fused ragged decoder execution is not shared by VNNI or Arm; freeze
       a common-control lane plus a separately labelled best-per-ISA lane before spend.
@@ -211,10 +230,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
   playback-aware harness only after QL-1 has one trusted reference and the QL-2a
   + QL-2b dispatch/quality gates are applied; do not present AMX-only decoder work as
   parity.
-  Completed slot: GCP C4 highcpu-16 / 8 physical AMX cores. `1x8` is the best
-  topology and is GOOD through C3; C4 is NOT QUALIFIED (`STREAM_RTF` p95 `0.974`),
-  while `2x4` is GOOD only through C2. No 4+1 probe or SOAK was authorized. Detail:
-  `.work/ql2-gcp-c4-highcpu16-amx-20260908.md`.
+  Completed slot: GCP C4 highcpu-16 / 8 physical AMX cores. For 1.7B, `1x8`
+  is the best topology and C2 is the final full-envelope point; C3 is screen-only
+  and C4 is NOT GOOD. For 0.6B, C3 is the final full-envelope point and C4 is
+  non-promoted. The next slot is AMD/Turin VNNI, then Axion/Arm. Detail:
+  `.work/ql2-gcp-c4-highcpu16-amx-20260908.md` and
+  `.work/gcp-c4-highcpu16-amx-product-capacity-20260908.md`.
 
 ### Retained, demoted or deferred (ids kept for addenda; none is a current priority)
 
