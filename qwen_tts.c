@@ -1948,14 +1948,31 @@ int qwen_tts_batch_max_prompt(void) {
     }
     return v;
 }
+/* Per-request generation ceiling of the batched/server paths, in codec frames (12.5/s).
+ * Precedence: QWEN_BATCH_MAX_FRAMES (explicit) > the value the server derives from
+ * --max-request-seconds (qwen_tts_set_batch_max_frames) > 600 (48 s).  Reaching it is
+ * NOT an EOS: the request is truncated, and every path that hits it says so on stderr
+ * (qwen_tts_note_frame_cap) instead of ending the stream as if the model had finished. */
+static int g_batch_max_frames_cfg = 0;
+void qwen_tts_set_batch_max_frames(int frames) { g_batch_max_frames_cfg = frames > 0 ? frames : 0; }
+int qwen_tts_batch_max_frames_source(void) {
+    const char *e = getenv("QWEN_BATCH_MAX_FRAMES");
+    if (e && atoi(e) > 0) return 2;               /* explicit env */
+    return g_batch_max_frames_cfg > 0 ? 1 : 0;    /* 1 = server-derived, 0 = compiled default */
+}
 int qwen_tts_batch_max_frames(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("QWEN_BATCH_MAX_FRAMES");
-        v = (e && atoi(e) > 0) ? atoi(e) : 600;
-        if (v < 32) v = 32;
-    }
+    const char *e = getenv("QWEN_BATCH_MAX_FRAMES");
+    int v = (e && atoi(e) > 0) ? atoi(e) : (g_batch_max_frames_cfg > 0 ? g_batch_max_frames_cfg : 600);
+    if (v < 32) v = 32;
     return v;
+}
+static void qwen_tts_note_frame_cap(const char *path, int frames, int cap, int kv_full) {
+    fprintf(stderr, "[%s] WARNING: request TRUNCATED after %d frames (%.1f s of audio): %s. "
+                    "The output ends as if the model had finished. Raise --max-request-seconds "
+                    "(server) or QWEN_BATCH_MAX_FRAMES (now %d frames = %.1f s), or split the text.\n",
+            path, frames, frames / 12.5,
+            kv_full ? "the slot's KV budget (prompt + frames) is full" : "the per-request frame cap was reached",
+            cap, cap / 12.5);
 }
 
 int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
@@ -2085,7 +2102,10 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                 float ft = ctx->temperature; int ftk = ctx->top_k;
                 if (ctx->greedy_warmup > 0 && frame < ctx->greedy_warmup) { ft = 0.0f; ftk = 1; }
                 int c0 = qwen_tts_sample(logits, vocab, ft, ftk, ctx->top_p, ctx->rep_penalty, prev_tok[b], nprev[b]);
-                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) { active[b] = 0; n_active--; code0[b] = 0; continue; }
+                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) {
+                    if (c0 != QWEN_TTS_CODEC_EOS) qwen_tts_note_frame_cap("batch", chframes[b], GEN_CAP, 0);
+                    active[b] = 0; n_active--; code0[b] = 0; continue;
+                }
                 code0[b] = c0; prev_tok[b][nprev[b]++] = c0;
             }
             if (n_active == 0) break;
@@ -2274,7 +2294,10 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
                 qwen_set_seed(rng[b]);
                 int c0 = qwen_tts_sample(logits, vocab, ft, ftk, p_topp[b], p_rep[b], prev_tok[b], nprev[b]);
                 rng[b] = qwen_get_seed();
-                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) { active[b] = 0; n_active--; code0[b] = 0; continue; }
+                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) {
+                    if (c0 != QWEN_TTS_CODEC_EOS) qwen_tts_note_frame_cap("batch", chframes[b], GEN_CAP, 0);
+                    active[b] = 0; n_active--; code0[b] = 0; continue;
+                }
                 code0[b] = c0; prev_tok[b][nprev[b]++] = c0;
             }
             if (n_active == 0) break;
@@ -2657,6 +2680,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     { int lim = qwen_tts_batch_max_frames(); if (GEN_CAP > lim) GEN_CAP = lim; }
     if (GEN_CAP < 32) GEN_CAP = 32;
     const int MAXPROMPT = qwen_tts_batch_max_prompt();
+    if (ctx->rope_cache_len > 0 && GEN_CAP > ctx->rope_cache_len - MAXPROMPT - 8) {
+        int lim = ctx->rope_cache_len - MAXPROMPT - 8;
+        fprintf(stderr, "[serve] frame cap %d exceeds the RoPE cache (%d positions - %d prompt): clamped to %d\n",
+                GEN_CAP, ctx->rope_cache_len, MAXPROMPT, lim);
+        GEN_CAP = lim < 32 ? 32 : lim;
+    }
     int kv_max = MAXPROMPT + GEN_CAP + 4;
     int force_matvec = getenv("QWEN_BATCH_FORCE_MATVEC") ? 1 : 0;
 
@@ -2898,6 +2927,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     unsigned int *rq_seed = (unsigned int *)calloc((size_t)B, sizeof(unsigned int));
     int *rq_tok = (int *)calloc((size_t)B, sizeof(int));
     double *rq_t0 = (double *)calloc((size_t)B, sizeof(double));
+    int *rq_capped = (int *)calloc((size_t)B, sizeof(int));   /* 1 = ended at the frame/KV cap, not at EOS */
     double pf_t0_loop = time_ms(), pf_mark = 0;
     long long pf_frames = 0, pf_slotframes = 0, pf_stepframes = 0;
     /* Decode-occupancy census: how often the batch actually holds >1 slot, and
@@ -2917,9 +2947,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         double _pf_f0 = prof_on ? time_ms() : 0;                                   \
         if (rq_trace)                                                              \
             fprintf(stderr, "[REQ] pid=%d seed=%u tokens=%d frames=%d audio_s=%.3f " \
-                            "service_ms=%.1f\n", (int)getpid(), rq_seed[b],        \
+                            "service_ms=%.1f truncated=%d\n", (int)getpid(), rq_seed[b], \
                     rq_tok[b], chframes[b], (double)chframes[b] / 12.5,            \
-                    time_ms() - rq_t0[b]);                                         \
+                    time_ms() - rq_t0[b], rq_capped[b]);                           \
         if (dec_on && (want_stream[b] || !amort)) {                                \
                \
             if (want_stream[b])                                                    \
@@ -3040,7 +3070,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         stream_tail_pos[(b_)] = 0;                                                        \
         ctx->stream_trailing_text = NULL; ctx->stream_trailing_len = 0;                   \
         ctx->stream_trailing_pos = 0;                                                     \
-        nprev[(b_)] = 0; chframes[(b_)] = 0; sframe[(b_)] = 0; decpos[(b_)] = 0;           \
+        nprev[(b_)] = 0; chframes[(b_)] = 0; sframe[(b_)] = 0; decpos[(b_)] = 0; rq_capped[(b_)] = 0;           \
         if (rq_trace) { rq_seed[(b_)] = (req_).seed; rq_tok[(b_)] = (pl_);                 \
                         rq_t0[(b_)] = time_ms(); }                                         \
         want_stream[(b_)] = ((req_).want_stream && sink->on_chunk) ? 1 : 0;                \
@@ -3074,6 +3104,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         rng[(b_)] = qwen_get_seed();                                                         \
         if (_c0 == QWEN_TTS_CODEC_EOS || chframes[(b_)] >= GEN_CAP ||                        \
             pos[(b_)] >= kv_max - 1) {                                                       \
+            if (_c0 != QWEN_TTS_CODEC_EOS) {                                                 \
+                rq_capped[(b_)] = 1;                                                         \
+                qwen_tts_note_frame_cap("serve", chframes[(b_)], GEN_CAP,                    \
+                                        chframes[(b_)] < GEN_CAP);                           \
+            }                                                                                \
             FINALIZE_SLOT((b_)); code0[(b_)] = 0; (stop_) = 1; break;                         \
         }                                                                                    \
         code0[(b_)] = _c0; prev_tok[(b_)][nprev[(b_)]++] = _c0; (c0_) = _c0;                 \
@@ -3208,7 +3243,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 #endif
                 p_temp[b] = p->req.temperature; p_topk[b] = p->req.top_k; p_topp[b] = p->req.top_p;
                 p_rep[b] = p->req.rep_penalty; p_gw[b] = p->req.greedy_warmup; rng[b] = p->req.seed;
-                nprev[b] = 0; chframes[b] = 0; sframe[b] = 0; decpos[b] = 0;
+                nprev[b] = 0; chframes[b] = 0; sframe[b] = 0; decpos[b] = 0; rq_capped[b] = 0;
                 if (rq_trace) { rq_seed[b] = p->req.seed; rq_tok[b] = p->pl; rq_t0[b] = time_ms(); }
                 if (ttfa_trace) {
                     t2_helper[b]   = 1;

@@ -231,8 +231,17 @@ disables the cap) and `--max-text-chars N` / `QWEN_MAX_TEXT_CHARS` — and the s
 effective pair at startup, so a log can be audited after the fact:
 
 ```
-[serve] per-request generation cap: 60 s -> text limit 1792 characters (--max-request-seconds N / --max-text-chars N; 0 disables the cap)
+[serve] per-request generation cap: 60 s -> text limit 1792 characters, frame cap 750 = 60.0 s of audio (from --max-request-seconds); a request that reaches the frame cap is TRUNCATED and logged (--max-request-seconds N / --max-text-chars N; 0 disables the text cap)
 ```
+
+The seconds bound the generation as well as the text: the batched engine stops a request at
+`--max-request-seconds × 12.5` codec frames (`QWEN_BATCH_MAX_FRAMES` overrides it, and a
+too-large value is clamped to the RoPE cache). Reaching that cap is **not** an end-of-speech:
+the audio ends where the model was cut. The server says so rather than letting the stream look
+complete — one `[serve] WARNING: request TRUNCATED after N frames (S s of audio)` line per
+request on stderr, and `truncated=1` in the `[REQ]` trace when `QWEN_REQ_TRACE` is on. Until
+2026-09-08 this cap was a silent 600 frames (48 s) regardless of `--max-request-seconds`, so a
+long prompt admitted under the 60 s text limit came back truncated with no trace at all.
 
 `GET /v1/health` reports the same numbers live, which is how a client discovers the limits it is
 subject to instead of hard-coding them:

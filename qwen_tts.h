@@ -637,6 +637,8 @@ typedef struct {
 
 int qwen_tts_batch_max_prompt(void);
 int qwen_tts_batch_max_frames(void);
+void qwen_tts_set_batch_max_frames(int frames);   /* server: derived from --max-request-seconds; env wins */
+int qwen_tts_batch_max_frames_source(void);       /* 0 compiled default, 1 server-derived, 2 QWEN_BATCH_MAX_FRAMES */
 
 void qwen_admit_probe_read(unsigned long long *seq, double *ts_ms, double *last_iter_ms);
 

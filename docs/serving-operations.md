@@ -439,7 +439,7 @@ from two things the profile already fixes — a batch slot's prompt budget
 one wins, floored at 200. On a stock server that is 1792 characters, and the startup line says so:
 
 ```
-[serve] per-request generation cap: 60 s -> text limit 1792 characters (--max-request-seconds N / --max-text-chars N; 0 disables the cap)
+[serve] per-request generation cap: 60 s -> text limit 1792 characters, frame cap 750 = 60.0 s of audio (from --max-request-seconds); a request that reaches the frame cap is TRUNCATED and logged (--max-request-seconds N / --max-text-chars N; 0 disables the text cap)
 ```
 
 Two consequences worth having in mind before a deployment quotes anything. Lowering

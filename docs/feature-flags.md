@@ -241,6 +241,7 @@ both belong before any number.
 | `QWEN_ADMIT_UTIL_LIMIT_MS` | 60 | recent service-loop interval limit in milliseconds for the transient third-slot predicate; benchmark thresholds must be fixed before an A/B run |
 | `QWEN_ADMIT_UTIL_TRACE` | off | diagnostic `[ADMITUTIL]` decisions: worker, active slots, sample age, recent interval, threshold and admit/reject reason |
 | `QWEN_THP` | off | `=1` advises transparent huge pages over the mapped weights (Linux) |
+| `QWEN_BATCH_MAX_FRAMES` | server: `--max-request-seconds × 12.5` (750 at the default 60 s); CLI `--batch`: 600 (48 s) | per-request generation ceiling of the batched/server paths in codec frames. Reaching it is **not** an EOS: the request is truncated, a `WARNING: request TRUNCATED after N frames` line goes to stderr and `[REQ]` traces carry `truncated=1`. Before 2026-09-08 the server stopped silently at 600 frames (48 s) while `--max-request-seconds 60` admitted 60 s of text. An explicit value here wins over the derived one; it is clamped to the RoPE cache |
 
 Note that `OPENBLAS_NUM_THREADS` is not in this table because it must be **absent**: the engine
 sizes OpenBLAS itself at startup and backs off entirely when that variable is already set, so

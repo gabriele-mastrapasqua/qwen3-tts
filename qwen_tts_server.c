@@ -878,14 +878,26 @@ static void srv_init_request_cap(void) {
     g_srv.max_text_chars = g_cfg_max_text_chars;
     { const char *e = getenv("QWEN_MAX_TEXT_CHARS");
       if (e && *e) { int v = atoi(e); if (v > 0) g_srv.max_text_chars = v; } }
+    /* The same seconds also bound the GENERATION: without this the batched engine stopped at
+     * its compiled 600-frame ceiling (48 s) while the text limit admitted 60 s of speech, and
+     * the stream ended as if the model had finished.  An explicit QWEN_BATCH_MAX_FRAMES wins. */
     if (g_srv.max_request_ms > 0)
-        fprintf(stderr, "[serve] per-request generation cap: %.0f s -> text limit %d characters "
-                        "(--max-request-seconds N / --max-text-chars N; 0 disables the cap)\n",
-                g_srv.max_request_ms / 1000.0, srv_max_text_chars());
-    else
-        fprintf(stderr, "[serve] per-request generation cap: DISABLED - one caller can hold a "
-                        "slot for as long as the token ceiling allows; text limit %d characters\n",
-                srv_max_text_chars());
+        qwen_tts_set_batch_max_frames((int)((g_srv.max_request_ms / 1000.0) * 12.5 + 0.5));
+    {
+        int fcap = qwen_tts_batch_max_frames();
+        int src = qwen_tts_batch_max_frames_source();
+        const char *why = src == 2 ? "QWEN_BATCH_MAX_FRAMES" : src == 1 ? "from --max-request-seconds" : "compiled default";
+        if (g_srv.max_request_ms > 0)
+            fprintf(stderr, "[serve] per-request generation cap: %.0f s -> text limit %d characters, "
+                            "frame cap %d = %.1f s of audio (%s); a request that reaches the frame cap "
+                            "is TRUNCATED and logged (--max-request-seconds N / --max-text-chars N; 0 disables the text cap)\n",
+                    g_srv.max_request_ms / 1000.0, srv_max_text_chars(), fcap, fcap / 12.5, why);
+        else
+            fprintf(stderr, "[serve] per-request generation cap: DISABLED - text limit %d characters; "
+                            "generation still stops at the frame cap %d = %.1f s of audio (%s) and is "
+                            "TRUNCATED and logged there\n",
+                    srv_max_text_chars(), fcap, fcap / 12.5, why);
+    }
 }
 
 static void handle_health(int fd) {
