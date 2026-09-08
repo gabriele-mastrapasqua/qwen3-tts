@@ -143,6 +143,12 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       per-class p95 remains under-sampled. C5/C6 screens fail startup/safe-start despite
       STREAM p95 <1. Detail:
       `.work/p4-fused-residual-20260907.md`.
+- [x] F1 fused-residual × quantum screen (2026-09-08): fused-on q4 is the next C4
+      playback/realtime reference candidate (STREAM_RTF p95 `0.868`, prebuffer p95
+      `201 ms`, stall@250 `0%`); q8 remains the higher-throughput control and q2 misses
+      the preferred STREAM p95 target. Three-wave screen only; not a qualification, and
+      no causal fused-vs-off frontier shift was isolated. Detail:
+      `.work/f1-fused-quantum-20260908.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving
