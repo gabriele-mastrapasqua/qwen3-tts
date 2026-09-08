@@ -197,8 +197,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       discover the maximum GOOD concurrency with margin; publish GOOD streams per cost unit.
       Qualification dimensions must include short/medium/long/mixed inputs and
       long-request arrival scenarios (`.work/post-p2-streaming-research-agenda.md` R8).
+- [x] QL-2a Cross-ISA serving parity audit: common server semantics are portable, but
+      AMX Design-D/fused ragged decoder execution is not shared by VNNI or Arm; freeze
+      a common-control lane plus a separately labelled best-per-ISA lane before spend.
+      Detail: `.work/cross-isa-serving-parity-audit-20260908.md`.
 - [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
-      playback-aware harness only after QL-1 has one trusted reference.
+      playback-aware harness only after QL-1 has one trusted reference and the QL-2a
+      dispatch/quality gates are applied; do not present AMX-only decoder work as parity.
 
 ### Retained, demoted or deferred (ids kept for addenda; none is a current priority)
 
