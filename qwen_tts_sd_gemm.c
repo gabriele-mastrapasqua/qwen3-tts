@@ -105,7 +105,7 @@ void qwen_sd_sgemm(int order, int ta, int tb, int M, int N, int K, float alpha,
 static void sdg_run(int order, int ta, int tb, int M, int N, int K, float alpha,
                     const float *A, int lda, const float *B, int ldb, float beta,
                     float *C, int ldc) {
-    int nt = qwen_get_threads();
+    int nt = qwen_lane_thread_here() ? qwen_lane_team_size() : qwen_get_threads();
     /* Small problems, single thread, inside a region, or BLAS still owning its team:
      * plain call.  The threshold keeps a ~us-scale GEMM from paying a pool dispatch. */
     if (!qwen_blas_own_effective() || nt <= 1 || order != (int)CblasRowMajor ||

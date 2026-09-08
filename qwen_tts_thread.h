@@ -54,6 +54,19 @@ double qwen_parallel_now_ms(void);
  * dependent phases with qwen_barrier_wait instead of leaving and re-dispatching.  A team
  * of 1 means the pool cannot promise that and the caller must use plain dispatches. */
 int qwen_parallel_team(void);
+
+/* Decoder lane (QWEN_SD_LANE_SPLIT=N): the worker's cpu mask is split into a STEP part
+ * (engine pool: Talker, CP, prefill) and a DECODER part (a private team that never touches
+ * the engine pool or its submit lock).  Prepare BEFORE the engine pool is created; the
+ * calling thread is confined to the STEP cpus so the pool inherits them.  Linux only;
+ * elsewhere prepare returns 0 and nothing changes. */
+int  qwen_lane_split_prepare(int *engine_threads);      /* 1 = split active, *engine_threads = STEP cpus */
+int  qwen_lane_team_start(void);                        /* creates the pinned decoder team; returns its size or 0 */
+void qwen_lane_team_stop(void);
+int  qwen_lane_team_size(void);                         /* 0 when there is no lane */
+void qwen_lane_thread_join(void);                       /* the decoder thread: pin to the DECODER cpus, mark TLS */
+int  qwen_lane_thread_here(void);                       /* 1 on the decoder thread or a lane worker */
+void qwen_lane_masks(const char **step, const char **dec);
 typedef struct { volatile int arrived; volatile int phase; int nt; } qwen_barrier_t;
 void qwen_barrier_init(qwen_barrier_t *b, int nt);
 void qwen_barrier_wait(qwen_barrier_t *b);

@@ -8,6 +8,7 @@
 /* main.c - Qwen3-TTS CLI */
 
 #include "qwen_tts.h"
+#include "qwen_tts_thread.h"
 #include "qwen_tts_audio.h"
 #include "qwen_tts_emotion.h"
 #include "qwen_tts_compose.h"
@@ -1414,6 +1415,9 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "cpu-mask: process pid %d confined to cpus %s (%d cpus)\n",
                 (int)getpid(), serve_cpu_mask, CPU_COUNT(&set));
+        /* QWEN_SD_LANE_SPLIT: split this single worker's mask now, before the pool exists */
+        { int lane_threads = 0;
+          if (qwen_lane_split_prepare(&lane_threads)) threads = lane_threads; }
 #else
         fprintf(stderr, "--cpu-mask is only supported on Linux\n");
         return 2;

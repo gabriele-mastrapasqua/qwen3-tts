@@ -325,7 +325,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_FUSED_RESIDUAL", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
-    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
+    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
     /* server, admission and request batching */
     "QWEN_ADMIT_M1", "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_SERVER_STRICT",
@@ -9020,6 +9020,15 @@ void qwen_exec_budget_engine_owned(const char *who) {
 }
 
 static void sd_pool_run(void (*fn)(void *), void *ctx) {
+    if (qwen_lane_thread_here()) {
+        /* Decoder lane: the lane team, through the redirect in qwen_parallel(); never the
+         * engine pool, never the private sdp_ team. */
+        int lt = qwen_lane_team_size();
+        if (lt <= 1 || qwen_parallel_active()) { fn(ctx); return; }
+        sd_gcd_job_t j = { fn, ctx };
+        qwen_parallel((size_t)lt, sd_gcd_task, &j);
+        return;
+    }
     int nt = sd_pool_threads();
     if (nt < 1) nt = 1;
     if (nt == 1) { fn(ctx); return; }

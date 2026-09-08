@@ -2833,6 +2833,8 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             if (sched_setaffinity(0, sizeof(set), &set) != 0) perror("sched_setaffinity");
             qwen_threadpool_after_fork();
             qwen_costmap_after_fork();
+            { int lane_threads = threads_per;
+              if (qwen_lane_split_prepare(&lane_threads)) threads_per = lane_threads; }
             qwen_set_threads(threads_per);
             /* Print the mask that was actually SET, not the slice indices: on an SMT host
              * those are no longer the same thing, and the mask is what a run manifest needs. */

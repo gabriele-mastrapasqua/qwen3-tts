@@ -542,6 +542,22 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
                      : "decoder raises its own worker team");
         row(&feats[n++], "decoder.pool", "-", "-", "QWEN_SD_POOL",
             pool_resolved, pool_reason);
+        {
+            const char *lm_step = "", *lm_dec = "";
+            qwen_lane_masks(&lm_step, &lm_dec);
+            static char lane_reason[256];
+            if (lm_dec && lm_dec[0])
+                snprintf(lane_reason, sizeof lane_reason,
+                         "step cpus %s (engine pool) · decoder cpus %s (private team); one decoder unit "
+                         "in flight per slot, the frame loop never waits for another slot's decode",
+                         lm_step, lm_dec);
+            else
+                snprintf(lane_reason, sizeof lane_reason,
+                         "off: the decoder runs inline on the frame loop (QWEN_SD_LANE_SPLIT=N reserves the "
+                         "last N cpus of the worker mask for a private decoder team)");
+            row(&feats[n++], "decoder.lane", "yes", "-", "QWEN_SD_LANE_SPLIT",
+                (lm_dec && lm_dec[0]) ? "ON" : "OFF", lane_reason);
+        }
         row(&feats[n++], "pool.nested_dispatch", "-", "-", NULL,
             onoff(qwen_pool_nested_dispatch_ok()),
             qwen_pool_nested_dispatch_ok() ? "a task on the pool may dispatch again"

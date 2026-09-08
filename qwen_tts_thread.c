@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1   /* sched_{get,set}affinity, CPU_SET, pthread_setaffinity_np (decoder lane) */
+#endif
 /* qwen_tts_thread.c - Cross-OS parallel-for */
 #include "qwen_tts_thread.h"
 #if defined(__linux__)
@@ -96,6 +99,15 @@ int qwen_pool_priority_ok(void) { return 0; }
  * of the first.  Reporting 0 here (as this did) was safe but oversubscribed. */
 int qwen_parallel_active(void) { return g_qp_depth > 0; }
 void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
+
+/* no decoder lane on this backend */
+int  qwen_lane_split_prepare(int *engine_threads) { (void)engine_threads; return 0; }
+int  qwen_lane_team_start(void) { return 0; }
+void qwen_lane_team_stop(void) {}
+int  qwen_lane_team_size(void) { return 0; }
+void qwen_lane_thread_join(void) {}
+int  qwen_lane_thread_here(void) { return 0; }
+void qwen_lane_masks(const char **step, const char **dec) { if (step) *step = ""; if (dec) *dec = ""; }
 /* 0 = this backend cannot hold a fixed team of workers inside a spin barrier, so the
  * persistent regions stay off here.  It is a capability answer, not a thread count. */
 int qwen_parallel_team(void) { return 0; }
@@ -235,6 +247,15 @@ int qwen_pool_priority_ok(void) { return 0; }
 int qwen_parallel_active(void) { return g_qp_depth > 0; }
 void qwen_parallel_set_low_until(double until_ms) { (void)until_ms; }
 int qwen_parallel_team(void) { return 0; }
+/* no decoder lane on this backend */
+int  qwen_lane_split_prepare(int *engine_threads) { (void)engine_threads; return 0; }
+int  qwen_lane_team_start(void) { return 0; }
+void qwen_lane_team_stop(void) {}
+int  qwen_lane_team_size(void) { return 0; }
+void qwen_lane_thread_join(void) {}
+int  qwen_lane_thread_here(void) { return 0; }
+void qwen_lane_masks(const char **step, const char **dec) { if (step) *step = ""; if (dec) *dec = ""; }
+
 
 #else
 
@@ -490,8 +511,14 @@ void qwen_threadpool_start(int n_threads) {
     if (created == 0) { free(P.threads); free(P.wargs); P.threads = NULL; P.wargs = NULL; }
 }
 
+static __thread int g_lane_tls = 0;
+static void lane_parallel(size_t nt, qwen_task_fn fn, void *ctx);
+
 void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     if (nt == 0) return;
+    /* The decoder lane never reaches the engine pool: everything its thread dispatches
+     * (conv panels, snake rows, SGEMM slices, im2col, bf16 matmat) runs on the lane team. */
+    if (g_lane_tls) { lane_parallel(nt, fn, ctx); return; }
     if (!g_inited || P.nworkers == 0 || nt == 1) {
         PS_INC(ps_serial);
         for (size_t i = 0; i < nt; i++) fn(i, nt, ctx);
@@ -578,6 +605,208 @@ int qwen_parallel_team(void) {
 int qwen_pool_nested_dispatch_ok(void) { return 0; }
 int qwen_pool_concurrent_submit_ok(void) { return 1; }
 int qwen_pool_priority_ok(void) { return 1; }
+
+/* ---------------------------------------------------------------------------------------
+ * Decoder lane (QWEN_SD_LANE_SPLIT=N).
+ *
+ * One worker = one cache domain.  The Talker/CP weight stream saturates that domain at two
+ * to four threads; the per-item speech decoder is compute/glue-bound and, inline, it
+ * serializes every other slot's step behind it.  The lane gives the decoder its own team on
+ * the LAST N cpus of the worker's mask and confines the engine pool to the rest.  The lane
+ * team is a plain generation/spin/park team like P, with its own submit lock; the redirect
+ * in qwen_parallel() is the single choke point that keeps lane work off P.submit_mtx.
+ * ------------------------------------------------------------------------------------- */
+#if defined(__linux__)
+#include <sched.h>
+#endif
+#define QWEN_LANE_MAX 64
+static struct {
+    pthread_t threads[QWEN_LANE_MAX];
+    qwen_worker_arg_t wargs[QWEN_LANE_MAX];
+    int nworkers, started, dec_cpus, step_cpus, prepared;
+    pthread_mutex_t submit_mtx, mtx;
+    pthread_cond_t wake, complete;
+    qwen_job_t *job;
+    _Atomic unsigned long generation;
+    _Atomic int completed;
+    int sleeping, main_sleeping;
+    _Atomic int stop;
+#if defined(__linux__)
+    cpu_set_t step_set, dec_set;
+#endif
+    char step_list[160], dec_list[160];
+} L;
+
+static void lane_list(const int *cpus, int n, char *out, size_t cap) {
+    size_t o = 0; out[0] = 0;
+    for (int i = 0; i < n && o + 8 < cap; ) {
+        int j = i;
+        while (j + 1 < n && cpus[j + 1] == cpus[j] + 1) j++;
+        if (j > i) o += (size_t)snprintf(out + o, cap - o, "%s%d-%d", o ? "," : "", cpus[i], cpus[j]);
+        else       o += (size_t)snprintf(out + o, cap - o, "%s%d", o ? "," : "", cpus[i]);
+        i = j + 1;
+    }
+}
+
+int qwen_lane_split_prepare(int *engine_threads) {
+#if defined(__linux__)
+    const char *e = getenv("QWEN_SD_LANE_SPLIT");
+    int dec = e ? atoi(e) : 0;
+    if (dec <= 0) return 0;
+    cpu_set_t cur; CPU_ZERO(&cur);
+    if (sched_getaffinity(0, sizeof cur, &cur) != 0) { perror("lane: sched_getaffinity"); return 0; }
+    int cpus[CPU_SETSIZE]; int n = 0;
+    for (int c = 0; c < CPU_SETSIZE; c++) if (CPU_ISSET(c, &cur)) cpus[n++] = c;
+    if (dec >= n) {
+        fprintf(stderr, "[lane] QWEN_SD_LANE_SPLIT=%d but the worker mask has %d cpus: split DISABLED "
+                        "(the engine needs at least one cpu)\n", dec, n);
+        return 0;
+    }
+    if (dec > QWEN_LANE_MAX) dec = QWEN_LANE_MAX;
+    CPU_ZERO(&L.step_set); CPU_ZERO(&L.dec_set);
+    for (int i = 0; i < n - dec; i++) CPU_SET(cpus[i], &L.step_set);
+    for (int i = n - dec; i < n; i++) CPU_SET(cpus[i], &L.dec_set);
+    lane_list(cpus, n - dec, L.step_list, sizeof L.step_list);
+    lane_list(cpus + (n - dec), dec, L.dec_list, sizeof L.dec_list);
+    /* pthreads inherit the creating thread's mask: confine this (engine) thread now, before
+     * qwen_set_threads() spawns the pool. */
+    if (sched_setaffinity(0, sizeof L.step_set, &L.step_set) != 0) { perror("lane: sched_setaffinity(step)"); return 0; }
+    L.step_cpus = n - dec; L.dec_cpus = dec; L.prepared = 1;
+    if (engine_threads) *engine_threads = n - dec;
+    fprintf(stderr, "[lane] split prepared: step cpus %s (%d, engine pool) · decoder cpus %s (%d, private team)\n",
+            L.step_list, L.step_cpus, L.dec_list, L.dec_cpus);
+    return 1;
+#else
+    (void)engine_threads;
+    return 0;
+#endif
+}
+
+static void *lane_worker_main(void *arg) {
+    qwen_ftz_on();
+    const qwen_worker_arg_t *wa = (const qwen_worker_arg_t *)arg;
+    { char name[16]; snprintf(name, sizeof name, "sd-lane-%d", wa->idx);
+#if defined(__linux__)
+      prctl(PR_SET_NAME, name, 0, 0, 0);
+      pthread_setaffinity_np(pthread_self(), sizeof L.dec_set, &L.dec_set);
+#endif
+    }
+    g_lane_tls = 1;
+    const int my_idx = wa->idx;
+    unsigned long seen = wa->seen0;
+    for (;;) {
+        unsigned long gw = atomic_load_explicit(&L.generation, memory_order_acquire);
+        int budget = qwen_pool_spin();
+        while (budget-- > 0 && !L.stop && !(gw != seen && QWEN_GW_NEED(gw) > my_idx)) {
+            qwen_cpu_relax();
+            gw = atomic_load_explicit(&L.generation, memory_order_acquire);
+        }
+        if (!L.stop && !(gw != seen && QWEN_GW_NEED(gw) > my_idx)) {
+            pthread_mutex_lock(&L.mtx);
+            L.sleeping++;
+            for (;;) {
+                gw = atomic_load_explicit(&L.generation, memory_order_relaxed);
+                if (L.stop || (gw != seen && QWEN_GW_NEED(gw) > my_idx)) break;
+                pthread_cond_wait(&L.wake, &L.mtx);
+            }
+            L.sleeping--;
+            pthread_mutex_unlock(&L.mtx);
+        }
+        if (L.stop) break;
+        seen = atomic_load_explicit(&L.generation, memory_order_acquire);
+        const int need = QWEN_GW_NEED(seen);
+        qwen_job_t *job = L.job;
+        if (job && my_idx < need) {
+            run_chunks(job);
+            if (atomic_fetch_add_explicit(&L.completed, 1, memory_order_acq_rel) + 1 == need) {
+                pthread_mutex_lock(&L.mtx);
+                if (L.main_sleeping) pthread_cond_signal(&L.complete);
+                pthread_mutex_unlock(&L.mtx);
+            }
+        }
+    }
+    return NULL;
+}
+
+int qwen_lane_team_start(void) {
+    if (!L.prepared) return 0;
+    if (L.started) return L.nworkers + 1;
+    pthread_mutex_init(&L.submit_mtx, NULL); pthread_mutex_init(&L.mtx, NULL);
+    pthread_cond_init(&L.wake, NULL); pthread_cond_init(&L.complete, NULL);
+    atomic_store(&L.stop, 0);
+    int want = L.dec_cpus - 1;
+    unsigned long gen0 = atomic_load_explicit(&L.generation, memory_order_acquire);
+    L.nworkers = 0;
+    for (int i = 0; i < want; i++) {
+        L.wargs[i].seen0 = gen0; L.wargs[i].idx = i;
+        if (pthread_create(&L.threads[i], NULL, lane_worker_main, &L.wargs[i]) != 0) break;
+        L.nworkers++;
+    }
+    L.started = 1;
+    return L.nworkers + 1;
+}
+
+void qwen_lane_team_stop(void) {
+    if (!L.started) return;
+    atomic_store(&L.stop, 1);
+    pthread_mutex_lock(&L.mtx);
+    atomic_store_explicit(&L.generation,
+        QWEN_GW_MAKE(QWEN_GW_GEN(atomic_load(&L.generation)) + 1, 0), memory_order_release);
+    pthread_cond_broadcast(&L.wake);
+    pthread_mutex_unlock(&L.mtx);
+    for (int i = 0; i < L.nworkers; i++) pthread_join(L.threads[i], NULL);
+    L.nworkers = 0; L.started = 0;
+}
+
+int  qwen_lane_team_size(void) { return L.started ? L.nworkers + 1 : 0; }
+int  qwen_lane_thread_here(void) { return g_lane_tls; }
+void qwen_lane_thread_join(void) {
+    g_lane_tls = 1;
+#if defined(__linux__)
+    if (L.prepared) pthread_setaffinity_np(pthread_self(), sizeof L.dec_set, &L.dec_set);
+#endif
+}
+void qwen_lane_masks(const char **step, const char **dec) {
+    if (step) *step = L.prepared ? L.step_list : "";
+    if (dec)  *dec  = L.prepared ? L.dec_list  : "";
+}
+
+static void lane_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
+    if (!L.started || L.nworkers == 0 || nt == 1 || g_qp_depth > 0) {
+        for (size_t i = 0; i < nt; i++) fn(i, nt, ctx);   /* nested inside a lane task: inline */
+        return;
+    }
+    qwen_job_t job;
+    job.fn = fn; job.ctx = ctx; job.nt = nt; job.tag = g_qwen_tls_tag;
+    atomic_init(&job.next, 0);
+    pthread_mutex_lock(&L.submit_mtx);
+    int need = (int)nt - 1;
+    if (need > L.nworkers) need = L.nworkers;
+    if (need < 0) need = 0;
+    L.job = &job;
+    atomic_store_explicit(&L.completed, 0, memory_order_relaxed);
+    pthread_mutex_lock(&L.mtx);
+    {
+        unsigned long gw = atomic_load_explicit(&L.generation, memory_order_relaxed);
+        atomic_store_explicit(&L.generation, QWEN_GW_MAKE(QWEN_GW_GEN(gw) + 1, need), memory_order_release);
+    }
+    if (L.sleeping > 0) pthread_cond_broadcast(&L.wake);
+    pthread_mutex_unlock(&L.mtx);
+    run_chunks(&job);
+    int budget = qwen_pool_spin();
+    while (budget-- > 0 && atomic_load_explicit(&L.completed, memory_order_acquire) != need)
+        qwen_cpu_relax();
+    if (atomic_load_explicit(&L.completed, memory_order_acquire) != need) {
+        pthread_mutex_lock(&L.mtx);
+        L.main_sleeping = 1;
+        while (atomic_load_explicit(&L.completed, memory_order_relaxed) != need)
+            pthread_cond_wait(&L.complete, &L.mtx);
+        L.main_sleeping = 0;
+        pthread_mutex_unlock(&L.mtx);
+    }
+    L.job = NULL;
+    pthread_mutex_unlock(&L.submit_mtx);
+}
 
 #endif
 

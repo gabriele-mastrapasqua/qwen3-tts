@@ -107,6 +107,7 @@
           "enum": [
             "amx-product",
             "vnni-product",
+            "vnni-bf16-product",
             "arm-product",
             "common-control"
           ]

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "profile": {
-    "id": "vnni-product",
-    "description": "Operational x86 AVX-512/VNNI product lane with explicit per-item decoder fallback.",
+    "id": "vnni-bf16-product",
+    "description": "Operational x86 AVX-512 VNNI + native BF16 product lane: INT8 VNNI Talker/CP, per-item INT8 VNNI decoder, native AVX-512 BF16 prefill. The vnni-product lane forces f32 prefill and on a BF16-capable CPU (Zen5 c8a) that costs ~600 ms per admission instead of ~58 (TTFA p95 0.7-2.6 s, 2026-09-09): a backend-selection defect, not an architecture result.",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
@@ -15,9 +15,8 @@
     }
   },
   "parity": {
-    "lane": "vnni-product",
+    "lane": "vnni-bf16-product",
     "isa_classes": [
-      "x86_avx512vnni",
       "x86_avx512bf16"
     ],
     "decoder": {
@@ -30,7 +29,7 @@
     },
     "backends": {
       "talker_cp": "vnni",
-      "prefill": "f32",
+      "prefill": "bf16-native",
       "q4": "vnni"
     },
     "features": {
@@ -62,12 +61,12 @@
     "physical_cores": "unspecified",
     "threads_per_core": "unspecified",
     "numa_nodes": "unspecified",
-    "notes": "No AMX-only request is allowed in this lane."
+    "notes": "No AMX-only request is allowed in this lane; native BF16 prefill is required and gated by --dispatch-map talker.prefill.matmat_bf16=ON."
   },
   "build": {
-    "target": "SIMD=avx512vnni",
+    "target": "SIMD=avx512bf16",
     "requirements": {
-      "isa": "AVX-512 VNNI runtime support; AVX-512 BF16 is not required by this lane",
+      "isa": "AVX-512 VNNI and AVX-512 BF16 runtime support (avx512_bf16 in /proc/cpuinfo); the prefill runs on the native bf16 matmat",
       "decoder": "per-item INT8 VNNI decoder leaf"
     }
   },
@@ -183,8 +182,9 @@
         "why": "retain VNNI activation quantization"
       },
       "QWEN_NO_BF16DOT": {
-        "value": "1",
-        "why": "make the no-BF16 product policy explicit"
+        "value": "0",
+        "why": "this lane claims the native BF16 dot/matmat; the VNNI-only policy lives in vnni-product",
+        "revert": "QWEN_NO_BF16DOT=1"
       },
       "QWEN_VNNI_MIN_B": {
         "value": "2",
@@ -248,8 +248,9 @@
         "why": "same server semantics as AMX product"
       },
       "QWEN_PREFILL_MATMAT": {
-        "value": "0",
-        "why": "this lane intentionally does not claim native AVX-512 BF16 prefill"
+        "value": "1",
+        "why": "native AVX-512 BF16 prefill where the CPU has avx512_bf16: measured admission ~58 ms vs ~600 ms on the f32 BLAS fallback (c8a.8xlarge 2026-09-09)",
+        "revert": "QWEN_PREFILL_MATMAT=0"
       },
       "QWEN_Q4_NAIVE": {
         "value": "0",
@@ -320,8 +321,9 @@
         "why": "same official known-text serving layout as AMX; ICL/clone and live incremental text remain outside this lane"
       },
       "QWEN_NO_BF16_MATMUL": {
-        "value": "1",
-        "why": "prevent an accidental BF16-prefill interpretation in a VNNI-only build"
+        "value": "0",
+        "why": "native BF16 matmat is the prefill backend of this lane",
+        "revert": "QWEN_NO_BF16_MATMUL=1"
       }
     }
   },
@@ -334,6 +336,6 @@
     "status": "unqualified",
     "workload": "Operational lane contract; no new hardware result is claimed by this file.",
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
-    "notes": "The per-item decoder fallback is intentional and must be recorded, never mistaken for ragged parity."
+    "notes": "The per-item decoder fallback is intentional and must be recorded, never mistaken for ragged parity. Derived from vnni-product on 2026-09-09 after the Turin step-6 screen showed the f32 prefill pin invalidating TTFA/TOTAL; steady-state STREAM was within 0.02-0.05 of the provisional profile."
   }
 }

@@ -32,6 +32,7 @@ not qualification claims:
 |---|---|---|
 | `amx-product` | best current AMX implementation | ragged Design-D INT8; AMX/fused requested |
 | `vnni-product` | best current VNNI implementation | per-item INT8 VNNI; Design-D is an explicit valid fallback |
+| `vnni-bf16-product` | VNNI lane for CPUs with native AVX-512 BF16 (Zen5, SPR+): same as `vnni-product` plus native bf16 prefill | `vnni-product` pins f32 prefill, which on a BF16 CPU costs ~600 ms per admission (Turin 2026-09-09); QWEN_POOL_SPIN=65536 measured on c8a.8xlarge |
 | `arm-product` | best current KleidiAI implementation | per-item INT8 DOTPROD; KAI covers generic Talker/CP/Q4 |
 | `common-control` | same serving/decoder shape across ISAs | `QWEN_DECODER_BATCH=0`, per-item INT8 |
 

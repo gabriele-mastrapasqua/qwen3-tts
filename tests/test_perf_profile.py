@@ -71,7 +71,7 @@ check("resolved precision carries --int8", "--int8" in argv)
 check("server-env is comma separated",
       "," in P.server_env(prof) and " " not in P.server_env(prof), P.server_env(prof))
 
-for lane in ("amx-product", "vnni-product", "arm-product", "common-control"):
+for lane in ("amx-product", "vnni-product", "vnni-bf16-product", "arm-product", "common-control"):
     lane_prof, _ = P.load(lane)
     lane_env = P.environ(lane_prof)
     check(f"{lane} pins the known-text streaming layout",
@@ -103,3 +103,13 @@ os.unlink(silent)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'all checks passed'}")
 sys.exit(1 if FAILURES else 0)
+
+# vnni-bf16-product: the VNNI lane for a CPU with native AVX-512 BF16 must claim the bf16 prefill
+# (the f32 pin of vnni-product cost ~600 ms per admission on Zen5, 2026-09-09) and the measured spin.
+bf16_prof, _ = P.load("vnni-bf16-product")
+bf16_env = P.environ(bf16_prof)
+check("vnni-bf16-product enables the native bf16 prefill",
+      bf16_env.get("QWEN_PREFILL_MATMAT") == "1" and bf16_env.get("QWEN_NO_BF16_MATMUL") == "0" and bf16_env.get("QWEN_NO_BF16DOT") == "0", bf16_env)
+check("vnni-bf16-product declares the bf16-native prefill backend", bf16_prof["parity"]["backends"]["prefill"] == "bf16-native")
+check("VNNI product lanes carry the measured Turin spin budget",
+      bf16_env.get("QWEN_POOL_SPIN") == "65536" and P.environ(P.load("vnni-product")[0]).get("QWEN_POOL_SPIN") == "65536")
