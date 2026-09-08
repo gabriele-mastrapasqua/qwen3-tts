@@ -362,13 +362,14 @@ The analyzer reports three separate decisions:
 `SOAK RESULT: PARTIAL` is intentional: it means the run is useful for stability, but latency
 drift was not scientifically assessable. The default command does not fail for that case;
 add `--strict-kpi` through `SOAK_ARGS` when a pipeline must reject an unassessed latency KPI.
-Queue-full/queue-timeout counters and server-side request timeouts are also recorded and fail
-the run. The analyzer fails only on request errors, resource growth, those timeout/rejection
-counters, or a measured KPI regression.
+Intentional fail-fast `503` responses are recorded separately as admission outcomes and do
+not fail the run; queue timeouts and server-side request timeouts still do. The analyzer
+fails only on request errors, resource growth, those timeout counters, or a measured KPI
+regression.
 
-Per-class p95 has a separate evidence threshold (`--min-per-class-p95`, default 20) because
-with four or five observations the p95 is effectively the maximum and one scheduling or text
-outlier can look like a regression. A short soak may therefore show
+Per-class p50 and p95 have separate evidence thresholds (`--min-per-class-p50`, default 5;
+`--min-per-class-p95`, default 20) because with four or five observations the percentile is
+effectively the maximum and one scheduling or text outlier can look like a regression. A short soak may therefore show
 `PER-CLASS KPI: <class>=PARTIAL` while pooled latency and resource checks pass. That is not a
 model failure. To assess per-class tails, use larger comparison windows and a longer run, for
 example `--window-s 300 --min-per-class 5 --min-per-class-p95 15` for a 15–30 minute soak.

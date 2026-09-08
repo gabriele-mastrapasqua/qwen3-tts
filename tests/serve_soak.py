@@ -554,6 +554,7 @@ def main():
     parser.add_argument("--window-s", type=float, default=60.0)
     parser.add_argument("--min-per-window", type=int, default=5)
     parser.add_argument("--min-per-class", type=int, default=3)
+    parser.add_argument("--min-per-class-p50", type=int, default=5)
     parser.add_argument("--min-per-class-p95", type=int, default=20)
     parser.add_argument("--min-windows", type=int, default=3)
     parser.add_argument("--max-mix-distance", type=float, default=0.20)
@@ -575,6 +576,7 @@ def main():
     if args.warmup_s < 0 or args.window_s <= 0:
         parser.error("--warmup-s must be non-negative and --window-s must be positive")
     if (args.min_per_window < 1 or args.min_per_class < 1 or
+            args.min_per_class_p50 < 1 or
             args.min_per_class_p95 < 1 or args.min_windows < 1):
         parser.error("minimum sample and window counts must be positive")
     if args.max_mix_distance < 0 or args.max_ttfa_drift < 0 or args.max_stream_drift < 0:
@@ -651,6 +653,7 @@ def main():
             "window_s": args.window_s,
             "min_per_window": args.min_per_window,
             "min_per_class": args.min_per_class,
+            "min_per_class_p50": args.min_per_class_p50,
             "min_per_class_p95": args.min_per_class_p95,
             "min_windows": args.min_windows,
             "max_mix_distance": args.max_mix_distance,
@@ -760,6 +763,7 @@ def main():
             "--window-s", str(args.window_s),
             "--min-per-window", str(args.min_per_window),
             "--min-per-class", str(args.min_per_class),
+            "--min-per-class-p50", str(args.min_per_class_p50),
             "--min-per-class-p95", str(args.min_per_class_p95),
             "--min-windows", str(args.min_windows),
             "--max-mix-distance", str(args.max_mix_distance),

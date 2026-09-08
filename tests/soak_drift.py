@@ -337,6 +337,8 @@ def analyze(directory, args):
 
     class_results = {}
     classes = sorted({row["class"] for row in usable})
+    min_per_class_p50 = getattr(args, "min_per_class_p50",
+                                max(args.min_per_class, 5))
     min_per_class_p95 = getattr(args, "min_per_class_p95", args.min_per_class)
     for cls in classes:
         class_windows = []
@@ -354,7 +356,7 @@ def analyze(directory, args):
             unassessed = []
             for name, key, limit in drift_pairs(args, has_ttfb):
                 quantile = 50 if "p50" in name else 95
-                required = min_per_class_p95 if quantile == 95 else args.min_per_class
+                required = min_per_class_p95 if quantile == 95 else min_per_class_p50
                 if len(first_group) < required or len(last_group) < required:
                     unassessed.append(name)
                     comparisons.append({
@@ -485,6 +487,7 @@ def main():
     parser.add_argument("--warmup-s", type=float, default=60.0)
     parser.add_argument("--min-per-window", type=int, default=5)
     parser.add_argument("--min-per-class", type=int, default=3)
+    parser.add_argument("--min-per-class-p50", type=int, default=5)
     parser.add_argument("--min-per-class-p95", type=int, default=20)
     parser.add_argument("--min-windows", type=int, default=3)
     parser.add_argument("--max-mix-distance", type=float, default=0.20)
@@ -494,6 +497,8 @@ def main():
     args = parser.parse_args()
     if args.window_s <= 0 or args.warmup_s < 0:
         parser.error("window and warm-up must be non-negative, with a positive window")
+    if args.min_per_class_p50 < 1:
+        parser.error("--min-per-class-p50 must be positive")
     return analyze(args.directory, args)
 
 
