@@ -142,6 +142,7 @@ def main():
     ap.add_argument("--classes", default="long")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--settle-ms", type=float, default=500.0)
+    ap.add_argument("--established-count", type=int, default=4)
     ap.add_argument("--seed", type=int, default=9100)
     ap.add_argument("--speaker", default="ryan")
     ap.add_argument("--language", default="English")
