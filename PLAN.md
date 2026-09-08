@@ -193,10 +193,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ### P6 Qualification and backend comparison
 
-- [ ] QL-1 Tier B qualification per `.work/professional-streaming-architecture.md` E9;
-      discover the maximum GOOD concurrency with margin; publish GOOD streams per cost unit.
-      Qualification dimensions must include short/medium/long/mixed inputs and
-      long-request arrival scenarios (`.work/post-p2-streaming-research-agenda.md` R8).
+- [x] QL-1 Tier-B C3 qualification completed on GCP C4 highcpu-16: `1x8` is the
+      strongest 8-core point and the corrected pooled SOAK passes, but long-input
+      startup and accepted long-prefill arrival prevent full C3 production qualification;
+      the full-envelope result is NOT QUALIFIED. Detail:
+      `.work/ql1-gcp-c4-highcpu16-c3-full-qualification-20260908.md`.
 - [x] QL-2a Cross-ISA serving parity audit: common server semantics are portable, but
       AMX Design-D/fused ragged decoder execution is not shared by VNNI or Arm; freeze
       a common-control lane plus a separately labelled best-per-ISA lane before spend.
