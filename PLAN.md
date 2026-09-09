@@ -94,17 +94,27 @@ the short/conversational soak tails (today waves 0.82-0.85, soak pooled 0.912, s
 frozen `turin-c8a-32c-vnni-product` control; lever of record: decoder residency down ->
 CP-overlap share down -> sustained tail down. Codex owns implementation; no push unless asked.
 
-- [ ] C12-WIN-1 Fresh post-V2 causal profile on the on-demand host (ranked decoder cost
-      table, CP/Talker with and without overlap) before any runtime change; pick ONE
-      target worth >= 4-6 ms of residency or a material CP-overlap cut.
-- [ ] C12-WIN-2 Phase-aware decoder overlap falsifier (overlap Talker, not CP; bounded
-      unit start delay / coarse yield; q4 units and lane ownership unchanged; no sub-frame units).
-- [ ] C12-WIN-3 Short-class fixed cost: ramp 1,2,4 (control) vs 1,4 (vs 2,4 only inside the
-      TTFA gate); short + conversational playback metrics first. No q8.
-- [ ] C12-WIN-4 Old preparation ideas (direct ConvT/dwconv/input, strip, copy removal) only
-      where the new cost map shows the targeted cost is material; neutral again = closed.
-- [ ] C12-WIN-5 Cheap screen: `QWEN_POOL_SPIN` 4096/8192/16384/65536; Talker and CP at
-      widths 4/5-6/8 with the decoder idle and active; no width promotion without a serving A/B.
+      Review 2026-09-09 (`.work/c12-architecture-review-20260909.md`, read-only): the
+      remaining unit is half f32 BLAS (transformer/convnext/init ~12 ms + convt 8.6 ms,
+      ~330 MB f32 weights per unit, excluded from int8 by construction) plus ~8 ms of
+      copy/calloc glue; closed-loop admission (inline prefill) is the likely short-class
+      tail; width is bounded out; phase-aware placement cannot help at sustained B3.
+- [ ] C12-WIN-1 Zero-code discriminators first (review §11): (a) `QWEN_PREFILL_HELPER=1`
+      10-min C12 soak vs control (short/conv p95, TTFA); (b) `QWEN_COST_MAP=1` +
+      `QWEN_STAGE_TRACE=1` at `--batch-cap 3` (CP sections by overlap flag, overlap share at
+      pinned B3); (c) `QWEN_POOL_SPIN` 4096/16384 vs 65536 short screen. Then the ranked
+      post-V2 cost table and ONE target worth >= 4-6 ms of residency.
+- [ ] C12-WIN-2 "Next RES1_V2": decoder pre-upsample block and convt on bf16/int8 matmat
+      (one GEMM per convt), residual-unit glue removal (split-input v2 kernel, out-of-place
+      snake, residual in the epilogue, no calloc), vectorised final conv — kernel microbench
+      first, then B4 single-CCX A/B on unit time AND CP-in-overlap ms (review §5).
+- [ ] C12-WIN-3 Short-class fixed cost: only after WIN-1(a): ramp 1,2,4 (control) vs 1,4
+      (vs 2,4 only inside the TTFA gate); short + conversational playback metrics. No q8.
+- [ ] C12-WIN-4 Old preparation flags: DIRECT_DWCONV/INPUT, STRIP, FUSED_RESIDUAL are inert
+      on VNNI (AMX-D gated) — closed as flags, re-done as the VNNI glue work of WIN-2;
+      DIRECT_CONVT superseded by the one-GEMM convt.
+- [ ] C12-WIN-5 Phase-aware decoder overlap: paper check only — NO-GO unless WIN-1(b) shows
+      overlap share < 50 % at pinned B3; no asymmetric Talker/CP widths (no mechanism).
 - [ ] C12-WIN-6 Opportunistic B2 lane batching (optional, last): residency of 2 units vs 2
       requests, decoder off the critical path, mailbox bounded, reject on any cadence loss.
 - [ ] C12-WIN-7 Short A/B gate per candidate (control vs one mechanism, repeated short C12
