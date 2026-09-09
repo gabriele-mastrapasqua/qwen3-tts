@@ -69,7 +69,7 @@ Alternatives examined (Mission A):
 | rank | cost | ms | kernel today | class |
 |---|---|---|---|---|
 | 1 | res1 (3 dilated k=7 per block × 4 blocks) | 17.1 | `qwen_conv1d_int8_v2` | compute+bandwidth, already int8 |
-| 2 | pre-upsample block: vq, pre-conv 512→1024, in-proj, 8-layer transformer, out-proj, 2 convnext (pw 1024↔4096), initial conv 1024→1536 | ~12 | **f32 `cblas_sgemm`**, M=4..22, ~255 MB f32 weights per unit ≈ 21 GB/s | **weight-bandwidth bound, f32 by construction** (`qwen_sd_int8_usable` needs in==out<=768, kernels.c:8762) |
+| 2 | pre-upsample block: vq, pre-conv 512→1024, in-proj, 8-layer transformer, out-proj, 2 convnext (pw 1024↔4096), initial conv 1024→1536 | ~12 (cost map of 2026-09-09: transformer region 5.2, the rest inside conv_stack 43.3) | **f32 `cblas_sgemm`**, M=4..22, ~255 MB f32 weights per unit ≈ 21 GB/s | **weight-bandwidth bound, f32 by construction** (`qwen_sd_int8_usable` needs in==out<=768, kernels.c:8762) |
 | 3 | convt ×4 (k=16/10/8/6) | 8.6 | `causal_conv_transpose1d_blas`: k separate sgemms + f32 panel + scalar scatter (speech_decoder.c:785-812), 75 MB f32 weights | bandwidth + glue |
 | 4 | res2 (1x1) | 4.0 | v2 kernel | int8 |
 | 5 | resadd + alloc | 5.0 | memcpy of `signal` into `res`, `calloc` of `c2_out`, separate add pass (2377-2437, 2410) | pure glue, ~4 full passes |

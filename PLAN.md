@@ -99,21 +99,28 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       ~330 MB f32 weights per unit, excluded from int8 by construction) plus ~8 ms of
       copy/calloc glue; closed-loop admission (inline prefill) is the likely short-class
       tail; width is bounded out; phase-aware placement cannot help at sustained B3.
-- [x] C12-WIN-1 Zero-code discriminators (2026-09-09): helper is NO-GO (pooled STREAM
-      p95 0.923 -> 0.915 but TTFA p95 172 -> 683 ms, safe-start 417 -> 922 ms and
-      stall@250 appears); fixed B3 shows 54.9% decoder-overlap wall and CP 22.2 ->
-      36.5 ms median; spin 4096/16384 does not beat the 65536 control. Decoder unit is
-      49.2 ms measured by cost map. Detail: `.work/c12-win-step1-3-20260909.md`.
+- [x] C12-WIN-1 Zero-code discriminators (2026-09-09): helper is NO-GO as an implementation
+      (TTFA p95 172 -> 683 ms, safe-start 417 -> 922 ms, stall@250 appears) but it CONFIRMS
+      the mechanism: with prefill off the loop the short class drops 0.966 -> 0.915 and
+      pooled 0.923 -> 0.915 — inline admission is the short tail, worth ~0.05; fixed B3
+      shows 54.9% decoder-overlap wall and CP 22.2 -> 36.5 ms median; spin 4096/16384 does
+      not beat the 65536 control. Decoder unit 49.2 ms by cost map (conv_stack 43.3,
+      transformer 5.2). Detail: `.work/c12-win-step1-3-20260909.md`.
 - [x] C12-WIN-1a Pre-upsample BF16 diagnostic (2026-09-09): persistent BF16 weights and
       matmat path implemented/default-off. The bounded Turin server screen moved modestly
       (STREAM p95 .842 -> .825), but the same-generation paired audio gate failed
       (`mel_corr=.97890 < .98`) and the non-clean B3 diagnostic did not show lower decoder
       residency or CP overlap cost. Keep BF16 default-off; detail:
       `.work/c12-win-bf16-preup-20260909.md`.
-- [x] C12-WIN-2 Decoder-residency falsifiers closed (2026-09-09): BF16 pre-up,
+- [x] C12-WIN-2 Decoder-residency falsifiers, first round (2026-09-09): BF16 pre-up,
       ConvT one-GEMM, allocation-only glue, and VNNI RES1_V2 split-input were each
-      isolated; no candidate earned a serving A/B. Keep the existing VNNI path as
-      control. Detail: `.work/c12-win-glue-vnni-20260909.md`.
+      isolated; no candidate earned a serving A/B. These are IMPLEMENTATION verdicts:
+      the tested BF16 arm covered the transformer only (5 ms of the unit) with bf16
+      activations; the ConvT arm used a zero-expanded input panel (k× the FLOPs), not the
+      proposed one-GEMM-per-layer on the un-expanded input; the glue arms were two pieces
+      run separately. Untested: weight-only bf16/int8 for the conv_stack f32 weights
+      (convnext pw, initial conv, convt ≈ 190 MB/unit) and the combined glue removal.
+      Forensic audit: `.work/c12-win-forensic-audit-20260909.md`.
 - [x] C12-WIN-2a ConvT one-GEMM falsifier (2026-09-09): exact decoder batch parity passed,
       but the expanded f32 panel made the treatment 14–32% slower across B1–B4/chunk 1–8.
       Rejected and reverted; no server A/B. Detail: `.work/c12-win-convt-one-gemm-20260909.md`.
