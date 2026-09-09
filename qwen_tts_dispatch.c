@@ -362,6 +362,12 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             "opt-in on this ISA (measured slower on the first frame elsewhere)"
 #endif
             );
+        row(&feats[n++], "decoder.res1_v2", yn(qwen_conv1d_int8_v2_available()),
+            yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_RES1_V2",
+            onoff(qwen_sd_res1_v2_active()),
+            qwen_sd_res1_v2_active()
+                ? "direct dilated int8 VNNI conv for the residual convs (per-position activation scale, per-(channel,tap) weight scale; DL-4)"
+                : "opt-in (QWEN_SD_RES1_V2=1); off: the residual convs run on the im2col panel kernel");
         row(&feats[n++], "decoder.mode", "yes", "yes", "QWEN_DECODER_BATCH",
             qwen_sd_decoder_mode(),
             "resolved decoder leaf: ragged AMX only when batch+exact-stream+AMX decoder support all hold; otherwise per-item");
@@ -669,6 +675,10 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
                     qwen_sd_fused_residual_active() ? "true" : "false");
             fprintf(j, "    \"stream_strip_active\": %s,\n",
                     qwen_sd_stream_strip_active() ? "true" : "false");
+            fprintf(j, "    \"res1_v2_active\": %s,\n", qwen_sd_res1_v2_active() ? "true" : "false");
+            { const char *lm_step = "", *lm_dec = ""; qwen_lane_masks(&lm_step, &lm_dec);
+              fprintf(j, "    \"decoder_lane_active\": %s,\n", (lm_dec && lm_dec[0]) ? "true" : "false");
+              fprintf(j, "    \"decoder_lane_elastic\": %s,\n", qwen_lane_elastic() ? "true" : "false"); }
             fprintf(j, "    \"decoder_pool\": ");
             json_str(j, qwen_sd_pool_mode() ? "engine" : "private");
             fprintf(j, ",\n    \"talker_cp_int8_backend\": ");

@@ -398,6 +398,7 @@ int qwen_sd_amx_bf16_active(void);
 int qwen_sd_stream_strip_active(void);
 int qwen_sd_fused_residual_active(void);
 const char *qwen_sd_decoder_mode(void);
+int  qwen_sd_res1_v2_active(void);   /* QWEN_SD_RES1_V2=1 and the kernel is available on this ISA */
 int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
                                       size_t *bytes_out);
 void qwen_sd_amx_int8_free_weights(int8_t *packed);
@@ -482,6 +483,9 @@ void qwen_conv1d_int8(float *out, const float *in,
  * position (one scale per position), weights once per (channel, tap) — no im2col panel.
  * wq [ch][kernel][Cp] s8, sw/wsum [ch][kernel]; Cp = ch rounded up to 64. */
 int  qwen_conv1d_int8_v2_available(void);
+int  qwen_conv1d_int8_v2_cp(int ch);                      /* padded channel count of the DL-4 layout */
+void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
+                              const float *w, int ch, int kernel, int Cp);
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
                          const float *bias, int ch, int length, int kernel, int dilation, int Cp);

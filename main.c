@@ -1226,6 +1226,11 @@ int main(int argc, char **argv) {
     }
 
     if (run_dispatch_map) {
+        /* A profile preflight probes the decoder lane the way a prefork worker would: split
+         * the mask this process inherited (a --cpu-mask, or a taskset) before the pool exists,
+         * so the decoder.lane row resolves instead of reading OFF in every probe. */
+        if (getenv("QWEN_SD_LANE_SPLIT"))
+            qwen_lane_split_prepare(NULL);
         QWEN_DIAG_INIT_THREADS();
         return qwen_dispatch_map_report(stdout, getenv("QWEN_DISPATCH_JSON"));
     }

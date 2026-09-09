@@ -195,6 +195,12 @@
             },
             "kleidi": {
               "$ref": "#/definitions/featureStatus"
+            },
+            "res1_v2": {
+              "$ref": "#/definitions/featureStatus"
+            },
+            "decoder_lane": {
+              "$ref": "#/definitions/featureStatus"
             }
           },
           "description": "Expected status, or an allowed status set when a common-control profile spans ISAs with different compiled capabilities."

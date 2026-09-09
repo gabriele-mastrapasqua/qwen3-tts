@@ -71,7 +71,7 @@ check("resolved precision carries --int8", "--int8" in argv)
 check("server-env is comma separated",
       "," in P.server_env(prof) and " " not in P.server_env(prof), P.server_env(prof))
 
-for lane in ("amx-product", "vnni-product", "vnni-bf16-product", "arm-product", "common-control"):
+for lane in ("amx-product", "vnni-product", "vnni-bf16-product", "turin-c8a-32c-vnni-product", "arm-product", "common-control"):
     lane_prof, _ = P.load(lane)
     lane_env = P.environ(lane_prof)
     check(f"{lane} pins the known-text streaming layout",

@@ -10168,6 +10168,37 @@ void qwen_conv1d_int8_v2(float *out, const float *in,
 }
 #endif
 
+/* The DL-4 weight layout, one implementation for the decoder and for --self-test:
+ * wq2[m][kk][Cp] with one scale and one weight sum per (m, kk).  The f32 weight is
+ * [out_ch][in_ch][kernel] (kk fastest, the im2col order); tap kk multiplies input position
+ * t - (kernel-1-kk)*dilation.  Cp = qwen_conv1d_int8_v2_cp(ch); the padding lanes are 0. */
+int qwen_conv1d_int8_v2_cp(int ch) { return (ch + 63) & ~63; }
+void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
+                              const float *w, int ch, int kernel, int Cp) {
+    for (int m = 0; m < ch; m++) {
+        const float *row = w + (size_t)m * ch * kernel;
+        for (int kk = 0; kk < kernel; kk++) {
+            float amax = 0.0f;
+            for (int ic = 0; ic < ch; ic++) { float a = fabsf(row[(size_t)ic * kernel + kk]); if (a > amax) amax = a; }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+            int8_t *d = q2 + ((size_t)m * kernel + kk) * Cp;
+            int32_t acc = 0;
+            for (int ic = 0; ic < Cp; ic++) {
+                int v = 0;
+                if (ic < ch) {
+                    float x = row[(size_t)ic * kernel + kk] * inv;
+                    v = (int)(x >= 0 ? x + 0.5f : x - 0.5f);
+                    if (v > 127) v = 127;
+                    if (v < -127) v = -127;
+                }
+                d[ic] = (int8_t)v; acc += v;
+            }
+            sw2[(size_t)m * kernel + kk] = scale;
+            ws2[(size_t)m * kernel + kk] = acc;
+        }
+    }
+}
+
 void qwen_conv1d_int8_design_d(float *out, const float *in,
                                const int8_t *Wq, const float *sw, const int32_t *wsum,
                                const float *bias, const int8_t *Wpack,
@@ -11195,6 +11226,113 @@ int qwen_kernel_selftest(void *out) {
             }
             free(in); free(wf2); free(wq2); free(sw2); free(ws2);
             free(outk); free(colf); free(colq); free(sa2);
+        }
+    }
+
+    if (qwen_conv1d_int8_v2_available()) {
+        /* DL-4 direct dilated conv (QWEN_SD_RES1_V2).  Three contracts per shape and length:
+         *  (a) the kernel equals an integer reference that mirrors its own quantisation
+         *      (per-position activation scale, per-(channel,tap) weight scale) to 1e-5;
+         *  (b) it stays within the quantisation error of the f32 causal conv (a loose gate,
+         *      but a mirrored or shifted tap fails it by two orders of magnitude);
+         *  (c) causality / continuation: output t computed on a window that starts pad
+         *      positions earlier equals the full-sequence output, which is what lets the
+         *      streaming decoder call the conv on a suffix with its left context.
+         * Shapes are the residual convs of the speech decoder (k=7, dilation 1/3/9, and the
+         * 1x1 res2 conv); lengths hit the 4-wide tile tail, a sequence shorter than the
+         * receptive field, one position, and several time blocks across threads. */
+        const int shapes[][3] = { {96, 7, 1}, {192, 7, 3}, {384, 7, 9}, {768, 1, 1}, {96, 7, 9} };
+        const int lengths[] = { 67, 5, 1, 260 };
+        const int nsh = (int)(sizeof(shapes) / sizeof(shapes[0]));
+        const int nln = (int)(sizeof(lengths) / sizeof(lengths[0]));
+        for (int si = 0; si < nsh; si++) {
+            const int ch = shapes[si][0], kern = shapes[si][1], dil = shapes[si][2];
+            const int K = ch * kern, Cp = qwen_conv1d_int8_v2_cp(ch), pad = (kern - 1) * dil;
+            for (int li = 0; li < nln; li++) {
+                const int L = lengths[li];
+                float   *in   = malloc((size_t)ch * L * sizeof(float));
+                float   *wf   = malloc((size_t)ch * K * sizeof(float));
+                float   *bias = malloc((size_t)ch * sizeof(float));
+                int8_t  *q2   = aligned_malloc((size_t)ch * kern * Cp);
+                float   *sw2  = aligned_malloc((size_t)ch * kern * sizeof(float));
+                int32_t *ws2  = aligned_malloc((size_t)ch * kern * sizeof(int32_t));
+                float   *outk = malloc((size_t)ch * L * sizeof(float));
+                float   *outw = malloc((size_t)ch * L * sizeof(float));
+                int8_t  *qa   = malloc((size_t)ch * L);          /* activation q per (ic, pos) */
+                float   *sa   = malloc((size_t)L * sizeof(float)); /* activation scale per pos */
+                if (!in || !wf || !bias || !q2 || !sw2 || !ws2 || !outk || !outw || !qa || !sa) {
+                    fprintf(f, "  [conv1d_int8_v2 ch=%d k=%d] OOM, skipped\n", ch, kern);
+                } else {
+                    for (size_t i = 0; i < (size_t)ch * L; i++) in[i] = NEXT_F;
+                    for (size_t i = 0; i < (size_t)ch * K; i++) wf[i] = NEXT_F;
+                    for (int m = 0; m < ch; m++) bias[m] = 0.25f * NEXT_F;
+                    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, ch, kern, Cp);
+                    qwen_conv1d_int8_v2(outk, in, q2, sw2, ws2, bias, ch, L, kern, dil, Cp);
+                    /* the kernel's own activation quantisation, per position */
+                    for (int p = 0; p < L; p++) {
+                        float amax = 0.0f;
+                        for (int ic = 0; ic < ch; ic++) { float a = fabsf(in[(size_t)ic * L + p]); if (a > amax) amax = a; }
+                        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+                        sa[p] = scale;
+                        for (int ic = 0; ic < ch; ic++) {
+                            int v = (int)lrintf(in[(size_t)ic * L + p] * inv);
+                            if (v > 127) v = 127; if (v < -127) v = -127;
+                            qa[(size_t)ic * L + p] = (int8_t)v;
+                        }
+                    }
+                    double an = 0.0, ad = 0.0, bn = 0.0, bd = 0.0; float aworst = 0.0f;
+                    for (int t = 0; t < L; t++) {
+                        for (int m = 0; m < ch; m++) {
+                            float acc = 0.0f; double f32 = 0.0;
+                            for (int kk = 0; kk < kern; kk++) {
+                                const int pos = t - (kern - 1 - kk) * dil;
+                                if (pos < 0) continue;
+                                const int8_t *wr = q2 + ((size_t)m * kern + kk) * Cp;
+                                int32_t ai = 0;
+                                for (int ic = 0; ic < ch; ic++) {
+                                    ai += (int32_t)wr[ic] * (int32_t)qa[(size_t)ic * L + pos];
+                                    f32 += (double)wf[(size_t)m * K + (size_t)ic * kern + kk] * in[(size_t)ic * L + pos];
+                                }
+                                acc += (float)ai * (sa[pos] * sw2[(size_t)m * kern + kk]);
+                            }
+                            const float got = outk[(size_t)m * L + t];
+                            const float da = got - (acc + bias[m]);
+                            const double db = (double)got - (f32 + bias[m]);
+                            if (fabsf(da) > aworst) aworst = fabsf(da);
+                            an += (double)da * da; ad += (double)(acc + bias[m]) * (acc + bias[m]);
+                            bn += db * db; bd += (f32 + bias[m]) * (f32 + bias[m]);
+                        }
+                    }
+                    const double arel = ad > 0 ? sqrt(an / ad) : 0.0, brel = bd > 0 ? sqrt(bn / bd) : 0.0;
+                    /* (c) continuation: a window that starts pad positions before t0 */
+                    double cworst = -1.0;
+                    if (L > pad + 8) {
+                        const int t0 = L / 2, s = t0 - pad, Lw = L - s;
+                        float *inw = malloc((size_t)ch * Lw * sizeof(float));
+                        if (inw) {
+                            for (int ic = 0; ic < ch; ic++)
+                                memcpy(inw + (size_t)ic * Lw, in + (size_t)ic * L + s, (size_t)Lw * sizeof(float));
+                            qwen_conv1d_int8_v2(outw, inw, q2, sw2, ws2, bias, ch, Lw, kern, dil, Cp);
+                            cworst = 0.0;
+                            for (int m = 0; m < ch; m++)
+                                for (int t = t0; t < L; t++) {
+                                    double d = fabs((double)outw[(size_t)m * Lw + (t - s)] - outk[(size_t)m * L + t]);
+                                    double ref = fabs((double)outk[(size_t)m * L + t]) + 1e-3;
+                                    if (d / ref > cworst) cworst = d / ref;
+                                }
+                            free(inw);
+                        }
+                    }
+                    const int ok_a = arel < 1e-5, ok_b = brel < 3e-2, ok_c = cworst < 1e-5;
+                    fprintf(f, "  [conv1d_int8_v2 ch=%3d k=%d dil=%d L=%3d] vs own-quant ref rel_L2=%.2e max_abs=%.2e | vs f32 conv rel_L2=%.2e | continuation %s  %s\n",
+                            ch, kern, dil, L, arel, aworst, brel,
+                            cworst < 0 ? "n/a" : (ok_c ? "exact" : "MISMATCH"),
+                            (ok_a && ok_b && ok_c) ? "PASS" : "FAIL");
+                    if (!(ok_a && ok_b && ok_c)) failures++;
+                }
+                free(in); free(wf); free(bias); free(q2); free(sw2); free(ws2);
+                free(outk); free(outw); free(qa); free(sa);
+            }
         }
     }
 

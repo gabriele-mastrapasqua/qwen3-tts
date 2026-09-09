@@ -186,11 +186,20 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
     design = bool(serving.get("design_d_active", False))
     fused = bool(serving.get("fused_residual_active", False))
     kai = bool(serving.get("kleidi_active", False))
+    res1_v2 = bool(serving.get("res1_v2_active", False)) or \
+        features.get("decoder.res1_v2", {}).get("resolved") == "ON"
+    lane = bool(serving.get("decoder_lane_active", False)) or \
+        features.get("decoder.lane", {}).get("resolved") == "ON"
     actual_status = {
         "design_d": resolved_feature_status(features, "decoder.design_d", design),
         "fused_residual": resolved_feature_status(features, "decoder.fused_residual", fused),
         "kleidi": resolved_feature_status(features, "kleidi.enabled", kai),
+        # Optional contracts (DL-4 conv, DL-1/DL-2 decoder lane): checked only when the
+        # profile names them, so the older lanes keep their three-feature contract.
+        "res1_v2": resolved_feature_status(features, "decoder.res1_v2", res1_v2),
+        "decoder_lane": resolved_feature_status(features, "decoder.lane", lane),
     }
+    actual_status = {k: v for k, v in actual_status.items() if k in parity["features"]}
     for name, actual in actual_status.items():
         wanted = parity["features"][name]
         if not status_allowed(wanted, actual):
@@ -252,6 +261,9 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
         "fused_residual_active": fused,
         "design_d_active": design,
         "kai_active": kai,
+        "res1_v2_active": res1_v2,
+        "decoder_lane_active": lane,
+        "decoder_lane_elastic": bool(serving.get("decoder_lane_elastic", False)),
         "fallback_detected": decoder_status == "VALID FALLBACK" or
                              any(v == "VALID FALLBACK" for v in actual_status.values()),
         "fallback_status": decoder_status,
