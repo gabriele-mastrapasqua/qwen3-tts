@@ -5,6 +5,7 @@ import json, os, subprocess, sys, tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import perf_profile as P  # noqa: E402
+import serving_profile as S  # noqa: E402
 
 FAILURES = []
 
@@ -77,6 +78,13 @@ for lane in ("amx-product", "vnni-product", "vnni-bf16-product", "turin-c8a-32c-
     check(f"{lane} pins the known-text streaming layout",
           lane_env.get("QWEN_TTS_STREAM_LAYOUT") == "1",
           f"got {lane_env.get('QWEN_TTS_STREAM_LAYOUT')!r}")
+
+turin, _ = P.load("turin-c8a-32c-vnni-product")
+effective, tunable_errors = S.merge_profile_env(turin, {"QWEN_POOL_SPIN": "4096"})
+check("declared tunable serving override is accepted",
+      not tunable_errors and effective["QWEN_POOL_SPIN"] == "4096", tunable_errors)
+_, fixed_errors = S.merge_profile_env(turin, {"QWEN_STREAM_DECODE_CHUNK": "8"})
+check("pinned serving override remains rejected", bool(fixed_errors), fixed_errors)
 
 readme = open(os.path.join(P.PERF, "README.md")).read()
 for token, why in ("2 workers x 8 threads", "the topology"), ("--int8", "the precision"), \

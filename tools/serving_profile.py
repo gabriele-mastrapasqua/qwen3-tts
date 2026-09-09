@@ -56,6 +56,25 @@ def parse_flags(text):
     return seen
 
 
+def merge_profile_env(prof, overrides):
+    """Apply explicit overrides while preserving the profile parity contract.
+
+    ``parity.tunable_flags`` names host/ISA knobs that a campaign may vary.  The
+    effective value still goes through the engine-owned dispatch and flag checks;
+    all other values pinned by the profile remain immutable.
+    """
+    parity = prof.get("parity") or {}
+    tunable = set(parity.get("tunable_flags", []))
+    base = P.environ(prof)
+    errors = []
+    for key, value in overrides.items():
+        if key in base and base[key] != value and key not in tunable:
+            errors.append("override %s=%s changes the parity profile value %s" %
+                          (key, value, base[key]))
+        base[key] = value
+    return base, errors
+
+
 def feature_index(doc):
     return {row.get("id"): row for row in doc.get("features", [])}
 
@@ -236,7 +255,7 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
         # Include streaming settings injected by perf_profile.environ(), not only the
         # runtime.environment map.  Otherwise decode quantum could drift while the
         # backend contract looked pinned.
-        for key, value in P.environ(prof).items():
+        for key, value in profile_env.items():
             if key.startswith("QWEN_") and flags.get(key) != value:
                 errors.append("engine [FLAGS] %s=%r, profile requested %r" %
                               (key, flags.get(key), value))
@@ -282,6 +301,8 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
             "bf16_backend": bf16,
         },
         "profile_flags": P.environ(prof),
+        "effective_profile_flags": profile_env,
+        "tunable_flags": sorted(parity.get("tunable_flags", [])),
         "profile_forbidden_flags": P.forbidden_env(prof),
         "quality_gate": parity["quality_gate"],
     }
@@ -313,12 +334,8 @@ def preflight(args):
     except ValueError as e:
         print("FAIL: %s" % e, file=sys.stderr)
         return 2
-    base = P.environ(prof)
-    for key, value in overrides.items():
-        if key in base and base[key] != value:
-            errors.append("override %s=%s changes the parity profile value %s" %
-                          (key, value, base[key]))
-        base[key] = value
+    base, override_errors = merge_profile_env(prof, overrides)
+    errors.extend(override_errors)
     for key in P.forbidden_env(prof):
         if key in os.environ and key not in overrides:
             errors.append("%s is declared absent by the profile but is present in the parent environment" % key)
