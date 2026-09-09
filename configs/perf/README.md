@@ -34,6 +34,7 @@ not qualification claims:
 | `vnni-product` | best current VNNI implementation | per-item INT8 VNNI; Design-D is an explicit valid fallback |
 | `vnni-bf16-product` | VNNI lane for CPUs with native AVX-512 BF16 (Zen5, SPR+): same as `vnni-product` plus native bf16 prefill | `vnni-product` pins f32 prefill, which on a BF16 CPU costs ~600 ms per admission (Turin 2026-09-09); QWEN_POOL_SPIN=65536 measured on c8a.8xlarge |
 | `turin-c8a-32c-vnni-product` | the measured Turin product point: `vnni-bf16-product` contract + 4 workers x 8 threads (one per CCX), cap 4, decode quantum 4, elastic decoder lane (`QWEN_SD_LANE_SPLIT=4`, `QWEN_SD_LANE_ELASTIC=1`) and the direct dilated conv (`QWEN_SD_RES1_V2=1`), fail-fast admission | c8a.8xlarge 2026-09-09/10: the inline engine tops out near C8; with the lane + V2 the host screen holds C12 at STREAM p95 0.80-0.81 and C16 at 0.88-0.92 with stall@250 0. The preflight requires `decoder.lane` and `decoder.res1_v2` ON |
+| `turin-c8a-32c-vnni-control` | the same file with `QWEN_SD_RES1_V2=0`: the reference arm of the paired RES1_V2 quality bank and of lane A/Bs | an A/B arm must be a committed, preflighted profile; the strict preflight refuses a shell override that changes a parity value |
 | `arm-product` | best current KleidiAI implementation | per-item INT8 DOTPROD; KAI covers generic Talker/CP/Q4 |
 | `common-control` | same serving/decoder shape across ISAs | `QWEN_DECODER_BATCH=0`, per-item INT8 |
 
