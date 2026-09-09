@@ -210,3 +210,44 @@ decoder unit while it runs next to the CP** — the f32 im2col/ConvT activations
 per-item path. The next falsifier is a decoder unit with a smaller working set (direct
 ConvT / no im2col materialisation, int8 activations, or `res1` on int8 panels that do not
 materialise f32), measured by CP ms during overlap, not by STREAM.
+
+## 9. DL-3 falsifiers: what does NOT move the interference tax (2026-09-10 00:16-00:37)
+
+First-class metric added: `[STAGE] overlap=1` marks iterations that start with a decoder
+unit in flight; the parser splits every stage by (active, overlap). Baseline (elastic 4+4,
+q4, long bank, B4): pure-overlap iterations CP **35.7 ms** vs 23.5 without the decoder (+12,
+i.e. the CP at its pure-DRAM rate, 1.8 GB / 55 GB/s = 33 ms: its L3-resident half is gone);
+Talker 36-40 vs 30.6 inline (+6-10). The tax per overlapped iteration is ~+20 ms; at B4 the
+decoder is in flight 48 % of the loop (units of 60-65 ms per 4 frames on 4 threads, four
+of them per 290 ms quantum).
+
+| arm (all elastic 4+4, one CCX, 1.7B) | CP in overlap (long B4) | STREAM p95 long B4 / fixed B4 | decoder unit (4 frames) | note |
+|---|---|---|---|---|
+| base q4 | 35.7 | 0.895 / 0.987 | 60-65 ms | reference |
+| `QWEN_SD_DIRECT_CONVT/DWCONV/INPUT=1` | 36.3 | 0.889 / 0.981 | same | the existing direct paths: no effect |
+| sub-quantum decode, 1-frame sub-calls (`QWEN_SD_LANE_SUBQ=1`) | 38.2 | 1.475 / 1.517 | 31 ms per frame | live set /4 makes it WORSE: 4x the calls saturate the lane (73 % in flight, mailbox wait 10 ms/frame) |
+| sub-quantum, 2-frame sub-calls | 36.8 | 1.132 / 1.196 | 46 ms per 2 frames | same direction |
+| q8 units (`QWEN_STREAM_DECODE_CHUNK=8`) | 34.2 | **0.864** / 1.025 | 113 ms per 8 frames | passes 0.90 on the long bank but prebuffer 806 ms, stall@250 100 %: the cadence law, not admissible |
+| NTA prefetch of conv weights in the VNNI tile (`QWEN_SD_NTA=1`) | 37.2 | 0.893 / — | same | no effect |
+| lane workers hot during a unit (park only between units) | 35.7 | 0.895 / 0.978 | same | no effect on the unit time |
+| decoder panels sized by the lane team (bug fix, kept) | 35.7 | 0.902 / 0.991 | same | no effect on the unit time |
+
+Reading (MEASURED, HIGH): the interference tax is not the decoder's activation live set,
+not its weight stream's cacheability, not the handoff, not park latency, and not the unit
+size. Whenever the decoder team runs beside the step team on the same CCX, the CP loses its
+L3 residency and the Talker's per-slot working set suffers, by a roughly constant ~20 ms per
+iteration. The only quantity that scales the mean tax is the FRACTION of iterations
+overlapped, which is the decoder's time on its four cores: 15-16 ms per frame there against
+7.6 on eight threads inline. Halving the decoder unit time halves the overlap share and the
+mean tax (≈ −8 ms per iteration at B4 → Talker+CP ≈ 62 ms → B4 ≈ 0.90).
+
+**DL-3 verdict: cache-friendliness tricks are falsified; the lever is decoder kernel
+efficiency on the lane (res1 = 52 % of the unit, at ~5 % of VNNI peak; the panel build is
+~30 % of the conv time; the 2x4 tile re-reads each weight row 32 times per panel).**
+That is the next implementation (DL-4): a res1 path with fewer weight re-reads and no
+separate f32 panel materialisation, measured by decoder unit time on 4 threads and by
+`overlap` share, then STREAM. Not started here.
+
+Code kept from this cycle (all default-off or bug fixes): `overlap` field in `[STAGE]`,
+`QWEN_SD_LANE_SUBQ`, `QWEN_SD_NTA`, hot lane workers during a unit, panel sizing by the lane
+team. Raw runs: `~/bench/lane/dl3*`, `~/bench/lane/c-dl2b-*` on the host.

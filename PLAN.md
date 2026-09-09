@@ -217,7 +217,14 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       the static-partition tax is NOT the cause; the step is slowed ~2x only while the
       decoder unit runs (CP loses L3 residency to the decoder's f32 activations). Next
       lever: the decoder unit's cache footprint, measured by CP ms during overlap.**
-      Detail: `.work/dl1-decoder-lane-split-20260909.md`.
+      DL-3 falsifiers (2026-09-10): sub-quantum decode, direct ConvT/dwconv/input, NTA
+      weight prefetch, hot lane workers, q8 — none moves the CP-in-overlap tax (35-38 ms
+      vs 23.5); q8 reaches long B4 0.864 but at prebuffer 806 ms / stall@250 100 %. The tax
+      is ~+20 ms per overlapped iteration whatever the decoder does; only the overlap
+      share (decoder time on 4 cores, 15-16 ms/frame) scales it. **Next: DL-4 = res1/conv
+      kernel efficiency on the lane (fewer weight re-reads, no separate f32 panel),
+      metric = decoder unit ms on 4 threads and overlap share.** Detail:
+      `.work/dl1-decoder-lane-split-20260909.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving

@@ -2577,6 +2577,7 @@ typedef struct {
     int *slot_codes;          /* lane: per-slot codes buffer, 32 frames x 16 */
     double overlap_ms;        /* time with the width capped (decoder in flight), for the report */
     double overlap_t0;
+    int subq;                 /* QWEN_SD_LANE_SUBQ: decode a unit as sub-calls of this many frames (cache footprint /N) */
 } dec_pool_t;
 
 /* The bounded mailbox: block THIS slot's producer until its unit in flight has completed.
@@ -2646,6 +2647,7 @@ static void *dec_worker_main(void *arg) {
         int _dw_first = 0;
         for (int i = 0; i < ng; i++) if (grp[i]->first) { _dw_first = 1; break; }
         double _dw_t0 = dp->trace ? qwen_mono_ms() : 0.0;
+        if (dp->lane) qwen_lane_unit_active(1);
         if (ng > 1) {
             for (int i = 0; i < ng; i++) {
                 items[i].st = &dp->sstate[grp[i]->slot];
@@ -2661,10 +2663,15 @@ static void *dec_worker_main(void *arg) {
                 free(items[i].audio);
             }
         } else if (j->stream) {
-            if (j->nframes > 0) {
+            /* DL-3: a unit decoded as sub-calls of `subq` frames keeps the decoder's f32
+             * activation live set 1/N of the unit's, so it evicts less of the CP's L3-resident
+             * rows on the step side.  Same slot, same order, same causal tails. */
+            int sub = (dp->lane && dp->subq > 0 && dp->subq < j->nframes) ? dp->subq : j->nframes;
+            for (int off = 0; off < j->nframes; off += sub) {
+                int nf = j->nframes - off < sub ? j->nframes - off : sub;
                 float *aud = NULL; int an = 0;
                 if (qwen_speech_decoder_decode_streaming_st(dp->ctx, &dp->sstate[j->slot],
-                        j->codes, j->nframes, &aud, &an) == 0 && aud && an > 0)
+                        j->codes + (size_t)off * 16, nf, &aud, &an) == 0 && aud && an > 0)
                     dp->sink->on_chunk(dp->sink->ud, j->tag, aud, an);
                 free(aud);
             }
@@ -2695,6 +2702,7 @@ static void *dec_worker_main(void *arg) {
             if (!prealloc) free(g);
         }
         if (dp->lane) {
+            qwen_lane_unit_active(0);
             pthread_mutex_lock(&dp->m);
             dp->queued -= ng;
             if (dp->elastic && dp->queued <= 0 && !dp->head) {
@@ -2871,6 +2879,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         dpool.running = 1; dpool.sink = sink; dpool.sstate = sstate; dpool.busy = dec_busy;
         dpool.lane = lane_team > 0;
         dpool.elastic = dpool.lane && qwen_lane_elastic();
+        { const char *sq = getenv("QWEN_SD_LANE_SUBQ"); dpool.subq = (dpool.lane && sq) ? atoi(sq) : 0; }
         dpool.step_width = qwen_get_threads() - lane_team;   /* the STEP cpus: caller + step_width-1 workers */
         if (dpool.lane) {
             dpool.slot_job = (dec_job_t *)calloc((size_t)B, sizeof(dec_job_t));
@@ -2890,8 +2899,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 if (dpool.elastic)
                     fprintf(stderr, "[serve] decoder LANE ENABLED (ELASTIC): engine pool %d threads on all cpus; while a "
                                     "decoder unit runs on %s (team %d) the engine narrows to %s (%d threads) · "
-                                    "mailbox 1 unit/slot, preallocated, lead <= 1 quantum\n",
-                            qwen_get_threads(), lm_dec, lane_team, lm_step, dpool.step_width);
+                                    "mailbox 1 unit/slot, preallocated, lead <= 1 quantum%s\n",
+                            qwen_get_threads(), lm_dec, lane_team, lm_step, dpool.step_width,
+                            dpool.subq > 0 ? " · units decoded in sub-calls (QWEN_SD_LANE_SUBQ)" : "");
                 else
                     fprintf(stderr, "[serve] decoder LANE ENABLED: step cpus %s (engine pool %d threads) · "
                                     "decoder cpus %s (private team %d) · mailbox 1 unit/slot, lead <= 1 quantum\n",
@@ -3324,6 +3334,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         int st_dec_calls = 0, st_dec_group_max = 0, st_dec_frames = 0;
         int st_dec_ragged = 0, st_dec_per_item = 0, st_dec_external = 0;
         double st_dec_wait = 0.0;
+        int st_overlap = (dec_on && dpool.lane) ? (dpool.elastic ? (qwen_pool_width() != 0) : (dpool.queued > 0)) : 0;
         int st_n_active = n_active, st_n_step = 0;
         PF_START();
         for (int b = 0; b < B; b++) {
@@ -3783,13 +3794,13 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     "sample_ms=%.3f cp_ms=%.3f decode_ms=%.3f talker_ms=%.3f "
                     "output_ms=%.3f queue_wait_ms=%.3f serial_ms=%.3f wall_ms=%.3f "
                     "dec_calls=%d dec_group_max=%d dec_frames=%d dec_ragged=%d "
-                    "dec_per_item=%d dec_external=%d dec_wait_ms=%.3f\n",
+                    "dec_per_item=%d dec_external=%d dec_wait_ms=%.3f overlap=%d\n",
                     (int)getpid(),
                     (unsigned long long)atomic_load_explicit(&g_admit_seq, memory_order_relaxed),
                     st_iter_start, st_end, st_n_active, st_n_step, st_admit, st_prefill_ms, st_head, st_samp,
                     st_cp, st_decode, st_talker, st_write_ms, st_wait, st_serial, st_wall,
                     st_dec_calls, st_dec_group_max, st_dec_frames, st_dec_ragged,
-                    st_dec_per_item, st_dec_external, st_dec_wait);
+                    st_dec_per_item, st_dec_external, st_dec_wait, st_overlap);
         }
     }
 

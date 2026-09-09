@@ -325,7 +325,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_FUSED_RESIDUAL", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
-    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT", "QWEN_SD_LANE_ELASTIC",
+    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT", "QWEN_SD_LANE_ELASTIC", "QWEN_SD_LANE_SUBQ", "QWEN_SD_NTA",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
     /* server, admission and request batching */
     "QWEN_ADMIT_M1", "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_SERVER_STRICT",
@@ -8752,6 +8752,13 @@ int qwen_q4_gemv_native(void) {
 #endif
     return 0;
 }
+/* QWEN_SD_NTA=1: non-temporal prefetch of the decoder conv weight rows inside the VNNI tile
+ * (DL-3d falsifier: does the decoder's weight stream evict the CP's L3-resident rows?) */
+static int sd_nta_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_NTA"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
 int qwen_sd_int8_usable(int in_ch, int out_ch) {
     return qwen_sd_int8_available() && in_ch == out_ch && in_ch > 0 && in_ch <= 768;
 }
@@ -8925,6 +8932,10 @@ static void *sdp_worker_main(void *arg) {
 static int sd_pool_threads(void) {
     static int cfg = -1;
     if (cfg < 0) { const char *e = getenv("QWEN_SD_THREADS"); cfg = e ? atoi(e) : 0; }
+    /* on the decoder lane the team IS the lane: panel sizing and the pool report must see 4,
+     * not the engine's 8 (elastic mode), or every conv layer runs twice the panels and
+     * re-reads its weights twice */
+    if (qwen_lane_thread_here()) { int lt = qwen_lane_team_size(); if (lt > 0) return lt; }
     return cfg > 0 ? cfg : qwen_get_threads();
 }
 
@@ -9176,6 +9187,7 @@ static inline void sd_tile_2x4(float *out, int out_ld, int m, int tcol,
 
     __m512 f0[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
     __m512 f1[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
+    const int nta = sd_nta_enabled();
 
     for (int b = 0; b < nblk; b++) {
         __m512i a0[4] = { _mm512_setzero_si512(), _mm512_setzero_si512(),
@@ -9186,6 +9198,12 @@ static inline void sd_tile_2x4(float *out, int out_ld, int m, int tcol,
         for (int k = b * blk; k < kend; k += 64) {
             int rem = kend - k;
             __mmask64 msk = rem >= 64 ? ~(__mmask64)0 : (((__mmask64)1 << rem) - 1);
+            if (nta) {
+                /* DL-3d: pull the next weight lines with the non-temporal hint so the decoder's
+                 * weight stream stays out of the L2/L3 the CP on the other cpus depends on */
+                _mm_prefetch((const char *)(w0 + k + 512), _MM_HINT_NTA);
+                _mm_prefetch((const char *)(w1 + k + 512), _MM_HINT_NTA);
+            }
             __m512i wv0 = _mm512_maskz_loadu_epi8(msk, w0 + k);
             __m512i wv1 = _mm512_maskz_loadu_epi8(msk, w1 + k);
             for (int c = 0; c < 4; c++) {

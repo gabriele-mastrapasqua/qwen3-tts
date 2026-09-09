@@ -111,6 +111,7 @@ void qwen_lane_masks(const char **step, const char **dec) { if (step) *step = ""
 int  qwen_lane_elastic(void) { return 0; }
 void qwen_pool_set_width(int width) { (void)width; }
 int  qwen_pool_width(void) { return 0; }
+void qwen_lane_unit_active(int on) { (void)on; }
 /* 0 = this backend cannot hold a fixed team of workers inside a spin barrier, so the
  * persistent regions stay off here.  It is a capability answer, not a thread count. */
 int qwen_parallel_team(void) { return 0; }
@@ -261,6 +262,7 @@ void qwen_lane_masks(const char **step, const char **dec) { if (step) *step = ""
 int  qwen_lane_elastic(void) { return 0; }
 void qwen_pool_set_width(int width) { (void)width; }
 int  qwen_pool_width(void) { return 0; }
+void qwen_lane_unit_active(int on) { (void)on; }
 
 
 #else
@@ -519,6 +521,8 @@ void qwen_threadpool_start(int n_threads) {
 
 static __thread int g_lane_tls = 0;
 static _Atomic int g_pool_width = 0;   /* elastic lane: 0 = full team, N = at most N participants */
+static _Atomic int g_lane_unit = 0;    /* elastic lane: a decoder unit is running -> lane workers keep the full spin budget */
+void qwen_lane_unit_active(int on) { atomic_store_explicit(&g_lane_unit, on ? 1 : 0, memory_order_release); }
 static void lane_parallel(size_t nt, qwen_task_fn fn, void *ctx);
 
 void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
@@ -727,9 +731,11 @@ static void *lane_worker_main(void *arg) {
     unsigned long seen = wa->seen0;
     for (;;) {
         unsigned long gw = atomic_load_explicit(&L.generation, memory_order_acquire);
-        /* between the dispatches of one unit the workers stay hot; between units, in
-         * elastic mode, the engine wants these cpus back, so the budget is short */
-        int budget = L.elastic ? (qwen_pool_spin() < 4096 ? qwen_pool_spin() : 4096) : qwen_pool_spin();
+        /* while a unit runs these cpus belong to the decoder: the full spin budget keeps the
+         * 50-120 dispatches of a unit hot; between units, in elastic mode, the engine wants
+         * the cpus back, so the budget is short and the worker parks */
+        int budget = (L.elastic && !atomic_load_explicit(&g_lane_unit, memory_order_acquire))
+                   ? (qwen_pool_spin() < 1024 ? qwen_pool_spin() : 1024) : qwen_pool_spin();
         while (budget-- > 0 && !L.stop && !(gw != seen && QWEN_GW_NEED(gw) > my_idx)) {
             qwen_cpu_relax();
             gw = atomic_load_explicit(&L.generation, memory_order_acquire);

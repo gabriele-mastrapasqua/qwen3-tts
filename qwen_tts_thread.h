@@ -75,6 +75,7 @@ void qwen_lane_masks(const char **step, const char **dec);
 int  qwen_lane_elastic(void);                           /* 1 when the elastic mode was prepared */
 void qwen_pool_set_width(int width);                    /* 0 = full team; N = at most N participants (caller + N-1 workers) */
 int  qwen_pool_width(void);
+void qwen_lane_unit_active(int on);                     /* decoder thread: a unit is running (lane workers stay hot) */
 typedef struct { volatile int arrived; volatile int phase; int nt; } qwen_barrier_t;
 void qwen_barrier_init(qwen_barrier_t *b, int nt);
 void qwen_barrier_wait(qwen_barrier_t *b);
