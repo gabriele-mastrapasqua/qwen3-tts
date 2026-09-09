@@ -86,6 +86,37 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       continuous path. Per-chunk flush tracing remains optional and client marks remain
       client-observed. Detail: `.work/mt4-transport-boundary-20260907.md`.
 
+### P0 C12 preferred gate on the frozen Turin architecture (starts after TQ-1/C16 closes) — detail: `.work/c12-win-track-20260909.md`
+
+Goal: sustain C12 with the full streaming contract AND STREAM_RTF p95 <= 0.90 including
+the short/conversational soak tails (today waves 0.82-0.85, soak pooled 0.912, short
+0.959, conversational 0.914; cadence already good). One mechanism at a time against the
+frozen `turin-c8a-32c-vnni-product` control; lever of record: decoder residency down ->
+CP-overlap share down -> sustained tail down. Codex owns implementation; no push unless asked.
+
+- [ ] C12-WIN-1 Fresh post-V2 causal profile on the on-demand host (ranked decoder cost
+      table, CP/Talker with and without overlap) before any runtime change; pick ONE
+      target worth >= 4-6 ms of residency or a material CP-overlap cut.
+- [ ] C12-WIN-2 Phase-aware decoder overlap falsifier (overlap Talker, not CP; bounded
+      unit start delay / coarse yield; q4 units and lane ownership unchanged; no sub-frame units).
+- [ ] C12-WIN-3 Short-class fixed cost: ramp 1,2,4 (control) vs 1,4 (vs 2,4 only inside the
+      TTFA gate); short + conversational playback metrics first. No q8.
+- [ ] C12-WIN-4 Old preparation ideas (direct ConvT/dwconv/input, strip, copy removal) only
+      where the new cost map shows the targeted cost is material; neutral again = closed.
+- [ ] C12-WIN-5 Cheap screen: `QWEN_POOL_SPIN` 4096/8192/16384/65536; Talker and CP at
+      widths 4/5-6/8 with the decoder idle and active; no width promotion without a serving A/B.
+- [ ] C12-WIN-6 Opportunistic B2 lane batching (optional, last): residency of 2 units vs 2
+      requests, decoder off the critical path, mailbox bounded, reject on any cadence loss.
+- [ ] C12-WIN-7 Short A/B gate per candidate (control vs one mechanism, repeated short C12
+      waves, playback-aware metrics, gain > noise) before any soak.
+- [ ] C12-WIN-8 Qualify the winner: C12 class waves, long+short, Poisson, overload
+      unchanged, 30-min soak by class and 5-min window; STREAM p95 <= 0.90 overall and per
+      class, stall@500 0, cadence targets kept; report an exact boundary rather than move the gate.
+- [ ] C12-WIN-9 Capacity curve C10-C16 after the win, classified as preferred /
+      mandatory-qualified / hard-capacity (never one "max C" number).
+- Stop: if no target, no falsifier and no screen moves C12 above noise, hand the evidence to
+      the post-Turin architecture review instead of stacking micro-optimizations.
+
 ### P1 Cadence truth (current binary, Tier A only) — detail: `.work/p1-cadence-truth-20260907.md`
 
 - [x] CT-1 Quantum discriminator at C3/C4, including gang-off control; q32 is rejected.
