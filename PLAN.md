@@ -128,7 +128,22 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       split-input V2 were exact/parity-safe where tested but slower or neutral; both
       were reverted. The remaining alternative geometries are not justified by the
       current evidence. Detail: `.work/c12-win-glue-vnni-20260909.md`.
-- [ ] C12-WIN-3 Short-class fixed cost: only after WIN-1(a): ramp 1,2,4 (control) vs 1,4
+- [ ] C12-WIN-10 Admission slicing (prefill as resumable token-range slices inside the
+      frame loop, one slice per iteration while streams are active, all at once when idle).
+      Spec: `.work/c12-win-admission-slicing-implementation.md`. Gate: `admit_ms` p95 <= 30 ms,
+      codes/mel parity, then 10-min C12 soak short p95 <= 0.92 with TTFA p95 <= 300 ms.
+      Do not use PREFILL_HELPER, a thread, or a trimmed prompt as the implementation.
+- [ ] C12-WIN-11 Conv-stack traffic: ConvT as ONE un-expanded GEMM (`[k·out_ch][in_ch]`
+      stacked weights, R = W×in, two-tap fused epilogue with carry/bias), then weight-only
+      bf16 with f32 activations/accumulate for ConvT block 0, convnext pw, initial conv.
+      Spec: `.work/c12-win-conv-stack-implementation.md`. Gate: step A >= 2 ms with parity
+      1e-5, A+B >= 4 ms on the q4 unit, paired mel >= 0.99 for B. Zero-expanded ConvT
+      formulation and bf16 activations explicitly forbidden.
+- [ ] C12-WIN-12 VNNI glue as one combined change: out-of-place snake1, V2 kernel with
+      (tail, tail_cols) context and residual epilogue, plain allocs, ownership transfer.
+      Spec: `.work/c12-win-vnni-glue-implementation.md`. Gate: bit-identical WAV, >= 3 ms on
+      the q4 B1/B3 unit, no per-element branch in the channel loop.
+- [ ] C12-WIN-3 Short-class fixed cost: only after WIN-10: ramp 1,2,4 (control) vs 1,4
       (vs 2,4 only inside the TTFA gate); short + conversational playback metrics. No q8.
 - [x] C12-WIN-4 Old preparation flags: DIRECT_DWCONV/INPUT, STRIP, FUSED_RESIDUAL are
       inert on VNNI (AMX-D gated); the VNNI glue falsifiers are now closed. DIRECT_CONVT
