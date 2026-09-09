@@ -230,7 +230,28 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       STREAM p95 0.80-0.81 prebuffer 247 ms stall@250 0 %, C16 0.88 long / 0.92 short
       prebuffer 360 ms stall@250 0 % — twice the inline C8. Screen only: next = SOAK
       C12/C16 with a qualified profile and the V2 numerics ear/mel-qualified.** Detail:
-      `.work/dl1-decoder-lane-split-20260909.md`.
+      `.work/dl1-decoder-lane-split-20260909.md`. **Qualification sprint 2026-09-09
+      (revision 28d6436, frozen `turin-c8a-32c-vnni-product`, control `-control`):** V2
+      quality automated PASS (52 paired files, mel-corr >= 0.9948, ASR CER equal, wav_qc
+      equal; ear verdict pending on the Mac listening set); **C12 QUALIFIED for the
+      mandatory contract** in every class (waves STREAM p95 0.82-0.85, prebuffer p95
+      ~260 ms, safe-start 467 ms, stall@250/@500 0; 30-min SOAK 2205 req 0 errors, pooled
+      STREAM p95 0.912, TTFA p95 170, resources/drift PASS) with the preferred 0.90 gate
+      missed only by the short (0.959) and conversational (0.914) classes under closed-loop
+      soak; Poisson 1.5/2.5 req/s TTFA p95 172/175 ms; overload fail-fast works (per-worker
+      cap). **C16 NOT RUN**: the spot host was reclaimed before Phase D. Handoff:
+      `.work/turin-vnni-final-handoff-20260909.md`.
+- [ ] TQ-1 C16 density qualification on a fresh c8a.8xlarge with the frozen profile (same
+      runner as C12: class waves, quality wave, STAGE diag, long+short, overload, Poisson,
+      30-min SOAK); outcome is one of preferred point / density-only point, never a tuned
+      threshold. Commands: handoff §8.
+- [ ] TQ-2 Fail-fast boundary: at a full host 4 of 28 rejects surfaced as a TCP reset
+      instead of a 503 (Poisson 2.5 req/s, C12 profile) — the reject path must drain the
+      request before closing; also record that rejection is per worker (cap 4): C20 sent 8
+      rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
+      for a simultaneous wave when the parent balances.
+- [ ] TQ-3 Ear verdict on the paired RES1_V2 bank (`samples/tests/2026-09-09_turin-qualification/`);
+      PASS promotes `turin-c8a-32c-vnni-product` from provisional to qualified for C12.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
       small-call/intercept work. Ragged worker scratch reuse was rejected as a serving
