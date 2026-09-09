@@ -86,7 +86,7 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       continuous path. Per-chunk flush tracing remains optional and client marks remain
       client-observed. Detail: `.work/mt4-transport-boundary-20260907.md`.
 
-### P0 C12 preferred gate on the frozen Turin architecture (starts after TQ-1/C16 closes) — detail: `.work/c12-win-track-20260909.md`
+### P0 C12 preferred gate on the frozen Turin architecture (ladder paused after bounded falsifiers) — detail: `.work/c12-win-track-20260909.md`, checkpoint: `.work/c12-win-checkpoint-20260909.md`
 
 Goal: sustain C12 with the full streaming contract AND STREAM_RTF p95 <= 0.90 including
 the short/conversational soak tails (today waves 0.82-0.85, soak pooled 0.912, short
@@ -99,22 +99,35 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       ~330 MB f32 weights per unit, excluded from int8 by construction) plus ~8 ms of
       copy/calloc glue; closed-loop admission (inline prefill) is the likely short-class
       tail; width is bounded out; phase-aware placement cannot help at sustained B3.
-- [ ] C12-WIN-1 Zero-code discriminators first (review §11): (a) `QWEN_PREFILL_HELPER=1`
-      10-min C12 soak vs control (short/conv p95, TTFA); (b) `QWEN_COST_MAP=1` +
-      `QWEN_STAGE_TRACE=1` at `--batch-cap 3` (CP sections by overlap flag, overlap share at
-      pinned B3); (c) `QWEN_POOL_SPIN` 4096/16384 vs 65536 short screen. Then the ranked
-      post-V2 cost table and ONE target worth >= 4-6 ms of residency.
-- [ ] C12-WIN-2 "Next RES1_V2": decoder pre-upsample block and convt on bf16/int8 matmat
-      (one GEMM per convt), residual-unit glue removal (split-input v2 kernel, out-of-place
-      snake, residual in the epilogue, no calloc), vectorised final conv — kernel microbench
-      first, then B4 single-CCX A/B on unit time AND CP-in-overlap ms (review §5).
+- [x] C12-WIN-1 Zero-code discriminators (2026-09-09): helper is NO-GO (pooled STREAM
+      p95 0.923 -> 0.915 but TTFA p95 172 -> 683 ms, safe-start 417 -> 922 ms and
+      stall@250 appears); fixed B3 shows 54.9% decoder-overlap wall and CP 22.2 ->
+      36.5 ms median; spin 4096/16384 does not beat the 65536 control. Decoder unit is
+      49.2 ms measured by cost map. Detail: `.work/c12-win-step1-3-20260909.md`.
+- [x] C12-WIN-1a Pre-upsample BF16 diagnostic (2026-09-09): persistent BF16 weights and
+      matmat path implemented/default-off. The bounded Turin server screen moved modestly
+      (STREAM p95 .842 -> .825), but the same-generation paired audio gate failed
+      (`mel_corr=.97890 < .98`) and the non-clean B3 diagnostic did not show lower decoder
+      residency or CP overlap cost. Keep BF16 default-off; detail:
+      `.work/c12-win-bf16-preup-20260909.md`.
+- [x] C12-WIN-2 Decoder-residency falsifiers closed (2026-09-09): BF16 pre-up,
+      ConvT one-GEMM, allocation-only glue, and VNNI RES1_V2 split-input were each
+      isolated; no candidate earned a serving A/B. Keep the existing VNNI path as
+      control. Detail: `.work/c12-win-glue-vnni-20260909.md`.
+- [x] C12-WIN-2a ConvT one-GEMM falsifier (2026-09-09): exact decoder batch parity passed,
+      but the expanded f32 panel made the treatment 14–32% slower across B1–B4/chunk 1–8.
+      Rejected and reverted; no server A/B. Detail: `.work/c12-win-convt-one-gemm-20260909.md`.
+- [x] C12-WIN-2b VNNI glue/preparation falsifiers (2026-09-09): allocation-only and
+      split-input V2 were exact/parity-safe where tested but slower or neutral; both
+      were reverted. The remaining alternative geometries are not justified by the
+      current evidence. Detail: `.work/c12-win-glue-vnni-20260909.md`.
 - [ ] C12-WIN-3 Short-class fixed cost: only after WIN-1(a): ramp 1,2,4 (control) vs 1,4
       (vs 2,4 only inside the TTFA gate); short + conversational playback metrics. No q8.
-- [ ] C12-WIN-4 Old preparation flags: DIRECT_DWCONV/INPUT, STRIP, FUSED_RESIDUAL are inert
-      on VNNI (AMX-D gated) — closed as flags, re-done as the VNNI glue work of WIN-2;
-      DIRECT_CONVT superseded by the one-GEMM convt.
-- [ ] C12-WIN-5 Phase-aware decoder overlap: paper check only — NO-GO unless WIN-1(b) shows
-      overlap share < 50 % at pinned B3; no asymmetric Talker/CP widths (no mechanism).
+- [x] C12-WIN-4 Old preparation flags: DIRECT_DWCONV/INPUT, STRIP, FUSED_RESIDUAL are
+      inert on VNNI (AMX-D gated); the VNNI glue falsifiers are now closed. DIRECT_CONVT
+      is superseded by the rejected one-GEMM falsifier.
+- [x] C12-WIN-5 Phase-aware decoder overlap: NO-GO at the measured pinned B3 overlap
+      share of 54.9%; no asymmetric Talker/CP width mechanism is justified.
 - [ ] C12-WIN-6 Opportunistic B2 lane batching (optional, last): residency of 2 units vs 2
       requests, decoder off the critical path, mailbox bounded, reject on any cadence loss.
 - [ ] C12-WIN-7 Short A/B gate per candidate (control vs one mechanism, repeated short C12
@@ -126,6 +139,15 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       mandatory-qualified / hard-capacity (never one "max C" number).
 - Stop: if no target, no falsifier and no screen moves C12 above noise, hand the evidence to
       the post-Turin architecture review instead of stacking micro-optimizations.
+
+### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
+
+- [ ] After the Turin C12-WIN track reaches a stable checkpoint, commonize the winning
+      streaming-decoder dataflow across x86 VNNI, x86 AMX and Arm/KleidiAI; keep this
+      deferred and do not mix it into the current paid Turin ladder. Start with a short
+      design/dataflow audit, then parity-gated leaves in this order: RES1_V2 direct causal
+      convolution, common glue/materialization removal, pre-upsample BF16/INT8 matmat,
+      and one-GEMM ConvT. Detail and gates: `.work/decoder-xisa-deferred-track-20260909.md`.
 
 ### P1 Cadence truth (current binary, Tier A only) — detail: `.work/p1-cadence-truth-20260907.md`
 
