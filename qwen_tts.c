@@ -868,6 +868,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].down_q2_rough);
     for (int i = 0; i < 16; i++) free(ctx->speech_dec.codebook[i]);
     for (int i = 0; i < 6; i++) free(ctx->speech_dec.convt_packed[i]);
+    for (int i = 0; i < 6; i++) free(ctx->speech_dec.convt_stack[i]);
     qwen_sd_bf16_preup_free(&ctx->speech_dec, ctx->config.dec_num_layers);
     free(ctx->speech_dec.pre_layers);
     free(ctx->speech_dec.rope_cos); free(ctx->speech_dec.rope_sin);

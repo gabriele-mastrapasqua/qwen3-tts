@@ -620,6 +620,18 @@ static int sd_glue_enabled(void) {
     return v;
 }
 int qwen_sd_glue_active(void) { return sd_glue_enabled(); }
+/* C12-WIN-11 step A: ConvT as one un-expanded GEMM + fused epilogue (default off, exact). */
+static int sd_convt_stack_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_CONVT_STACK"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
+int qwen_sd_convt_stack_active(void) { return sd_convt_stack_enabled(); }
+static const float *g_convt_stack_key[6]; static const float *g_convt_stack_val[6];
+static const float *sd_convt_stack_for(const float *packed) {
+    for (int i = 0; i < 6; i++) if (g_convt_stack_key[i] == packed) return g_convt_stack_val[i];
+    return NULL;
+}
 /* Build the DL-4 layout for a residual conv: wq2[m][kk][Cp] with one scale and one weight
  * sum per (m, kk); the f32 weight is [out_ch][in_ch][kernel] (kk fastest, the im2col order). */
 static void sd_wq_build_v2(sd_wq_entry_t *e, const float *w, int ch, int kernel) {
@@ -1166,6 +1178,11 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
             if (!p) { fprintf(stderr, "Error: out of memory packing ConvNeXt %d\n", b); return -1; }
             sd->convt_packed[b] = p;
             sd->convnext[b].conv_weight = p;
+            if (sd_convt_stack_enabled()) {
+                float *q = (float *)aligned_malloc((size_t)cn_k * cn_ch * cn_ch * sizeof(float));
+                if (q) { qwen_convt_pack_stack(q, p, cn_ch, cn_ch, cn_k); sd->convt_stack[b] = q;
+                         g_convt_stack_key[b] = p; g_convt_stack_val[b] = q; }
+            }
             packed_bytes += (size_t)cn_k * cn_ch * cn_ch * sizeof(float);
         }
         for (int b = 0; b < 4; b++) {
@@ -1175,6 +1192,11 @@ int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx) {
             if (!p) { fprintf(stderr, "Error: out of memory packing upsample %d\n", b); return -1; }
             sd->convt_packed[2 + b] = p;
             sd->upsample_blocks[b].upsample.conv_weight = p;
+            if (sd_convt_stack_enabled()) {
+                float *q = (float *)aligned_malloc((size_t)up_k[b] * up_in[b] * up_out[b] * sizeof(float));
+                if (q) { qwen_convt_pack_stack(q, p, up_in[b], up_out[b], up_k[b]); sd->convt_stack[2 + b] = q;
+                         g_convt_stack_key[2 + b] = p; g_convt_stack_val[2 + b] = q; }
+            }
             packed_bytes += (size_t)up_k[b] * up_in[b] * up_out[b] * sizeof(float);
         }
         if (!ctx->silent)
@@ -2368,6 +2390,24 @@ static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
         float *direct = cs_convt_direct(in, in_ch, out_ch, len, kernel, stride,
                                         w, b, carry);
         if (direct) return direct;
+    }
+#endif
+#ifdef USE_BLAS
+    if (sd_convt_stack_enabled() && kernel == 2 * stride) {
+        const float *stack = sd_convt_stack_for(w);
+        if (stack) {
+            /* one GEMM on the un-expanded input: R[k*out_ch][len] = Wstack[k*out_ch][in_ch] x in[in_ch][len] */
+            const int M = kernel * out_ch;
+            float *R = (float *)sd_tmp_alloc((size_t)M * len * sizeof(float));
+            float *out = (float *)sd_tmp_alloc((size_t)out_ch * out_len * sizeof(float));
+            if (R && out) {
+                SD_GEMM(CblasNoTrans, CblasNoTrans, M, len, in_ch, 1.0f, stack, in_ch, in, len, 0.0f, R, len);
+                qwen_convt_stack_epilogue(out, R, carry, b, out_ch, len, stride);
+                sd_tmp_free(R);
+                return out;
+            }
+            sd_tmp_free(R); sd_tmp_free(out);
+        }
     }
 #endif
 

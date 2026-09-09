@@ -289,6 +289,7 @@ typedef struct {
     qwen_sd_upsample_block_t upsample_blocks[4];
 
     float *convt_packed[6];
+    float *convt_stack[6];      /* C12-WIN-11: [k*out_ch][in_ch] stacked ConvT weights (NULL unless QWEN_SD_CONVT_STACK) */
 
     const float *final_conv_weight;
     const float *final_conv_bias;

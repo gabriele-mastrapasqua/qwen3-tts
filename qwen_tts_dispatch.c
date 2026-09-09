@@ -373,6 +373,11 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_sd_bf16_preup_active()
                 ? "diagnostic persistent BF16 pre-transformer weights; streaming per-item path only"
                 : "default OFF; f32 decoder pre-transformer path remains the control");
+        row(&feats[n++], "decoder.convt_stack", "yes", "yes", "QWEN_SD_CONVT_STACK",
+            onoff(qwen_sd_convt_stack_active()),
+            qwen_sd_convt_stack_active()
+                ? "ConvT as one un-expanded GEMM per layer with the two-tap/carry/bias epilogue (exact; C12-WIN-11 A)"
+                : "opt-in (QWEN_SD_CONVT_STACK=1); off: per-tap GEMMs + scatter + full-length intermediate");
         row(&feats[n++], "decoder.glue_fused", yn(qwen_conv1d_int8_v2_available()),
             yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_GLUE", onoff(qwen_sd_glue_active()),
             qwen_sd_glue_active()

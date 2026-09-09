@@ -325,7 +325,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_BF16_PREUP", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_FUSED_RESIDUAL", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
-    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT", "QWEN_SD_LANE_ELASTIC", "QWEN_SD_LANE_SUBQ", "QWEN_SD_NTA", "QWEN_SD_RES1_V2", "QWEN_SD_GLUE",
+    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT", "QWEN_SD_LANE_ELASTIC", "QWEN_SD_LANE_SUBQ", "QWEN_SD_NTA", "QWEN_SD_RES1_V2", "QWEN_SD_GLUE", "QWEN_SD_CONVT_STACK",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
     /* server, admission and request batching */
     "QWEN_ADMIT_M1", "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_SERVER_STRICT",
@@ -10190,6 +10190,53 @@ void qwen_conv1d_int8_v2(float *out, const float *in,
 }
 #endif
 
+/* C12-WIN-11 step A: ConvTranspose1d (kernel = 2*stride) from ONE un-expanded GEMM.
+ * R[(j*out_ch + oc)*len + t] = sum_ic Wstack[j*out_ch + oc][ic] * in[ic][t] (computed by the
+ * caller, BLAS or a custom kernel).  Output position o = t*stride + j (j < stride) receives
+ * exactly tap j from input column t and tap j+stride from column t-1 (column -1 = carry of
+ * the previous unit).  Writes out[out_ch][len*stride] in final form (bias folded) and the
+ * new carry[out_ch][stride] = R[(j+stride)*out_ch + oc][len-1].  Same arithmetic count as
+ * the per-tap GEMMs; no input expansion, no full-length intermediate, no scatter pass. */
+typedef struct {
+    float *out; const float *R; float *carry; const float *bias;
+    int out_ch, len, stride; _Atomic int next;
+} sd_convt_epi_job_t;
+static void sd_convt_epi_worker(void *vj) {
+    sd_convt_epi_job_t *j = (sd_convt_epi_job_t *)vj;
+    const int len = j->len, r = j->stride, oc_n = j->out_ch;
+    for (;;) {
+        const int oc = atomic_fetch_add(&j->next, 1);
+        if (oc >= oc_n) break;
+        const float bv = j->bias ? j->bias[oc] : 0.0f;
+        float *o = j->out + (size_t)oc * len * r;
+        float *cr = j->carry ? j->carry + (size_t)oc * r : NULL;
+        for (int t = 0; t < len; t++) {
+            for (int jj = 0; jj < r; jj++) {
+                const float a = j->R[((size_t)jj * oc_n + oc) * len + t];
+                const float b = (t >= 1) ? j->R[((size_t)(jj + r) * oc_n + oc) * len + (t - 1)]
+                                         : (cr ? cr[jj] : 0.0f);
+                o[(size_t)t * r + jj] = a + b + bv;
+            }
+        }
+        if (cr)
+            for (int jj = 0; jj < r; jj++) cr[jj] = j->R[((size_t)(jj + r) * oc_n + oc) * len + (len - 1)];
+    }
+}
+void qwen_convt_stack_epilogue(float *out, const float *R, float *carry, const float *bias,
+                               int out_ch, int len, int stride) {
+    sd_convt_epi_job_t job = { .out = out, .R = R, .carry = carry, .bias = bias,
+                               .out_ch = out_ch, .len = len, .stride = stride };
+    atomic_store(&job.next, 0);
+    sd_pool_run(sd_convt_epi_worker, &job);
+}
+void qwen_convt_pack_stack(float *stack, const float *packed, int in_ch, int out_ch, int kernel) {
+    /* packed[(k*in_ch + ic)*out_ch + oc]  ->  stack[(k*out_ch + oc)*in_ch + ic] */
+    for (int k = 0; k < kernel; k++)
+        for (int ic = 0; ic < in_ch; ic++)
+            for (int oc = 0; oc < out_ch; oc++)
+                stack[((size_t)k * out_ch + oc) * in_ch + ic] = packed[((size_t)k * in_ch + ic) * out_ch + oc];
+}
+
 /* The DL-4 weight layout, one implementation for the decoder and for --self-test:
  * wq2[m][kk][Cp] with one scale and one weight sum per (m, kk).  The f32 weight is
  * [out_ch][in_ch][kernel] (kk fastest, the im2col order); tap kk multiplies input position
@@ -11385,6 +11432,83 @@ int qwen_kernel_selftest(void *out) {
                 }
                 free(in); free(wf); free(bias); free(q2); free(sw2); free(ws2);
                 free(outk); free(outw); free(qa); free(sa);
+            }
+        }
+    }
+
+    {
+        /* C12-WIN-11: the one-GEMM ConvT epilogue must equal the per-tap scatter + carry + bias
+         * reference on the real block geometries (k = 2*stride), across two consecutive units. */
+        const int geo[][3] = { {1536, 768, 8}, {768, 384, 5}, {384, 192, 4}, {192, 96, 3}, {64, 64, 1} };
+        const int lens[] = { 16, 5, 1 };
+        for (int gi = 0; gi < (int)(sizeof(geo) / sizeof(geo[0])); gi++) {
+            const int in_ch = geo[gi][0] / 8, out_ch = geo[gi][1] / 8, r = geo[gi][2], K = 2 * r;   /* /8: keep the reference cheap */
+            for (int li = 0; li < 3; li++) {
+                const int len = lens[li];
+                float *packed = malloc((size_t)K * in_ch * out_ch * sizeof(float));
+                float *stack  = malloc((size_t)K * out_ch * in_ch * sizeof(float));
+                float *in0 = malloc((size_t)in_ch * len * sizeof(float)), *in1 = malloc((size_t)in_ch * len * sizeof(float));
+                float *bias = malloc((size_t)out_ch * sizeof(float));
+                float *carry_ref = calloc((size_t)out_ch * r, sizeof(float)), *carry_new = calloc((size_t)out_ch * r, sizeof(float));
+                float *R = malloc((size_t)K * out_ch * len * sizeof(float));
+                float *outn = malloc((size_t)out_ch * len * r * sizeof(float));
+                float *full = malloc((size_t)out_ch * ((len - 1) * r + K) * sizeof(float));
+                float *outr = malloc((size_t)out_ch * len * r * sizeof(float));
+                if (!packed || !stack || !in0 || !in1 || !bias || !carry_ref || !carry_new || !R || !outn || !full || !outr) {
+                    fprintf(f, "  [convt_stack] OOM, skipped\n");
+                } else {
+                    for (size_t i = 0; i < (size_t)K * in_ch * out_ch; i++) packed[i] = NEXT_F;
+                    for (size_t i = 0; i < (size_t)in_ch * len; i++) { in0[i] = NEXT_F; in1[i] = NEXT_F; }
+                    for (int oc = 0; oc < out_ch; oc++) bias[oc] = 0.25f * NEXT_F;
+                    qwen_convt_pack_stack(stack, packed, in_ch, out_ch, K);
+                    double worst = 0.0;
+                    const float *ins[2] = { in0, in1 };
+                    for (int u = 0; u < 2; u++) {
+                        const float *in = ins[u];
+                        const int full_len = (len - 1) * r + K;
+                        /* reference: per-tap accumulate into full, carry, bias, new carry (cs_convt contract) */
+                        memset(full, 0, (size_t)out_ch * full_len * sizeof(float));
+                        for (int k = 0; k < K; k++)
+                            for (int oc = 0; oc < out_ch; oc++)
+                                for (int t = 0; t < len; t++) {
+                                    double acc = 0.0;
+                                    for (int ic = 0; ic < in_ch; ic++)
+                                        acc += (double)packed[((size_t)k * in_ch + ic) * out_ch + oc] * in[(size_t)ic * len + t];
+                                    full[(size_t)oc * full_len + t * r + k] += (float)acc;
+                                }
+                        for (int oc = 0; oc < out_ch; oc++) {
+                            for (int i = 0; i < r; i++) full[(size_t)oc * full_len + i] += carry_ref[(size_t)oc * r + i];
+                            for (int o = 0; o < len * r; o++) outr[(size_t)oc * len * r + o] = full[(size_t)oc * full_len + o] + bias[oc];
+                            for (int i = 0; i < r; i++) carry_ref[(size_t)oc * r + i] = full[(size_t)oc * full_len + len * r + i];
+                        }
+                        /* treatment: R = stack x in (naive GEMM here; BLAS in the decoder), then the epilogue */
+                        for (int m = 0; m < K * out_ch; m++)
+                            for (int t = 0; t < len; t++) {
+                                double acc = 0.0;
+                                for (int ic = 0; ic < in_ch; ic++) acc += (double)stack[(size_t)m * in_ch + ic] * in[(size_t)ic * len + t];
+                                R[(size_t)m * len + t] = (float)acc;
+                            }
+                        qwen_convt_stack_epilogue(outn, R, carry_new, bias, out_ch, len, r);
+                        /* relative to the tensor's max magnitude (float32 cancellation noise is
+                         * ~1e-6 here; a wrong tap mapping is O(1)) */
+                        double mx = 1e-12, dd = 0.0;
+                        for (size_t i = 0; i < (size_t)out_ch * len * r; i++) {
+                            if (fabs((double)outr[i]) > mx) mx = fabs((double)outr[i]);
+                            double d = fabs((double)outn[i] - outr[i]); if (d > dd) dd = d;
+                        }
+                        for (size_t i = 0; i < (size_t)out_ch * r; i++) {
+                            if (fabs((double)carry_ref[i]) > mx) mx = fabs((double)carry_ref[i]);
+                            double d = fabs((double)carry_new[i] - carry_ref[i]); if (d > dd) dd = d;
+                        }
+                        if (dd / mx > worst) worst = dd / mx;
+                    }
+                    const int ok = worst < 1e-5;
+                    fprintf(f, "  [convt_stack in=%4d out=%3d k=%2d stride=%d len=%2d] vs per-tap reference, two units: max|diff|/max|ref| %.2e  %s\n",
+                            in_ch, out_ch, K, r, len, worst, ok ? "PASS" : "FAIL");
+                    if (!ok) failures++;
+                }
+                free(packed); free(stack); free(in0); free(in1); free(bias); free(carry_ref); free(carry_new);
+                free(R); free(outn); free(full); free(outr);
             }
         }
     }
