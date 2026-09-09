@@ -325,7 +325,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_BF16_PREUP", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_FUSED_RESIDUAL", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
     "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
     "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
-    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT", "QWEN_SD_LANE_ELASTIC", "QWEN_SD_LANE_SUBQ", "QWEN_SD_NTA", "QWEN_SD_RES1_V2",
+    "QWEN_DECODER_THREAD", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT", "QWEN_SD_LANE_ELASTIC", "QWEN_SD_LANE_SUBQ", "QWEN_SD_NTA", "QWEN_SD_RES1_V2", "QWEN_SD_GLUE",
     "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
     /* server, admission and request batching */
     "QWEN_ADMIT_M1", "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_SERVER_STRICT",
@@ -10043,6 +10043,8 @@ typedef struct {
     float *out; const float *in;
     const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
     int ch, length, kernel, dilation, Cp, tb;
+    const float *tail; int tail_cols;   /* left context [ch][tail_cols] for positions < 0 (NULL: zero rows) */
+    const float *residual;              /* [ch][length] added in the epilogue (NULL: none) */
     _Atomic int next; int n_blocks;
 } sd_dconv_job_t;
 
@@ -10066,9 +10068,12 @@ static void sd_dconv_worker(void *vj) {
         for (int r = 0; r < nrows; r++) {
             const int p = t0 - pad + r;
             uint8_t *qr = q + (size_t)r * Cp;
-            if (p < 0 || p >= L) { memset(qr, 0x80, (size_t)Cp); sc[r] = 0.0f; continue; }
+            const float *src; size_t sstride;
+            if (p >= 0 && p < L) { src = j->in + p; sstride = (size_t)L; }
+            else if (p < 0 && j->tail && -p <= j->tail_cols) { src = j->tail + (j->tail_cols + p); sstride = (size_t)j->tail_cols; }
+            else { memset(qr, 0x80, (size_t)Cp); sc[r] = 0.0f; continue; }
             float amax = 0.0f;
-            for (int ic = 0; ic < ch; ic++) { float v = j->in[(size_t)ic * L + p]; frow[ic] = v; float a = fabsf(v); if (a > amax) amax = a; }
+            for (int ic = 0; ic < ch; ic++) { float v = src[(size_t)ic * sstride]; frow[ic] = v; float a = fabsf(v); if (a > amax) amax = a; }
             const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
             sc[r] = scale;
             int ic = 0;
@@ -10134,8 +10139,11 @@ static void sd_dconv_worker(void *vj) {
                 for (int i = 0; i < mn; i++) {
                     const float bv = j->bias ? j->bias[m0 + i] : 0.0f;
                     float *o = j->out + (size_t)(m0 + i) * L + t;
-                    for (int jj = 0; jj < tn; jj++)
-                        o[jj] = _mm512_reduce_add_ps(facc[i * 4 + jj]) - corr[i][jj] + bv;
+                    const float *rs = j->residual ? j->residual + (size_t)(m0 + i) * L + t : NULL;
+                    for (int jj = 0; jj < tn; jj++) {
+                        float v = _mm512_reduce_add_ps(facc[i * 4 + jj]) - corr[i][jj] + bv;
+                        o[jj] = rs ? v + rs[jj] : v;
+                    }
                 }
             }
         }
@@ -10143,13 +10151,15 @@ static void sd_dconv_worker(void *vj) {
 }
 
 int qwen_conv1d_int8_v2_available(void) { return 1; }
-void qwen_conv1d_int8_v2(float *out, const float *in,
-                         const int8_t *wq, const float *sw, const int32_t *wsum,
-                         const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
+void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
+                             const float *residual,
+                             const int8_t *wq, const float *sw, const int32_t *wsum,
+                             const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
     qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, ch, ch * kernel, length);
     qwen_census_leaf(QWEN_LEAF_VNNI);
     sd_dconv_job_t job = { .out = out, .in = in, .wq = wq, .sw = sw, .wsum = wsum, .bias = bias,
-                           .ch = ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp };
+                           .ch = ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
+                           .tail = tail, .tail_cols = tail ? tail_cols : 0, .residual = residual };
     int nt = sd_pool_threads(); if (nt < 1) nt = 1;
     int tb = (length + nt * 2 - 1) / (nt * 2);
     if (tb < 32) tb = 32; if (tb > 256) tb = 256; tb = (tb + 3) & ~3;
@@ -10158,8 +10168,20 @@ void qwen_conv1d_int8_v2(float *out, const float *in,
     qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
     sd_pool_run(sd_dconv_worker, &job);
 }
+void qwen_conv1d_int8_v2(float *out, const float *in,
+                         const int8_t *wq, const float *sw, const int32_t *wsum,
+                         const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
+    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, ch, length, kernel, dilation, Cp);
+}
 #else
 int qwen_conv1d_int8_v2_available(void) { return 0; }
+void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
+                             const float *residual,
+                             const int8_t *wq, const float *sw, const int32_t *wsum,
+                             const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)wq; (void)sw; (void)wsum;
+    (void)bias; (void)ch; (void)length; (void)kernel; (void)dilation; (void)Cp;
+}
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
                          const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
@@ -11325,10 +11347,39 @@ int qwen_kernel_selftest(void *out) {
                             free(inw);
                         }
                     }
-                    const int ok_a = arel < 1e-5, ok_b = brel < 3e-2, ok_c = cworst < 1e-5;
-                    fprintf(f, "  [conv1d_int8_v2 ch=%3d k=%d dil=%d L=%3d] vs own-quant ref rel_L2=%.2e max_abs=%.2e | vs f32 conv rel_L2=%.2e | continuation %s  %s\n",
+                    /* (d) DL-glue contract: (tail, in) split context and the residual epilogue must be
+                     * bit-identical to the contiguous [tail|in] path for every new position. */
+                    double dworst = -1.0;
+                    if (L > pad + 8) {
+                        const int t0 = pad + (L - pad) / 2, s = t0 - pad, Lw = L - s, Ln = L - t0;
+                        float *tl = malloc((size_t)ch * pad * sizeof(float));
+                        float *inn = malloc((size_t)ch * Ln * sizeof(float));
+                        float *resid = malloc((size_t)ch * Ln * sizeof(float));
+                        float *outc = malloc((size_t)ch * Ln * sizeof(float));
+                        if (tl && inn && resid && outc) {
+                            for (int ic = 0; ic < ch; ic++) {
+                                memcpy(tl + (size_t)ic * pad, in + (size_t)ic * L + s, (size_t)pad * sizeof(float));
+                                memcpy(inn + (size_t)ic * Ln, in + (size_t)ic * L + t0, (size_t)Ln * sizeof(float));
+                            }
+                            for (size_t i = 0; i < (size_t)ch * Ln; i++) resid[i] = NEXT_F;
+                            qwen_conv1d_int8_v2_ctx(outc, inn, tl, pad, resid, q2, sw2, ws2, bias, ch, Ln, kern, dil, Cp);
+                            dworst = 0.0;
+                            for (int m = 0; m < ch; m++)
+                                for (int t = 0; t < Ln; t++) {
+                                    float want = outk[(size_t)m * L + t0 + t] + resid[(size_t)m * Ln + t];
+                                    double d = fabs((double)outc[(size_t)m * Ln + t] - want);
+                                    if (d > dworst) dworst = d;
+                                }
+                        }
+                        (void)Lw;
+                        free(tl); free(inn); free(resid); free(outc);
+                    }
+                    const int ok_d = dworst <= 0.0;
+                    const int ok_a = arel < 1e-5 && ok_d, ok_b = brel < 3e-2, ok_c = cworst < 1e-5;
+                    fprintf(f, "  [conv1d_int8_v2 ch=%3d k=%d dil=%d L=%3d] vs own-quant ref rel_L2=%.2e max_abs=%.2e | vs f32 conv rel_L2=%.2e | continuation %s | ctx+residual %s  %s\n",
                             ch, kern, dil, L, arel, aworst, brel,
                             cworst < 0 ? "n/a" : (ok_c ? "exact" : "MISMATCH"),
+                            dworst < 0 ? "n/a" : (ok_d ? "exact" : "MISMATCH"),
                             (ok_a && ok_b && ok_c) ? "PASS" : "FAIL");
                     if (!(ok_a && ok_b && ok_c)) failures++;
                 }

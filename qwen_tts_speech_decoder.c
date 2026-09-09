@@ -609,6 +609,17 @@ static int sd_res1_v2_enabled(void) {
     return v;
 }
 int qwen_sd_res1_v2_active(void) { return sd_res1_v2_enabled(); }
+/* C12-WIN-12: fused residual unit on the VNNI per-item path (default off). One combined
+ * dataflow: snake1 out of place (the residual is never copied back), res1 with the left
+ * context passed to the kernel (no [tail|in] build, no full/cut), res2 with the residual
+ * added in the kernel epilogue (no separate add pass), plain allocations, ownership
+ * transfer.  Bit-identical to the control by construction. */
+static int sd_glue_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_GLUE"); v = (e && atoi(e) != 0 && sd_res1_v2_enabled()) ? 1 : 0; }
+    return v;
+}
+int qwen_sd_glue_active(void) { return sd_glue_enabled(); }
 /* Build the DL-4 layout for a residual conv: wq2[m][kk][Cp] with one scale and one weight
  * sum per (m, kk); the f32 weight is [out_ch][in_ch][kernel] (kk fastest, the im2col order). */
 static void sd_wq_build_v2(sd_wq_entry_t *e, const float *w, int ch, int kernel) {
@@ -1787,7 +1798,6 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
         int dilations[3] = {1, 3, 9};
         for (int r = 0; r < 3; r++) {
             int dil = dilations[r];
-
             float *res = (float *)aligned_malloc((int64_t)cur_ch * cur_len * sizeof(float));
             memcpy(res, signal, (int64_t)cur_ch * cur_len * sizeof(float));
 
@@ -2148,6 +2158,29 @@ static int cs_conv1d_amx_range(float *out, const float *ext,
                                            e->Kp, sd_int8_blk());
 }
 
+static void cs_save_tail(float *tail, const float *in, int in_ch, int len, int tail_cols);
+/* C12-WIN-12: V2 conv with the left context passed to the kernel and an optional residual
+ * in the epilogue.  Output is written in final form ([ch][len], new positions only).
+ * NULL when the V2 layout is unavailable for this weight (caller uses the control path). */
+static sd_wq_entry_t *cs_v2_entry(const float *w, int ch, int kernel) {
+    if (!sd_int8_enabled() || !qwen_sd_int8_usable(ch, ch) || (ch & 3)) return NULL;
+    sd_wq_entry_t *e = sd_wq_get_conv(w, ch, ch * kernel);
+    if (!e || !e->q) return NULL;
+    if (!e->q2 && !e->v2_tried) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, w, ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
+    return e->q2 ? e : NULL;
+}
+static float *cs_conv1d_v2_ctx(sd_wq_entry_t *e, const float *in, int ch, int len,
+                               int kernel, int dilation, const float *b,
+                               float *tail, int warm, const float *residual) {
+    int tail_cols = (kernel - 1) * dilation;
+    float *out = (float *)sd_tmp_alloc((size_t)ch * len * sizeof(float));
+    if (!out) return NULL;
+    qwen_conv1d_int8_v2_ctx(out, in, warm ? tail : NULL, tail_cols, residual,
+                            e->q2, e->sw2, e->wsum2, b, ch, len, kernel, dilation, e->Cp2);
+    if (tail_cols > 0 && tail) cs_save_tail(tail, in, ch, len, tail_cols);
+    return out;
+}
+
 static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
                         int kernel, int dilation,
                         const float *w, const float *b, float *tail, int warm) {
@@ -2504,6 +2537,36 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         int dilations[3] = {1, 3, 9};
         for (int r = 0; r < 3; r++) {
             int dil = dilations[r];
+            if (sd_glue_enabled()) {
+                sd_wq_entry_t *e1 = cs_v2_entry(ub->res_blocks[r].conv1_weight, cur_ch, 7);
+                sd_wq_entry_t *e2 = cs_v2_entry(ub->res_blocks[r].conv2_weight, cur_ch, 1);
+                if (e1 && e2) {
+                    /* act = snake1(signal); signal stays untouched: it is the residual */
+                    float *act = (float *)sd_tmp_alloc((int64_t)cur_ch * cur_len * sizeof(float));
+                    if (!act) { sd_tmp_free(signal); return -1; }
+                    memcpy(act, signal, (int64_t)cur_ch * cur_len * sizeof(float));
+                    if (ub->res_blocks[r].snake1_alpha && ub->res_blocks[r].snake1_beta)
+                        snake_activation(act, cur_ch, cur_len,
+                                         ub->res_blocks[r].snake1_alpha, ub->res_blocks[r].snake1_beta);
+                    float *c1 = cs_conv1d_v2_ctx(e1, act, cur_ch, cur_len, 7, dil,
+                                                 ub->res_blocks[r].conv1_bias,
+                                                 st->cs_res_tail[b][r], st->cs_warm, NULL);
+                    sd_tmp_free(act);
+                    if (!c1) { sd_tmp_free(signal); return -1; }
+                    if (ub->res_blocks[r].snake2_alpha && ub->res_blocks[r].snake2_beta)
+                        snake_activation(c1, cur_ch, cur_len,
+                                         ub->res_blocks[r].snake2_alpha, ub->res_blocks[r].snake2_beta);
+                    float *c2 = cs_conv1d_v2_ctx(e2, c1, cur_ch, cur_len, 1, 1,
+                                                 ub->res_blocks[r].conv2_bias,
+                                                 NULL, 0, signal);   /* epilogue: conv2 + residual */
+                    sd_tmp_free(c1);
+                    if (!c2) { sd_tmp_free(signal); return -1; }
+                    sd_tmp_free(signal);
+                    signal = c2;
+                    continue;
+                }
+            }
+
             UP_T0();
             float *res = (float *)sd_tmp_alloc((int64_t)cur_ch * cur_len * sizeof(float));
             if (!res) { sd_tmp_free(signal); return -1; }

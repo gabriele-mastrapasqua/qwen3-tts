@@ -373,6 +373,11 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_sd_bf16_preup_active()
                 ? "diagnostic persistent BF16 pre-transformer weights; streaming per-item path only"
                 : "default OFF; f32 decoder pre-transformer path remains the control");
+        row(&feats[n++], "decoder.glue_fused", yn(qwen_conv1d_int8_v2_available()),
+            yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_GLUE", onoff(qwen_sd_glue_active()),
+            qwen_sd_glue_active()
+                ? "residual unit fused on the VNNI path: context-aware V2 conv, residual in the epilogue, no ext/full/cut/add passes"
+                : "opt-in (QWEN_SD_GLUE=1, needs QWEN_SD_RES1_V2=1); off: the control residual unit");
         row(&feats[n++], "decoder.mode", "yes", "yes", "QWEN_DECODER_BATCH",
             qwen_sd_decoder_mode(),
             "resolved decoder leaf: ragged AMX only when batch+exact-stream+AMX decoder support all hold; otherwise per-item");

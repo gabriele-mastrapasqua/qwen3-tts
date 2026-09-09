@@ -164,6 +164,7 @@ static const qwen_flag_scope_t g_qwen_flag_scope[] = {
     { "QWEN_SD_DIRECT_DWCONV", 127u },
     { "QWEN_SD_DIRECT_INPUT", 127u },
     { "QWEN_SD_FUSED_RESIDUAL", 127u },
+    { "QWEN_SD_GLUE", 127u },
     { "QWEN_SD_INT8", 127u },
     { "QWEN_SD_INT8_BLK", 127u },
     { "QWEN_SD_LANE_ELASTIC", 127u },
