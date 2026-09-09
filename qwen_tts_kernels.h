@@ -459,6 +459,7 @@ int qwen_arm_bfdot_on(void);           /* Arm BFDOT bf16 matvec, opt-in QWEN_ARM
 int qwen_prefill_matmat_resolved(const char **why);   /* the Talker prefill predicate */
 int qwen_cp_prefill2_requested(void);  /* env/arch part of cp_prefill2 (weights decide the rest) */
 int qwen_sd_int8_enabled(void);
+int qwen_sd_bf16_preup_active(void);
 int qwen_pool_spin_value(void);
 int qwen_pool_narrow_value(void);
 int qwen_dispatch_map_report(void *out, const char *json_path);

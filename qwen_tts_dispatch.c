@@ -368,6 +368,11 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             qwen_sd_res1_v2_active()
                 ? "direct dilated int8 VNNI conv for the residual convs (per-position activation scale, per-(channel,tap) weight scale; DL-4)"
                 : "opt-in (QWEN_SD_RES1_V2=1); off: the residual convs run on the im2col panel kernel");
+        row(&feats[n++], "decoder.pre_up_bf16", "yes", yn(qwen_avx512_bf16_matmat_available()),
+            "QWEN_SD_BF16_PREUP", onoff(qwen_sd_bf16_preup_active()),
+            qwen_sd_bf16_preup_active()
+                ? "diagnostic persistent BF16 pre-transformer weights; streaming per-item path only"
+                : "default OFF; f32 decoder pre-transformer path remains the control");
         row(&feats[n++], "decoder.mode", "yes", "yes", "QWEN_DECODER_BATCH",
             qwen_sd_decoder_mode(),
             "resolved decoder leaf: ragged AMX only when batch+exact-stream+AMX decoder support all hold; otherwise per-item");
@@ -676,6 +681,7 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             fprintf(j, "    \"stream_strip_active\": %s,\n",
                     qwen_sd_stream_strip_active() ? "true" : "false");
             fprintf(j, "    \"res1_v2_active\": %s,\n", qwen_sd_res1_v2_active() ? "true" : "false");
+            fprintf(j, "    \"pre_up_bf16_active\": %s,\n", qwen_sd_bf16_preup_active() ? "true" : "false");
             { const char *lm_step = "", *lm_dec = ""; qwen_lane_masks(&lm_step, &lm_dec);
               fprintf(j, "    \"decoder_lane_active\": %s,\n", (lm_dec && lm_dec[0]) ? "true" : "false");
               fprintf(j, "    \"decoder_lane_elastic\": %s,\n", qwen_lane_elastic() ? "true" : "false"); }

@@ -208,11 +208,18 @@ typedef struct {
     const float *attn_k;
     const float *attn_v;
     const float *attn_o;
+    uint16_t *attn_q_bf16;
+    uint16_t *attn_k_bf16;
+    uint16_t *attn_v_bf16;
+    uint16_t *attn_o_bf16;
     const float *attn_layer_scale;
     const float *ffn_norm;
     const float *ffn_gate;
     const float *ffn_up;
     const float *ffn_down;
+    uint16_t *ffn_gate_bf16;
+    uint16_t *ffn_up_bf16;
+    uint16_t *ffn_down_bf16;
     const float *ffn_layer_scale;
 } qwen_sd_pre_layer_t;
 
@@ -262,10 +269,14 @@ typedef struct {
 
     qwen_sd_pre_layer_t *pre_layers;
     const float *input_proj_weight;
+    uint16_t *input_proj_weight_bf16;
     const float *input_proj_bias;
     const float *final_norm_weight;
     const float *output_proj_weight;
+    uint16_t *output_proj_weight_bf16;
     const float *output_proj_bias;
+    int bf16_preup_ready;
+    size_t bf16_preup_bytes;
 
     float *rope_cos;
     float *rope_sin;
@@ -660,6 +671,9 @@ int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, in
 int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx);
 int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_samples,
                                 int **codes_out, int *n_frames_out);
+
+int qwen_sd_bf16_preup_active(void);
+void qwen_sd_bf16_preup_free(qwen_speech_decoder_t *sd, int n_layers);
 
 #ifdef __cplusplus
 }
