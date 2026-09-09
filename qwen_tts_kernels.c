@@ -11307,7 +11307,9 @@ int qwen_kernel_selftest(void *out) {
                     /* (c) continuation: a window that starts pad positions before t0 */
                     double cworst = -1.0;
                     if (L > pad + 8) {
-                        const int t0 = L / 2, s = t0 - pad, Lw = L - s;
+                        /* the window starts s >= 4 positions into the sequence, so its left
+                         * context is real input and its length is never more than L */
+                        const int t0 = pad + (L - pad) / 2, s = t0 - pad, Lw = L - s;
                         float *inw = malloc((size_t)ch * Lw * sizeof(float));
                         if (inw) {
                             for (int ic = 0; ic < ch; ic++)
