@@ -272,12 +272,14 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       soak; Poisson 1.5/2.5 req/s TTFA p95 172/175 ms; overload fail-fast works (per-worker
       cap). **C16 NOT RUN**: the spot host was reclaimed before Phase D. Handoff:
       `.work/turin-vnni-final-handoff-20260909.md`.
-- [ ] TQ-1 C16 density qualification on a fresh c8a.8xlarge with the frozen profile (same
-      runner as C12: class waves, quality wave, STAGE diag, long+short, overload, Poisson,
-      30-min SOAK); outcome is one of preferred point / density-only point, never a tuned
-      threshold. Commands: handoff §8.
-- [ ] TQ-2 Fail-fast boundary: at a full host 4 of 28 rejects surfaced as a TCP reset
-      instead of a 503 (Poisson 2.5 req/s, C12 profile) — the reject path must drain the
+- [x] TQ-1 C16 density qualification (2026-09-09, on-demand c8a.8xlarge, revision e1b1ec7):
+      waves STREAM p95 0.91-0.96, 30-min soak FAIL (pooled p95 1.004, short 1.045, 596
+      per-worker rejects, 111 broken-pipe errors) — C16 = hard-capacity boundary, not a
+      product point. Sweep C10-C16 + 10-min soaks C10/C11: knee at C13 (first B4 worker);
+      **preferred C11** (pooled soak 0.886; short class alone 0.917, and 0.905 at C10),
+      **mandatory-qualified C12**, **hard capacity C16**. Handoff §3.
+- [ ] TQ-2 Fail-fast boundary: at a full host rejects surface as TCP resets / broken pipes
+      instead of a 503 (4 of 28 in the C12 Poisson run, 111 of 707 in the C16 soak) — the reject path must drain the
       request before closing; also record that rejection is per worker (cap 4): C20 sent 8
       rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
       for a simultaneous wave when the parent balances.

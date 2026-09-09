@@ -121,12 +121,67 @@ was taken at spin 4096 on the 16-core profile; the frozen profile (spin 65536) m
 0.82-0.85 in waves. C12 is the recommended production point; a strict 0.90 SLA on short
 clips wants C10 (not measured here).
 
-### C16 — NOT RUN
+### C16 — DENSITY-ONLY / hard-capacity boundary, NOT qualified (on-demand host, 2026-09-09 12:48-13:31 UTC)
 
-The spot host was reclaimed at 12:25:55 GMT ("instance-terminated-no-capacity") after the
-C12 soak and before Phase D started. The screen of 2026-09-10 (C16 STREAM p95 0.919 short
-/ 0.881 long, prebuffer 360, stall@250 0) stands as the only C16 evidence and is SCREEN
-grade. Commands in section 8; the runner treats C16 exactly like C12.
+Same frozen profile, on-demand c8a.8xlarge `i-027eb619eec9be89e` (us-east-1b), revision
+e1b1ec7 (binary 63316641), Triad 186.3 GB/s, preflight PASS. Waves (3 x 16):
+
+| class | TTFB p95 | TTFA p95 | STREAM p50/p95 | TOTAL p95 | prebuffer p95 | safe-start p95 | stall @250/@500 |
+|---|---|---|---|---|---|---|---|
+| short | 154 | 352 | 0.888/**0.963** | 1.105 | 374 | 636 | 2/0 % |
+| medium | 225 | 360 | 0.883/**0.934** | 0.985 | 385 | 664 | 0/0 |
+| long | 218 | 357 | 0.888/**0.911** | 0.922 | 381 | 644 | 0/0 |
+| mixed | 157 | 358 | 0.882/**0.944** | 1.094 | 394 | 653 | 0/0 |
+| long+short | 222 | 354 | 0.882/**0.974** | 1.104 | 382 | 646 | 0/0 |
+
+SOAK 30 min closed-loop C16: **FAIL** — 2577 completed, STREAM p50/p95 **0.948/1.004**
+(short 1.045, long 0.967), TOTAL p95 1.04, prebuffer p95 358, safe-start p95 518,
+stall@250 6 %, stall@500 0; **596 intentional rejects** (16 closed-loop clients against a
+per-worker cap of 4: a client whose worker is full is bounced even when another worker
+has a slot) and **111 transport errors** (108 "Broken pipe", 3 "Connection reset" — the
+reject path closes the socket before the client has finished writing: the TQ-2 defect,
+now at scale). Resources and drift PASS. Poisson 2.0 req/s: TTFA p95 182 ms, 17 rejects;
+3.3 req/s: TTFA p95 194 ms, 50 rejects. Overload C24/C28: accepted 32, rejected 16/24,
+accepted streams STREAM p95 0.967/1.029. STAGE at C16 mixed: overlap share 32.0 %, CP
+18.5-25.3 ms outside overlap vs 35.3-36.8 inside, decoder unit 52.0 mean / 56.2 p95 ms.
+
+C16 is therefore the **hard-capacity boundary** of this architecture on this host: every
+stream still plays (stall@500 0) but STREAM p95 crosses 1.0 in sustained closed loop and
+the fail-fast boundary is exercised continuously. Not a product point.
+
+### Capacity curve (sweep, 3 waves per level, frozen profile, on-demand host)
+
+| C | mixed STREAM p50/p95 | short STREAM p50/p95 | TTFA p95 mixed/short | prebuffer p95 | safe-start p95 | stall@250 |
+|---|---|---|---|---|---|---|
+| 10 | 0.738/**0.842** | 0.756/**0.842** | 277/268 | 268/260 | 490/465 | 0 |
+| 11 | 0.780/**0.830** | 0.795/**0.879** | 269/273 | 256/258 | 460/473 | 0 |
+| 12 | 0.771/**0.849** | 0.813/**0.862** | 279/266 | 272/263 | 489/472 | 0 |
+| 13 | 0.806/**0.881** | 0.832/**0.963** | 344/339 | 361/367 | 612/624 | 0 |
+| 14 | 0.805/**0.924** | 0.832/**0.944** | 348/347 | 364/366 | 617/623 | 0 |
+| 16 | 0.854/**0.940** | 0.898/**1.005** | 350/363 | 369/379 | 625/649 | 0 |
+
+The knee is at C13: the first level where a worker holds 4 streams (B4) — prebuffer jumps
+260 -> 360 ms, safe-start 470 -> 620, short STREAM p95 0.86 -> 0.96.
+
+Short soaks, 10 min closed-loop, temperature 0.9 (preferred-point probes, not
+qualification soaks):
+
+| C | n | STREAM p50/p95 all | short | conversational | medium | long | italian | TTFA p95 | prebuffer p95 | safe-start p95 | stall @250/@500 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 10 | 652 | 0.821/**0.878** | 0.905 | 0.859 | 0.874 | 0.847 | 0.860 | 168 | 236 | 378 | 0/0 |
+| 11 | 696 | 0.837/**0.886** | 0.917 | 0.874 | 0.873 | 0.855 | 0.872 | 172 | 245 | 393 | <=1/0 |
+| 12 (30 min) | 2209 | 0.838/**0.912** | 0.959 | 0.914 | 0.885 | 0.880 | 0.888 | 170 | 262 | 408 | <=1/0 |
+
+### The three capacities of this architecture (1.7B, this host)
+
+* **Preferred capacity: C11** — pooled STREAM p95 <= 0.90 in sustained closed loop (0.886)
+  and every wave class <= 0.88, with the caveat that the **short class alone is 0.917 at
+  C11 and already 0.905 at C10** in closed loop: the short-clip fixed cost, not the frame
+  law, is what keeps a class-clean 0.90 out of reach (PLAN C12-WIN-3).
+* **Mandatory-qualified capacity: C12** — every class STREAM < 1, prebuffer p95 262 ms,
+  safe-start 408, stall@500 0, zero errors over 30 min.
+* **Hard capacity: C16** — sustained STREAM p95 crosses 1.0, rejects and reset/broken-pipe
+  errors under closed loop; C13-C14 sit between (waves short 0.94-0.96, no soak).
 
 ## 4. Quality status of RES1_V2 (Phase B, 2026-09-09, revision 28d6436)
 
@@ -205,11 +260,12 @@ ear**, and the product profile stays `provisional`.
   (29.8 % at C12 mixed) and the fixed ~+13 ms CP tax per overlapped iteration follows it.
 * Short clips under closed-loop soak sit at STREAM p95 0.959: the fixed per-request cost
   (admission + first-chunk ramp 1,2,4) is the lever for the short class, not the frame law.
-* C16: screen only; the short-class tail margin is smaller than C12's (0.919 vs 0.848 in
-  the screen vs wave).
-* Fail-fast boundary: 4 of 28 rejects at a full host surfaced as a TCP reset instead of a
-  503 (client-visible, no audio impact); the rejection is per worker, so a host with free
-  slots elsewhere still rejects (8 rejects at C20 with 16 slots).
+* C13 is the knee (first B4 worker): prebuffer/safe-start jump ~100/150 ms; C16 sustained
+  STREAM p95 crosses 1.0. Density above C12 needs a shorter decoder unit, not tuning.
+* Fail-fast boundary: at a full host rejects surface as TCP resets / broken pipes instead
+  of a 503 (4/28 in the C12 Poisson run, 111 in the C16 soak); the rejection is per worker,
+  so a host with free slots elsewhere still rejects (8 rejects at C20 with 16 slots, 596 in
+  the C16 closed-loop soak).
 * Cross-ISA: `qwen_conv1d_int8_v2` and the decoder lane exist for x86 AVX-512 VNNI + Linux
   only (stubs elsewhere); AMX/Arm equivalents are neither implemented nor qualified.
 
@@ -248,7 +304,8 @@ their raw outputs are in `.work/evidence/turin-qualification-20260909/` (local o
 
 ## 9. Git state
 
-Branch `feature/x86-amx-vnni-oss`, pushed to origin. Commits of this sprint on top of
+Branch `feature/x86-amx-vnni-oss`; pushed through e1b1ec7, later commits local only (no
+push unless the user asks). Commits of this sprint on top of
 94be84d (DL-4 kernel): 1acf02e (frozen profile + verifiable lane/V2 contracts + V2
 self-test), 7c2490f (self-test window fix), 28d6436 (control profile) — every Phase B/C
 number was produced by a clean checkout of 28d6436 — and the closing docs commit. Worktree
