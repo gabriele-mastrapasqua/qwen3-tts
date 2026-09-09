@@ -480,7 +480,43 @@ typedef struct {
     size_t amx_bf16_bytes;
     int amx_bf16_Kp;
     int Kp;
+    int8_t *q2; float *sw2; int32_t *wsum2; int Cp2; int v2_tried;   /* DL-4 per-(channel,tap) layout */
 } sd_wq_entry_t;
+
+static int sd_res1_v2_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_RES1_V2"); v = (e && atoi(e) != 0 && qwen_conv1d_int8_v2_available()) ? 1 : 0; }
+    return v;
+}
+/* Build the DL-4 layout for a residual conv: wq2[m][kk][Cp] with one scale and one weight
+ * sum per (m, kk); the f32 weight is [out_ch][in_ch][kernel] (kk fastest, the im2col order). */
+static void sd_wq_build_v2(sd_wq_entry_t *e, const float *w, int ch, int kernel) {
+    if (e->v2_tried) return;
+    e->v2_tried = 1;
+    const int Cp = (ch + 63) & ~63;
+    int8_t *q2 = (int8_t *)aligned_malloc((size_t)ch * kernel * Cp);
+    float *sw2 = (float *)aligned_malloc((size_t)ch * kernel * sizeof(float));
+    int32_t *ws2 = (int32_t *)aligned_malloc((size_t)ch * kernel * sizeof(int32_t));
+    if (!q2 || !sw2 || !ws2) { free(q2); free(sw2); free(ws2); return; }
+    for (int m = 0; m < ch; m++) {
+        for (int kk = 0; kk < kernel; kk++) {
+            const float *row = w + (size_t)m * ch * kernel;
+            float amax = 0.0f;
+            for (int ic = 0; ic < ch; ic++) { float a = fabsf(row[(size_t)ic * kernel + kk]); if (a > amax) amax = a; }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+            int8_t *d = q2 + ((size_t)m * kernel + kk) * Cp;
+            int32_t acc = 0;
+            for (int ic = 0; ic < Cp; ic++) {
+                int v = 0;
+                if (ic < ch) { float x = row[(size_t)ic * kernel + kk] * inv; v = (int)(x >= 0 ? x + 0.5f : x - 0.5f); if (v > 127) v = 127; if (v < -127) v = -127; }
+                d[ic] = (int8_t)v; acc += v;
+            }
+            sw2[(size_t)m * kernel + kk] = scale;
+            ws2[(size_t)m * kernel + kk] = acc;
+        }
+    }
+    e->q2 = q2; e->sw2 = sw2; e->wsum2 = ws2; e->Cp2 = Cp;
+}
 
 #define SD_WQ_MAX 128
 static sd_wq_entry_t sd_wq[SD_WQ_MAX];
@@ -660,6 +696,17 @@ static void causal_conv1d_blas(float *out, const float *in,
                 qwen_conv1d_int8_design_d(out, in, e->q, e->scales, e->wsum, bias,
                                           e->amx_d_wpack, in_ch, out_ch, length,
                                           kernel, dilation, e->Kp, sd_int8_blk());
+            else if (use_i8 && e->q && kernel >= 1 && in_ch == out_ch && (in_ch & 3) == 0 &&
+                     sd_res1_v2_enabled() && (e->q2 || !e->v2_tried)) {
+                if (!e->q2) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, weight, in_ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
+                if (e->q2)
+                    qwen_conv1d_int8_v2(out, in, e->q2, e->sw2, e->wsum2, bias,
+                                        in_ch, length, kernel, dilation, e->Cp2);
+                else
+                    qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
+                                     in_ch, out_ch, length, kernel, dilation,
+                                     e->Kp, sd_int8_blk());
+            }
             else if (use_i8 && e->q)
                 qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
                                  in_ch, out_ch, length, kernel, dilation,

@@ -477,6 +477,14 @@ void qwen_conv1d_int8(float *out, const float *in,
                       int in_ch, int out_ch, int length, int kernel, int dilation,
                       int Kp, int blk);
 
+/* DL-4 (QWEN_SD_RES1_V2): direct dilated causal conv1d on int8 VNNI for the decoder's
+ * residual convs (in_ch == out_ch, k taps).  Activations are quantised once per time
+ * position (one scale per position), weights once per (channel, tap) — no im2col panel.
+ * wq [ch][kernel][Cp] s8, sw/wsum [ch][kernel]; Cp = ch rounded up to 64. */
+int  qwen_conv1d_int8_v2_available(void);
+void qwen_conv1d_int8_v2(float *out, const float *in,
+                         const int8_t *wq, const float *sw, const int32_t *wsum,
+                         const float *bias, int ch, int length, int kernel, int dilation, int Cp);
 void qwen_conv1d_int8_design_d(float *out, const float *in,
                                const int8_t *Wq, const float *sw, const int32_t *wsum,
                                const float *bias, const int8_t *Wpack,

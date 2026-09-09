@@ -251,3 +251,60 @@ separate f32 panel materialisation, measured by decoder unit time on 4 threads a
 Code kept from this cycle (all default-off or bug fixes): `overlap` field in `[STAGE]`,
 `QWEN_SD_LANE_SUBQ`, `QWEN_SD_NTA`, hot lane workers during a unit, panel sizing by the lane
 team. Raw runs: `~/bench/lane/dl3*`, `~/bench/lane/c-dl2b-*` on the host.
+
+## 10. DL-4 — direct dilated conv kernel for the residual convs (2026-09-10 00:45-00:56)
+
+Built (`QWEN_SD_RES1_V2=1`, default-off; `qwen_conv1d_int8_v2` in `qwen_tts_kernels.c`,
+weight layout `sd_wq_build_v2` in the decoder): for the residual convs (in_ch == out_ch,
+k = 7 dilated and the 1x1 conv2) the input is transposed and quantised ONCE per time
+position (one scale per position, stored u8 = x+128 so the inner loop has no XOR), the
+weights live per (channel, tap) with their own scale and weight sum, and a 4-channel x
+4-position register tile walks the taps directly (16 `dpbusd` per 8 loads; each weight
+vector feeds four positions, each activation vector four channels); a time block reads
+the layer's weights once, against the panel path's 32 re-reads per panel and its 7-tap
+f32 im2col column per position. The first build applied the taps mirrored (parity
+correlation −0.11); tap kk reads position t − (K−1−kk)·dil, as the panel builder does.
+
+Pre-registered gates and results (same single-CCX setup, one worker `1x8@0-7`, 1.7B, q4, SL-1):
+
+| gate | target | result |
+|---|---|---|
+| 1. kernel: res1 wall, no quality regression | ≥ 1.5x | **res1 13.4 → 7.8 ms** per 4-frame call at 8T (1.72x); on the 4-thread lane 29-32 → 17.1 (1.8x); res2 (1x1) 5.1 → 2.0; decoder call at 8T 33.0 → 24.4 ms. Parity inline vs V2, same seed/text: correlation 0.99978, max diff 572 LSB, rms 57 LSB — a numerical change (per-position / per-(channel,tap) scales instead of per-256 blocks), above the 0.99 gate, to be qualified like any numerical change before promotion |
+| 2. decoder unit on 4 lane threads | 60-65 → ≤ 45-48 ms | **49.8 ms** (−24 %); missed by 2-5 ms. What remains in the unit: convt 8.6, res1 17.1, res2 4.0, resadd 3.5, alloc 1.5, final 1.3, snake 1.0, transformer/cnext/init ≈ 12 |
+| 3. architecture: overlap share down, long B4 < 0.90, fixed B4 → ≤ 0.92 | | overlap share **48 → 39 %** (long), 24 → 18 % (fixed); **long B4 STREAM p95 0.869** (was 0.895), **fixed B4 0.918** (was 0.987), prebuffer p95 345 ms (was 451), stall@250 0 % on both; per overlapped iteration the CP tax is unchanged (34-35 ms), exactly as the overlap-duration model predicts |
+
+The DL-1 gate as originally written (fixed B4 ≤ 0.92 AND long B4 ≤ 0.90 with stall@250 = 0)
+is met on one CCX by elastic lane + V2 conv. Per the owner's rule the 4x8 host screen at
+C8/C12/C16 follows (§11).
+
+Not done: the lifecycle/parity gate set of §4 was not repeated for V2 (the kernel changes
+numerics, not lifecycle); `res2` on V2 changes the 1x1 conv's quantisation too. Both are
+part of the qualification that a promotion would need.
+
+## 11. Host screen after DL-4 (2026-09-10 00:57-01:00): 4x8 cap 4, elastic lane + V2 conv
+
+`--topo 4x8 --batch-cap 4`, q4, SL-1, `QWEN_SD_LANE_SPLIT=4 QWEN_SD_LANE_ELASTIC=1
+QWEN_SD_RES1_V2=1`, profile aws-c8a-16c-vnni-ttfa, one wave per level, all four workers
+report `LANE ENABLED (ELASTIC)` on their own CCX (0-7, 8-15, 16-23, 24-31). SCREEN grade.
+
+| bank | C | TTFB p95 | TTFA p95 | STREAM p50/p95 | TOTAL p95 | prebuffer p95 | safe-start p95 | max gap p95 | stall @100/@250/@500 | req/s | cores |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| short | 8 | 49 | 183 | .730/**.751** | .827 | 143 | 293 | 268 | 0/0/0 % | 3.67 | 26.1 |
+| short | 12 | 103 | 265 | .793/**.814** | .947 | 247 | 452 | 310 | 67/0/0 % | 4.89 | 27.7 |
+| short | 16 | 133 | 341 | .864/**.919** | 1.067 | 360 | 598 | 356 | 100/0/0 % | 5.73 | 26.7 |
+| long | 8 | 55 | 188 | .717/**.721** | .725 | 144 | 299 | 265 | 0/0/0 % | — | 28.4 |
+| long | 12 | 107 | 264 | .784/**.798** | .807 | 246 | 448 | 308 | 67/0/0 % | — | 28.7 |
+| long | 16 | 143 | 341 | .863/**.881** | .891 | 358 | 604 | 356 | 100/0/0 % | — | 28.3 |
+
+Against the inline engine on the same host one day earlier (fast-screen §3): 4x8 cap 2 C8
+STREAM p95 0.87 with stall@250 12-25 %, C10 over realtime. Now C8 0.72-0.75, **C12 0.80-0.81
+with prebuffer 247 ms and stall@250 0 %**, **C16 0.88 (long) / 0.92 (short) with prebuffer
+360 ms and stall@250 0 %**. Zero errors or rejects at every level. Read against the PLAN
+gates: C12 meets every preferred target on both banks in this screen (STREAM ≤ 0.90,
+prebuffer ≤ 500, safe-start ≤ 1 s, stall@250 0); C16 meets the mandatory set and the
+preferred STREAM on the long bank, and sits at 0.919 on the short bank.
+
+What this is not: a qualification. One wave, the provisional profile, no SOAK, no Poisson,
+no class-mix, and V2's numerics not yet ear/mel-qualified. What it is: the first time this
+host serves C16 of 1.7B under the complete playback envelope in a screen, twice the
+inline engine's C8, on the architecture DL-1/DL-2 built and the kernel DL-4 fed it.

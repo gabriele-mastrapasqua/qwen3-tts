@@ -223,7 +223,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       is ~+20 ms per overlapped iteration whatever the decoder does; only the overlap
       share (decoder time on 4 cores, 15-16 ms/frame) scales it. **Next: DL-4 = res1/conv
       kernel efficiency on the lane (fewer weight re-reads, no separate f32 panel),
-      metric = decoder unit ms on 4 threads and overlap share.** Detail:
+      metric = decoder unit ms on 4 threads and overlap share.** DL-4 built
+      (`QWEN_SD_RES1_V2=1`, direct dilated conv, per-position quant, 4x4 register tile,
+      weights read once per time block): res1 1.72x, unit 64 -> 50 ms, overlap share
+      48 -> 39 %, lane B4 long 0.869 / fixed 0.918 (gate met); **4x8 host screen: C12
+      STREAM p95 0.80-0.81 prebuffer 247 ms stall@250 0 %, C16 0.88 long / 0.92 short
+      prebuffer 360 ms stall@250 0 % — twice the inline C8. Screen only: next = SOAK
+      C12/C16 with a qualified profile and the V2 numerics ear/mel-qualified.** Detail:
       `.work/dl1-decoder-lane-split-20260909.md`.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
       retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
