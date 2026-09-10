@@ -132,6 +132,84 @@ repeating the two-step history x86 went through. Its exactness oracle already ex
 ISA-neutral: the `conv1d_int8_v2` self-test cases assert the context+residual path is
 bit-identical to the contiguous one.
 
+## 2c. Where Arm decoder time actually goes — and one hypothesis the reviewer killed
+
+REPORTED-MEASURED by the reviewer on their Arm box (open 0.6B weights, `--stream`,
+`QWEN_SD_INT8=1`, `QWEN_SD_PHASE=1`, warm 10-frame quantum). Not reproducible here — no Arm
+Linux host — so it is recorded with its provenance and not as our own number.
+
+| component | ms | share of `conv_up` |
+|---|---:|---:|
+| **res1** (k=7 dilated) | 52-56 | **48 %** |
+| convt | 26-28 | 24 % |
+| snake | 12-15 | 11-13 % |
+| res2 (k=1) | 9-10 | 9 % |
+| resadd | 4.0-4.2 | 4 % |
+
+The conv stack is ~92 % of the decoder unit (`conv=124.3` of `total=135.0`). If that holds,
+**the missing V2 leaf points at the single largest item on Arm**, and item 8 of section 5 is
+the right place to spend, not a tidy-up elsewhere.
+
+**A hypothesis proposed, measured and withdrawn — do not chase it again.** The AMX
+strip/range "compute only the new output columns" path looked portable: the driver is the
+generic `sd_conv_job_t` + pool, already compiled on Arm, and the only coupling to AMX is a
+`Wpack != NULL` test that could simply be dropped. The reviewer measured the size of the
+prize first: the control path discards **0.4 %** of its output columns at a 10-frame quantum
+(1.9 % at 2 frames), and the `ext` build plus the `cut` copy are ~3.0 ms of a 55.5 ms
+residual-conv total, about 5 %. So the change buys single digits at best and only at small
+quanta. **Do it for tidiness if the code becomes cleaner, never for the number.** Recorded
+because it is exactly the kind of plausible-sounding port that gets re-proposed.
+
+The same "portable body, ISA-locked leaf" shape appears three times — CP/Talker regions
+(x86-guarded body, Arm KleidiAI leaf already written), the Design-D panel driver, and the
+strip/range entries. Useful framing for scoping: what is bolted to one ISA is a tile kernel
+and a weight pack, not the scheduling or the dataflow.
+
+## 2d. The September AMX gaps are closed — do not reopen them
+
+REPORTED, structurally consistent with what is readable here (`qwen_region_i8_backend`
+carries an `__AMX_INT8__` branch reporting "AMX int8 tiles" at B>=4). The three gaps in
+`docs/cross-backend-audit-2026-09-05.md` §2 — regions off at B>=4, batched CP heads off for
+the same reason, and the bf16 AMX matmat allocating per call — are all closed on this
+branch. Anyone reading that older page should not re-open them.
+
+What AMX still lacks is the V2 residual conv, and that is a **choice, not a gap**:
+`causal_conv1d_blas` places Design-D ahead of V2, so on an AMX host with `QWEN_SD_AMX_D=1`
+the V2 branch is unreachable by construction. Worth a sentence in the docs so nobody "fixes"
+it.
+
+## 2e. GPU serving — one real bug, and a scoping fact for our own roadmap
+
+Not an Arm item; recorded here because it arrived with the same review and needs a home.
+
+**VERIFIED here: `--backend cuda --prefork N` has no guard.** `main.c` creates the resident
+CUDA Talker/CP state at :1665 (`QWEN_CUDA_FUSED_TALKER`), and `qwen_tts_serve_prefork` is
+called at :3082 — the context is built BEFORE the fork, and a CUDA context does not survive
+`fork()`. Children inherit handles they cannot use. A search for any mutual exclusion across
+`main.c`, `qwen_tts.c`, `qwen_tts_server.c` and `qwen_tts_cuda.c` returns nothing, and the
+transport layer contains zero CUDA references (confirmed: `grep -ci cuda qwen_tts_server.c`
+= 0), so nothing downstream catches it either. macOS escapes only by accident, through the
+non-Linux `qwen_tts_serve_prefork` stub. This is a silent wrong-answer path, which is worse
+than a crash. Fix: refuse the combination, or fall back to the single-process batched server
+with a warning, in the same shape as the existing non-Linux stub.
+
+**VERIFIED here: the global GPU seam is bf16-only.** `qwen_tts_backend.h` exposes exactly
+`matvec_bf16` and `matmat_bf16`. So `--backend cuda` WITHOUT the fused/resident env vars
+offloads nothing on an `--int8` or `--quant-mixed` run — which is what the product profiles
+use — while the startup line still advertises GPU offload. That line should say when it will
+have no effect.
+
+**Scoping fact that touches the C12-WIN roadmap.** Every mechanism of this generation that
+we are qualifying — the decoder lane, `QWEN_SD_INT8`, `RES1_V2`, `GLUE`, `CONVT_STACK`,
+Design-D — is a CPU decoder mechanism, and a GPU-resident decoder replaces that component
+wholesale rather than tuning it. So **specs 11A and 12 have no value on a GPU lane**, and
+none of the Arm decoder work would either. What does carry over is the backend-agnostic
+layer: admission, prefix cache, stream layout, `--max-queue`, 503 semantics. Also worth
+knowing before anyone quotes GPU readiness: the reported CUDA numbers are throughput and
+RTF from an earlier serving generation, and the playback-aware contract this branch
+qualifies against (STREAM p95, prebuffer, safe-start, stall@250/@500, soak) has never been
+run on a GPU build.
+
 ## 3. Reported but NOT verified here
 
 Recorded so nobody treats them as established. Each needs one command on an Arm Linux host.
@@ -185,7 +263,8 @@ Priority MEDIUM as a track. Item 0 is the exception and is not medium.
 6. §1.9 requalify the two Arm decoder defaults.
 7. §1.8 region-body wiring, via the existing `.work/decoder-xisa-deferred-track-20260909.md`
    item 2. Not before the rest.
-8. The DL-4 leaf for dotprod/i8mm (section 2b). Sized as one kernel against an already
+8. The DL-4 leaf for dotprod/i8mm (sections 2b and 2c) — aimed at ~48 % of the Arm decoder
+   unit if the reported cost map holds. Sized as one kernel against an already
    ISA-neutral packing path, written against the `_ctx` contract, and closing Arm, AVX2 and
    AVX-512F together. Rename or re-document `QWEN_SD_RES1_V2` and the `decoder.res1_v2` row
    first, and declare the `in_ch <= 768` gate in the map, or the next reader repeats (a).
