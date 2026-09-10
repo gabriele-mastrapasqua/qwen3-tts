@@ -244,7 +244,18 @@ def analyze(directory, args):
         return 1
 
     rows, errors, rejects = read_requests(request_path)
-    usable_all = [row for row in rows if row["t"] >= args.warmup_s]
+    # THE TAIL IS NOT STEADY STATE.  The closed-loop client stops ADMITTING at the
+    # deadline, so in the last stretch of a run no new work enters and only what is
+    # already in flight can finish.  The long classes take the longest, so they are the
+    # ones that stop appearing first: the final window ends up with a handful of them,
+    # the per-class p95 becomes uncomputable, and the completed-class mix shifts enough
+    # that the pooled drift is refused.  Both are artefacts of the stopping rule, not of
+    # the server.  --cooldown-s drops that drain tail, exactly as --warmup-s drops the
+    # ramp at the other end, so the compared windows are both full-admission windows.
+    # Set it to a little more than the longest utterance the bank can produce.
+    horizon = max((row["t"] for row in rows), default=0.0) - args.cooldown_s
+    usable_all = [row for row in rows
+                  if row["t"] >= args.warmup_s and (args.cooldown_s <= 0 or row["t"] <= horizon)]
     usable = [row for row in usable_all if not row["probe"]]
     if not usable:
         print("FAIL: no completed requests after warm-up")
@@ -280,7 +291,7 @@ def analyze(directory, args):
     print(f"completed={len(usable_all)} kpi_samples={len(usable)} "
           f"audio_probes={len(usable_all) - len(usable)} errors={len(errors)} "
           f"intentional_rejects={len(rejects)} duration_s={end:.1f} "
-          f"warmup_s={args.warmup_s:.0f}")
+          f"warmup_s={args.warmup_s:.0f} cooldown_s={args.cooldown_s:.0f}")
     print(f"windows={len(windows)} window_s={args.window_s:.0f} "
           f"min_per_window={args.min_per_window}")
     print()
@@ -462,6 +473,7 @@ def analyze(directory, args):
         "request_timeout": request_timeouts,
         "duration_s": end,
         "warmup_s": args.warmup_s,
+        "cooldown_s": args.cooldown_s,
         "windows": [{key: value for key, value in window.items() if key != "rows"}
                      for window in windows],
         "latency_kpi": kpi,
@@ -485,6 +497,9 @@ def main():
     parser.add_argument("directory")
     parser.add_argument("--window-s", type=float, default=60.0)
     parser.add_argument("--warmup-s", type=float, default=60.0)
+    parser.add_argument("--cooldown-s", type=float, default=0.0,
+                        help="drop requests finishing in the last N seconds: the drain "
+                             "tail after the client stops admitting is not steady state")
     parser.add_argument("--min-per-window", type=int, default=5)
     parser.add_argument("--min-per-class", type=int, default=3)
     parser.add_argument("--min-per-class-p50", type=int, default=5)
