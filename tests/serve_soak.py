@@ -142,11 +142,31 @@ def profile_command(args):
 
 
 def open_model_name(model):
+    """The label that stands in for the checkpoint everywhere an artifact is written.
+
+    The soak's manifest, its printed argv and its KPI rows are meant to be publishable, so
+    the checkpoint's PATH must never reach them -- only a name. For the open weights that
+    name is the directory itself. A checkpoint that is not open needs an explicit neutral
+    label instead: QWEN_SOAK_MODEL_ALIAS is that label, it is validated to be a short plain
+    token, and it -- never the path -- is what the artifacts carry. Without it a non-open
+    checkpoint is refused, so the failure mode stays "no soak" rather than "a soak whose
+    manifest names something that should not be published".
+    """
     name = os.path.basename(os.path.normpath(model))
-    if name not in OPEN_MODELS:
-        allowed = ", ".join(sorted(OPEN_MODELS))
-        raise SystemExit(f"model {name!r} is not an allowed open model ({allowed})")
-    return name
+    if name in OPEN_MODELS:
+        return name
+    alias = os.environ.get("QWEN_SOAK_MODEL_ALIAS", "").strip()
+    if alias:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", alias):
+            raise SystemExit(
+                "QWEN_SOAK_MODEL_ALIAS must be a short lowercase label "
+                "([a-z0-9][a-z0-9._-]{0,63}); it is written into published artifacts")
+        return alias
+    allowed = ", ".join(sorted(OPEN_MODELS))
+    raise SystemExit(
+        f"model {name!r} is not an allowed open model ({allowed}). "
+        "To soak a checkpoint that is not open, set QWEN_SOAK_MODEL_ALIAS to a neutral "
+        "label: the alias, never the path, is what reaches the manifest.")
 
 
 def sha256(path):
