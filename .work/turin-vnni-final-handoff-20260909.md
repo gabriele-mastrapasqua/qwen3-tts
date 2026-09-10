@@ -266,8 +266,13 @@ ear**, and the product profile stays `provisional`.
   of a 503 (4/28 in the C12 Poisson run, 111 in the C16 soak); the rejection is per worker,
   so a host with free slots elsewhere still rejects (8 rejects at C20 with 16 slots, 596 in
   the C16 closed-loop soak).
-* Cross-ISA: `qwen_conv1d_int8_v2` and the decoder lane exist for x86 AVX-512 VNNI + Linux
-  only (stubs elsewhere); AMX/Arm equivalents are neither implemented nor qualified.
+* Cross-ISA: `qwen_conv1d_int8_v2` exists for x86 AVX-512 VNNI and Arm dot-product only.
+  **CORRECTION 2026-09-10:** the decoder lane is NOT x86-only, as this line originally
+  claimed. `qwen_lane_split_prepare` (`qwen_tts_thread.c`) is guarded by `__linux__` and
+  nothing else, contains no intrinsic, and has been observed running on an Arm Linux host.
+  It is the one server mechanism of this generation that ports unchanged and that no Arm
+  profile currently sets. See `.work/arm-linux-v2-parity-track-20260910.md`.
+  AMX/Arm equivalents of the int8 conv are neither implemented nor qualified.
 
 ## 8. Exact next commands (on a fresh c8a.8xlarge, Ubuntu 26.04)
 

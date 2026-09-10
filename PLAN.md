@@ -181,6 +181,22 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
 - Stop: if no target, no falsifier and no screen moves C12 above noise, hand the evidence to
       the post-Turin architecture review instead of stacking micro-optimizations.
 
+### Deferred ARM-LINUX-V2 — parity for the v2 serving generation and C12-WIN (MEDIUM)
+
+- [ ] After the Turin C12-WIN track closes, bring Arm Linux serving up to the v2 generation.
+      Track document with the verified/unverified split, the ordered work and the
+      do-not-carry-over list: `.work/arm-linux-v2-parity-track-20260910.md`.
+      Headline finding, CONFIRMED against this tree: the decoder lane
+      (`QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC`) has NO ISA guard — only `__linux__` —
+      so the mechanism of record on the Turin product profile ports to Arm unchanged, and no
+      Arm profile sets it. The reason it was never tried is a wrong sentence in our own
+      handoff, corrected 2026-09-10. Also confirmed: the five newest decoder flags have zero
+      entries in `docs/feature-flags.md`, and `g_mm_gate[]` has no KleidiAI int8/bf16 rows.
+      NOT established and not to be quoted: every Arm serving number behind this, which came
+      from an unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
+      server — below the regime the lane exists for.
+      Ordering: the build break above is NOT part of this track and must not wait for it.
+
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
 - [ ] After the Turin C12-WIN track reaches a stable checkpoint, commonize the winning
@@ -356,6 +372,17 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       request before closing; also record that rejection is per worker (cap 4): C20 sent 8
       rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
       for a simultaneous wave when the parent balances.
+- [ ] TQ-6 BUILD BREAK, not Arm-specific: the tree does not link when neither
+      `__ARM_FEATURE_DOTPROD` nor `__AVX512VNNI__` is defined — `SIMD=portable` (the default
+      non-VNNI x86 target) and `SIMD=scalar` both fail. Seven symbols are declared and called
+      unconditionally but defined only inside the ISA guard in `qwen_tts_kernels.c`, and the
+      `#else` fallback sits inside that guard, so it is unreachable. VERIFIED at HEAD with
+      `make blas ARCH_FLAGS="-march=armv8-a"`. Partly introduced by C12-WIN: `_ctx` in
+      ddfa5d8, `_pack_stack`/`_stack_epilogue` in edfd3fb. Fix: an unconditional fallback
+      section outside the guard, and move the two ConvT helpers out of the ISA guard entirely
+      (they contain no intrinsic). Add `SIMD=portable` and `SIMD=scalar` link-only CI jobs —
+      this break is invisible on a VNNI or dotprod host. Detail:
+      `.work/arm-linux-v2-parity-track-20260910.md` section 1.
 - [ ] TQ-5 HTTP JSON string parsing: `json_extract_string()` performs NO unescaping — it
       skips a character after a backslash while scanning for the closing quote, then copies
       the raw bytes. Every escape reaches the tokenizer literally (`\uXXXX`, `\"`, `\n`,
