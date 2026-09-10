@@ -196,6 +196,13 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       from an unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
       server — below the regime the lane exists for.
       Ordering: the build break above is NOT part of this track and must not wait for it.
+      Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
+      convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
+      largest single item. DO NOT chase the AMX strip/range port: it was measured first and
+      discards only 0.4 % of columns at a 10-frame quantum (~5 % of residual-conv time). The
+      three September AMX gaps are CLOSED on this branch; do not reopen them from the older
+      cross-backend audit page. AMX lacking V2 is a dispatch-order CHOICE (Design-D precedes
+      V2), not a gap.
 - [ ] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
       `.work/arm-linux-v2-parity-track-20260910.md` section 2b. Four facts the dispatch map
       does not show: `QWEN_SD_RES1_V2` selects on SHAPE (`kernel>=1 && in_ch==out_ch &&
@@ -384,6 +391,19 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       request before closing; also record that rejection is per worker (cap 4): C20 sent 8
       rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
       for a simultaneous wave when the parent balances.
+- [ ] TQ-7 GPU serving: `--backend cuda --prefork N` is silently broken. VERIFIED at HEAD:
+      the resident CUDA Talker/CP state is created in `main.c` (~:1665) BEFORE
+      `qwen_tts_serve_prefork` (~:3082) forks; a CUDA context does not survive `fork()`, and
+      no guard exists anywhere (`grep -ci cuda qwen_tts_server.c` = 0, no mutual exclusion in
+      main/qwen_tts/cuda). macOS escapes only via the non-Linux prefork stub. Silent wrong
+      answer, not a crash. Fix: refuse the combination, or fall back to the single-process
+      batched server with a warning. Related: the global GPU seam is bf16-only
+      (`qwen_tts_backend.h` exposes only `matvec_bf16`/`matmat_bf16`), so `--backend cuda`
+      with `--int8` offloads nothing while the startup line still advertises offload.
+      Scoping note: specs 11A/12 and the Arm decoder work carry NO value on a GPU lane, since
+      a GPU-resident decoder replaces that component rather than tuning it; the
+      backend-agnostic layers do carry over. Detail:
+      `.work/arm-linux-v2-parity-track-20260910.md` section 2e.
 - [ ] TQ-6 BUILD BREAK, not Arm-specific: the tree does not link when neither
       `__ARM_FEATURE_DOTPROD` nor `__AVX512VNNI__` is defined — `SIMD=portable` (the default
       non-VNNI x86 target) and `SIMD=scalar` both fail. Seven symbols are declared and called
