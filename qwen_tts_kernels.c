@@ -8302,15 +8302,20 @@ void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, 
     }
 }
 
-void qwen_causal_attention_bf16kv(float *out, const float *Q,
-                                  const uint16_t *K_bf16, const uint16_t *V_bf16,
-                                  int seq_q, int seq_k, int n_heads, int n_kv_heads,
-                                  int head_dim, float scale, int q_offset) {
+/* Head-ranged body of the bf16-KV attention.  Split out of
+ * qwen_causal_attention_bf16kv so a multi-row query block (a sliced prefill) can
+ * be spread over the pool exactly the way qwen_causal_attention_prefill spreads
+ * the f32 one.  Called with [0, n_heads) it is the previous function verbatim. */
+void qwen_causal_attention_bf16kv_heads(float *out, const float *Q,
+                                        const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                        int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                        int head_dim, float scale, int q_offset,
+                                        int h_lo, int h_hi) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
 
-    for (int h = 0; h < n_heads; h++) {
+    for (int h = h_lo; h < h_hi; h++) {
         int kv_h = h / heads_per_kv;
 
         for (int i = 0; i < seq_q; i++) {
@@ -8441,6 +8446,52 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
             }
         }
     }
+}
+
+void qwen_causal_attention_bf16kv(float *out, const float *Q,
+                                  const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                  int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                  int head_dim, float scale, int q_offset) {
+    qwen_causal_attention_bf16kv_heads(out, Q, K_bf16, V_bf16, seq_q, seq_k,
+                                       n_heads, n_kv_heads, head_dim, scale, q_offset,
+                                       0, n_heads);
+}
+
+typedef struct {
+    float *out; const float *Q; const uint16_t *K, *V;
+    int seq_q, seq_k, n_heads, n_kv_heads, head_dim, q_offset;
+    float scale;
+} qwen_attn_bf16kv_job_t;
+
+static void qwen_attn_bf16kv_task(size_t tid, size_t nt, void *ctx) {
+    const qwen_attn_bf16kv_job_t *j = (const qwen_attn_bf16kv_job_t *)ctx;
+    int per = (j->n_heads + (int)nt - 1) / (int)nt;
+    int h0 = (int)tid * per, h1 = h0 + per;
+    if (h0 >= j->n_heads) return;
+    if (h1 > j->n_heads) h1 = j->n_heads;
+    qwen_causal_attention_bf16kv_heads(j->out, j->Q, j->K, j->V, j->seq_q, j->seq_k,
+                                       j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
+                                       j->q_offset, h0, h1);
+}
+
+/* Multi-row query block against a bf16 KV cache, parallel over heads.  The head
+ * split is a pure partition of the output rows, so the result does not depend on
+ * the thread count. */
+void qwen_causal_attention_bf16kv_prefill(float *out, const float *Q,
+                                          const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                          int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                          int head_dim, float scale, int q_offset) {
+    int nt = qwen_get_threads();
+    if (nt > n_heads) nt = n_heads;
+    if (nt > 1 && seq_q > 1) {
+        qwen_attn_bf16kv_job_t job = { out, Q, K_bf16, V_bf16, seq_q, seq_k, n_heads,
+                                       n_kv_heads, head_dim, q_offset, scale };
+        qwen_parallel((size_t)nt, qwen_attn_bf16kv_task, &job);
+        return;
+    }
+    qwen_causal_attention_bf16kv_heads(out, Q, K_bf16, V_bf16, seq_q, seq_k,
+                                       n_heads, n_kv_heads, head_dim, scale, q_offset,
+                                       0, n_heads);
 }
 
 void qwen_silu(float *x, int n) {
@@ -11583,6 +11634,56 @@ int qwen_kernel_selftest(void *out) {
             free(src); free(d1); free(d2); free(s1); free(s2);
         }
 #endif
+    }
+
+    /* bf16-KV attention over a multi-row query block (the sliced-prefill entry point).
+     * The head-parallel block form must equal the per-row decode form exactly: same
+     * kernel, same accumulation order per (head, row), only the head partition and the
+     * number of query rows differ.  This is the oracle for the refactor that
+     * qwen_talker_prefill_range depends on. */
+    {
+        const struct { int seq_k, q_off, n_rows, n_heads, n_kv, hd; } acase[] = {
+            {  64,  40,  24, 16,  8, 128 },
+            { 137,  89,  48, 16,  2, 128 },
+            {  17,   0,  17,  8,  8,  64 },
+            { 200, 199,   1, 16,  4, 128 },
+        };
+        for (int c = 0; c < (int)(sizeof(acase) / sizeof(acase[0])); c++) {
+            int seq_k = acase[c].seq_k, q_off = acase[c].q_off, n = acase[c].n_rows;
+            int nh = acase[c].n_heads, nkv = acase[c].n_kv, hd = acase[c].hd;
+            int qh = nh * hd, kvh = nkv * hd;
+            float scale = 1.0f / sqrtf((float)hd);
+            float    *Q  = malloc((size_t)n * qh * sizeof(float));
+            uint16_t *K  = malloc((size_t)seq_k * kvh * sizeof(uint16_t));
+            uint16_t *V  = malloc((size_t)seq_k * kvh * sizeof(uint16_t));
+            float    *o1 = malloc((size_t)n * qh * sizeof(float));
+            float    *o2 = malloc((size_t)n * qh * sizeof(float));
+            if (!Q || !K || !V || !o1 || !o2) {
+                fprintf(f, "  [attn_bf16kv] OOM, skipped\n");
+                free(Q); free(K); free(V); free(o1); free(o2); continue;
+            }
+            for (size_t i = 0; i < (size_t)n * qh; i++) Q[i] = NEXT_F;
+            for (size_t i = 0; i < (size_t)seq_k * kvh; i++) {
+                float a = NEXT_F, b = NEXT_F;
+                uint32_t ba, bb; memcpy(&ba, &a, 4); memcpy(&bb, &b, 4);
+                K[i] = (uint16_t)(ba >> 16); V[i] = (uint16_t)(bb >> 16);
+            }
+            memset(o1, 0x5A, (size_t)n * qh * sizeof(float));
+            memset(o2, 0xA5, (size_t)n * qh * sizeof(float));
+            /* reference: one query row at a time, exactly what the decode step does */
+            for (int r = 0; r < n; r++)
+                qwen_causal_attention_bf16kv(o1 + (size_t)r * qh, Q + (size_t)r * qh, K, V,
+                                             1, seq_k, nh, nkv, hd, scale, q_off + r);
+            qwen_causal_attention_bf16kv_prefill(o2, Q, K, V, n, seq_k, nh, nkv, hd,
+                                                 scale, q_off);
+            int bad = memcmp(o1, o2, (size_t)n * qh * sizeof(float)) != 0;
+            fprintf(f, "  [attn_bf16kv rows=%2d seq_k=%3d q_off=%3d heads=%2d/%-2d hd=%3d] "
+                       "block vs per-row: %s  %s\n",
+                    n, seq_k, q_off, nh, nkv, hd, bad ? "DIFFER" : "bit-identical",
+                    bad ? "FAIL" : "PASS");
+            if (bad) failures++;
+            free(Q); free(K); free(V); free(o1); free(o2);
+        }
     }
 
     #undef NEXT_F

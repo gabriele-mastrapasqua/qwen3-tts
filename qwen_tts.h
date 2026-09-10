@@ -461,6 +461,13 @@ typedef struct qwen_tts_ctx {
     int kv_len;
 
     int prefill_only;
+    /* C12-WIN-10 sliced admission: with prefill_defer set, a prefill_only generate
+     * builds the prompt and hands the embeddings back here instead of running the
+     * Talker, so the caller can drive qwen_talker_prefill_range() slice by slice.
+     * prefill_embeds is owned by the caller once the call returns 0. */
+    int prefill_defer;
+    float *prefill_embeds;
+    int prefill_seq_len;
     int bg_text_content_len;
 
     /* Known-text streaming layout (SL-1).  The prefill contains only the

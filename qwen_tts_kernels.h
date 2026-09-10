@@ -353,6 +353,15 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
                                   const uint16_t *K_bf16, const uint16_t *V_bf16,
                                   int seq_q, int seq_k, int n_heads, int n_kv_heads,
                                   int head_dim, float scale, int q_offset);
+void qwen_causal_attention_bf16kv_heads(float *out, const float *Q,
+                                        const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                        int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                        int head_dim, float scale, int q_offset,
+                                        int h_lo, int h_hi);
+void qwen_causal_attention_bf16kv_prefill(float *out, const float *Q,
+                                          const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                          int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                          int head_dim, float scale, int q_offset);
 
 void qwen_compute_rope_interleaved(float *cos_out, float *sin_out, const int *positions,
                                    int seq, int head_dim, float theta);

@@ -366,6 +366,9 @@ extern int qwen_talker_load(qwen_tts_ctx_t *ctx);
 extern int qwen_cp_load(qwen_tts_ctx_t *ctx);
 extern int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx);
 extern int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len);
+extern int qwen_talker_prefill_plan(qwen_tts_ctx_t *ctx, int seq_len, int *pos0_out);
+extern int qwen_talker_prefill_range(qwen_tts_ctx_t *ctx, const float *input_embeds,
+                                     int seq_len, int pos0, int t0, int t1);
 extern void qwen_talker_prefix_key(qwen_tts_ctx_t *ctx, int prefix_len, int speaker_id,
                                    int language_id, int think_mode, uint64_t ihash);
 extern uint64_t qwen_prefix_hash(const int *toks, int n);
@@ -888,6 +891,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->dec_attn_out); free(ctx->dec_proj_out); free(ctx->dec_gate); free(ctx->dec_up); free(ctx->dec_ffn_out);
     free(ctx->cp_dec_x); free(ctx->cp_dec_q); free(ctx->cp_dec_k); free(ctx->cp_dec_v);
     free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_up); free(ctx->cp_dec_ffn_out);
+    free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
     free(ctx->pref_residual); free(ctx->pref_x_norm); free(ctx->pref_q);
     free(ctx->pref_k); free(ctx->pref_v); free(ctx->pref_attn_out);
     free(ctx->pref_gate); free(ctx->pref_proj);
@@ -968,6 +972,7 @@ qwen_tts_ctx_t *qwen_tts_clone_for_worker(const qwen_tts_ctx_t *base) {
     w->codec_codes = NULL; w->codec_frames = 0; w->codec_frames_cap = 0;
     w->prev_tokens = NULL; w->n_prev_tokens = 0; w->prev_tokens_cap = 0;
     w->prev_input_embeds = NULL; w->prev_prefill_len = 0;
+    w->prefill_defer = 0; w->prefill_embeds = NULL; w->prefill_seq_len = 0;
     w->stream_trailing_text = NULL; w->stream_trailing_len = 0; w->stream_trailing_pos = 0;
     w->stream_layout_prefill_len = 0;
     w->audio_buf = NULL; w->audio_samples = 0;
@@ -992,6 +997,7 @@ void qwen_tts_free_clone(qwen_tts_ctx_t *ctx) {
     free(ctx->swiglu_tmp);
     free(ctx->cp_dec_x); free(ctx->cp_dec_q); free(ctx->cp_dec_k); free(ctx->cp_dec_v);
     free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_up); free(ctx->cp_dec_ffn_out);
+    free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
     free(ctx->pref_residual); free(ctx->pref_x_norm); free(ctx->pref_q);
     free(ctx->pref_k); free(ctx->pref_v); free(ctx->pref_attn_out);
     free(ctx->pref_gate); free(ctx->pref_proj);
@@ -1547,6 +1553,18 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         free(input_embeds);
         qwen_stream_trailing_clear(ctx);
         return -1;
+    }
+
+    /* C12-WIN-10: hand the built prompt back and let the caller run the Talker in
+     * token-range slices.  Everything above this point is the prompt builder and is
+     * untouched; nothing below it has run, so the context still holds no KV for this
+     * request beyond the prefix positions the slicing path re-establishes itself. */
+    if (ctx->prefill_defer && ctx->prefill_only) {
+        free(ctx->prefill_embeds);
+        ctx->prefill_embeds = input_embeds;      /* ownership moves to the caller */
+        ctx->prefill_seq_len = prefill_len;
+        ctx->bg_text_content_len = text_content_len;
+        return 0;
     }
 
     double t_prefill = time_ms();

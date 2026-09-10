@@ -1858,6 +1858,367 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Sliced prefill (C12-WIN-10).
+ *
+ * qwen_talker_prefill computes every layer over every new token in one call, so
+ * an admission holds the frame loop for the whole prompt.  The two functions
+ * below compute the SAME thing in token-range slices: qwen_talker_prefill_plan
+ * establishes the resume boundary once (prefix positions materialised in the
+ * bf16 KV cache, buffers sized, kv cache grown) and qwen_talker_prefill_range
+ * runs the 28 layers over the new-token rows [t0, t1) only.
+ *
+ * Why this is a valid boundary: a token's residual stream never crosses a slice
+ * (each token walks all 28 layers inside its own slice), and a slice reads the
+ * earlier tokens only through ctx->kv_cache_{k,v}, which the slices before it
+ * have already filled for every layer.  The one intended difference from the
+ * monolithic path is that a new token attends to the earlier positions of the
+ * SAME prompt through the bf16 cache instead of the f32 pref_k/pref_v staging
+ * buffer -- the same precision the decode step already attends over.
+ *
+ * The prefix cache is used (a hit is materialised once by _plan) but never
+ * FILLED from this path: filling needs the f32 K/V of the prefix positions of
+ * every layer alive at the end of the request, which is exactly the state the
+ * slicing must not carry.  _plan reports that case and the caller runs the
+ * monolithic path for that one admission (a handful of times per worker life,
+ * at cold start).
+ * ------------------------------------------------------------------------- */
+
+int qwen_talker_prefill_plan(qwen_tts_ctx_t *ctx, int seq_len, int *pos0_out) {
+    qwen_tts_config_t *c = &ctx->config;
+    int h = c->hidden_size;
+    int q_dim = c->num_heads * c->head_dim;
+    int kv_dim = c->num_kv_heads * c->head_dim;
+    int inter = c->intermediate_size;
+
+    if (pos0_out) *pos0_out = 0;
+    if (seq_len <= 0) return -1;
+    if (kv_cache_grow(ctx, seq_len) != 0) return -1;
+
+    const qwen_prefix_cache_t *pfx = qwen_prefix_cache_enabled() ? pfx_find(ctx) : NULL;
+    const int pos0 = pfx ? pfx->len : 0;
+    if (pos0 >= seq_len) return -1;               /* nothing new to compute */
+
+    /* A prompt that would populate an empty prefix slot must take the monolithic
+     * path: see the header comment.  Report it instead of faking the fill. */
+    if (qwen_prefix_cache_enabled() && !pfx && ctx->pfx_len > 0 && ctx->pfx_len < seq_len) {
+        for (int i = 0; i < QWEN_PFX_SLOTS; i++)
+            if (atomic_load_explicit(&g_pfx_state[i], memory_order_acquire) == PFX_EMPTY)
+                return 1;                          /* caller: run inline this once */
+    }
+
+    if (seq_len > ctx->pref_seq_cap) {
+        free(ctx->pref_residual); free(ctx->pref_q); free(ctx->pref_k); free(ctx->pref_v);
+        free(ctx->pref_x_norm); free(ctx->pref_attn_out); free(ctx->pref_gate); free(ctx->pref_proj);
+        ctx->pref_residual = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_q = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+        ctx->pref_k = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+        ctx->pref_v = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+        ctx->pref_x_norm = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_attn_out = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+        ctx->pref_gate = (float *)aligned_malloc((int64_t)seq_len * 2 * inter * sizeof(float));
+        ctx->pref_proj = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_seq_cap = seq_len;
+    }
+    if (!ctx->pref_wq_f32) {
+        ctx->pref_wq_f32 = (float *)aligned_malloc((int64_t)q_dim * h * sizeof(float));
+        ctx->pref_wk_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+        ctx->pref_wv_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+        ctx->pref_wo_f32 = (float *)aligned_malloc((int64_t)h * q_dim * sizeof(float));
+        ctx->pref_gate_up_f32 = (float *)aligned_malloc((int64_t)2 * inter * h * sizeof(float));
+        ctx->pref_down_f32 = (float *)aligned_malloc((int64_t)h * inter * sizeof(float));
+    }
+    if (!ctx->pref_residual || !ctx->pref_q || !ctx->pref_k || !ctx->pref_v ||
+        !ctx->pref_x_norm || !ctx->pref_attn_out || !ctx->pref_gate || !ctx->pref_proj ||
+        !ctx->pref_wq_f32 || !ctx->pref_wk_f32 || !ctx->pref_wv_f32 || !ctx->pref_wo_f32 ||
+        !ctx->pref_gate_up_f32 || !ctx->pref_down_f32) {
+        fprintf(stderr, "Error: sliced prefill allocation failed\n");
+        return -1;
+    }
+
+    /* Materialise the prefix hit into the bf16 cache once, for every layer. */
+    if (pos0 > 0) {
+        long n = atomic_fetch_add_explicit(&g_pfx_hits, 1, memory_order_relaxed) + 1;
+        if (n == 1 || !ctx->silent)
+            fprintf(stderr, "  Prefix cache HIT: %d/%d positions reused, computing %d\n",
+                    pos0, seq_len, seq_len - pos0);
+        for (int layer = 0; layer < c->num_layers; layer++) {
+            int64_t cache_base = (int64_t)layer * ctx->kv_max * kv_dim;
+            size_t off = (size_t)layer * pos0 * kv_dim;
+            f32_to_bf16_vec(ctx->kv_cache_k + cache_base, pfx->k + off, (int64_t)pos0 * kv_dim);
+            f32_to_bf16_vec(ctx->kv_cache_v + cache_base, pfx->v + off, (int64_t)pos0 * kv_dim);
+        }
+    } else if (qwen_prefix_cache_enabled() && ctx->pfx_len > 0) {
+        atomic_fetch_add_explicit(&g_pfx_miss, 1, memory_order_relaxed);
+    }
+
+    ctx->kv_len = pos0;
+    ctx->ml_steer_w_eff = 0.0f;
+    if (pos0_out) *pos0_out = pos0;
+    return 0;
+}
+
+int qwen_talker_prefill_range(qwen_tts_ctx_t *ctx, const float *input_embeds, int seq_len,
+                              int pos0, int t0, int t1) {
+    qwen_tts_config_t *c = &ctx->config;
+    int h = c->hidden_size;
+    int q_dim = c->num_heads * c->head_dim;
+    int kv_dim = c->num_kv_heads * c->head_dim;
+    int inter = c->intermediate_size;
+    float eps = c->rms_norm_eps;
+    const int n_new = seq_len - pos0;
+
+    if (t0 < 0 || t1 > n_new || t0 >= t1) return -1;
+    const int n = t1 - t0;
+    const int abs0 = pos0 + t0;                    /* first absolute position of the slice */
+
+    qwen_mm_component(QWEN_COMP_TALKER);
+    qwen_region_begin(QWEN_RGN_TK_PREFILL);
+
+    static __thread int mm_env = -1;
+    if (mm_env < 0) mm_env = qwen_prefill_matmat_resolved(NULL);
+    int use_matmat = mm_env;
+    int pref_quant = !use_matmat && tk_prefill_quant_enabled();
+    if (pref_quant) tk_release_bf16(ctx);
+    static __thread float *rg_xT = NULL, *rg_yT = NULL;
+    static __thread int rg_cap = 0;
+    if (use_matmat) {
+        int need_in = (h > inter ? h : inter);
+        int need_out = 2 * inter;
+        const int CH = prefill_chunk_tokens();
+        int cap = (need_in > need_out ? need_in : need_out) * CH;
+        if (cap > rg_cap) {
+            float *nx = (float *)realloc(rg_xT, (size_t)need_in * CH * sizeof(float));
+            float *ny = (float *)realloc(rg_yT, (size_t)need_out * CH * sizeof(float));
+            if (nx) rg_xT = nx;
+            if (ny) rg_yT = ny;
+            if (!rg_xT || !rg_yT) { use_matmat = 0; } else { rg_cap = cap; }
+        }
+    }
+
+    float *residual     = ctx->pref_residual;
+    float *pref_q       = ctx->pref_q;
+    float *pref_k       = ctx->pref_k;
+    float *pref_v       = ctx->pref_v;
+    float *pref_x_norm  = ctx->pref_x_norm;
+    float *pref_attn_out= ctx->pref_attn_out;
+    float *pref_gate    = ctx->pref_gate;
+    float *pref_proj    = ctx->pref_proj;
+    float *wq_f32       = ctx->pref_wq_f32;
+    float *wk_f32       = ctx->pref_wk_f32;
+    float *wv_f32       = ctx->pref_wv_f32;
+    float *wo_f32       = ctx->pref_wo_f32;
+    float *gate_up_f32  = ctx->pref_gate_up_f32;
+    float *down_f32     = ctx->pref_down_f32;
+    if (!residual || !pref_q || !pref_k || !pref_v || !pref_x_norm || !pref_attn_out ||
+        !pref_gate || !pref_proj) {
+        qwen_region_end(QWEN_RGN_TK_PREFILL);
+        return -1;
+    }
+
+    memcpy(residual, input_embeds + (int64_t)abs0 * h, (int64_t)n * h * sizeof(float));
+
+    for (int layer = 0; layer < c->num_layers; layer++) {
+        qwen_talker_layer_t *l = &ctx->layers[layer];
+        int64_t cache_base = (int64_t)layer * ctx->kv_max * kv_dim;
+
+        if (!use_matmat) {
+            qwen_region_begin(QWEN_RGN_TK_PF_WEIGHT_PREP);
+            tk_prefill_weight_f32(wq_f32, PREFW(l, wq), l->wq_int8, l->wq_scale,
+                                  l->wq_q4, l->wq_q6, q_dim, h, pref_quant);
+            tk_prefill_weight_f32(wk_f32, PREFW(l, wk), l->wk_int8, l->wk_scale,
+                                  l->wk_q4, l->wk_q6, kv_dim, h, pref_quant);
+            tk_prefill_weight_f32(wv_f32, PREFW(l, wv), l->wv_int8, l->wv_scale,
+                                  l->wv_q4, l->wv_q6, kv_dim, h, pref_quant);
+            tk_prefill_weight_f32(wo_f32, PREFW(l, wo), l->wo_int8, l->wo_scale,
+                                  l->wo_q4, l->wo_q6, h, q_dim, pref_quant);
+            tk_prefill_weight_f32(gate_up_f32, PREFW(l, gate_up_fused),
+                                  l->gate_up_fused_int8, l->gate_up_fused_scale,
+                                  l->gate_up_fused_q4, l->gate_up_fused_q6,
+                                  2 * inter, h, pref_quant);
+            tk_prefill_weight_f32(down_f32, PREFW(l, down), l->down_int8, l->down_scale,
+                                  l->down_q4, l->down_q6, h, inter, pref_quant);
+            qwen_region_end(QWEN_RGN_TK_PF_WEIGHT_PREP);
+        }
+
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
+        qwen_rms_norm(pref_x_norm, residual, l->input_norm, n, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_QKV);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->wq_int8 && l->wk_int8 && l->wv_int8) {
+                prefill_proj_matmat_i8(pref_q, l->wq_int8, l->wq_scale, pref_x_norm, n, h, q_dim,  rg_xT, rg_yT);
+                prefill_proj_matmat_i8(pref_k, l->wk_int8, l->wk_scale, pref_x_norm, n, h, kv_dim, rg_xT, rg_yT);
+                prefill_proj_matmat_i8(pref_v, l->wv_int8, l->wv_scale, pref_x_norm, n, h, kv_dim, rg_xT, rg_yT);
+            } else
+            prefill_proj_matmat_qkv(pref_q, pref_k, pref_v,
+                                    PREFW(l, wq), PREFW(l, wk), PREFW(l, wv),
+                                    pref_x_norm, n, h, q_dim, kv_dim, rg_xT, rg_yT);
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, q_dim, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, q_dim, h, 1.0f,
+                        pref_x_norm, h, wq_f32, h, 0.0f, pref_q, q_dim);
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, kv_dim, h, 1.0f,
+                        pref_x_norm, h, wk_f32, h, 0.0f, pref_k, kv_dim);
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, kv_dim, h, 1.0f,
+                        pref_x_norm, h, wv_f32, h, 0.0f, pref_v, kv_dim);
+#else
+            for (int s = 0; s < n; s++) {
+                const float *xs = pref_x_norm + (int64_t)s * h;
+                float *qs = pref_q + (int64_t)s * q_dim;
+                float *ks = pref_k + (int64_t)s * kv_dim;
+                float *vs = pref_v + (int64_t)s * kv_dim;
+                for (int o = 0; o < q_dim; o++) {
+                    float sum = 0.0f; const float *row = wq_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    qs[o] = sum;
+                }
+                for (int o = 0; o < kv_dim; o++) {
+                    float sum = 0.0f; const float *row = wk_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    ks[o] = sum;
+                }
+                for (int o = 0; o < kv_dim; o++) {
+                    float sum = 0.0f; const float *row = wv_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    vs[o] = sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_QKV);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_QKROPEKV);
+        qwen_rms_norm_per_head(pref_q, l->q_norm, n, c->num_heads, c->head_dim, eps);
+        qwen_rms_norm_per_head(pref_k, l->k_norm, n, c->num_kv_heads, c->head_dim, eps);
+        for (int s = 0; s < n; s++) {
+            apply_rope_neox_inplace(pref_q + (int64_t)s * q_dim, c->num_heads, c->head_dim,
+                                    ctx->rope_cos, ctx->rope_sin, abs0 + s);
+            apply_rope_neox_inplace(pref_k + (int64_t)s * kv_dim, c->num_kv_heads, c->head_dim,
+                                    ctx->rope_cos, ctx->rope_sin, abs0 + s);
+        }
+        /* The slice's own K/V must be visible to its own causal attention below. */
+        f32_to_bf16_vec(ctx->kv_cache_k + cache_base + (int64_t)abs0 * kv_dim, pref_k,
+                        (int64_t)n * kv_dim);
+        f32_to_bf16_vec(ctx->kv_cache_v + cache_base + (int64_t)abs0 * kv_dim, pref_v,
+                        (int64_t)n * kv_dim);
+        qwen_region_end(QWEN_RGN_TK_PF_QKROPEKV);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_ATTN);
+        qwen_causal_attention_bf16kv_prefill(pref_attn_out, pref_q,
+                                             ctx->kv_cache_k + cache_base,
+                                             ctx->kv_cache_v + cache_base,
+                                             n, abs0 + n, c->num_heads, c->num_kv_heads,
+                                             c->head_dim, 1.0f / sqrtf((float)c->head_dim),
+                                             abs0);
+        qwen_region_end(QWEN_RGN_TK_PF_ATTN);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_OPROJ);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->wo_int8)
+                prefill_proj_matmat_i8(pref_proj, l->wo_int8, l->wo_scale, pref_attn_out, n, q_dim, h, rg_xT, rg_yT);
+            else
+                prefill_proj_matmat(pref_proj, PREFW(l, wo), pref_attn_out, n, q_dim, h, rg_xT, rg_yT);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, q_dim, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, h, q_dim, 1.0f,
+                        pref_attn_out, q_dim, wo_f32, q_dim, 0.0f, pref_proj, h);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+#else
+            for (int s = 0; s < n; s++) {
+                float *xs = residual + (int64_t)s * h;
+                const float *attn = pref_attn_out + (int64_t)s * q_dim;
+                for (int o = 0; o < h; o++) {
+                    float sum = 0.0f; const float *row = wo_f32 + (int64_t)o * q_dim;
+                    for (int i = 0; i < q_dim; i++) sum += row[i] * attn[i];
+                    xs[o] += sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_OPROJ);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
+        qwen_rms_norm(pref_x_norm, residual, l->post_attn_norm, n, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_GATEUP);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->gate_up_fused_int8)
+                prefill_proj_matmat_i8(pref_gate, l->gate_up_fused_int8, l->gate_up_fused_scale, pref_x_norm, n, h, 2 * inter, rg_xT, rg_yT);
+            else
+                prefill_proj_matmat(pref_gate, PREFW(l, gate_up_fused), pref_x_norm, n, h, 2 * inter, rg_xT, rg_yT);
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, 2 * inter, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, 2 * inter, h, 1.0f,
+                        pref_x_norm, h, gate_up_f32, h, 0.0f, pref_gate, 2 * inter);
+#else
+            for (int s = 0; s < n; s++) {
+                const float *xs = pref_x_norm + (int64_t)s * h;
+                float *o2 = pref_gate + (int64_t)s * 2 * inter;
+                for (int o = 0; o < 2 * inter; o++) {
+                    float sum = 0.0f; const float *row = gate_up_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    o2[o] = sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_GATEUP);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_FFN_ACT);
+        for (int s = 0; s < n; s++) {
+            float *src = pref_gate + (int64_t)s * 2 * inter;
+            float *dst = pref_gate + (int64_t)s * inter;
+            qwen_swiglu_prefill(src, ctx->swiglu_tmp, inter);
+            if (dst != src) memcpy(dst, src, inter * sizeof(float));
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_FFN_ACT);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_DOWN);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->down_int8)
+                prefill_proj_matmat_i8(pref_proj, l->down_int8, l->down_scale, pref_gate, n, inter, h, rg_xT, rg_yT);
+            else
+                prefill_proj_matmat(pref_proj, l->down_bf16, pref_gate, n, inter, h, rg_xT, rg_yT);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, inter, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, h, inter, 1.0f,
+                        pref_gate, inter, down_f32, inter, 0.0f, pref_proj, h);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+#else
+            for (int s = 0; s < n; s++) {
+                float *xs = residual + (int64_t)s * h;
+                const float *gs = pref_gate + (int64_t)s * inter;
+                for (int o = 0; o < h; o++) {
+                    float sum = 0.0f; const float *row = down_f32 + (int64_t)o * inter;
+                    for (int i = 0; i < inter; i++) sum += row[i] * gs[i];
+                    xs[o] += sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_DOWN);
+    }
+
+    ctx->kv_len = abs0 + n;
+    if (t1 == n_new)
+        memcpy(ctx->dec_x, residual + (int64_t)(n - 1) * h, h * sizeof(float));
+
+    qwen_region_end(QWEN_RGN_TK_PREFILL);
+    return 0;
+}
+
+
 static void batch_gather(float *Xt, const float *src, int n, int dim, int srcstride,
                          const int *idx) {
     for (int j = 0; j < n; j++) {
