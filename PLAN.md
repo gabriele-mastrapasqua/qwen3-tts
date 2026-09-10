@@ -128,19 +128,25 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       split-input V2 were exact/parity-safe where tested but slower or neutral; both
       were reverted. The remaining alternative geometries are not justified by the
       current evidence. Detail: `.work/c12-win-glue-vnni-20260909.md`.
-- [ ] C12-WIN-10 Admission slicing (prefill as resumable token-range slices inside the
-      frame loop, one slice per iteration while streams are active, all at once when idle).
-      Spec: `.work/c12-win-admission-slicing-implementation.md`. Gate: `admit_ms` p95 <= 30 ms,
-      codes/mel parity, then 10-min C12 soak short p95 <= 0.92 with TTFA p95 <= 300 ms.
-      Do not use PREFILL_HELPER, a thread, or a trimmed prompt as the implementation.
-      IMPLEMENTED default-off as `QWEN_PREFILL_SLICE=N` (2026-09-10). Correctness contract
-      REVISED (spec section 8): (A) slicing state-machine parity is a HARD EXACT gate and
-      passes at zero (`--prefill-slice-check`: dec_x 0.0, 0 KV rows differing, slices 2..48,
-      no 1-token slice ever emitted); (B) monolithic-vs-sliced drift is expected and bounded
-      (8e-4 to 1.7e-3, below one bf16 ulp) and is NOT a bug; (C) the old 9.2 mel gate is
-      WITHDRAWN as unsatisfiable and replaced by a paired product-quality bank. Remaining:
-      the `admit_ms` diagnostic, the A/B and the quality bank on the qualification path.
-      NOT RUN on x86.
+- [x] C12-WIN-10 Admission slicing (prefill as resumable token-range slices inside the frame
+      loop). Spec: `.work/c12-win-admission-slicing-implementation.md`; local evidence
+      `.work/c12-win-admission-slicing-20260910.md`. CLOSED 2026-09-10 on Turin: state parity
+      CORRECT, serving behaviour a severe REGRESSION, flag stays default-off and unpromoted.
+      Sliced-state parity was proven exact for every partition without a one-token slice, and
+      two engine defects were found and fixed while proving it. The server A/B says the
+      mechanism must not be promoted. Closed-loop C12, 10 minutes per arm, frozen profile,
+      one variable: completed 1294 -> 721 (-44 %), TTFA p95 183 -> 1574 ms, STREAM_RTF p95
+      0.922 -> 4.609, and 7 server request timeouts against 0 on the control. It made the
+      established-stream interference it was built to remove about five times worse.
+      Note what it did NOT test: all four workers report mean_slices=1.00, so with a warm
+      prefix cache the admission prefill is ~1 new token (seq_len=10, prefix=9) and nothing
+      was ever actually split. The damage therefore comes from the sliced-admission PATH, not
+      from slicing -- most likely the one-admission-per-frame-iteration break stealing
+      iterations from running streams. A first A/B attempt with the true-wave arrival model
+      was void and is not cited: with a positive flag and n_active==0 the code takes the whole
+      prefill in one slice by design, so a wave that releases every request into an idle
+      engine cannot reach the mechanism at all. Any retry needs a redesign of the admission
+      path first, plus a cold-prefix workload so real multi-slice prefills occur.
 - [x] C12-WIN-11 A Conv-stack traffic: ConvT as ONE un-expanded GEMM per layer with a fused
       two-tap carry/bias epilogue. Spec: `.work/c12-win-conv-stack-implementation.md`.
       CLOSED 2026-09-10 on Turin: implementation CORRECT, effect NULL, flag stays default-off.
