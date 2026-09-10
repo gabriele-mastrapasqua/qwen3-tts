@@ -145,53 +145,189 @@ completion or on cancel/disconnect of the pending request (the pending P must ho
 Do NOT touch: decoder lane, `dec_enqueue`, quantum/ramp, server parent, profiles,
 `qwen_tts_server.c` reader/dispatch, sampling, M1 early admission, helper path.
 
-## 8. NUMERICAL / SEMANTIC INVARIANTS
-* Prompt tokens, positions and RoPE angles identical to the inline path.
-* K/V written to the cache at the same rows with the same bf16 conversion.
-* Attention of a new token over earlier tokens uses bf16 K/V instead of f32 — NOT EXACT;
-  bounded: the decode path already attends over the same bf16 cache. Gate in §9.
-* `dec_x` after the last slice equals the inline `dec_x` within bf16-attention error.
-* No change to what the client receives: same request semantics, same fail-fast boundary,
-  same quantum/ramp. No hidden queue: at most one pending P per worker, visible in
-  `[serve-profile]` as `admissions_pending_max`.
-* `QWEN_PREFILL_SLICE` unset → byte-identical binary behaviour to today.
+## 8. CORRECTNESS CONTRACT (REVISED 2026-09-10 — supersedes the original 8 and 9.2)
+
+The original sections 8 and 9.2 were internally inconsistent and the local implementation
+proved it. Section 5 forbids keeping the f32 K/V of all layers across slices; section 9.2
+then required the sliced result to match the monolithic one to mel-corr >= 0.99 with
+identical codes. Those cannot both hold: slices are token-outer and layer-inner, so at
+slice 2 layer 5 needs layer 5's K/V of the slice-1 tokens, which slice 1 computed and
+discarded. Reading them back from the bf16 cache is the only option section 5 leaves, and
+it is not bit-equal to an f32-resident pass. **Section 9.2 is SUPERSEDED. It is not
+relaxed — it is withdrawn as unsatisfiable, and replaced by C below.**
+
+Three different notions of correctness apply, and they must never be collapsed.
+
+### A. SLICING STATE-MACHINE PARITY — HARD EXACT GATE
+
+For any two valid partitionings of the SAME sliced computation, uninterrupted versus
+paused-and-resumed, the following must be EXACT, not approximate:
+
+* `dec_x` (the final hidden the first decode step consumes) — bit-equal
+* the K cache over `[0, kv_len)`, every layer — bit-equal
+* the V cache over `[0, kv_len)`, every layer — bit-equal
+* `kv_len` — equal
+* the Talker pre-generation state as a whole — equal
+
+This is the primary structural oracle. **Any failure here is an implementation bug**, never
+a tolerance to widen. Oracle: `--prefill-slice-check <S>`, which reports each arm against
+the unsliced arm and against the first sliced arm; the second comparison is the one that
+isolates slicing from precision, because both arms attend over the same bf16 cache.
+
+Measured 2026-09-10 (0.6B, 38- and 107-position prompts), slices 2, 3, 4, 5, 7, 16, 32, 48:
+`dec_x` 0.000e+00, zero K rows differing, zero V rows differing, `kv_len` equal. PASS.
+
+Boundary condition that is part of the contract: **no emitted slice may contain exactly one
+token.** At M=1 the shared prefill projection kernels take the matvec path, whose
+accumulation order differs from the matmat path, which made the result depend on where the
+boundaries fell. `qwen_prefill_slice_next` absorbs a 1-token remainder into the current
+slice (so a slice is at most `S+1` tokens and never one) and is shared by the serving loop
+and the oracle so the gate exercises the shipped rule. `QWEN_PREFILL_SLICE=1` is a debug
+value only; it crosses that kernel boundary by construction and is not held to A.
+
+### B. MONOLITHIC-vs-SLICED NUMERICAL DRIFT — EXPECTED, BOUNDED, NOT A BUG
+
+The sliced continuation reads earlier tokens from the bf16 KV cache; the monolithic pass
+keeps f32 K/V resident for the whole prompt. The two therefore differ numerically. This is
+a property of the design, not a defect, and it must not be reported as one.
+
+Measured drift of the final pre-generation state:
+
+| prompt | dec_x max abs / max ref | K rows differing | V rows differing |
+|---|---|---|---|
+| 38 positions | 7.96e-04 | 783/1064 | 783/1064 |
+| 107 positions | 1.686e-03 | 2646/2996 | 2646/2996 |
+
+Both are below one bf16 ulp (3.91e-3), i.e. at the quantisation floor of the cache the
+sliced path attends over. **Do not treat this as a state divergence bug.** But do not
+dismiss it either: at temperature 0 a difference far below an ulp is enough to flip one
+argmax, after which the utterance diverges completely. Small in state space is not small in
+output space once a discrete choice sits downstream.
+
+Worth recording because it reframes which arm is anomalous: during a monolithic prefill a
+prompt token attends over f32 K/V, but every decode step afterwards attends over the bf16
+cache. The sliced path is the self-consistent one; the control is the special case.
+
+### C. PRODUCT QUALITY PARITY — THE QUALIFICATION GATE
+
+Because A cannot be extended across the monolithic/sliced boundary, acceptance is a
+QUALITY regression gate on real generated audio, not a state oracle. Paired runs, same
+text, seed, speaker/voice path, model, precision and server configuration; treatment differs
+only by `QWEN_PREFILL_SLICE`.
+
+Per pair, in this order of authority:
+
+1. **Valid WAV** — parses, non-empty, sane sample rate, no clipping run, no silence-only
+   tail. Automated `wav_qc`. Any failure is a hard stop.
+2. **Duration semantics** — the sliced arm produces a different but valid utterance, so
+   duration is NOT expected to be identical. Gate the DISTRIBUTION: median |Δdur| and the
+   worst case, against the control arm's own run-to-run spread on the same bank. A pair
+   outside the control's spread is an outlier to listen to, not an automatic failure.
+3. **ASR transcript comparison** — CER/WER per pair against the input text, control and
+   treatment scored the SAME way. The gate is that the treatment's CER distribution is not
+   worse than the control's (report median, p90, max, and every pair where treatment CER
+   exceeds control CER by more than the control's own p90 spread). ASR is never the sole
+   oracle: it has its own error floor and it is language-dependent.
+4. **mel / log-mel similarity** — SOFT DIAGNOSTIC ONLY. It is not a proof of anything here,
+   because two valid utterances of the same sentence legitimately score low. Use it to RANK
+   pairs for listening, never as a pass/fail.
+5. **Human listening** on every pair flagged by 2, 3 or 4, and on a fixed random subset.
+
+Bank: small and paired, 20-30 sentences, reported as a distribution plus a named outlier
+list. Do not compute a single mean and call it a gate. Do not invent a permissive
+threshold: where no defensible threshold exists, report the distribution and escalate.
+
+The product question C exists to answer is exactly:
+
+> Does sliced admission preserve acceptable speech quality while materially reducing
+> established-stream interference, WITHOUT repeating the PREFILL_HELPER TTFA catastrophe
+> (172 -> 683 ms)?
+
+Quality alone is not a pass, and interference reduction alone is not a pass. Both, or no.
 
 ## 9. LOCAL CORRECTNESS ORACLE (before any cloud run)
-1. Build + `--self-test` + `check_flag_registry` + `perf_profile.py validate` PASS.
-2. `tests/prefill_slice_parity.py`: single worker (`--prefork 1 -j 8`), `--batch-size 1`,
-   temperature 0, seed 42, 10 bank texts (short/medium/long/italian), arm A inline, arm B
-   `QWEN_PREFILL_SLICE=48`: (a) the first 8 codec frames' codes identical for >= 9/10 texts;
-   (b) `tests/compare_audio.py` per pair mel-corr >= 0.99, duration within 2 %; (c) zero
-   errors, `wav_qc` equal. Also `QWEN_PREFILL_SLICE=1000` (one slice) must be exactly the
-   inline result modulo bf16 attention (same gate).
-3. Cancel/disconnect during a pending P (`tests/cancel_correctness.py` with a long text and
-   slice 16): no leak (ASan build), no orphaned P, worker stays healthy.
 
-## 10. MICROBENCH DESIGN
-No kernel microbench (this is a scheduling change). Server DIAGNOSTIC on the Turin host,
-one worker `1x8@0-7`, cap 3, `QWEN_STAGE_TRACE=1`, closed-loop 3 clients on the mixed bank
-for 3 minutes, arms inline vs `QWEN_PREFILL_SLICE=48`: metric = distribution of
-`admit_ms` per iteration. GO to the server A/B only if `admit_ms` p95 <= 30 ms in the slice
-arm (control 60-240) AND the slice arm's per-request prefill total is within +15 % of inline.
+1. Build + `--self-test` + `make check-flag-registry` + `tools/flag_parity.py --check` +
+   `tests/test_perf_profile.py` + `tools/check_plan.py` PASS.
+2. `--prefill-slice-check <S>` for S in {2, 3, 16, 48}: contract A, exact. This is the gate
+   that decides whether the implementation is correct.
+3. `tests/prefill_slice_parity.py`: asserts FIRST that the treatment actually took the
+   sliced path (`[ADMSLICE] first_sliced_admission`) and that the control did not. Without
+   that check the whole harness is vacuous — a WAV is a function of integer codes, so a
+   correct slicing and a slicing that never ran produce identical files. It also requires
+   `--batch-size >= 2`, because 1 routes to the non-batched server where the admission
+   block does not exist.
+4. Cancellation: drop a pending admission and serve again. Currently INCONCLUSIVE — the
+   post-cancel request is refused with 503 on the CONTROL arm too (PLAN TQ-2, fail-fast
+   admission). It must be re-run once TQ-2 is fixed; it is not a verdict on this change.
 
-## 11. SERVER A/B GATE
-Frozen `turin-c8a-32c-vnni-product` (only `QWEN_PREFILL_SLICE=48` added on the treatment
-via `--server-env`; the profile must list it under `tunable_flags` for the preflight, or the
-run is a two-profile A/B as for RES1_V2), 4x8 cap 4, C12, 10-minute closed-loop soak each,
-same bank, temperature 0.9. PASS if: short p95 <= 0.92 (control 0.959-0.966), conversational
-<= 0.90, pooled <= 0.90, TTFA p95 <= 300 ms, safe-start p95 <= 500 ms, prebuffer p95 <= 300,
-stall@250 <= 0.5 %, stall@500 = 0, errors/timeouts 0. Then the C12-WIN-8 qualification.
+## 10. MEASUREMENT DESIGN (REVISED 2026-09-10)
+
+No kernel microbench: this is a scheduling change. Spec 10 is measured SEPARATELY from the
+Spec 11/12 winners — one mechanism at a time — and only after those have their own verdict,
+so a decoder change never sits inside a scheduler A/B.
+
+CONTROL: current monolithic admission (`QWEN_PREFILL_SLICE` unset).
+TREATMENT: `QWEN_PREFILL_SLICE=48`. Everything else identical: same profile, topology, cap,
+quantum, lane, bank, seed policy, model path, precision.
+
+Workloads, in this order:
+
+1. **Isolated new request** — short / medium / long input, no other traffic. Establishes
+   TTFA cost of slicing on its own; a long text pays (slices-1) extra iterations and that
+   must be visible, not pooled away.
+2. **One established stream + a new SHORT request.**
+3. **One established stream + a new LONG request** — the worst case for interference and
+   the one the mechanism exists for.
+4. **Steady closed-loop short workload** — the class the helper arm moved 0.966 -> 0.915.
+5. **Mixed workload.**
+
+Metrics, per arm and per workload:
+
+* new-request TTFA (p50/p95/max)
+* established-stream MAX GAP — the direct measure of the interference this removes
+* `required_prebuffer`, `safe_play_start`
+* STREAM_RTF p50/p95, TOTAL_RTF where useful
+* stall@250, stall@500
+* errors / rejects / timeouts
+* `admit_ms` distribution per iteration (the mechanism's own metric)
+* slice count per request and slice wall time (`[ADMSLICE]`, `[STAGE] prefill_slice=`)
+* **monolithic fallback count** — reported separately, never pooled
+
+**The cold prefix-cache population request MUST be reported separately from steady sliced
+admissions.** The first request that populates a prefix slot falls back to the monolithic
+path by design (contract in section 8 / the implementation record). Pooling it into the
+same distribution would both understate the slicing benefit and hide a regression in the
+fallback. Split every table into `steady sliced` and `cold fallback`.
+
+GO to the server A/B only if, in the treatment: `admit_ms` p95 <= 30 ms (control 60-240),
+total per-request prefill work within +15 % of the control, and no increase in rejects.
+
+## 11. SERVER A/B AND QUALIFICATION GATE
+Frozen `turin-c8a-32c-vnni-product` (the treatment adds only `QWEN_PREFILL_SLICE=48`; the
+profile must list it under `tunable_flags` for the preflight, or run it as a two-profile
+A/B as was done for RES1_V2), 4x8 cap 4, C12, 10-minute closed-loop soak per arm.
+
+Performance PASS: short p95 <= 0.92 (control 0.959-0.966), conversational <= 0.90, pooled
+<= 0.90, TTFA p95 <= 300 ms, safe-start p95 <= 500 ms, prebuffer p95 <= 300, stall@250
+<= 0.5 %, stall@500 = 0, errors/timeouts 0.
+
+Quality PASS: contract C of section 8 — the paired quality bank, reported as a distribution
+with named outliers. Performance without quality is not a pass, and quality without the
+interference reduction is not a pass either.
 
 ## 12. STOP / REVERT RULES
-STOP after the diagnostic if `admit_ms` p95 does not drop below 30 ms, or the slice arm
-does more total prefill work than inline (+15 %), or codes parity (<9/10) fails.
-REVERT immediately if TTFA p95 > 350 ms, safe-start p95 > 550, stall@250 > 0.5 %, any
-error/timeout, or the parity gate fails. One allowed correction: SLICE 48 → 32 or 64, once.
+STOP after the diagnostic if `admit_ms` p95 does not drop below 30 ms, or the treatment does
+more total prefill work than the control (+15 %).
+STOP and report, do not adjust, if contract A (section 8) fails at any slice size >= 2: that
+is an implementation bug, not a tuning question.
+REVERT immediately if TTFA p95 > 350 ms, safe-start p95 > 550, stall@250 > 0.5 %, or any
+error/timeout appears. One allowed correction: SLICE 48 -> 32 or 64, once.
 Never make the helper, a thread, or a smaller prompt the "fix".
+Do NOT use contract B (monolithic-vs-sliced drift) as a stop reason; it is expected.
 
 ## 13. SUCCESS STATE
-Commit "serve: slice the Talker prefill across frame iterations (QWEN_PREFILL_SLICE)" with
-the new function, flag, dispatch row, parity test; evidence in
-`.work/c12-win-admission-slicing-<date>.md` (diagnostic table, A/B table, parity output);
-PLAN C12-WIN-10 closed with numbers; profile gains `QWEN_PREFILL_SLICE=48` ONLY after the
-C12-WIN-8 qualification (status provisional → qualified requires the ear check as usual).
+Implementation: DONE locally (2026-09-10), default off, contract A exact. Remaining:
+the section 10 diagnostic, the section 11 A/B, and the contract C quality bank on the
+qualification model path. `QWEN_PREFILL_SLICE` enters the product profile only after all
+three, and status stays `provisional` until the ear check as usual.

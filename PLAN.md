@@ -133,13 +133,14 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       Spec: `.work/c12-win-admission-slicing-implementation.md`. Gate: `admit_ms` p95 <= 30 ms,
       codes/mel parity, then 10-min C12 soak short p95 <= 0.92 with TTFA p95 <= 300 ms.
       Do not use PREFILL_HELPER, a thread, or a trimmed prompt as the implementation.
-      IMPLEMENTED default-off as `QWEN_PREFILL_SLICE=N` (2026-09-10). State oracle
-      `--prefill-slice-check` proves resume is BIT-EXACT (dec_x 0.0, 0 KV rows differing,
-      slices 2..48); server harness `tests/prefill_slice_parity.py`. BLOCKED ON A DECISION:
-      spec 9.2 (mel >= 0.99 vs monolithic) is unreachable for any token-outer slicing, since
-      exactness needs f32 K/V of all 28 layers across slices, which spec 5 forbids; the
-      measured state deviation is below one bf16 ulp but flips a sampled code. Options and
-      evidence in `.work/c12-win-admission-slicing-20260910.md` 3.4. NOT RUN on x86.
+      IMPLEMENTED default-off as `QWEN_PREFILL_SLICE=N` (2026-09-10). Correctness contract
+      REVISED (spec section 8): (A) slicing state-machine parity is a HARD EXACT gate and
+      passes at zero (`--prefill-slice-check`: dec_x 0.0, 0 KV rows differing, slices 2..48,
+      no 1-token slice ever emitted); (B) monolithic-vs-sliced drift is expected and bounded
+      (8e-4 to 1.7e-3, below one bf16 ulp) and is NOT a bug; (C) the old 9.2 mel gate is
+      WITHDRAWN as unsatisfiable and replaced by a paired product-quality bank. Remaining:
+      the `admit_ms` diagnostic, the A/B and the quality bank on the qualification path.
+      NOT RUN on x86.
 - [ ] C12-WIN-11 Conv-stack traffic: ConvT as ONE un-expanded GEMM (`[k·out_ch][in_ch]`
       stacked weights, R = W×in, two-tap fused epilogue with carry/bias), then weight-only
       bf16 with f32 activations/accumulate for ConvT block 0, convnext pw, initial conv.
@@ -164,6 +165,12 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       share of 54.9%; no asymmetric Talker/CP width mechanism is justified.
 - [ ] C12-WIN-6 Opportunistic B2 lane batching (optional, last): residency of 2 units vs 2
       requests, decoder off the critical path, mailbox bounded, reject on any cadence loss.
+- [ ] C12-WIN-6b AWS campaign order, model matrix and gates for specs 10/11A/12:
+      `.work/aws-qualification-checklist-20260910.md`. PRIMARY qualification path is
+      1.7B Base OSS + Galatea qvoice (clone conditioning), SECONDARY control is 1.7B
+      CustomVoice + Ryan (preset-speaker). The public ~25 MB CC0 grafts load on Base with
+      `--load-voice ... --icl-only`; what is NOT yet exercised is the clone conditioning
+      path through the BATCHED SERVER, which Phase A0/A confirms before any timing claim.
 - [ ] C12-WIN-7 Short A/B gate per candidate (control vs one mechanism, repeated short C12
       waves, playback-aware metrics, gain > noise) before any soak.
 - [ ] C12-WIN-8 Qualify the winner: C12 class waves, long+short, Poisson, overload
@@ -349,6 +356,13 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       request before closing; also record that rejection is per worker (cap 4): C20 sent 8
       rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
       for a simultaneous wave when the parent balances.
+- [ ] TQ-4 Server-vs-CLI Italian pronunciation defect: CLI good, server streaming malformed,
+      English controls good; reproduced on Turin and on a dev machine. Owned and executed on
+      a separate track. Independent review, code-level CLI/server asymmetries, ranked
+      hypotheses and the classification table for the returning evidence:
+      `.work/server-cli-italian-correctness-20260910.md`. Blocks a final product-quality
+      claim for any new runtime path; does NOT block the 11A/12 kernel microbenches.
+      Predates C12-WIN-10, which is default OFF and must not be blamed for it.
 - [ ] TQ-3 Ear verdict on the paired RES1_V2 bank (`samples/tests/2026-09-09_turin-qualification/`);
       PASS promotes `turin-c8a-32c-vnni-product` from provisional to qualified for C12.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;

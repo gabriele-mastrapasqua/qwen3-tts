@@ -140,6 +140,14 @@ Claiming a parity gate there would be claiming a property the engine does not ha
 
 ### 3.4 THE OPEN CONFLICT — spec section 5 versus spec section 9.2
 
+**RESOLVED IN THE SPEC 2026-09-10.** Section 9.2 is withdrawn as unsatisfiable and replaced
+by the three-part correctness contract now in section 8 of
+`.work/c12-win-admission-slicing-implementation.md`: (A) slicing state-machine parity, a
+hard exact gate, which this implementation passes at zero; (B) monolithic-vs-sliced drift,
+expected and bounded, not a bug; (C) a product quality regression gate on real audio, which
+replaces the impossible exact/mel structural gate. The analysis below is what forced that
+correction and is kept as the evidence for it.
+
 Section 8 predicted the deviation ("attention over earlier tokens uses bf16 K/V instead of
 f32 -- NOT EXACT; bounded") and section 9.2 set the gate at mel-corr >= 0.99 with identical
 codes for >= 9/10 texts. **That gate is unreachable for ANY token-outer sliced prefill.**
