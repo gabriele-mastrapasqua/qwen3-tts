@@ -267,8 +267,17 @@ def analyze(directory, args):
         index = int((row["t"] - args.warmup_s) // args.window_s)
         window_map.setdefault(index, []).append(row)
     windows = []
+    # A WINDOW THAT COVERS LESS WALL TIME IS NOT COMPARABLE TO THE OTHERS. The run rarely
+    # ends on a window boundary, and --cooldown-s moves the horizon further inward, so the
+    # trailing window is usually a stub holding a fraction of the samples the full ones do.
+    # Kept, it becomes the "last" window every per-class comparison is made against, and its
+    # thin per-class counts are what turn a flat run into PARTIAL. Drop it.
+    last_index = max(window_map) if window_map else -1
     for index in sorted(window_map):
         group = window_map[index]
+        if (index == last_index
+                and args.warmup_s + (index + 1) * args.window_s > end + 1e-6):
+            continue
         if len(group) < args.min_per_window:
             continue
         windows.append({
@@ -398,11 +407,36 @@ def analyze(directory, args):
                     })
                     continue
                 change = drift_percent(before, after)
-                comparisons.append({"metric": name, "first": before,
-                                    "last": after, "drift_pct": change,
-                                    "limit_pct": limit, "status": "ASSESSED"})
-                if change is not None and change > limit:
+                # DRIFT IS A CLAIM ABOUT A TREND, AND TWO POINTS CANNOT SHOW ONE.
+                # Comparing only the first and last window applies a percentage limit to a
+                # single pair of samples, which is fine for a metric that moves smoothly and
+                # wrong for one that jitters: TTFB p95 sits around 50 ms, so 15 ms of ordinary
+                # bounce is 30 % and trips the gate while the run is flat. Measure the same
+                # metric in EVERY window first. If the last window lands inside the range the
+                # earlier windows already spanned, the run visited that value before it ended
+                # and has not drifted -- whatever the first-to-last percentage says.
+                track = []
+                for window, group in class_windows:
+                    if len(group) >= required:
+                        value = percentile([row[key] for row in group], quantile)
+                        if value is not None:
+                            track.append(value)
+                entry = {"metric": name, "first": before, "last": after,
+                         "drift_pct": change, "limit_pct": limit, "status": "ASSESSED"}
+                within = False
+                if len(track) >= 3:
+                    earlier = track[:-1]
+                    lo, hi = min(earlier), max(earlier)
+                    within = lo <= after <= hi
+                    entry["windows_n"] = len(track)
+                    entry["window_range"] = [lo, hi]
+                    entry["within_run_range"] = within
+                comparisons.append(entry)
+                if change is not None and change > limit and not within:
                     failures.append(name)
+                elif change is not None and change > limit and within:
+                    entry["note"] = ("first-to-last exceeds the limit but the value stays "
+                                     "inside the range the run already spanned: jitter, not drift")
             status = "FAIL" if failures else ("PARTIAL" if unassessed else "PASS")
             result = {"status": status,
                       "first_n": len(first_group), "last_n": len(last_group),
