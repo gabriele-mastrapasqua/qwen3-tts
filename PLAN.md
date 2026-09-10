@@ -228,13 +228,20 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       elastic + RES1_V2 + GLUE + CONVT_STACK measures STREAM p95 0.843 against 0.939 for
       the untreated tree (WAVE screen, no SOAK yet).  RES1_V2 audio gate: 21/21 paired
       files, mel-corr min 0.9945.
-      NEXT (each with a paired WAV/quality gate): convnext MLP int8 via KleidiAI;
-      pre-transformer BF16 via KleidiAI (x86 has the AVX-512 BF16 sibling); ConvT BF16;
-      rectangular/wide DL-4 (the `in_ch <= 768` and square-only gates still leave the
-      initial/pre conv on f32 on every backend); multi-slot DL-4 for the lane.  Threading
-      constraint found while scoping them: the decoder unit runs on the lane team, so the
-      KAI wrappers that dispatch through qwen_parallel are not directly usable there -- the
-      prepared-state prep/run pair (tid/nt over the lane team) is the shape to use.
+      NEXT (each with a paired WAV/quality gate): pre-transformer BF16 via KleidiAI (x86
+      has the AVX-512 BF16 sibling); ConvT BF16; rectangular/wide DL-4 (the `in_ch <= 768`
+      and square-only gates still leave the initial/pre conv on f32 on every backend);
+      multi-slot DL-4 for the lane.  Threading constraint found while scoping them: the
+      decoder unit runs on the lane team, so the KAI wrappers that dispatch through
+      qwen_parallel are not directly usable there -- the prepared-state prep/run pair
+      (tid/nt over the lane team) is the shape to use.  Two more traps found while doing it:
+      the region/prepared-state API is keyed on the ORIGINAL f32 weight pointer (the int8
+      buffer is not a key), and the ConvNeXt MLP exists TWICE -- the CLI path uses a
+      `pw_dim = cur_ch*4` copy, the streaming server path the 4096-wide `convnext_mlp`; a
+      CLI A/B cannot see a change made in the other one.
+      DONE since: ConvNeXt pointwise pair on KAI int8 (`QWEN_SD_CNEXT_I8`, default off) --
+      6 paired server texts mel-corr min 0.99736 / mean 0.99805, C10 0.843 -> 0.821.  Still
+      open: the full 21-text bank and the 1.7B for that flag, then pretf/ConvT/DL-4 items.
       Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
       convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
       largest single item. DO NOT chase the AMX strip/range port: it was measured first and
