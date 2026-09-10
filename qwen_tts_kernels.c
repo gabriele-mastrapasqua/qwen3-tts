@@ -10102,6 +10102,29 @@ typedef struct {
 
 static inline int sd_dconv_round(float q) { return (int)(q >= 0 ? q + 0.5f : q - 0.5f); }
 
+/* WHY THIS ONE FUNCTION OPTS OUT OF REASSOCIATION.
+ *
+ * The epilogue computes `reduce(facc) - corr + bias` and, when a residual is supplied,
+ * adds it: a four-term float sum.  The build uses -ffast-math, so the compiler is free to
+ * re-associate that sum -- and it does, but only in the four-term case, because the
+ * three-term one has nothing to move.  The two arms then round differently in the last
+ * bit.  That would be harmless in most kernels; here it is not, because the residual
+ * unit's output is re-quantised per position by the NEXT unit: one ulp can shift `amax`,
+ * which shifts the scale for every channel at that position.  Measured end to end on
+ * Turin the drift reached 115 LSB on a 9550 peak (~1.2 %, mel-corr 0.99847) -- far above
+ * the -90 dB the engine treats as benign.
+ *
+ * Disabling reassociation for this function alone restores the contract the fused path is
+ * supposed to honour: with it, `QWEN_SD_GLUE=0` and `=1` produce byte-identical audio, so
+ * the mechanism is a pure performance change and needs no quality gate of its own.
+ * -fno-associative-math is the narrowest switch that does it; the rest of -ffast-math is
+ * untouched, and the arithmetic is unchanged in both arms.
+ *
+ * If a compiler ignores the attribute the failure is loud, not silent: the
+ * `conv1d_int8_v2 ... ctx+residual` self-test case demands bit-equality and fails. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math")))
+#endif
 static void sd_dconv_worker(void *vj) {
     sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
     const int ch = j->ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
