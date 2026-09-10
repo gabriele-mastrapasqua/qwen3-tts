@@ -655,6 +655,16 @@ typedef struct {
 } qwen_batch_sink_t;
 
 int qwen_tts_batch_max_prompt(void);
+
+/* Resolve and VALIDATE QWEN_PREFILL_SLICE (C12-WIN-10).  Exits with a message on an
+ * unusable value, so call it once in the parent before any fork: a worker that dies on a
+ * bad flag would otherwise be respawned while the parent keeps serving the control. */
+int qwen_prefill_slice_tokens(void);
+
+/* Tokens the next prefill slice takes, given what is left and the configured bound.
+ * Shared by the serving loop and by --prefill-slice-check so the tested rule is the
+ * shipped rule. */
+int qwen_prefill_slice_next(int remaining, int slice);
 int qwen_tts_batch_max_frames(void);
 void qwen_tts_set_batch_max_frames(int frames);   /* server: derived from --max-request-seconds; env wins */
 int qwen_tts_batch_max_frames_source(void);       /* 0 compiled default, 1 server-derived, 2 QWEN_BATCH_MAX_FRAMES */

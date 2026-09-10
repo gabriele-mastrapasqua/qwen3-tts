@@ -321,6 +321,21 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
         row(&feats[n++], "talker.prefill.f32_blas_fallback", "no", "-", NULL, "OFF",
             "no BLAS in this build");
 #endif
+        {
+            const char *e = getenv("QWEN_PREFILL_SLICE");
+            int slice = (e && e[0]) ? atoi(e) : 0;
+            static char why_slice[128];
+            if (slice < 0)
+                snprintf(why_slice, sizeof(why_slice),
+                         "slices of %d tokens, idle worker included - PARITY TEST setting, "
+                         "not a product arm", -slice);
+            else
+                snprintf(why_slice, sizeof(why_slice),
+                         slice > 0 ? "admission prefilled in slices of %d tokens, one per frame iteration"
+                                   : "monolithic inline prefill (product default)", slice);
+            row(&feats[n++], "talker.prefill.slice", "yes", "-", "QWEN_PREFILL_SLICE",
+                onoff(slice != 0), why_slice);
+        }
         row(&feats[n++], "talker.prefix_cache", "yes", "-", "QWEN_PREFIX_CACHE",
             onoff(qwen_prefix_cache_enabled()), "default ON; QWEN_PREFIX_CACHE=0 disables");
     }

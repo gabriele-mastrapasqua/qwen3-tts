@@ -784,6 +784,7 @@ int main(int argc, char **argv) {
     int run_matmat_tune = 0;
     int run_dispatch_map = 0;
     int run_effective_config = 0;
+    int prefill_slice_check = 0;
     int run_gpu_selftest = 0;
     int run_gpu_selftest_talker = 0;
     int run_gpu_batch_bench = 0; int gpu_batch_B = 4;
@@ -908,6 +909,7 @@ int main(int argc, char **argv) {
         {"ml-decay",      required_argument, 0, 1047},
         {"ml-frames",     required_argument, 0, 1048},
         {"self-test",     no_argument,       0, 1027},
+        {"prefill-slice-check", required_argument, 0, 1099},
         {"matmat-bench",  no_argument,       0, 1038},
         {"matmat-tune",   no_argument,       0, 1096},
         {"dispatch-map",  no_argument,       0, 1097},
@@ -1049,6 +1051,7 @@ int main(int argc, char **argv) {
             case 1047: ml_decay = (float)atof(optarg); break;
             case 1048: ml_frames = atoi(optarg); break;
             case 1027: run_self_test = 1; break;
+            case 1099: prefill_slice_check = atoi(optarg); if (prefill_slice_check < 1) prefill_slice_check = 1; break;
             case 1038: run_matmat_bench = 1; break;
             case 1096: run_matmat_tune = 1; break;
             case 1097: run_dispatch_map = 1; break;
@@ -1225,6 +1228,12 @@ int main(int argc, char **argv) {
         return qwen_kernel_selftest(stdout);
     }
 
+    /* Resolve the experimental serving flags that must be rejected BEFORE the server
+     * forks its workers: a worker that exits on a bad value is simply respawned, and the
+     * parent would keep serving the control arm while the operator believes the treatment
+     * is on. */
+    (void)qwen_prefill_slice_tokens();
+
     if (run_dispatch_map) {
         /* A profile preflight probes the decoder lane the way a prefork worker would: split
          * the mask this process inherited (a --cpu-mask, or a taskset) before the pool exists,
@@ -1315,7 +1324,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: --model-dir is required\n");
         return 1;
     }
-    int create_voice_only = (save_voice && !text && serve_port <= 0);
+    int create_voice_only = (save_voice && !text && serve_port <= 0) || prefill_slice_check > 0;
     if (!export_q4lsq && !text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test && !run_batch_bench
         && !run_gpu_selftest_talker && !run_gpu_batch_bench && !list_speakers) {
         fprintf(stderr, "Error: --text, --compose or --serve is required\n");
@@ -1780,6 +1789,153 @@ int main(int argc, char **argv) {
     if (ctx_greedy_warmup > 0) ctx->greedy_warmup = ctx_greedy_warmup;
     if (icl_frames > 0) ctx->icl_frames_cap = icl_frames;
     ctx->graft_mode = graft;
+
+
+    /* --prefill-slice-check <S>: the STATE oracle for C12-WIN-10.
+     *
+     * The audio cannot answer this question.  A WAV is a function of integer codes, so a
+     * correct slicing and a slicing that never ran both produce an identical file, while a
+     * last-bit difference that flips one argmax produces a completely different — and
+     * equally valid — utterance.  What must be compared is the Talker state the prefill
+     * leaves behind: the KV cache it filled and the final hidden dec_x the first decode
+     * step consumes.  Everything here runs on one process, one thread of control, with no
+     * server and no sampling. */
+    if (prefill_slice_check > 0) {
+        extern int qwen_talker_prefill(qwen_tts_ctx_t *, float *, int);
+        extern int qwen_talker_prefill_plan(qwen_tts_ctx_t *, int, int *);
+        extern int qwen_talker_prefill_range(qwen_tts_ctx_t *, const float *, int, int, int, int);
+        const char *probe = text ? text : "Il treno delle nove parte dal binario tre e "
+                                          "arriva in stazione centrale poco prima di mezzogiorno.";
+        int kvd = ctx->config.num_kv_heads * ctx->config.head_dim;
+        int nl = ctx->config.num_layers, hh = ctx->config.hidden_size;
+
+        ctx->prev_prefill_len = 0; ctx->prefill_only = 1; ctx->prefill_defer = 1;
+        int rc = qwen_tts_generate(ctx, probe, NULL, NULL);
+        ctx->prefill_only = 0; ctx->prefill_defer = 0;
+        if (rc != 0 || !ctx->prefill_embeds || ctx->prefill_seq_len <= 0) {
+            fprintf(stderr, "prefill-slice-check: could not build the prompt (rc=%d)\n", rc);
+            qwen_tts_unload(ctx); return 1;
+        }
+        int seq_len = ctx->prefill_seq_len;
+        float *embeds = (float *)malloc((size_t)seq_len * hh * sizeof(float));
+        memcpy(embeds, ctx->prefill_embeds, (size_t)seq_len * hh * sizeof(float));
+
+        /* arm 1: the monolithic control */
+        ctx->kv_len = 0;
+        if (qwen_talker_prefill(ctx, embeds, seq_len) != 0) {
+            fprintf(stderr, "prefill-slice-check: monolithic prefill failed\n");
+            qwen_tts_unload(ctx); return 1;
+        }
+        int ref_kv_len = ctx->kv_len;
+        float *ref_dec = (float *)malloc((size_t)hh * sizeof(float));
+        memcpy(ref_dec, ctx->dec_x, (size_t)hh * sizeof(float));
+        size_t kvn = (size_t)nl * ctx->kv_max * kvd;
+        uint16_t *ref_k = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+        uint16_t *ref_v = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+        memcpy(ref_k, ctx->kv_cache_k, kvn * sizeof(uint16_t));
+        memcpy(ref_v, ctx->kv_cache_v, kvn * sizeof(uint16_t));
+
+        int slices[4] = { seq_len, prefill_slice_check, 1, 0 };
+        int fails = 0;
+        /* A bf16 K/V element carries an 8-bit mantissa, so nothing below ~2^-8 relative is
+         * representable in the cache the sliced path attends over.  A deviation at or under
+         * that floor is the KV quantisation, not an error in the slicing. */
+        const double BF16_ULP = 1.0 / 256.0;
+        float *first_dec = NULL; uint16_t *first_k = NULL, *first_v = NULL; int first_kv = 0;
+        printf("prefill-slice-check: prompt %d positions, %d layers, kv_dim %d\n",
+               seq_len, nl, kvd);
+        printf("  vs MONOLITHIC (f32 attention) -- deviation floor is one bf16 ulp %.2e\n", BF16_ULP);
+        printf("  arm                 kv_len   dec_x max|d|/max|ref|   K rows differing   V rows differing\n");
+        for (int si = 0; slices[si] > 0; si++) {
+            int S = slices[si];
+            int pos0 = 0;
+            int plan = qwen_talker_prefill_plan(ctx, seq_len, &pos0);
+            if (plan != 0) {
+                printf("  slice=%-6d        SKIP (plan=%d: this prompt takes the monolithic path)\n",
+                       S, plan);
+                continue;
+            }
+            int n_new = seq_len - pos0, bad = 0, nslices = 0;
+            for (int t = 0; t < n_new && !bad; ) {
+                int step = qwen_prefill_slice_next(n_new - t, S);   /* the serving rule */
+                if (qwen_talker_prefill_range(ctx, embeds, seq_len, pos0, t, t + step) != 0) bad = 1;
+                t += step; nslices++;
+            }
+            (void)nslices;
+            if (bad) { printf("  slice=%-6d        FAIL (range returned an error)\n", S); fails++; continue; }
+
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < hh; i++) {
+                double d = fabs((double)ctx->dec_x[i] - (double)ref_dec[i]);
+                double r = fabs((double)ref_dec[i]);
+                if (d > num) num = d;
+                if (r > den) den = r;
+            }
+            long kdiff = 0, vdiff = 0;
+            for (int L = 0; L < nl; L++) {
+                size_t base = (size_t)L * ctx->kv_max * kvd;
+                for (int t = 0; t < ref_kv_len; t++) {
+                    if (memcmp(ref_k + base + (size_t)t * kvd, ctx->kv_cache_k + base + (size_t)t * kvd,
+                               (size_t)kvd * sizeof(uint16_t)) != 0) kdiff++;
+                    if (memcmp(ref_v + base + (size_t)t * kvd, ctx->kv_cache_v + base + (size_t)t * kvd,
+                               (size_t)kvd * sizeof(uint16_t)) != 0) vdiff++;
+                }
+            }
+            double rel = den > 0 ? num / den : num;
+            int ok = (ctx->kv_len == ref_kv_len) && rel <= BF16_ULP;
+            printf("  slice=%-6d %s   %6d   %18.3e   %8ld/%-8d   %8ld/%-8d  %s\n",
+                   S, S == seq_len ? "(one) " : (S == 1 ? "(every)" : "       "),
+                   ctx->kv_len, rel, kdiff, ref_kv_len * nl, vdiff, ref_kv_len * nl,
+                   ok ? "PASS" : "FAIL");
+            if (!ok) fails++;
+
+            /* The decisive split: arm against the FIRST sliced arm.  Both attend over the
+             * same bf16 cache, so any difference here is the SLICING itself, not the KV
+             * precision.  Exactness here means resume-equals-uninterrupted. */
+            if (!first_dec) {
+                first_kv = ctx->kv_len;
+                first_dec = (float *)malloc((size_t)hh * sizeof(float));
+                memcpy(first_dec, ctx->dec_x, (size_t)hh * sizeof(float));
+                first_k = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+                first_v = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+                memcpy(first_k, ctx->kv_cache_k, kvn * sizeof(uint16_t));
+                memcpy(first_v, ctx->kv_cache_v, kvn * sizeof(uint16_t));
+            } else {
+                long kd2 = 0, vd2 = 0; double n2 = 0.0, d2 = 0.0;
+                for (int i = 0; i < hh; i++) {
+                    double d = fabs((double)ctx->dec_x[i] - (double)first_dec[i]);
+                    double r = fabs((double)first_dec[i]);
+                    if (d > n2) n2 = d;
+                    if (r > d2) d2 = r;
+                }
+                for (int L = 0; L < nl; L++) {
+                    size_t base = (size_t)L * ctx->kv_max * kvd;
+                    for (int t = 0; t < first_kv; t++) {
+                        if (memcmp(first_k + base + (size_t)t * kvd, ctx->kv_cache_k + base + (size_t)t * kvd,
+                                   (size_t)kvd * sizeof(uint16_t)) != 0) kd2++;
+                        if (memcmp(first_v + base + (size_t)t * kvd, ctx->kv_cache_v + base + (size_t)t * kvd,
+                                   (size_t)kvd * sizeof(uint16_t)) != 0) vd2++;
+                    }
+                }
+                double rel2 = d2 > 0 ? n2 / d2 : n2;
+                int ok2 = (ctx->kv_len == first_kv) && kd2 == 0 && vd2 == 0 && rel2 == 0.0;
+                /* A slice of one token cannot be exact and is not required to be: at M=1
+                 * the shared projection kernels take the matvec path.  The serving rule
+                 * never emits a 1-token slice unless the whole remainder is one token. */
+                int one_row = (S == 1);
+                printf("     ^ vs slice=%d (SLICING ONLY, must be exact): dec_x %.3e  "
+                       "K %ld  V %ld  %s\n",
+                       seq_len, rel2, kd2, vd2,
+                       ok2 ? "PASS" : (one_row ? "EXPECTED-DIFFERENT (M=1 matvec path)" : "FAIL"));
+                if (!ok2 && !one_row) fails++;
+            }
+        }
+        free(embeds); free(ref_dec); free(ref_k); free(ref_v);
+        free(first_dec); free(first_k); free(first_v);
+        printf("%s\n", fails ? "PREFILL-SLICE STATE: FAIL" : "PREFILL-SLICE STATE: PASS");
+        qwen_tts_unload(ctx);
+        return fails ? 1 : 0;
+    }
 
     int compose_from_text = 0;
     if (!compose_spec && !no_compose && text && qwen_compose_has_markup(text)) {

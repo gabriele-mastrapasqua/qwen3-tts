@@ -142,6 +142,7 @@ static const qwen_flag_scope_t g_qwen_flag_scope[] = {
     { "QWEN_PREFILL_LOW_MS", 127u },
     { "QWEN_PREFILL_MATMAT", 127u },
     { "QWEN_PREFILL_QKV_SHARE", 127u },
+    { "QWEN_PREFILL_SLICE", 127u },
     { "QWEN_PREFILL_QUANT", 127u },
     { "QWEN_PREFILL_ROWPACK", 24u },
     { "QWEN_PREFIX_CACHE", 127u },

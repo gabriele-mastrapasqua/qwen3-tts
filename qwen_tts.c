@@ -1961,6 +1961,54 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     return 0;
 }
 
+/* C12-WIN-10.  QWEN_PREFILL_SLICE=N runs the Talker prefill of an admission in
+ * resumable slices of at most N new tokens, one slice per frame iteration while other
+ * slots are streaming; an idle worker still runs the whole prompt in one visit, so a
+ * cold-start TTFA does not grow.  Unset or 0 keeps the monolithic inline prefill.
+ *
+ * A NEGATIVE value means |N| and slices even when the worker is idle.  That is a
+ * PARITY-TEST setting, never a product arm: it makes the slice boundary reachable with
+ * one client and one slot, which is what makes "resume equals uninterrupted" testable
+ * deterministically.  Product arms use a positive value.
+ *
+ * An unusable value is fatal rather than silently ignored: a benchmark arm that thinks
+ * it enabled the treatment and did not is worse than a dead worker. */
+/* How many new tokens the next slice takes.  A slice of exactly ONE token is avoided:
+ * at M=1 the shared prefill projection kernels take the matvec path, whose accumulation
+ * order differs from the matmat path, so a 1-token slice would make the prefill depend on
+ * where the slice boundaries happen to fall.  A remainder of one token is absorbed into
+ * the current slice instead, so a slice is at most `slice + 1` tokens and never one.
+ * Measured
+ * 2026-09-10 with --prefill-slice-check: with this rule every partition is bit-identical
+ * to the unsliced arm; without it S=2 and S=4 differ from S=one on a 29-token prompt. */
+int qwen_prefill_slice_next(int remaining, int slice) {
+    int s = (slice < remaining) ? slice : remaining;
+    if (remaining - s == 1) s = remaining;   /* take the last token now, never leave one */
+    return s;
+}
+
+int qwen_prefill_slice_tokens(void) {
+    static atomic_int cached = 0;
+    static atomic_int have = 0;
+    if (!atomic_load_explicit(&have, memory_order_acquire)) {
+        const char *e = getenv("QWEN_PREFILL_SLICE");
+        int v = 0;
+        if (e && e[0]) {
+            char *end = NULL;
+            long n = strtol(e, &end, 10);
+            if (!end || *end != '\0' || n < -100000 || n > 100000) {
+                fprintf(stderr, "Error: QWEN_PREFILL_SLICE=\"%s\" is not a token count "
+                                "in [-100000, 100000]\n", e);
+                exit(1);
+            }
+            v = (int)n;
+        }
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+        atomic_store_explicit(&have, 1, memory_order_release);
+    }
+    return atomic_load_explicit(&cached, memory_order_relaxed);
+}
+
 int qwen_tts_batch_max_prompt(void) {
     static int v = -1;
     if (v < 0) {
@@ -3280,6 +3328,41 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         }                                                                                     \
     } while (0)
 
+    /* C12-WIN-10: run the Talker prefill of a newly admitted request as resumable
+     * token-range slices inside the frame loop instead of one monolithic call, so an
+     * admission costs the established streams one slice (~S tokens) instead of the whole
+     * prompt.  0 (the default and the product value) is the monolithic path, byte for byte.
+     * At most one pending admission per worker: no new queue, no extra capacity. */
+    const int adm_slice_raw = qwen_prefill_slice_tokens();
+    const int adm_slice = adm_slice_raw < 0 ? -adm_slice_raw : adm_slice_raw;
+    const int adm_slice_idle = adm_slice_raw < 0;   /* parity testing only */
+    typedef struct {
+        int   active;          /* a prompt is built and partially prefilled          */
+        qwen_batch_req_t req;  /* scalars only; .text is not held past preparation   */
+        void *tag;
+        int   seq_len;         /* total prompt positions (prefix included)           */
+        int   pos0;            /* prefix positions already in the bf16 cache         */
+        int   done;            /* new-token rows completed so far, in [0, seq_len-pos0] */
+        int   slices;
+        double t_admit;
+    } adm_pending_t;
+    adm_pending_t adm;
+    memset(&adm, 0, sizeof(adm));
+    long long adm_slices_total = 0, adm_sliced_reqs = 0, adm_inline_reqs = 0;
+
+    /* Release a pending sliced admission and everything it owns.  why_ = NULL is a
+     * cancellation (the client is gone), a string is a rejection. */
+    #define ADM_DROP(why_) do {                                                          \
+        if (adm.tag) {                                                                   \
+            if ((why_) != NULL && sink->on_reject)                                       \
+                sink->on_reject(sink->ud, adm.tag, (why_));                              \
+            else sink->on_done(sink->ud, adm.tag, NULL, 0);                              \
+        }                                                                                \
+        free(ctx->prefill_embeds); ctx->prefill_embeds = NULL; ctx->prefill_seq_len = 0;  \
+        qwen_stream_trailing_clear(ctx);                                                  \
+        memset(&adm, 0, sizeof(adm));                                                     \
+    } while (0)
+
     /* The helper submits from its own thread beside the frame loop, so it needs concurrent
      * submitters (a pool capability) and the QWEN_PREFILL_HELPER opt-in (a feature flag).
      * One predicate used to stand for both, which made a feature flag change pool policy. */
@@ -3360,6 +3443,142 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         for (int b = 0; b < B; b++) {
             if (active[b]) continue;
             if (dec_on && atomic_load(&dec_busy[b]) != 0) { if (prof_on) occ_free_decbusy++; continue; }
+
+            /* ---- C12-WIN-10: sliced admission ------------------------------------
+             * A pending admission owns this block until it completes: exactly one
+             * slice per iteration while other slots stream, the whole remainder in
+             * one visit when the worker is idle (there is nobody to protect, and the
+             * cold-start TTFA must not grow).  While it is pending no other request
+             * is prefilled, because the partial KV of this one lives in ctx->kv_cache
+             * and the prompt state (dec_x, bg_text_content_len, trailing text) lives
+             * in ctx -- a second prompt build would destroy both. */
+            if (adm_slice > 0 && !use_helper) {
+                if (adm.active && sink->cancelled && adm.tag &&
+                    sink->cancelled(sink->ud, adm.tag)) {
+                    ADM_DROP(NULL);
+                    continue;
+                }
+                if (!adm.active) {
+                    if (!sink->running(sink->ud)) break;
+                    int a_block = (n_active == 0);
+                    qwen_batch_req_t a_req;
+                    void *a_tag = NULL;
+                    double a_w0 = prof_on ? time_ms() : 0;
+                    int a_got = sink->next_job(sink->ud, &a_req, &a_tag, a_block);
+                    if (prof_on) { double d = time_ms() - a_w0; pf_wait += d; pf_mark += d; }
+                    if (!a_got) {
+                        if (prof_on) occ_free_empty++;
+                        if (a_block) break;
+                        continue;
+                    }
+                    /* Build the prompt, then stop: prefill_defer hands the embeddings
+                     * back instead of running the Talker. */
+                    int sv_spk = ctx->speaker_id, sv_lang = ctx->language_id;
+                    ctx->speaker_id = a_req.speaker_id; ctx->language_id = a_req.language_id;
+                    ctx->prev_prefill_len = 0; ctx->prefill_only = 1; ctx->prefill_defer = 1;
+                    double a_t0 = qwen_mono_ms();
+                    double a_st0 = stage_trace ? a_t0 : 0;
+                    int a_rc = qwen_tts_generate(ctx, a_req.text, NULL, NULL);
+                    ctx->prefill_only = 0; ctx->prefill_defer = 0;
+                    ctx->speaker_id = sv_spk; ctx->language_id = sv_lang;
+                    int a_len = ctx->prefill_seq_len;
+                    if (a_rc != 0 || a_len <= 0 || a_len > MAXPROMPT || !ctx->prefill_embeds) {
+                        const char *why = (a_len > MAXPROMPT) ? "prompt too long for a batch slot"
+                                                              : "prefill failed";
+                        adm.tag = a_tag;
+                        ADM_DROP(why);
+                        continue;
+                    }
+                    int a_pos0 = 0;
+                    int a_plan = qwen_talker_prefill_plan(ctx, a_len, &a_pos0);
+                    if (a_plan < 0) {
+                        adm.tag = a_tag;
+                        ADM_DROP("prefill failed");
+                        continue;
+                    }
+                    if (a_plan == 1) {
+                        /* This prompt would POPULATE the prefix cache, which the sliced
+                         * path cannot do (it would have to keep the f32 K/V of every
+                         * layer alive across slices).  Run it monolithically, once:
+                         * the prompt is already built, so this is the inline path with
+                         * the same computation and the same result. */
+                        double a_pf0 = stage_trace ? qwen_mono_ms() : 0;
+                        ctx->kv_len = 0;
+                        int a_prc = qwen_talker_prefill(ctx, ctx->prefill_embeds, a_len);
+                        if (stage_trace) st_prefill_ms += qwen_mono_ms() - a_pf0;
+                        int a_pl = ctx->kv_len;
+                        if (a_prc != 0 || a_pl <= 0) {
+                            adm.tag = a_tag;
+                            ADM_DROP("prefill failed");
+                            continue;
+                        }
+                        if (ttfa_trace) {
+                            double a_t1 = qwen_mono_ms();
+                            t2_helper[b] = 0;          t2_seed[b]      = a_req.seed;
+                            t2_admitted[b] = a_t0;     t2_pf_start[b]  = a_t0;
+                            t2_pf_done[b]  = a_t1;     t2_state_rdy[b] = a_t1;
+                            t2_pfq_push[b] = 0;        t2_pfq_pop[b]   = 0;
+                            t2_step1[b] = 0; t2_talker1[b] = 0; t2_decode1[b] = 0;
+                            t2_frame1[b] = 0; t2_audio1[b] = 0; t2_emitted[b] = 0;
+                            t2_batch_at_inst[b] = n_active; t2_qdepth_at_pop[b] = -1;
+                            t2_adm_seq[b] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
+                        }
+                        ADMIT_INSTALL(b, a_req, a_tag, a_pl);
+                        free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
+                        ctx->prefill_seq_len = 0;
+                        adm_inline_reqs++;
+                        if (prof_on) occ_admits++;
+                        break;
+                    }
+                    if (adm_sliced_reqs == 0 && adm_slices_total == 0)
+                        fprintf(stderr, "[ADMSLICE] v=1 pid=%d first_sliced_admission=1 "
+                                        "slice=%d idle_slicing=%d seq_len=%d prefix=%d\n",
+                                (int)getpid(), adm_slice, adm_slice_idle, a_len, a_pos0);
+                    adm.active = 1;
+                    adm.req = a_req; adm.req.text = NULL;  /* scalars only from here on */
+                    adm.tag = a_tag; adm.seq_len = a_len; adm.pos0 = a_pos0;
+                    adm.done = 0; adm.slices = 0; adm.t_admit = a_t0;
+                    if (stage_trace) st_prefill_ms += qwen_mono_ms() - a_st0;
+                }
+
+                {
+                    int a_new = adm.seq_len - adm.pos0;
+                    int a_rem = a_new - adm.done;
+                    int a_S = (n_active == 0 && !adm_slice_idle)
+                                  ? a_rem
+                                  : qwen_prefill_slice_next(a_rem, adm_slice);
+                    double a_s0 = stage_trace ? qwen_mono_ms() : 0;
+                    int a_rc = qwen_talker_prefill_range(ctx, ctx->prefill_embeds, adm.seq_len,
+                                                         adm.pos0, adm.done, adm.done + a_S);
+                    if (stage_trace) st_prefill_ms += qwen_mono_ms() - a_s0;
+                    if (a_rc != 0) { ADM_DROP("prefill failed"); break; }
+                    adm.done += a_S; adm.slices++; adm_slices_total++;
+                    if (adm.done >= a_new) {
+                        int a_pl = ctx->kv_len;
+                        if (ttfa_trace) {
+                            double a_t1 = qwen_mono_ms();
+                            t2_helper[b] = 0;             t2_seed[b]      = adm.req.seed;
+                            t2_admitted[b] = adm.t_admit; t2_pf_start[b]  = adm.t_admit;
+                            t2_pf_done[b]  = a_t1;        t2_state_rdy[b] = a_t1;
+                            t2_pfq_push[b] = 0;           t2_pfq_pop[b]   = 0;
+                            t2_step1[b] = 0; t2_talker1[b] = 0; t2_decode1[b] = 0;
+                            t2_frame1[b] = 0; t2_audio1[b] = 0; t2_emitted[b] = 0;
+                            t2_batch_at_inst[b] = n_active; t2_qdepth_at_pop[b] = -1;
+                            t2_adm_seq[b] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
+                        }
+                        void *a_tag2 = adm.tag;
+                        qwen_batch_req_t a_req2 = adm.req;
+                        ADMIT_INSTALL(b, a_req2, a_tag2, a_pl);
+                        free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
+                        ctx->prefill_seq_len = 0;
+                        memset(&adm, 0, sizeof(adm));
+                        adm_sliced_reqs++;
+                        if (prof_on) occ_admits++;
+                    }
+                }
+                break;
+            }
+
             if (use_helper) {
                 if (!sink->running(sink->ud) && n_active > 0) break;
                 int block = (n_active == 0);
@@ -3612,7 +3831,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         }
 
         int m1_slot_i = -1; unsigned int m1_seed_i = 0; double m1_ts_i = 0;
-        if (admit_m1 && sink->running(sink->ud)) {
+        /* A pending sliced admission owns ctx->kv_cache and the prompt state; the M1
+         * late admission is monolithic and would overwrite both. */
+        if (admit_m1 && !adm.active && sink->running(sink->ud)) {
             m1_scan++;
             int m1_free_slot = 0;
             for (int b = 0; b < B; b++) {
@@ -3814,13 +4035,15 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     "sample_ms=%.3f cp_ms=%.3f decode_ms=%.3f talker_ms=%.3f "
                     "output_ms=%.3f queue_wait_ms=%.3f serial_ms=%.3f wall_ms=%.3f "
                     "dec_calls=%d dec_group_max=%d dec_frames=%d dec_ragged=%d "
-                    "dec_per_item=%d dec_external=%d dec_wait_ms=%.3f overlap=%d\n",
+                    "dec_per_item=%d dec_external=%d dec_wait_ms=%.3f overlap=%d "
+                    "prefill_slice=%d prefill_pending=%d prefill_done=%d\n",
                     (int)getpid(),
                     (unsigned long long)atomic_load_explicit(&g_admit_seq, memory_order_relaxed),
                     st_iter_start, st_end, st_n_active, st_n_step, st_admit, st_prefill_ms, st_head, st_samp,
                     st_cp, st_decode, st_talker, st_write_ms, st_wait, st_serial, st_wall,
                     st_dec_calls, st_dec_group_max, st_dec_frames, st_dec_ragged,
-                    st_dec_per_item, st_dec_external, st_dec_wait, st_overlap);
+                    st_dec_per_item, st_dec_external, st_dec_wait, st_overlap,
+                    adm_slice, adm.active, adm.active ? adm.done : 0);
         }
     }
 
@@ -3929,6 +4152,16 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     free(lead_mask);
     free(prio_mask); free(frozen);
 
+    if (adm.active) ADM_DROP(NULL);
+    free(ctx->prefill_embeds); ctx->prefill_embeds = NULL; ctx->prefill_seq_len = 0;
+    if (adm_slice > 0)
+        fprintf(stderr, "[ADMSLICE] v=1 pid=%d slice=%d idle_slicing=%d sliced_requests=%lld "
+                        "slices=%lld mean_slices=%.2f inline_requests=%lld\n",
+                (int)getpid(), adm_slice, adm_slice_idle, adm_sliced_reqs, adm_slices_total,
+                adm_sliced_reqs ? (double)adm_slices_total / (double)adm_sliced_reqs : 0.0,
+                adm_inline_reqs);
+
+    #undef ADM_DROP
     #undef PF_START
     #undef PF_END
     #undef FINALIZE_SLOT
