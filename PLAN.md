@@ -216,6 +216,13 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       from an unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
       server — below the regime the lane exists for.
       Ordering: the build break above is NOT part of this track and must not wait for it.
+      Progress on `feature/arm-parity-vnni` (2026-09-10): items 0 (link fix, = TQ-6), 1
+      (KleidiAI gate rows), 2 (prefork plans on the inherited mask), 3 (docs + expectation
+      rows) and 4 (lane honours the requested engine width) are implemented; the Arm DL-4
+      leaf of item 8 is implemented and passes the 20-case `--self-test` on aarch64 dotprod.
+      NEXT: the same tree on the 16-core Neoverse-V2 host — preflight, KAI/i8mm checks, the
+      leaf quality gate, then the lane A/B. Old Arm probe numbers are not evidence and the
+      arm-product profile is NOT flipped until that gate passes.
       Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
       convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
       largest single item. DO NOT chase the AMX strip/range port: it was measured first and
@@ -232,9 +239,11 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       AVX-512F-without-VNNI have NO int8 decoder conv at all, so the gap is three CPU
       families; and an undeclared `in_ch <= 768` gate drops every backend to f32 above it,
       AMX and VNNI included. Work: one dotprod/i8mm DL-4 leaf against the already ISA-neutral
-      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract, closing Arm + AVX2 +
-      AVX-512F together. Rename/re-document the flag and the `decoder.res1_v2` row and
-      declare the 768 gate in the map FIRST.
+      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract. IMPLEMENTED for Arm
+      dot-product on `feature/arm-parity-vnni` (serves res2 by shape); AVX2 and AVX-512F stay
+      on the f32 fallback, so the three-family claim of this item is not delivered. The flag
+      and the `decoder.res1_v2` row are re-documented (shape-based, 768 gate) but not renamed;
+      Arm quality/perf qualification is the open part.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
@@ -454,16 +463,16 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       a GPU-resident decoder replaces that component rather than tuning it; the
       backend-agnostic layers do carry over. Detail:
       `.work/arm-linux-v2-parity-track-20260910.md` section 2e.
-- [ ] TQ-6 BUILD BREAK, not Arm-specific: the tree does not link when neither
+- [x] TQ-6 BUILD BREAK, not Arm-specific: the tree does not link when neither
       `__ARM_FEATURE_DOTPROD` nor `__AVX512VNNI__` is defined — `SIMD=portable` (the default
       non-VNNI x86 target) and `SIMD=scalar` both fail. Seven symbols are declared and called
       unconditionally but defined only inside the ISA guard in `qwen_tts_kernels.c`, and the
       `#else` fallback sits inside that guard, so it is unreachable. VERIFIED at HEAD with
       `make blas ARCH_FLAGS="-march=armv8-a"`. Partly introduced by C12-WIN: `_ctx` in
-      ddfa5d8, `_pack_stack`/`_stack_epilogue` in edfd3fb. Fix: an unconditional fallback
-      section outside the guard, and move the two ConvT helpers out of the ISA guard entirely
-      (they contain no intrinsic). Add `SIMD=portable` and `SIMD=scalar` link-only CI jobs —
-      this break is invisible on a VNNI or dotprod host. Detail:
+      ddfa5d8, `_pack_stack`/`_stack_epilogue` in edfd3fb. FIXED on `feature/arm-parity-vnni`:
+      the ISA-neutral ConvT stack and the DL-4 packer moved outside the guard, no-op fallbacks
+      for the three ISA-bound entry points, link-only CI jobs. Re-verified with
+      `-march=armv8-a` (links, self-test PASS) and on the native build. Detail:
       `.work/arm-linux-v2-parity-track-20260910.md` section 1.
 - [x] TQ-5 HTTP JSON string parsing: **ROOT-CAUSED + FIXED** in
       `cf8dd6b09d6de8abc51cccfa6aa90d3fa062b8c7`. The server now decodes standard JSON
