@@ -234,6 +234,23 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       convolution, common glue/materialization removal, pre-upsample BF16/INT8 matmat,
       and one-GEMM ConvT. Detail and gates: `.work/decoder-xisa-deferred-track-20260909.md`.
 
+### Deferred QUANT-PTQ — calibration-aware quantization revisit (MEDIUM/LOW)
+
+- [ ] Revisit lower-precision prefill and weight storage using calibration/optimization-aware
+      PTQ (AutoRound-style or equivalent) instead of the engine's earlier straightforward
+      conversion. Production keeps prefill in BF16 deliberately; the earlier simple INT8
+      prefill and simple INT4/Q4 attempts were rejected because pronunciation and speaker character
+      drifted audibly while the audio stayed otherwise valid. Those verdicts reject THOSE
+      IMPLEMENTATIONS, not lower precision as a direction -- do not record "INT8 prefill" or
+      "INT4" as architecturally disproven. Tracks: calibrated INT8/W8A8 prefill; quality-
+      optimized Q4/INT4 or mixed precision for suitable Talker/CP/prefill regions; offline
+      calibration only, with the C runtime consuming packed weights and scales and no
+      training machinery; and a re-test of whether the V2 kernels change the premise. GATE:
+      a performance gain is irrelevant unless pronunciation and speaker character survive against the current INT8 + BF16-prefill baseline, judged by paired audio, ASR
+      and listening -- waveform/mel/duration equality is necessary and not sufficient, since
+      the earlier rejections passed exactly those. Start only after the C12-WIN items and
+      the report qualification work. Detail: `.work/quantization-ptq-revisit.md`.
+
 ### P1 Cadence truth (current binary, Tier A only) — detail: `.work/p1-cadence-truth-20260907.md`
 
 - [x] CT-1 Quantum discriminator at C3/C4, including gang-off control; q32 is rejected.
