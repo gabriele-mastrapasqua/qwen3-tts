@@ -115,3 +115,6 @@ samples/ingot_v101_check/
 /.work/**/*.csv
 /.work/**/*.log
 /.work/**/*.txt
+
+# make flag stamp: rewritten when SIMD/ARCH_FLAGS change
+/.build_state/
