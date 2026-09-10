@@ -356,6 +356,16 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       request before closing; also record that rejection is per worker (cap 4): C20 sent 8
       rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
       for a simultaneous wave when the parent balances.
+- [ ] TQ-5 HTTP JSON string parsing: `json_extract_string()` performs NO unescaping — it
+      skips a character after a backslash while scanning for the closing quote, then copies
+      the raw bytes. Every escape reaches the tokenizer literally (`\uXXXX`, `\"`, `\n`,
+      `\\`, `\t`). Standard JSON encoders emit `\uXXXX` for non-ASCII by default, so this
+      corrupts every accented language and destroys CJK; `\"`/`\n` corrupt English too.
+      The CLI is unaffected (text comes from argv as raw UTF-8). Root cause of TQ-4. Fix
+      belongs in the parser: passing `ensure_ascii=False` from a harness is a diagnostic,
+      not a fix, and no repo harness sets it today. Evidence impact in
+      `.work/server-cli-italian-correctness-20260910.md` 0.1: paired A/B results survive
+      (both arms equally corrupted), absolute Italian quality and CER claims do not.
 - [ ] TQ-4 Server-vs-CLI Italian pronunciation defect: CLI good, server streaming malformed,
       English controls good; reproduced on Turin and on a dev machine. Owned and executed on
       a separate track. Independent review, code-level CLI/server asymmetries, ranked
@@ -363,6 +373,7 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       `.work/server-cli-italian-correctness-20260910.md`. Blocks a final product-quality
       claim for any new runtime path; does NOT block the 11A/12 kernel microbenches.
       Predates C12-WIN-10, which is default OFF and must not be blamed for it.
+      ROOT CAUSE FOUND 2026-09-10 on the execution track: see TQ-5, the JSON string parser.
 - [ ] TQ-3 Ear verdict on the paired RES1_V2 bank (`samples/tests/2026-09-09_turin-qualification/`);
       PASS promotes `turin-c8a-32c-vnni-product` from provisional to qualified for C12.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;

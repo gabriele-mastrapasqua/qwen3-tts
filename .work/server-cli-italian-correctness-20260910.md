@@ -20,15 +20,60 @@ before it starts instrumenting.
 Two constraints that follow from ownership: do not modify instrumentation the execution
 owner may be relying on, and do not treat any partial result as a conclusion.
 
+## 0.1 ROOT CAUSE FOUND BY THE EXECUTION TRACK (2026-09-10) — and what it costs us
+
+The live forensic located the first divergence in the server's TEXT INPUT, before prefill,
+KV or CP: `json_extract_string()` in `qwen_tts_server.c` performs **no unescaping at all**.
+It uses the backslash only to skip a character while scanning for the closing quote, then
+`memcpy`s the raw bytes. Verified by reading the function.
+
+So the defect is broader than the reported `\uXXXX` case. Every JSON escape reaches the
+tokenizer literally: `\uXXXX`, `\"`, `\n`, `\\`, `\t`, `\/`. A request containing a quoted
+phrase or a newline is corrupted in ANY language, English included; the language pattern in
+the symptom comes from WHICH clients emit escapes, not from the language itself.
+
+Why CLI is clean and server is not: the CLI takes `--text` from `argv` as raw UTF-8 and
+never passes through this parser.
+
+**This is a product interoperability defect, not a harness artifact.** Python's
+`json.dumps` defaults to `ensure_ascii=True`, as does much other tooling, so a standard
+client sends `\uXXXX` for every non-ASCII character. That breaks every accented language and
+destroys CJK entirely (each character becomes a six-character literal). Sending
+`ensure_ascii=False` is the correct isolated CONFIRMATION and it fixes our harnesses; it is
+NOT the fix. The fix belongs in the parser. No repository harness that sends text currently
+passes `ensure_ascii=False`.
+
+### Evidence integrity — what survives and what does not
+
+Every serving campaign that sent non-ASCII text through the JSON API fed the engine text
+that was not the text we intended.
+
+* **Survives**: paired A/B comparisons where BOTH arms went through the same corrupted
+  path, because both arms received identical (corrupted) input. That includes the RES1_V2
+  reference-vs-V2 parity result and the spec 10 server parity harness gates.
+* **Does NOT survive**: any ABSOLUTE Italian quality claim, any CER/WER scored against the
+  intended text, and any statement that an Italian bank "sounded right". The V2 quality
+  qualification keeps its parity meaning and loses its semantic-quality meaning.
+* **Marginal**: performance numbers. The corrupted Italian prompts carried a few extra text
+  tokens, so the short/medium/long class boundaries were slightly off for Italian; RTF
+  conclusions are not materially affected.
+
+### Why the frame-count difference follows
+
+More text tokens raise `ctx->bg_text_content_len`, which the server captures as `tcl[b]` and
+feeds to its hardcoded EOS heuristic (section 3.1). The 53-versus-55 frame difference is a
+CONSEQUENCE of the corrupted input, not an independent stopping-policy bug. Section 3.1
+remains a real CLI/server asymmetry, but it is not the cause here and must not be "fixed"
+on the strength of this case.
+
 ## 1. What must NOT be assumed
 
 * **Not spec 10.** `QWEN_PREFILL_SLICE` is default OFF and this defect predates it. It can
   only be implicated if the flag is actually enabled in the failing run.
 * **Not RES1_V2**, merely because it is recent.
 * **Not batching**, until B_eff=1 evidence exists.
-* **Not "Italian is special"** until an English sentence of comparable token length and
-  structure has been tried. Italian and English of the same content tokenize to different
-  lengths, so any length-dependent policy will look language-dependent without being so.
+* **Not "Italian is special"** — CONFIRMED in section 0.1: the trigger is which characters
+  a client escapes, not the language. English is exposed too, through `\"` and `\n`.
 
 ## 2. Four categories that must never be collapsed
 
