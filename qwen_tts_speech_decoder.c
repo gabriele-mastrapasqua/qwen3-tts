@@ -5,6 +5,7 @@
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_costmap.h"
 #include "qwen_tts_thread.h"
+#include "qwen_tts_kleidi.h"
 #include "ingot/safetensors.h"
 
 #include <stdio.h>
@@ -1953,6 +1954,84 @@ extern int g_cuda_decoder_conv_on;
 extern int qwen_cuda_conv_decoder_run(void *ctx, float *signal, int cur_ch, int cur_len, float **audio_out, int *n_out);
 #endif
 
+/* ---- QWEN_SD_CNEXT_I8: the ConvNeXt pointwise pair on KleidiAI int8 -------------------
+ * The two GEMMs are the largest f32 weights left in the decoder unit (4096-wide) and their
+ * shapes are exactly a KAI int8 matmul with the sequence as the batch.  The unit runs on the
+ * lane team, so the dispatching wrapper qwen_kleidi_matmul_i8_native (which nests
+ * qwen_parallel) is not usable here; the prepared-state pair is: every worker packs the LHS
+ * into its own scratch, then runs this thread's n-tiles.  Outputs are int8 GEMMs with
+ * per-row weight scales, i.e. a NUMERIC change, so the flag is default off. */
+static int sd_cnext_i8_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_CNEXT_I8"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
+
+typedef struct { float *dst; const void *key; const float *lhs;
+                 int rows, cols, B; size_t dstride; } sd_kai_job_t;
+
+static void sd_kai_task(size_t tid, size_t nt, void *v) {
+    sd_kai_job_t *j = (sd_kai_job_t *)v;
+    const void *lp = qwen_kleidi_i8_region_prep(j->lhs, (size_t)j->cols * sizeof(float),
+                                                j->cols, j->B);
+    if (lp) qwen_kleidi_i8_region_run(j->key, j->dst, j->dstride, lp,
+                                      j->rows, j->cols, j->B, tid, nt);
+}
+
+static int sd_kai_matmul(float *dst, const void *key, const float *lhs,
+                         int rows, int cols, int B, size_t dstride) {
+    if (!qwen_kleidi_i8_region_usable(key, rows, cols, B)) return 0;
+    sd_kai_job_t j = { dst, key, lhs, rows, cols, B, dstride };
+    if (qwen_parallel_active()) { sd_kai_task(0, 1, &j); return 1; }
+    int nt = qwen_lane_thread_here() ? qwen_lane_team_size() : qwen_get_threads();
+    if (nt < 1) nt = 1;
+    if (nt == 1) sd_kai_task(0, 1, &j);
+    else          qwen_parallel((size_t)nt, sd_kai_task, &j);
+    return 1;
+}
+
+static void sd_cnext_quant_row(const float *w, int8_t *q, float *s, int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        const float *row = w + (size_t)r * cols;
+        float amax = 0.0f;
+        for (int c = 0; c < cols; c++) { float a = fabsf(row[c]); if (a > amax) amax = a; }
+        const float sc = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / sc;
+        int8_t *qr = q + (size_t)r * cols;
+        for (int c = 0; c < cols; c++) {
+            int v = (int)lrintf(row[c] * inv);
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            qr[c] = (int8_t)v;
+        }
+        s[r] = sc;
+    }
+}
+
+static int sd_cnext_i8_prepare(qwen_sd_convnext_t *cn, int cur_ch) {
+    if (!sd_cnext_i8_enabled() || cur_ch <= 0) return 0;
+    if (cn->pwconv1_i8) return cn->pw1_cols == cur_ch;
+    const int r1 = 4096, c1 = cur_ch, r2 = cur_ch, c2 = 4096;
+    int8_t *q1 = (int8_t *)aligned_malloc((size_t)r1 * c1);
+    float  *s1 = (float *)aligned_malloc((size_t)r1 * sizeof(float));
+    int8_t *q2 = (int8_t *)aligned_malloc((size_t)r2 * c2);
+    float  *s2 = (float *)aligned_malloc((size_t)r2 * sizeof(float));
+    if (!q1 || !s1 || !q2 || !s2) { free(q1); free(s1); free(q2); free(s2); return 0; }
+    sd_cnext_quant_row(cn->pwconv1_weight, q1, s1, r1, c1);
+    sd_cnext_quant_row(cn->pwconv2_weight, q2, s2, r2, c2);
+    if (!qwen_kleidi_register_i8_fam(cn->pwconv1_weight, q1, s1, r1, c1,
+                                     QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER) ||
+        !qwen_kleidi_register_i8_fam(cn->pwconv2_weight, q2, s2, r2, c2,
+                                     QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER)) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "[cnext] QWEN_SD_CNEXT_I8=1 but the weights were not registered (KleidiAI i8 off?); f32 path\n"); }
+        free(q1); free(s1); free(q2); free(s2);
+        return 0;
+    }
+    cn->pwconv1_i8 = q1; cn->pwconv1_scale = s1; cn->pw1_rows = r1; cn->pw1_cols = c1;
+    cn->pwconv2_i8 = q2; cn->pwconv2_scale = s2; cn->pw2_rows = r2; cn->pw2_cols = c2;
+    return 1;
+}
+
 static void convnext_mlp(qwen_sd_convnext_t *cn, float *signal, const float *residual,
                          int cur_ch, int cur_len) {
     for (int t = 0; t < cur_len; t++) {
@@ -1971,6 +2050,46 @@ static void convnext_mlp(qwen_sd_convnext_t *cn, float *signal, const float *res
     }
 
     int pw_dim = 4096;
+    if (sd_cnext_i8_prepare(cn, cur_ch)) {
+        float *y1 = (float *)sd_tmp_alloc((int64_t)pw_dim * cur_len * sizeof(float));
+        float *xt = (float *)sd_tmp_alloc((int64_t)cur_ch * cur_len * sizeof(float));
+        if (y1 && xt) {
+            for (int t = 0; t < cur_len; t++)
+                for (int c = 0; c < cur_ch; c++)
+                    xt[(size_t)t * cur_ch + c] = signal[(size_t)c * cur_len + t];
+            if (sd_kai_matmul(y1, cn->pwconv1_weight, xt, pw_dim, cur_ch, cur_len,
+                              (size_t)pw_dim * sizeof(float))) {
+                if (cn->pwconv1_bias)
+                    for (int t = 0; t < cur_len; t++)
+                        for (int i = 0; i < pw_dim; i++) y1[(size_t)t * pw_dim + i] += cn->pwconv1_bias[i];
+                for (int64_t i = 0; i < (int64_t)pw_dim * cur_len; i++)
+                    y1[i] = 0.5f * y1[i] * (1.0f + erff(y1[i] * 0.7071067811865476f));
+                float *y2 = (float *)sd_tmp_alloc((int64_t)cur_ch * cur_len * sizeof(float));
+                if (y2 && sd_kai_matmul(y2, cn->pwconv2_weight, y1, cur_ch, pw_dim, cur_len,
+                                        (size_t)cur_ch * sizeof(float))) {
+                    for (int c = 0; c < cur_ch; c++) {
+                        const float g = cn->gamma[c];
+                        const float b2 = cn->pwconv2_bias ? cn->pwconv2_bias[c] : 0.0f;
+                        for (int t = 0; t < cur_len; t++)
+                            signal[(size_t)c * cur_len + t] = residual[(size_t)c * cur_len + t]
+                                + (y2[(size_t)t * cur_ch + c] + b2) * g;
+                    }
+                    if (y2) sd_tmp_free(y2);
+                    sd_tmp_free(xt); sd_tmp_free(y1);
+                    return;
+                }
+                if (y2) sd_tmp_free(y2);
+            }
+        }
+        if (xt) sd_tmp_free(xt);
+        if (y1) sd_tmp_free(y1);
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[cnext] QWEN_SD_CNEXT_I8=1 but the int8 GEMM did not run (ch=%d len=%d); f32 path\n",
+                    cur_ch, cur_len);
+        }
+    }
     float *pw1_out = (float *)sd_tmp_alloc((int64_t)pw_dim * cur_len * sizeof(float));
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
