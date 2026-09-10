@@ -141,14 +141,19 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       WITHDRAWN as unsatisfiable and replaced by a paired product-quality bank. Remaining:
       the `admit_ms` diagnostic, the A/B and the quality bank on the qualification path.
       NOT RUN on x86.
-- [ ] C12-WIN-11 Conv-stack traffic: ConvT as ONE un-expanded GEMM (`[k·out_ch][in_ch]`
-      stacked weights, R = W×in, two-tap fused epilogue with carry/bias), then weight-only
-      bf16 with f32 activations/accumulate for ConvT block 0, convnext pw, initial conv.
-      Spec: `.work/c12-win-conv-stack-implementation.md`. Gate: step A >= 2 ms with parity
-      1e-5, A+B >= 4 ms on the q4 unit, paired mel >= 0.99 for B. Zero-expanded ConvT
-      formulation and bf16 activations explicitly forbidden. Step A IMPLEMENTED default-off
-      as `QWEN_SD_CONVT_STACK=1` (2026-09-09), self-test 8e-8 vs the per-tap reference on
-      every block geometry; step B not started. NOT RUN on x86.
+- [x] C12-WIN-11 A Conv-stack traffic: ConvT as ONE un-expanded GEMM per layer with a fused
+      two-tap carry/bias epilogue. Spec: `.work/c12-win-conv-stack-implementation.md`.
+      CLOSED 2026-09-10 on Turin: implementation CORRECT, effect NULL, flag stays default-off.
+      Correctness passes on x86 -- self-test 0 failures with the convt_stack cases at 3e-8..1e-7
+      against a 1e-5 contract, dispatch verified ON/OFF, CLI audio mel-corr 0.99962 at identical
+      duration. The microbench (1.7B, 4 threads, taskset 4-7, B1-B4, 9 warm reps) shows no
+      effect at the product quantum: chunk-4 deltas B1 -0.20, B2 -0.70, B3 +0.70, B4 +1.30 ms,
+      and 16 of 32 cells faster -- a coin flip. A control-vs-control run of the SAME arm on the
+      same binary in the same minutes measured a noise floor of -0.40..+2.70 ms at chunk 4 and
+      up to 32 ms at chunk 16, so every one of those deltas is inside the noise. Note for any
+      future rung: the >= 2 ms gate this spec asked for is BELOW this harness's own resolution
+      at B3/B4 (noise alone is +2.7 ms there); a rung that needs to resolve 2 ms needs paired
+      replicates, not a single run of each arm.
 - [x] C12-WIN-12 VNNI glue as one combined change: out-of-place snake1, V2 kernel with
       (tail, tail_cols) context and residual epilogue, plain allocs, ownership transfer.
       Spec: `.work/c12-win-vnni-glue-implementation.md`. CLOSED 2026-09-10 on Turin:
