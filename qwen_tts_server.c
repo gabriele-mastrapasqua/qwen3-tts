@@ -17,6 +17,7 @@
 #include "qwen_tts_emotion.h"
 #include "qwen_tts_compose.h"
 #include "qwen_tts_audio.h"
+#include "qwen_json.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,26 +80,15 @@ static inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static char *json_extract_string(const char *json, const char *key) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return NULL;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ':') p++;
-    if (*p != '"') return NULL;
-    p++;
-    const char *end = p;
-    while (*end && *end != '"') {
-        if (*end == '\\' && end[1]) end++;
-        end++;
-    }
-    int len = (int)(end - p);
-    char *result = (char *)malloc(len + 1);
-    if (!result) return NULL;
-    memcpy(result, p, len);
-    result[len] = '\0';
-    return result;
+static qwen_json_string_status_t json_extract_string(const char *json, const char *key,
+                                                     char **out, const char **why) {
+    return qwen_json_extract_string(json, key, out, why);
+}
+
+static int json_string_error(char *err, size_t errsz, const char *field, const char *why) {
+    snprintf(err, errsz, "invalid JSON string for '%s': %s", field,
+             why ? why : "malformed string");
+    return -1;
 }
 
 static double json_extract_number(const char *json, const char *key, double def) {
@@ -176,20 +166,7 @@ static void send_json(int fd, int status, const char *json) {
 }
 
 static void json_escape(char *dst, size_t dstsz, const char *src) {
-    size_t j = 0;
-    for (const unsigned char *p = (const unsigned char *)src; *p && j + 8 < dstsz; p++) {
-        switch (*p) {
-            case '"':  if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='"';  } break;
-            case '\\': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='\\'; } break;
-            case '\n': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='n';  } break;
-            case '\r': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='r';  } break;
-            case '\t': if (j + 2 < dstsz) { dst[j++]='\\'; dst[j++]='t';  } break;
-            default:
-                if (*p < 0x20 || *p > 0x7e) j += (size_t)snprintf(dst + j, dstsz - j, "\\u%04x", *p);
-                else dst[j++] = (char)*p;
-        }
-    }
-    dst[j < dstsz ? j : dstsz - 1] = '\0';
+    qwen_json_escape(dst, dstsz, src);
 }
 
 static const char *api_error_type(int status) {
@@ -665,29 +642,7 @@ static const char *js_ws(const char *p) {
 static const char *js_value(const char *p, int depth, const char **why);
 
 static const char *js_string(const char *p, const char **why) {
-    if (*p != '"') { *why = "expected a string"; return NULL; }
-    p++;
-    for (;;) {
-        unsigned char ch = (unsigned char)*p;
-        if (ch == '\0') { *why = "unterminated string"; return NULL; }
-        if (ch == '"')  return p + 1;
-        if (ch < 0x20)  { *why = "control character in string"; return NULL; }
-        if (ch == '\\') {
-            p++;
-            switch (*p) {
-                case '"': case '\\': case '/': case 'b': case 'f':
-                case 'n': case 'r': case 't': p++; break;
-                case 'u':
-                    p++;
-                    for (int i = 0; i < 4; i++, p++)
-                        if (!isxdigit((unsigned char)*p)) { *why = "bad \\u escape"; return NULL; }
-                    break;
-                default: *why = "bad escape in string"; return NULL;
-            }
-            continue;
-        }
-        p++;
-    }
+    return qwen_json_string_end(p, why);
 }
 
 static const char *js_number(const char *p, const char **why) {
@@ -786,8 +741,12 @@ static const char *const g_known_fields[] = {
 };
 
 static int check_response_format(const char *body, char *err, size_t errsz) {
-    char *f = json_extract_string(body, "response_format");
-    if (!f) return 0;
+    char *f = NULL;
+    const char *why = NULL;
+    qwen_json_string_status_t st = json_extract_string(body, "response_format", &f, &why);
+    if (st == QWEN_JSON_STRING_INVALID)
+        return json_string_error(err, errsz, "response_format", why);
+    if (st == QWEN_JSON_STRING_ABSENT) return 0;
     int ok = !strcasecmp(f, "wav") || !strcasecmp(f, "pcm");
     if (!ok) snprintf(err, errsz, "response_format '%.16s' is not supported - this server "
                                   "emits 'wav' (default) or 'pcm'", f);
@@ -971,13 +930,24 @@ static void reset_request_state(qwen_tts_ctx_t *ctx) {
 
 static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
                                float *out_volume, float *out_rate) {
+    g_req_err[0] = '\0';
     reset_request_state(ctx);
 
-    char *text = json_extract_string(body, "text");
-    if (!text) {
-        text = json_extract_string(body, "input");
+    char *text = NULL;
+    const char *why = NULL;
+    qwen_json_string_status_t text_status = json_extract_string(body, "text", &text, &why);
+    if (text_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(g_req_err, sizeof(g_req_err), "text", why);
+        return NULL;
     }
-    if (!text || text[0] == '\0') {
+    if (text_status == QWEN_JSON_STRING_ABSENT) {
+        text_status = json_extract_string(body, "input", &text, &why);
+        if (text_status == QWEN_JSON_STRING_INVALID) {
+            json_string_error(g_req_err, sizeof(g_req_err), "input", why);
+            return NULL;
+        }
+    }
+    if (text_status != QWEN_JSON_STRING_VALID || !text || text[0] == '\0') {
         free(text);
         return NULL;
     }
@@ -997,8 +967,19 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
         return NULL;
     }
 
-    char *speaker = json_extract_string(body, "speaker");
-    if (!speaker) speaker = json_extract_string(body, "voice");
+    char *speaker = NULL;
+    qwen_json_string_status_t speaker_status = json_extract_string(body, "speaker", &speaker, &why);
+    if (speaker_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(g_req_err, sizeof(g_req_err), "speaker", why);
+        free(text); return NULL;
+    }
+    if (speaker_status == QWEN_JSON_STRING_ABSENT) {
+        speaker_status = json_extract_string(body, "voice", &speaker, &why);
+        if (speaker_status == QWEN_JSON_STRING_INVALID) {
+            json_string_error(g_req_err, sizeof(g_req_err), "voice", why);
+            free(text); return NULL;
+        }
+    }
     if (speaker) {
         int sid = ctx->speaker_id;
         int bad = resolve_speaker_checked(ctx, speaker, &sid, g_req_err, sizeof(g_req_err));
@@ -1007,17 +988,39 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
         ctx->speaker_id = sid;
     }
 
-    char *language = json_extract_string(body, "language");
+    char *language = NULL;
+    qwen_json_string_status_t language_status = json_extract_string(body, "language", &language, &why);
+    if (language_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(g_req_err, sizeof(g_req_err), "language", why);
+        free(text); return NULL;
+    }
     if (language) {
         int lid = qwen_tts_language_id(language);
         if (lid >= 0) ctx->language_id = lid;
     }
 
     free(ctx->instruct);
-    ctx->instruct = json_extract_string(body, "instruct");
-    if (!ctx->instruct) ctx->instruct = json_extract_string(body, "instructions");
+    ctx->instruct = NULL;
+    qwen_json_string_status_t instruct_status = json_extract_string(body, "instruct",
+                                                                     &ctx->instruct, &why);
+    if (instruct_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(g_req_err, sizeof(g_req_err), "instruct", why);
+        free(text); free(language); return NULL;
+    }
+    if (instruct_status == QWEN_JSON_STRING_ABSENT) {
+        instruct_status = json_extract_string(body, "instructions", &ctx->instruct, &why);
+        if (instruct_status == QWEN_JSON_STRING_INVALID) {
+            json_string_error(g_req_err, sizeof(g_req_err), "instructions", why);
+            free(text); free(language); return NULL;
+        }
+    }
 
-    char *vd = json_extract_string(body, "voice_design");
+    char *vd = NULL;
+    qwen_json_string_status_t vd_status = json_extract_string(body, "voice_design", &vd, &why);
+    if (vd_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(g_req_err, sizeof(g_req_err), "voice_design", why);
+        free(text); free(language); return NULL;
+    }
     if (vd) {
         if (strcmp(vd, "true") == 0 || strcmp(vd, "1") == 0) ctx->voice_design = 1;
         free(vd);
@@ -1054,7 +1057,12 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     float req_vol  = (float)json_extract_number(body, "volume", 1.0);
     float req_rate = (float)json_extract_number(body, "rate",
                           json_extract_number(body, "speed", 1.0));
-    char *emotion = json_extract_string(body, "emotion");
+    char *emotion = NULL;
+    qwen_json_string_status_t emotion_status = json_extract_string(body, "emotion", &emotion, &why);
+    if (emotion_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(g_req_err, sizeof(g_req_err), "emotion", why);
+        free(emotion); free(language); free(text); return NULL;
+    }
     if (emotion && emotion[0]) {
         qwen_tts_apply_emotion(ctx, emotion, language,
                                0.0f, 0, req_vol, vol_present, req_rate, rate_present,
@@ -1104,7 +1112,8 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     int n_samples = 0;
 
     if (qwen_compose_has_markup(text)) {
-        char *language = json_extract_string(body, "language");
+        char *language = NULL;
+        (void)json_extract_string(body, "language", &language, NULL);
         qwen_cspan_t *spans = NULL; int nspans = 0;
         if (qwen_compose_parse(text, &spans, &nspans) != 0 || nspans == 0) {
             send_error(fd, 500, "markup parse failed");
@@ -1179,7 +1188,8 @@ static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     if (!state.out) (void)send_chunked_header(fd);
 
     if (qwen_compose_has_markup(text)) {
-        char *language = json_extract_string(body, "language");
+        char *language = NULL;
+        (void)json_extract_string(body, "language", &language, NULL);
         qwen_cspan_t *spans = NULL; int nspans = 0;
         if (qwen_compose_parse(text, &spans, &nspans) == 0 && nspans > 0) {
             fprintf(stderr, "[HTTP] inline markup -> per-sentence compose stream (%d spans)\n", nspans);
@@ -1714,8 +1724,20 @@ static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_la
                              char *err, size_t errsz) {
     if (err && errsz) err[0] = '\0';
     *needs_single = 0;
-    char *text = json_extract_string(body, "text");
-    if (!text) text = json_extract_string(body, "input");
+    char *text = NULL;
+    const char *why = NULL;
+    qwen_json_string_status_t text_status = json_extract_string(body, "text", &text, &why);
+    if (text_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(err, errsz, "text", why);
+        return NULL;
+    }
+    if (text_status == QWEN_JSON_STRING_ABSENT) {
+        text_status = json_extract_string(body, "input", &text, &why);
+        if (text_status == QWEN_JSON_STRING_INVALID) {
+            json_string_error(err, errsz, "input", why);
+            return NULL;
+        }
+    }
     if (json_validate_object(body, err, errsz)) { free(text); return NULL; }
     if (reject_unknown_fields(body, err, errsz)) { free(text); return NULL; }
     if (check_response_format(body, err, errsz)) { free(text); return NULL; }
@@ -1724,7 +1746,7 @@ static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_la
           snprintf(err, errsz, "speed %.3g out of range - allowed 0.25 to 4.0", sp);
           free(text); return NULL;
       } }
-    if (!text || text[0] == '\0') {
+    if (text_status != QWEN_JSON_STRING_VALID || !text || text[0] == '\0') {
         snprintf(err, errsz, "missing or empty 'text'");
         free(text); return NULL;
     }
@@ -1741,8 +1763,19 @@ static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_la
     struct timeval tv; gettimeofday(&tv, NULL);
     req->seed = (uint32_t)(tv.tv_sec ^ tv.tv_usec);
 
-    char *speaker = json_extract_string(body, "speaker");
-    if (!speaker) speaker = json_extract_string(body, "voice");
+    char *speaker = NULL;
+    qwen_json_string_status_t speaker_status = json_extract_string(body, "speaker", &speaker, &why);
+    if (speaker_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(err, errsz, "speaker", why);
+        free(text); return NULL;
+    }
+    if (speaker_status == QWEN_JSON_STRING_ABSENT) {
+        speaker_status = json_extract_string(body, "voice", &speaker, &why);
+        if (speaker_status == QWEN_JSON_STRING_INVALID) {
+            json_string_error(err, errsz, "voice", why);
+            free(text); return NULL;
+        }
+    }
     if (speaker) {
         int sid = req->speaker_id;
         int bad = resolve_speaker_checked(ctx, speaker, &sid, err, errsz);
@@ -1750,7 +1783,12 @@ static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_la
         if (bad) { free(text); return NULL; }
         req->speaker_id = sid;
     }
-    char *language = json_extract_string(body, "language");
+    char *language = NULL;
+    qwen_json_string_status_t language_status = json_extract_string(body, "language", &language, &why);
+    if (language_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(err, errsz, "language", why);
+        free(text); return NULL;
+    }
     if (language) { int lid = qwen_tts_language_id(language); if (lid >= 0) req->language_id = lid; free(language); }
 
     req->temperature = clampf((float)json_extract_number(body, "temperature", req->temperature), 0.0f, 2.0f);
@@ -1762,10 +1800,20 @@ static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_la
     int seed = (int)json_extract_number(body, "seed", -1);
     if (seed >= 0) req->seed = (uint32_t)seed;
 
-    char *instruct = json_extract_string(body, "instruct");
+    char *instruct = NULL;
+    qwen_json_string_status_t instruct_status = json_extract_string(body, "instruct", &instruct, &why);
+    if (instruct_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(err, errsz, "instruct", why);
+        free(text); free(instruct); return NULL;
+    }
     if (instruct && instruct[0]) *needs_single = 1;
     free(instruct);
-    char *vd = json_extract_string(body, "voice_design");
+    char *vd = NULL;
+    qwen_json_string_status_t vd_status = json_extract_string(body, "voice_design", &vd, &why);
+    if (vd_status == QWEN_JSON_STRING_INVALID) {
+        json_string_error(err, errsz, "voice_design", why);
+        free(text); free(vd); return NULL;
+    }
     if (vd) { if (strcmp(vd, "true") == 0 || strcmp(vd, "1") == 0) *needs_single = 1; free(vd); }
 
     req->text = NULL;

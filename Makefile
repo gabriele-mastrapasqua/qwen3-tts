@@ -122,6 +122,7 @@ SRCS = main.c \
        qwen_tts_compose.c \
        qwen_tts_sampling.c \
        qwen_tts_tokenizer.c \
+       qwen_json.c \
        qwen_tts_server.c \
        qwen_tts_voice_clone.c \
        qwen_tts_speech_encoder.c \
@@ -361,6 +362,10 @@ test-selftest: $(TARGET)
 	@QWEN_NO_SDOT=1 QWEN_NO_VNNI=1 ./$(TARGET) --self-test || { echo "FAIL: kernel self-test (fallback)"; exit 1; }
 	@echo "PASS: kernel self-test (both paths numerically correct)"
 	@echo ""
+
+test-json-parser:
+	@$(CC) $(CFLAGS) -I. tests/json_string_parser_test.c qwen_json.c -o /tmp/qwen_json_string_parser_test
+	@/tmp/qwen_json_string_parser_test
 
 MODEL_SMALL = qwen3-tts-0.6b
 MODEL_LARGE = qwen3-tts-1.7b
@@ -1360,6 +1365,7 @@ test-it-ryan: test-small-it
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden test-stream-layout test-sd-pool-config golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
+		test-json-parser \
         emotion-para-demo para-demo \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all \
         test-clone test-voice-design \
