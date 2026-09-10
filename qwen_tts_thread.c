@@ -698,16 +698,31 @@ int qwen_lane_split_prepare(int *engine_threads) {
     if (L.elastic) {
         /* the engine keeps every cpu; the pool is pinned one worker per cpu at team start and
          * narrowed to the STEP cpus only while a decoder unit is in flight */
-        if (engine_threads) *engine_threads = n;
+        /* ARM-4: the caller's width is a CEILING, not a suggestion.  <=0 means "unset,
+         * you choose"; anything larger than the mask cannot be honoured anyway. */
+        if (engine_threads) {
+            const int want = *engine_threads;
+            if (want > 0 && want < n)
+                fprintf(stderr, "[lane] requested %d engine threads, mask has %d cpus: keeping %d\n",
+                        want, n, want);
+            if (want <= 0 || want > n) *engine_threads = n;
+        }
         fprintf(stderr, "[lane] ELASTIC split prepared: %d cpus, engine pool %d threads pinned one per cpu; "
                         "step cpus %s (%d) keep the engine while a decoder unit runs on %s (%d)\n",
-                n, n, L.step_list, L.step_cpus, L.dec_list, L.dec_cpus);
+                n, engine_threads ? *engine_threads : n, L.step_list, L.step_cpus, L.dec_list, L.dec_cpus);
         return 1;
     }
     /* pthreads inherit the creating thread's mask: confine this (engine) thread now, before
      * qwen_set_threads() spawns the pool. */
     if (sched_setaffinity(0, sizeof L.step_set, &L.step_set) != 0) { perror("lane: sched_setaffinity(step)"); return 0; }
-    if (engine_threads) *engine_threads = n - dec;
+    /* ARM-4: same ceiling rule on the static split. */
+    if (engine_threads) {
+        const int want = *engine_threads, avail = n - dec;
+        if (want > 0 && want < avail)
+            fprintf(stderr, "[lane] requested %d engine threads, step side has %d cpus: keeping %d\n",
+                    want, avail, want);
+        if (want <= 0 || want > avail) *engine_threads = avail;
+    }
     fprintf(stderr, "[lane] split prepared: step cpus %s (%d, engine pool) · decoder cpus %s (%d, private team)\n",
             L.step_list, L.step_cpus, L.dec_list, L.dec_cpus);
     return 1;
