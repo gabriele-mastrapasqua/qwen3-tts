@@ -127,6 +127,8 @@ static const char *gate_id(int mmk) {
     case QWEN_MMK_Q4_AVX2:     return "gate.q4.avx2";
     case QWEN_MMK_Q4_SMMLA:    return "gate.q4.smmla";
     case QWEN_MMK_KLEIDI_Q4:   return "gate.q4.kleidi";
+    case QWEN_MMK_KLEIDI_I8:   return "gate.int8.kleidi";
+    case QWEN_MMK_KLEIDI_BF16: return "gate.bf16.kleidi";
     default:                   return "gate.other";
     }
 }

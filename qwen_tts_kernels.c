@@ -2337,6 +2337,8 @@ static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_Q4_AVX2]     = { "QWEN_NO_AVX2MM",   NULL,                "QWEN_AVX2MM_MIN_B",  NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_Q4_SMMLA]    = { "QWEN_NO_SMMLA",    NULL,                "QWEN_SMMLA_MIN_B",   NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_KLEIDI_Q4]   = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
+    [QWEN_MMK_KLEIDI_I8]   = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
+    [QWEN_MMK_KLEIDI_BF16] = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
 };
 static atomic_int g_mm_gate_on[QWEN_MMK_COUNT];
 static atomic_int g_mm_gate_minb[QWEN_MMK_COUNT];
@@ -2466,6 +2468,10 @@ static int qwen_mmk_compiled(int mmk) {
 #endif
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     case QWEN_MMK_INT8_SMMLA: case QWEN_MMK_Q4_SMMLA: case QWEN_MMK_KLEIDI_Q4: return 1;
+    case QWEN_MMK_KLEIDI_I8: case QWEN_MMK_KLEIDI_I8_GEMV: return 1;
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    case QWEN_MMK_KLEIDI_BF16: case QWEN_MMK_KLEIDI_BF16_GEMV: return 1;
+#endif
 #endif
 #if defined(__AVX2__)
     case QWEN_MMK_INT8_AVX2: case QWEN_MMK_Q4_AVX2: return 1;
@@ -2489,6 +2495,8 @@ static int qwen_mmk_supported(int mmk) {
     case QWEN_MMK_INT8_AVX2: case QWEN_MMK_Q4_AVX2: return __builtin_cpu_supports("avx2") ? 1 : 0;
 #endif
     case QWEN_MMK_KLEIDI_Q4: return qwen_kleidi_supported();
+    case QWEN_MMK_KLEIDI_I8: case QWEN_MMK_KLEIDI_I8_GEMV:
+    case QWEN_MMK_KLEIDI_BF16: case QWEN_MMK_KLEIDI_BF16_GEMV: return qwen_kleidi_supported();
     default: return qwen_mmk_compiled(mmk);   /* -march=native: compiled == the host has it */
     }
 }
