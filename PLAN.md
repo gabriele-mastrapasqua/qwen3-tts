@@ -218,11 +218,23 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       Ordering: the build break above is NOT part of this track and must not wait for it.
       Progress on `feature/arm-parity-vnni` (2026-09-10): items 0 (link fix, = TQ-6), 1
       (KleidiAI gate rows), 2 (prefork plans on the inherited mask), 3 (docs + expectation
-      rows) and 4 (lane honours the requested engine width) are implemented; the Arm DL-4
-      leaf of item 8 is implemented and passes the 20-case `--self-test` on aarch64 dotprod.
-      NEXT: the same tree on the 16-core Neoverse-V2 host — preflight, KAI/i8mm checks, the
-      leaf quality gate, then the lane A/B. Old Arm probe numbers are not evidence and the
-      arm-product profile is NOT flipped until that gate passes.
+      rows), 4 (lane honours the requested engine width) and the Arm DL-4 leaf of item 8
+      are implemented; the leaf passes the 20-case `--self-test` on aarch64 dotprod.
+      Item 7's region body is wired on Arm through the prepared-state API that was written
+      for it and never connected: Talker and CP batched regions now pack the KleidiAI LHS
+      once per projection group and run the same kai_i8_task in-region.  Verified on the
+      16-core Neoverse-V2: Talker region 12/12 WAV byte-identical on/off, CP region 12/12
+      byte-identical, arm-product preflight VALID, dispatch gate PASS; C10 2x8 lane4
+      elastic + RES1_V2 + GLUE + CONVT_STACK measures STREAM p95 0.843 against 0.939 for
+      the untreated tree (WAVE screen, no SOAK yet).  RES1_V2 audio gate: 21/21 paired
+      files, mel-corr min 0.9945.
+      NEXT (each with a paired WAV/quality gate): convnext MLP int8 via KleidiAI;
+      pre-transformer BF16 via KleidiAI (x86 has the AVX-512 BF16 sibling); ConvT BF16;
+      rectangular/wide DL-4 (the `in_ch <= 768` and square-only gates still leave the
+      initial/pre conv on f32 on every backend); multi-slot DL-4 for the lane.  Threading
+      constraint found while scoping them: the decoder unit runs on the lane team, so the
+      KAI wrappers that dispatch through qwen_parallel are not directly usable there -- the
+      prepared-state prep/run pair (tid/nt over the lane team) is the shape to use.
       Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
       convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
       largest single item. DO NOT chase the AMX strip/range port: it was measured first and
