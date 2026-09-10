@@ -149,13 +149,22 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       formulation and bf16 activations explicitly forbidden. Step A IMPLEMENTED default-off
       as `QWEN_SD_CONVT_STACK=1` (2026-09-09), self-test 8e-8 vs the per-tap reference on
       every block geometry; step B not started. NOT RUN on x86.
-- [ ] C12-WIN-12 VNNI glue as one combined change: out-of-place snake1, V2 kernel with
+- [x] C12-WIN-12 VNNI glue as one combined change: out-of-place snake1, V2 kernel with
       (tail, tail_cols) context and residual epilogue, plain allocs, ownership transfer.
-      Spec: `.work/c12-win-vnni-glue-implementation.md`. Gate: bit-identical WAV, >= 3 ms on
-      the q4 B1/B3 unit, no per-element branch in the channel loop. IMPLEMENTED default-off
-      as `QWEN_SD_GLUE=1` (2026-09-09), self-test asserts the context+residual path is
-      bit-identical to the contiguous one. NOT RUN on x86: the V2 self-test cases do not
-      execute on ARM, so `--self-test` on Turin is this item's first real gate.
+      Spec: `.work/c12-win-vnni-glue-implementation.md`. CLOSED 2026-09-10 on Turin:
+      correctness REPAIRED, performance NO-GO, flag stays default-off and unpromoted.
+      The first x86 `--self-test` failed 10 cases, all the `ctx+residual` contract: with
+      -ffast-math the compiler re-associates the epilogue's four-term sum only when a
+      residual is supplied. Not benign here, because the next residual unit re-quantises
+      per position, so one ulp shifts amax and the whole position's scale: 115 LSB on a
+      9550 peak end to end. Fixed in `d49aa10` by disabling reassociation for
+      `sd_dconv_worker` alone -- self-test 10 failures to none, `QWEN_SD_GLUE=0/1`
+      byte-identical, and the attribute costs nothing on the default path (control vs
+      control -2.4..+2.9 ms, no systematic sign). With the epilogue exact the MECHANISM
+      is slower than its control in 21 of 32 cells: +0.8 ms at B3 chunk 4 against a gate
+      asking for -3 ms, rising to +60 ms at B4 chunk 16. The -11 ms seen before the fix
+      was measured while the fused path was still free to re-associate, so it was not
+      computing the same result as the control and was never a valid comparison.
 - [ ] C12-WIN-3 Short-class fixed cost: only after WIN-10: ramp 1,2,4 (control) vs 1,4
       (vs 2,4 only inside the TTFA gate); short + conversational playback metrics. No q8.
 - [x] C12-WIN-4 Old preparation flags: DIRECT_DWCONV/INPUT, STRIP, FUSED_RESIDUAL are
