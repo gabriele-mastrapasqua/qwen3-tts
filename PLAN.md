@@ -428,6 +428,19 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       request before closing; also record that rejection is per worker (cap 4): C20 sent 8
       rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
       for a simultaneous wave when the parent balances.
+- [ ] TQ-8 Leading silence before speech: a measured ~0.5 s of dead air ahead of the first
+      voiced frame on a 1.7B-class checkpoint (median 0.50 s over 36 files) against 0.06 s on
+      a 0.6B-class one (52 files), consistent across every text class. It is not covered by
+      any latency metric we gate on: what a caller experiences is TTFA PLUS the lead-in, so
+      ~740 ms against ~186+60 ms. That is larger than anything the C12-WIN decoder ladder was
+      chasing, and the ladder delivered nothing. CAUSE NOT ESTABLISHED -- model-emitted silent
+      frames or an engine/prompt artefact are both open, and checkpoint size is confounded
+      with training data. FIRST STEP is the discriminator, not a fix: run the same
+      energy-envelope pass on the OPEN 1.7B and 0.6B models, same bank and settings; ~10
+      minutes, CLI is enough. Only if it is model-side does a bounded, default-off leading
+      trim make sense, gated on `safe_play_start` rather than TTFA and checked against the
+      streaming decoder's continuity contract. Detail:
+      `.work/leading-silence-perceived-latency-20260910.md`.
 - [ ] TQ-7 GPU serving: `--backend cuda --prefork N` is silently broken. VERIFIED at HEAD:
       the resident CUDA Talker/CP state is created in `main.c` (~:1665) BEFORE
       `qwen_tts_serve_prefork` (~:3082) forks; a CUDA context does not survive `fork()`, and
