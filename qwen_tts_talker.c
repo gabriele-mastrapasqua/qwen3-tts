@@ -2507,17 +2507,59 @@ typedef struct {
     qwen_tts_ctx_t *ctx; qwen_batch_t *bb; const int *pos_arr; const uint8_t *active;
     int BW; const int *idx; float scale;
     int8_t *qx; float *swtmp; float sx[16];
+    int arm_kai;                 /* 1: KleidiAI prepared-state runner (Arm) */
     qwen_barrier_t bar;
 } tk_region_t;
 
-static void tk_region_gather_quant(tk_region_t *r, const float *src, int b, int j, int cols, int srcstride) {
-    float *Xt = r->bb->Xt; const float *s = src + (size_t)b * srcstride;
+/* The two runners want different activation layouts.  The x86 in-region row blocks take a
+ * k-major int8 panel with per-column scales; KleidiAI quantises the activation itself and
+ * wants it row-major [B][cols] float -- the "second gather shape" the prepared-state API
+ * was written for and never got.  Same kernels either way: the dispatched Arm path already
+ * calls kai_i8_try, so this changes the runner, not the arithmetic. */
+static void tk_region_gather(tk_region_t *r, const float *src, int b, int j, int cols, int srcstride) {
+    const float *s = src + (size_t)b * srcstride;
+    if (r->arm_kai) {
+        memcpy(r->bb->Xt + (size_t)j * cols, s, (size_t)cols * sizeof(float));
+        return;
+    }
+    float *Xt = r->bb->Xt;
     for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
     r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
 }
-static void tk_region_scatter(tk_region_t *r, float *dst, const float *Yt, int b, int j, int rows) {
+static void tk_region_scatter(tk_region_t *r, float *dst, const float *Y, int b, int j, int rows) {
     float *d = dst + (size_t)b * rows;
-    for (int i = 0; i < rows; i++) d[i] = Yt[(size_t)i * r->BW + j];
+    if (r->arm_kai) { memcpy(d, Y + (size_t)j * rows, (size_t)rows * sizeof(float)); return; }
+    for (int i = 0; i < rows; i++) d[i] = Y[(size_t)i * r->BW + j];
+}
+/* Every thread calls these: the KAI pack is thread-local, the run takes this thread's
+ * n-tile slice, exactly as qwen_kleidi_matmul_i8_native partitions it. */
+static void tk_region_run_proj(tk_region_t *r, const int8_t *W, const float *sw,
+                               int rows, int cols, size_t tid, size_t nt) {
+    if (r->arm_kai) {
+        const void *lp = qwen_kleidi_i8_region_prep(r->bb->Xt, (size_t)cols * sizeof(float),
+                                                    cols, r->BW);
+        if (!lp) { fprintf(stderr, "[talker] KAI region LHS prep failed\n"); abort(); }
+        qwen_kleidi_i8_region_run(W, r->bb->Yt, (size_t)rows * sizeof(float), lp,
+                                  rows, cols, r->BW, tid, nt);
+        return;
+    }
+    qwen_region_i8_run(r->bb->Yt, W, sw, r->qx, r->sx, rows, cols, r->BW, tid, nt);
+}
+static void tk_region_run_qkv(tk_region_t *r, const int8_t *Wq, const float *sq,
+                              const int8_t *Wk, const float *sk,
+                              const int8_t *Wv, const float *sv,
+                              float *Yk, float *Yv, int q_rows, int kv_rows, int cols,
+                              size_t tid, size_t nt) {
+    if (r->arm_kai) {
+        const void *lp = qwen_kleidi_i8_region_prep(r->bb->Xt, (size_t)cols * sizeof(float),
+                                                    cols, r->BW);
+        if (!lp) { fprintf(stderr, "[talker] KAI region LHS prep failed\n"); abort(); }
+        qwen_kleidi_i8_qkv_region_run(Wq, Wk, Wv, r->bb->Yt, Yk, Yv, lp,
+                                      q_rows, kv_rows, cols, r->BW, tid, nt);
+        return;
+    }
+    qwen_region_i8_run_qkv(r->bb->Yt, Yk, Yv, Wq, sq, Wk, sk, Wv, sv,
+                           r->qx, r->sx, q_rows, kv_rows, cols, r->BW, tid, nt);
 }
 
 static void tk_region_task(size_t tid, size_t nt, void *v) {
@@ -2532,14 +2574,14 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
     for (int j = 0; j < BW; j++) if (TMINE(j)) {
         int b = TSLOT(j);
         qwen_rms_norm(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h, ctx->layers[0].input_norm, 1, h, eps);
-        tk_region_gather_quant(r, bb->x_norm, b, j, h, h);
+        tk_region_gather(r, bb->x_norm, b, j, h, h);
     }
     qwen_barrier_wait(&r->bar);
     for (int L = 0; L < c->num_layers; L++) {
         qwen_talker_layer_t *l = &ctx->layers[L];
         float *Yk = Yt + (size_t)qd * BW, *Yv = Yt + (size_t)(qd + kvd) * BW;
-        qwen_region_i8_run_qkv(Yt, Yk, Yv, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
-                          l->wv_int8, l->wv_scale, r->qx, r->sx, qd, kvd, h, BW, tid, nt);
+        tk_region_run_qkv(r, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
+                              l->wv_int8, l->wv_scale, Yk, Yv, qd, kvd, h, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
             int b = TSLOT(j), pos = TPOS(b);
@@ -2557,29 +2599,29 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
             qwen_causal_attention_bf16kv(bb->attn_out + (size_t)b * qd, bb->q + (size_t)b * qd,
                                          bb->kv_k + lbase, bb->kv_v + lbase, 1, pos + 1,
                                          c->num_heads, c->num_kv_heads, c->head_dim, scale, pos);
-            tk_region_gather_quant(r, bb->attn_out, b, j, qd, qd);
+            tk_region_gather(r, bb->attn_out, b, j, qd, qd);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_region_i8_run(Yt, l->wo_int8, l->wo_scale, r->qx, r->sx, h, qd, BW, tid, nt);
+        tk_region_run_proj(r, l->wo_int8, l->wo_scale, h, qd, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
             int b = TSLOT(j);
             tk_region_scatter(r, bb->proj_out, Yt, b, j, h);
             qwen_rms_norm_residual(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h,
                                    bb->proj_out + (size_t)b * h, l->post_attn_norm, h, eps);
-            tk_region_gather_quant(r, bb->x_norm, b, j, h, h);
+            tk_region_gather(r, bb->x_norm, b, j, h, h);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_region_i8_run(Yt, l->gate_up_fused_int8, l->gate_up_fused_scale, r->qx, r->sx, 2 * inter, h, BW, tid, nt);
+        tk_region_run_proj(r, l->gate_up_fused_int8, l->gate_up_fused_scale, 2 * inter, h, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
             int b = TSLOT(j);
             tk_region_scatter(r, bb->gate, Yt, b, j, 2 * inter);
             qwen_swiglu_inplace(bb->gate + (size_t)b * 2 * inter, r->swtmp + (size_t)j * inter, inter);
-            tk_region_gather_quant(r, bb->gate, b, j, inter, 2 * inter);
+            tk_region_gather(r, bb->gate, b, j, inter, 2 * inter);
         }
         qwen_barrier_wait(&r->bar);
-        qwen_region_i8_run(Yt, l->down_int8, l->down_scale, r->qx, r->sx, h, inter, BW, tid, nt);
+        tk_region_run_proj(r, l->down_int8, l->down_scale, h, inter, tid, nt);
         qwen_barrier_wait(&r->bar);
         for (int j = 0; j < BW; j++) if (TMINE(j)) {
             int b = TSLOT(j);
@@ -2587,7 +2629,7 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
             if (L + 1 < c->num_layers) {
                 qwen_rms_norm_residual(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h,
                                        bb->proj_out + (size_t)b * h, ctx->layers[L + 1].input_norm, h, eps);
-                tk_region_gather_quant(r, bb->x_norm, b, j, h, h);
+                tk_region_gather(r, bb->x_norm, b, j, h, h);
             } else {
                 float *xb = bb->x + (size_t)b * h, *pb = bb->proj_out + (size_t)b * h;
                 for (int i = 0; i < h; i++) xb[i] += pb[i];
@@ -2603,23 +2645,34 @@ static void tk_region_task(size_t tid, size_t nt, void *v) {
 /* Returns 1 when the whole layer stack ran as one region (the caller skips its loop). */
 static int tk_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const int *pos_arr,
                          const uint8_t *active, float scale) {
-    static int shapes_ok = -1;
+    static int region_mode = -1;   /* 0 off, 1 x86 in-region row blocks, 2 Arm KAI prepared state */
     qwen_tts_config_t *c = &ctx->config;
     int BW = bb->B_eff > 0 ? bb->B_eff : bb->B;
     int h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
-    if (shapes_ok < 0) {
+    if (region_mode < 0) {
         const char *e = getenv("QWEN_TK_REGION");
         qwen_talker_layer_t *l = &ctx->layers[0];
-        shapes_ok = !(e && e[0] == '0') && qwen_parallel_team() >= 2 && bb->B >= 2 &&
+        const int want = !(e && e[0] == '0') && qwen_parallel_team() >= 2 && bb->B >= 2 &&
                     l->wq_int8 && l->wk_int8 && l->wv_int8 && l->wo_int8 && l->gate_up_fused_int8 && l->down_int8 &&
-                    !l->wq_q4 && !l->wk_q4 && !l->wv_q4 && !l->wo_q4 && !l->gate_up_fused_q4 && !l->down_q4 &&
-                    qwen_region_i8_qkv_usable(qd, kvd, h, 2) && qwen_region_i8_usable(h, qd, 2) &&
+                    !l->wq_q4 && !l->wk_q4 && !l->wv_q4 && !l->wo_q4 && !l->gate_up_fused_q4 && !l->down_q4;
+        const int vnni = want && qwen_region_i8_qkv_usable(qd, kvd, h, 2) &&
+                    qwen_region_i8_usable(h, qd, 2) &&
                     qwen_region_i8_usable(2 * inter, h, 2) && qwen_region_i8_usable(h, inter, 2);
+        /* The KleidiAI prepared-state runner was written for exactly this and never had
+         * a consumer: same kernels the dispatched Arm path calls (kai_i8_try), reached
+         * between the region's own barriers instead of one pool entry per projection. */
+        const int kai = !vnni && want &&
+                    qwen_kleidi_i8_qkv_region_usable(l->wq_int8, l->wk_int8, l->wv_int8, qd, kvd, h, 2) &&
+                    qwen_kleidi_i8_region_usable(l->wo_int8, h, qd, 2) &&
+                    qwen_kleidi_i8_region_usable(l->gate_up_fused_int8, 2 * inter, h, 2) &&
+                    qwen_kleidi_i8_region_usable(l->down_int8, h, inter, 2);
+        region_mode = vnni ? 1 : (kai ? 2 : 0);
         fprintf(stderr, "[talker] batched step as one parallel region: %s (team %d)\n",
-                shapes_ok ? "ON" : "off", qwen_parallel_team());
+                region_mode == 1 ? "ON" : region_mode == 2 ? "ON (KleidiAI prepared state)" : "off",
+                qwen_parallel_team());
     }
-    if (!shapes_ok || bb->force_matvec || BW < 2 || BW > 16) return 0;
-    if (!(qwen_region_i8_qkv_usable(qd, kvd, h, BW) && qwen_region_i8_usable(h, qd, BW) &&
+    if (region_mode == 0 || bb->force_matvec || BW < 2 || BW > 16) return 0;
+    if (region_mode == 1 && !(qwen_region_i8_qkv_usable(qd, kvd, h, BW) && qwen_region_i8_usable(h, qd, BW) &&
           qwen_region_i8_usable(2 * inter, h, BW) && qwen_region_i8_usable(h, inter, BW))) return 0;
     static int8_t *qx = NULL; static float *swtmp = NULL; static size_t qx_cap = 0, sw_cap = 0;
     size_t maxc = (size_t)(inter > qd ? inter : qd); if (maxc < (size_t)h) maxc = h;
@@ -2629,7 +2682,7 @@ static int tk_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const int *pos_a
     if (!qx || !swtmp) return 0;
     tk_region_t r; memset(&r, 0, sizeof r);
     r.ctx = ctx; r.bb = bb; r.pos_arr = pos_arr; r.active = active; r.BW = BW; r.idx = bb->act_idx;
-    r.scale = scale; r.qx = qx; r.swtmp = swtmp;
+    r.scale = scale; r.qx = qx; r.swtmp = swtmp; r.arm_kai = (region_mode == 2);
     int team = qwen_parallel_team();
     qwen_barrier_init(&r.bar, team);
     qwen_parallel((size_t)team, tk_region_task, &r);
