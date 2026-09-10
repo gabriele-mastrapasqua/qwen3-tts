@@ -10265,84 +10265,6 @@ void qwen_conv1d_int8_v2(float *out, const float *in,
 }
 #endif
 
-/* C12-WIN-11 step A: ConvTranspose1d (kernel = 2*stride) from ONE un-expanded GEMM.
- * R[(j*out_ch + oc)*len + t] = sum_ic Wstack[j*out_ch + oc][ic] * in[ic][t] (computed by the
- * caller, BLAS or a custom kernel).  Output position o = t*stride + j (j < stride) receives
- * exactly tap j from input column t and tap j+stride from column t-1 (column -1 = carry of
- * the previous unit).  Writes out[out_ch][len*stride] in final form (bias folded) and the
- * new carry[out_ch][stride] = R[(j+stride)*out_ch + oc][len-1].  Same arithmetic count as
- * the per-tap GEMMs; no input expansion, no full-length intermediate, no scatter pass. */
-typedef struct {
-    float *out; const float *R; float *carry; const float *bias;
-    int out_ch, len, stride; _Atomic int next;
-} sd_convt_epi_job_t;
-static void sd_convt_epi_worker(void *vj) {
-    sd_convt_epi_job_t *j = (sd_convt_epi_job_t *)vj;
-    const int len = j->len, r = j->stride, oc_n = j->out_ch;
-    for (;;) {
-        const int oc = atomic_fetch_add(&j->next, 1);
-        if (oc >= oc_n) break;
-        const float bv = j->bias ? j->bias[oc] : 0.0f;
-        float *o = j->out + (size_t)oc * len * r;
-        float *cr = j->carry ? j->carry + (size_t)oc * r : NULL;
-        for (int t = 0; t < len; t++) {
-            for (int jj = 0; jj < r; jj++) {
-                const float a = j->R[((size_t)jj * oc_n + oc) * len + t];
-                const float b = (t >= 1) ? j->R[((size_t)(jj + r) * oc_n + oc) * len + (t - 1)]
-                                         : (cr ? cr[jj] : 0.0f);
-                o[(size_t)t * r + jj] = a + b + bv;
-            }
-        }
-        if (cr)
-            for (int jj = 0; jj < r; jj++) cr[jj] = j->R[((size_t)(jj + r) * oc_n + oc) * len + (len - 1)];
-    }
-}
-void qwen_convt_stack_epilogue(float *out, const float *R, float *carry, const float *bias,
-                               int out_ch, int len, int stride) {
-    sd_convt_epi_job_t job = { .out = out, .R = R, .carry = carry, .bias = bias,
-                               .out_ch = out_ch, .len = len, .stride = stride };
-    atomic_store(&job.next, 0);
-    sd_pool_run(sd_convt_epi_worker, &job);
-}
-void qwen_convt_pack_stack(float *stack, const float *packed, int in_ch, int out_ch, int kernel) {
-    /* packed[(k*in_ch + ic)*out_ch + oc]  ->  stack[(k*out_ch + oc)*in_ch + ic] */
-    for (int k = 0; k < kernel; k++)
-        for (int ic = 0; ic < in_ch; ic++)
-            for (int oc = 0; oc < out_ch; oc++)
-                stack[((size_t)k * out_ch + oc) * in_ch + ic] = packed[((size_t)k * in_ch + ic) * out_ch + oc];
-}
-
-/* The DL-4 weight layout, one implementation for the decoder and for --self-test:
- * wq2[m][kk][Cp] with one scale and one weight sum per (m, kk).  The f32 weight is
- * [out_ch][in_ch][kernel] (kk fastest, the im2col order); tap kk multiplies input position
- * t - (kernel-1-kk)*dilation.  Cp = qwen_conv1d_int8_v2_cp(ch); the padding lanes are 0. */
-int qwen_conv1d_int8_v2_cp(int ch) { return (ch + 63) & ~63; }
-void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
-                              const float *w, int ch, int kernel, int Cp) {
-    for (int m = 0; m < ch; m++) {
-        const float *row = w + (size_t)m * ch * kernel;
-        for (int kk = 0; kk < kernel; kk++) {
-            float amax = 0.0f;
-            for (int ic = 0; ic < ch; ic++) { float a = fabsf(row[(size_t)ic * kernel + kk]); if (a > amax) amax = a; }
-            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
-            int8_t *d = q2 + ((size_t)m * kernel + kk) * Cp;
-            int32_t acc = 0;
-            for (int ic = 0; ic < Cp; ic++) {
-                int v = 0;
-                if (ic < ch) {
-                    float x = row[(size_t)ic * kernel + kk] * inv;
-                    v = (int)(x >= 0 ? x + 0.5f : x - 0.5f);
-                    if (v > 127) v = 127;
-                    if (v < -127) v = -127;
-                }
-                d[ic] = (int8_t)v; acc += v;
-            }
-            sw2[(size_t)m * kernel + kk] = scale;
-            ws2[(size_t)m * kernel + kk] = acc;
-        }
-    }
-}
-
 void qwen_conv1d_int8_design_d(float *out, const float *in,
                                const int8_t *Wq, const float *sw, const int32_t *wsum,
                                const float *bias, const int8_t *Wpack,
@@ -10453,6 +10375,114 @@ int qwen_conv1d_int8_design_d_range_split(float *out,
 }
 
 #endif  /* x86 VNNI / Arm dot-product decoder kernels */
+
+/* ---- ARM-1(a): moved OUT of the dot-product/VNNI guard ---------------------------------
+ * Everything below is ISA-neutral C: the ConvT one-GEMM epilogue, its weight restack and
+ * the DL-4 weight quantiser.  It was inside the guard only by position, which made
+ * SIMD=portable / SIMD=scalar / a no-dotprod Arm build fail to LINK on symbols they are
+ * allowed to call.  No behaviour change on VNNI or dot-product builds. */
+
+/* C12-WIN-11 step A: ConvTranspose1d (kernel = 2*stride) from ONE un-expanded GEMM.
+ * R[(j*out_ch + oc)*len + t] = sum_ic Wstack[j*out_ch + oc][ic] * in[ic][t] (computed by the
+ * caller, BLAS or a custom kernel).  Output position o = t*stride + j (j < stride) receives
+ * exactly tap j from input column t and tap j+stride from column t-1 (column -1 = carry of
+ * the previous unit).  Writes out[out_ch][len*stride] in final form (bias folded) and the
+ * new carry[out_ch][stride] = R[(j+stride)*out_ch + oc][len-1].  Same arithmetic count as
+ * the per-tap GEMMs; no input expansion, no full-length intermediate, no scatter pass. */
+typedef struct {
+    float *out; const float *R; float *carry; const float *bias;
+    int out_ch, len, stride; _Atomic int next;
+} sd_convt_epi_job_t;
+static void sd_convt_epi_worker(void *vj) {
+    sd_convt_epi_job_t *j = (sd_convt_epi_job_t *)vj;
+    const int len = j->len, r = j->stride, oc_n = j->out_ch;
+    for (;;) {
+        const int oc = atomic_fetch_add(&j->next, 1);
+        if (oc >= oc_n) break;
+        const float bv = j->bias ? j->bias[oc] : 0.0f;
+        float *o = j->out + (size_t)oc * len * r;
+        float *cr = j->carry ? j->carry + (size_t)oc * r : NULL;
+        for (int t = 0; t < len; t++) {
+            for (int jj = 0; jj < r; jj++) {
+                const float a = j->R[((size_t)jj * oc_n + oc) * len + t];
+                const float b = (t >= 1) ? j->R[((size_t)(jj + r) * oc_n + oc) * len + (t - 1)]
+                                         : (cr ? cr[jj] : 0.0f);
+                o[(size_t)t * r + jj] = a + b + bv;
+            }
+        }
+        if (cr)
+            for (int jj = 0; jj < r; jj++) cr[jj] = j->R[((size_t)(jj + r) * oc_n + oc) * len + (len - 1)];
+    }
+}
+void qwen_convt_stack_epilogue(float *out, const float *R, float *carry, const float *bias,
+                               int out_ch, int len, int stride) {
+    sd_convt_epi_job_t job = { .out = out, .R = R, .carry = carry, .bias = bias,
+                               .out_ch = out_ch, .len = len, .stride = stride };
+    atomic_store(&job.next, 0);
+    sd_pool_run(sd_convt_epi_worker, &job);
+}
+void qwen_convt_pack_stack(float *stack, const float *packed, int in_ch, int out_ch, int kernel) {
+    /* packed[(k*in_ch + ic)*out_ch + oc]  ->  stack[(k*out_ch + oc)*in_ch + ic] */
+    for (int k = 0; k < kernel; k++)
+        for (int ic = 0; ic < in_ch; ic++)
+            for (int oc = 0; oc < out_ch; oc++)
+                stack[((size_t)k * out_ch + oc) * in_ch + ic] = packed[((size_t)k * in_ch + ic) * out_ch + oc];
+}
+
+/* The DL-4 weight layout, one implementation for the decoder and for --self-test:
+ * wq2[m][kk][Cp] with one scale and one weight sum per (m, kk).  The f32 weight is
+ * [out_ch][in_ch][kernel] (kk fastest, the im2col order); tap kk multiplies input position
+ * t - (kernel-1-kk)*dilation.  Cp = qwen_conv1d_int8_v2_cp(ch); the padding lanes are 0. */
+int qwen_conv1d_int8_v2_cp(int ch) { return (ch + 63) & ~63; }
+void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
+                              const float *w, int ch, int kernel, int Cp) {
+    for (int m = 0; m < ch; m++) {
+        const float *row = w + (size_t)m * ch * kernel;
+        for (int kk = 0; kk < kernel; kk++) {
+            float amax = 0.0f;
+            for (int ic = 0; ic < ch; ic++) { float a = fabsf(row[(size_t)ic * kernel + kk]); if (a > amax) amax = a; }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+            int8_t *d = q2 + ((size_t)m * kernel + kk) * Cp;
+            int32_t acc = 0;
+            for (int ic = 0; ic < Cp; ic++) {
+                int v = 0;
+                if (ic < ch) {
+                    float x = row[(size_t)ic * kernel + kk] * inv;
+                    v = (int)(x >= 0 ? x + 0.5f : x - 0.5f);
+                    if (v > 127) v = 127;
+                    if (v < -127) v = -127;
+                }
+                d[ic] = (int8_t)v; acc += v;
+            }
+            sw2[(size_t)m * kernel + kk] = scale;
+            ws2[(size_t)m * kernel + kk] = acc;
+        }
+    }
+}
+
+
+/* ---- ARM-1(b): fallbacks for the three genuinely ISA-bound V2 entry points -------------
+ * Declared unconditionally in qwen_tts_kernels.h and called unconditionally from
+ * qwen_tts_dispatch.c (the decoder.res1_v2 / decoder.glue_fused rows) and from
+ * qwen_tts_speech_decoder.c.  _available() returning 0 keeps every caller on the control
+ * path -- the same contract as the #else that already exists inside the guard. */
+#if !defined(__ARM_FEATURE_DOTPROD) && !defined(__AVX512VNNI__)
+int qwen_conv1d_int8_v2_available(void) { return 0; }
+void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
+                             const float *residual,
+                             const int8_t *wq, const float *sw, const int32_t *wsum,
+                             const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)wq; (void)sw; (void)wsum;
+    (void)bias; (void)ch; (void)length; (void)kernel; (void)dilation; (void)Cp;
+}
+void qwen_conv1d_int8_v2(float *out, const float *in,
+                         const int8_t *wq, const float *sw, const int32_t *wsum,
+                         const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)wq; (void)sw; (void)wsum; (void)bias; (void)ch; (void)length;
+    (void)kernel; (void)dilation; (void)Cp;
+}
+#endif
+
 
 #if defined(__AMX_BF16__) && defined(__AMX_TILE__)
 typedef struct {
