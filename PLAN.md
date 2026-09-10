@@ -383,24 +383,22 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       (they contain no intrinsic). Add `SIMD=portable` and `SIMD=scalar` link-only CI jobs —
       this break is invisible on a VNNI or dotprod host. Detail:
       `.work/arm-linux-v2-parity-track-20260910.md` section 1.
-- [ ] TQ-5 HTTP JSON string parsing: `json_extract_string()` performs NO unescaping — it
-      skips a character after a backslash while scanning for the closing quote, then copies
-      the raw bytes. Every escape reaches the tokenizer literally (`\uXXXX`, `\"`, `\n`,
-      `\\`, `\t`). Standard JSON encoders emit `\uXXXX` for non-ASCII by default, so this
-      corrupts every accented language and destroys CJK; `\"`/`\n` corrupt English too.
-      The CLI is unaffected (text comes from argv as raw UTF-8). Root cause of TQ-4. Fix
-      belongs in the parser: passing `ensure_ascii=False` from a harness is a diagnostic,
-      not a fix, and no repo harness sets it today. Evidence impact in
-      `.work/server-cli-italian-correctness-20260910.md` 0.1: paired A/B results survive
-      (both arms equally corrupted), absolute Italian quality and CER claims do not.
-- [ ] TQ-4 Server-vs-CLI Italian pronunciation defect: CLI good, server streaming malformed,
-      English controls good; reproduced on Turin and on a dev machine. Owned and executed on
-      a separate track. Independent review, code-level CLI/server asymmetries, ranked
-      hypotheses and the classification table for the returning evidence:
-      `.work/server-cli-italian-correctness-20260910.md`. Blocks a final product-quality
-      claim for any new runtime path; does NOT block the 11A/12 kernel microbenches.
-      Predates C12-WIN-10, which is default OFF and must not be blamed for it.
-      ROOT CAUSE FOUND 2026-09-10 on the execution track: see TQ-5, the JSON string parser.
+- [x] TQ-5 HTTP JSON string parsing: **ROOT-CAUSED + FIXED** in
+      `cf8dd6b09d6de8abc51cccfa6aa90d3fa062b8c7`. The server now decodes standard JSON
+      escapes, UTF-16 surrogate pairs, and raw UTF-8 correctly; malformed strings are
+      explicit HTTP 400 errors rather than absent optional fields, and JSON responses
+      preserve non-ASCII UTF-8. Causal Turin C1 gate passed: escaped/raw requests converge
+      to `tail_len=24`, 53 codec frames, and the CLI-identical full codec SHA. The Python
+      harness default `json.dumps()` remains the regression oracle; it was not globally
+      changed to `ensure_ascii=False`. Requalification is needed for previous non-ASCII
+      semantic-quality/CER/golden evidence. Paired V2/control comparative performance
+      evidence remains usable; no full C12 performance rerun is required. Detail:
+      `.work/server-cli-italian-correctness-20260910.md`.
+- [x] TQ-4 Server-vs-CLI Italian pronunciation defect: **ROOT-CAUSED + FIXED** by TQ-5.
+      The defect was upstream JSON decoding, not Talker/CP/KV/V2/GEMM, batching, or the
+      decoder. The fixed-tree listening pair is retained privately for human sanity review.
+      Previous absolute Italian semantic-quality claims remain pending requalification;
+      the existing C12-WIN order resumes unchanged after the Spec12/Spec11A gates.
 - [ ] TQ-3 Ear verdict on the paired RES1_V2 bank (`samples/tests/2026-09-09_turin-qualification/`);
       PASS promotes `turin-c8a-32c-vnni-product` from provisional to qualified for C12.
 - [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;

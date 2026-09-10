@@ -1,13 +1,14 @@
-# Server-vs-CLI Italian correctness — independent review (NOT the execution track)
+# Server-vs-CLI Italian correctness — ROOT-CAUSED + FIXED (2026-09-10)
 
 **Task.** Prepare an interpretation framework for a reported server-only Italian
 pronunciation defect, by inspecting the current code for places where the server path and
 the CLI path differ SEMANTICALLY. **Question.** Where is the first point at which a request
 served through the batched server stops being the same computation as the same request run
-on the CLI? **Known facts.** CLI pronunciation of the reproducible Italian case is good;
-server streaming pronunciation is wrong; English controls appear good; ASR agrees with the
-listener on at least some bad Italian outputs; reproduced on both Turin and a Mac.
-**Unknowns.** Everything causal. No experiment in this document has been run by its author.
+on the CLI? **Historical facts.** CLI pronunciation of the reproducible Italian case was
+good; the pre-fix server streaming pronunciation was wrong; English controls appeared good;
+the defect reproduced on both Turin and a Mac.
+**Remaining unknown.** CLI whole-sequence PCM versus server streaming PCM remains a separate
+downstream question and is intentionally not reopened here.
 
 ## 0. OWNERSHIP — read this first
 
@@ -20,7 +21,7 @@ before it starts instrumenting.
 Two constraints that follow from ownership: do not modify instrumentation the execution
 owner may be relying on, and do not treat any partial result as a conclusion.
 
-## 0.1 ROOT CAUSE FOUND BY THE EXECUTION TRACK (2026-09-10) — and what it costs us
+## 0.1 ROOT CAUSE FOUND AND FIXED BY THE EXECUTION TRACK (2026-09-10) — and what it costs us
 
 The live forensic located the first divergence in the server's TEXT INPUT, before prefill,
 KV or CP: `json_extract_string()` in `qwen_tts_server.c` performs **no unescaping at all**.
@@ -40,8 +41,15 @@ never passes through this parser.
 client sends `\uXXXX` for every non-ASCII character. That breaks every accented language and
 destroys CJK entirely (each character becomes a six-character literal). Sending
 `ensure_ascii=False` is the correct isolated CONFIRMATION and it fixes our harnesses; it is
-NOT the fix. The fix belongs in the parser. No repository harness that sends text currently
-passes `ensure_ascii=False`.
+NOT the fix. The fix belongs in the parser, and is now implemented in the shared `qwen_json`
+codec. No repository harness was globally changed to `ensure_ascii=False`; the default
+escaped payload remains a regression oracle.
+
+The fixed parser distinguishes absent, valid, and malformed string fields; decodes the
+standard short escapes and UTF-16 surrogate pairs; preserves raw UTF-8; rejects malformed
+or truncated escapes and `\u0000` for C-string fields; and propagates malformed fields as
+HTTP 400. `json_escape()` now leaves UTF-8 bytes unchanged and escapes only JSON syntax and
+control bytes.
 
 ### Evidence integrity — what survives and what does not
 
@@ -65,6 +73,31 @@ feeds to its hardcoded EOS heuristic (section 3.1). The 53-versus-55 frame diffe
 CONSEQUENCE of the corrupted input, not an independent stopping-policy bug. Section 3.1
 remains a real CLI/server asymmetry, but it is not the cause here and must not be "fixed"
 on the strength of this case.
+
+## 0.2 Causal closure gate
+
+On the fixed Turin diagnostic checkout, with fresh C1/B_eff=1, Ryan Italian, seed 4200,
+the exact sentence
+
+`Posso spostare l'appuntamento a giovedì mattina alle nove, se le va bene.`
+
+was sent once through the CLI and once through the server using the Python harness's
+default escaped JSON representation. The server parsed `gioved\u00ec` as `giovedì`.
+The CLI, escaped server, and raw-UTF-8 server all produced 53 codec frames with
+`tail_len=24`; the complete codec-code SHA was
+`52c41a39a4b000e63a1b76366c7085c9fe5193a65fd6f2a7d1a42734bb310ab1` in every path.
+This closes the upstream Italian forensic. The CLI and server WAVs are retained under the
+ignored private evidence area for a human listening sanity check; PCM byte identity is not
+claimed.
+
+Evidence bookkeeping:
+
+* paired V2/control performance and comparative parity evidence remains usable because
+  both arms received the same escaped payload;
+* previous absolute Italian semantic-quality/CER/golden evidence is invalid for its stated
+  text and must be regenerated after this fix;
+* no full C12 performance campaign rerun is required;
+* do not reopen Talker/CP/KV/V2/GEMM, batching, or decoder investigation for this defect.
 
 ## 1. What must NOT be assumed
 

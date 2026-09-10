@@ -118,11 +118,13 @@ decoder treatment.
 * Report the cold prefix-cache fallback separately from steady sliced admissions.
 * Every claim carries its arm, its mask, its build and its provenance.
 
-## 6. Known blocker, tracked elsewhere
+## 6. Resolved parser blocker, tracked elsewhere
 
-A server-vs-CLI Italian pronunciation defect is under investigation on a separate track and
-is NOT owned here. It predates these three flags and spec 10 is default OFF, so it must not
-be attributed to them. It blocks a final PRODUCT QUALITY claim, but it does not block the
-Phase B kernel microbenches or the Phase C diagnostic A/B, which are timing evidence. No new
-runtime path is promoted until that defect is understood well enough to show the treatment
-does not worsen it.
+The server-vs-CLI Italian pronunciation defect was root-caused to JSON string decoding and
+fixed at commit `cf8dd6b09d6de8abc51cccfa6aa90d3fa062b8c7`. It predates these three flags and
+spec 10 is default OFF, so it must not be attributed to them. The escaped/raw Turin C1 gate
+now passes with `tail_len=24`, 53 codec frames, and identical codec SHA. Previous absolute
+non-ASCII semantic-quality/CER/golden evidence remains marked for regeneration; paired
+comparative performance evidence remains usable. This does not change the existing C12-WIN
+order: Spec12 x86 self-test/microbench, Spec11A microbench, server A/B only for winners,
+then C12 soak for a surviving treatment, with Spec10 qualified separately.
