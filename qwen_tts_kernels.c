@@ -2604,6 +2604,13 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
     if (qwen_amx_bf16_ready()) bf16_c[nbf++] = QWEN_MMK_BF16_AMX;
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    /* ARM-5: KleidiAI bf16 first -- qwen_matvec_bf16 / qwen_matmat_bf16 call kai_bf16_try()
+     * before the in-house BFMMLA kernel, and qwen_matmat_family_bf16() lists it first too.
+     * KAI's bf16 ukernels only ship when i8mm is also present (Makefile: KAI_DIR is gated
+     * on __ARM_FEATURE_MATMUL_INT8), hence the inner guard. */
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    bf16_c[nbf++] = QWEN_MMK_KLEIDI_BF16;
+#endif
     bf16_c[nbf++] = QWEN_MMK_BF16_BFMMLA;
 #endif
 #if defined(__AVX512BF16__)
@@ -2616,6 +2623,11 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
     int8_c[nint8++] = QWEN_MMK_INT8_VNNI;  q4_c[nq4++] = QWEN_MMK_Q4_VNNI;
 #endif
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+    /* ARM-5: KleidiAI FIRST -- that is the order the dispatcher itself tries
+     * (qwen_matmat_int8 -> kai_i8_try before any gate) and the order
+     * qwen_matmat_family_int8() reports.  Without these entries --caps names the
+     * in-house SMMLA fallback for shapes KleidiAI serves. */
+    int8_c[nint8++] = QWEN_MMK_KLEIDI_I8;  q4_c[nq4++] = QWEN_MMK_KLEIDI_Q4;
     int8_c[nint8++] = QWEN_MMK_INT8_SMMLA; q4_c[nq4++] = QWEN_MMK_Q4_SMMLA;
 #endif
 #if defined(__AVX2__)
