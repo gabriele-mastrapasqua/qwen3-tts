@@ -2702,8 +2702,11 @@ static int elastic_apply(int workers, int ncpu, const int *slice, const pid_t *k
  *
  * Falls back to the identity order when sysfs is unavailable or inconsistent; on a host without
  * SMT the two orders are the same anyway. */
-static int qwen_cpu_core_major_order(int *order, int ncpu) {
-    for (int i = 0; i < ncpu; i++) order[i] = i;
+static int qwen_cpu_core_major_order(int *order, int ncpu, const int *cand) {
+    /* ARM-3: `cand` is the list of cpu ids to order (length ncpu).  NULL means 0..ncpu-1,
+     * which is the historical behaviour, bit for bit. */
+#define QCPU(i) (cand ? cand[(i)] : (i))
+    for (int i = 0; i < ncpu; i++) order[i] = QCPU(i);
 #if defined(__linux__)
     int *pkg = (int *)malloc((size_t)ncpu * sizeof(int));
     int *core = (int *)malloc((size_t)ncpu * sizeof(int));
@@ -2712,9 +2715,9 @@ static int qwen_cpu_core_major_order(int *order, int ncpu) {
         char path[128]; FILE *f; long v;
         pkg[c] = core[c] = -1;
         snprintf(path, sizeof path,
-                 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
+                 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", QCPU(c));
         if ((f = fopen(path, "r"))) { if (fscanf(f, "%ld", &v) == 1) pkg[c] = (int)v; fclose(f); }
-        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", QCPU(c));
         if ((f = fopen(path, "r"))) { if (fscanf(f, "%ld", &v) == 1) core[c] = (int)v; fclose(f); }
         if (pkg[c] < 0 || core[c] < 0) { free(pkg); free(core); return 0; }
     }
@@ -2723,20 +2726,21 @@ static int qwen_cpu_core_major_order(int *order, int ncpu) {
         int seen = 0;
         for (int d = 0; d < c; d++) if (pkg[d] == pkg[c] && core[d] == core[c]) { seen = 1; break; }
         if (seen) continue;
-        if (n >= ncpu) { free(pkg); free(core); for (int i = 0; i < ncpu; i++) order[i] = i; return 0; }
-        order[n++] = c;
+        if (n >= ncpu) { free(pkg); free(core); for (int i = 0; i < ncpu; i++) order[i] = QCPU(i); return 0; }
+        order[n++] = QCPU(c);
         for (int d = c + 1; d < ncpu; d++)     /* then that core's siblings, next to it */
             if (pkg[d] == pkg[c] && core[d] == core[c]) {
-                if (n >= ncpu) { free(pkg); free(core); for (int i = 0; i < ncpu; i++) order[i] = i; return 0; }
-                order[n++] = d;
+                if (n >= ncpu) { free(pkg); free(core); for (int i = 0; i < ncpu; i++) order[i] = QCPU(i); return 0; }
+                order[n++] = QCPU(d);
             }
     }
     free(pkg); free(core);
-    if (n != ncpu) { for (int i = 0; i < ncpu; i++) order[i] = i; return 0; }
+    if (n != ncpu) { for (int i = 0; i < ncpu; i++) order[i] = QCPU(i); return 0; }
     return 1;
 #else
     (void)ncpu; return 0;
 #endif
+#undef QCPU
 }
 
 int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
@@ -2751,11 +2755,35 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
      * unbounded A/B override. */
     const int reject_full_at_parent = (g_cfg_max_queue == 0 && !getenv("QWEN_QUEUE_UNBOUNDED"));
     if (workers < 1) workers = 1;
-    const int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    /* ARM-3: plan on the cpus this process is ALLOWED to use, not on the machine's.
+     * sysconf(_SC_NPROCESSORS_ONLN) sees neither an inherited taskset mask nor a cpuset
+     * cgroup, so a pinned run silently escaped its mask and a container planned the whole
+     * host.  qwen_lane_split_prepare() next door already reads the mask; this makes the
+     * prefork planner agree with it.  Full mask => byte-identical behaviour to before. */
+    int allow_n = 0; int *allow = NULL;
+#if defined(__linux__)
+    {   cpu_set_t aff; CPU_ZERO(&aff);
+        if (sched_getaffinity(0, sizeof aff, &aff) == 0) {
+            const int an = CPU_COUNT(&aff);
+            if (an > 0 && (allow = (int *)malloc((size_t)an * sizeof(int)))) {
+                int k = 0;
+                for (int c = 0; c < CPU_SETSIZE && k < an; c++)
+                    if (CPU_ISSET(c, &aff)) allow[k++] = c;
+                allow_n = k;
+            }
+        }
+    }
+#endif
+    const int online = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    const int ncpu = allow_n > 0 ? allow_n : online;
+    if (allow_n > 0 && allow_n != online)
+        fprintf(stderr, "prefork: inherited cpu mask has %d of %d online cpus; planning on the mask\n",
+                allow_n, online);
+    if (allow_n == online) { free(allow); allow = NULL; }   /* identity: keep the old path */
     const int per = ncpu / workers > 0 ? ncpu / workers : 1;
     int *cpu_order = (int *)malloc((size_t)(ncpu > 0 ? ncpu : 1) * sizeof(int));
-    if (!cpu_order) return -1;
-    const int core_major = qwen_cpu_core_major_order(cpu_order, ncpu);
+    if (!cpu_order) { free(allow); return -1; }
+    const int core_major = qwen_cpu_core_major_order(cpu_order, ncpu, allow);
     if (threads_per < 1) threads_per = per;
     const int cap = max_batch >= 1 ? max_batch : 1;
     int admit_util = qwen_admit_util_requested() && cap == 2;
@@ -3147,7 +3175,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
         fprintf(stderr, "  worker %d: assigned=%lld completed=%lld still-active=%d\n",
                 w, assigned[w], completed[w], active[w]);
     free(pfd); free(sp); free(kids); free(assigned); free(completed); free(active);
-    free(act_area_w); free(slice); free(cur); free(cpu_order);
+    free(act_area_w); free(slice); free(cur); free(cpu_order); free(allow);
 #if defined(__linux__)
     if (admit_health)
         munmap(admit_health, (size_t)workers * sizeof(*admit_health));
