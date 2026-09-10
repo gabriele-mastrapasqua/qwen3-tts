@@ -196,6 +196,18 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       from an unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
       server — below the regime the lane exists for.
       Ordering: the build break above is NOT part of this track and must not wait for it.
+- [ ] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
+      `.work/arm-linux-v2-parity-track-20260910.md` section 2b. Four facts the dispatch map
+      does not show: `QWEN_SD_RES1_V2` selects on SHAPE (`kernel>=1 && in_ch==out_ch &&
+      !(in_ch&3)`), so it takes res2 and every square conv, not just res1 — implementing
+      from the flag name builds half of it; residual fusion needs AMX, so VNNI also pays a
+      separate pass (`QWEN_SD_GLUE` is the VNNI answer, default off, unqualified); AVX2 and
+      AVX-512F-without-VNNI have NO int8 decoder conv at all, so the gap is three CPU
+      families; and an undeclared `in_ch <= 768` gate drops every backend to f32 above it,
+      AMX and VNNI included. Work: one dotprod/i8mm DL-4 leaf against the already ISA-neutral
+      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract, closing Arm + AVX2 +
+      AVX-512F together. Rename/re-document the flag and the `decoder.res1_v2` row and
+      declare the 768 gate in the map FIRST.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 

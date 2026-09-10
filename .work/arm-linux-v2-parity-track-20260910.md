@@ -65,10 +65,72 @@ developing on a VNNI or dotprod host.
 | 2.3 | the decoder lane has no ISA guard | read `qwen_lane_split_prepare` | CONFIRMED — `#if defined(__linux__)` only, no intrinsic |
 | 2.4 | the handoff doc wrongly calls the lane x86-only | read `.work/turin-vnni-final-handoff-20260909.md` | CONFIRMED — **corrected in this commit** |
 | 2.5 | `g_mm_gate[]` has no KleidiAI int8/bf16 rows | grep the table | CONFIRMED — only `QWEN_MMK_KLEIDI_Q4` has a row |
+| 2.6 | `QWEN_SD_RES1_V2` selects on shape, so it also takes res2 | read the branch at `qwen_tts_speech_decoder.c:827` | CONFIRMED, see 2b |
+| 2.7 | residual fusion requires AMX; VNNI pays a separate pass | read `cs_conv1d_fused_residual` | CONFIRMED, see 2b |
+| 2.8 | AVX2 and AVX-512F have no int8 decoder conv at all | read `qwen_sd_int8_available()` | CONFIRMED, see 2b |
+| 2.9 | an undeclared `in_ch <= 768` gate drops every backend to f32 above it | read `qwen_sd_int8_usable` | CONFIRMED, see 2b |
 
 2.3 plus 2.4 is the substantive finding of the review: **the decoder lane, the mechanism of
 record on the Turin product profile, ports to Arm Linux unchanged and no Arm profile sets
 it** — and the reason it was never tried is most likely a wrong sentence in our own handoff.
+
+## 2b. The residual unit (res1/res2) — verified backend map
+
+A second addendum traced res1/res2 through the dispatcher. Re-checked here; all four
+structural claims hold, and they change the shape of the Arm gap.
+
+`causal_conv1d_blas` (`qwen_tts_speech_decoder.c` ~810) picks, in order: AMX bf16 → AMX
+Design-D int8 → V2 (DL-4) → v1 int8 tile → f32 im2col + SGEMM.
+
+| build | res1 (k=7 dilated) | res2 (k=1) | residual add |
+|---|---|---|---|
+| AMX + Design-D | Design-D tiles | Design-D tiles | fused in the epilogue |
+| AVX-512 VNNI | V2 (DL-4) | **V2 as well** | separate pass by default; fused only with `QWEN_SD_GLUE=1`, default off and unqualified |
+| Arm i8mm/dotprod | v1 dotprod tile, opt-in | v1 dotprod tile | separate pass, always |
+| AVX2 / AVX-512F (no VNNI) | **f32 im2col + SGEMM** | **f32** | separate pass |
+
+**(a) `QWEN_SD_RES1_V2` is not "res1 only".** VERIFIED at
+`qwen_tts_speech_decoder.c:827`: the branch tests a SHAPE, `kernel >= 1 && in_ch == out_ch
+&& (in_ch & 3) == 0`, not a role. It therefore takes res2 (k=1 is square) and every other
+square conv in the stack, and `sd_wq_build_v2` is keyed on the weight pointer, not the role.
+Both the flag name and the `decoder.res1_v2` dispatch row are misleading, and anyone
+implementing the Arm leaf from either would build half of it. This is the single most
+useful thing in the addendum.
+
+**(b) Residual fusion is AMX-only, not "x86".** VERIFIED: `cs_conv1d_fused_residual`
+returns 0 unless `sd_amx_d_enabled()`. So VNNI pays the separate `signal[i] += c2_out[i]`
+pass too — "x86 has it, Arm does not" would be wrong for the residual unit.
+**Correction to the addendum:** VNNI is not simply without an answer. `QWEN_SD_GLUE`
+(spec 12, `ddfa5d8`) IS the VNNI-side fusion, via `qwen_conv1d_int8_v2_ctx` with a context
+and a residual epilogue. It is default off and has never executed on x86, so today the
+statement holds; once it is qualified the row changes.
+
+**(c) Three CPU families have no int8 decoder conv, not one.** VERIFIED:
+`qwen_sd_int8_available()` (`qwen_tts_kernels.c:8568`) returns 1 only under
+`__ARM_FEATURE_DOTPROD` or `__AVX512VNNI__`. On AVX2 and AVX-512F-without-VNNI the whole
+residual unit runs in f32. A scalar `qwen_conv1d_int8` is compiled there but unreachable
+from serving — that follows from the same predicate, since `use_i8` is false, so the branch
+is never taken whatever the leaf contains.
+
+**(d) An undeclared shape gate.** VERIFIED: `qwen_sd_int8_usable` is
+`in_ch == out_ch && in_ch > 0 && in_ch <= 768`. Above 768 channels everything falls to f32
+on EVERY backend, AMX and VNNI included. No dispatch-map row states this, so a map read as
+"int8 ACTIVE" does not mean the wide convs are int8.
+
+### What this means for the Arm work
+
+The gap is one kernel, not a family: a dotprod/i8mm leaf with the DL-4 per-(channel, tap)
+layout. The packing side is already ISA-neutral (`sd_wq_build_v2` → `qwen_conv1d_int8_v2_pack`
+/ `_cp`) and needs only a different channel padding. The same leaf would serve AVX2 and
+AVX-512F, so it closes three families at once rather than one.
+
+One piece of guidance from this side, since the glue contract was written here: an Arm leaf
+should be written against `qwen_conv1d_int8_v2_ctx` — context `(tail, tail_cols)` plus the
+optional residual in the epilogue — rather than against the plain `qwen_conv1d_int8_v2`
+signature. That is the fused form, it costs nothing extra to implement, and it avoids
+repeating the two-step history x86 went through. Its exactness oracle already exists and is
+ISA-neutral: the `conv1d_int8_v2` self-test cases assert the context+residual path is
+bit-identical to the contiguous one.
 
 ## 3. Reported but NOT verified here
 
@@ -123,6 +185,10 @@ Priority MEDIUM as a track. Item 0 is the exception and is not medium.
 6. §1.9 requalify the two Arm decoder defaults.
 7. §1.8 region-body wiring, via the existing `.work/decoder-xisa-deferred-track-20260909.md`
    item 2. Not before the rest.
+8. The DL-4 leaf for dotprod/i8mm (section 2b). Sized as one kernel against an already
+   ISA-neutral packing path, written against the `_ctx` contract, and closing Arm, AVX2 and
+   AVX-512F together. Rename or re-document `QWEN_SD_RES1_V2` and the `decoder.res1_v2` row
+   first, and declare the `in_ch <= 768` gate in the map, or the next reader repeats (a).
 
 ## 6. Relation to the current tracks
 
