@@ -10268,21 +10268,154 @@ void qwen_conv1d_int8_v2(float *out, const float *in,
                          const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
     qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, ch, length, kernel, dilation, Cp);
 }
-#else
-int qwen_conv1d_int8_v2_available(void) { return 0; }
+#elif defined(__ARM_FEATURE_DOTPROD)
+/* ---- ARM-6: DL-4 direct dilated int8 conv, SDOT leaf --------------------------------
+ * Twin of the VNNI kernel above.  Same panel, same per-position activation scale, same
+ * tap order, same block scheduling.  Activation is int8 (SDOT is s8 x s8), so the u8 +128
+ * bias and its `128 * wsum` correction are dropped: the two cancel exactly over int32. */
+QWEN_MM_SCRATCH(dcq, int8_t)
+QWEN_MM_SCRATCH(dcs, float)
+QWEN_MM_SCRATCH(dcf, float)
+typedef struct {
+    float *out; const float *in;
+    const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
+    int ch, length, kernel, dilation, Cp, tb;
+    const float *tail; int tail_cols;
+    const float *residual;
+    _Atomic int next; int n_blocks;
+} sd_dconv_job_t;
+
+
+static void sd_dconv_worker(void *vj) {
+    sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
+    const int ch = j->ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
+    const int pad = (K - 1) * dil;
+    const int maxrows = j->tb + pad + 4;
+    int8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
+    float  *sc = mm_scratch_dcs((size_t)maxrows);
+    float  *frow = mm_scratch_dcf((size_t)Cp);
+    if (!q || !sc || !frow) return;
+    for (;;) {
+        int b = atomic_fetch_add(&j->next, 1);
+        if (b >= j->n_blocks) break;
+        const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
+        const int nrows = (t1 - t0) + pad + 4;
+        /* one quantised row per INPUT POSITION, with that position's own scale */
+        for (int r = 0; r < nrows; r++) {
+            const int p = t0 - pad + r;
+            int8_t *qr = q + (size_t)r * Cp;
+            const float *src; size_t sstride;
+            if (p >= 0 && p < L)                                        { src = j->in + p; sstride = (size_t)L; }
+            else if (p < 0 && j->tail && -p <= j->tail_cols)            { src = j->tail + (j->tail_cols + p); sstride = (size_t)j->tail_cols; }
+            else { memset(qr, 0, (size_t)Cp); sc[r] = 0.0f; continue; }
+            float amax = 0.0f;
+            for (int ic = 0; ic < ch; ic++) {
+                const float v = src[(size_t)ic * sstride];
+                frow[ic] = v;
+                const float a = fabsf(v); if (a > amax) amax = a;
+            }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+            sc[r] = scale;
+            int ic = 0;
+            for (; ic < ch; ic++) {
+                /* HALF TO EVEN, not sd_dconv_round's half-away-from-zero.  The VNNI kernel
+                 * quantises its bulk with _mm512_cvtps_epi32 (nearest-even, current mode)
+                 * and only its scalar tail uses sd_dconv_round; the self-test's integer
+                 * reference uses lrintf, i.e. nearest-even.  Rounding half away here makes
+                 * the leaf disagree with that reference on exact .5 ties -- measured as
+                 * rel_L2 1.3e-4 on ch=192 k=7 dil=3 L=67 and 3.1e-5 on ch=768 k=1 L=260,
+                 * zero everywhere else.  lrintf is one instruction on AArch64. */
+                int v = (int)lrintf(frow[ic] * inv);
+                if (v >  127) v =  127;
+                if (v < -127) v = -127;
+                qr[ic] = (int8_t)v;
+            }
+            for (; ic < Cp; ic++) qr[ic] = 0;
+        }
+        for (int m0 = 0; m0 < ch; m0 += 4) {
+            const int mn = ch - m0 < 4 ? ch - m0 : 4;
+            for (int t = t0; t < t1; t += 4) {
+                const int tn = t1 - t < 4 ? t1 - t : 4;
+                float facc[4][4] = {{0.0f}};
+                for (int kk = 0; kk < K; kk++) {
+                    /* kk = 0 is the oldest tap, kk = K-1 the current position */
+                    const int8_t *x0 = q + (size_t)((t + 0) - t0 + kk * dil) * Cp;
+                    const int8_t *x1 = x0 + Cp, *x2 = x0 + 2 * Cp, *x3 = x0 + 3 * Cp;
+                    const int8_t *w0 = j->wq + ((size_t)(m0 + 0) * K + kk) * Cp;
+                    const int8_t *w1 = mn > 1 ? j->wq + ((size_t)(m0 + 1) * K + kk) * Cp : w0;
+                    const int8_t *w2 = mn > 2 ? j->wq + ((size_t)(m0 + 2) * K + kk) * Cp : w0;
+                    const int8_t *w3 = mn > 3 ? j->wq + ((size_t)(m0 + 3) * K + kk) * Cp : w0;
+                    int32x4_t a00 = vdupq_n_s32(0), a01 = a00, a02 = a00, a03 = a00;
+                    int32x4_t a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+                    int32x4_t a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+                    int32x4_t a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+                    for (int k = 0; k < Cp; k += 16) {
+                        const int8x16_t xv0 = vld1q_s8(x0 + k);
+                        const int8x16_t xv1 = vld1q_s8(x1 + k);
+                        const int8x16_t xv2 = vld1q_s8(x2 + k);
+                        const int8x16_t xv3 = vld1q_s8(x3 + k);
+                        int8x16_t wv = vld1q_s8(w0 + k);
+                        a00 = vdotq_s32(a00, xv0, wv); a01 = vdotq_s32(a01, xv1, wv);
+                        a02 = vdotq_s32(a02, xv2, wv); a03 = vdotq_s32(a03, xv3, wv);
+                        wv = vld1q_s8(w1 + k);
+                        a10 = vdotq_s32(a10, xv0, wv); a11 = vdotq_s32(a11, xv1, wv);
+                        a12 = vdotq_s32(a12, xv2, wv); a13 = vdotq_s32(a13, xv3, wv);
+                        wv = vld1q_s8(w2 + k);
+                        a20 = vdotq_s32(a20, xv0, wv); a21 = vdotq_s32(a21, xv1, wv);
+                        a22 = vdotq_s32(a22, xv2, wv); a23 = vdotq_s32(a23, xv3, wv);
+                        wv = vld1q_s8(w3 + k);
+                        a30 = vdotq_s32(a30, xv0, wv); a31 = vdotq_s32(a31, xv1, wv);
+                        a32 = vdotq_s32(a32, xv2, wv); a33 = vdotq_s32(a33, xv3, wv);
+                    }
+                    const int32x4_t acc[16] = { a00, a01, a02, a03, a10, a11, a12, a13,
+                                                a20, a21, a22, a23, a30, a31, a32, a33 };
+                    for (int i = 0; i < mn; i++) {
+                        const float swv = j->sw[(size_t)(m0 + i) * K + kk];
+                        for (int jj = 0; jj < 4; jj++) {
+                            const int r = (t + jj) - t0 + kk * dil;
+                            /* exact int32 reduction, then ONE f32 fma per tap */
+                            facc[i][jj] += (float)vaddvq_s32(acc[i * 4 + jj]) * (sc[r] * swv);
+                        }
+                    }
+                }
+                for (int i = 0; i < mn; i++) {
+                    const float bv = j->bias ? j->bias[m0 + i] : 0.0f;
+                    float *o = j->out + (size_t)(m0 + i) * L + t;
+                    const float *rs = j->residual ? j->residual + (size_t)(m0 + i) * L + t : NULL;
+                    for (int jj = 0; jj < tn; jj++) {
+                        const float v = facc[i][jj] + bv;
+                        o[jj] = rs ? v + rs[jj] : v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+int qwen_conv1d_int8_v2_available(void) { return 1; }
 void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
                              const float *residual,
                              const int8_t *wq, const float *sw, const int32_t *wsum,
                              const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
-    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)wq; (void)sw; (void)wsum;
-    (void)bias; (void)ch; (void)length; (void)kernel; (void)dilation; (void)Cp;
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, ch, ch * kernel, length);
+    qwen_census_leaf(QWEN_LEAF_SDOT);
+    sd_dconv_job_t job = { .out = out, .in = in, .wq = wq, .sw = sw, .wsum = wsum, .bias = bias,
+                           .ch = ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
+                           .tail = tail, .tail_cols = tail ? tail_cols : 0, .residual = residual };
+    int nt = sd_pool_threads(); if (nt < 1) nt = 1;
+    int tb = (length + nt * 2 - 1) / (nt * 2);
+    if (tb < 32) tb = 32; if (tb > 256) tb = 256; tb = (tb + 3) & ~3;
+    job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
+    atomic_store(&job.next, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    sd_pool_run(sd_dconv_worker, &job);
 }
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
                          const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
-    (void)out; (void)in; (void)wq; (void)sw; (void)wsum; (void)bias; (void)ch; (void)length;
-    (void)kernel; (void)dilation; (void)Cp;
+    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, ch, length, kernel, dilation, Cp);
 }
+
 #endif
 
 void qwen_conv1d_int8_design_d(float *out, const float *in,
