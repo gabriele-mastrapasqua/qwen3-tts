@@ -86,9 +86,9 @@ default escaped JSON representation. The server parsed `gioved\u00ec` as `gioved
 The CLI, escaped server, and raw-UTF-8 server all produced 53 codec frames with
 `tail_len=24`; the complete codec-code SHA was
 `52c41a39a4b000e63a1b76366c7085c9fe5193a65fd6f2a7d1a42734bb310ab1` in every path.
-This closes the upstream Italian forensic. The CLI and server WAVs are retained under the
-ignored private evidence area for a human listening sanity check; PCM byte identity is not
-claimed.
+This closes the upstream Italian forensic. The CLI and server WAVs are retained in a local
+temporary area outside the repository for a human listening sanity check; PCM byte identity
+is not claimed.
 
 Evidence bookkeeping:
 
