@@ -269,6 +269,11 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_SD_SGEMM_CENSUS` | off | diagnostic: prints every decoder SGEMM shape with its wall time (every 100 calls and at exit) |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |
+| `QWEN_SD_RES1_V2` | off | direct dilated int8 conv (DL-4) for the residual convs: per-position activation scale, per-(channel,tap) weight scale, no im2col panel. Leaves for AVX-512 VNNI and Arm dot-product. Chosen by SHAPE (`in_ch == out_ch`, channels a multiple of 4, `in_ch <= 768`), so it serves **res2 and every square conv in the stack**, not only res1; the flag name understates it |
+| `QWEN_SD_GLUE` | off | fused residual unit on top of `QWEN_SD_RES1_V2`: snake out of place, res1 with its left context passed to the kernel, res2 with the residual in the kernel epilogue (exact, one pass) |
+| `QWEN_SD_CONVT_STACK` | off | ConvT as one un-expanded GEMM per layer with a two-tap/carry/bias epilogue (exact); measured neutral on the x86 product quantum, never qualified on Arm |
+| `QWEN_SD_BF16_PREUP` | off | diagnostic persistent bf16 pre-transformer weights; failed its x86 audio gate and stays off |
+| `QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC` | off | reserve the last N cpus of the worker mask for a private decoder team, and narrow the engine pool only while a decoder unit is in flight. Linux-only, **not ISA-specific** |
 | `QWEN_SERVER_ASYNC_OUTPUT` | off | experimental stream transport isolation: a bounded per-stream PCM queue and detached writer keep inference callbacks off the socket; queue overflow/disconnect fails and closes the stream rather than dropping PCM silently |
 | `QWEN_STREAM_OUTPUT_MAX_BYTES` | 1048576 | byte cap for the experimental per-stream output queue; invalid values fall back to the 1 MiB default |
 | `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS` | 5000 | socket send timeout used by the experimental stream writer; a stalled reader is terminated after the timeout |
@@ -447,8 +452,15 @@ their `*_MIN_B` thresholds. `QWEN_PREFILL_MATMAT` exists on both, but what it se
 the KleidiAI bf16 matmat on ARM, the AMX one on x86.
 
 **x86 only** — `QWEN_NO_VNNI`, `QWEN_NO_VNNI_TILE`, `QWEN_NO_AMX`, `QWEN_NO_AVX2MM`,
-`QWEN_NO_BF16DOT`, `QWEN_NO_BF16_MATMUL`, `QWEN_SD_INT8` (on by default only where AVX-512 VNNI
-exists), the AMX/VNNI/AVX2 batch thresholds, and the `*_NCHUNK` row-chunk family.
+`QWEN_NO_BF16DOT`, `QWEN_NO_BF16_MATMUL`, the AMX/VNNI/AVX2 batch thresholds, and the
+`*_NCHUNK` row-chunk family.
+
+**Both, but opt-in outside VNNI** — `QWEN_SD_INT8` has an int8 decoder conv on Arm
+dot-product too; it is default-on only where AVX-512 VNNI is. `QWEN_SD_RES1_V2` and
+`QWEN_SD_GLUE` have both a VNNI and an Arm dot-product leaf. `QWEN_SD_LANE_SPLIT` /
+`QWEN_SD_LANE_ELASTIC` and `QWEN_SD_CONVT_STACK` carry no ISA guard at all. AVX2 and
+AVX-512F have **no** int8 decoder conv, so there the whole family falls back to f32
+im2col + SGEMM.
 
 **The two sides are not symmetric, and the asymmetry is the point.** `QWEN_KAI_NCHUNK` is on by
 default at 384 because sub-tiling the KleidiAI GEMM was measured to win on ARM. The x86
