@@ -88,18 +88,56 @@ explain an Italian-only symptom — but it does mean the two paths are not the s
 of `(speaker, language)`, and it is a trap when constructing "identical" CLI and server
 control runs. Category 1, relevant to experiment design rather than to the defect.
 
-## 4. Ranked hypotheses — all UNPROVEN
+## 3.4 MEASURED 2026-09-10 — the streaming decoder is NOT the mechanism
+
+Run entirely on a dev machine, no server, no cloud, and deliberately NOT a duplicate of the
+live forensic: this compares the CLI against ITSELF, changing only the shape of the decode.
+Same model (1.7B CustomVoice, ryan), same Italian sentence in the reproducible class, same
+`-T 0 --seed 42 --int8`, so the generation is identical and only the waveform decoder
+differs — whole-sequence `qwen_speech_decoder_decode` versus chunked
+`qwen_speech_decoder_decode_streaming_st` at `--stream-chunk 4` (the server's quantum) and
+`--stream-chunk 10`.
+
+| comparison | codec tokens | audio |
+|---|---|---|
+| whole vs chunk 4 | **bit-identical** (73 frames, same sha) | mel-corr 0.99975, rms 9.7 LSB on a 15607 peak, 0.7 % of samples differ |
+| whole vs chunk 10 | **bit-identical** | same magnitude |
+| chunk 4 vs chunk 10 | bit-identical | max 1 LSB over 24 samples — chunk-size invariant |
+
+The only frame exceeding 2 % of peak error is the LAST one (frame 72 of 73), i.e. the
+end-of-utterance tail flush, not a per-chunk-boundary effect — and chunk-size invariance
+confirms that reading: if chunk boundaries were corrupting state, quantum 4 and quantum 10
+would place the damage differently, and they do not.
+
+**Therefore H1 is falsified for this case: chunked streaming decode reproduces
+whole-sequence decode.** Consistent with this, both the whole path and the streaming path
+use the same attention window (72) and the streaming path trims its K/V cache coherently.
+
+Scope of the claim, deliberately narrow: CLI versus CLI, one process, one sentence, one
+voice, ARM, no lane, no `QWEN_DECODER_BATCH`, no per-slot state. It exonerates the streaming
+decode MECHANISM; it does not exonerate the server's decoder lane, the batched decoder, or
+per-slot decoder state. And if the codec tokens themselves differ between CLI and server, the
+decoder is irrelevant regardless.
+
+## 4. Ranked hypotheses — updated with the 3.4 measurement
 
 | # | hypothesis | category | first evidence that would confirm | first evidence that would kill it |
 |---|---|---|---|---|
-| H1 | Streaming decoder chunk continuation corrupts audio at chunk boundaries | 4 | codec tokens identical CLI vs server, WAV differs, differences cluster at chunk boundaries | codec tokens already differ |
+| ~~H1~~ | ~~Streaming decoder chunk continuation corrupts audio at chunk boundaries~~ | 4 | — | **FALSIFIED locally, see 3.4**: chunked reproduces whole at mel-corr 0.99975 and is chunk-size invariant. Only the server-specific decoder paths (lane, batched decoder, per-slot state) remain untested. |
 | H2 | Server stopping policy (3.1) truncates or over-extends vs CLI | 1/3 | frame counts differ for the same text/seed; divergence at/near the end | frame counts identical and divergence is mid-utterance |
 | H3 | Per-slot state installed at admission differs from CLI pre-generation state | 1 | a KV/dec_x/position/tcl field differs right after ADMIT_INSTALL | all installation-time state hashes equal |
 | H4 | Batched Talker/CP kernels differ numerically even at B_eff=1 | 2/3 | state equal at install, first Talker step differs, divergence index early | first Talker step bit-equal |
 | H5 | Prefix-cache reuse injects a prompt prefix built under different conditioning | 1 | failure disappears with `QWEN_PREFIX_CACHE=0`; first request behaves differently from later ones | identical failure with the prefix cache disabled |
 
-H1 and H2 are ranked highest because they are the two places where the server is
-structurally a different computation rather than the same computation executed differently.
+With H1 falsified, **H2 and H3 move to the top**. H2 because the stopping policy is
+demonstrably a different function in the two paths (section 3.1) and its input is a token
+length, which makes it look language-dependent without being so. H3 because installation is
+the remaining place where the server builds state the CLI never builds.
+
+The externally reported observation that CLI and server already differ at concurrency 1 is
+consistent with this: it removes true batching from the primary suspects and, combined with
+3.4, points upstream of the waveform decoder. That observation is not this author's
+measurement and is recorded as reported, not as established.
 
 ## 5. Instrumentation reality check (important, and easy to trip over)
 
@@ -112,22 +150,25 @@ in the CLI generate loop).
 `tests/decoder_standalone` (`test_decoder_standalone.c`) replays a `QWEN_DUMP_CODES` file
 through the decoder, which makes hypothesis H1 testable WITHOUT the server at all.
 
-## 6. The single most discriminating next test — offline, no server, no cloud
+## 6. The next single discriminating test
 
-If the execution owner's CLI-vs-server comparison shows **identical codec tokens** but
-different audio, the whole question reduces to the decoder, and it can be settled offline:
+Section 3.4 already ran the offline decoder A/B that this section originally proposed, and
+it came back negative. The next single test therefore belongs to the execution track and is
+the codec-token bifurcation:
 
-1. Take one code sequence (a `QWEN_DUMP_CODES` file from a failing Italian sentence).
-2. Decode it whole: `qwen_speech_decoder_decode`.
-3. Decode the same codes in chunks through `qwen_speech_decoder_decode_streaming_st` with
-   the per-slot streaming state, using the quantum the server actually used.
-4. Compare the two WAVs and locate the sample offsets of the differences.
+> For the same model, voice, language, text, seed and sampling configuration, at B_eff = 1:
+> are the generated codec token IDs identical between CLI and server?
 
-If the differences cluster at chunk boundaries, H1 is confirmed and neither the scheduler
-nor the Talker nor the CP is involved. If the two decodes agree, H1 is dead and the defect
-is upstream of the decoder.
+If they DIFFER: the waveform decoder is out of scope entirely (3.4 plus this). Report the
+first differing frame index; early points at installation/conditioning (H3, H5), late points
+at the stopping policy (H2).
 
-This is proposed, not run. One experiment, not five.
+If they are IDENTICAL: the defect is in the server-specific decoder paths that 3.4 did NOT
+cover — the decoder lane, `QWEN_DECODER_BATCH`, per-slot streaming state — and the next test
+is to disable them one at a time.
+
+Blocker to be aware of before instrumenting: `QWEN_DUMP_CODES` lives in `qwen_cp_predict`
+and does not cover `qwen_batch_cp_predict`, which is what the batched server runs (section 5).
 
 ## 7. Classification table for the returning evidence
 
