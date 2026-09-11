@@ -2497,6 +2497,41 @@ static float *cs_convt_direct(const float *in, int in_ch, int out_ch, int len,
 }
 #endif
 
+/* ---- QWEN_SD_CONVT_I8: the one-GEMM ConvT stack on KleidiAI int8 ----------------------
+ * The stack is [kernel*out_ch][in_ch] and the sequence is the batch: the same
+ * prepared-state shape the ConvNeXt pair uses, so sd_kai_matmul applies unchanged.  The
+ * carry/two-tap/bias epilogue is untouched -- it reads R in its own layout, so only the
+ * GEMM output is transposed back.  Numeric change, default off. */
+static int sd_convt_i8_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_CONVT_I8"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
+static struct { const float *key; int8_t *q; float *scale; int rows, cols; } g_convt_i8[6];
+static int sd_convt_i8_for(const float *stack, int rows, int cols) {
+    for (int i = 0; i < 6; i++)
+        if (g_convt_i8[i].key == stack)
+            return g_convt_i8[i].rows == rows && g_convt_i8[i].cols == cols;
+    int8_t *q = (int8_t *)aligned_malloc((size_t)rows * cols);
+    float *s = (float *)aligned_malloc((size_t)rows * sizeof(float));
+    if (!q || !s) { free(q); free(s); return 0; }
+    sd_cnext_quant_row(stack, q, s, rows, cols);
+    if (!qwen_kleidi_register_i8_fam(stack, q, s, rows, cols,
+                                     QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER)) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "[convt] QWEN_SD_CONVT_I8=1 but the stack was not registered; f32 path\n"); }
+        free(q); free(s);
+        return 0;
+    }
+    for (int i = 0; i < 6; i++)
+        if (!g_convt_i8[i].key) {
+            g_convt_i8[i].key = stack; g_convt_i8[i].q = q; g_convt_i8[i].scale = s;
+            g_convt_i8[i].rows = rows; g_convt_i8[i].cols = cols;
+            break;
+        }
+    return 1;
+}
+
 static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
                        int kernel, int stride,
                        const float *w, const float *b, float *carry) {
@@ -2520,7 +2555,26 @@ static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
             float *R = (float *)sd_tmp_alloc((size_t)M * len * sizeof(float));
             float *out = (float *)sd_tmp_alloc((size_t)out_ch * out_len * sizeof(float));
             if (R && out) {
-                SD_GEMM(CblasNoTrans, CblasNoTrans, M, len, in_ch, 1.0f, stack, in_ch, in, len, 0.0f, R, len);
+                int done_i8 = 0;
+                if (sd_convt_i8_enabled() && sd_convt_i8_for(stack, M, in_ch)) {
+                    float *Rk = (float *)sd_tmp_alloc((size_t)M * len * sizeof(float));
+                    float *xt = (float *)sd_tmp_alloc((size_t)in_ch * len * sizeof(float));
+                    if (Rk && xt) {
+                        for (int t = 0; t < len; t++)
+                            for (int c = 0; c < in_ch; c++)
+                                xt[(size_t)t * in_ch + c] = in[(size_t)c * len + t];
+                        if (sd_kai_matmul(Rk, stack, xt, M, in_ch, len, (size_t)M * sizeof(float))) {
+                            for (int k = 0; k < M; k++)
+                                for (int t = 0; t < len; t++)
+                                    R[(size_t)k * len + t] = Rk[(size_t)t * M + k];
+                            done_i8 = 1;
+                        }
+                    }
+                    if (Rk) sd_tmp_free(Rk);
+                    if (xt) sd_tmp_free(xt);
+                }
+                if (!done_i8)
+                    SD_GEMM(CblasNoTrans, CblasNoTrans, M, len, in_ch, 1.0f, stack, in_ch, in, len, 0.0f, R, len);
                 qwen_convt_stack_epilogue(out, R, carry, b, out_ch, len, stride);
                 sd_tmp_free(R);
                 return out;
