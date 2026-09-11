@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile": {
     "id": "turin-c8a-32c-vnni-control",
-    "description": "Control arm of turin-c8a-32c-vnni-product: byte-for-byte the same topology, lane and backend contract with the residual convs on the im2col panel kernel (QWEN_SD_RES1_V2=0). Exists so a paired RES1_V2 off/on quality bank or A/B runs two committed, preflighted profiles instead of a shell override that the strict preflight rightly refuses.",
+    "description": "Control arm of turin-c8a-32c-vnni-product: byte-for-byte the same topology, lane and backend contract with the residual convs on the im2col panel kernel (QWEN_SD_RES1_V2=0) and the DL-4 cohort explicitly disabled (QWEN_SD_MULTISLOT=0). Exists so paired RES1_V2/multi-slot A/Bs run two committed, preflighted profiles instead of shell overrides that the strict preflight rightly refuses.",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
@@ -37,7 +37,8 @@
       "fused_residual": "UNSUPPORTED",
       "kleidi": "UNSUPPORTED",
       "res1_v2": "VALID FALLBACK",
-      "decoder_lane": "ACTIVE"
+      "decoder_lane": "ACTIVE",
+      "multislot": "VALID FALLBACK"
     },
     "quality_gate": {
       "required": true,
@@ -347,6 +348,11 @@
         "value": "0",
         "why": "control arm: the residual convs run on the panel kernel, the reference numerics of every qualified VNNI decoder result before DL-4",
         "revert": "QWEN_SD_RES1_V2=1 (the product profile)"
+      },
+      "QWEN_SD_MULTISLOT": {
+        "value": "0",
+        "why": "explicit control for the product's default 2-slot DL-4 cohort; keep the shared-weight sweep out of the reference arm",
+        "revert": "QWEN_SD_MULTISLOT=2 (the product profile)"
       },
       "QWEN_VNNI_GEMV_MR": {
         "value": "2",

@@ -10149,7 +10149,7 @@ typedef struct {
 
 static inline int sd_dconv_round(float q) { return (int)(q >= 0 ? q + 0.5f : q - 0.5f); }
 
-/* WHY THIS ONE FUNCTION OPTS OUT OF REASSOCIATION.
+/* WHY THESE WORKERS OPT OUT OF REASSOCIATION AND AUTO-VECTORIZATION.
  *
  * The epilogue computes `reduce(facc) - corr + bias` and, when a residual is supplied,
  * adds it: a four-term float sum.  The build uses -ffast-math, so the compiler is free to
@@ -10161,16 +10161,18 @@ static inline int sd_dconv_round(float q) { return (int)(q >= 0 ? q + 0.5f : q -
  * Turin the drift reached 115 LSB on a 9550 peak (~1.2 %, mel-corr 0.99847) -- far above
  * the -90 dB the engine treats as benign.
  *
- * Disabling reassociation for this function alone restores the contract the fused path is
- * supposed to honour: with it, `QWEN_SD_GLUE=0` and `=1` produce byte-identical audio, so
- * the mechanism is a pure performance change and needs no quality gate of its own.
- * -fno-associative-math is the narrowest switch that does it; the rest of -ffast-math is
- * untouched, and the arithmetic is unchanged in both arms.
+ * Disabling reassociation and GCC's loop vectorizer for these workers restores the
+ * contract the fused path is supposed to honour: the single-slot 4x4 and multi-slot
+ * 4x2 tiles then produce the same float sequence, so the multi-slot oracle is bit-exact.
+ * The two attributes are narrow: explicit AVX-512 intrinsics remain vectorized, while
+ * the scalar correction bookkeeping is kept in source order.  The rest of -ffast-math
+ * and every other kernel remain untouched.
  *
  * If a compiler ignores the attribute the failure is loud, not silent: the
- * `conv1d_int8_v2 ... ctx+residual` self-test case demands bit-equality and fails. */
+ * `conv1d_int8_v2 ... ctx+residual` and multi-slot self-test cases demand bit-equality
+ * and fail. */
 #if defined(__GNUC__) && !defined(__clang__)
-__attribute__((optimize("no-associative-math")))
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
 #endif
 static void sd_dconv_worker(void *vj) {
     sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
@@ -10314,7 +10316,7 @@ typedef struct {
 } sd_dconv_multi_job_t;
 
 #if defined(__GNUC__) && !defined(__clang__)
-__attribute__((optimize("no-associative-math")))
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
 #endif
 static void sd_dconv_multi_worker(void *vj) {
     sd_dconv_multi_job_t *j = (sd_dconv_multi_job_t *)vj;

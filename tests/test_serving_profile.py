@@ -21,7 +21,8 @@ def check(name, condition, detail=""):
         FAILURES.append(name)
 
 
-def dispatch_for(isa, mode, *, batch, design, fused, kai, prefill, talker, q4, bf16):
+def dispatch_for(isa, mode, *, batch, design, fused, kai, prefill, talker, q4, bf16,
+                 res1_v2=False):
     def row(ident, compiled, supported):
         return {"id": ident, "compiled": "yes" if compiled else "no",
                 "supported": "yes" if supported else "no", "resolved": "ON"}
@@ -32,6 +33,7 @@ def dispatch_for(isa, mode, *, batch, design, fused, kai, prefill, talker, q4, b
             row("decoder.design_d", design, design),
             row("decoder.fused_residual", fused, fused),
             row("kleidi.enabled", kai, kai),
+            row("decoder.res1_v2", res1_v2, res1_v2),
         ],
         "serving": {
             "decoder_batch_requested": bool(batch),
@@ -39,6 +41,7 @@ def dispatch_for(isa, mode, *, batch, design, fused, kai, prefill, talker, q4, b
             "design_d_active": bool(design and mode == "ragged-design-d-int8"),
             "fused_residual_active": bool(fused),
             "stream_strip_active": bool(design),
+            "res1_v2_active": bool(res1_v2),
             "decoder_pool": "engine",
             "talker_cp_int8_backend": talker,
             "q4_backend": q4,
@@ -65,7 +68,8 @@ cases = [
         kai=False, prefill=False, talker="INT8 VNNI", q4="Q4 VNNI", bf16="bf16 fixed-B twin")),
     ("arm-product", dispatch_for(
         "arm_i8mm_bf16", "per-item-int8-dotprod", batch=1, design=False, fused=False,
-        kai=True, prefill=True, talker="KleidiAI INT8", q4="KleidiAI Q4", bf16="KleidiAI BF16")),
+        kai=True, prefill=True, talker="KleidiAI INT8", q4="KleidiAI Q4", bf16="KleidiAI BF16",
+        res1_v2=True)),
     ("common-control", dispatch_for(
         "x86_amx", "per-item-int8-vnni", batch=0, design=False, fused=False,
         kai=False, prefill=False, talker="INT8 VNNI", q4="Q4 VNNI", bf16="bf16 fixed-B twin")),

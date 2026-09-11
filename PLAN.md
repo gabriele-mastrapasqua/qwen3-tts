@@ -286,17 +286,30 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       RES1_V2 is available; BF16 pre-up and multi-slot remain explicit default-off controls
       until their separate quality/16-core qualification gates pass.
 
+- [x] VNNI DL-4 multi-slot promotion smoke (2026-09-11): after the exact multi-slot oracle
+      fix, the Turin product A/B ran three synchronized short waves at C4/C8/C12/C16 and
+      two mixed short/long waves at C8/C12 against the explicit `QWEN_SD_MULTISLOT=0`
+      control. All 120 requests per arm completed with zero errors/rejects; sustained
+      stream/total p95 and req/s improved coherently at C8-C16. The Turin product profile
+      now defaults `QWEN_SD_MULTISLOT=2`; the control profile pins 0, Arm/KleidiAI stays
+      default-off pending its own 16-core/quality gate, and paired audio quality remains
+      required before calling the feature qualified across products.
+
 - [ ] PRE-GRAVITON-5 regression gate (ASAP, before any AWS Graviton 5 spot campaign):
-      this is an ordered two-arm gate, and Graviton is blocked until both arms are recorded:
-      (1) FAST rerun `turin-c8a-32c-vnni-product` with the already qualified "yesterday"
+      this is an ordered two-arm gate, and Graviton is blocked until both arms are recorded.
+      The Turin box is a dirty bench checkout: after validation, sync back only the final
+      tracked source/config/commits to this canonical checkout; never pull `models/`,
+      `private/`, WAVs or other ignored/untracked customer-bench material, and recheck the
+      reachable log/tree privacy before calling the branch clean. (1) FAST rerun
+      `turin-c8a-32c-vnni-product` with the already qualified "yesterday"
       policy fully on (native BF16 prefill, INT8 VNNI decoder, RES1_V2, elastic split=4
       lane, pool-spin and the frozen topology), at least C6/C8 plus the established C11/C12
       boundary, using the same model/bank/seed and dispatch/self-test checks; this is the
       regression control against `.work/turin-vnni-final-handoff-20260909.md` and
       `.work/c12-win-checkpoint-20260909.md`. (2) Run a separate unqualified FAST diagnostic
       on the same Turin topology with the new cross-ISA options enabled together:
-      `QWEN_SD_BF16_PREUP=1`, `QWEN_SD_MULTISLOT=2`, `QWEN_SD_GLUE=1` and
-      `QWEN_SD_CONVT_STACK=1` (RES1_V2/lane remain on); record C6/C8/C11/C12 deltas,
+      `QWEN_SD_BF16_PREUP=1`, `QWEN_SD_GLUE=1` and `QWEN_SD_CONVT_STACK=1` (RES1_V2/lane
+      and the now-default Turin `QWEN_SD_MULTISLOT=2` remain on); record C6/C8/C11/C12 deltas,
       errors/rejects, TTFA, playback and RTF. `QWEN_SD_CNEXT_I8` is Arm/KleidiAI-specific
       and is not part of the VNNI arm. Any all-on gain is diagnostic only until paired WAV,
       mel/ASR/listening and a serving gate pass. Do not start the Graviton topology matrix

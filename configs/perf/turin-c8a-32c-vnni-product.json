@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile": {
     "id": "turin-c8a-32c-vnni-product",
-    "description": "Measured Turin product point: AWS c8a.8xlarge (AMD EPYC 9R45 Zen 5, 32 physical cores, no SMT, 4 CCX x 8 cores, 32 MiB L3 each). Four prefork workers pinned one per CCX, four in-flight streams per worker, INT8 VNNI Talker/CP, per-item INT8 VNNI decoder on the elastic decoder lane (DL-2: 8 <-> 4+4 cpus, one bounded decoder unit per slot) with the DL-4 direct dilated conv (QWEN_SD_RES1_V2), native AVX-512 BF16 prefill, decode quantum 4, fail-fast admission (no queue). Derived from vnni-bf16-product; the topology and the lane/conv contracts are the difference.",
+    "description": "Measured Turin product point: AWS c8a.8xlarge (AMD EPYC 9R45 Zen 5, 32 physical cores, no SMT, 4 CCX x 8 cores, 32 MiB L3 each). Four prefork workers pinned one per CCX, four in-flight streams per worker, INT8 VNNI Talker/CP, per-item INT8 VNNI decoder on the elastic decoder lane (DL-2: 8 <-> 4+4 cpus, one bounded decoder unit per slot) with the DL-4 direct dilated conv (QWEN_SD_RES1_V2) and the verified 2-slot shared-weight cohort (QWEN_SD_MULTISLOT=2), native AVX-512 BF16 prefill, decode quantum 4, fail-fast admission (no queue). Derived from vnni-bf16-product; the topology and the lane/conv contracts are the difference.",
     "objective": {
       "primary": "realtime_factor",
       "secondary": "ttfa",
@@ -37,7 +37,8 @@
       "fused_residual": "UNSUPPORTED",
       "kleidi": "UNSUPPORTED",
       "res1_v2": "ACTIVE",
-      "decoder_lane": "ACTIVE"
+      "decoder_lane": "ACTIVE",
+      "multislot": "ACTIVE"
     },
     "quality_gate": {
       "required": true,
@@ -347,6 +348,11 @@
         "value": "1",
         "why": "DL-4 direct dilated int8 VNNI conv for the residual convs: res1 1.72x, decoder unit on 4 threads 64 -> 50 ms, overlap share 48 -> 39 %, host screen C12 STREAM p95 0.80-0.81 / C16 0.88-0.92 (2026-09-10). Numerics differ from the panel kernel (per-position activation scale): qualified by the paired audio bank of this profile",
         "revert": "QWEN_SD_RES1_V2=0"
+      },
+      "QWEN_SD_MULTISLOT": {
+        "value": "2",
+        "why": "default the verified DL-4 shared-weight 2-slot lane cohort: three synchronized short waves at C4/C8/C12/C16 and mixed short/long waves at C8/C12 improved the sustained VNNI metrics versus the explicit 0 control, with zero errors/rejects",
+        "revert": "QWEN_SD_MULTISLOT=0 for the committed control/A-B arm"
       },
       "QWEN_VNNI_GEMV_MR": {
         "value": "2",
