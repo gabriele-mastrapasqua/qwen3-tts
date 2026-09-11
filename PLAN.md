@@ -325,7 +325,9 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       and the all-on result is classified as GO/NO-GO.
       Reminder: before spending more on the Graviton5 topology matrix, rerun the Turin
       control first and record C6/C8 plus the C11/C12 boundary; the Graviton screen above
-      is not a substitute for that regression check.
+      is not a substitute for that regression check. On 2026-09-11 the Turin SSH endpoint
+      timed out twice, so no Turin pull/build/benchmark was attempted and this gate remains
+      pending for the next available host window.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
