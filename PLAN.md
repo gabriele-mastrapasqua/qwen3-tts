@@ -303,31 +303,30 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       default-off pending its own 16-core/quality gate, and paired audio quality remains
       required before calling the feature qualified across products.
 
-- [ ] PRE-GRAVITON-5 regression gate (ASAP, before any AWS Graviton 5 spot campaign):
-      this is an ordered two-arm gate, and Graviton is blocked until both arms are recorded.
-      The Turin box is a dirty bench checkout: after validation, sync back only the final
-      tracked source/config/commits to this canonical checkout; never pull `models/`,
-      `private/`, WAVs or other ignored/untracked customer-bench material, and recheck the
-      reachable log/tree privacy before calling the branch clean. (1) FAST rerun
-      `turin-c8a-32c-vnni-product` with the already qualified "yesterday"
-      policy fully on (native BF16 prefill, INT8 VNNI decoder, RES1_V2, elastic split=4
-      lane, pool-spin and the frozen topology), at least C6/C8 plus the established C11/C12
-      boundary, using the same model/bank/seed and dispatch/self-test checks; this is the
-      regression control against `.work/turin-vnni-final-handoff-20260909.md` and
-      `.work/c12-win-checkpoint-20260909.md`. (2) Run a separate unqualified FAST diagnostic
-      on the same Turin topology with the new cross-ISA options enabled together:
-      `QWEN_SD_BF16_PREUP=1`, `QWEN_SD_GLUE=1` and `QWEN_SD_CONVT_STACK=1` (RES1_V2/lane
-      and the now-default Turin `QWEN_SD_MULTISLOT=2` remain on); record C6/C8/C11/C12 deltas,
-      errors/rejects, TTFA, playback and RTF. `QWEN_SD_CNEXT_I8` is Arm/KleidiAI-specific
-      and is not part of the VNNI arm. Any all-on gain is diagnostic only until paired WAV,
-      mel/ASR/listening and a serving gate pass. Do not start the Graviton topology matrix
-      until the control shows no regression or the regression is explained and recorded,
-      and the all-on result is classified as GO/NO-GO.
-      Reminder: before spending more on the Graviton5 topology matrix, rerun the Turin
-      control first and record C6/C8 plus the C11/C12 boundary; the Graviton screen above
-      is not a substitute for that regression check. On 2026-09-11 the Turin SSH endpoint
-      timed out twice, so no Turin pull/build/benchmark was attempted and this gate remains
-      pending for the next available host window.
+- [x] PRE-GRAVITON-5 Turin regression applicability gate: the Turin VNNI product/control
+      A/B and the C4/C8/C12/C16 multi-slot smoke are already recorded in the Turin handoff
+      and the preceding VNNI promotion work. The later commits `c6e6e26` and `5b03269` touch
+      only the KleidiAI/Arm paths: on x86 VNNI the new region helpers are not selected and
+      the BF16 KAI consumer is a fallback no-op. Therefore Turin does not need another run
+      solely for this Arm-only delta. Reopen this gate if shared x86 kernels, threading,
+      profiles, or dispatch code change. The Turin checkout remains a dirty bench checkout:
+      sync only tracked source/config/commits, never models/private/WAVs, and keep the
+      privacy/log/tree check in force.
+
+- [ ] GRAVITON-5 full qualification campaign: first run the clean `arm-product` baseline
+      with RES1_V2/KAI INT8 and the profile's BF16 pre-up/multi-slot defaults OFF; run
+      `make doctor`, strict preflight, caps/dispatch/self-test, paired audio quality and
+      the capacity/streaming ladder on the selected 32-core topology. Do the short topology
+      break-in (4x8 versus 2x16/8x4, lane split and pool-spin) before spending on the full
+      waves/soaks. Record TTFB, TTFA, STREAM/TOTAL RTF, playback stalls, rejects/errors,
+      L3/bandwidth and the exact profile manifest. The exploratory 4x8 all-on screen is
+      evidence for choosing follow-up arms, not a qualification.
+
+- [ ] ARM optional-feature promotion: qualify BF16 pre-up, multi-slot and CNEXT-I8 as
+      separate paired A/Bs only after the Graviton baseline. BF16 and multi-slot remain
+      default-off: the existing Arm quality/perf evidence is not a promotion, and the
+      current multi-slot short A/B was negative. Do not bundle these into the baseline
+      claim or change the Arm JSON defaults without paired audio plus serving evidence.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
