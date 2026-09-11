@@ -239,7 +239,9 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       buffer is not a key), and the ConvNeXt MLP exists TWICE -- the CLI path uses a
       `pw_dim = cur_ch*4` copy, the streaming server path the 4096-wide `convnext_mlp`; a
       CLI A/B cannot see a change made in the other one.
-      DONE since: ConvNeXt pointwise pair on KAI int8 (`QWEN_SD_CNEXT_I8`, default off) --
+      DONE since: DL-4 rectangular/wide shapes (API `in_ch`/`out_ch`, any shape when the flag is
+      on; two rectangular self-test cases exact / 5.6e-3); ConvNeXt pointwise pair on KAI
+      int8 (`QWEN_SD_CNEXT_I8`, default off) --
       6 paired server texts mel-corr min 0.99736 / mean 0.99805, C10 0.843 -> 0.821.  Still
       open: the full 21-text bank and the 1.7B for that flag, then pretf/ConvT/DL-4 items.
       Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
