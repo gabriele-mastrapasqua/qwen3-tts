@@ -119,24 +119,36 @@ static int sd_bf16_preup_requested(void);
 /* KAI bf16 prepared-state path: the same kernels the dispatched path runs, reached without
  * a nested qwen_parallel (lane workers), and KAI writes [B][rows] directly -- the layout the
  * caller wants, so the packed adapter's transpose is skipped. */
-typedef struct { float *dst; const void *key; const float *lhs; int rows, cols, B; } sd_kai_bf16_job_t;
+typedef struct {
+    float *dst; const void *key; const float *lhs; int rows, cols, B;
+    const void *lhs_packed;
+    int prep_ok;
+    qwen_barrier_t bar;
+} sd_kai_bf16_job_t;
 static void sd_kai_bf16_task(size_t tid, size_t nt, void *v) {
     sd_kai_bf16_job_t *j = (sd_kai_bf16_job_t *)v;
-    const void *lp = qwen_kleidi_bf16_region_prep(j->lhs, (size_t)j->cols * sizeof(float),
-                                                  j->cols, j->B);
-    if (lp) qwen_kleidi_bf16_region_run(j->key, j->dst, (size_t)j->rows * sizeof(float), lp,
-                                        j->rows, j->cols, j->B, tid, nt);
+    if (tid == 0) {
+        j->lhs_packed = qwen_kleidi_bf16_region_prep(
+            j->lhs, (size_t)j->cols * sizeof(float), j->cols, j->B);
+        j->prep_ok = (j->lhs_packed != NULL);
+    }
+    qwen_barrier_wait(&j->bar);
+    if (j->prep_ok)
+        qwen_kleidi_bf16_region_run(j->key, j->dst, (size_t)j->rows * sizeof(float),
+                                    j->lhs_packed, j->rows, j->cols, j->B, tid, nt);
 }
 static int sd_kai_matmul_bf16(float *dst, const void *key, const float *lhs,
                               int rows, int cols, int B) {
     if (!qwen_kleidi_bf16_region_usable(key, rows, cols, B)) return 0;
-    sd_kai_bf16_job_t j = { dst, key, lhs, rows, cols, B };
-    if (qwen_parallel_active()) { sd_kai_bf16_task(0, 1, &j); return 1; }
-    int nt = qwen_lane_thread_here() ? qwen_lane_team_size() : qwen_get_threads();
+    sd_kai_bf16_job_t j = { 0 };
+    j.dst = dst; j.key = key; j.lhs = lhs; j.rows = rows; j.cols = cols; j.B = B;
+    int nt = qwen_parallel_active() ? 1
+                                   : (qwen_lane_thread_here() ? qwen_lane_team_size() : qwen_get_threads());
     if (nt < 1) nt = 1;
+    qwen_barrier_init(&j.bar, nt);
     if (nt == 1) sd_kai_bf16_task(0, 1, &j);
     else          qwen_parallel((size_t)nt, sd_kai_bf16_task, &j);
-    return 1;
+    return j.prep_ok;
 }
 
 static int sd_bf16_preup_matmat(float *Y, const uint16_t *W, const void *key, const float *X,

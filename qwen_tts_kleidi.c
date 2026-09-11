@@ -538,13 +538,12 @@ static int kai_i8_run(const kai_entry_t *e, float *dst, const float *lhs,
  *
  * These three entries expose exactly the phases that already exist.  Same pack, same
  * kernel, same n-tile partition, so the values are the ones the dispatcher produces --
- * this is not an SMMLA substitution and it changes no arithmetic.  There is no consumer
- * yet: the CP/Talker regions gather k-major [cols][B] for the shared per-column int8
- * quantiser, while KleidiAI wants row-major float activations it quantises itself, so
- * wiring them needs a second gather shape in the region body (a separate task).
+ * this is not an SMMLA substitution and it changes no arithmetic.  The CP/Talker regions
+ * gather row-major [B][cols] for this interface, and the region leader packs that
+ * activation once into its TLS scratch before the team runs the shared n-tile work.
  *
- * Contract: EVERY thread of the team calls prep (it packs into its own thread-local
- * scratch, O(B*cols) against O(rows*cols/nt) of work), then calls run with its tid. */
+ * Contract: the region leader calls prep, every thread calls run with its tid, and the
+ * caller places a barrier after run before the leader reuses its TLS scratch. */
 int qwen_kleidi_i8_region_usable(const void *key, int rows, int cols, int B) {
     if (!qwen_kleidi_i8_enabled() || B < 1 || g_kai_bypass) return 0;
     const kai_entry_t *e = kai_lookup_kind(key, KAI_KIND_I8);

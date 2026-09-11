@@ -1019,6 +1019,8 @@ typedef struct {
     int BW; const int *idx;
     int8_t *qx; float *swtmp; float sx[16];
     int arm_kai;                 /* 1: KleidiAI prepared-state runner (Arm) */
+    const void *kai_lhs_packed;  /* one pack shared by the whole region team */
+    int kai_prep_failed;
     qwen_barrier_t bar;
     /* frame mode only: the whole 15-group decode inside one region */
     const float *talker_hidden; const int *code0; int *out_codes;
@@ -1043,12 +1045,28 @@ static void cp_region_scatter(cp_region_t *r, float *dst, const float *Y, int b,
     if (r->arm_kai) { memcpy(d, Y + (size_t)j * rows, (size_t)rows * sizeof(float)); return; }
     for (int i = 0; i < rows; i++) d[i] = Y[(size_t)i * r->BW + j];
 }
+
+/* Pack the row-major activation once.  qwen_kleidi_*_region_prep() uses TLS scratch,
+ * so the leader's packed buffer remains valid for all workers until the phase barrier
+ * following the run releases it for the next projection. */
+static const void *cp_region_kai_prep(cp_region_t *r, int cols, size_t tid) {
+    if (tid == 0) {
+        r->kai_lhs_packed = qwen_kleidi_i8_region_prep(
+            r->bb->cp_Xt, (size_t)cols * sizeof(float), cols, r->BW);
+        r->kai_prep_failed = (r->kai_lhs_packed == NULL);
+    }
+    qwen_barrier_wait(&r->bar);
+    if (r->kai_prep_failed) {
+        if (tid == 0) fprintf(stderr, "[cp] KAI region LHS prep failed\n");
+        abort();
+    }
+    return r->kai_lhs_packed;
+}
+
 static void cp_region_run_proj(cp_region_t *r, const int8_t *W, const float *sw,
                                int rows, int cols, size_t tid, size_t nt) {
     if (r->arm_kai) {
-        const void *lp = qwen_kleidi_i8_region_prep(r->bb->cp_Xt, (size_t)cols * sizeof(float),
-                                                    cols, r->BW);
-        if (!lp) { fprintf(stderr, "[cp] KAI region LHS prep failed\n"); abort(); }
+        const void *lp = cp_region_kai_prep(r, cols, tid);
         qwen_kleidi_i8_region_run(W, r->bb->cp_Yt, (size_t)rows * sizeof(float), lp,
                                   rows, cols, r->BW, tid, nt);
         return;
@@ -1061,9 +1079,7 @@ static void cp_region_run_qkv(cp_region_t *r, const int8_t *Wq, const float *sq,
                               float *Yk, float *Yv, int q_rows, int kv_rows, int cols,
                               size_t tid, size_t nt) {
     if (r->arm_kai) {
-        const void *lp = qwen_kleidi_i8_region_prep(r->bb->cp_Xt, (size_t)cols * sizeof(float),
-                                                    cols, r->BW);
-        if (!lp) { fprintf(stderr, "[cp] KAI region LHS prep failed\n"); abort(); }
+        const void *lp = cp_region_kai_prep(r, cols, tid);
         qwen_kleidi_i8_qkv_region_run(Wq, Wk, Wv, r->bb->cp_Yt, Yk, Yv, lp,
                                       q_rows, kv_rows, cols, r->BW, tid, nt);
         return;
