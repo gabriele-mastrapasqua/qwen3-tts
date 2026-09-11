@@ -635,15 +635,15 @@ static const float *sd_convt_stack_for(const float *packed) {
 }
 /* Build the DL-4 layout for a residual conv: wq2[m][kk][Cp] with one scale and one weight
  * sum per (m, kk); the f32 weight is [out_ch][in_ch][kernel] (kk fastest, the im2col order). */
-static void sd_wq_build_v2(sd_wq_entry_t *e, const float *w, int ch, int kernel) {
+static void sd_wq_build_v2(sd_wq_entry_t *e, const float *w, int in_ch, int out_ch, int kernel) {
     if (e->v2_tried) return;
     e->v2_tried = 1;
-    const int Cp = qwen_conv1d_int8_v2_cp(ch);
-    int8_t *q2 = (int8_t *)aligned_malloc((size_t)ch * kernel * Cp);
-    float *sw2 = (float *)aligned_malloc((size_t)ch * kernel * sizeof(float));
-    int32_t *ws2 = (int32_t *)aligned_malloc((size_t)ch * kernel * sizeof(int32_t));
+    const int Cp = qwen_conv1d_int8_v2_cp(in_ch);
+    int8_t *q2 = (int8_t *)aligned_malloc((size_t)out_ch * kernel * Cp);
+    float *sw2 = (float *)aligned_malloc((size_t)out_ch * kernel * sizeof(float));
+    int32_t *ws2 = (int32_t *)aligned_malloc((size_t)out_ch * kernel * sizeof(int32_t));
     if (!q2 || !sw2 || !ws2) { free(q2); free(sw2); free(ws2); return; }
-    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, w, ch, kernel, Cp);
+    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, w, in_ch, out_ch, kernel, Cp);
     e->q2 = q2; e->sw2 = sw2; e->wsum2 = ws2; e->Cp2 = Cp;
 }
 
@@ -814,7 +814,11 @@ static void causal_conv1d_blas(float *out, const float *in,
                                int kernel, int dilation) {
     const int use_bf16 = sd_amx_bf16_enabled() && (out_ch & 15) == 0;
     const int use_i8 = sd_int8_enabled() && qwen_sd_int8_usable(in_ch, out_ch);
-    if (use_bf16 || use_i8) {
+    /* DL-4 handles rectangular/wide shapes the v1 panel path cannot: the activation and
+     * weight padding is per-in_ch, so the 768/square gate does not apply to it. */
+    const int use_v2 = sd_int8_enabled() && sd_res1_v2_enabled() &&
+                       qwen_conv1d_int8_v2_available() && kernel >= 1 && in_ch > 0 && out_ch > 0;
+    if (use_bf16 || use_i8 || use_v2) {
         sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
         if (e) {
             if (use_bf16 && e->amx_bf16_wpack)
@@ -825,12 +829,11 @@ static void causal_conv1d_blas(float *out, const float *in,
                 qwen_conv1d_int8_design_d(out, in, e->q, e->scales, e->wsum, bias,
                                           e->amx_d_wpack, in_ch, out_ch, length,
                                           kernel, dilation, e->Kp, sd_int8_blk());
-            else if (use_i8 && e->q && kernel >= 1 && in_ch == out_ch && (in_ch & 3) == 0 &&
-                     sd_res1_v2_enabled() && (e->q2 || !e->v2_tried)) {
-                if (!e->q2) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, weight, in_ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
+            else if (use_v2 && (e->q2 || !e->v2_tried)) {
+                if (!e->q2) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, weight, in_ch, out_ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
                 if (e->q2)
                     qwen_conv1d_int8_v2(out, in, e->q2, e->sw2, e->wsum2, bias,
-                                        in_ch, length, kernel, dilation, e->Cp2);
+                                        in_ch, out_ch, length, kernel, dilation, e->Cp2);
                 else
                     qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
                                      in_ch, out_ch, length, kernel, dilation,
@@ -2307,7 +2310,7 @@ static sd_wq_entry_t *cs_v2_entry(const float *w, int ch, int kernel) {
     if (!sd_int8_enabled() || !qwen_sd_int8_usable(ch, ch) || (ch & 3)) return NULL;
     sd_wq_entry_t *e = sd_wq_get_conv(w, ch, ch * kernel);
     if (!e || !e->q) return NULL;
-    if (!e->q2 && !e->v2_tried) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, w, ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
+    if (!e->q2 && !e->v2_tried) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, w, ch, ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
     return e->q2 ? e : NULL;
 }
 static float *cs_conv1d_v2_ctx(sd_wq_entry_t *e, const float *in, int ch, int len,
@@ -2317,7 +2320,7 @@ static float *cs_conv1d_v2_ctx(sd_wq_entry_t *e, const float *in, int ch, int le
     float *out = (float *)sd_tmp_alloc((size_t)ch * len * sizeof(float));
     if (!out) return NULL;
     qwen_conv1d_int8_v2_ctx(out, in, warm ? tail : NULL, tail_cols, residual,
-                            e->q2, e->sw2, e->wsum2, b, ch, len, kernel, dilation, e->Cp2);
+                            e->q2, e->sw2, e->wsum2, b, ch, ch, len, kernel, dilation, e->Cp2);
     if (tail_cols > 0 && tail) cs_save_tail(tail, in, ch, len, tail_cols);
     return out;
 }

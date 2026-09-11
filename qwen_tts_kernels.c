@@ -10114,7 +10114,7 @@ QWEN_MM_SCRATCH(dcf, float)
 typedef struct {
     float *out; const float *in;
     const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
-    int ch, length, kernel, dilation, Cp, tb;
+    int in_ch, out_ch, length, kernel, dilation, Cp, tb;
     const float *tail; int tail_cols;   /* left context [ch][tail_cols] for positions < 0 (NULL: zero rows) */
     const float *residual;              /* [ch][length] added in the epilogue (NULL: none) */
     _Atomic int next; int n_blocks;
@@ -10147,7 +10147,7 @@ __attribute__((optimize("no-associative-math")))
 #endif
 static void sd_dconv_worker(void *vj) {
     sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
-    const int ch = j->ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
+    const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
     const int pad = (K - 1) * dil;
     const int maxrows = j->tb + pad + 4;
     uint8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
@@ -10168,21 +10168,21 @@ static void sd_dconv_worker(void *vj) {
             else if (p < 0 && j->tail && -p <= j->tail_cols) { src = j->tail + (j->tail_cols + p); sstride = (size_t)j->tail_cols; }
             else { memset(qr, 0x80, (size_t)Cp); sc[r] = 0.0f; continue; }
             float amax = 0.0f;
-            for (int ic = 0; ic < ch; ic++) { float v = src[(size_t)ic * sstride]; frow[ic] = v; float a = fabsf(v); if (a > amax) amax = a; }
+            for (int ic = 0; ic < in_ch; ic++) { float v = src[(size_t)ic * sstride]; frow[ic] = v; float a = fabsf(v); if (a > amax) amax = a; }
             const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
             sc[r] = scale;
             int ic = 0;
-            for (; ic + 16 <= ch; ic += 16) {
+            for (; ic + 16 <= in_ch; ic += 16) {
                 __m512 v = _mm512_mul_ps(_mm512_loadu_ps(frow + ic), _mm512_set1_ps(inv));
                 __m512i qi = _mm512_cvtps_epi32(_mm512_roundscale_ps(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
                 qi = _mm512_add_epi32(_mm512_max_epi32(_mm512_min_epi32(qi, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127)), _mm512_set1_epi32(128));
                 _mm_storeu_si128((__m128i *)(qr + ic), _mm512_cvtepi32_epi8(qi));
             }
-            for (; ic < ch; ic++) { int v = sd_dconv_round(frow[ic] * inv); if (v > 127) v = 127; if (v < -127) v = -127; qr[ic] = (uint8_t)(v + 128); }
+            for (; ic < in_ch; ic++) { int v = sd_dconv_round(frow[ic] * inv); if (v > 127) v = 127; if (v < -127) v = -127; qr[ic] = (uint8_t)(v + 128); }
             for (; ic < Cp; ic++) qr[ic] = 0x80;
         }
-        for (int m0 = 0; m0 < ch; m0 += 4) {
-            const int mn = ch - m0 < 4 ? ch - m0 : 4;
+        for (int m0 = 0; m0 < out_ch; m0 += 4) {
+            const int mn = out_ch - m0 < 4 ? out_ch - m0 : 4;
             for (int t = t0; t < t1; t += 4) {
                 const int tn = t1 - t < 4 ? t1 - t : 4;
                 float corr[4][4] = {{0}};
@@ -10249,11 +10249,11 @@ int qwen_conv1d_int8_v2_available(void) { return 1; }
 void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
                              const float *residual,
                              const int8_t *wq, const float *sw, const int32_t *wsum,
-                             const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
-    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, ch, ch * kernel, length);
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, in_ch, in_ch * kernel, length);
     qwen_census_leaf(QWEN_LEAF_VNNI);
     sd_dconv_job_t job = { .out = out, .in = in, .wq = wq, .sw = sw, .wsum = wsum, .bias = bias,
-                           .ch = ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
+                           .in_ch = in_ch, .out_ch = out_ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
                            .tail = tail, .tail_cols = tail ? tail_cols : 0, .residual = residual };
     int nt = sd_pool_threads(); if (nt < 1) nt = 1;
     int tb = (length + nt * 2 - 1) / (nt * 2);
@@ -10265,8 +10265,8 @@ void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int
 }
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
-                         const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
-    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, ch, length, kernel, dilation, Cp);
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, in_ch, out_ch, length, kernel, dilation, Cp);
 }
 #elif defined(__ARM_FEATURE_DOTPROD)
 /* ---- ARM-6: DL-4 direct dilated int8 conv, SDOT leaf --------------------------------
@@ -10279,7 +10279,7 @@ QWEN_MM_SCRATCH(dcf, float)
 typedef struct {
     float *out; const float *in;
     const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
-    int ch, length, kernel, dilation, Cp, tb;
+    int in_ch, out_ch, length, kernel, dilation, Cp, tb;
     const float *tail; int tail_cols;
     const float *residual;
     _Atomic int next; int n_blocks;
@@ -10288,7 +10288,7 @@ typedef struct {
 
 static void sd_dconv_worker(void *vj) {
     sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
-    const int ch = j->ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
+    const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
     const int pad = (K - 1) * dil;
     const int maxrows = j->tb + pad + 4;
     int8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
@@ -10309,7 +10309,7 @@ static void sd_dconv_worker(void *vj) {
             else if (p < 0 && j->tail && -p <= j->tail_cols)            { src = j->tail + (j->tail_cols + p); sstride = (size_t)j->tail_cols; }
             else { memset(qr, 0, (size_t)Cp); sc[r] = 0.0f; continue; }
             float amax = 0.0f;
-            for (int ic = 0; ic < ch; ic++) {
+            for (int ic = 0; ic < in_ch; ic++) {
                 const float v = src[(size_t)ic * sstride];
                 frow[ic] = v;
                 const float a = fabsf(v); if (a > amax) amax = a;
@@ -10317,7 +10317,7 @@ static void sd_dconv_worker(void *vj) {
             const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
             sc[r] = scale;
             int ic = 0;
-            for (; ic < ch; ic++) {
+            for (; ic < in_ch; ic++) {
                 /* HALF TO EVEN, not sd_dconv_round's half-away-from-zero.  The VNNI kernel
                  * quantises its bulk with _mm512_cvtps_epi32 (nearest-even, current mode)
                  * and only its scalar tail uses sd_dconv_round; the self-test's integer
@@ -10332,8 +10332,8 @@ static void sd_dconv_worker(void *vj) {
             }
             for (; ic < Cp; ic++) qr[ic] = 0;
         }
-        for (int m0 = 0; m0 < ch; m0 += 4) {
-            const int mn = ch - m0 < 4 ? ch - m0 : 4;
+        for (int m0 = 0; m0 < out_ch; m0 += 4) {
+            const int mn = out_ch - m0 < 4 ? out_ch - m0 : 4;
             for (int t = t0; t < t1; t += 4) {
                 const int tn = t1 - t < 4 ? t1 - t : 4;
                 float facc[4][4] = {{0.0f}};
@@ -10396,11 +10396,11 @@ int qwen_conv1d_int8_v2_available(void) { return 1; }
 void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
                              const float *residual,
                              const int8_t *wq, const float *sw, const int32_t *wsum,
-                             const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
-    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, ch, ch * kernel, length);
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, in_ch, in_ch * kernel, length);
     qwen_census_leaf(QWEN_LEAF_SDOT);
     sd_dconv_job_t job = { .out = out, .in = in, .wq = wq, .sw = sw, .wsum = wsum, .bias = bias,
-                           .ch = ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
+                           .in_ch = in_ch, .out_ch = out_ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
                            .tail = tail, .tail_cols = tail ? tail_cols : 0, .residual = residual };
     int nt = sd_pool_threads(); if (nt < 1) nt = 1;
     int tb = (length + nt * 2 - 1) / (nt * 2);
@@ -10412,8 +10412,8 @@ void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int
 }
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
-                         const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
-    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, ch, length, kernel, dilation, Cp);
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, in_ch, out_ch, length, kernel, dilation, Cp);
 }
 
 #endif
@@ -10588,18 +10588,18 @@ void qwen_convt_pack_stack(float *stack, const float *packed, int in_ch, int out
  * t - (kernel-1-kk)*dilation.  Cp = qwen_conv1d_int8_v2_cp(ch); the padding lanes are 0. */
 int qwen_conv1d_int8_v2_cp(int ch) { return (ch + 63) & ~63; }
 void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
-                              const float *w, int ch, int kernel, int Cp) {
-    for (int m = 0; m < ch; m++) {
-        const float *row = w + (size_t)m * ch * kernel;
+                              const float *w, int in_ch, int out_ch, int kernel, int Cp) {
+    for (int m = 0; m < out_ch; m++) {
+        const float *row = w + (size_t)m * in_ch * kernel;
         for (int kk = 0; kk < kernel; kk++) {
             float amax = 0.0f;
-            for (int ic = 0; ic < ch; ic++) { float a = fabsf(row[(size_t)ic * kernel + kk]); if (a > amax) amax = a; }
+            for (int ic = 0; ic < in_ch; ic++) { float a = fabsf(row[(size_t)ic * kernel + kk]); if (a > amax) amax = a; }
             const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
             int8_t *d = q2 + ((size_t)m * kernel + kk) * Cp;
             int32_t acc = 0;
             for (int ic = 0; ic < Cp; ic++) {
                 int v = 0;
-                if (ic < ch) {
+                if (ic < in_ch) {
                     float x = row[(size_t)ic * kernel + kk] * inv;
                     v = (int)(x >= 0 ? x + 0.5f : x - 0.5f);
                     if (v > 127) v = 127;
@@ -10624,14 +10624,14 @@ int qwen_conv1d_int8_v2_available(void) { return 0; }
 void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
                              const float *residual,
                              const int8_t *wq, const float *sw, const int32_t *wsum,
-                             const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
     (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)wq; (void)sw; (void)wsum;
-    (void)bias; (void)ch; (void)length; (void)kernel; (void)dilation; (void)Cp;
+    (void)bias; (void)in_ch; (void)out_ch; (void)length; (void)kernel; (void)dilation; (void)Cp;
 }
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
-                         const float *bias, int ch, int length, int kernel, int dilation, int Cp) {
-    (void)out; (void)in; (void)wq; (void)sw; (void)wsum; (void)bias; (void)ch; (void)length;
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)wq; (void)sw; (void)wsum; (void)bias; (void)in_ch; (void)out_ch; (void)length;
     (void)kernel; (void)dilation; (void)Cp;
 }
 #endif
@@ -11593,8 +11593,8 @@ int qwen_kernel_selftest(void *out) {
                     for (size_t i = 0; i < (size_t)ch * L; i++) in[i] = NEXT_F;
                     for (size_t i = 0; i < (size_t)ch * K; i++) wf[i] = NEXT_F;
                     for (int m = 0; m < ch; m++) bias[m] = 0.25f * NEXT_F;
-                    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, ch, kern, Cp);
-                    qwen_conv1d_int8_v2(outk, in, q2, sw2, ws2, bias, ch, L, kern, dil, Cp);
+                    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, ch, ch, kern, Cp);
+                    qwen_conv1d_int8_v2(outk, in, q2, sw2, ws2, bias, ch, ch, L, kern, dil, Cp);
                     /* the kernel's own activation quantisation, per position */
                     for (int p = 0; p < L; p++) {
                         float amax = 0.0f;
@@ -11641,7 +11641,7 @@ int qwen_kernel_selftest(void *out) {
                         if (inw) {
                             for (int ic = 0; ic < ch; ic++)
                                 memcpy(inw + (size_t)ic * Lw, in + (size_t)ic * L + s, (size_t)Lw * sizeof(float));
-                            qwen_conv1d_int8_v2(outw, inw, q2, sw2, ws2, bias, ch, Lw, kern, dil, Cp);
+                            qwen_conv1d_int8_v2(outw, inw, q2, sw2, ws2, bias, ch, ch, Lw, kern, dil, Cp);
                             cworst = 0.0;
                             for (int m = 0; m < ch; m++)
                                 for (int t = t0; t < L; t++) {
@@ -11667,7 +11667,7 @@ int qwen_kernel_selftest(void *out) {
                                 memcpy(inn + (size_t)ic * Ln, in + (size_t)ic * L + t0, (size_t)Ln * sizeof(float));
                             }
                             for (size_t i = 0; i < (size_t)ch * Ln; i++) resid[i] = NEXT_F;
-                            qwen_conv1d_int8_v2_ctx(outc, inn, tl, pad, resid, q2, sw2, ws2, bias, ch, Ln, kern, dil, Cp);
+                            qwen_conv1d_int8_v2_ctx(outc, inn, tl, pad, resid, q2, sw2, ws2, bias, ch, ch, Ln, kern, dil, Cp);
                             dworst = 0.0;
                             for (int m = 0; m < ch; m++)
                                 for (int t = 0; t < Ln; t++) {
@@ -11691,6 +11691,69 @@ int qwen_kernel_selftest(void *out) {
                 free(in); free(wf); free(bias); free(q2); free(sw2); free(ws2);
                 free(outk); free(outw); free(qa); free(sa);
             }
+        }
+    }
+
+    if (qwen_conv1d_int8_v2_available()) {
+        /* Rectangular/wide shapes the v1 panel path cannot take: initial (1536/1024 k7) and
+         * pre (512 -> 1024 k3) convs.  Same two oracles as above, no continuation case. */
+        const int rect[][4] = { {1536,1024,7,1}, {512,1024,3,1} };
+        for (int ri = 0; ri < (int)(sizeof(rect)/sizeof(rect[0])); ri++) {
+            const int in_ch = rect[ri][0], out_ch = rect[ri][1], kern = rect[ri][2], dil = rect[ri][3];
+            const int K = in_ch * kern, Cp = qwen_conv1d_int8_v2_cp(in_ch), L = 33;
+            float   *in   = malloc((size_t)in_ch * L * sizeof(float));
+            float   *wf   = malloc((size_t)out_ch * K * sizeof(float));
+            float   *bias = malloc((size_t)out_ch * sizeof(float));
+            int8_t  *q2   = aligned_malloc((size_t)out_ch * kern * Cp);
+            float   *sw2  = aligned_malloc((size_t)out_ch * kern * sizeof(float));
+            int32_t *ws2  = aligned_malloc((size_t)out_ch * kern * sizeof(int32_t));
+            float   *outk = malloc((size_t)out_ch * L * sizeof(float));
+            int8_t  *qa   = malloc((size_t)in_ch * L);
+            float   *sa   = malloc((size_t)L * sizeof(float));
+            if (!in || !wf || !bias || !q2 || !sw2 || !ws2 || !outk || !qa || !sa) {
+                fprintf(f, "  [conv1d_int8_v2 rect in=%d out=%d] OOM, skipped\n", in_ch, out_ch);
+            } else {
+                for (size_t i = 0; i < (size_t)in_ch * L; i++) in[i] = NEXT_F;
+                for (size_t i = 0; i < (size_t)out_ch * K; i++) wf[i] = NEXT_F;
+                for (int m = 0; m < out_ch; m++) bias[m] = 0.25f * NEXT_F;
+                qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, in_ch, out_ch, kern, Cp);
+                qwen_conv1d_int8_v2(outk, in, q2, sw2, ws2, bias, in_ch, out_ch, L, kern, dil, Cp);
+                for (int p = 0; p < L; p++) {
+                    float amax = 0.0f;
+                    for (int ic = 0; ic < in_ch; ic++) { float a = fabsf(in[(size_t)ic * L + p]); if (a > amax) amax = a; }
+                    const float sc = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / sc; sa[p] = sc;
+                    for (int ic = 0; ic < in_ch; ic++) {
+                        int v = (int)lrintf(in[(size_t)ic * L + p] * inv);
+                        if (v > 127) v = 127; if (v < -127) v = -127;
+                        qa[(size_t)ic * L + p] = (int8_t)v;
+                    }
+                }
+                double an = 0.0, ad = 0.0, bn = 0.0, bd = 0.0;
+                for (int t = 0; t < L; t++) for (int m = 0; m < out_ch; m++) {
+                    float acc = 0.0f; double f32 = 0.0;
+                    for (int kk = 0; kk < kern; kk++) {
+                        const int pos = t - (kern - 1 - kk) * dil;
+                        if (pos < 0) continue;
+                        const int8_t *wr = q2 + ((size_t)m * kern + kk) * Cp;
+                        int32_t ai = 0;
+                        for (int ic = 0; ic < in_ch; ic++) {
+                            ai += (int32_t)wr[ic] * (int32_t)qa[(size_t)ic * L + pos];
+                            f32 += (double)wf[(size_t)m * K + (size_t)ic * kern + kk] * in[(size_t)ic * L + pos];
+                        }
+                        acc += (float)ai * (sa[pos] * sw2[(size_t)m * kern + kk]);
+                    }
+                    const float got = outk[(size_t)m * L + t];
+                    const double da = got - (acc + bias[m]), db = (double)got - (f32 + bias[m]);
+                    an += da * da; ad += (double)(acc + bias[m]) * (acc + bias[m]);
+                    bn += db * db; bd += (f32 + bias[m]) * (f32 + bias[m]);
+                }
+                const double arel = ad > 0 ? sqrt(an / ad) : 0.0, brel = bd > 0 ? sqrt(bn / bd) : 0.0;
+                const int ok = arel < 1e-5 && brel < 3e-2;
+                fprintf(f, "  [conv1d_int8_v2 rect in=%d out=%d k=%d dil=%d L=%d] own-quant rel_L2=%.2e | f32 rel_L2=%.2e  %s\n",
+                        in_ch, out_ch, kern, dil, L, arel, brel, ok ? "PASS" : "FAIL");
+                if (!ok) failures++;
+            }
+            free(in); free(wf); free(bias); free(q2); free(sw2); free(ws2); free(outk); free(qa); free(sa);
         }
     }
 

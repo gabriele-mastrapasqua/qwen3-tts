@@ -383,8 +383,8 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_RES1_V2",
             onoff(qwen_sd_res1_v2_active()),
             qwen_sd_res1_v2_active()
-                ? "direct dilated int8 DL-4 conv for the square residual convs (VNNI / Arm dotprod; per-position activation scale, per-(channel,tap) weight scale; serves res1 and res2 by shape, in_ch<=768)"
-                : "opt-in (QWEN_SD_RES1_V2=1); off: the residual convs run on the im2col panel kernel. The branch is chosen by SHAPE (in_ch==out_ch, multiple of 4, in_ch<=768), so res2 and every square conv above 768 channels keep the panel path even when on");
+                ? "direct dilated int8 DL-4 conv (VNNI / Arm dotprod; per-position activation scale, per-(channel,tap) weight scale). Any shape: it serves res1, res2, the rectangular initial/pre convs and wide channels; the in_ch<=768 square-only bound applies to the v1/Design-D paths, not here"
+                : "opt-in (QWEN_SD_RES1_V2=1); off: the residual convs run on the im2col panel kernel (v1 int8 where the square/768 shape allows, f32 otherwise)");
         row(&feats[n++], "decoder.pre_up_bf16", "yes", yn(qwen_avx512_bf16_matmat_available()),
             "QWEN_SD_BF16_PREUP", onoff(qwen_sd_bf16_preup_active()),
             qwen_sd_bf16_preup_active()

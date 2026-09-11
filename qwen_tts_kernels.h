@@ -497,17 +497,17 @@ int  qwen_conv1d_int8_v2_available(void);
 void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
                              const float *residual,
                              const int8_t *wq, const float *sw, const int32_t *wsum,
-                             const float *bias, int ch, int length, int kernel, int dilation, int Cp);
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp);
 void qwen_convt_stack_epilogue(float *out, const float *R, float *carry, const float *bias,
                                int out_ch, int len, int stride);      /* C12-WIN-11 step A */
 void qwen_convt_pack_stack(float *stack, const float *packed, int in_ch, int out_ch, int kernel);
 int  qwen_sd_convt_stack_active(void);
 int  qwen_conv1d_int8_v2_cp(int ch);                      /* padded channel count of the DL-4 layout */
 void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
-                              const float *w, int ch, int kernel, int Cp);
+                              const float *w, int in_ch, int out_ch, int kernel, int Cp);
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
-                         const float *bias, int ch, int length, int kernel, int dilation, int Cp);
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp);
 void qwen_conv1d_int8_design_d(float *out, const float *in,
                                const int8_t *Wq, const float *sw, const int32_t *wsum,
                                const float *bias, const int8_t *Wpack,

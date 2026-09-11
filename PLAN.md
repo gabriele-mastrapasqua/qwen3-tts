@@ -258,11 +258,15 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       AVX-512F-without-VNNI have NO int8 decoder conv at all, so the gap is three CPU
       families; and an undeclared `in_ch <= 768` gate drops every backend to f32 above it,
       AMX and VNNI included. Work: one dotprod/i8mm DL-4 leaf against the already ISA-neutral
-      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract. IMPLEMENTED for Arm
-      dot-product on `feature/arm-parity-vnni` (serves res2 by shape); AVX2 and AVX-512F stay
+      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract. DONE on
+      `feature/arm-parity-vnni`: the leaf exists for Arm dot-product and the API is now
+      rectangular (`in_ch`/`out_ch`, Cp from `in_ch`), so DL-4 also takes the initial/pre
+      convs and the wide channels that the v1 panel and Design-D paths cannot; --self-test
+      covers both rectangular shapes and the 20 square ones. AVX2/AVX-512F-without-VNNI stay
       on the f32 fallback, so the three-family claim of this item is not delivered. The flag
-      and the `decoder.res1_v2` row are re-documented (shape-based, 768 gate) but not renamed;
-      Arm quality/perf qualification is the open part.
+      and the `decoder.res1_v2` row are re-documented but not renamed; the Arm quality/perf
+      qualification of the widened path is the open part (x86 re-validation too: the VNNI
+      kernel shares the API change).
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
