@@ -116,11 +116,35 @@ static int sd_bf16_preup_requested(void);
  * public BF16 matmat leaf consumes packed [B][K] activations and returns
  * [M][B].  Keep this adapter local to the experimental decoder arm so the
  * existing f32 SGEMM path remains byte-for-byte untouched when it is off. */
+/* KAI bf16 prepared-state path: the same kernels the dispatched path runs, reached without
+ * a nested qwen_parallel (lane workers), and KAI writes [B][rows] directly -- the layout the
+ * caller wants, so the packed adapter's transpose is skipped. */
+typedef struct { float *dst; const void *key; const float *lhs; int rows, cols, B; } sd_kai_bf16_job_t;
+static void sd_kai_bf16_task(size_t tid, size_t nt, void *v) {
+    sd_kai_bf16_job_t *j = (sd_kai_bf16_job_t *)v;
+    const void *lp = qwen_kleidi_bf16_region_prep(j->lhs, (size_t)j->cols * sizeof(float),
+                                                  j->cols, j->B);
+    if (lp) qwen_kleidi_bf16_region_run(j->key, j->dst, (size_t)j->rows * sizeof(float), lp,
+                                        j->rows, j->cols, j->B, tid, nt);
+}
+static int sd_kai_matmul_bf16(float *dst, const void *key, const float *lhs,
+                              int rows, int cols, int B) {
+    if (!qwen_kleidi_bf16_region_usable(key, rows, cols, B)) return 0;
+    sd_kai_bf16_job_t j = { dst, key, lhs, rows, cols, B };
+    if (qwen_parallel_active()) { sd_kai_bf16_task(0, 1, &j); return 1; }
+    int nt = qwen_lane_thread_here() ? qwen_lane_team_size() : qwen_get_threads();
+    if (nt < 1) nt = 1;
+    if (nt == 1) sd_kai_bf16_task(0, 1, &j);
+    else          qwen_parallel((size_t)nt, sd_kai_bf16_task, &j);
+    return 1;
+}
+
 static int sd_bf16_preup_matmat(float *Y, const uint16_t *W, const float *X,
                                 int B, int rows, int cols,
                                 uint16_t *Xb, float *Yt) {
     if (!sd_bf16_preup_requested() || !W || !X || !Y || !Xb || !Yt || B < 1 || B > 16)
         return 0;
+    if (sd_kai_matmul_bf16(Y, W, X, rows, cols, B)) return 1;
     qwen_bf16_pack_rows(Xb, X, cols, cols, B);
     qwen_matmat_bf16_packed(Yt, W, Xb, rows, cols, B);
     for (int r = 0; r < rows; r++)
@@ -352,7 +376,7 @@ static int sd_bf16_preup_requested(void) {
     if (en < 0) {
         const char *e = getenv("QWEN_SD_BF16_PREUP");
         const int want = e && *e && *e != '0';
-        en = want && qwen_avx512_bf16_matmat_available();
+        en = want && (qwen_avx512_bf16_matmat_available() || qwen_kleidi_bf16_enabled());
     }
     return en;
 }
