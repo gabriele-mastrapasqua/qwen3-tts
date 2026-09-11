@@ -287,11 +287,21 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       until their separate quality/16-core qualification gates pass.
 
 - [ ] PRE-GRAVITON-5 regression gate (ASAP, before any AWS Graviton 5 spot campaign):
-      rerun the frozen Turin VNNI control after the Arm/v2 changes, at least C6/C8 and the
-      established C11/C12 boundary, with dispatch/self-test plus short/conversational
-      playback metrics. Compare against `.work/turin-vnni-final-handoff-20260909.md` and
-      `.work/c12-win-checkpoint-20260909.md`; do not start the Graviton topology matrix
-      until Turin shows no regression or the regression is explained and recorded.
+      this is an ordered two-arm gate, and Graviton is blocked until both arms are recorded:
+      (1) FAST rerun `turin-c8a-32c-vnni-product` with the already qualified "yesterday"
+      policy fully on (native BF16 prefill, INT8 VNNI decoder, RES1_V2, elastic split=4
+      lane, pool-spin and the frozen topology), at least C6/C8 plus the established C11/C12
+      boundary, using the same model/bank/seed and dispatch/self-test checks; this is the
+      regression control against `.work/turin-vnni-final-handoff-20260909.md` and
+      `.work/c12-win-checkpoint-20260909.md`. (2) Run a separate unqualified FAST diagnostic
+      on the same Turin topology with the new cross-ISA options enabled together:
+      `QWEN_SD_BF16_PREUP=1`, `QWEN_SD_MULTISLOT=2`, `QWEN_SD_GLUE=1` and
+      `QWEN_SD_CONVT_STACK=1` (RES1_V2/lane remain on); record C6/C8/C11/C12 deltas,
+      errors/rejects, TTFA, playback and RTF. `QWEN_SD_CNEXT_I8` is Arm/KleidiAI-specific
+      and is not part of the VNNI arm. Any all-on gain is diagnostic only until paired WAV,
+      mel/ASR/listening and a serving gate pass. Do not start the Graviton topology matrix
+      until the control shows no regression or the regression is explained and recorded,
+      and the all-on result is classified as GO/NO-GO.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
