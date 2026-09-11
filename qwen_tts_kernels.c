@@ -10144,7 +10144,7 @@ typedef struct {
     int in_ch, out_ch, length, kernel, dilation, Cp, tb;
     const float *tail; int tail_cols;   /* left context [ch][tail_cols] for positions < 0 (NULL: zero rows) */
     const float *residual;              /* [ch][length] added in the epilogue (NULL: none) */
-    _Atomic int next; int n_blocks;
+    _Atomic int next; _Atomic int entered; int n_blocks;
 } sd_dconv_job_t;
 
 static inline int sd_dconv_round(float q) { return (int)(q >= 0 ? q + 0.5f : q - 0.5f); }
@@ -10176,17 +10176,23 @@ __attribute__((optimize("no-associative-math", "no-tree-vectorize")))
 #endif
 static void sd_dconv_worker(void *vj) {
     sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
     const int pad = (K - 1) * dil;
     const int maxrows = j->tb + pad + 4;
     uint8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
     float *sc = mm_scratch_dcs((size_t)maxrows);
     float *frow = mm_scratch_dcf((size_t)Cp);
-    if (!q || !sc || !frow) return;
+    long long claimed = 0;
+    if (!q || !sc || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
     __m512 facc[16];
     for (;;) {
         int b = atomic_fetch_add(&j->next, 1);
         if (b >= j->n_blocks) break;
+        claimed++;
         const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
         const int nrows = (t1 - t0) + pad + 4;
         for (int r = 0; r < nrows; r++) {
@@ -10272,6 +10278,7 @@ static void sd_dconv_worker(void *vj) {
             }
         }
     }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
 
 int qwen_conv1d_int8_v2_available(void) { return 1; }
@@ -10290,7 +10297,9 @@ void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int
     job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
     atomic_store(&job.next, 0);
     qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
     sd_pool_run(sd_dconv_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
@@ -10312,7 +10321,7 @@ typedef struct {
     const size_t *in_stride; const size_t *out_stride;
     const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
     int in_ch, out_ch, nslots, length, kernel, dilation, Cp, tb;
-    _Atomic int next; int n_blocks;
+    _Atomic int next; _Atomic int entered; int n_blocks;
 } sd_dconv_multi_job_t;
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -10320,6 +10329,7 @@ __attribute__((optimize("no-associative-math", "no-tree-vectorize")))
 #endif
 static void sd_dconv_multi_worker(void *vj) {
     sd_dconv_multi_job_t *j = (sd_dconv_multi_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     const int S = j->nslots, in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp;
     const int K = j->kernel, dil = j->dilation, L = j->length;
     const int pad = (K - 1) * dil;
@@ -10327,10 +10337,15 @@ static void sd_dconv_multi_worker(void *vj) {
     uint8_t *qa = mm_scratch_dcmq((size_t)S * maxrows * Cp);
     float *sa = mm_scratch_dcms((size_t)S * maxrows);
     float *frow = mm_scratch_dcmf((size_t)Cp);
-    if (!qa || !sa || !frow) return;
+    long long claimed = 0;
+    if (!qa || !sa || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
     for (;;) {
         int b = atomic_fetch_add(&j->next, 1);
         if (b >= j->n_blocks) break;
+        claimed++;
         const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
         const int nrows = (t1 - t0) + pad + 4;
         for (int s = 0; s < S; s++) {
@@ -10436,6 +10451,7 @@ static void sd_dconv_multi_worker(void *vj) {
             }
         }
     }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
 
 int qwen_conv1d_int8_v2_multi_available(void) { return 1; }
@@ -10464,7 +10480,9 @@ void qwen_conv1d_int8_v2_multi_ctx_strided(
     job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
     atomic_store(&job.next, 0);
     qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
     sd_pool_run(sd_dconv_multi_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 void qwen_conv1d_int8_v2_multi_ctx(
     float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
@@ -10490,7 +10508,7 @@ typedef struct {
     int in_ch, out_ch, length, kernel, dilation, Cp, tb;
     const float *tail; int tail_cols;
     const float *residual;
-    _Atomic int next; int n_blocks;
+    _Atomic int next; _Atomic int entered; int n_blocks;
 } sd_dconv_job_t;
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -10502,16 +10520,22 @@ __attribute__((optimize("no-associative-math", "no-tree-vectorize")))
 #endif
 static void sd_dconv_worker(void *vj) {
     sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
     const int pad = (K - 1) * dil;
     const int maxrows = j->tb + pad + 4;
     int8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
     float  *sc = mm_scratch_dcs((size_t)maxrows);
     float  *frow = mm_scratch_dcf((size_t)Cp);
-    if (!q || !sc || !frow) return;
+    long long claimed = 0;
+    if (!q || !sc || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
     for (;;) {
         int b = atomic_fetch_add(&j->next, 1);
         if (b >= j->n_blocks) break;
+        claimed++;
         const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
         const int nrows = (t1 - t0) + pad + 4;
         /* one quantised row per INPUT POSITION, with that position's own scale */
@@ -10604,6 +10628,7 @@ static void sd_dconv_worker(void *vj) {
             }
         }
     }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
 
 int qwen_conv1d_int8_v2_available(void) { return 1; }
@@ -10622,7 +10647,9 @@ void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int
     job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
     atomic_store(&job.next, 0);
     qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
     sd_pool_run(sd_dconv_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
@@ -10643,7 +10670,7 @@ typedef struct {
     const size_t *in_stride; const size_t *out_stride;
     const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
     int in_ch, out_ch, nslots, length, kernel, dilation, Cp, tb;
-    _Atomic int next; int n_blocks;
+    _Atomic int next; _Atomic int entered; int n_blocks;
 } sd_dconv_multi_job_t;
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -10651,6 +10678,7 @@ __attribute__((optimize("no-associative-math", "no-tree-vectorize")))
 #endif
 static void sd_dconv_multi_worker(void *vj) {
     sd_dconv_multi_job_t *j = (sd_dconv_multi_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     const int S = j->nslots, in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp;
     const int K = j->kernel, dil = j->dilation, L = j->length;
     const int pad = (K - 1) * dil;
@@ -10658,10 +10686,15 @@ static void sd_dconv_multi_worker(void *vj) {
     int8_t *qa = mm_scratch_dcmq((size_t)S * maxrows * Cp);
     float *sa = mm_scratch_dcms((size_t)S * maxrows);
     float *frow = mm_scratch_dcmf((size_t)Cp);
-    if (!qa || !sa || !frow) return;
+    long long claimed = 0;
+    if (!qa || !sa || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
     for (;;) {
         int b = atomic_fetch_add(&j->next, 1);
         if (b >= j->n_blocks) break;
+        claimed++;
         const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
         const int nrows = (t1 - t0) + pad + 4;
         for (int s = 0; s < S; s++) {
@@ -10749,6 +10782,7 @@ static void sd_dconv_multi_worker(void *vj) {
             }
         }
     }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
 
 int qwen_conv1d_int8_v2_multi_available(void) { return 1; }
@@ -10777,7 +10811,9 @@ void qwen_conv1d_int8_v2_multi_ctx_strided(
     job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
     atomic_store(&job.next, 0);
     qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
     sd_pool_run(sd_dconv_multi_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 void qwen_conv1d_int8_v2_multi_ctx(
     float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,

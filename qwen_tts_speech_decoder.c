@@ -128,17 +128,14 @@ static void sd_kai_bf16_task(size_t tid, size_t nt, void *v) {
     qwen_kleidi_bf16_region_run(j->key, j->dst, (size_t)j->rows * sizeof(float),
                                 j->lhs_packed, j->rows, j->cols, j->B, tid, nt);
 }
-static int sd_kai_matmul_bf16(float *dst, const void *key, const float *lhs,
-                              int rows, int cols, int B) {
-    if (!qwen_kleidi_bf16_region_usable(key, rows, cols, B)) return 0;
+static int sd_kai_bf16_run_packed(float *dst, const void *key, const void *lhs_packed,
+                                  int rows, int cols, int B) {
+    if (!lhs_packed || !qwen_kleidi_bf16_region_usable(key, rows, cols, B)) return 0;
     /* The prepared pointer belongs to the caller's KAI TLS scratch.  Prepare before
      * dispatch, while this thread owns the scratch, then keep it live until the joined
      * qwen_parallel returns.  A barrier inside the task is not safe here: qwen_parallel
      * may execute task IDs serially (GCD, a serial fallback, or a narrowed pool), while
      * the task's nt argument still describes the logical tile partition. */
-    const void *lhs_packed = qwen_kleidi_bf16_region_prep(
-        lhs, (size_t)cols * sizeof(float), cols, B);
-    if (!lhs_packed) return 0;
     sd_kai_bf16_job_t j = { 0 };
     j.dst = dst; j.key = key; j.lhs_packed = lhs_packed;
     j.rows = rows; j.cols = cols; j.B = B;
@@ -147,6 +144,35 @@ static int sd_kai_matmul_bf16(float *dst, const void *key, const float *lhs,
     if (nt < 1) nt = 1;
     if (nt == 1) sd_kai_bf16_task(0, 1, &j);
     else          qwen_parallel((size_t)nt, sd_kai_bf16_task, &j);
+    return 1;
+}
+
+static int sd_kai_matmul_bf16(float *dst, const void *key, const float *lhs,
+                              int rows, int cols, int B) {
+    if (!qwen_kleidi_bf16_region_usable(key, rows, cols, B)) return 0;
+    const void *lhs_packed = qwen_kleidi_bf16_region_prep(
+        lhs, (size_t)cols * sizeof(float), cols, B);
+    return sd_kai_bf16_run_packed(dst, key, lhs_packed, rows, cols, B);
+}
+
+/* One packed activation can feed every projection with the same [B][K] shape.  The
+ * weight key is used only to select/validate the KAI family; the packed LHS layout
+ * depends on K and B, not on the weight matrix, so Q/K/V and gate/up can share it. */
+typedef struct {
+    const void *lhs_packed;
+    int rows, cols, B;
+} sd_bf16_prepared_t;
+
+static int sd_bf16_prepare(sd_bf16_prepared_t *p, const void *key, const float *lhs,
+                           int rows, int cols, int B) {
+    if (!p) return 0;
+    *p = (sd_bf16_prepared_t){ 0 };
+    if (!sd_bf16_preup_requested() || !lhs || B < 1 || B > 16 ||
+        !qwen_kleidi_bf16_region_usable(key, rows, cols, B)) return 0;
+    p->lhs_packed = qwen_kleidi_bf16_region_prep(
+        lhs, (size_t)cols * sizeof(float), cols, B);
+    if (!p->lhs_packed) return 0;
+    p->rows = rows; p->cols = cols; p->B = B;
     return 1;
 }
 
@@ -166,6 +192,19 @@ static int sd_bf16_preup_matmat(float *Y, const uint16_t *W, const void *key, co
         for (int b = 0; b < B; b++)
             Y[(size_t)b * rows + r] = Yt[(size_t)r * B + b];
     return 1;
+}
+
+static int sd_bf16_preup_matmat_prepared(float *Y, const uint16_t *W, const void *key,
+                                         const float *X, int B, int rows, int cols,
+                                         uint16_t *Xb, float *Yt,
+                                         const sd_bf16_prepared_t *prepared) {
+    if (!sd_bf16_preup_requested() || !W || !X || !Y || B < 1 || B > 16)
+        return 0;
+    if (prepared && prepared->lhs_packed && prepared->rows == rows &&
+        prepared->cols == cols && prepared->B == B &&
+        sd_kai_bf16_run_packed(Y, key, prepared->lhs_packed, rows, cols, B))
+        return 1;
+    return sd_bf16_preup_matmat(Y, W, key, X, B, rows, cols, Xb, Yt);
 }
 
 #ifdef QWEN_HAVE_CUDA
@@ -1540,18 +1579,26 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
         }
 
 #ifdef USE_BLAS
-        if (!sd_bf16_preup_matmat(q, l->attn_q_bf16, l->attn_q, x_norm,
-                                  n_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        sd_bf16_prepared_t qkv_prepared;
+        sd_bf16_prepare(&qkv_prepared,
+                        l->attn_q_bf16 ? l->attn_q_bf16 :
+                        (l->attn_k_bf16 ? l->attn_k_bf16 : l->attn_v_bf16),
+                        x_norm, qkv_dim, dec_hidden, n_frames);
+        if (!sd_bf16_preup_matmat_prepared(q, l->attn_q_bf16, l->attn_q, x_norm,
+                                           n_frames, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         n_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
-        if (!sd_bf16_preup_matmat(kk, l->attn_k_bf16, l->attn_k, x_norm,
-                                  n_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        if (!sd_bf16_preup_matmat_prepared(kk, l->attn_k_bf16, l->attn_k, x_norm,
+                                           n_frames, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         n_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, kk, qkv_dim);
-        if (!sd_bf16_preup_matmat(vv, l->attn_v_bf16, l->attn_v, x_norm,
-                                  n_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        if (!sd_bf16_preup_matmat_prepared(vv, l->attn_v_bf16, l->attn_v, x_norm,
+                                           n_frames, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         n_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, vv, qkv_dim);
@@ -1690,14 +1737,20 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
         {
             float *ffn_gate = (float *)aligned_malloc((int64_t)n_frames * dec_inter * sizeof(float));
             float *ffn_up = (float *)aligned_malloc((int64_t)n_frames * dec_inter * sizeof(float));
-            if (!sd_bf16_preup_matmat(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
-                                      n_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+            sd_bf16_prepared_t gate_prepared;
+            sd_bf16_prepare(&gate_prepared,
+                            l->ffn_gate_bf16 ? l->ffn_gate_bf16 : l->ffn_up_bf16,
+                            x_norm, dec_inter, dec_hidden, n_frames);
+            if (!sd_bf16_preup_matmat_prepared(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
+                                               n_frames, dec_inter, dec_hidden,
+                                               bf16_xb, bf16_yt, &gate_prepared))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             n_frames, dec_inter, dec_hidden, 1.0f,
                             x_norm, dec_hidden, l->ffn_gate, dec_hidden,
                             0.0f, ffn_gate, dec_inter);
-            if (!sd_bf16_preup_matmat(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
-                                      n_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+            if (!sd_bf16_preup_matmat_prepared(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
+                                               n_frames, dec_inter, dec_hidden,
+                                               bf16_xb, bf16_yt, &gate_prepared))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             n_frames, dec_inter, dec_hidden, 1.0f,
                             x_norm, dec_hidden, l->ffn_up, dec_hidden,
@@ -3261,18 +3314,26 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
         qwen_rms_norm(x_norm, hidden, l->attn_norm, new_frames, dec_hidden, eps);
 
 #ifdef USE_BLAS
-        if (!sd_bf16_preup_matmat(q, l->attn_q_bf16, l->attn_q, x_norm,
-                                  new_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        sd_bf16_prepared_t qkv_prepared;
+        sd_bf16_prepare(&qkv_prepared,
+                        l->attn_q_bf16 ? l->attn_q_bf16 :
+                        (l->attn_k_bf16 ? l->attn_k_bf16 : l->attn_v_bf16),
+                        x_norm, qkv_dim, dec_hidden, new_frames);
+        if (!sd_bf16_preup_matmat_prepared(q, l->attn_q_bf16, l->attn_q, x_norm,
+                                           new_frames, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
-        if (!sd_bf16_preup_matmat(new_k, l->attn_k_bf16, l->attn_k, x_norm,
-                                  new_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        if (!sd_bf16_preup_matmat_prepared(new_k, l->attn_k_bf16, l->attn_k, x_norm,
+                                           new_frames, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, new_k, qkv_dim);
-        if (!sd_bf16_preup_matmat(new_v, l->attn_v_bf16, l->attn_v, x_norm,
-                                  new_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        if (!sd_bf16_preup_matmat_prepared(new_v, l->attn_v_bf16, l->attn_v, x_norm,
+                                           new_frames, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, new_v, qkv_dim);
@@ -3399,14 +3460,20 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
         {
             float *ffn_gate = (float *)sd_tmp_alloc((int64_t)new_frames * dec_inter * sizeof(float));
             float *ffn_up = (float *)sd_tmp_alloc((int64_t)new_frames * dec_inter * sizeof(float));
-            if (!sd_bf16_preup_matmat(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
-                                      new_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+            sd_bf16_prepared_t gate_prepared;
+            sd_bf16_prepare(&gate_prepared,
+                            l->ffn_gate_bf16 ? l->ffn_gate_bf16 : l->ffn_up_bf16,
+                            x_norm, dec_inter, dec_hidden, new_frames);
+            if (!sd_bf16_preup_matmat_prepared(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
+                                               new_frames, dec_inter, dec_hidden,
+                                               bf16_xb, bf16_yt, &gate_prepared))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             new_frames, dec_inter, dec_hidden, 1.0f,
                             x_norm, dec_hidden, l->ffn_gate, dec_hidden,
                             0.0f, ffn_gate, dec_inter);
-            if (!sd_bf16_preup_matmat(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
-                                      new_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+            if (!sd_bf16_preup_matmat_prepared(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
+                                               new_frames, dec_inter, dec_hidden,
+                                               bf16_xb, bf16_yt, &gate_prepared))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             new_frames, dec_inter, dec_hidden, 1.0f,
                             x_norm, dec_hidden, l->ffn_up, dec_hidden,
@@ -4642,16 +4709,24 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
 
         qwen_rms_norm(x_norm, hidden, l->attn_norm, (int)TF, dec_hidden, eps);
 
-        if (!sd_bf16_preup_matmat(q, l->attn_q_bf16, l->attn_q, x_norm,
-                                  (int)TF, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        sd_bf16_prepared_t qkv_prepared;
+        sd_bf16_prepare(&qkv_prepared,
+                        l->attn_q_bf16 ? l->attn_q_bf16 :
+                        (l->attn_k_bf16 ? l->attn_k_bf16 : l->attn_v_bf16),
+                        x_norm, qkv_dim, dec_hidden, (int)TF);
+        if (!sd_bf16_preup_matmat_prepared(q, l->attn_q_bf16, l->attn_q, x_norm,
+                                           (int)TF, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
                         1.0f, x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
-        if (!sd_bf16_preup_matmat(new_k, l->attn_k_bf16, l->attn_k, x_norm,
-                                  (int)TF, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        if (!sd_bf16_preup_matmat_prepared(new_k, l->attn_k_bf16, l->attn_k, x_norm,
+                                           (int)TF, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
                         1.0f, x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, new_k, qkv_dim);
-        if (!sd_bf16_preup_matmat(new_v, l->attn_v_bf16, l->attn_v, x_norm,
-                                  (int)TF, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+        if (!sd_bf16_preup_matmat_prepared(new_v, l->attn_v_bf16, l->attn_v, x_norm,
+                                           (int)TF, qkv_dim, dec_hidden,
+                                           bf16_xb, bf16_yt, &qkv_prepared))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
                         1.0f, x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, new_v, qkv_dim);
 
@@ -4749,12 +4824,18 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
             float *ffn_up   = (float *)aligned_malloc(TF * dec_inter * sizeof(float));
             float *ffn_down_out = NULL;
             if (!ffn_gate || !ffn_up) { free(ffn_gate); free(ffn_up); goto done; }
-            if (!sd_bf16_preup_matmat(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
-                                      (int)TF, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+            sd_bf16_prepared_t gate_prepared;
+            sd_bf16_prepare(&gate_prepared,
+                            l->ffn_gate_bf16 ? l->ffn_gate_bf16 : l->ffn_up_bf16,
+                            x_norm, dec_inter, dec_hidden, (int)TF);
+            if (!sd_bf16_preup_matmat_prepared(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
+                                               (int)TF, dec_inter, dec_hidden,
+                                               bf16_xb, bf16_yt, &gate_prepared))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
                             1.0f, x_norm, dec_hidden, l->ffn_gate, dec_hidden, 0.0f, ffn_gate, dec_inter);
-            if (!sd_bf16_preup_matmat(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
-                                      (int)TF, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+            if (!sd_bf16_preup_matmat_prepared(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
+                                               (int)TF, dec_inter, dec_hidden,
+                                               bf16_xb, bf16_yt, &gate_prepared))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
                             1.0f, x_norm, dec_hidden, l->ffn_up, dec_hidden, 0.0f, ffn_up, dec_inter);
             for (int64_t i = 0; i < TF * dec_inter; i++)

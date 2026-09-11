@@ -239,8 +239,9 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       6 paired server texts mel-corr min 0.99736 / mean 0.99805, C10 0.843 -> 0.821.
       Item 1 implementation is now wired through full, streaming and ragged pre-transformer
       forwards: Arm KAI registers all persistent BF16 rows and unregisters them on teardown;
-      the Neoverse-V2 smoke is functional on both 0.6B and 1.7B, but the BF16 quality screen
-      remains NO-GO (the implementation is default-off). Item 3 is implemented for VNNI and
+      the Neoverse-V2 smoke is functional on both 0.6B and 1.7B. The corrected Graviton5
+      prepared-LHS micro A/B and paired C1 WAV gate are now PASS, while the broader BF16
+      product promotion screen remains open (the implementation is default-off). Item 3 is implemented for VNNI and
       Arm SDOT with compact and production strided APIs, exact S=2/S=3 oracles, and a lane
       cohort. The Arm 2/3-slot WAVE reached group=2/3 with zero mailbox overruns, but measured
       2.8--3.9% slower on the short 0.6B/1.7B A/B, so it is also default-off. Evidence and
@@ -317,11 +318,17 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       build/self-test/doctor passed; 4x8 was the useful topology. The exploratory all-on
       Arm v2 screen held C12/C16 at STREAM p95 `.834/.947` and TTFA p95 `347/470 ms`,
       while C18 crossed the edge (`1.514` STREAM, `529 ms` TTFA). Lane+multi-slot was the
-      main gain; BF16-only was marginal and remains default-off. C2/C4 cost-map parity
-      passed with no UNKNOWN/fallback mismatch. The profiler's multi-slot occupancy row is
-      still unaccounted because the new worker lacks `workers/units` markers. Scratch stats
-      showed zero spills and grow-once/reused arenas. Full qualification and paired audio
-      remain open; details: `.work/graviton5-arm-v2-mini-sweep-20260911.md`.
+      main gain; BF16-only was marginal and remains default-off. The marker follow-up now
+      attributes the decoder panels: C2/C4 cost-map parity is still PASS, with 8/8 workers
+      entered and 100% panel occupancy at both levels; the previous UNACCOUNTED row was
+      instrumentation, not an inactive kernel. `conv_stack` is 93.0%/91.4% of the serve
+      decoder map and pool wait is a real 16.2%/24.1% completion-wait share. The prepared
+      BF16 LHS reuse is wired through full/streaming/ragged decoder paths; corrected C12
+      FAST A/Bs improve STREAM/TOTAL p95 directionally in both orders with zero errors, and
+      paired C1 WAVs are byte-identical. Pool-spin 0/4096/16384/65536 was noisy, so the
+      Arm 65536 default remains. Scratch stats showed zero spills and grow-once/reused
+      arenas. Full qualification remains open; details:
+      `.work/graviton5-arm-v2-mini-sweep-20260911.md`.
 
 - [ ] GRAVITON-5 full qualification campaign: first run the clean `arm-product` baseline
       with RES1_V2/KAI INT8 and the profile's BF16 pre-up/multi-slot defaults OFF; run
