@@ -261,6 +261,14 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       three September AMX gaps are CLOSED on this branch; do not reopen them from the older
       cross-backend audit page. AMX lacking V2 is a dispatch-order CHOICE (Design-D precedes
       V2), not a gap.
+      Follow-up 2026-09-11: `c6e6e26` shares the KleidiAI activation preparation across
+      Talker/CP region workers (same prepared-state kernel); `5b03269` makes the BF16 KAI
+      pre-up prepare synchronously before dispatch, removing a barrier that was unsafe for
+      serial/GCD/narrowed pools. Mac build/self-test and a clean Graviton5 build/self-test
+      pass; four Graviton5 C4 WAVs are byte-identical to the pre-change baseline. The
+      Graviton5 4x8 all-on FAST screen is exploratory only (C8/C12 TTFA p95 257/328 ms,
+      STREAM p95 0.794/0.853, zero errors/rejects); it does not close the Turin regression
+      gate or qualify the Arm product profile.
 - [x] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
       `.work/arm-linux-v2-parity-track-20260910.md` section 2b. Four facts the dispatch map
       does not show: `QWEN_SD_RES1_V2` selects on SHAPE (`kernel>=1 && in_ch==out_ch &&
@@ -315,6 +323,9 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       mel/ASR/listening and a serving gate pass. Do not start the Graviton topology matrix
       until the control shows no regression or the regression is explained and recorded,
       and the all-on result is classified as GO/NO-GO.
+      Reminder: before spending more on the Graviton5 topology matrix, rerun the Turin
+      control first and record C6/C8 plus the C11/C12 boundary; the Graviton screen above
+      is not a substitute for that regression check.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
