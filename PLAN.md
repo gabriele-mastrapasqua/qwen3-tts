@@ -313,6 +313,16 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       sync only tracked source/config/commits, never models/private/WAVs, and keep the
       privacy/log/tree check in force.
 
+- [x] GRAVITON-5 v2 mini-sweep and flow audit (2026-09-11): clean 32-core Neoverse-V3
+      build/self-test/doctor passed; 4x8 was the useful topology. The exploratory all-on
+      Arm v2 screen held C12/C16 at STREAM p95 `.834/.947` and TTFA p95 `347/470 ms`,
+      while C18 crossed the edge (`1.514` STREAM, `529 ms` TTFA). Lane+multi-slot was the
+      main gain; BF16-only was marginal and remains default-off. C2/C4 cost-map parity
+      passed with no UNKNOWN/fallback mismatch. The profiler's multi-slot occupancy row is
+      still unaccounted because the new worker lacks `workers/units` markers. Scratch stats
+      showed zero spills and grow-once/reused arenas. Full qualification and paired audio
+      remain open; details: `.work/graviton5-arm-v2-mini-sweep-20260911.md`.
+
 - [ ] GRAVITON-5 full qualification campaign: first run the clean `arm-product` baseline
       with RES1_V2/KAI INT8 and the profile's BF16 pre-up/multi-slot defaults OFF; run
       `make doctor`, strict preflight, caps/dispatch/self-test, paired audio quality and
