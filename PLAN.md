@@ -330,14 +330,23 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       arenas. Full qualification remains open; details:
       `.work/graviton5-arm-v2-mini-sweep-20260911.md`.
 
-- [x] GRAVFULL-1 Graviton5 full qualification campaign (2026-09-11): the clean `arm-product`
+- [x] GRAVFULL-1 Graviton5 qualification campaign execution (2026-09-11): the clean `arm-product`
       RES1_V2/KAI INT8 baseline was built and dispatched on the selected 4x8 topology;
       doctor, strict preflight, caps/dispatch/self-test, CPU check, paired structural
       audio, capacity waves and C4 SOAK passed with zero errors/rejects and zero fixed-
       buffer stalls. The all-on arm also passed serving/resource SOAK and the 1.7B/0.6B
       FAST ladders, but its paired mel gate failed (`0.88559` minimum vs `0.98`), so
-      BF16 pre-up and multi-slot remain default-off. Turin comparison and exact evidence:
+      BF16 pre-up and multi-slot remain default-off. This closes the campaign execution,
+      not the per-concurrency capacity qualification; exact evidence:
       `.work/graviton5-arm-v2-full-qualification-20260911.md`.
+
+- [ ] GRAVFULL-2 Graviton5 per-concurrency SOAK qualification: when the box is leased
+      again, run identical closed-loop SOAKs for control OFF and exploratory all-on at
+      C6/C8/C12/C16; run C18 as a diagnostic edge only if admission remains meaningful.
+      C4 is already covered. Record per-C TTFA, STREAM/TOTAL, prebuffer, safe-start,
+      stall@250/@500, rejects/errors, resources and wall time. A WAVE is not a capacity
+      qualification: do not call C12/C16/C18 qualified until both arms have the same-C
+      SOAK evidence; all-on remains non-promotable unless paired audio also passes.
 
 - [ ] TURIN-POST-ARM quick regression safety screen (before the next cross-ISA release
       claim or paid capacity ladder): rerun the current VNNI control and yesterday's
