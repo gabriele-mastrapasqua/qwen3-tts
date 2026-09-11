@@ -846,6 +846,28 @@ int qwen_kleidi_register_bf16_fam(const void *key, const uint16_t *W, int rows, 
     return kai_insert_fam(key, rhs, rows, cols, KAI_KIND_BF16, sz, comp, fam);
 }
 
+/* Decoder BF16 copies are owner-scoped and may be torn down before a later model
+ * load reuses their addresses.  Remove only the exact prepared entry; the other
+ * persistent KAI registrations (Q4/I8 and unrelated BF16 owners) stay intact. */
+int qwen_kleidi_unregister_bf16(const void *key) {
+    if (!key) return 0;
+    pthread_mutex_lock(&g_kai_mx);
+    for (int i = 0; i < g_kai_n; i++) {
+        if (g_kai[i].key != key || g_kai[i].kind != KAI_KIND_BF16) continue;
+        free(g_kai[i].rhs);
+        g_kai_bytes -= g_kai[i].bytes;
+        g_kai_bytes_kind[KAI_KIND_BF16] -= g_kai[i].bytes;
+        if (g_kai_n_kind[KAI_KIND_BF16] > 0) g_kai_n_kind[KAI_KIND_BF16]--;
+        memmove(&g_kai[i], &g_kai[i + 1], (size_t)(g_kai_n - i - 1) * sizeof(*g_kai));
+        g_kai_n--;
+        atomic_store_explicit((_Atomic int *)&g_kai_n, g_kai_n, memory_order_release);
+        pthread_mutex_unlock(&g_kai_mx);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_kai_mx);
+    return 0;
+}
+
 typedef struct {
     const kai_entry_t *e;
     const void *lhs_packed;
@@ -1101,6 +1123,7 @@ void qwen_kleidi_bf16_region_run(const void *k, float *d, size_t ds, const void 
 int qwen_kleidi_register_bf16(const void *k, const uint16_t *W, int r, int c) {
     (void)k; (void)W; (void)r; (void)c; return 0;
 }
+int qwen_kleidi_unregister_bf16(const void *k) { (void)k; return 0; }
 int qwen_kleidi_matmul_bf16(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
 }
@@ -1200,6 +1223,7 @@ int qwen_kleidi_matmul_i8_qkv(float *q, float *k, float *v, const void *a, const
 int qwen_kleidi_register_bf16(const void *k, const uint16_t *W, int r, int c) {
     (void)k; (void)W; (void)r; (void)c; return 0;
 }
+int qwen_kleidi_unregister_bf16(const void *k) { (void)k; return 0; }
 int qwen_kleidi_matmul_bf16(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
 }

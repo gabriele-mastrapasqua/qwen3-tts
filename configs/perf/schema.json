@@ -201,6 +201,9 @@
             },
             "decoder_lane": {
               "$ref": "#/definitions/featureStatus"
+            },
+            "multislot": {
+              "$ref": "#/definitions/featureStatus"
             }
           },
           "description": "Expected status, or an allowed status set when a common-control profile spans ISAs with different compiled capabilities."

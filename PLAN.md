@@ -242,8 +242,15 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       DONE since: DL-4 rectangular/wide shapes (API `in_ch`/`out_ch`, any shape when the flag is
       on; two rectangular self-test cases exact / 5.6e-3); ConvNeXt pointwise pair on KAI
       int8 (`QWEN_SD_CNEXT_I8`, default off) --
-      6 paired server texts mel-corr min 0.99736 / mean 0.99805, C10 0.843 -> 0.821.  Still
-      open: the full 21-text bank and the 1.7B for that flag, then pretf/ConvT/DL-4 items.
+      6 paired server texts mel-corr min 0.99736 / mean 0.99805, C10 0.843 -> 0.821.
+      Item 1 implementation is now wired through full, streaming and ragged pre-transformer
+      forwards: Arm KAI registers all persistent BF16 rows and unregisters them on teardown;
+      the Neoverse-V2 smoke is functional on both 0.6B and 1.7B, but the BF16 quality screen
+      remains NO-GO (the implementation is default-off). Item 3 is implemented for VNNI and
+      Arm SDOT with compact and production strided APIs, exact S=2/S=3 oracles, and a lane
+      cohort. The Arm 2/3-slot WAVE reached group=2/3 with zero mailbox overruns, but measured
+      2.8--3.9% slower on the short 0.6B/1.7B A/B, so it is also default-off. Evidence and
+      remaining qualification gaps: `.work/arm-linux-v2-parity-implementation-20260911.md`.
       Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
       convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
       largest single item. DO NOT chase the AMX strip/range port: it was measured first and
@@ -266,9 +273,15 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       convs and the wide channels that the v1 panel and Design-D paths cannot; --self-test
       covers both rectangular shapes and the 20 square ones. AVX2/AVX-512F-without-VNNI stay
       on the f32 fallback, so the three-family claim of this item is not delivered. The flag
-      and the `decoder.res1_v2` row are re-documented but not renamed; the Arm quality/perf
-      qualification of the widened path is the open part (x86 re-validation too: the VNNI
-      kernel shares the API change).
+      and the `decoder.res1_v2` row are re-documented but not renamed; the Arm widened-path
+      quality/perf qualification and a clean-tree x86 execution campaign remain open (the
+      VNNI kernel shares the API change).
+
+- [x] ARM-LINUX-V2 final config TODO, completed last after the BF16/multi-slot A/B and x86
+      VNNI compile/parity checks: update `configs/perf/arm-product.json` and
+      `configs/perf/axion-16c-ttfa.json` with RES1_V2, lane, multi-slot and BF16 policy.
+      RES1_V2 is available; BF16 pre-up and multi-slot remain explicit default-off controls
+      until their separate quality/16-core qualification gates pass.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 

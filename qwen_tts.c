@@ -2621,6 +2621,8 @@ typedef struct dec_job {
     int is_final;
     int stream;
     int first;
+    int cohort_n;                 /* lane multi-slot leader; followers stay off the queue */
+    struct dec_job *cohort[3];
     struct dec_job *next;
 } dec_job_t;
 
@@ -2637,6 +2639,7 @@ typedef struct {
     int first_group;
     int trace;
     int lane;                 /* QWEN_SD_LANE_SPLIT: pinned private team, one unit in flight per slot */
+    int multislot;             /* QWEN_SD_MULTISLOT=2..3: shape-compatible lane cohort */
     pthread_cond_t done_cv;   /* broadcast when a slot's busy count drops (the bounded mailbox) */
     int elastic;              /* width full <-> step_width while a unit is queued or running */
     int step_width;
@@ -2692,7 +2695,9 @@ static void *dec_worker_main(void *arg) {
 
         int ng = 0;
         grp[ng++] = j;
-        if (dp->batch && j->stream && j->nframes > 0 &&
+        if (j->cohort_n >= 2 && j->cohort_n <= 3) {
+            for (int i = 1; i < j->cohort_n; i++) grp[ng++] = j->cohort[i];
+        } else if (dp->batch && j->stream && j->nframes > 0 &&
             (dp->first_group || !j->first)) {
             dec_job_t *prev = NULL, *it = dp->head;
             while (it && ng < DEC_GROUP_MAX) {
@@ -2818,6 +2823,48 @@ static void dec_enqueue(dec_pool_t *dp, int slot, const int *codes, int nframes,
         pthread_mutex_unlock(&dp->m);
     }
     dec_push(dp, j);
+}
+
+/* Queue one leader for a cohort of preallocated lane jobs.  The worker consumes
+ * the member pointers as one ragged decode call, so no second mailbox wake-up or
+ * queue turn is introduced for the paired slots.  Return 0 before mutating any
+ * slot when the bounded preallocation contract cannot hold. */
+static int dec_enqueue_cohort(dec_pool_t *dp, const int *slots, const int *nframes,
+                              int n, int *const *codes, void *const *tags,
+                              const int *first) {
+    if (!dp->lane || dp->multislot < 2 || n < 2 || n > 3 || n > dp->multislot ||
+        !dp->slot_job || !dp->slot_codes || !slots || !nframes || !codes || !tags)
+        return 0;
+    for (int i = 0; i < n; i++) {
+        if (slots[i] < 0 || nframes[i] <= 0 || nframes[i] > 32 || !codes[i] ||
+            atomic_load(&dp->busy[slots[i]]) != 0)
+            return 0;
+    }
+    for (int i = 1; i < n; i++)
+        if (nframes[i] != nframes[0]) return 0;
+    dec_job_t *members[3] = { NULL, NULL, NULL };
+    for (int i = 0; i < n; i++) {
+        const int slot = slots[i];
+        dec_job_t *j = &dp->slot_job[slot];
+        memset(j, 0, sizeof *j);
+        j->codes = dp->slot_codes + (size_t)slot * 32 * 16;
+        memcpy(j->codes, codes[i], (size_t)nframes[i] * 16 * sizeof(int));
+        j->slot = slot; j->nframes = nframes[i]; j->tag = tags[i];
+        j->stream = 1; j->first = first ? first[i] : 0;
+        members[i] = j;
+        atomic_fetch_add(&dp->busy[slot], 1);
+    }
+    dec_job_t *leader = members[0];
+    leader->first = 0;
+    for (int i = 0; i < n; i++) if (members[i]->first) leader->first = 1;
+    leader->cohort_n = n;
+    for (int i = 0; i < n; i++) leader->cohort[i] = members[i];
+    pthread_mutex_lock(&dp->m);
+    if (dp->elastic && dp->queued == 0) { qwen_pool_set_width(dp->step_width); dp->overlap_t0 = qwen_mono_ms(); }
+    dp->queued += n;
+    pthread_mutex_unlock(&dp->m);
+    dec_push(dp, leader);
+    return 1;
 }
 
 int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sink) {
@@ -2946,6 +2993,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         pthread_cond_init(&dpool.done_cv, NULL);
         dpool.running = 1; dpool.sink = sink; dpool.sstate = sstate; dpool.busy = dec_busy;
         dpool.lane = lane_team > 0;
+        dpool.multislot = dpool.lane ? atoi(getenv("QWEN_SD_MULTISLOT") ? getenv("QWEN_SD_MULTISLOT") : "0") : 0;
+        if (!qwen_sd_multislot_active() || dpool.multislot < 2) dpool.multislot = 0;
+        if (dpool.multislot > 3) dpool.multislot = 3;
         dpool.elastic = dpool.lane && qwen_lane_elastic();
         { const char *sq = getenv("QWEN_SD_LANE_SUBQ"); dpool.subq = (dpool.lane && sq) ? atoi(sq) : 0; }
         dpool.step_width = qwen_get_threads() - lane_team;   /* the STEP cpus: caller + step_width-1 workers */
@@ -2967,13 +3017,15 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 if (dpool.elastic)
                     fprintf(stderr, "[serve] decoder LANE ENABLED (ELASTIC): engine pool %d threads on all cpus; while a "
                                     "decoder unit runs on %s (team %d) the engine narrows to %s (%d threads) · "
-                                    "mailbox 1 unit/slot, preallocated, lead <= 1 quantum%s\n",
+                                    "mailbox 1 unit/slot, cohort <= %d, preallocated, lead <= 1 quantum%s\n",
                             qwen_get_threads(), lm_dec, lane_team, lm_step, dpool.step_width,
+                            dpool.multislot > 0 ? dpool.multislot : 1,
                             dpool.subq > 0 ? " · units decoded in sub-calls (QWEN_SD_LANE_SUBQ)" : "");
                 else
                     fprintf(stderr, "[serve] decoder LANE ENABLED: step cpus %s (engine pool %d threads) · "
-                                    "decoder cpus %s (private team %d) · mailbox 1 unit/slot, lead <= 1 quantum\n",
-                            lm_step, qwen_get_threads(), lm_dec, lane_team);
+                            "decoder cpus %s (private team %d) · mailbox 1 unit/slot, cohort <= %d, lead <= 1 quantum\n",
+                            lm_step, qwen_get_threads(), lm_dec, lane_team,
+                            dpool.multislot > 0 ? dpool.multislot : 1);
             } else
                 fprintf(stderr, "[serve] decoder thread ENABLED (decode leaves the frame loop)\n");
         } else {
@@ -3763,6 +3815,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 
         PF_START();
         if (st_td) qwen_set_threads_soft(st_td);
+        int cohort_n = 0;
+        int cohort_slots[3] = { 0, 0, 0 }, cohort_frames[3] = { 0, 0, 0 };
+        int *cohort_codes[3] = { NULL, NULL, NULL };
+        void *cohort_tags[3] = { NULL, NULL, NULL };
+        int cohort_first[3] = { 0, 0, 0 };
         for (int b = 0; b < B; b++) {
             if (!step_active[b]) {
                 memset(step_embed + (size_t)b * h, 0, (size_t)h * sizeof(float));
@@ -3786,7 +3843,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 if (pending < target) continue;
                 if (dec_on && want_stream[b]) {
-                    if (stage_trace) {
+                    if (stage_trace && !(dpool.lane && dpool.multislot >= 2)) {
                         st_dec_calls++; st_dec_group_max = 1;
                         st_dec_frames += pending; st_dec_external = 1;
                     }
@@ -3796,6 +3853,56 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                          * slot's producer waits for its decoder, and only this slot's */
                         double _dw = dec_wait_idle(&dpool, b);
                         st_dec_wait += _dw; pf_decwait += _dw;
+                    }
+                    if (dpool.lane && dpool.multislot >= 2) {
+                        /* Keep one candidate until a same-length peer is ready.  A
+                         * different pending length is flushed as an ordinary unit;
+                         * it must never enter a scalar-length multi kernel. */
+                        if (cohort_n > 0 && pending != cohort_frames[0]) {
+                            int queued_prev = 0;
+                            if (cohort_n >= 2)
+                                queued_prev = dec_enqueue_cohort(
+                                    &dpool, cohort_slots, cohort_frames, cohort_n,
+                                    cohort_codes, cohort_tags, cohort_first);
+                            if (!queued_prev) {
+                                for (int ci = 0; ci < cohort_n; ci++)
+                                    dec_enqueue(&dpool, cohort_slots[ci], cohort_codes[ci], cohort_frames[ci],
+                                                cohort_tags[ci], 0, 1, cohort_first[ci]);
+                            }
+                            if (stage_trace) {
+                                st_dec_calls += queued_prev ? 1 : cohort_n;
+                                if (st_dec_group_max < (queued_prev ? cohort_n : 1))
+                                    st_dec_group_max = queued_prev ? cohort_n : 1;
+                                for (int ci = 0; ci < cohort_n; ci++) st_dec_frames += cohort_frames[ci];
+                                st_dec_external = 1;
+                            }
+                            cohort_n = 0;
+                        }
+                        cohort_slots[cohort_n] = b;
+                        cohort_frames[cohort_n] = pending;
+                        cohort_codes[cohort_n] = chcodes[b] + (size_t)decpos[b] * 16;
+                        cohort_tags[cohort_n] = tag[b];
+                        cohort_first[cohort_n] = decpos[b] == 0;
+                        cohort_n++;
+                        decpos[b] = chframes[b];
+                        if (cohort_n < dpool.multislot) continue;
+                        const int queued_cohort = dec_enqueue_cohort(
+                            &dpool, cohort_slots, cohort_frames, cohort_n,
+                            cohort_codes, cohort_tags, cohort_first);
+                        if (!queued_cohort) {
+                            for (int ci = 0; ci < cohort_n; ci++)
+                                dec_enqueue(&dpool, cohort_slots[ci], cohort_codes[ci], cohort_frames[ci],
+                                            cohort_tags[ci], 0, 1, cohort_first[ci]);
+                        }
+                        if (stage_trace) {
+                            st_dec_calls += queued_cohort ? 1 : cohort_n;
+                            if (st_dec_group_max < (queued_cohort ? cohort_n : 1))
+                                st_dec_group_max = queued_cohort ? cohort_n : 1;
+                            for (int ci = 0; ci < cohort_n; ci++) st_dec_frames += cohort_frames[ci];
+                            st_dec_external = 1;
+                        }
+                        cohort_n = 0;
+                        continue;
                     }
                     dec_enqueue(&dpool, b, chcodes[b] + (size_t)decpos[b] * 16, pending,
                                 tag[b], 0, 1, decpos[b] == 0);
@@ -3827,6 +3934,26 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     }
                 }
                 free(aud);
+            }
+        }
+        if (cohort_n > 0) {
+            if (cohort_n >= 2 && dec_enqueue_cohort(&dpool, cohort_slots, cohort_frames, cohort_n,
+                                                    cohort_codes, cohort_tags, cohort_first)) {
+                if (stage_trace) {
+                    st_dec_calls++;
+                    if (st_dec_group_max < cohort_n) st_dec_group_max = cohort_n;
+                    for (int ci = 0; ci < cohort_n; ci++) st_dec_frames += cohort_frames[ci];
+                    st_dec_external = 1;
+                }
+            } else {
+                for (int ci = 0; ci < cohort_n; ci++) {
+                    dec_enqueue(&dpool, cohort_slots[ci], cohort_codes[ci], cohort_frames[ci],
+                                cohort_tags[ci], 0, 1, cohort_first[ci]);
+                    if (stage_trace) {
+                        st_dec_calls++; st_dec_group_max = st_dec_group_max < 1 ? 1 : st_dec_group_max;
+                        st_dec_frames += cohort_frames[ci]; st_dec_external = 1;
+                    }
+                }
             }
         }
 

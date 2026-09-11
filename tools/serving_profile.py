@@ -209,6 +209,8 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
         features.get("decoder.res1_v2", {}).get("resolved") == "ON"
     lane = bool(serving.get("decoder_lane_active", False)) or \
         features.get("decoder.lane", {}).get("resolved") == "ON"
+    multislot = bool(serving.get("decoder_multislot_active", False)) or \
+        features.get("decoder.multislot", {}).get("resolved") == "ON"
     actual_status = {
         "design_d": resolved_feature_status(features, "decoder.design_d", design),
         "fused_residual": resolved_feature_status(features, "decoder.fused_residual", fused),
@@ -217,6 +219,7 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
         # profile names them, so the older lanes keep their three-feature contract.
         "res1_v2": resolved_feature_status(features, "decoder.res1_v2", res1_v2),
         "decoder_lane": resolved_feature_status(features, "decoder.lane", lane),
+        "multislot": resolved_feature_status(features, "decoder.multislot", multislot),
     }
     actual_status = {k: v for k, v in actual_status.items() if k in parity["features"]}
     for name, actual in actual_status.items():
@@ -282,6 +285,7 @@ def evaluate(prof, dispatch, flags, binary=None, profile_env=None, errors=None,
         "kai_active": kai,
         "res1_v2_active": res1_v2,
         "decoder_lane_active": lane,
+        "multislot_active": multislot,
         "decoder_lane_elastic": bool(serving.get("decoder_lane_elastic", False)),
         "fallback_detected": decoder_status == "VALID FALLBACK" or
                              any(v == "VALID FALLBACK" for v in actual_status.values()),
