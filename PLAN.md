@@ -330,14 +330,21 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       arenas. Full qualification remains open; details:
       `.work/graviton5-arm-v2-mini-sweep-20260911.md`.
 
-- [ ] GRAVITON-5 full qualification campaign: first run the clean `arm-product` baseline
-      with RES1_V2/KAI INT8 and the profile's BF16 pre-up/multi-slot defaults OFF; run
-      `make doctor`, strict preflight, caps/dispatch/self-test, paired audio quality and
-      the capacity/streaming ladder on the selected 32-core topology. Do the short topology
-      break-in (4x8 versus 2x16/8x4, lane split and pool-spin) before spending on the full
-      waves/soaks. Record TTFB, TTFA, STREAM/TOTAL RTF, playback stalls, rejects/errors,
-      L3/bandwidth and the exact profile manifest. The exploratory 4x8 all-on screen is
-      evidence for choosing follow-up arms, not a qualification.
+- [x] GRAVFULL-1 Graviton5 full qualification campaign (2026-09-11): the clean `arm-product`
+      RES1_V2/KAI INT8 baseline was built and dispatched on the selected 4x8 topology;
+      doctor, strict preflight, caps/dispatch/self-test, CPU check, paired structural
+      audio, capacity waves and C4 SOAK passed with zero errors/rejects and zero fixed-
+      buffer stalls. The all-on arm also passed serving/resource SOAK and the 1.7B/0.6B
+      FAST ladders, but its paired mel gate failed (`0.88559` minimum vs `0.98`), so
+      BF16 pre-up and multi-slot remain default-off. Turin comparison and exact evidence:
+      `.work/graviton5-arm-v2-full-qualification-20260911.md`.
+
+- [ ] TURIN-POST-ARM quick regression safety screen (before the next cross-ISA release
+      claim or paid capacity ladder): rerun the current VNNI control and yesterday's
+      promoted feature profile at C6/C8, including one short FAST and the existing
+      TTFB/TTFA/STREAM/TOTAL comparison. The Arm-only applicability gate says this is
+      not required to attribute the Arm result, but the screen is retained as the
+      requested regression check; record any drift separately from the Arm report.
 
 - [ ] ARM optional-feature promotion: qualify BF16 pre-up, multi-slot and CNEXT-I8 as
       separate paired A/Bs only after the Graviton baseline. BF16 and multi-slot remain
