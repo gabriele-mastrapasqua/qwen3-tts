@@ -341,12 +341,15 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       `.work/graviton5-arm-v2-full-qualification-20260911.md`.
 
 - [ ] GRAVFULL-2 Graviton5 per-concurrency SOAK qualification: when the box is leased
-      again, run identical closed-loop SOAKs for control OFF and exploratory all-on at
-      C6/C8/C12/C16; run C18 as a diagnostic edge only if admission remains meaningful.
-      C4 is already covered. Record per-C TTFA, STREAM/TOTAL, prebuffer, safe-start,
-      stall@250/@500, rejects/errors, resources and wall time. A WAVE is not a capacity
-      qualification: do not call C12/C16/C18 qualified until both arms have the same-C
-      SOAK evidence; all-on remains non-promotable unless paired audio also passes.
+      again, split the matrix by model. For 1.7B, run identical closed-loop SOAKs for
+      control OFF and exploratory all-on at C6/C8/C12/C16; run C18 as a diagnostic edge
+      only if admission remains meaningful (C4 is already covered for 1.7B). For 0.6B,
+      extend the existing C1/C4/C8/C12 FAST screen through C16/C20 and continue to C24+
+      until the knee, then SOAK the selected levels for both arms. Record per-model,
+      per-C TTFA, STREAM/TOTAL, prebuffer, safe-start, stall@250/@500, rejects/errors,
+      resources and wall time. A WAVE is not a capacity qualification: do not call any
+      1.7B C12/C16/C18 or 0.6B C16/C20+ level qualified without same-model SOAK evidence;
+      all-on remains non-promotable unless paired audio also passes.
 
 - [ ] TURIN-POST-ARM quick regression safety screen (before the next cross-ISA release
       claim or paid capacity ladder): rerun the current VNNI control and yesterday's

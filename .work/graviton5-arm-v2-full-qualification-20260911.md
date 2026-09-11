@@ -42,9 +42,20 @@ strict profile checks and the corrected CPU check: 19 passes, 0 failures,
 match, native self-test, fallback self-test, Arm dispatch match, hardware
 fingerprint, bandwidth roofs and zero surviving benchmark processes.
 
-All serving runs used the 1.7B model, Ryan/English, INT8 serving, 4 prefork
-workers with 8 threads, 4-slot batches, fail-fast admission, and 4x8 CPU
-placement. The 0.6B block used the same 4x8 placement and short FAST bank.
+The 1.7B serving runs used Ryan/English, INT8 serving, 4 prefork workers with
+8 threads, 4-slot batches, fail-fast admission, and 4x8 CPU placement. The
+0.6B block used the same 4x8 placement and short FAST bank, but it was a FAST
+screen only.
+
+### Actual coverage by model
+
+* **1.7B:** control and all-on WAVE measurements at C6/C8/C12/C14/C16;
+  paired C4 SOAK; the older exploratory all-on mini-sweep also reached C18.
+  There is no 1.7B C6/C8/C12/C14/C16/C18 SOAK in this campaign.
+* **0.6B:** control and all-on FAST measurements at C1/C4/C8/C12 only.
+  There is no 0.6B SOAK and no 0.6B C16/C20+ measurement yet. Therefore the
+  0.6B capacity must not be inferred from the 1.7B table; its expected higher
+  ceiling remains unmeasured.
 
 ### Clean 1.7B C4 SOAK
 
