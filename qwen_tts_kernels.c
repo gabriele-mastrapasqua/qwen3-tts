@@ -10493,7 +10493,13 @@ typedef struct {
     _Atomic int next; int n_blocks;
 } sd_dconv_job_t;
 
-
+#if defined(__GNUC__) && !defined(__clang__)
+/* GCC 15 on Neoverse-V3 can reassociate or auto-vectorize the scalar float
+ * bookkeeping differently in the context+residual and multi-slot workers.
+ * Keep the reduction order exact; the explicit SDOT intrinsics remain native
+ * vector code.  This is the ARM counterpart of the VNNI guard above. */
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
+#endif
 static void sd_dconv_worker(void *vj) {
     sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
     const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
@@ -10640,6 +10646,9 @@ typedef struct {
     _Atomic int next; int n_blocks;
 } sd_dconv_multi_job_t;
 
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
+#endif
 static void sd_dconv_multi_worker(void *vj) {
     sd_dconv_multi_job_t *j = (sd_dconv_multi_job_t *)vj;
     const int S = j->nslots, in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp;
