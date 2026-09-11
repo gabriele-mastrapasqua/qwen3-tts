@@ -201,20 +201,21 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
 - Stop: if no target, no falsifier and no screen moves C12 above noise, hand the evidence to
       the post-Turin architecture review instead of stacking micro-optimizations.
 
-### Deferred ARM-LINUX-V2 — parity for the v2 serving generation and C12-WIN (MEDIUM)
+### ARM-LINUX-V2 — parity implementation complete; optional policy qualification deferred
 
-- [ ] After the Turin C12-WIN track closes, bring Arm Linux serving up to the v2 generation.
-      Track document with the verified/unverified split, the ordered work and the
-      do-not-carry-over list: `.work/arm-linux-v2-parity-track-20260910.md`.
+- [x] Arm Linux serving is at the v2 generation on `feature/arm-parity-vnni` (`6117437`).
+      The implementation, exact self-tests, ISA/link checks, dispatch checks and final
+      config policy are complete. The track document with the verified/unverified split
+      and do-not-carry-over list remains `.work/arm-linux-v2-parity-track-20260910.md`.
       Headline finding, CONFIRMED against this tree: the decoder lane
       (`QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC`) has NO ISA guard — only `__linux__` —
       so the mechanism of record on the Turin product profile ports to Arm unchanged, and no
       Arm profile sets it. The reason it was never tried is a wrong sentence in our own
       handoff, corrected 2026-09-10. Also confirmed: the five newest decoder flags have zero
       entries in `docs/feature-flags.md`, and `g_mm_gate[]` has no KleidiAI int8/bf16 rows.
-      NOT established and not to be quoted: every Arm serving number behind this, which came
-      from an unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
-      server — below the regime the lane exists for.
+      The old unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
+      server remains non-evidence. The new exact-commit Axion screen is recorded below as
+      a one-wave performance screen only, not as an Arm product qualification.
       Ordering: the build break above is NOT part of this track and must not wait for it.
       Progress on `feature/arm-parity-vnni` (2026-09-10): items 0 (link fix, = TQ-6), 1
       (KleidiAI gate rows), 2 (prefork plans on the inherited mask), 3 (docs + expectation
@@ -228,17 +229,10 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       elastic + RES1_V2 + GLUE + CONVT_STACK measures STREAM p95 0.843 against 0.939 for
       the untreated tree (WAVE screen, no SOAK yet).  RES1_V2 audio gate: 21/21 paired
       files, mel-corr min 0.9945.
-      NEXT (each with a paired WAV/quality gate): pre-transformer BF16 via KleidiAI (x86
-      has the AVX-512 BF16 sibling); ConvT BF16; rectangular/wide DL-4 (the `in_ch <= 768`
-      and square-only gates still leave the initial/pre conv on f32 on every backend);
-      multi-slot DL-4 for the lane.  Threading constraint found while scoping them: the
-      decoder unit runs on the lane team, so the KAI wrappers that dispatch through
-      qwen_parallel are not directly usable there -- the prepared-state prep/run pair
-      (tid/nt over the lane team) is the shape to use.  Two more traps found while doing it:
-      the region/prepared-state API is keyed on the ORIGINAL f32 weight pointer (the int8
-      buffer is not a key), and the ConvNeXt MLP exists TWICE -- the CLI path uses a
-      `pw_dim = cur_ch*4` copy, the streaming server path the 4096-wide `convnext_mlp`; a
-      CLI A/B cannot see a change made in the other one.
+      The original next list is now closed at implementation level: pre-transformer BF16
+      wiring, rectangular/wide DL-4, and multi-slot DL-4 are all implemented and tested.
+      The lane-team constraint is handled by the prepared-state prep/run pair (tid/nt),
+      while the region/prepared-state API remains keyed on the ORIGINAL f32 weight pointer.
       DONE since: DL-4 rectangular/wide shapes (API `in_ch`/`out_ch`, any shape when the flag is
       on; two rectangular self-test cases exact / 5.6e-3); ConvNeXt pointwise pair on KAI
       int8 (`QWEN_SD_CNEXT_I8`, default off) --
@@ -251,6 +245,15 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       cohort. The Arm 2/3-slot WAVE reached group=2/3 with zero mailbox overruns, but measured
       2.8--3.9% slower on the short 0.6B/1.7B A/B, so it is also default-off. Evidence and
       remaining qualification gaps: `.work/arm-linux-v2-parity-implementation-20260911.md`.
+      Exact-commit Axion FAST screen (Neoverse-V2, 2x8, short synchronized wave, custom
+      1b7 model, INT8) reached C8 with lane split=4: C6/C8 STREAM p95 `.646/.716`,
+      TOTAL p95 `.699/.806`, TTFA p95 `236/303 ms`, zero errors/rejects; C12/C14 are
+      screen-only and miss playback headroom. Inline control was `.917/.860` STREAM p95
+      at C6/C8; split=2 was slower, so no lane split is promoted in the Arm profile.
+      This is not an apples-to-apples Turin claim: Turin has 32 cores and the reference
+      screen uses the open 1.7B model. Turin's 4x8 screen was `.87/.87` STREAM p95 at
+      C6/C8, making the Arm C6/C8 steady-state screen comparable despite half the cores;
+      first-audio and full qualification still need a repeated product run.
       Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
       convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
       largest single item. DO NOT chase the AMX strip/range port: it was measured first and
@@ -258,7 +261,7 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       three September AMX gaps are CLOSED on this branch; do not reopen them from the older
       cross-backend audit page. AMX lacking V2 is a dispatch-order CHOICE (Design-D precedes
       V2), not a gap.
-- [ ] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
+- [x] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
       `.work/arm-linux-v2-parity-track-20260910.md` section 2b. Four facts the dispatch map
       does not show: `QWEN_SD_RES1_V2` selects on SHAPE (`kernel>=1 && in_ch==out_ch &&
       !(in_ch&3)`), so it takes res2 and every square conv, not just res1 — implementing
@@ -273,15 +276,22 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       convs and the wide channels that the v1 panel and Design-D paths cannot; --self-test
       covers both rectangular shapes and the 20 square ones. AVX2/AVX-512F-without-VNNI stay
       on the f32 fallback, so the three-family claim of this item is not delivered. The flag
-      and the `decoder.res1_v2` row are re-documented but not renamed; the Arm widened-path
-      quality/perf qualification and a clean-tree x86 execution campaign remain open (the
-      VNNI kernel shares the API change).
+      and the `decoder.res1_v2` row are re-documented but not renamed. Arm widened-path
+      quality/perf promotion remains intentionally open; parity implementation and exact
+      Arm/x86 build/self-test gates are complete (the VNNI kernel shares the API change).
 
 - [x] ARM-LINUX-V2 final config TODO, completed last after the BF16/multi-slot A/B and x86
       VNNI compile/parity checks: update `configs/perf/arm-product.json` and
       `configs/perf/axion-16c-ttfa.json` with RES1_V2, lane, multi-slot and BF16 policy.
       RES1_V2 is available; BF16 pre-up and multi-slot remain explicit default-off controls
       until their separate quality/16-core qualification gates pass.
+
+- [ ] PRE-GRAVITON-5 regression gate (ASAP, before any AWS Graviton 5 spot campaign):
+      rerun the frozen Turin VNNI control after the Arm/v2 changes, at least C6/C8 and the
+      established C11/C12 boundary, with dispatch/self-test plus short/conversational
+      playback metrics. Compare against `.work/turin-vnni-final-handoff-20260909.md` and
+      `.work/c12-win-checkpoint-20260909.md`; do not start the Graviton topology matrix
+      until Turin shows no regression or the regression is explained and recorded.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
