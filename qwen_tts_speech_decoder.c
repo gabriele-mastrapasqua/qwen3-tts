@@ -5,6 +5,7 @@
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_costmap.h"
 #include "qwen_tts_thread.h"
+#include "qwen_tts_kleidi.h"
 #include "ingot/safetensors.h"
 
 #include <stdio.h>
@@ -115,11 +116,39 @@ static int sd_bf16_preup_requested(void);
  * public BF16 matmat leaf consumes packed [B][K] activations and returns
  * [M][B].  Keep this adapter local to the experimental decoder arm so the
  * existing f32 SGEMM path remains byte-for-byte untouched when it is off. */
-static int sd_bf16_preup_matmat(float *Y, const uint16_t *W, const float *X,
+/* KAI bf16 prepared-state path: the same kernels the dispatched path runs, reached without
+ * a nested qwen_parallel (lane workers), and KAI writes [B][rows] directly -- the layout the
+ * caller wants, so the packed adapter's transpose is skipped. */
+typedef struct { float *dst; const void *key; const float *lhs; int rows, cols, B; } sd_kai_bf16_job_t;
+static void sd_kai_bf16_task(size_t tid, size_t nt, void *v) {
+    sd_kai_bf16_job_t *j = (sd_kai_bf16_job_t *)v;
+    const void *lp = qwen_kleidi_bf16_region_prep(j->lhs, (size_t)j->cols * sizeof(float),
+                                                  j->cols, j->B);
+    if (lp) qwen_kleidi_bf16_region_run(j->key, j->dst, (size_t)j->rows * sizeof(float), lp,
+                                        j->rows, j->cols, j->B, tid, nt);
+}
+static int sd_kai_matmul_bf16(float *dst, const void *key, const float *lhs,
+                              int rows, int cols, int B) {
+    if (!qwen_kleidi_bf16_region_usable(key, rows, cols, B)) return 0;
+    sd_kai_bf16_job_t j = { dst, key, lhs, rows, cols, B };
+    if (qwen_parallel_active()) { sd_kai_bf16_task(0, 1, &j); return 1; }
+    int nt = qwen_lane_thread_here() ? qwen_lane_team_size() : qwen_get_threads();
+    if (nt < 1) nt = 1;
+    if (nt == 1) sd_kai_bf16_task(0, 1, &j);
+    else          qwen_parallel((size_t)nt, sd_kai_bf16_task, &j);
+    return 1;
+}
+
+static int sd_bf16_preup_matmat(float *Y, const uint16_t *W, const void *key, const float *X,
                                 int B, int rows, int cols,
                                 uint16_t *Xb, float *Yt) {
-    if (!sd_bf16_preup_requested() || !W || !X || !Y || !Xb || !Yt || B < 1 || B > 16)
+    if (!sd_bf16_preup_requested() || !W || !X || !Y || B < 1 || B > 16)
         return 0;
+    if (sd_kai_matmul_bf16(Y, key, X, rows, cols, B)) return 1;
+    /* The AVX-512 packed fallback still needs its two scratch matrices.  KAI's
+     * prepared-state path does not: it packs the LHS in its own TLS scratch and
+     * writes the caller's row-major [B][rows] destination directly. */
+    if (!Xb || !Yt) return 0;
     qwen_bf16_pack_rows(Xb, X, cols, cols, B);
     qwen_matmat_bf16_packed(Yt, W, Xb, rows, cols, B);
     for (int r = 0; r < rows; r++)
@@ -351,7 +380,7 @@ static int sd_bf16_preup_requested(void) {
     if (en < 0) {
         const char *e = getenv("QWEN_SD_BF16_PREUP");
         const int want = e && *e && *e != '0';
-        en = want && qwen_avx512_bf16_matmat_available();
+        en = want && (qwen_avx512_bf16_matmat_available() || qwen_kleidi_bf16_enabled());
     }
     return en;
 }
@@ -375,6 +404,18 @@ static uint16_t *sd_bf16_copy_weight(const float *src, size_t n) {
 
 void qwen_sd_bf16_preup_free(qwen_speech_decoder_t *sd, int n_layers) {
     if (!sd) return;
+    qwen_kleidi_unregister_bf16(sd->input_proj_weight);
+    qwen_kleidi_unregister_bf16(sd->output_proj_weight);
+    for (int i = 0; sd->pre_layers && i < n_layers; i++) {
+        qwen_sd_pre_layer_t *l = &sd->pre_layers[i];
+        qwen_kleidi_unregister_bf16(l->attn_q);
+        qwen_kleidi_unregister_bf16(l->attn_k);
+        qwen_kleidi_unregister_bf16(l->attn_v);
+        qwen_kleidi_unregister_bf16(l->attn_o);
+        qwen_kleidi_unregister_bf16(l->ffn_gate);
+        qwen_kleidi_unregister_bf16(l->ffn_up);
+        qwen_kleidi_unregister_bf16(l->ffn_down);
+    }
     free(sd->input_proj_weight_bf16);
     free(sd->output_proj_weight_bf16);
     sd->input_proj_weight_bf16 = NULL;
@@ -435,11 +476,44 @@ static void sd_bf16_preup_prepare(qwen_speech_decoder_t *sd, int n_layers, int s
         if (!silent) fprintf(stderr, "  Decoder pre-up BF16: requested but allocation failed; using f32 fallback\n");
         return;
     }
+    /* The prepared KAI consumer is keyed by the original persistent f32 weight, as are
+     * the other KAI decoder representations.  Register every
+     * decoder projection only after the complete set is ready, so a partial allocation
+     * cannot leave a live registry entry behind.  A failed registration is deliberately
+     * non-fatal: the AVX-512 packed leaf (or the f32 caller fallback) remains valid. */
+    int kai_n = 0;
+    if (qwen_kleidi_bf16_enabled()) {
+        kai_n += qwen_kleidi_register_bf16_fam(sd->input_proj_weight,
+                                               sd->input_proj_weight_bf16, dec_hidden, latent_dim,
+                                               QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER);
+        kai_n += qwen_kleidi_register_bf16_fam(sd->output_proj_weight,
+                                               sd->output_proj_weight_bf16, latent_dim, dec_hidden,
+                                               QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER);
+        for (int i = 0; i < n_layers; i++) {
+            qwen_sd_pre_layer_t *l = &sd->pre_layers[i];
+            kai_n += qwen_kleidi_register_bf16_fam(l->attn_q, l->attn_q_bf16,
+                                                   qkv_dim, dec_hidden, QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_QKV);
+            kai_n += qwen_kleidi_register_bf16_fam(l->attn_k, l->attn_k_bf16,
+                                                   qkv_dim, dec_hidden, QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_QKV);
+            kai_n += qwen_kleidi_register_bf16_fam(l->attn_v, l->attn_v_bf16,
+                                                   qkv_dim, dec_hidden, QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_QKV);
+            kai_n += qwen_kleidi_register_bf16_fam(l->attn_o, l->attn_o_bf16,
+                                                   dec_hidden, qkv_dim, QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_O);
+            kai_n += qwen_kleidi_register_bf16_fam(l->ffn_gate, l->ffn_gate_bf16,
+                                                   dec_inter, dec_hidden, QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_FFN);
+            kai_n += qwen_kleidi_register_bf16_fam(l->ffn_up, l->ffn_up_bf16,
+                                                   dec_inter, dec_hidden, QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_FFN);
+            kai_n += qwen_kleidi_register_bf16_fam(l->ffn_down, l->ffn_down_bf16,
+                                                   dec_hidden, dec_inter, QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_FFN);
+        }
+    }
     sd->bf16_preup_ready = 1;
     sd->bf16_preup_bytes = bytes;
     if (!silent)
-        fprintf(stderr, "  Decoder pre-up BF16: ACTIVE (persistent weights %.1f MB; AVX-512 BF16 rows)\n",
-                (double)bytes / 1e6);
+        fprintf(stderr, "  Decoder pre-up BF16: ACTIVE (persistent weights %.1f MB; %s prepared rows%s)\n",
+                (double)bytes / 1e6,
+                qwen_kleidi_bf16_enabled() ? "KAI" : "AVX-512",
+                qwen_kleidi_bf16_enabled() ? (kai_n == 2 + 7 * n_layers ? ", all weights registered" : ", partial KAI registry") : "");
 }
 
 static int sd_phase_on(void) {
@@ -609,6 +683,22 @@ static int sd_res1_v2_enabled(void) {
     return v;
 }
 int qwen_sd_res1_v2_active(void) { return sd_res1_v2_enabled(); }
+/* A cohort is opt-in and shape-safe: the batch kernel has one geometry and one
+ * time length for all slots.  The lane scheduler may still form ordinary batch
+ * groups when this is off; only this flag admits the shared-weight DL-4 leaf. */
+static int sd_multislot_slots(void) {
+    static int slots = -1;
+    if (slots < 0) {
+        const char *e = getenv("QWEN_SD_MULTISLOT");
+        slots = (e && atoi(e) != 0 && sd_int8_enabled() && sd_res1_v2_enabled() &&
+                 qwen_conv1d_int8_v2_multi_available()) ? atoi(e) : 0;
+        if (slots < 0) slots = 0;
+        if (slots > 3) slots = 3;
+        if (slots == 1) slots = 0;
+    }
+    return slots;
+}
+int qwen_sd_multislot_active(void) { return sd_multislot_slots() >= 2; }
 /* C12-WIN-12: fused residual unit on the VNNI per-item path (default off). One combined
  * dataflow: snake1 out of place (the residual is never copied back), res1 with the left
  * context passed to the kernel (no [tail|in] build, no full/cut), res2 with the residual
@@ -634,15 +724,15 @@ static const float *sd_convt_stack_for(const float *packed) {
 }
 /* Build the DL-4 layout for a residual conv: wq2[m][kk][Cp] with one scale and one weight
  * sum per (m, kk); the f32 weight is [out_ch][in_ch][kernel] (kk fastest, the im2col order). */
-static void sd_wq_build_v2(sd_wq_entry_t *e, const float *w, int ch, int kernel) {
+static void sd_wq_build_v2(sd_wq_entry_t *e, const float *w, int in_ch, int out_ch, int kernel) {
     if (e->v2_tried) return;
     e->v2_tried = 1;
-    const int Cp = qwen_conv1d_int8_v2_cp(ch);
-    int8_t *q2 = (int8_t *)aligned_malloc((size_t)ch * kernel * Cp);
-    float *sw2 = (float *)aligned_malloc((size_t)ch * kernel * sizeof(float));
-    int32_t *ws2 = (int32_t *)aligned_malloc((size_t)ch * kernel * sizeof(int32_t));
+    const int Cp = qwen_conv1d_int8_v2_cp(in_ch);
+    int8_t *q2 = (int8_t *)aligned_malloc((size_t)out_ch * kernel * Cp);
+    float *sw2 = (float *)aligned_malloc((size_t)out_ch * kernel * sizeof(float));
+    int32_t *ws2 = (int32_t *)aligned_malloc((size_t)out_ch * kernel * sizeof(int32_t));
     if (!q2 || !sw2 || !ws2) { free(q2); free(sw2); free(ws2); return; }
-    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, w, ch, kernel, Cp);
+    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, w, in_ch, out_ch, kernel, Cp);
     e->q2 = q2; e->sw2 = sw2; e->wsum2 = ws2; e->Cp2 = Cp;
 }
 
@@ -813,7 +903,11 @@ static void causal_conv1d_blas(float *out, const float *in,
                                int kernel, int dilation) {
     const int use_bf16 = sd_amx_bf16_enabled() && (out_ch & 15) == 0;
     const int use_i8 = sd_int8_enabled() && qwen_sd_int8_usable(in_ch, out_ch);
-    if (use_bf16 || use_i8) {
+    /* DL-4 handles rectangular/wide shapes the v1 panel path cannot: the activation and
+     * weight padding is per-in_ch, so the 768/square gate does not apply to it. */
+    const int use_v2 = sd_int8_enabled() && sd_res1_v2_enabled() &&
+                       qwen_conv1d_int8_v2_available() && kernel >= 1 && in_ch > 0 && out_ch > 0;
+    if (use_bf16 || use_i8 || use_v2) {
         sd_wq_entry_t *e = sd_wq_get_conv(weight, out_ch, in_ch * kernel);
         if (e) {
             if (use_bf16 && e->amx_bf16_wpack)
@@ -824,12 +918,11 @@ static void causal_conv1d_blas(float *out, const float *in,
                 qwen_conv1d_int8_design_d(out, in, e->q, e->scales, e->wsum, bias,
                                           e->amx_d_wpack, in_ch, out_ch, length,
                                           kernel, dilation, e->Kp, sd_int8_blk());
-            else if (use_i8 && e->q && kernel >= 1 && in_ch == out_ch && (in_ch & 3) == 0 &&
-                     sd_res1_v2_enabled() && (e->q2 || !e->v2_tried)) {
-                if (!e->q2) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, weight, in_ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
+            else if (use_v2 && (e->q2 || !e->v2_tried)) {
+                if (!e->q2) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, weight, in_ch, out_ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
                 if (e->q2)
                     qwen_conv1d_int8_v2(out, in, e->q2, e->sw2, e->wsum2, bias,
-                                        in_ch, length, kernel, dilation, e->Cp2);
+                                        in_ch, out_ch, length, kernel, dilation, e->Cp2);
                 else
                     qwen_conv1d_int8(out, in, e->q, e->scales, e->wsum, bias,
                                      in_ch, out_ch, length, kernel, dilation,
@@ -1368,16 +1461,26 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
     int dec_hidden = 512;
     float *hidden = (float *)aligned_malloc((int64_t)n_frames * dec_hidden * sizeof(float));
 #ifdef USE_BLAS
+    uint16_t *bf16_xb = NULL;
+    float *bf16_yt = NULL;
+    if (sd->bf16_preup_ready && n_frames <= 16) {
+        const int max_cols = latent_dim > 1024 ? latent_dim : 1024;
+        const int max_rows = latent_dim > 1024 ? latent_dim : 1024;
+        bf16_xb = (uint16_t *)sd_tmp_alloc((size_t)n_frames * max_cols * sizeof(*bf16_xb));
+        bf16_yt = (float *)sd_tmp_alloc((size_t)n_frames * max_rows * sizeof(*bf16_yt));
+    }
     float *pre_conv_rm = (float *)aligned_malloc((int64_t)n_frames * latent_dim * sizeof(float));
     for (int f = 0; f < n_frames; f++)
         for (int d = 0; d < latent_dim; d++)
             pre_conv_rm[(int64_t)f * latent_dim + d] = pre_conv_out[(int64_t)d * n_frames + f];
     free(pre_conv_out);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                n_frames, dec_hidden, latent_dim, 1.0f,
-                pre_conv_rm, latent_dim,
-                sd->input_proj_weight, latent_dim,
-                0.0f, hidden, dec_hidden);
+    if (!sd_bf16_preup_matmat(hidden, sd->input_proj_weight_bf16, sd->input_proj_weight, pre_conv_rm,
+                              n_frames, dec_hidden, latent_dim, bf16_xb, bf16_yt))
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    n_frames, dec_hidden, latent_dim, 1.0f,
+                    pre_conv_rm, latent_dim,
+                    sd->input_proj_weight, latent_dim,
+                    0.0f, hidden, dec_hidden);
     free(pre_conv_rm);
     if (sd->input_proj_bias) {
         for (int f = 0; f < n_frames; f++)
@@ -1426,15 +1529,21 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
         }
 
 #ifdef USE_BLAS
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    n_frames, qkv_dim, dec_hidden, 1.0f,
-                    x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    n_frames, qkv_dim, dec_hidden, 1.0f,
-                    x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, kk, qkv_dim);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    n_frames, qkv_dim, dec_hidden, 1.0f,
-                    x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, vv, qkv_dim);
+        if (!sd_bf16_preup_matmat(q, l->attn_q_bf16, l->attn_q, x_norm,
+                                  n_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        n_frames, qkv_dim, dec_hidden, 1.0f,
+                        x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
+        if (!sd_bf16_preup_matmat(kk, l->attn_k_bf16, l->attn_k, x_norm,
+                                  n_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        n_frames, qkv_dim, dec_hidden, 1.0f,
+                        x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, kk, qkv_dim);
+        if (!sd_bf16_preup_matmat(vv, l->attn_v_bf16, l->attn_v, x_norm,
+                                  n_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        n_frames, qkv_dim, dec_hidden, 1.0f,
+                        x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, vv, qkv_dim);
 #else
         for (int s = 0; s < n_frames; s++) {
             const float *xs = x_norm + s * dec_hidden;
@@ -1526,10 +1635,12 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
 #ifdef USE_BLAS
         {
             float *oproj = x_norm;
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        n_frames, dec_hidden, qkv_dim, 1.0f,
-                        attn_out, qkv_dim, l->attn_o, qkv_dim,
-                        0.0f, oproj, dec_hidden);
+            if (!sd_bf16_preup_matmat(oproj, l->attn_o_bf16, l->attn_o, attn_out,
+                                      n_frames, dec_hidden, qkv_dim, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            n_frames, dec_hidden, qkv_dim, 1.0f,
+                            attn_out, qkv_dim, l->attn_o, qkv_dim,
+                            0.0f, oproj, dec_hidden);
             for (int s = 0; s < n_frames; s++) {
                 float *xs = hidden + s * dec_hidden;
                 float *ps = oproj + s * dec_hidden;
@@ -1568,22 +1679,28 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
         {
             float *ffn_gate = (float *)aligned_malloc((int64_t)n_frames * dec_inter * sizeof(float));
             float *ffn_up = (float *)aligned_malloc((int64_t)n_frames * dec_inter * sizeof(float));
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        n_frames, dec_inter, dec_hidden, 1.0f,
-                        x_norm, dec_hidden, l->ffn_gate, dec_hidden,
-                        0.0f, ffn_gate, dec_inter);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        n_frames, dec_inter, dec_hidden, 1.0f,
-                        x_norm, dec_hidden, l->ffn_up, dec_hidden,
-                        0.0f, ffn_up, dec_inter);
+            if (!sd_bf16_preup_matmat(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
+                                      n_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            n_frames, dec_inter, dec_hidden, 1.0f,
+                            x_norm, dec_hidden, l->ffn_gate, dec_hidden,
+                            0.0f, ffn_gate, dec_inter);
+            if (!sd_bf16_preup_matmat(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
+                                      n_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            n_frames, dec_inter, dec_hidden, 1.0f,
+                            x_norm, dec_hidden, l->ffn_up, dec_hidden,
+                            0.0f, ffn_up, dec_inter);
             for (int64_t i = 0; i < (int64_t)n_frames * dec_inter; i++)
                 ffn_gate[i] = (ffn_gate[i] / (1.0f + expf(-ffn_gate[i]))) * ffn_up[i];
             free(ffn_up);
             float *ffn_down_out = ffn_up = (float *)aligned_malloc((int64_t)n_frames * dec_hidden * sizeof(float));
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        n_frames, dec_hidden, dec_inter, 1.0f,
-                        ffn_gate, dec_inter, l->ffn_down, dec_inter,
-                        0.0f, ffn_down_out, dec_hidden);
+            if (!sd_bf16_preup_matmat(ffn_down_out, l->ffn_down_bf16, l->ffn_down, ffn_gate,
+                                      n_frames, dec_hidden, dec_inter, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            n_frames, dec_hidden, dec_inter, 1.0f,
+                            ffn_gate, dec_inter, l->ffn_down, dec_inter,
+                            0.0f, ffn_down_out, dec_hidden);
             free(ffn_gate);
             for (int s = 0; s < n_frames; s++) {
                 float *hs = hidden + s * dec_hidden;
@@ -1648,11 +1765,13 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
 
     float *latent_out = (float *)aligned_malloc((int64_t)n_frames * latent_dim * sizeof(float));
 #ifdef USE_BLAS
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                n_frames, latent_dim, dec_hidden, 1.0f,
-                hidden, dec_hidden,
-                sd->output_proj_weight, dec_hidden,
-                0.0f, latent_out, latent_dim);
+    if (!sd_bf16_preup_matmat(latent_out, sd->output_proj_weight_bf16, sd->output_proj_weight, hidden,
+                              n_frames, latent_dim, dec_hidden, bf16_xb, bf16_yt))
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    n_frames, latent_dim, dec_hidden, 1.0f,
+                    hidden, dec_hidden,
+                    sd->output_proj_weight, dec_hidden,
+                    0.0f, latent_out, latent_dim);
     if (sd->output_proj_bias) {
         for (int f = 0; f < n_frames; f++)
             for (int o = 0; o < latent_dim; o++)
@@ -1667,6 +1786,9 @@ static int sd_decode_body(qwen_tts_ctx_t *ctx, const int *codes, int n_frames,
             latent_out[(int64_t)f * latent_dim + o] = sum;
         }
     }
+#endif
+#ifdef USE_BLAS
+    sd_tmp_free(bf16_xb); sd_tmp_free(bf16_yt);
 #endif
     free(hidden);
 
@@ -1953,6 +2075,84 @@ extern int g_cuda_decoder_conv_on;
 extern int qwen_cuda_conv_decoder_run(void *ctx, float *signal, int cur_ch, int cur_len, float **audio_out, int *n_out);
 #endif
 
+/* ---- QWEN_SD_CNEXT_I8: the ConvNeXt pointwise pair on KleidiAI int8 -------------------
+ * The two GEMMs are the largest f32 weights left in the decoder unit (4096-wide) and their
+ * shapes are exactly a KAI int8 matmul with the sequence as the batch.  The unit runs on the
+ * lane team, so the dispatching wrapper qwen_kleidi_matmul_i8_native (which nests
+ * qwen_parallel) is not usable here; the prepared-state pair is: every worker packs the LHS
+ * into its own scratch, then runs this thread's n-tiles.  Outputs are int8 GEMMs with
+ * per-row weight scales, i.e. a NUMERIC change, so the flag is default off. */
+static int sd_cnext_i8_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_CNEXT_I8"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
+
+typedef struct { float *dst; const void *key; const float *lhs;
+                 int rows, cols, B; size_t dstride; } sd_kai_job_t;
+
+static void sd_kai_task(size_t tid, size_t nt, void *v) {
+    sd_kai_job_t *j = (sd_kai_job_t *)v;
+    const void *lp = qwen_kleidi_i8_region_prep(j->lhs, (size_t)j->cols * sizeof(float),
+                                                j->cols, j->B);
+    if (lp) qwen_kleidi_i8_region_run(j->key, j->dst, j->dstride, lp,
+                                      j->rows, j->cols, j->B, tid, nt);
+}
+
+static int sd_kai_matmul(float *dst, const void *key, const float *lhs,
+                         int rows, int cols, int B, size_t dstride) {
+    if (!qwen_kleidi_i8_region_usable(key, rows, cols, B)) return 0;
+    sd_kai_job_t j = { dst, key, lhs, rows, cols, B, dstride };
+    if (qwen_parallel_active()) { sd_kai_task(0, 1, &j); return 1; }
+    int nt = qwen_lane_thread_here() ? qwen_lane_team_size() : qwen_get_threads();
+    if (nt < 1) nt = 1;
+    if (nt == 1) sd_kai_task(0, 1, &j);
+    else          qwen_parallel((size_t)nt, sd_kai_task, &j);
+    return 1;
+}
+
+static void sd_cnext_quant_row(const float *w, int8_t *q, float *s, int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        const float *row = w + (size_t)r * cols;
+        float amax = 0.0f;
+        for (int c = 0; c < cols; c++) { float a = fabsf(row[c]); if (a > amax) amax = a; }
+        const float sc = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / sc;
+        int8_t *qr = q + (size_t)r * cols;
+        for (int c = 0; c < cols; c++) {
+            int v = (int)lrintf(row[c] * inv);
+            if (v > 127) v = 127;
+            if (v < -127) v = -127;
+            qr[c] = (int8_t)v;
+        }
+        s[r] = sc;
+    }
+}
+
+static int sd_cnext_i8_prepare(qwen_sd_convnext_t *cn, int cur_ch) {
+    if (!sd_cnext_i8_enabled() || cur_ch <= 0) return 0;
+    if (cn->pwconv1_i8) return cn->pw1_cols == cur_ch;
+    const int r1 = 4096, c1 = cur_ch, r2 = cur_ch, c2 = 4096;
+    int8_t *q1 = (int8_t *)aligned_malloc((size_t)r1 * c1);
+    float  *s1 = (float *)aligned_malloc((size_t)r1 * sizeof(float));
+    int8_t *q2 = (int8_t *)aligned_malloc((size_t)r2 * c2);
+    float  *s2 = (float *)aligned_malloc((size_t)r2 * sizeof(float));
+    if (!q1 || !s1 || !q2 || !s2) { free(q1); free(s1); free(q2); free(s2); return 0; }
+    sd_cnext_quant_row(cn->pwconv1_weight, q1, s1, r1, c1);
+    sd_cnext_quant_row(cn->pwconv2_weight, q2, s2, r2, c2);
+    if (!qwen_kleidi_register_i8_fam(cn->pwconv1_weight, q1, s1, r1, c1,
+                                     QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER) ||
+        !qwen_kleidi_register_i8_fam(cn->pwconv2_weight, q2, s2, r2, c2,
+                                     QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER)) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "[cnext] QWEN_SD_CNEXT_I8=1 but the weights were not registered (KleidiAI i8 off?); f32 path\n"); }
+        free(q1); free(s1); free(q2); free(s2);
+        return 0;
+    }
+    cn->pwconv1_i8 = q1; cn->pwconv1_scale = s1; cn->pw1_rows = r1; cn->pw1_cols = c1;
+    cn->pwconv2_i8 = q2; cn->pwconv2_scale = s2; cn->pw2_rows = r2; cn->pw2_cols = c2;
+    return 1;
+}
+
 static void convnext_mlp(qwen_sd_convnext_t *cn, float *signal, const float *residual,
                          int cur_ch, int cur_len) {
     for (int t = 0; t < cur_len; t++) {
@@ -1971,6 +2171,46 @@ static void convnext_mlp(qwen_sd_convnext_t *cn, float *signal, const float *res
     }
 
     int pw_dim = 4096;
+    if (sd_cnext_i8_prepare(cn, cur_ch)) {
+        float *y1 = (float *)sd_tmp_alloc((int64_t)pw_dim * cur_len * sizeof(float));
+        float *xt = (float *)sd_tmp_alloc((int64_t)cur_ch * cur_len * sizeof(float));
+        if (y1 && xt) {
+            for (int t = 0; t < cur_len; t++)
+                for (int c = 0; c < cur_ch; c++)
+                    xt[(size_t)t * cur_ch + c] = signal[(size_t)c * cur_len + t];
+            if (sd_kai_matmul(y1, cn->pwconv1_weight, xt, pw_dim, cur_ch, cur_len,
+                              (size_t)pw_dim * sizeof(float))) {
+                if (cn->pwconv1_bias)
+                    for (int t = 0; t < cur_len; t++)
+                        for (int i = 0; i < pw_dim; i++) y1[(size_t)t * pw_dim + i] += cn->pwconv1_bias[i];
+                for (int64_t i = 0; i < (int64_t)pw_dim * cur_len; i++)
+                    y1[i] = 0.5f * y1[i] * (1.0f + erff(y1[i] * 0.7071067811865476f));
+                float *y2 = (float *)sd_tmp_alloc((int64_t)cur_ch * cur_len * sizeof(float));
+                if (y2 && sd_kai_matmul(y2, cn->pwconv2_weight, y1, cur_ch, pw_dim, cur_len,
+                                        (size_t)cur_ch * sizeof(float))) {
+                    for (int c = 0; c < cur_ch; c++) {
+                        const float g = cn->gamma[c];
+                        const float b2 = cn->pwconv2_bias ? cn->pwconv2_bias[c] : 0.0f;
+                        for (int t = 0; t < cur_len; t++)
+                            signal[(size_t)c * cur_len + t] = residual[(size_t)c * cur_len + t]
+                                + (y2[(size_t)t * cur_ch + c] + b2) * g;
+                    }
+                    if (y2) sd_tmp_free(y2);
+                    sd_tmp_free(xt); sd_tmp_free(y1);
+                    return;
+                }
+                if (y2) sd_tmp_free(y2);
+            }
+        }
+        if (xt) sd_tmp_free(xt);
+        if (y1) sd_tmp_free(y1);
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[cnext] QWEN_SD_CNEXT_I8=1 but the int8 GEMM did not run (ch=%d len=%d); f32 path\n",
+                    cur_ch, cur_len);
+        }
+    }
     float *pw1_out = (float *)sd_tmp_alloc((int64_t)pw_dim * cur_len * sizeof(float));
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
@@ -2188,7 +2428,7 @@ static sd_wq_entry_t *cs_v2_entry(const float *w, int ch, int kernel) {
     if (!sd_int8_enabled() || !qwen_sd_int8_usable(ch, ch) || (ch & 3)) return NULL;
     sd_wq_entry_t *e = sd_wq_get_conv(w, ch, ch * kernel);
     if (!e || !e->q) return NULL;
-    if (!e->q2 && !e->v2_tried) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, w, ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
+    if (!e->q2 && !e->v2_tried) { pthread_mutex_lock(&sd_wq_mu); sd_wq_build_v2(e, w, ch, ch, kernel); pthread_mutex_unlock(&sd_wq_mu); }
     return e->q2 ? e : NULL;
 }
 static float *cs_conv1d_v2_ctx(sd_wq_entry_t *e, const float *in, int ch, int len,
@@ -2198,7 +2438,7 @@ static float *cs_conv1d_v2_ctx(sd_wq_entry_t *e, const float *in, int ch, int le
     float *out = (float *)sd_tmp_alloc((size_t)ch * len * sizeof(float));
     if (!out) return NULL;
     qwen_conv1d_int8_v2_ctx(out, in, warm ? tail : NULL, tail_cols, residual,
-                            e->q2, e->sw2, e->wsum2, b, ch, len, kernel, dilation, e->Cp2);
+                            e->q2, e->sw2, e->wsum2, b, ch, ch, len, kernel, dilation, e->Cp2);
     if (tail_cols > 0 && tail) cs_save_tail(tail, in, ch, len, tail_cols);
     return out;
 }
@@ -2378,6 +2618,41 @@ static float *cs_convt_direct(const float *in, int in_ch, int out_ch, int len,
 }
 #endif
 
+/* ---- QWEN_SD_CONVT_I8: the one-GEMM ConvT stack on KleidiAI int8 ----------------------
+ * The stack is [kernel*out_ch][in_ch] and the sequence is the batch: the same
+ * prepared-state shape the ConvNeXt pair uses, so sd_kai_matmul applies unchanged.  The
+ * carry/two-tap/bias epilogue is untouched -- it reads R in its own layout, so only the
+ * GEMM output is transposed back.  Numeric change, default off. */
+static int sd_convt_i8_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_CONVT_I8"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
+static struct { const float *key; int8_t *q; float *scale; int rows, cols; } g_convt_i8[6];
+static int sd_convt_i8_for(const float *stack, int rows, int cols) {
+    for (int i = 0; i < 6; i++)
+        if (g_convt_i8[i].key == stack)
+            return g_convt_i8[i].rows == rows && g_convt_i8[i].cols == cols;
+    int8_t *q = (int8_t *)aligned_malloc((size_t)rows * cols);
+    float *s = (float *)aligned_malloc((size_t)rows * sizeof(float));
+    if (!q || !s) { free(q); free(s); return 0; }
+    sd_cnext_quant_row(stack, q, s, rows, cols);
+    if (!qwen_kleidi_register_i8_fam(stack, q, s, rows, cols,
+                                     QWEN_KAI_COMP_TALKER, QWEN_KAI_FAM_OTHER)) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "[convt] QWEN_SD_CONVT_I8=1 but the stack was not registered; f32 path\n"); }
+        free(q); free(s);
+        return 0;
+    }
+    for (int i = 0; i < 6; i++)
+        if (!g_convt_i8[i].key) {
+            g_convt_i8[i].key = stack; g_convt_i8[i].q = q; g_convt_i8[i].scale = s;
+            g_convt_i8[i].rows = rows; g_convt_i8[i].cols = cols;
+            break;
+        }
+    return 1;
+}
+
 static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
                        int kernel, int stride,
                        const float *w, const float *b, float *carry) {
@@ -2401,7 +2676,26 @@ static float *cs_convt(const float *in, int in_ch, int out_ch, int len,
             float *R = (float *)sd_tmp_alloc((size_t)M * len * sizeof(float));
             float *out = (float *)sd_tmp_alloc((size_t)out_ch * out_len * sizeof(float));
             if (R && out) {
-                SD_GEMM(CblasNoTrans, CblasNoTrans, M, len, in_ch, 1.0f, stack, in_ch, in, len, 0.0f, R, len);
+                int done_i8 = 0;
+                if (sd_convt_i8_enabled() && sd_convt_i8_for(stack, M, in_ch)) {
+                    float *Rk = (float *)sd_tmp_alloc((size_t)M * len * sizeof(float));
+                    float *xt = (float *)sd_tmp_alloc((size_t)in_ch * len * sizeof(float));
+                    if (Rk && xt) {
+                        for (int t = 0; t < len; t++)
+                            for (int c = 0; c < in_ch; c++)
+                                xt[(size_t)t * in_ch + c] = in[(size_t)c * len + t];
+                        if (sd_kai_matmul(Rk, stack, xt, M, in_ch, len, (size_t)M * sizeof(float))) {
+                            for (int k = 0; k < M; k++)
+                                for (int t = 0; t < len; t++)
+                                    R[(size_t)k * len + t] = Rk[(size_t)t * M + k];
+                            done_i8 = 1;
+                        }
+                    }
+                    if (Rk) sd_tmp_free(Rk);
+                    if (xt) sd_tmp_free(xt);
+                }
+                if (!done_i8)
+                    SD_GEMM(CblasNoTrans, CblasNoTrans, M, len, in_ch, 1.0f, stack, in_ch, in, len, 0.0f, R, len);
                 qwen_convt_stack_epilogue(out, R, carry, b, out_ch, len, stride);
                 sd_tmp_free(R);
                 return out;
@@ -2889,7 +3183,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
         for (int d = 0; d < latent_dim; d++)
             pre_conv_rm[(int64_t)f * latent_dim + d] = pre_conv_out[(int64_t)d * conv_in_len + pad_frames + f];
     sd_tmp_free(pre_conv_out);
-    if (!sd_bf16_preup_matmat(hidden, sd->input_proj_weight_bf16, pre_conv_rm,
+    if (!sd_bf16_preup_matmat(hidden, sd->input_proj_weight_bf16, sd->input_proj_weight, pre_conv_rm,
                               new_frames, dec_hidden, latent_dim, bf16_xb, bf16_yt))
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     new_frames, dec_hidden, latent_dim, 1.0f,
@@ -2956,17 +3250,17 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
         qwen_rms_norm(x_norm, hidden, l->attn_norm, new_frames, dec_hidden, eps);
 
 #ifdef USE_BLAS
-        if (!sd_bf16_preup_matmat(q, l->attn_q_bf16, x_norm,
+        if (!sd_bf16_preup_matmat(q, l->attn_q_bf16, l->attn_q, x_norm,
                                   new_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
-        if (!sd_bf16_preup_matmat(new_k, l->attn_k_bf16, x_norm,
+        if (!sd_bf16_preup_matmat(new_k, l->attn_k_bf16, l->attn_k, x_norm,
                                   new_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, qkv_dim, dec_hidden, 1.0f,
                         x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, new_k, qkv_dim);
-        if (!sd_bf16_preup_matmat(new_v, l->attn_v_bf16, x_norm,
+        if (!sd_bf16_preup_matmat(new_v, l->attn_v_bf16, l->attn_v, x_norm,
                                   new_frames, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         new_frames, qkv_dim, dec_hidden, 1.0f,
@@ -3058,7 +3352,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
 #ifdef USE_BLAS
         {
             float *oproj = x_norm;
-            if (!sd_bf16_preup_matmat(oproj, l->attn_o_bf16, attn_out,
+            if (!sd_bf16_preup_matmat(oproj, l->attn_o_bf16, l->attn_o, attn_out,
                                       new_frames, dec_hidden, qkv_dim, bf16_xb, bf16_yt))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             new_frames, dec_hidden, qkv_dim, 1.0f,
@@ -3094,13 +3388,13 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
         {
             float *ffn_gate = (float *)sd_tmp_alloc((int64_t)new_frames * dec_inter * sizeof(float));
             float *ffn_up = (float *)sd_tmp_alloc((int64_t)new_frames * dec_inter * sizeof(float));
-            if (!sd_bf16_preup_matmat(ffn_gate, l->ffn_gate_bf16, x_norm,
+            if (!sd_bf16_preup_matmat(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
                                       new_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             new_frames, dec_inter, dec_hidden, 1.0f,
                             x_norm, dec_hidden, l->ffn_gate, dec_hidden,
                             0.0f, ffn_gate, dec_inter);
-            if (!sd_bf16_preup_matmat(ffn_up, l->ffn_up_bf16, x_norm,
+            if (!sd_bf16_preup_matmat(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
                                       new_frames, dec_inter, dec_hidden, bf16_xb, bf16_yt))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             new_frames, dec_inter, dec_hidden, 1.0f,
@@ -3110,7 +3404,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                 ffn_gate[i] = (ffn_gate[i] / (1.0f + expf(-ffn_gate[i]))) * ffn_up[i];
             sd_tmp_free(ffn_up);
             float *ffn_down_out = (float *)sd_tmp_alloc((int64_t)new_frames * dec_hidden * sizeof(float));
-            if (!sd_bf16_preup_matmat(ffn_down_out, l->ffn_down_bf16, ffn_gate,
+            if (!sd_bf16_preup_matmat(ffn_down_out, l->ffn_down_bf16, l->ffn_down, ffn_gate,
                                       new_frames, dec_hidden, dec_inter, bf16_xb, bf16_yt))
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             new_frames, dec_hidden, dec_inter, 1.0f,
@@ -3185,7 +3479,7 @@ static int sd_stream_st_body(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
 
     float *lat_dst = st->latent_cache + (int64_t)(st->latent_frames - st->latent_base) * latent_dim;
 #ifdef USE_BLAS
-    if (!sd_bf16_preup_matmat(lat_dst, sd->output_proj_weight_bf16, hidden,
+    if (!sd_bf16_preup_matmat(lat_dst, sd->output_proj_weight_bf16, sd->output_proj_weight, hidden,
                               new_frames, latent_dim, dec_hidden, bf16_xb, bf16_yt))
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     new_frames, latent_dim, dec_hidden, 1.0f,
@@ -3610,6 +3904,44 @@ static int rag_conv1d(float *out, const float *in, int in_ch, int out_ch,
                       const sd_rag_t *r, int kernel, int dilation,
                       const float *w, const float *bias, float * const *tails) {
     int64_t total = r->total;
+    if (sd_multislot_slots() >= 2 && r->n >= 2 && r->n <= 3 &&
+        total > 0 && total <= INT_MAX) {
+        int length = r->len[0], same = length > 0;
+        for (int b = 1; b < r->n && same; b++) same = r->len[b] == length;
+        if (same) {
+            sd_wq_entry_t *e = sd_wq_get_conv(w, out_ch, in_ch * kernel);
+            if (e) {
+                if (!e->q2 && !e->v2_tried) {
+                    pthread_mutex_lock(&sd_wq_mu);
+                    sd_wq_build_v2(e, w, in_ch, out_ch, kernel);
+                    pthread_mutex_unlock(&sd_wq_mu);
+                }
+                if (e->q2) {
+                    float *outv[3] = { NULL, NULL, NULL };
+                    const float *inv[3] = { NULL, NULL, NULL };
+                    const float *tailv[3] = { NULL, NULL, NULL };
+                    int tc[3] = { 0, 0, 0 };
+                    size_t stride[3] = { (size_t)total, (size_t)total, (size_t)total };
+                    const int tail_cols = (kernel - 1) * dilation;
+                    for (int b = 0; b < r->n; b++) {
+                        outv[b] = out + r->off[b];
+                        inv[b] = in + r->off[b];
+                        tailv[b] = tails ? tails[b] : NULL;
+                        tc[b] = tail_cols;
+                    }
+                    qwen_conv1d_int8_v2_multi_ctx_strided(
+                        outv, inv, tailv, tc, NULL, stride, stride,
+                        e->q2, e->sw2, e->wsum2, bias,
+                        in_ch, out_ch, r->n, length, kernel, dilation, e->Cp2);
+                    if (tails)
+                        for (int b = 0; b < r->n; b++)
+                            rag_save_tail(tails[b], in, in_ch, (int)total,
+                                          r->off[b], r->len[b], tail_cols);
+                    return 0;
+                }
+            }
+        }
+    }
     if (kernel == 1) {
         SD_GEMM(CblasNoTrans, CblasNoTrans, out_ch, (int)total, in_ch,
                 1.0f, w, in_ch, in, (int)total, 0.0f, out, (int)total);
@@ -4116,7 +4448,9 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
      * ragged batch alive when Design D or BF16 is explicitly selected.  Plain INT8/V1 keeps
      * the old fallback until it has an equivalent batched panel implementation. */
     const int sd_batch_amx = sd_amx_d_enabled() || sd_amx_bf16_enabled();
-    if (nb == 1 || !sd_exact_stream_enabled() || (sd_int8_enabled() && !sd_batch_amx)) {
+    const int sd_batch_v2 = sd_multislot_slots() >= 2;
+    if (nb == 1 || !sd_exact_stream_enabled() ||
+        (sd_int8_enabled() && !sd_batch_amx && !sd_batch_v2)) {
         free(idx);
         return sd_batch_fallback(ctx, it, n_items);
     }
@@ -4144,6 +4478,8 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     float *vq_out = NULL, *cb_sum = NULL, *vq_cf = NULL, *pre_conv_out = NULL;
     float *pre_conv_rm = NULL, *hidden = NULL, *q = NULL, *new_k = NULL, *new_v = NULL;
     float *x_norm = NULL, *attn_out = NULL, *lat_tmp = NULL, *signal = NULL;
+    uint16_t *bf16_xb = NULL;
+    float *bf16_yt = NULL;
 
     int64_t TF = 0;
     if (rag_alloc(&fr, nb) != 0) { rag_free(&fr); free(idx); return -1; }
@@ -4226,14 +4562,22 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     hidden = (float *)aligned_malloc(TF * dec_hidden * sizeof(float));
     pre_conv_rm = (float *)aligned_malloc(TF * latent_dim * sizeof(float));
     if (!hidden || !pre_conv_rm) goto done;
+    if (sd->bf16_preup_ready && TF <= 16) {
+        const int max_cols = latent_dim > dec_inter ? latent_dim : dec_inter;
+        const int max_rows = latent_dim > dec_inter ? latent_dim : dec_inter;
+        bf16_xb = (uint16_t *)sd_tmp_alloc((size_t)TF * max_cols * sizeof(*bf16_xb));
+        bf16_yt = (float *)sd_tmp_alloc((size_t)TF * max_rows * sizeof(*bf16_yt));
+    }
     for (int64_t f = 0; f < TF; f++)
         for (int d = 0; d < latent_dim; d++)
             pre_conv_rm[f * latent_dim + d] = pre_conv_out[(int64_t)d * TF + f];
     free(pre_conv_out); pre_conv_out = NULL;
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                (int)TF, dec_hidden, latent_dim, 1.0f,
-                pre_conv_rm, latent_dim, sd->input_proj_weight, latent_dim,
-                0.0f, hidden, dec_hidden);
+    if (!sd_bf16_preup_matmat(hidden, sd->input_proj_weight_bf16, sd->input_proj_weight, pre_conv_rm,
+                              (int)TF, dec_hidden, latent_dim, bf16_xb, bf16_yt))
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)TF, dec_hidden, latent_dim, 1.0f,
+                    pre_conv_rm, latent_dim, sd->input_proj_weight, latent_dim,
+                    0.0f, hidden, dec_hidden);
     free(pre_conv_rm); pre_conv_rm = NULL;
     if (sd->input_proj_bias)
         for (int64_t f = 0; f < TF; f++)
@@ -4287,12 +4631,18 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
 
         qwen_rms_norm(x_norm, hidden, l->attn_norm, (int)TF, dec_hidden, eps);
 
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
-                    1.0f, x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
-                    1.0f, x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, new_k, qkv_dim);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
-                    1.0f, x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, new_v, qkv_dim);
+        if (!sd_bf16_preup_matmat(q, l->attn_q_bf16, l->attn_q, x_norm,
+                                  (int)TF, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
+                        1.0f, x_norm, dec_hidden, l->attn_q, dec_hidden, 0.0f, q, qkv_dim);
+        if (!sd_bf16_preup_matmat(new_k, l->attn_k_bf16, l->attn_k, x_norm,
+                                  (int)TF, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
+                        1.0f, x_norm, dec_hidden, l->attn_k, dec_hidden, 0.0f, new_k, qkv_dim);
+        if (!sd_bf16_preup_matmat(new_v, l->attn_v_bf16, l->attn_v, x_norm,
+                                  (int)TF, qkv_dim, dec_hidden, bf16_xb, bf16_yt))
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, qkv_dim, dec_hidden,
+                        1.0f, x_norm, dec_hidden, l->attn_v, dec_hidden, 0.0f, new_v, qkv_dim);
 
         for (int b = 0; b < nb; b++) {
             for (int s = 0; s < fr.len[b]; s++) {
@@ -4366,8 +4716,10 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
 
         {
             float *oproj = x_norm;
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_hidden, qkv_dim,
-                        1.0f, attn_out, qkv_dim, l->attn_o, qkv_dim, 0.0f, oproj, dec_hidden);
+            if (!sd_bf16_preup_matmat(oproj, l->attn_o_bf16, l->attn_o, attn_out,
+                                      (int)TF, dec_hidden, qkv_dim, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_hidden, qkv_dim,
+                            1.0f, attn_out, qkv_dim, l->attn_o, qkv_dim, 0.0f, oproj, dec_hidden);
             for (int64_t s = 0; s < TF; s++) {
                 float *xs = hidden + s * dec_hidden;
                 float *ps = oproj + s * dec_hidden;
@@ -4386,17 +4738,23 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
             float *ffn_up   = (float *)aligned_malloc(TF * dec_inter * sizeof(float));
             float *ffn_down_out = NULL;
             if (!ffn_gate || !ffn_up) { free(ffn_gate); free(ffn_up); goto done; }
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
-                        1.0f, x_norm, dec_hidden, l->ffn_gate, dec_hidden, 0.0f, ffn_gate, dec_inter);
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
-                        1.0f, x_norm, dec_hidden, l->ffn_up, dec_hidden, 0.0f, ffn_up, dec_inter);
+            if (!sd_bf16_preup_matmat(ffn_gate, l->ffn_gate_bf16, l->ffn_gate, x_norm,
+                                      (int)TF, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
+                            1.0f, x_norm, dec_hidden, l->ffn_gate, dec_hidden, 0.0f, ffn_gate, dec_inter);
+            if (!sd_bf16_preup_matmat(ffn_up, l->ffn_up_bf16, l->ffn_up, x_norm,
+                                      (int)TF, dec_inter, dec_hidden, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_inter, dec_hidden,
+                            1.0f, x_norm, dec_hidden, l->ffn_up, dec_hidden, 0.0f, ffn_up, dec_inter);
             for (int64_t i = 0; i < TF * dec_inter; i++)
                 ffn_gate[i] = (ffn_gate[i] / (1.0f + expf(-ffn_gate[i]))) * ffn_up[i];
             free(ffn_up);
             ffn_down_out = (float *)aligned_malloc(TF * dec_hidden * sizeof(float));
             if (!ffn_down_out) { free(ffn_gate); goto done; }
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_hidden, dec_inter,
-                        1.0f, ffn_gate, dec_inter, l->ffn_down, dec_inter, 0.0f, ffn_down_out, dec_hidden);
+            if (!sd_bf16_preup_matmat(ffn_down_out, l->ffn_down_bf16, l->ffn_down, ffn_gate,
+                                      (int)TF, dec_hidden, dec_inter, bf16_xb, bf16_yt))
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, dec_hidden, dec_inter,
+                            1.0f, ffn_gate, dec_inter, l->ffn_down, dec_inter, 0.0f, ffn_down_out, dec_hidden);
             free(ffn_gate);
             for (int64_t s = 0; s < TF; s++) {
                 float *hs = hidden + s * dec_hidden;
@@ -4421,9 +4779,11 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
 
     lat_tmp = (float *)aligned_malloc(TF * latent_dim * sizeof(float));
     if (!lat_tmp) goto done;
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, latent_dim, dec_hidden,
-                1.0f, hidden, dec_hidden, sd->output_proj_weight, dec_hidden,
-                0.0f, lat_tmp, latent_dim);
+    if (!sd_bf16_preup_matmat(lat_tmp, sd->output_proj_weight_bf16, sd->output_proj_weight, hidden,
+                              (int)TF, latent_dim, dec_hidden, bf16_xb, bf16_yt))
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)TF, latent_dim, dec_hidden,
+                    1.0f, hidden, dec_hidden, sd->output_proj_weight, dec_hidden,
+                    0.0f, lat_tmp, latent_dim);
     if (sd->output_proj_bias)
         for (int64_t f = 0; f < TF; f++)
             for (int o = 0; o < latent_dim; o++)
@@ -4492,6 +4852,7 @@ done:
     free(vq_out); free(cb_sum); free(vq_cf); free(pre_conv_out); free(pre_conv_rm);
     free(hidden); free(q); free(new_k); free(new_v); free(x_norm); free(attn_out);
     free(lat_tmp); free(signal);
+    sd_tmp_free(bf16_xb); sd_tmp_free(bf16_yt);
     if (rc != 0) for (int i = 0; i < n_items; i++) it[i].rc = rc;
     return rc;
 }

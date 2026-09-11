@@ -65,10 +65,16 @@ int qwen_kleidi_matmul_i8_qkv(float *q, float *k, float *v,
                               const float *x, int in_dim, int q_dim, int kv_dim);
 
 int qwen_kleidi_register_bf16(const void *key, const uint16_t *W, int rows, int cols);
+int qwen_kleidi_unregister_bf16(const void *key);
 int qwen_kleidi_matmul_bf16(float *Y, const void *key, const float *X, int rows, int cols, int B);
 int qwen_kleidi_matmul_bf16_native(float *dst, const void *key, const float *lhs,
                                    size_t lhs_stride, size_t dst_stride,
                                    int rows, int cols, int B);
+int  qwen_kleidi_bf16_region_usable(const void *key, int rows, int cols, int B);
+const void *qwen_kleidi_bf16_region_prep(const float *lhs, size_t lhs_stride, int cols, int B);
+void qwen_kleidi_bf16_region_run(const void *key, float *dst, size_t dst_stride,
+                                 const void *lhs_packed, int rows, int cols, int B,
+                                 size_t tid, size_t nt);
 
 int qwen_kleidi_i8_enabled(void);
 int qwen_kleidi_bf16_enabled(void);

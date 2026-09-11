@@ -127,6 +127,8 @@ static const char *gate_id(int mmk) {
     case QWEN_MMK_Q4_AVX2:     return "gate.q4.avx2";
     case QWEN_MMK_Q4_SMMLA:    return "gate.q4.smmla";
     case QWEN_MMK_KLEIDI_Q4:   return "gate.q4.kleidi";
+    case QWEN_MMK_KLEIDI_I8:   return "gate.int8.kleidi";
+    case QWEN_MMK_KLEIDI_BF16: return "gate.bf16.kleidi";
     default:                   return "gate.other";
     }
 }
@@ -381,13 +383,20 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_RES1_V2",
             onoff(qwen_sd_res1_v2_active()),
             qwen_sd_res1_v2_active()
-                ? "direct dilated int8 VNNI conv for the residual convs (per-position activation scale, per-(channel,tap) weight scale; DL-4)"
-                : "opt-in (QWEN_SD_RES1_V2=1); off: the residual convs run on the im2col panel kernel");
-        row(&feats[n++], "decoder.pre_up_bf16", "yes", yn(qwen_avx512_bf16_matmat_available()),
+                ? "direct dilated int8 DL-4 conv (VNNI / Arm dotprod; per-position activation scale, per-(channel,tap) weight scale). Any shape: it serves res1, res2, the rectangular initial/pre convs and wide channels; the in_ch<=768 square-only bound applies to the v1/Design-D paths, not here"
+                : "opt-in (QWEN_SD_RES1_V2=1); off: the residual convs run on the im2col panel kernel (v1 int8 where the square/768 shape allows, f32 otherwise)");
+        row(&feats[n++], "decoder.pre_up_bf16", "yes",
+            yn(qwen_avx512_bf16_matmat_available() || qwen_kleidi_bf16_enabled()),
             "QWEN_SD_BF16_PREUP", onoff(qwen_sd_bf16_preup_active()),
             qwen_sd_bf16_preup_active()
-                ? "diagnostic persistent BF16 pre-transformer weights; streaming per-item path only"
+                ? "persistent BF16 pre-transformer weights; native AVX-512 BF16 or Arm KleidiAI prepared rows"
                 : "default OFF; f32 decoder pre-transformer path remains the control");
+        row(&feats[n++], "decoder.multislot", yn(qwen_conv1d_int8_v2_multi_available()),
+            yn(qwen_conv1d_int8_v2_multi_available()), "QWEN_SD_MULTISLOT",
+            onoff(qwen_sd_multislot_active()),
+            qwen_sd_multislot_active()
+                ? "lane cohort DL-4 shared-weight sweep for 2..3 equal-length slots; rectangular in/out shapes supported"
+                : "default OFF; requires QWEN_SD_INT8=1, QWEN_SD_RES1_V2=1 and a shape-compatible lane cohort");
         row(&feats[n++], "decoder.convt_stack", "yes", "yes", "QWEN_SD_CONVT_STACK",
             onoff(qwen_sd_convt_stack_active()),
             qwen_sd_convt_stack_active()
@@ -396,7 +405,7 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
         row(&feats[n++], "decoder.glue_fused", yn(qwen_conv1d_int8_v2_available()),
             yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_GLUE", onoff(qwen_sd_glue_active()),
             qwen_sd_glue_active()
-                ? "residual unit fused on the VNNI path: context-aware V2 conv, residual in the epilogue, no ext/full/cut/add passes"
+                ? "residual unit fused on the DL-4 path (VNNI / Arm dotprod): context-aware conv, residual in the epilogue, no ext/full/cut/add passes"
                 : "opt-in (QWEN_SD_GLUE=1, needs QWEN_SD_RES1_V2=1); off: the control residual unit");
         row(&feats[n++], "decoder.mode", "yes", "yes", "QWEN_DECODER_BATCH",
             qwen_sd_decoder_mode(),
@@ -707,6 +716,8 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
                     qwen_sd_stream_strip_active() ? "true" : "false");
             fprintf(j, "    \"res1_v2_active\": %s,\n", qwen_sd_res1_v2_active() ? "true" : "false");
             fprintf(j, "    \"pre_up_bf16_active\": %s,\n", qwen_sd_bf16_preup_active() ? "true" : "false");
+            fprintf(j, "    \"decoder_multislot_active\": %s,\n",
+                    qwen_sd_multislot_active() ? "true" : "false");
             { const char *lm_step = "", *lm_dec = ""; qwen_lane_masks(&lm_step, &lm_dec);
               fprintf(j, "    \"decoder_lane_active\": %s,\n", (lm_dec && lm_dec[0]) ? "true" : "false");
               fprintf(j, "    \"decoder_lane_elastic\": %s,\n", qwen_lane_elastic() ? "true" : "false"); }

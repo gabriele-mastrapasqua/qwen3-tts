@@ -128,27 +128,38 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       split-input V2 were exact/parity-safe where tested but slower or neutral; both
       were reverted. The remaining alternative geometries are not justified by the
       current evidence. Detail: `.work/c12-win-glue-vnni-20260909.md`.
-- [ ] C12-WIN-10 Admission slicing (prefill as resumable token-range slices inside the
-      frame loop, one slice per iteration while streams are active, all at once when idle).
-      Spec: `.work/c12-win-admission-slicing-implementation.md`. Gate: `admit_ms` p95 <= 30 ms,
-      codes/mel parity, then 10-min C12 soak short p95 <= 0.92 with TTFA p95 <= 300 ms.
-      Do not use PREFILL_HELPER, a thread, or a trimmed prompt as the implementation.
-      IMPLEMENTED default-off as `QWEN_PREFILL_SLICE=N` (2026-09-10). Correctness contract
-      REVISED (spec section 8): (A) slicing state-machine parity is a HARD EXACT gate and
-      passes at zero (`--prefill-slice-check`: dec_x 0.0, 0 KV rows differing, slices 2..48,
-      no 1-token slice ever emitted); (B) monolithic-vs-sliced drift is expected and bounded
-      (8e-4 to 1.7e-3, below one bf16 ulp) and is NOT a bug; (C) the old 9.2 mel gate is
-      WITHDRAWN as unsatisfiable and replaced by a paired product-quality bank. Remaining:
-      the `admit_ms` diagnostic, the A/B and the quality bank on the qualification path.
-      NOT RUN on x86.
-- [ ] C12-WIN-11 Conv-stack traffic: ConvT as ONE un-expanded GEMM (`[k·out_ch][in_ch]`
-      stacked weights, R = W×in, two-tap fused epilogue with carry/bias), then weight-only
-      bf16 with f32 activations/accumulate for ConvT block 0, convnext pw, initial conv.
-      Spec: `.work/c12-win-conv-stack-implementation.md`. Gate: step A >= 2 ms with parity
-      1e-5, A+B >= 4 ms on the q4 unit, paired mel >= 0.99 for B. Zero-expanded ConvT
-      formulation and bf16 activations explicitly forbidden. Step A IMPLEMENTED default-off
-      as `QWEN_SD_CONVT_STACK=1` (2026-09-09), self-test 8e-8 vs the per-tap reference on
-      every block geometry; step B not started. NOT RUN on x86.
+- [x] C12-WIN-10 Admission slicing (prefill as resumable token-range slices inside the frame
+      loop). Spec: `.work/c12-win-admission-slicing-implementation.md`; local evidence
+      `.work/c12-win-admission-slicing-20260910.md`. CLOSED 2026-09-10 on Turin: state parity
+      CORRECT, serving behaviour a severe REGRESSION, flag stays default-off and unpromoted.
+      Sliced-state parity was proven exact for every partition without a one-token slice, and
+      two engine defects were found and fixed while proving it. The server A/B says the
+      mechanism must not be promoted. Closed-loop C12, 10 minutes per arm, frozen profile,
+      one variable: completed 1294 -> 721 (-44 %), TTFA p95 183 -> 1574 ms, STREAM_RTF p95
+      0.922 -> 4.609, and 7 server request timeouts against 0 on the control. It made the
+      established-stream interference it was built to remove about five times worse.
+      Note what it did NOT test: all four workers report mean_slices=1.00, so with a warm
+      prefix cache the admission prefill is ~1 new token (seq_len=10, prefix=9) and nothing
+      was ever actually split. The damage therefore comes from the sliced-admission PATH, not
+      from slicing -- most likely the one-admission-per-frame-iteration break stealing
+      iterations from running streams. A first A/B attempt with the true-wave arrival model
+      was void and is not cited: with a positive flag and n_active==0 the code takes the whole
+      prefill in one slice by design, so a wave that releases every request into an idle
+      engine cannot reach the mechanism at all. Any retry needs a redesign of the admission
+      path first, plus a cold-prefix workload so real multi-slice prefills occur.
+- [x] C12-WIN-11 A Conv-stack traffic: ConvT as ONE un-expanded GEMM per layer with a fused
+      two-tap carry/bias epilogue. Spec: `.work/c12-win-conv-stack-implementation.md`.
+      CLOSED 2026-09-10 on Turin: implementation CORRECT, effect NULL, flag stays default-off.
+      Correctness passes on x86 -- self-test 0 failures with the convt_stack cases at 3e-8..1e-7
+      against a 1e-5 contract, dispatch verified ON/OFF, CLI audio mel-corr 0.99962 at identical
+      duration. The microbench (1.7B, 4 threads, taskset 4-7, B1-B4, 9 warm reps) shows no
+      effect at the product quantum: chunk-4 deltas B1 -0.20, B2 -0.70, B3 +0.70, B4 +1.30 ms,
+      and 16 of 32 cells faster -- a coin flip. A control-vs-control run of the SAME arm on the
+      same binary in the same minutes measured a noise floor of -0.40..+2.70 ms at chunk 4 and
+      up to 32 ms at chunk 16, so every one of those deltas is inside the noise. Note for any
+      future rung: the >= 2 ms gate this spec asked for is BELOW this harness's own resolution
+      at B3/B4 (noise alone is +2.7 ms there); a rung that needs to resolve 2 ms needs paired
+      replicates, not a single run of each arm.
 - [x] C12-WIN-12 VNNI glue as one combined change: out-of-place snake1, V2 kernel with
       (tail, tail_cols) context and residual epilogue, plain allocs, ownership transfer.
       Spec: `.work/c12-win-vnni-glue-implementation.md`. CLOSED 2026-09-10 on Turin:
@@ -190,21 +201,59 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
 - Stop: if no target, no falsifier and no screen moves C12 above noise, hand the evidence to
       the post-Turin architecture review instead of stacking micro-optimizations.
 
-### Deferred ARM-LINUX-V2 — parity for the v2 serving generation and C12-WIN (MEDIUM)
+### ARM-LINUX-V2 — parity implementation complete; optional policy qualification deferred
 
-- [ ] After the Turin C12-WIN track closes, bring Arm Linux serving up to the v2 generation.
-      Track document with the verified/unverified split, the ordered work and the
-      do-not-carry-over list: `.work/arm-linux-v2-parity-track-20260910.md`.
+- [x] Arm Linux serving is at the v2 generation on `feature/arm-parity-vnni` (`6117437`).
+      The implementation, exact self-tests, ISA/link checks, dispatch checks and final
+      config policy are complete. The track document with the verified/unverified split
+      and do-not-carry-over list remains `.work/arm-linux-v2-parity-track-20260910.md`.
       Headline finding, CONFIRMED against this tree: the decoder lane
       (`QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC`) has NO ISA guard — only `__linux__` —
       so the mechanism of record on the Turin product profile ports to Arm unchanged, and no
       Arm profile sets it. The reason it was never tried is a wrong sentence in our own
       handoff, corrected 2026-09-10. Also confirmed: the five newest decoder flags have zero
       entries in `docs/feature-flags.md`, and `g_mm_gate[]` has no KleidiAI int8/bf16 rows.
-      NOT established and not to be quoted: every Arm serving number behind this, which came
-      from an unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
-      server — below the regime the lane exists for.
+      The old unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
+      server remains non-evidence. The new exact-commit Axion screen is recorded below as
+      a one-wave performance screen only, not as an Arm product qualification.
       Ordering: the build break above is NOT part of this track and must not wait for it.
+      Progress on `feature/arm-parity-vnni` (2026-09-10): items 0 (link fix, = TQ-6), 1
+      (KleidiAI gate rows), 2 (prefork plans on the inherited mask), 3 (docs + expectation
+      rows), 4 (lane honours the requested engine width) and the Arm DL-4 leaf of item 8
+      are implemented; the leaf passes the 20-case `--self-test` on aarch64 dotprod.
+      Item 7's region body is wired on Arm through the prepared-state API that was written
+      for it and never connected: Talker and CP batched regions now pack the KleidiAI LHS
+      once per projection group and run the same kai_i8_task in-region.  Verified on the
+      16-core Neoverse-V2: Talker region 12/12 WAV byte-identical on/off, CP region 12/12
+      byte-identical, arm-product preflight VALID, dispatch gate PASS; C10 2x8 lane4
+      elastic + RES1_V2 + GLUE + CONVT_STACK measures STREAM p95 0.843 against 0.939 for
+      the untreated tree (WAVE screen, no SOAK yet).  RES1_V2 audio gate: 21/21 paired
+      files, mel-corr min 0.9945.
+      The original next list is now closed at implementation level: pre-transformer BF16
+      wiring, rectangular/wide DL-4, and multi-slot DL-4 are all implemented and tested.
+      The lane-team constraint is handled by the prepared-state prep/run pair (tid/nt),
+      while the region/prepared-state API remains keyed on the ORIGINAL f32 weight pointer.
+      DONE since: DL-4 rectangular/wide shapes (API `in_ch`/`out_ch`, any shape when the flag is
+      on; two rectangular self-test cases exact / 5.6e-3); ConvNeXt pointwise pair on KAI
+      int8 (`QWEN_SD_CNEXT_I8`, default off) --
+      6 paired server texts mel-corr min 0.99736 / mean 0.99805, C10 0.843 -> 0.821.
+      Item 1 implementation is now wired through full, streaming and ragged pre-transformer
+      forwards: Arm KAI registers all persistent BF16 rows and unregisters them on teardown;
+      the Neoverse-V2 smoke is functional on both 0.6B and 1.7B, but the BF16 quality screen
+      remains NO-GO (the implementation is default-off). Item 3 is implemented for VNNI and
+      Arm SDOT with compact and production strided APIs, exact S=2/S=3 oracles, and a lane
+      cohort. The Arm 2/3-slot WAVE reached group=2/3 with zero mailbox overruns, but measured
+      2.8--3.9% slower on the short 0.6B/1.7B A/B, so it is also default-off. Evidence and
+      remaining qualification gaps: `.work/arm-linux-v2-parity-implementation-20260911.md`.
+      Exact-commit Axion FAST screen (Neoverse-V2, 2x8, short synchronized wave, custom
+      1b7 model, INT8) reached C8 with lane split=4: C6/C8 STREAM p95 `.646/.716`,
+      TOTAL p95 `.699/.806`, TTFA p95 `236/303 ms`, zero errors/rejects; C12/C14 are
+      screen-only and miss playback headroom. Inline control was `.917/.860` STREAM p95
+      at C6/C8; split=2 was slower, so no lane split is promoted in the Arm profile.
+      This is not an apples-to-apples Turin claim: Turin has 32 cores and the reference
+      screen uses the open 1.7B model. Turin's 4x8 screen was `.87/.87` STREAM p95 at
+      C6/C8, making the Arm C6/C8 steady-state screen comparable despite half the cores;
+      first-audio and full qualification still need a repeated product run.
       Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
       convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
       largest single item. DO NOT chase the AMX strip/range port: it was measured first and
@@ -212,7 +261,7 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       three September AMX gaps are CLOSED on this branch; do not reopen them from the older
       cross-backend audit page. AMX lacking V2 is a dispatch-order CHOICE (Design-D precedes
       V2), not a gap.
-- [ ] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
+- [x] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
       `.work/arm-linux-v2-parity-track-20260910.md` section 2b. Four facts the dispatch map
       does not show: `QWEN_SD_RES1_V2` selects on SHAPE (`kernel>=1 && in_ch==out_ch &&
       !(in_ch&3)`), so it takes res2 and every square conv, not just res1 — implementing
@@ -221,9 +270,38 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       AVX-512F-without-VNNI have NO int8 decoder conv at all, so the gap is three CPU
       families; and an undeclared `in_ch <= 768` gate drops every backend to f32 above it,
       AMX and VNNI included. Work: one dotprod/i8mm DL-4 leaf against the already ISA-neutral
-      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract, closing Arm + AVX2 +
-      AVX-512F together. Rename/re-document the flag and the `decoder.res1_v2` row and
-      declare the 768 gate in the map FIRST.
+      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract. DONE on
+      `feature/arm-parity-vnni`: the leaf exists for Arm dot-product and the API is now
+      rectangular (`in_ch`/`out_ch`, Cp from `in_ch`), so DL-4 also takes the initial/pre
+      convs and the wide channels that the v1 panel and Design-D paths cannot; --self-test
+      covers both rectangular shapes and the 20 square ones. AVX2/AVX-512F-without-VNNI stay
+      on the f32 fallback, so the three-family claim of this item is not delivered. The flag
+      and the `decoder.res1_v2` row are re-documented but not renamed. Arm widened-path
+      quality/perf promotion remains intentionally open; parity implementation and exact
+      Arm/x86 build/self-test gates are complete (the VNNI kernel shares the API change).
+
+- [x] ARM-LINUX-V2 final config TODO, completed last after the BF16/multi-slot A/B and x86
+      VNNI compile/parity checks: update `configs/perf/arm-product.json` and
+      `configs/perf/axion-16c-ttfa.json` with RES1_V2, lane, multi-slot and BF16 policy.
+      RES1_V2 is available; BF16 pre-up and multi-slot remain explicit default-off controls
+      until their separate quality/16-core qualification gates pass.
+
+- [ ] PRE-GRAVITON-5 regression gate (ASAP, before any AWS Graviton 5 spot campaign):
+      this is an ordered two-arm gate, and Graviton is blocked until both arms are recorded:
+      (1) FAST rerun `turin-c8a-32c-vnni-product` with the already qualified "yesterday"
+      policy fully on (native BF16 prefill, INT8 VNNI decoder, RES1_V2, elastic split=4
+      lane, pool-spin and the frozen topology), at least C6/C8 plus the established C11/C12
+      boundary, using the same model/bank/seed and dispatch/self-test checks; this is the
+      regression control against `.work/turin-vnni-final-handoff-20260909.md` and
+      `.work/c12-win-checkpoint-20260909.md`. (2) Run a separate unqualified FAST diagnostic
+      on the same Turin topology with the new cross-ISA options enabled together:
+      `QWEN_SD_BF16_PREUP=1`, `QWEN_SD_MULTISLOT=2`, `QWEN_SD_GLUE=1` and
+      `QWEN_SD_CONVT_STACK=1` (RES1_V2/lane remain on); record C6/C8/C11/C12 deltas,
+      errors/rejects, TTFA, playback and RTF. `QWEN_SD_CNEXT_I8` is Arm/KleidiAI-specific
+      and is not part of the VNNI arm. Any all-on gain is diagnostic only until paired WAV,
+      mel/ASR/listening and a serving gate pass. Do not start the Graviton topology matrix
+      until the control shows no regression or the regression is explained and recorded,
+      and the all-on result is classified as GO/NO-GO.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
@@ -417,6 +495,19 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       request before closing; also record that rejection is per worker (cap 4): C20 sent 8
       rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
       for a simultaneous wave when the parent balances.
+- [ ] TQ-8 Leading silence before speech: a measured ~0.5 s of dead air ahead of the first
+      voiced frame on a 1.7B-class checkpoint (median 0.50 s over 36 files) against 0.06 s on
+      a 0.6B-class one (52 files), consistent across every text class. It is not covered by
+      any latency metric we gate on: what a caller experiences is TTFA PLUS the lead-in, so
+      ~740 ms against ~186+60 ms. That is larger than anything the C12-WIN decoder ladder was
+      chasing, and the ladder delivered nothing. CAUSE NOT ESTABLISHED -- model-emitted silent
+      frames or an engine/prompt artefact are both open, and checkpoint size is confounded
+      with training data. FIRST STEP is the discriminator, not a fix: run the same
+      energy-envelope pass on the OPEN 1.7B and 0.6B models, same bank and settings; ~10
+      minutes, CLI is enough. Only if it is model-side does a bounded, default-off leading
+      trim make sense, gated on `safe_play_start` rather than TTFA and checked against the
+      streaming decoder's continuity contract. Detail:
+      `.work/leading-silence-perceived-latency-20260910.md`.
 - [ ] TQ-7 GPU serving: `--backend cuda --prefork N` is silently broken. VERIFIED at HEAD:
       the resident CUDA Talker/CP state is created in `main.c` (~:1665) BEFORE
       `qwen_tts_serve_prefork` (~:3082) forks; a CUDA context does not survive `fork()`, and
@@ -430,16 +521,16 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       a GPU-resident decoder replaces that component rather than tuning it; the
       backend-agnostic layers do carry over. Detail:
       `.work/arm-linux-v2-parity-track-20260910.md` section 2e.
-- [ ] TQ-6 BUILD BREAK, not Arm-specific: the tree does not link when neither
+- [x] TQ-6 BUILD BREAK, not Arm-specific: the tree does not link when neither
       `__ARM_FEATURE_DOTPROD` nor `__AVX512VNNI__` is defined — `SIMD=portable` (the default
       non-VNNI x86 target) and `SIMD=scalar` both fail. Seven symbols are declared and called
       unconditionally but defined only inside the ISA guard in `qwen_tts_kernels.c`, and the
       `#else` fallback sits inside that guard, so it is unreachable. VERIFIED at HEAD with
       `make blas ARCH_FLAGS="-march=armv8-a"`. Partly introduced by C12-WIN: `_ctx` in
-      ddfa5d8, `_pack_stack`/`_stack_epilogue` in edfd3fb. Fix: an unconditional fallback
-      section outside the guard, and move the two ConvT helpers out of the ISA guard entirely
-      (they contain no intrinsic). Add `SIMD=portable` and `SIMD=scalar` link-only CI jobs —
-      this break is invisible on a VNNI or dotprod host. Detail:
+      ddfa5d8, `_pack_stack`/`_stack_epilogue` in edfd3fb. FIXED on `feature/arm-parity-vnni`:
+      the ISA-neutral ConvT stack and the DL-4 packer moved outside the guard, no-op fallbacks
+      for the three ISA-bound entry points, link-only CI jobs. Re-verified with
+      `-march=armv8-a` (links, self-test PASS) and on the native build. Detail:
       `.work/arm-linux-v2-parity-track-20260910.md` section 1.
 - [x] TQ-5 HTTP JSON string parsing: **ROOT-CAUSED + FIXED** in
       `cf8dd6b09d6de8abc51cccfa6aa90d3fa062b8c7`. The server now decodes standard JSON

@@ -258,8 +258,8 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_DECODER_THREAD` | off | experimental decoder consumer beside Talker; with `QWEN_SD_POOL=engine` it submits decoder tiles to the shared engine pool, but the current path disables inline decoder batching and is **not a serving default** (C4 Tier-A test regressed STREAM_RTF p95 0.847→1.296 and TTFA p95 174→1126 ms; detail `.work/p4-same-pool-decoder-20260907.md`) |
 | `QWEN_SD_POOL` | server: `engine` | `engine` runs decoder tiles on the engine pool (inline when already inside a region); `private` keeps the decoder's own worker team. Legacy aliases `qwen`, `q`, `1` (engine) and `0` (private) remain accepted; unknown values fail fast |
 | `QWEN_BLAS_OWN` | server: `1` | `1` holds OpenBLAS at one thread and partitions the decoder SGEMMs across the engine pool (exact sub-problems, output bit-identical); `0` lets OpenBLAS run its own team |
-| `QWEN_CP_REGION` | on (x86 VNNI **and AMX**, int8 CP) | runs each batched code-predictor transformer step as ONE persistent parallel region with spin barriers between phases instead of 20 pool dispatches; per-slot sections run one slot per thread; outputs bit-identical; `0` restores the dispatched path. The in-region runner follows the same gate table the dispatcher uses, so an AMX host runs AMX tiles in-region at `B>=4` and VNNI row blocks below that |
-| `QWEN_TK_REGION` | on (x86 VNNI, int8 Talker) | same design for the batched Talker step: one pool entry per step (28 layers, projections as VNNI row blocks, per-slot sections one slot per thread) instead of 112 dispatches; outputs bit-identical; `0` restores the dispatched path. Off automatically on every other ISA, with int4/bf16 weights and on the GCD pool |
+| `QWEN_CP_REGION` | on (x86 VNNI **and AMX**, int8 CP; Arm i8mm via KleidiAI prepared state) | runs each batched code-predictor transformer step as ONE persistent parallel region with spin barriers between phases instead of 20 pool dispatches; per-slot sections run one slot per thread; outputs bit-identical; `0` restores the dispatched path. The in-region runner follows the same gate table the dispatcher uses, so an AMX host runs AMX tiles in-region at `B>=4`, VNNI row blocks below that, and an Arm host packs the KleidiAI LHS once per projection group and runs the same `kai_i8_task` the dispatched path runs |
+| `QWEN_TK_REGION` | on (x86 VNNI, int8 Talker; Arm i8mm via KleidiAI prepared state) | same design for the batched Talker step: one pool entry per step (28 layers, projections as VNNI row blocks, per-slot sections one slot per thread) instead of 112 dispatches; outputs bit-identical; `0` restores the dispatched path. Off automatically with int4/bf16 weights and on the GCD pool |
 | `QWEN_CP_FRAME_REGION` | on (same build/shape conditions as `QWEN_CP_REGION`) | runs the WHOLE 16-step code-predictor frame — every MTP projection, every transformer step and every lm_head argmax — inside ONE pool entry instead of 47. The embedding row of each step is either `code0` or an argmax this frame produced, so the sequence is decidable before entering; kernels, quantiser and argmax order are unchanged and the codes are bit-identical. `0` restores the per-call path |
 | `QWEN_CP_BATCH_HEAD` | on (x86 VNNI **and AMX**, int8 CP heads) | at concurrency >= 2 runs the MTP projection and each lm_head once for all active slots as one int8 matmat (same quantiser, exact int32 dots, codes bit-identical) instead of one GEMV per slot; `0` restores the per-slot path; int4/bf16 heads and other ISAs keep the per-slot path automatically |
 | `QWEN_SD_SCRATCH_STATS` | off | diagnostic: when a stream ends, prints its decoder scratch arena (blocks, bytes, peak per chunk, spills) |
@@ -269,6 +269,13 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_SD_SGEMM_CENSUS` | off | diagnostic: prints every decoder SGEMM shape with its wall time (every 100 calls and at exit) |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |
+| `QWEN_SD_RES1_V2` | off | direct dilated int8 conv (DL-4) for the residual convs: per-position activation scale, per-(channel,tap) weight scale, no im2col panel. Leaves for AVX-512 VNNI and Arm dot-product. The DL-4 leaf takes any shape (rectangular and wide included: the activation/weight padding is per `in_ch`), so it serves **res2, the initial/pre convs and every square conv**, not only res1; the flag name understates it. The `in_ch <= 768` square-only bound now applies to the v1 panel and Design-D paths, not to DL-4 |
+| `QWEN_SD_GLUE` | off | fused residual unit on top of `QWEN_SD_RES1_V2`: snake out of place, res1 with its left context passed to the kernel, res2 with the residual in the kernel epilogue (exact, one pass) |
+| `QWEN_SD_CONVT_STACK` | off | ConvT as one un-expanded GEMM per layer with a two-tap/carry/bias epilogue (exact); measured neutral on the x86 product quantum, never qualified on Arm |
+| `QWEN_SD_CONVT_I8` | off | the one-GEMM ConvT stack (needs `QWEN_SD_CONVT_STACK=1`) on KleidiAI int8 with per-row weight scales; the exact carry/two-tap/bias epilogue is unchanged and only the GEMM output is transposed back. Numeric change: default off, Arm i8mm only today |
+| `QWEN_SD_CNEXT_I8` | off | the ConvNeXt pointwise pair (4096-wide, the largest f32 weights left in the decoder unit) on KleidiAI int8 with per-row weight scales, built at first use and driven through the prepared-state pair because the unit runs on the lane team. Numeric change: off until a paired audio gate; Arm i8mm only today |
+| `QWEN_SD_BF16_PREUP` | off | diagnostic persistent bf16 pre-transformer weights; failed its x86 audio gate and stays off |
+| `QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC` | off | reserve the last N cpus of the worker mask for a private decoder team, and narrow the engine pool only while a decoder unit is in flight. Linux-only, **not ISA-specific** |
 | `QWEN_SERVER_ASYNC_OUTPUT` | off | experimental stream transport isolation: a bounded per-stream PCM queue and detached writer keep inference callbacks off the socket; queue overflow/disconnect fails and closes the stream rather than dropping PCM silently |
 | `QWEN_STREAM_OUTPUT_MAX_BYTES` | 1048576 | byte cap for the experimental per-stream output queue; invalid values fall back to the 1 MiB default |
 | `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS` | 5000 | socket send timeout used by the experimental stream writer; a stalled reader is terminated after the timeout |
@@ -447,8 +454,15 @@ their `*_MIN_B` thresholds. `QWEN_PREFILL_MATMAT` exists on both, but what it se
 the KleidiAI bf16 matmat on ARM, the AMX one on x86.
 
 **x86 only** — `QWEN_NO_VNNI`, `QWEN_NO_VNNI_TILE`, `QWEN_NO_AMX`, `QWEN_NO_AVX2MM`,
-`QWEN_NO_BF16DOT`, `QWEN_NO_BF16_MATMUL`, `QWEN_SD_INT8` (on by default only where AVX-512 VNNI
-exists), the AMX/VNNI/AVX2 batch thresholds, and the `*_NCHUNK` row-chunk family.
+`QWEN_NO_BF16DOT`, `QWEN_NO_BF16_MATMUL`, the AMX/VNNI/AVX2 batch thresholds, and the
+`*_NCHUNK` row-chunk family.
+
+**Both, but opt-in outside VNNI** — `QWEN_SD_INT8` has an int8 decoder conv on Arm
+dot-product too; it is default-on only where AVX-512 VNNI is. `QWEN_SD_RES1_V2` and
+`QWEN_SD_GLUE` have both a VNNI and an Arm dot-product leaf. `QWEN_SD_LANE_SPLIT` /
+`QWEN_SD_LANE_ELASTIC` and `QWEN_SD_CONVT_STACK` carry no ISA guard at all. AVX2 and
+AVX-512F have **no** int8 decoder conv, so there the whole family falls back to f32
+im2col + SGEMM.
 
 **The two sides are not symmetric, and the asymmetry is the point.** `QWEN_KAI_NCHUNK` is on by
 default at 384 because sub-tiling the KleidiAI GEMM was measured to win on ARM. The x86

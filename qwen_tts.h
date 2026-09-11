@@ -235,6 +235,10 @@ typedef struct {
     const float *norm_weight;
     const float *norm_bias;
     const float *gamma;
+    /* QWEN_SD_CNEXT_I8: per-output-row int8 copies of the two pointwise weights, built
+     * once at first use, registered with KleidiAI under the f32 pointer as the key. */
+    int8_t *pwconv1_i8; float *pwconv1_scale; int pw1_rows, pw1_cols;
+    int8_t *pwconv2_i8; float *pwconv2_scale; int pw2_rows, pw2_cols;
 } qwen_sd_convnext_t;
 
 typedef struct {

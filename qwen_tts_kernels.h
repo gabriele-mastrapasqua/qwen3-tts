@@ -408,6 +408,7 @@ int qwen_sd_stream_strip_active(void);
 int qwen_sd_fused_residual_active(void);
 const char *qwen_sd_decoder_mode(void);
 int  qwen_sd_res1_v2_active(void);
+int  qwen_sd_multislot_active(void);
 int  qwen_sd_glue_active(void);       /* QWEN_SD_GLUE=1 on top of RES1_V2 (C12-WIN-12) */   /* QWEN_SD_RES1_V2=1 and the kernel is available on this ISA */
 int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
                                       size_t *bytes_out);
@@ -497,17 +498,36 @@ int  qwen_conv1d_int8_v2_available(void);
 void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
                              const float *residual,
                              const int8_t *wq, const float *sw, const int32_t *wsum,
-                             const float *bias, int ch, int length, int kernel, int dilation, int Cp);
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp);
 void qwen_convt_stack_epilogue(float *out, const float *R, float *carry, const float *bias,
                                int out_ch, int len, int stride);      /* C12-WIN-11 step A */
 void qwen_convt_pack_stack(float *stack, const float *packed, int in_ch, int out_ch, int kernel);
 int  qwen_sd_convt_stack_active(void);
 int  qwen_conv1d_int8_v2_cp(int ch);                      /* padded channel count of the DL-4 layout */
 void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
-                              const float *w, int ch, int kernel, int Cp);
+                              const float *w, int in_ch, int out_ch, int kernel, int Cp);
 void qwen_conv1d_int8_v2(float *out, const float *in,
                          const int8_t *wq, const float *sw, const int32_t *wsum,
-                         const float *bias, int ch, int length, int kernel, int dilation, int Cp);
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp);
+/* DL-4 multi-slot cohort.  All slots share the packed weights and geometry; the
+ * compact API uses [channel][length] buffers per slot.  The strided form is for
+ * the ragged decoder workset, where each slot is a window into one global
+ * [channel][total] allocation.  Both preserve the single-slot numerical order. */
+int  qwen_conv1d_int8_v2_multi_available(void);
+void qwen_conv1d_int8_v2_multi_ctx(float *const *out, const float *const *in,
+                                   const float *const *tail, const int *tail_cols,
+                                   const float *const *residual,
+                                   const int8_t *wq, const float *sw, const int32_t *wsum,
+                                   const float *bias, int in_ch, int out_ch, int nslots,
+                                   int length, int kernel, int dilation, int Cp);
+void qwen_conv1d_int8_v2_multi_ctx_strided(
+                                   float *const *out, const float *const *in,
+                                   const float *const *tail, const int *tail_cols,
+                                   const float *const *residual,
+                                   const size_t *in_stride, const size_t *out_stride,
+                                   const int8_t *wq, const float *sw, const int32_t *wsum,
+                                   const float *bias, int in_ch, int out_ch, int nslots,
+                                   int length, int kernel, int dilation, int Cp);
 void qwen_conv1d_int8_design_d(float *out, const float *in,
                                const int8_t *Wq, const float *sw, const int32_t *wsum,
                                const float *bias, const int8_t *Wpack,

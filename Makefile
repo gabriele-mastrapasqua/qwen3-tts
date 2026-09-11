@@ -69,6 +69,25 @@ endif
 
 CFLAGS = $(CFLAGS_BASE) -I$(INGOT_DIR)/include $(KAI_INC) $(EXTRA_CFLAGS)
 
+# Compile flags are invisible to make: `make blas` followed by
+# `make blas ARCH_FLAGS="-march=armv8-a"` reused every object and produced a MIXED binary
+# (portable kernels with a native dispatch, observed 2026-09-10).  Keep the effective flags
+# in a stamp file rewritten ONLY when they change; every compiled object depends on it, so a
+# flag change forces a full recompile and an unchanged build stays a no-op.  Changing SIMD
+# alone is the same trap because it also changes -DQWEN_SIMD_PROFILE.
+#
+# The stamp is a real target so the 1 s settle runs only when the value changes: GNU make
+# 3.81 (the one Apple ships) compares mtimes in whole seconds, and a stamp written in the
+# same second as the last object would silently leave that object stale.
+ARCH_STAMP_DIR   := .build_state
+ARCH_STAMP       := $(ARCH_STAMP_DIR)/compile_flags
+ARCH_STAMP_VALUE := SIMD=$(SIMD) ARCH_FLAGS=$(ARCH_FLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS)
+
+$(ARCH_STAMP): FORCE
+	@mkdir -p $(ARCH_STAMP_DIR)
+	@printf '%s\n' '$(ARCH_STAMP_VALUE)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; sleep 1; fi
+
 KAI_HAS_I8MM := $(shell $(CC) $(ARCH_FLAGS) -dM -E -x c /dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8)
 ifeq ($(KAI_HAS_I8MM),1)
 KAI_DIR  = third_party/kleidiai
@@ -130,7 +149,7 @@ SRCS = main.c \
 
 OBJS = $(SRCS:.c=.o) $(KAI_AOBJ)
 
-%_asm.o: %_asm.S
+%_asm.o: %_asm.S $(ARCH_STAMP)
 	$(CC) $(CFLAGS) -c -o $@ $<
 TARGET = qwen_tts
 
@@ -325,16 +344,17 @@ test-decoder-tool: $(filter-out main.o,$(OBJS)) test_decoder_standalone.o
 	$(CC) $(CFLAGS) -o qwen_tts_decoder_tool $^ $(LDLIBS)
 	@echo "Built ./qwen_tts_decoder_tool  (usage: ./qwen_tts_decoder_tool codes.txt [model_dir] [out.wav])"
 
-%.o: %.c
+%.o: %.c $(ARCH_STAMP)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-qwen_tts_speech_encoder.o: qwen_tts_speech_encoder.c
+qwen_tts_speech_encoder.o: qwen_tts_speech_encoder.c $(ARCH_STAMP)
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -MMD -MP -c -o $@ $<
 
 -include $(OBJS:.o=.d) qwen_tts_backend.d qwen_tts_cuda.d qwen_tts_metal.d
 
 clean:
 	@rm -f qwen_build_id.h qwen_build_id.h.tmp
+	rm -rf $(ARCH_STAMP_DIR)
 	rm -f $(OBJS) $(OBJS:.o=.d) $(TARGET) qwen_tts_backend.o qwen_tts_cuda.o qwen_tts_metal.o qwen_tts_cuda_kernels.o
 	rm -f qwen_tts_backend.d qwen_tts_cuda.d qwen_tts_metal.d vendor/lz4.d
 	rm -f test_decoder_standalone.o test_decoder_standalone.d qwen_tts_decoder_tool
@@ -628,7 +648,7 @@ $(MEMBW_BIN): tests/membw.c
 
 MINI_ARMS ?= --int8 --int4 --quant-mixed-int6=q4n14
 
-tests/decoder_batch_parity.o: tests/decoder_batch_parity.c
+tests/decoder_batch_parity.o: tests/decoder_batch_parity.c $(ARCH_STAMP)
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 test-decoder-batch-parity: $(filter-out main.o,$(OBJS)) tests/decoder_batch_parity.o $(INGOT_LIB)
@@ -638,7 +658,7 @@ test-decoder-batch-parity: $(filter-out main.o,$(OBJS)) tests/decoder_batch_pari
 	@echo "--- same schedule, without one-frame chunks (expected: bit-identical) ---"
 	@QWEN_PARITY_PAT=2 ./qwen_tts_batch_parity $(MODEL_SMALL) 4 6
 
-tests/decode_quantum_bench.o: tests/decode_quantum_bench.c
+tests/decode_quantum_bench.o: tests/decode_quantum_bench.c $(ARCH_STAMP)
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 test-decode-quantum: $(filter-out main.o,$(OBJS)) tests/decode_quantum_bench.o $(INGOT_LIB)
