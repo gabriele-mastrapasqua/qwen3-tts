@@ -97,6 +97,12 @@ qualification contract, were:
 | 14 | 1.304 / 1.386 | 0.928 / 1.036 |
 | 16 | 1.378 / 1.427 | 0.974 / 1.053 |
 
+These C6-C16 rows are synchronized parallel WAVE measurements (three waves per
+level), not long SOAKs. The clean paired SOAK was run at C4 only, once with the
+control and once with all-on. There was no paired C16 SOAK in this campaign.
+C18 belongs only to the earlier exploratory all-on mini-sweep; it was not run
+as a control/all-on SOAK pair and is not part of this qualification table.
+
 ### Quality gate
 
 The control WAVs were valid and passed structural WAV QC. The all-on paired
