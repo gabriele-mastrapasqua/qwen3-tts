@@ -344,12 +344,16 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       again, split the matrix by model. For 1.7B, run identical closed-loop SOAKs for
       control OFF and exploratory all-on at C6/C8/C12/C16; run C18 as a diagnostic edge
       only if admission remains meaningful (C4 is already covered for 1.7B). For 0.6B,
-      extend the existing C1/C4/C8/C12 FAST screen through C16/C20 and continue to C24+
-      until the knee, then SOAK the selected levels for both arms. Record per-model,
-      per-C TTFA, STREAM/TOTAL, prebuffer, safe-start, stall@250/@500, rejects/errors,
-      resources and wall time. A WAVE is not a capacity qualification: do not call any
-      1.7B C12/C16/C18 or 0.6B C16/C20+ level qualified without same-model SOAK evidence;
-      all-on remains non-promotable unless paired audio also passes.
+      extend the existing C1/C4/C8/C12 FAST screen through C16/C20/C22/C24+ until the
+      knee, then SOAK the selected levels for both arms. Keep the current fail-fast
+      admission/batch cap as the control, but add a second small-model pass with an
+      explicitly raised per-worker batch/admission cap when testing C20/C22/C24; record
+      the exact cap and queue policy in the manifest. A WAVE is not a capacity
+      qualification: do not call any 1.7B C12/C16/C18 or 0.6B C16/C20+ level qualified
+      without same-model SOAK evidence and errors/rejects=0. A c4a 32-core Arm result
+      can select candidate C levels and cap settings for this pass, but cannot replace
+      same-host Graviton5 evidence. All-on remains non-promotable unless paired audio
+      also passes.
 
 - [ ] GRAVBOX-1 GCP c4a highcpu-32 Arm candidate: record the Iowa region and quoted
       `$1.21/hour` cost, then—only after the per-model SOAKs and feature gates—derive a
