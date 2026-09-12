@@ -324,6 +324,6 @@
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-0.6b",
     "speaker": "ryan",
-    "notes": "This profile deliberately scopes the all-on deployment candidate to this 32-core c4a host and the 0.6B model. It makes no 1.7B claim and does not change arm-product defaults. C20 is an edge policy, not a promise of zero tail stalls under every text mix; C32 must remain admission-only. Status stays unqualified until the candidate has a canonical clean-tree SOAK and paired 0.6B audio gate."
+    "notes": "This profile deliberately scopes the all-on deployment candidate to this 32-core c4a host and the 0.6B model. It makes no 1.7B claim and does not change arm-product defaults. Final confirmation: C16 had zero errors/rejects/timeouts and STREAM_RTF p95 0.881 but missed per-class drift; C20 is an edge with STREAM_RTF p50/p95 1.02/1.09 and playback degradation; paired audio mel correlation was 0.94558-0.96306 vs 0.98. C32 must remain admission-only. Status stays unqualified until the numerical/audio delta is fixed or explicitly accepted."
   }
 }
