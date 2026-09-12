@@ -370,6 +370,10 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       separate 32-core Arm profile from `arm-product` with the newly qualified flags.
       The box setup alone must not promote BF16 pre-up, lane, multi-slot or other
       optional features; keep the profile explicitly tied to its 32-core topology.
+      A host/model-scoped all-on deployment candidate is now recorded at
+      `configs/perf/axion-c4a-highcpu32-0p6b-all-on.json`: C16 preferred, C20 soft edge,
+      C32 admission-only. It remains `unqualified` until a clean-tree canonical SOAK
+      and paired 0.6B audio gate are run.
 
 - [ ] TURIN-POST-ARM quick regression safety screen (before the next cross-ISA release
       claim or paid capacity ladder): rerun the current VNNI control and yesterday's
