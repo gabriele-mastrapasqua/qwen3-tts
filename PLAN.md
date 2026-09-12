@@ -353,7 +353,11 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       without same-model SOAK evidence and errors/rejects=0. A c4a 32-core Arm result
       can select candidate C levels and cap settings for this pass, but cannot replace
       same-host Graviton5 evidence. All-on remains non-promotable unless paired audio
-      also passes.
+      also passes. After the current c4a campaign, if the 1.7B C12-C16 interval is
+      incomplete or C16 fails at the current cap, add a fine-grained C13/C14/C15
+      sweep for control and all-on. Run it first at the existing cap for comparability;
+      if admission rejects are the limiting factor, repeat the selected levels with an
+      explicitly raised cap and label that as a separate admission experiment.
 
 - [ ] GRAVBOX-1 GCP c4a highcpu-32 Arm candidate: record the Iowa region and quoted
       `$1.21/hour` cost, then—only after the per-model SOAKs and feature gates—derive a
