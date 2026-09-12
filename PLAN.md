@@ -351,6 +351,12 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       1.7B C12/C16/C18 or 0.6B C16/C20+ level qualified without same-model SOAK evidence;
       all-on remains non-promotable unless paired audio also passes.
 
+- [ ] GRAVBOX-1 GCP c4a highcpu-32 Arm candidate: record the Iowa region and quoted
+      `$1.21/hour` cost, then—only after the per-model SOAKs and feature gates—derive a
+      separate 32-core Arm profile from `arm-product` with the newly qualified flags.
+      The box setup alone must not promote BF16 pre-up, lane, multi-slot or other
+      optional features; keep the profile explicitly tied to its 32-core topology.
+
 - [ ] TURIN-POST-ARM quick regression safety screen (before the next cross-ISA release
       claim or paid capacity ladder): rerun the current VNNI control and yesterday's
       promoted feature profile at C6/C8, including one short FAST and the existing
