@@ -358,6 +358,12 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       sweep for control and all-on. Run it first at the existing cap for comparability;
       if admission rejects are the limiting factor, repeat the selected levels with an
       explicitly raised cap and label that as a separate admission experiment.
+      The c4a candidate admission experiment is now complete (2026-09-12): with
+      batch-cap 8 per worker on 4x8, WAVE admission reached C32 with zero rejects for
+      both 0.6B arms and C36 rejected 12; no raised-cap C20+ SOAK passed the strict
+      playback/KPI gate. This selects C20 as an exploratory all-on candidate and C32
+      as an admission-only candidate, not as qualification. Detail:
+      `.work/c4a-arm-v2-raised-cap-report-20260912.md`.
 
 - [ ] GRAVBOX-1 GCP c4a highcpu-32 Arm candidate: record the Iowa region and quoted
       `$1.21/hour` cost, then—only after the per-model SOAKs and feature gates—derive a
