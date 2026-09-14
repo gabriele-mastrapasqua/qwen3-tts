@@ -72,6 +72,144 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ## Immediate priorities
 
+### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
+
+This is the current serving blocker before any new headline concurrency claim. Keep the
+benchmark families separate: TRUE-WAVE / parallel capacity, sustained closed-loop capacity,
+and realistic arrival-load capacity (for example POISSON). A true-wave result is never a
+sustained qualification.
+
+- [x] ARM-SOAK-0 Reproduce and classify the regression (2026-09-13): C6/C7/C8 mini-soaks
+      reproduce it in roughly 2–5 minutes; zero crashes, rejects, request timeouts and
+      obvious functional failures, but STREAM_RTF p95 is around/above 1, safe-start rises,
+      and stall@250/@500 becomes material. The baseline does not show systematic
+      window-by-window growth; memory, threads, FDs and scratch remain stable. Long STAGE
+      iterations are 271–364 ms and the problematic samples contain roughly 171–196 ms of
+      admission/prefill while decoder time is negligible. This is currently a
+      serving/scheduling/QoS problem, not a proven allocator leak.
+- [x] ARM-SOAK-0a Prefill-helper A/B: control vs `QWEN_PREFILL_HELPER=1`, same Arm v2
+      all-on C8/4x8 1.7B closed-loop run. The helper removed inline prefill from STAGE but
+      worsened STREAM p95 `1.041 -> 1.098`, safe-start p95 `717 -> 1129 ms`, stall@250
+      `20.1% -> 46.8%` and stall@500 `2.8% -> 10.1%`; errors/rejects/timeouts stayed
+      `0/0/0`. **REJECTED** as a treatment; the broader admission/prefill resource-
+      interference hypothesis is **PARTIALLY CONFIRMED**, because the helper still uses
+      the shared engine pool and adds contention. Keep helper default-off.
+- [x] ARM-SOAK-1 **P0-A playback-first admission guard** (2026-09-13): implemented as a
+      reversible `QWEN_ADMISSION_GUARD` policy in the continuous batched lane and tested
+      at the same all-on C8 closed-loop point. With a 400 ms ready-audio target, control →
+      guard changed STREAM_RTF p95 `1.061 -> 1.053`, stall@250 `25.5% -> 13.8%`, but
+      stall@500 `4.7% -> 6.5%`, safe-start p95 `776 -> 3066 ms`, TTFA p95 `241 ->
+      2805 ms`, and completed requests `173 -> 147`; errors/rejects/timeouts stayed
+      `0/0/0`, with stable threads/RSS/FDs. The guard recorded 111 deferred admissions
+      versus 87 immediate admissions; defer p50 was roughly 1.0–1.6 s per worker, p95
+      2.8–3.0 s, and the largest observed defer was 19.4 s. **PARTIALLY CONFIRMED**:
+      it reduces short playback gaps, but the current policy over-protects by making
+      fresh admission latency and throughput unacceptable, while the 500 ms tail remains
+      unsafe. Do not promote this target or start slicing yet; tune/retest the admission
+      decision as the next P0 experiment. The guard is intentionally limited to the
+      continuous batched queue; `JOB_SINGLE` is not covered by this A/B.
+- [x] ARM-SOAK-2 **P0-B cooperative prefill slices** (2026-09-13): the existing
+      token-range path was exercised at `QWEN_PREFILL_SLICE=24` and `48` on the same C8
+      setup, with `[ADMSLICE]` proof in both runs. It did not provide bounded playback
+      occupancy: nonzero `prefill_ms` was invariant at about `83.5/96.6 ms` p50/p95 for
+      24 and `82.4/96.7 ms` for 48; STREAM/safe-start/stall tails did not improve enough
+      to offset the cost. **REJECTED for playback protection in this configuration**;
+      do not test 72. The next blocker is the source of the approximately 80–100 ms
+      non-preemptible floor (kernel/layer/setup granularity), to be located before any
+      finer-grained preemption or genuine resource-isolation A/B.
+- [x] ARM-SOAK-2a **P0-B finer prefill checkpoint**: the short component trace found no
+      single 90 ms kernel. A 28-layer range is serial and non-yielding: per-layer total
+      `2.92/3.29 ms` p50/p95, range total `83.24/88.43 ms`, setup/finalize approximately
+      zero. The layer-level checkpoint is implemented behind `QWEN_PREFILL_LAYER_SLICE`
+      and the prescribed C8 sweep ran with token slice/guard/helper off on the same new
+      binary. Occupancy scaled as intended: baseline `84.9/119.5 ms`, layer 1 single-
+      digit (sampled ~3 ms), layer 2 `5.9/10.6 ms`, layer 4 `11.7/20.1 ms` nonzero
+      `prefill_ms` p50/p95. Results were:
+
+      | layer group | TTFA p95 | safe-start p95 | STREAM p95 | stall@250 | stall@500 | completed |
+      |---:|---:|---:|---:|---:|---:|---:|
+      | 0 (baseline) | 223 ms | 846 ms | 1.049 | 30.4% | 6.3% | 79 |
+      | 1 | 2460 ms | 3380 ms | 1.105 | 25.8% | 11.3% | 62 |
+      | 2 | 1208 ms | 2079 ms | 1.076 | **11.8%** | **2.9%** | 68 |
+      | 4 | **757 ms** | **1872 ms** | 1.131 | 22.9% | 11.4% | 70 |
+
+      All points had zero errors/rejects/timeouts. **PARTIALLY CONFIRMED**: true layer
+      checkpoints remove the ~85 ms non-preemptible floor and layer=2 materially protects
+      playback, but the one-pending-admission design turns that protection into admission
+      starvation; no point is promoted as the production default. Do not micro-tune 3/5/6
+      layers. Next discriminator is genuine admission/playback resource isolation (or an
+      equivalent bounded admission policy) rather than another token/layer sweep.
+- [ ] ARM-SOAK-3 **P0-C explicit temporal/QoS budget**: cap admission wall time and return
+      control to active generation when the playback budget is at risk; start from the
+      layer=2 checkpoint, not the rejected token-range slice.
+- [x] ARM-SOAK-4 **P1 resource isolation** (2026-09-13): tested a genuine per-worker CPU
+      partition on Graviton5 C8/4x8, with layer=2 and no shared-pool helper. The treatment
+      reserved CPU 7/15/23/31 for admission and left engine masks 0-6/8-14/16-22/24-30;
+      helper binding was observed on each reserved CPU, OpenBLAS stayed at one thread and
+      the resource sample stayed at 216 threads with no RSS/FD growth. It did not retain
+      the layer=2 playback benefit: control vs isolate-1CPU STREAM p95 `1.070 -> 1.156`,
+      stall@250 `31.4% -> 30.3%`, stall@500 `8.6% -> 24.4%`, safe-start p95
+      `2.60 -> 3.63 s`, while TTFA p95 improved `1.39 -> 0.78 s`; completed requests
+      were `51 -> 49`, with zero errors/rejects/timeouts in both. Actual 2-layer groups
+      were initially 7-14 ms but under sustained load commonly 31-47 ms, with full
+      14-group prefill about 425-580 ms on the one reserved CPU. **REJECTED for this
+      1-CPU partition**: isolation was real, but it did not protect playback and is
+      underprovisioned for admission. Do not call the architecture fixed; no 2-CPU
+      follow-up is justified because continuity did not improve strongly.
+- [x] ARM-SOAK-4a **Graviton5 topology/bandwidth discriminator** (2026-09-13): the 32-core
+      Neoverse-V3 guest exposes one socket, one NUMA node and one 48 MiB L3 shared by
+      CPUs 0-31. Existing `membw` measured full-host read 13.1/102.3/159.0/160.8 GB/s
+      at 1/8/16/32 threads. The real Talker INT8 GEMV measured 1x8 at 8.82 ms/159.9
+      GB/s, 2x8 simultaneously at 19.82--22.19 ms/63.5--71.1 GB/s per worker, and
+      4x8 at 38.56--40.10 ms/35.1--36.5 GB/s per worker (aggregate ~143.4 GB/s).
+      The same 4x8 spread layout reached ~152.7 GB/s, only ~6.5% better. The follow-up
+      measured isolated 1x6/1x16 references and simultaneous 2x16 at 17.25--19.07 ms,
+      73.9--81.7 GB/s per worker, **155.6 GB/s aggregate**, plus 4x6 at 35.45--37.06 ms,
+      38.0--39.8 GB/s per worker, **155.4 GB/s aggregate**. Thus 2x16 is the next serving
+      baseline (4x6 is a close spare-core fallback); 1x32 is only a single-worker point.
+      **CONFIRMED**: cross-worker shared-cache/memory/fabric contention is material; 4x8
+      is not four independent Turin-like bandwidth domains. No production soak or
+      scheduler change was started; next is a short C6/C8 closed-loop check on 2x16.
+- [x] ARM-SOAK-4b **Graviton5 serving-width/affinity sweep** (2026-09-13): reused the
+      same five-repetition `roof_matvec` primitive, with isolated references 1x6
+      `10.50 ms/134.2 GB/s` and 1x16 `10.52 ms/134.0 GB/s`. Simultaneous 2x16 reached
+      `17.25--19.07 ms`, `73.9--81.7 GB/s` per worker and `155.6 GB/s` aggregate;
+      4x6 reached `35.45--37.06 ms`, `38.0--39.8 GB/s` per worker and `155.4 GB/s`;
+      contiguous 4x8 was `143.4 GB/s`, spread 4x8 `152.7 GB/s`. **2x16 wins** the
+      concurrent shape screen; 4x6 is a close spare-core fallback. Next: short C6/C8
+      closed-loop validation on 2x16, with no admission-policy tuning before that check.
+- [x] ARM-SOAK-4c **Axion cross-host GEMV control** (2026-09-13): the 32-core Neoverse-V2
+      Axion guest also exposes one NUMA node and one shared L3, but the same kernel gives
+      1x8 `8.98 ms/156.9 GB/s`, 2x8 `10.22--10.23 ms/137.8--137.9 GB/s` per worker
+      (`275.7 GB/s` aggregate), and 4x8 `15.97--16.49 ms/85.5--88.3 GB/s` per worker
+      (`347.8 GB/s` aggregate). Per-worker slowdown is only ~1.81x at 4x8 versus ~4.45x
+      on Graviton5, whose aggregate does not scale. **GRAVITON5-SPECIFIC CONTENTION
+      STRONGLY CONFIRMED**; no Axion engine soak was run. Keep 2x16 as the next G5
+      serving candidate, but treat the fabric/cache issue as a hardware-shape constraint
+      that scheduler tuning alone cannot remove.
+- [x] ARM-SOAK-4d **Graviton4 cross-host GEMV control** (2026-09-13): the AWS spot guest
+      reports 32 Neoverse-V2 cores, one NUMA node and one 36 MiB shared L3. The same
+      unchanged benchmark measured 1x8 `8.26 ms/170.7 GB/s`, 2x8 `9.65--10.07 ms` and
+      `139.9--146.1 GB/s` per worker (`286.0 GB/s` aggregate), and 4x8 `12.91--12.99 ms`
+      and `108.5--109.2 GB/s` per worker (`435.1 GB/s` aggregate). Per-worker slowdown is
+      ~1.57x at 4x8 versus ~4.45x on Graviton5. **GRAVITON5-SPECIFIC CONTENTION STRONGLY
+      CONFIRMED by two ARM controls**; no G4 engine soak or spread sweep was run.
+- [x] ARM-SOAK-4e **Graviton4 short closed-loop curiosity screen** (2026-09-13): with
+      the explicit Arm-v2 all-on environment and unchanged 4x8 server, 1.7B/C8 completed
+      131 requests in 2 minutes with STREAM p95 `0.680`, safe-start p95 `230 ms`,
+      stall@250/500 `0%/0%`, and zero errors/rejects/timeouts (**PASS**). The 0.6B/C16
+      screen completed 128 with zero functional errors but STREAM p95 `1.084`, safe-start
+      p95 `1.876 s`, stall@250/500 `46.8%/14.7%` (**FAIL playback**). These are diagnostic
+      screens only, not G4 qualifications or capacity promotion.
+- [ ] ARM-SOAK-5 **P1 admission concurrency cap**: test max one concurrent admission/prefill,
+      accepting some fresh-request TTFA increase in exchange for existing-stream safety.
+- [ ] ARM-SOAK-6 **P1 cohort preservation**: measure active cohort size, phase skew and
+      batched-vs-per-item GEMM/GEMV behaviour; test bounded staggering only after the
+      playback-first guard evidence.
+- [ ] ARM-SOAK-7 **P2 allocation/churn audit**: inspect ragged temporaries and request
+      setup/teardown only after scheduling experiments; current evidence does not justify
+      a broad malloc/thread refactor.
+
 ### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11, E12
 
 - [x] MT-1 Receive-mark semantics audited; TTFB stamped independently of TTFA
@@ -340,7 +478,8 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       not the per-concurrency capacity qualification; exact evidence:
       `.work/graviton5-arm-v2-full-qualification-20260911.md`.
 
-- [ ] GRAVFULL-2 Graviton5 per-concurrency SOAK qualification: when the box is leased
+- [ ] GRAVFULL-2 Graviton5 per-concurrency SOAK qualification (campaign execution complete;
+      strict promotion gate remains open): when the box is leased
       again, split the matrix by model. For 1.7B, run identical closed-loop SOAKs for
       control OFF and exploratory all-on at C6/C8/C12/C16; run C18 as a diagnostic edge
       only if admission remains meaningful (C4 is already covered for 1.7B). For 0.6B,
@@ -364,6 +503,44 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       playback/KPI gate. This selects C20 as an exploratory all-on candidate and C32
       as an admission-only candidate, not as qualification. Detail:
       `.work/c4a-arm-v2-raised-cap-report-20260912.md`.
+
+      Graviton5 32-core all-on OSS campaign executed 2026-09-13 on clean `dc8bc48`
+      (4x8, C9g.8xlarge/Neoverse-V3): complete 1.7B C1-C20 and 0.6B C1-C26
+      capacity waves, short/long parallel waves, Poisson, 30-minute C12/C20 gates,
+      and the additional 1.7B C10 30-minute gate. All completed requests had zero
+      errors/rejects/timeouts in the measured gates. The customer-facing playback
+      rule still classifies 1.7B C10 as EDGE (TOTAL_RTF p95 1.03, stall@250 9.2%),
+      1.7B C12 as EDGE (1.07, 18.6%), and 0.6B C20 as EDGE (1.12, 65.8%); clean
+      wave candidates are C12 and C16 respectively, not sustained qualifications.
+      No extra small-model C24/C26 soak or WAV probe was needed after the full
+      capacity/parallel coverage. Private evidence and the customer report remain
+      outside the OSS tree; all-on is not promoted by this run.
+
+- [x] GRAVBOX-2 AWS Graviton5 profile decision (2026-09-13): the 32-core G5
+      `roof_matvec_int8` discriminator rejected 4x8 as a serving baseline (aggregate
+      throughput did not scale and each worker slowed by about 4.45x). Do not retain a
+      4x8 all-on profile for G5; preserve the topology evidence and test 2x16/1x32 only
+      as a separate host-specific experiment if the box is rented again.
+
+- [x] GRAVBOX-3 AWS Graviton4 all-on profile artifact (2026-09-13): created and validated
+      `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json` for the 32-core Neoverse-V2
+      control, using the measured 4x8-friendly KAI/RES1_V2/BF16-pre-up/lane/multislot
+      feature set. It is host-scoped and remains `unqualified`; the G4 C8/C12 screens
+      select the candidate shape but do not replace full same-host quality and soak gates.
+
+- [x] ARM-TOPO-1 doctor topology preflight (2026-09-13): `tools/doctor.py` now runs a
+      short fixed-mask `roof_matvec_int8` 1x8 / simultaneous 2x8 / simultaneous 4x8
+      discriminator on Arm Linux boxes with at least 32 online CPUs. It archives parsed
+      rows and raw worker output in `arm_gemv_scaling.json` / `arm_gemv_*.txt`, prints
+      the 4x8 scale and per-worker slowdown near the top of the report, and recommends
+      `2x16` then `1x32` for G5-like contention. The verdict is topology-specific, not
+      a claim that the whole instance is unusable. Offline doctor tests pass; an actual
+      Arm run remains part of the next box preflight.
+
+- [x] ARM-SOAK-CLEANUP engine baseline restored (2026-09-13): the rejected admission
+      guard/helper, layer/token slicing, isolation and temporary tracing changes were
+      removed from the engine. The source baseline is `dc8bc48`; the evidence and
+      topology doctor changes remain local and unqualified until deliberately committed.
 
 - [ ] GRAVBOX-1 GCP c4a highcpu-32 Arm candidate: record the Iowa region and quoted
       `$1.21/hour` cost, then—only after the per-model SOAKs and feature gates—derive a

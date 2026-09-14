@@ -218,8 +218,8 @@ help:
 	@echo "CPU profiling gate (docs/cpu-profiling.md) — run BEFORE any CPU optimisation:"
 	@echo "  make cpu-check             - 15 s preflight: provenance, hardware, RESOLVED dispatch map, self-test,"
 	@echo "                               expected-vs-observed per ISA class -> profiles/<date>_<host>_<sha8>/"
-	@echo "  make doctor                - <1 min, no model: box identity + bandwidth + dispatch + shape probe ->"
-	@echo "                               PREDICTED W x K / batch cap / quantum / env set + draft profile (labels on every number)"
+	@echo "  make doctor                - first serving preflight: <1 min, no model; on 32-core Arm also"
+	@echo "                               simultaneous 1x8/2x8/4x8 GEMV scaling, then identity + dispatch + draft profile"
 	@echo "  make dispatch-map          - just the resolved dispatch table (./qwen_tts --dispatch-map)"
 	@echo "  make profile-cpu-check     - is the last profile still valid for THIS binary/source/env/host?"
 	@echo "  make cost-map              - coarse cost map: where the wall time goes AROUND the kernels."
@@ -915,8 +915,9 @@ cpu-check: $(TARGET) $(MEMBW_BIN)
 # doctor: the under-a-minute, model-free FIRST look at a box for the streaming server.
 # Identity + bandwidth (cached per hardware fingerprint in profiles/roofs) + caps + RESOLVED
 # dispatch + model-free matmat shapes, then a PREDICTED W x K / batch cap / quantum / env set
-# with a label on every number and a schema-valid draft profile.  It never replaces cpu-check
-# (the qualification preflight) or a wave; it tells the next agent where to start.
+# with a label on every number and a schema-valid draft profile. On a 32-core Arm Linux box it
+# first runs the simultaneous 1x8/2x8/4x8 roof_matvec_int8 topology discriminator and archives
+# arm_gemv_scaling.json. It never replaces cpu-check or a wave; it tells the next agent where to start.
 #   make doctor                                 # ~10-40 s
 #   make doctor DOCTOR_ARGS="--full"            # + --self-test and the quick --matmat-tune grid
 #   make doctor DOCTOR_ARGS="--no-measure"      # cached roofs only, never runs membw

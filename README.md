@@ -435,6 +435,7 @@ curl -s http://localhost:8080/v1/audio/speech \
 > Full guide: all endpoints, request body, performance → [docs/server.md](docs/server.md)
 > · running it in production — pre-forked pinned workers, finding `W x K` on your box,
 > deployment profiles and the benchmark suite → [docs/serving-operations.md](docs/serving-operations.md)
+> · Arm topology/bandwidth preflight before serving or soak → [docs/arm-topology-preflight.md](docs/arm-topology-preflight.md)
 > · every runtime flag, its default and why they travel together → [docs/feature-flags.md](docs/feature-flags.md)
 > · a 16-core Arm box measured across every rung → [docs/reference-arm-16c.md](docs/reference-arm-16c.md)
 > · an 8-core Intel AMX box, and what AMX buys per stage → [docs/reference-x86-8c-amx.md](docs/reference-x86-8c-amx.md)
@@ -561,6 +562,13 @@ batch full (a finished request's slot is refilled immediately) and **streaming c
 still gets their own progressive audio stream. This trades a little per-request latency for much higher
 total throughput on bandwidth-bound boxes. Measure it on your CPU with `make bench-server`; details in
 [docs/server-batching.md](docs/server-batching.md).
+
+**Before serving on a new Arm box:** run `make doctor` first. On a 32-core Arm
+Linux host it now includes a short simultaneous `1x8` / `2x8` / `4x8` INT8 GEMV
+scaling preflight. Read its 4×8 verdict before renting time for a wave or soak:
+the check detects shared-cache/fabric contention that a single-worker roof can
+hide, and may recommend `2x16` or `1x32`. It classifies the tested topology,
+not the whole machine. See [the Arm preflight note](docs/arm-topology-preflight.md).
 
 **vs other implementations:**
 

@@ -408,6 +408,261 @@ def step_gemv_roofs(roof_bin, ident, sizes, out, reps=3):
     return res, notes
 
 
+ARM_GEMV_THREADS = 8
+ARM_GEMV_GROUPS = 4
+
+
+def _arm_gemv_write_json(out, result):
+    path = os.path.join(out, "arm_gemv_scaling.json")
+    result["artifact"] = relp(path)
+    with open(path, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    return result
+
+
+def _arm_gemv_skip(out, reason):
+    return _arm_gemv_write_json(out, {
+        "schema_version": 1,
+        "benchmark": "roof_matvec_int8",
+        "status": "SKIPPED",
+        "verdict": "SKIPPED / ARM multi-worker GEMV preflight not run",
+        "reason": reason,
+        "rows": [],
+    })
+
+
+def classify_arm_gemv_scaling(isolated_gbs, aggregate_2x8, aggregate_4x8,
+                              per_worker_slowdown):
+    """Classify the tested 4x8 shape without implying that the whole host is unusable."""
+    if not all(x is not None and x > 0 for x in
+               (isolated_gbs, aggregate_2x8, aggregate_4x8, per_worker_slowdown)):
+        return {
+            "status": "UNKNOWN",
+            "verdict": "UNKNOWN / insufficient GEMV scaling measurements",
+            "message": "the 1x8, 2x8 and 4x8 rows were not all measurable",
+        }
+    scale = aggregate_4x8 / isolated_gbs
+    if aggregate_4x8 <= isolated_gbs:
+        return {
+            "status": "FAIL",
+            "verdict": "FAIL / severe cross-worker contention; do not qualify 4x8 serving on this box",
+            "message": "4x8 aggregate throughput is no higher than isolated 1x8",
+        }
+    if scale < 1.4 or per_worker_slowdown > 2.5:
+        return {
+            "status": "STRONG WARNING",
+            "verdict": "STRONG WARNING / 4x8 serving topology not recommended",
+            "message": "4x8 has severe cross-worker GEMV contention",
+        }
+    if scale < 2.0 or per_worker_slowdown > 2.0:
+        return {
+            "status": "WARNING",
+            "verdict": "WARNING / topology-sensitive; validate alternate worker shapes",
+            "message": "4x8 scaling is topology-sensitive",
+        }
+    return {
+        "status": "PASS",
+        "verdict": "PASS / topology appears suitable for 4x8 serving",
+        "message": "4x8 aggregate scaling and per-worker slowdown are within the preflight bands",
+    }
+
+
+def _arm_gemv_groups(ident):
+    cpus = sorted(TP.mask_parse(ident.get("online_mask") or "") or [])
+    if len(cpus) < ARM_GEMV_THREADS * ARM_GEMV_GROUPS:
+        return []
+    return [TP.mask_str(frozenset(cpus[i * ARM_GEMV_THREADS:(i + 1) * ARM_GEMV_THREADS]))
+            for i in range(ARM_GEMV_GROUPS)]
+
+
+def _arm_gemv_spawn(roof_bin, mask, out, tag, reps):
+    json_path = os.path.join(out, f"arm_gemv_{tag}.json")
+    text_path = os.path.join(out, f"arm_gemv_{tag}.txt")
+    cmd = [roof_bin, "--threads", str(ARM_GEMV_THREADS), "--layers", "28",
+           "--reps", str(reps), "--json", json_path]
+    taskset = shutil.which("taskset")
+    if not taskset:
+        return None, None, None, "taskset is unavailable; fixed CPU-mask preflight cannot run"
+    cmd = [taskset, "-c", mask] + cmd
+    try:
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+    except OSError as ex:
+        return None, None, None, f"could not start {' '.join(cmd)}: {ex}"
+    return proc, json_path, text_path, None
+
+
+def _arm_gemv_collect(proc, json_path, text_path, mask):
+    try:
+        so, se = proc.communicate(timeout=180)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        so, se = proc.communicate()
+        se = (se or "") + "\ntimeout after 180s"
+        rc = 124
+    else:
+        rc = proc.returncode
+    with open(text_path, "w") as f:
+        f.write(so + se)
+    row = {"mask": mask, "returncode": rc, "stdout": so, "stderr": se,
+           "text_artifact": relp(text_path), "json_artifact": relp(json_path)}
+    try:
+        with open(json_path) as f:
+            doc = json.load(f)
+        frame = doc.get("frame") or {}
+        row["frame_ms"] = float(frame["ms"])
+        row["gbs"] = float(frame["gbs"])
+        row["frame_bytes"] = doc.get("frame_bytes")
+        row["read_only_roof_gbs"] = doc.get("read_only_roof_gbs")
+    except (OSError, ValueError, KeyError, TypeError) as ex:
+        row["error"] = f"missing/invalid roof JSON: {ex}"
+    return row
+
+
+def _arm_gemv_run_shape(roof_bin, masks, out, shape, reps):
+    procs = []
+    for i, mask in enumerate(masks):
+        proc, jp, tp, err = _arm_gemv_spawn(roof_bin, mask, out, f"{shape}_w{i}", reps)
+        if err:
+            for old, _, _, _ in procs:
+                old.kill()
+                old.wait()
+            return {"shape": shape, "masks": masks, "workers": len(masks), "error": err, "runs": []}
+        procs.append((proc, jp, tp, mask))
+    runs = [_arm_gemv_collect(*item) for item in procs]
+    good = [r for r in runs if r.get("frame_ms") and r.get("gbs")]
+    row = {"shape": shape, "masks": masks, "workers": len(masks), "runs": runs}
+    if len(good) != len(runs) or not good:
+        row["error"] = "one or more roof workers did not produce a valid frame result"
+        return row
+    ms = [r["frame_ms"] for r in good]
+    gbs = [r["gbs"] for r in good]
+    row["worker_ms"] = {"min": min(ms), "max": max(ms), "mean": sum(ms) / len(ms)}
+    row["per_worker_gbs"] = {"min": min(gbs), "max": max(gbs), "mean": sum(gbs) / len(gbs)}
+    row["aggregate_gbs"] = sum(gbs)
+    return row
+
+
+def step_arm_gemv_preflight(roof_bin, ident, out, reps=3, enabled=True):
+    """Short, fixed-mask simultaneous GEMV discriminator for Arm serving shapes.
+
+    This is deliberately separate from the existing one-worker roof used by the cost
+    model: 4x8 must be measured concurrently or shared-cache/fabric contention is hidden.
+    """
+    if not enabled:
+        return _arm_gemv_skip(out, "disabled by command-line option")
+    arch = str(ident.get("arch") or "").lower()
+    if not (arch.startswith("aarch64") or arch.startswith("arm64") or arch.startswith("arm")):
+        return _arm_gemv_skip(out, f"non-Arm architecture: {ident.get('arch') or 'unknown'}")
+    if not (roof_bin and os.path.isfile(roof_bin) and os.access(roof_bin, os.X_OK)):
+        return _arm_gemv_skip(out, f"roof tool missing or not executable ({roof_bin})")
+    if not shutil.which("taskset"):
+        return _arm_gemv_skip(out, "taskset unavailable; fixed disjoint CPU masks are required")
+    groups = _arm_gemv_groups(ident)
+    if len(groups) != ARM_GEMV_GROUPS:
+        return _arm_gemv_skip(out, "fewer than 32 online CPUs; 4x8 fixed-mask preflight is not applicable")
+    ram = ident.get("ram_gib")
+    if ram and ram < 20:
+        return _arm_gemv_skip(out, f"only {ram:.1f} GiB RAM; four concurrent roof workers need a larger safety margin")
+
+    reps = max(1, int(reps))
+    rows = [
+        _arm_gemv_run_shape(roof_bin, groups[:1], out, "1x8", reps),
+        _arm_gemv_run_shape(roof_bin, groups[:2], out, "2x8", reps),
+        _arm_gemv_run_shape(roof_bin, groups[:4], out, "4x8", reps),
+    ]
+    isolated = rows[0].get("per_worker_gbs", {}).get("mean")
+    for row in rows:
+        row["scale_vs_1x8"] = (row.get("aggregate_gbs") / isolated
+                                if isolated and row.get("aggregate_gbs") else None)
+    row2 = rows[1] if len(rows) > 1 else {}
+    row4 = rows[2] if len(rows) > 2 else {}
+    agg2 = row2.get("aggregate_gbs")
+    agg4 = row4.get("aggregate_gbs")
+    ms4 = (row4.get("worker_ms") or {}).get("mean")
+    slowdown = (ms4 / rows[0]["worker_ms"]["mean"]
+                if ms4 and rows[0].get("worker_ms", {}).get("mean") else None)
+    verdict = classify_arm_gemv_scaling(isolated, agg2, agg4, slowdown)
+    result = {
+        "schema_version": 1,
+        "benchmark": "roof_matvec_int8",
+        "status": verdict["status"],
+        "verdict": verdict["verdict"],
+        "message": verdict["message"],
+        "threads_per_worker": ARM_GEMV_THREADS,
+        "layers": 28,
+        "reps": reps,
+        "masks": groups,
+        "rows": rows,
+        "isolated_gbs": isolated,
+        "two_x8_aggregate_gbs": agg2,
+        "four_x8_aggregate_gbs": agg4,
+        "four_x8_scale": (agg4 / isolated) if isolated and agg4 else None,
+        "four_x8_per_worker_slowdown": slowdown,
+        "next_topologies": ["2x16", "1x32"] if verdict["status"] not in ("PASS", "SKIPPED") else [],
+        "raw_values": {
+            "isolated_gbs": isolated,
+            "two_x8_aggregate_gbs": agg2,
+            "four_x8_aggregate_gbs": agg4,
+            "four_x8_scale": (agg4 / isolated) if isolated and agg4 else None,
+            "four_x8_per_worker_slowdown": slowdown,
+        },
+    }
+    if verdict["status"] == "FAIL" and slowdown and slowdown >= 2.5:
+        result["g5_like_warning"] = True
+        result["g5_warning"] = (
+            "WARNING: severe cross-worker GEMV contention detected.\n"
+            "4x8 aggregate throughput does not scale from isolated 1x8 and\n"
+            f"per-worker latency increases ~{slowdown:.1f}x.\n"
+            "The default 4x8 Arm v2 serving topology is NOT recommended on\n"
+            "this machine. Run topology sweep (2x16 / 1x32) before any soak\n"
+            "or production qualification."
+        )
+    elif verdict["status"] == "STRONG WARNING":
+        result["g5_like_warning"] = False
+    return _arm_gemv_write_json(out, result)
+
+
+def _arm_gemv_span(values):
+    if not values:
+        return "n/a"
+    lo, hi = values.get("min"), values.get("max")
+    if lo is None or hi is None:
+        return "n/a"
+    return f"{lo:.1f}" if abs(hi - lo) < 0.05 else f"{lo:.1f}-{hi:.1f}"
+
+
+def render_arm_gemv_scaling(arm):
+    lines = ["ARM multi-worker GEMV scaling",
+             "-" * 63,
+             "shape   worker ms        per-worker GB/s   aggregate GB/s   scale"]
+    rows = arm.get("rows") or []
+    for row in rows:
+        if row.get("error"):
+            lines.append(f"{row.get('shape', '?'):<7} ERROR: {row['error']}")
+            continue
+        lines.append(f"{row.get('shape', '?'):<7} "
+                     f"{_arm_gemv_span(row.get('worker_ms')):<16} "
+                     f"{_arm_gemv_span(row.get('per_worker_gbs')):<18} "
+                     f"{row.get('aggregate_gbs', 0):<16.1f} "
+                     f"{(row.get('scale_vs_1x8') or 0):.2f}x")
+    lines.append("-" * 63)
+    if arm.get("four_x8_per_worker_slowdown") is not None:
+        lines.append(f"4x8 per-worker slowdown vs isolated: {arm['four_x8_per_worker_slowdown']:.2f}x")
+        lines.append(f"4x8 aggregate scaling vs isolated:   {arm.get('four_x8_scale', 0):.2f}x")
+    else:
+        lines.append("4x8 per-worker slowdown vs isolated: n/a")
+        lines.append("4x8 aggregate scaling vs isolated:   n/a")
+    lines.append(f"VERDICT: {arm.get('verdict', 'UNKNOWN')}")
+    if arm.get("g5_warning"):
+        lines.extend(arm["g5_warning"].splitlines())
+    elif arm.get("status") in ("STRONG WARNING", "WARNING"):
+        lines.append("Next topology tests: 2x16, then 1x32; do not use 4x8 as the serving baseline yet.")
+    elif arm.get("status") == "SKIPPED":
+        lines.append(f"SKIPPED: {arm.get('reason', 'not applicable')}")
+    return lines
+
+
 def roof_at(roofs, bwres, K):
     """(gemv_gbs, l3_gbs, source) for a worker of K threads.  Measured for that K when the
     roof tool ran there; otherwise the nearest measured size scaled by the membw read
@@ -839,9 +1094,15 @@ def render(rep):
     L = []
     ident, bw, binr, shp, topo, rec = (rep["identity"], rep["bandwidth"], rep["binary"],
                                        rep["shapes"], rep["topology"], rep["recommendation"])
+    arm = rep.get("arm_gemv_scaling") or {
+        "status": "SKIPPED", "verdict": "SKIPPED / ARM multi-worker GEMV preflight not run",
+        "reason": "not recorded in this report", "rows": [],
+    }
     L.append(f"DOCTOR  {ident.get('host')}  {rep['utc']}   {rep['elapsed_s']:.1f}s   out={rep['out']}")
     L.append("=" * 100)
     L.append("legend: [MEASURED] here now · [CACHED] here earlier · [TRANSFERRED] reference-host constant · [PREDICTED] model · [UNKNOWN]")
+    L.append("")
+    L.extend(render_arm_gemv_scaling(arm))
     L.append("")
     L.append("1. MACHINE [MEASURED]")
     L.append(f"   {ident.get('cpu_model')}   cloud={ident.get('cloud') or '-'}   os={ident.get('os')}/{ident.get('arch')}")
@@ -1013,6 +1274,10 @@ def main():
     ap.add_argument("--roof", default=os.environ.get("ROOF_MATVEC_BIN", "/tmp/qwen_roof_matvec"),
                     help="tests/roof_matvec_int8.c binary (make roof-matvec); the Talker/CP terms are MEASURED with it")
     ap.add_argument("--no-roof", action="store_true", help="skip the GEMV roof (falls back to membw x transferred factor)")
+    ap.add_argument("--no-arm-gemv-preflight", action="store_true",
+                    help="skip the fixed-mask Arm 1x8/2x8/4x8 GEMV scaling preflight")
+    ap.add_argument("--arm-gemv-reps", type=int, default=3,
+                    help="roof_matvec repetitions per worker for the Arm scaling preflight (default: 3)")
     ap.add_argument("--out", default=None, help="artifact dir (default profiles/doctor/<utc>_<host>)")
     ap.add_argument("--store", default=os.path.join(ROOT, "profiles", "roofs"), help="roofs store shared with `make roofs`")
     ap.add_argument("--budget", type=float, default=BUDGET_S_DEFAULT, help="seconds; the tune grid runs only inside it")
@@ -1040,6 +1305,9 @@ def main():
         print(f"doctor: {err}", file=sys.stderr)
         return 1
     ident = identity_summary(hw)
+    arm_gemv = step_arm_gemv_preflight(
+        a.roof, ident, out, reps=a.arm_gemv_reps,
+        enabled=not a.no_roof and not a.no_arm_gemv_preflight)
 
     # binary first: isa_class decides the decoder calibration and the env set
     cores = ident["online_cpus"] or ident["physical_cores"] or 1
@@ -1117,7 +1385,7 @@ def main():
     rec = {"argv": argv, "env": envrows, "undeclared": undeclared, "draft_path": relp(dpath), "related": related_profiles(isa),
            "draft_errors": errs, "verify": verify, "alt": alt}
     rep = {"tool": "tools/doctor.py", "utc": utc, "elapsed_s": time.time() - t0, "out": relp(out),
-           "identity": ident, "bandwidth": bw, "binary": binr, "shapes": shp,
+           "identity": ident, "arm_gemv_scaling": arm_gemv, "bandwidth": bw, "binary": binr, "shapes": shp,
            "topology": {k: v for k, v in topo.items() if k != "rows"}, "predictions": preds,
            "ceiling": ceilings(ident, bw, isa, roofs=roofs),
            "calibration": CAL, "recommendation": rec}

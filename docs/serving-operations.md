@@ -115,10 +115,11 @@ so beside the numbers; what you must not do is let a `2x8` slice quietly mean fo
 
 ```bash
 # 0. the preflight, and the artifact directory every later number refers to
-make doctor                       # <1 min, no model: identity, bandwidth, the engine's own int8
-                                  # GEMV roof on the candidate worker mask, resolved dispatch,
-                                  # shape probe -> a PREDICTED W x K / cap / quantum / env set and
-                                  # a draft profile, every number labelled; start the sweep from it
+make doctor                       # first command on a new box; <1 min, no model: identity,
+                                  # bandwidth, and on 32-core Arm Linux a simultaneous 1x8/2x8/4x8
+                                  # roof_matvec_int8 scaling preflight; then the engine's own GEMV
+                                  # roof, resolved dispatch, shape probe -> a PREDICTED W x K /
+                                  # cap / quantum / env set and a draft profile
 make cpu-check                    # provenance + hardware + self-test + RESOLVED dispatch map vs
                                   # what this ISA class should select; fails on a silent fallback
 
@@ -135,6 +136,13 @@ $EDITOR configs/perf/<your-host>.json
 ```
 
 Steps 1 and 2 are cheap. Step 3 is what makes the result last: see §3.
+
+`make doctor` is the topology screen, not a serving qualification. Its Arm
+multi-worker GEMV block is visible near the top and archives
+`arm_gemv_scaling.json`; a poor 4×8 verdict means test `2x16`, then `1x32`,
+before paying for a wave or soak. The verdict concerns the tested 4×8 shape,
+not the whole instance. Details and interpretation are in
+[Arm topology preflight](arm-topology-preflight.md).
 
 `bench-topo` starts one server per topology, fires true simultaneous waves at each concurrency
 and prints one row per cell. Measured on the 16-core Axion reference host, 1.7B open weights at

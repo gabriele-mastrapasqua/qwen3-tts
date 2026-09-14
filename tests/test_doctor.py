@@ -177,6 +177,14 @@ rep = {"utc": "t", "elapsed_s": 0.1, "out": "x", "identity": idn, "bandwidth": {
 txt = D.render(rep)
 check("report renders all eight sections and says UNKNOWN when there is no roof",
       all(f"{i}." in txt for i in range(1, 9)) and "[UNKNOWN] no GEMV roof" in txt)
+g5 = D.classify_arm_gemv_scaling(159.9, 134.6, 143.4, 4.45)
+check("Arm GEMV preflight classifies G5-like 4x8 contention as FAIL",
+      g5["status"] == "FAIL" and "do not qualify 4x8" in g5["verdict"], g5)
+good_arm = D.classify_arm_gemv_scaling(170.7, 286.0, 435.1, 1.57)
+check("Arm GEMV preflight classifies G4-like 4x8 scaling as PASS",
+      good_arm["status"] == "PASS" and "suitable" in good_arm["verdict"], good_arm)
+check("report keeps the Arm GEMV preflight visible at the top",
+      txt.splitlines()[4] == "ARM multi-worker GEMV scaling" and "VERDICT:" in txt, txt[:300])
 # ---- ceilings: physics (bandwidth only) >= model (with decoder) >= floor (B=1), all from the same terms
 c8 = D.ceiling("1.7b", 4, 8, 55.6, 4.0 * 8, False, l3_gbs=69.4)
 check("c8a 4x8 (55.6 GB/s per CCX): physics (perfect batching, free decoder) far above the model ceiling B1..2; floor 4",
