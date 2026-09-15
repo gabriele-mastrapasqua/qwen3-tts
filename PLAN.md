@@ -1098,6 +1098,14 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       edge case. The PR also adds a `decoder_convT_packed` self-test. MERGE IT WITH
       `gh pr merge 29 --merge` — never a local `git merge --squash` + commit, which reassigns
       authorship away from the contributor.
+- [ ] CUDA-7 **The Metal batched path has the same defect as the CUDA one, unfixed.**
+      `qwen_batch_talker_step_ragged` (`qwen_tts_talker.c`) and `batch_cp_transformer_step`
+      (`qwen_tts_code_predictor.c`) each have a Metal branch a few lines below the CUDA branch
+      that likewise calls `qwen_metal_*_batch_step(...)` without forwarding `active`. The CUDA
+      version of this was an illegal memory access and wrong audio (fixed in `c749ac0`); the
+      Metal shaders must be read to confirm whether they index by per-slot position the same
+      way. NOT fixed here because no Apple GPU was available to verify, and the session was
+      scoped to CUDA. Do not assume it is benign.
 - [ ] CUDA-3 NEEDS-GPU: `QWEN_CUDA_CONVDEC=1` disables the exact streaming decoder
       (`sd_exact_stream_enabled()` returns 0, `qwen_tts_speech_decoder.c:3062`) and, when not
       streaming, forces `dt_no_overlap = 1` (`qwen_tts.c:1696`), dropping decoder/talker
