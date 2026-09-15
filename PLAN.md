@@ -411,6 +411,31 @@ sustained qualification.
       setup/teardown only after scheduling experiments; current evidence does not justify
       a broad malloc/thread refactor.
 
+### P0 BLOCKER — `make test-all` does not pass on main: first request differs from the rest
+
+- [ ] REPRO-1 **`test-serve-repro` FAILS, and it fails on `main` too** (found 2026-09-15 while
+      preparing a merge/release). Three identical requests, `-j1 --temperature 0`, against the
+      server: `repro_2` and `repro_3` are **byte-identical to each other**, `repro_1` differs
+      from both — `ndiff 118333 (81.094%)`, `max|diff| 17475 LSB`, and crucially
+      **`mel_corr(1,2) = 0.92744`**, far below the 0.98 contract, at identical duration
+      (6.08 s) and identical file size. So it is a genuinely different generation, not a
+      sample shift and not fp noise.
+      **Not introduced by the Arm campaign.** Byte-identical failure numbers at three commits:
+      `9cef8cc` (HEAD), `97c0fa1` (before the two cohort commits) and `main` (`e56ec7e`,
+      the v0.21.0 lineage). It is long-standing and was missed because the recent campaigns
+      ran targeted sub-tests on remote boxes rather than `make test-all` on a dev machine.
+      **Leading hypothesis, not yet proven: the prefix cache.** The server log shows
+      `Prefix cache FILLED slot 0` during the first request; requests 2 and 3 hit the warm
+      cache and agree exactly with each other. That is a cold-vs-warm divergence, which would
+      mean the prefix cache changes the output rather than only saving work.
+      First step is the discriminator, not a fix: re-run the same three requests with
+      `QWEN_PREFIX_CACHE=0`. If all three then agree, the cache is confirmed and the question
+      becomes whether the cold or the warm path is the correct one. If they still diverge,
+      the cause is elsewhere and `test-serve-repro`'s own contract needs re-reading.
+      **Gate implication: do not tag a release claiming a clean `make test-all` until this is
+      understood.** Everything else in `test-all` passes, including both self-test paths, the
+      golden set (mel_corr 1.00000 / 0.99995) and the flag registry.
+
 ### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11, E12
 
 - [x] MT-1 Receive-mark semantics audited; TTFB stamped independently of TTFA
