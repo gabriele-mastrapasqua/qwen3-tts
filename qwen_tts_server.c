@@ -923,6 +923,18 @@ static void reset_request_state(qwen_tts_ctx_t *ctx) {
     ctx->cp_roughness = 0.0f;
     if (ctx->ml_steer) { free(ctx->ml_steer); ctx->ml_steer = NULL; ctx->ml_steer_layers = 0; }
 
+    /* Forget the previous request's prefill.  qwen_tts_generate() keeps prev_input_embeds and
+     * re-prefills only from the first position whose embedding differs, reusing the KV rows
+     * of the common prefix.  That reuse is causally sound but NOT bit-identical: the tail
+     * positions are then computed in a shorter prefill, with different GEMM tiling and
+     * accumulation order, and over ~96 autoregressive frames the difference forks the
+     * trajectory.  The effect is that output depended on WHICH request came before
+     * (identical consecutive texts matched fully and fell back to a full prefill, so they
+     * were right; anything else diverged from the CLI reference by mel_corr ~0.93).
+     * qwen_tts_generate_batch() already clears this per item, so the batched server was
+     * never affected — this makes the single-process server agree with it and with the CLI. */
+    ctx->prev_prefill_len = 0;
+
     struct timeval tv;
     gettimeofday(&tv, NULL);
     ctx->seed = (uint32_t)(tv.tv_sec ^ tv.tv_usec);

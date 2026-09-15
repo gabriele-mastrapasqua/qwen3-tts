@@ -1681,6 +1681,16 @@ int main(int argc, char **argv) {
             if (!metal_fused) qwen_backend_install_global(gpu_backend);
             fprintf(stderr, "GPU offload: bf16 matvec via '%s' backend "
                             "(EXPERIMENTAL; CPU stays default elsewhere)\n", gpu_backend->name);
+            /* The global seam carries bf16 only (qwen_tts_backend.h exposes matvec_bf16 and
+             * matmat_bf16 and nothing else), so with quantized weights there is nothing for it
+             * to take.  Say so: the line above otherwise advertises an offload that does not
+             * happen, which is how a run manifest ends up claiming GPU work it never did. */
+            if (use_int8 || use_int4)
+                fprintf(stderr, "  NOTE: --%s keeps the weights quantized and the backend seam "
+                                "is bf16-only, so this offloads NOTHING. Drop the quantization "
+                                "flag, or use the resident CUDA paths (QWEN_CUDA_FUSED_TALKER / "
+                                "QWEN_CUDA_DECODER / QWEN_CUDA_CONVDEC).\n",
+                        use_int4 ? "int4" : "int8");
 #if defined(QWEN_HAVE_CUDA)
             if (bk == QWEN_BACKEND_CUDA && getenv("QWEN_CUDA_FUSED_TALKER")) {
                 extern void *g_cuda_talker_state, *g_cuda_cp_state, *g_gpu_fused_owner;
