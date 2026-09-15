@@ -1438,6 +1438,30 @@ int main(int argc, char **argv) {
 #endif
     }
 
+#if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
+    /* A GPU backend and --prefork are mutually exclusive, and the combination used to fail
+       SILENTLY.  qwen_backend_init() and the resident CUDA Talker/CP state are created below
+       in THIS process; qwen_tts_serve_prefork() forks afterwards.  Neither a CUDA nor a Metal
+       context survives fork() — the child inherits a handle it may not use — so the workers
+       either fell back to the CPU without saying so or produced a wrong answer, while the
+       startup banner still advertised GPU offload.  Refusing is the honest outcome: a silently
+       wrong answer is worse than a failed launch.
+
+       Per-worker GPU contexts are a real design (fork first, initialise inside each child),
+       not a bug fix; until that exists, --batch-size raises GPU serving throughput within the
+       single process that owns the context.
+
+       Inert without --backend: gpu_backend_str stays NULL, so the CPU path is unchanged. */
+    if (gpu_backend_str && serve_port > 0 && serve_prefork > 1) {
+        fprintf(stderr,
+                "--backend %s cannot be combined with --prefork %d: a GPU context does not "
+                "survive fork(), so the prefork workers would not run on the GPU.\n"
+                "Run a single process and raise --batch-size instead.\n",
+                gpu_backend_str, serve_prefork);
+        return 2;
+    }
+#endif
+
     /* --prefork 1 runs a single server, which never reaches the prefork path: without this
        its pool would silently keep the default size while the invocation asked for K. */
     if (threads <= 0 && serve_port > 0 && serve_prefork <= 1 && serve_prefork_threads > 0)

@@ -430,22 +430,53 @@ sustained qualification.
       both arms** — `r1 4a0cd0f3…`, `r2 = r3 9ea67803…`, `mel_corr(r1,r2) = 0.92744` in both.
       The cache therefore changes nothing about the output, which is the behaviour it should
       have; the first-request divergence happens without it.
-      **New leading hypothesis: lazily built quantized weights.** Several decoder weight packs
-      are constructed at first use rather than at load — `sd_wq_build_v2` guarded by
-      `e->q2 / e->v2_tried` (`qwen_tts_speech_decoder.c:971`, `:2495`, `:3992`), plus
-      `sd_cnext_i8_prepare` and `sd_convt_i8_for`, both documented as "built at first use".
-      If any call on the first request takes the float path while the int8 pack is still being
-      built, and later calls take the packed path, that reproduces exactly this signature:
-      request 1 numerically different, requests 2+ identical to each other.
-      Next discriminators, cheapest first: (1) run the three requests with `QWEN_SD_INT8=0`,
-      which removes the lazily built int8 packs entirely — if all three then agree, the
-      lazy-build path is confirmed; (2) if they still diverge, `QWEN_SD_RES1_V2=0` isolates
-      the DL-4 pack specifically; (3) only then bisect. Note the owner's observation that the
-      server has been heavily modified since August and `test-all` was not part of that loop,
-      so the regression window is large but bounded.
+      **ROOT CAUSE CHARACTERISED 2026-09-15 (CPU, M1, 0.6B). The lazy-weight-pack hypothesis
+      is REFUTED and the test's own accusation is backwards.**
+      1. *Which request is wrong.* The CLI is the reference path (`make test-golden` uses it).
+         `--text` with the same seed/temperature/speaker gives `mel_corr = 1.00000` against
+         **r2/r3** and `0.92744` against **r1**. So r2/r3 are CORRECT and **r1 is the
+         anomaly** — `test-serve-repro` takes r1 as its baseline and reports the two good
+         requests as failures.
+      2. *Decoder flags are inert here.* `QWEN_SD_INT8=0` and `QWEN_SD_RES1_V2=0`, both
+         provably applied via the server's `[FLAGS]` line, leave all three WAVs
+         **byte-identical to the baseline** (`4a0cd0f3` / `9ea67803` / `9ea67803`). They do not
+         perturb this build at all, so the lazily built speech-decoder packs do not
+         participate. Consistent with the code: the CP quantizes at load
+         (`qwen_tts_code_predictor.c:455-483`), not at first use.
+      3. *The real rule is not "first request".* With a fresh server: request A (one text),
+         then B, then B again — **B-after-A is the wrong variant (`4a0cd0f3`, mel_corr 0.92744
+         vs the CLI oracle) and only the immediately repeated B is correct (`9ea67803`,
+         mel_corr 1.00000)**. The defect is therefore: **any request whose text differs from
+         the immediately preceding one diverges from the CLI reference.** In production
+         consecutive requests always differ, so the divergent variant is what customers get.
+         `test-serve-repro` cannot see this by construction — it sends three *identical*
+         texts, so it only ever catches the r1 edge.
+      4. *`server_prewarm` is the first instance, not the cause.* `qwen_tts_server.c:2378`
+         synthesises "Warm up." before listening (111 code frames with zero requests) and its
+         comment already blames "test-serve-repro's trajectory fork", which is why it calls
+         `reset_request_state()` on both sides. `QWEN_NO_PREWARM=1` does make r1 == r2 == r3
+         and match the CLI oracle — but **with prewarm OFF, B-after-A still diverges**, so the
+         pre-warm merely supplies the differing predecessor for request 1. Not a fix.
+      5. *Where the state is NOT.* Prefix cache refuted (above). `reset_request_state`
+         (`qwen_tts_server.c:908`) restores sampling params, speaker/language, instruct, steer
+         and seed, but nothing KV-shaped. The CP KV is zeroed per frame
+         (`qwen_tts_code_predictor.c:826`), so it is not that either. A `QWEN_DUMP_CODES`
+         capture at the one point its framing was trustworthy showed codebook 0-3 identical
+         and **4-15 divergent** at the first differing frame — i.e. the fork is downstream of
+         the Talker's coarse token. (Caveat: the dump's line counts are not stable run to run
+         — 127 / 184 / 288 for 1 / 2 / 3 requests — so it is a weak instrument; the md5 +
+         mel-corr evidence above is the load-bearing part.)
+      **Next step:** find the per-request field that survives into the next generation, by
+      diffing context state across two consecutive different-text requests. Same class as the
+      closed issue #19 (delta-prefill KV staleness on the fused server) — which suggests
+      checking whether the CPU serving path has the equivalent of that fix.
       **Gate implication: do not tag a release claiming a clean `make test-all` until this is
       understood.** Everything else in `test-all` passes, including both self-test paths, the
-      golden set (mel_corr 1.00000 / 0.99995) and the flag registry.
+      golden set (mel_corr 1.00000 / 0.99995) and the flag registry. Severity is now higher
+      than a flaky-test blocker: server output deviates from the documented CLI reference for
+      essentially every production request. Whether the divergent variant is audibly worse is
+      NOT established — that needs an ear/whisper check — but the reproducibility and
+      CLI-parity contracts are broken either way.
 
 ### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11, E12
 
@@ -1082,7 +1113,15 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       trim make sense, gated on `safe_play_start` rather than TTFA and checked against the
       streaming decoder's continuity contract. Detail:
       `.work/leading-silence-perceived-latency-20260910.md`.
-- [ ] TQ-7 GPU serving: `--backend cuda --prefork N` is silently broken. VERIFIED at HEAD:
+- [ ] TQ-7 GPU serving: `--backend cuda --prefork N` is silently broken. **GUARD WRITTEN
+      2026-09-15, NOT YET VERIFIED ON A GPU.** `main.c` now refuses the combination up front
+      (inside `#if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)`, and only when
+      `gpu_backend_str` is non-NULL, so a CPU-only build does not even compile it and
+      `--prefork` without `--backend` is untouched). Message points the user at
+      `--batch-size`, which raises throughput inside the single process that owns the context.
+      Per-worker GPU contexts (fork first, initialise in each child) remain a possible future
+      design, not a bug fix. Still to do on a GPU box: confirm the refusal fires and that
+      `--backend cuda` without `--prefork` is unaffected. Original analysis: VERIFIED at HEAD:
       the resident CUDA Talker/CP state is created in `main.c` (~:1665) BEFORE
       `qwen_tts_serve_prefork` (~:3082) forks; a CUDA context does not survive `fork()`, and
       no guard exists anywhere (`grep -ci cuda qwen_tts_server.c` = 0, no mutual exclusion in
