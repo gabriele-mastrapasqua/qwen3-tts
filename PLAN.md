@@ -424,14 +424,25 @@ sustained qualification.
       `9cef8cc` (HEAD), `97c0fa1` (before the two cohort commits) and `main` (`e56ec7e`,
       the v0.21.0 lineage). It is long-standing and was missed because the recent campaigns
       ran targeted sub-tests on remote boxes rather than `make test-all` on a dev machine.
-      **Leading hypothesis, not yet proven: the prefix cache.** The server log shows
-      `Prefix cache FILLED slot 0` during the first request; requests 2 and 3 hit the warm
-      cache and agree exactly with each other. That is a cold-vs-warm divergence, which would
-      mean the prefix cache changes the output rather than only saving work.
-      First step is the discriminator, not a fix: re-run the same three requests with
-      `QWEN_PREFIX_CACHE=0`. If all three then agree, the cache is confirmed and the question
-      becomes whether the cold or the warm path is the correct one. If they still diverge,
-      the cause is elsewhere and `test-serve-repro`'s own contract needs re-reading.
+      **The prefix cache is REFUTED as the cause** (2026-09-15, flag provably applied: the
+      server's own `[FLAGS]` line reads `QWEN_PREFIX_CACHE=0` and the "Prefix cache" log lines
+      drop from 2 to 0). With the cache ON and OFF the three WAVs are **byte-identical across
+      both arms** — `r1 4a0cd0f3…`, `r2 = r3 9ea67803…`, `mel_corr(r1,r2) = 0.92744` in both.
+      The cache therefore changes nothing about the output, which is the behaviour it should
+      have; the first-request divergence happens without it.
+      **New leading hypothesis: lazily built quantized weights.** Several decoder weight packs
+      are constructed at first use rather than at load — `sd_wq_build_v2` guarded by
+      `e->q2 / e->v2_tried` (`qwen_tts_speech_decoder.c:971`, `:2495`, `:3992`), plus
+      `sd_cnext_i8_prepare` and `sd_convt_i8_for`, both documented as "built at first use".
+      If any call on the first request takes the float path while the int8 pack is still being
+      built, and later calls take the packed path, that reproduces exactly this signature:
+      request 1 numerically different, requests 2+ identical to each other.
+      Next discriminators, cheapest first: (1) run the three requests with `QWEN_SD_INT8=0`,
+      which removes the lazily built int8 packs entirely — if all three then agree, the
+      lazy-build path is confirmed; (2) if they still diverge, `QWEN_SD_RES1_V2=0` isolates
+      the DL-4 pack specifically; (3) only then bisect. Note the owner's observation that the
+      server has been heavily modified since August and `test-all` was not part of that loop,
+      so the regression window is large but bounded.
       **Gate implication: do not tag a release claiming a clean `make test-all` until this is
       understood.** Everything else in `test-all` passes, including both self-test paths, the
       golden set (mel_corr 1.00000 / 0.99995) and the flag registry.
