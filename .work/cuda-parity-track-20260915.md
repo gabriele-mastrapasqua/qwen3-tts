@@ -293,3 +293,60 @@ forgoing bf16 tensor cores.
 not move the concurrency threshold while the device idles at 15%. The fix is the resident path —
 which already exists and already carries the graphs, but sits behind `QWEN_CUDA_FUSED_TALKER`
 with a single `g_gpu_fused_owner` that the server's batched paths never reach (see §6.1).
+
+## 9. QWEN_CUDA_BATCH has never worked — and the repo's own self-test says so
+
+The resident batched GPU path (`QWEN_CUDA_FUSED_TALKER` + `QWEN_CUDA_BATCH`, reached through
+`qwen_tts_serve_continuous`) is the architecture this track hoped to make the CUDA default. It
+is comprehensively broken, and the breakage is **pre-existing**, not introduced by this
+session's changes. `--gpu-batch-bench 8` on the RTX PRO 6000, run on the binary from before and
+after the mask fix:
+
+| | before mask fix | after mask fix |
+| --- | --- | --- |
+| illegal memory accesses | 10296 | 11362 |
+| Talker `max abs(batched - single)` | **2.93e+01 FAIL** | **2.93e+01 FAIL** |
+| CP `max abs(batched - single)` | 0.00e+00 PASS | 0.00e+00 PASS |
+| Talker throughput vs single | **GAIN 0.12x** | GAIN 0.12x |
+| CP throughput vs single | GAIN 0.61x | GAIN 0.60x |
+
+Readings:
+
+* **The batched Talker computes a different answer**, off by 29.3 absolute against the
+  single-stream oracle. That is not precision drift; it is a wrong result. The code predictor,
+  by contrast, is exact (0.00e+00), so the defect is confined to the Talker batch path.
+* **It is also eight times slower than single-stream** (0.12x). Even repaired, batching as it
+  stands is a loss, so "fix the crash and make it the default" would not have been the win it
+  looked like.
+* `compute-sanitizer` on the standalone self-test names the faulting kernel:
+  `Invalid __global__ write of size 4 bytes at k_matmat_bf16(...)`, reached through
+  `talker_body_batch -> qwen_cuda_talker_batch_step`, with an address that is not a plausible
+  device pointer at all ("137866940870132 bytes before the nearest allocation"), i.e. a bad
+  destination rather than an index that overshoots. 216417 errors in one run.
+* The self-test prints `FAIL` unprompted. This has been visible to anyone who ran
+  `--gpu-batch-bench`, which evidently nobody did.
+
+### What this session changed, and what it did not
+
+`c749ac0` makes the CUDA branches of `qwen_batch_talker_step_ragged` and
+`batch_cp_transformer_step` forward the `active` mask, which they were dropping. Those branches
+were genuinely wrong — a lane that is not stepping keeps the position of whatever request last
+held the slot, and every position-indexed kernel derives an address from it — and a host-side
+clamp would have been unsafe because a slot can be active-but-paused (`step_active` narrows
+`active` through the lead, priority, width and decoder gates) and writing its KV would corrupt
+a live request. **But the mask was not the cause of the observed failure**: the self-test
+reproduces it with no server, no concurrency, and every lane active (it passes NULL). The fix
+is kept as a correctness repair, not as a remedy for this symptom; no observable symptom has
+been shown to depend on it.
+
+### Next step, and it needs very little GPU time
+
+`--gpu-batch-bench N` is a standalone, seconds-long reproducer that needs no server, no model
+serving and no concurrency. Debugging the batched Talker should be done against it, not against
+a soak. Start from the `k_matmat_bf16` destination pointer in `talker_body_batch`, since the
+sanitizer says the write target is invalid rather than merely out of range.
+
+Until that is fixed, `QWEN_CUDA_BATCH` must stay off, and the earlier proposal to make the
+resident batched path the CUDA server default is withdrawn: today it would ship wrong audio
+with the GPU idle, and it fails silently — the server still answers 200 with plausibly sized
+WAVs.
