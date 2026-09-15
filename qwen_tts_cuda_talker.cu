@@ -421,15 +421,26 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
  * d_pos[B] is per-sequence so it generalizes to ragged batching. B capped at QB_MAX. */
 #define QB_MAX 8
 
-/* batched matmat: X[B][cols], Y[B][rows]; warp per output row reads W[row,:] once → B dots. */
+/* batched matmat: X[B][cols], Y[B][rows]; warp per output row reads W[row,:] once → B dots.
+ *
+ * The per-sequence loops are unrolled over the compile-time QB_MAX with a b<B guard rather
+ * than written as `for(b=0;b<B;++b)`.  With a runtime bound the compiler cannot prove the
+ * index range of the s[] accumulator, so it places the array in LOCAL memory -- which is
+ * backed by global memory.  That cost correctness and speed at once: the batch self-test went
+ * from exact at B<=2 to max|batched-single|=2.93e+01 at B>=4, compute-sanitizer reported
+ * "Invalid __global__ write of size 4 bytes" inside this kernel, and throughput collapsed from
+ * 0.89x to 0.06x of single-stream. Unrolled, s[] stays in registers and every index is a
+ * compile-time constant. */
 __global__ void k_matmat_bf16(const __nv_bfloat16 *W,const float *X,float *Y,int rows,int cols,int B){
     int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
     const __nv_bfloat16 *wr=W+(size_t)row*cols; float s[QB_MAX];
     #pragma unroll
     for(int b=0;b<QB_MAX;++b) s[b]=0.f;
     for(int i=lane;i<cols;i+=32){ float w=__bfloat162float(wr[i]);
-        for(int b=0;b<B;++b) s[b]+=w*X[(size_t)b*cols+i]; }
-    for(int b=0;b<B;++b){ float v=s[b];
+        #pragma unroll
+        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+i]; }
+    #pragma unroll
+    for(int b=0;b<QB_MAX;++b){ if(b>=B) break; float v=s[b];
         #pragma unroll
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=v; }
@@ -440,9 +451,11 @@ __global__ void k_matmat_int8(const int8_t *W,const float *scale,const float *X,
     #pragma unroll
     for(int b=0;b<QB_MAX;++b) s[b]=0.f;
     for(int i=lane;i<cols;i+=32){ float w=(float)wr[i];
-        for(int b=0;b<B;++b) s[b]+=w*X[(size_t)b*cols+i]; }
+        #pragma unroll
+        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+i]; }
     float sc=scale[row];
-    for(int b=0;b<B;++b){ float v=s[b];
+    #pragma unroll
+    for(int b=0;b<QB_MAX;++b){ if(b>=B) break; float v=s[b];
         #pragma unroll
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=sc*v; }
@@ -455,8 +468,10 @@ __global__ void k_matmat_q4_0(const q4blk *W,const float *X,float *Y,int rows,in
     for(int c=lane;c<cols;c+=32){ const q4blk *bk=wr+(c>>5); int ic=c&31;
         unsigned char byte=bk->qs[ic>>1]; int nib=(ic&1)?(byte>>4):(byte&0x0F);
         float w=(float)(nib-8)*__half2float(bk->scale);
-        for(int b=0;b<B;++b) s[b]+=w*X[(size_t)b*cols+c]; }
-    for(int b=0;b<B;++b){ float v=s[b];
+        #pragma unroll
+        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+c]; }
+    #pragma unroll
+    for(int b=0;b<QB_MAX;++b){ if(b>=B) break; float v=s[b];
         #pragma unroll
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=v; }
@@ -595,6 +610,15 @@ extern "C" void *qwen_cuda_talker_batch_init(void *single, int B){
     CK(cudaMalloc(&s->gu,(size_t)B*2*inter*sizeof(float)));
     CK(cudaMalloc(&s->d_pos,B*sizeof(int)));
     CK(cudaMalloc(&s->d_act,(size_t)B));
+    if(getenv("QWEN_CUDA_VERBOSE")){
+        fprintf(stderr,"[cuda batch] B=%d L=%d H=%d qd=%d kvd=%d inter=%d kv_max=%d prec=%d\n",
+                B,L,H,qd,kvd,inter,s->kv_max,s->prec);
+        fprintf(stderr,"[cuda batch] x=%p xn=%p q=%p k=%p v=%p attn=%p proj=%p gate=%p gu=%p kc=%p vc=%p\n",
+                (void*)s->x,(void*)s->xn,(void*)s->q,(void*)s->k,(void*)s->v,(void*)s->attn,
+                (void*)s->proj,(void*)s->gate,(void*)s->gu,(void*)s->kcache,(void*)s->vcache);
+        fprintf(stderr,"[cuda batch] wq[0]=%p wk[0]=%p wv[0]=%p wo[0]=%p wgu[0]=%p wdn[0]=%p\n",
+                (void*)s->wq[0],(void*)s->wk[0],(void*)s->wv[0],(void*)s->wo[0],(void*)s->wgu[0],(void*)s->wdn[0]);
+    }
     return s;
 }
 /* embeds=[B][H] host, pos_arr=[B] host; hidden_out=[B][H] host (final-normed). */
