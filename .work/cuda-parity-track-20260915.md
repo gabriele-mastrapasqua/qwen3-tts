@@ -233,3 +233,63 @@ behind `#ifdef QWEN_HAVE_CUDA` *and* a default-off env flag declared in
 not even compile the new code, and `make test-all` with the golden gate remains the regression
 net. The two fixes landed today follow that shape: the TQ-7 guard and the offload NOTE are
 inside the GPU `#if` and absent from the CPU build.
+
+## 7. TF32 refuted as the cause of the CPU/CUDA divergence
+
+Hypothesis: the hardcoded `CUBLAS_TF32_TENSOR_OP_MATH` (10-bit mantissa) explained the
+backend's `rel ~1e-3` and therefore the audio fork. **Refuted by measurement** on the
+RTX PRO 6000, with the mode made switchable (`QWEN_CUDA_TF32`, commit `633dbfd`):
+
+| mode | matvec rel | matmat rel | cuda matmat |
+| --- | --- | --- | --- |
+| TF32 on (historical default) | 1.879e-03 | 1.624e-03 | 0.035 ms |
+| TF32 off (fp32 math) | **1.879e-03** | 1.656e-03 | 0.039 ms |
+
+Identical for matvec, marginally worse for matmat. TF32 is not the source.
+
+**What is:** the self-test compares the CPU's bf16 kernel against the GPU's f32 GEMM, and the
+two boxes differ in *CPU* capability, not GPU. The A100 host built `SIMD=portable` and reports
+`bf16 dot: widen->FMA (no AVX-512-BF16)` — it widens bf16 to f32, so it agreed with the GPU to
+`2.326e-07`. The RTX PRO 6000 host builds `SIMD=avx512bf16` and uses the native bf16 dot, whose
+8-bit mantissa (2^-8 ~ 3.9e-3) is consistent with the observed 1.9e-3. **The GPU is the more
+accurate of the two**; the reference is the coarser side.
+
+**And precision is not the lever anyway.** On the A100, where CPU and GPU matvec agreed to
+2.3e-07, the audio still diverged (mel_corr 0.518). Greedy sampling over 75-100 frames will
+eventually flip an argmax on a difference of any size. So CPU/CUDA audio divergence is inherent
+to running different arithmetic, not a defect to be tuned away, and it confirms §5.3: a GPU
+lane needs its own reference set rather than validation against a CPU golden.
+
+The `QWEN_CUDA_TF32` lever is kept — it costs about 11% on this matmat when disabled and is
+useful for isolating precision questions — but it must not be described as a fix for parity.
+
+## 8. Where the serving time actually goes (measured)
+
+Mini-soaks on the CUDA streaming server (0.6B, bf16 seam + `QWEN_CUDA_CONVDEC=1`, single
+process, `--prefork-threads 16 --batch-size 8`), 2 minutes each, GPU sampled throughout:
+
+| C | RTF p50 | RTF p95 | TTFB p50/p95 | TTFA p50/p95 | safe-start p50/p95 | prebuffer p50/p95 | st@250 | st@500 | GPU median |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | 0.56-0.60 | 0.61-0.68 | 37 / 59 ms | 98-119 / 165-231 ms | 118 / 280 ms | 0.008 / 0.035 s | 1% | 0% | **15%** |
+| 5 | 0.67-0.71 | 0.71-0.85 | 41 / 66 ms | 117-126 / 171-177 ms | 172 / 471 ms | 0.042 / 0.153 s | 12% | 0% | **23%** |
+| 6 | 0.80-0.83 | 0.90-0.93 | 46 / 88 ms | 130-146 / 232-250 ms | 375 / 719 ms | 0.249 / 0.511 s | 44% | 2% | **14%** |
+
+Threshold: **C4 clean, C5 soft edge, C6 past the knee.** The earlier `soak_fast` screen agrees
+(C4 HEALTHY, C8 KNEE). Note these are 2-minute screens: the `per-class KPI drift` FAILs are an
+under-sampling artifact by construction and must not be read as a verdict on C4.
+
+**The GPU never exceeds 23% median (38% peak) while the server is already knee-ing.** Latency is
+excellent (TTFB 37 ms, TTFA 98 ms at C4); it is sustained throughput that collapses. That is the
+signature of a device waiting on the host, not of a saturated device.
+
+The cause is structural in the seam (`qwen_tts_cuda.c:105-121`): every `matmat_bf16` call does a
+synchronous H2D copy, one `cublasSgemm`, and a synchronous D2H copy. With 28 layers and roughly
+seven matvecs each, that is ~200 blocking PCIe round trips per generated frame. A per-operation
+offload is round-trip-bound by construction and cannot be fixed incrementally. It also stores
+weights as f32 on the device after a host-side bf16->f32 expansion, doubling weight memory and
+forgoing bf16 tensor cores.
+
+**Consequence for the work order:** optimising GPU kernels, or extending the CUDA graphs, would
+not move the concurrency threshold while the device idles at 15%. The fix is the resident path —
+which already exists and already carries the graphs, but sits behind `QWEN_CUDA_FUSED_TALKER`
+with a single `g_gpu_fused_owner` that the server's batched paths never reach (see §6.1).
