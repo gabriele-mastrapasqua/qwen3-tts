@@ -350,3 +350,67 @@ Until that is fixed, `QWEN_CUDA_BATCH` must stay off, and the earlier proposal t
 resident batched path the CUDA server default is withdrawn: today it would ship wrong audio
 with the GPU idle, and it fails silently — the server still answers 200 with plausibly sized
 WAVs.
+
+## 10. The batched Talker defect, found and fixed
+
+`--gpu-batch-bench` bisected cleanly: exact at B<=2, broken at B>=4, with correctness and
+throughput failing at the same threshold.
+
+    before   B=1 exact 0.52x | B=2 exact 0.89x | B=4 FAIL 0.06x | B=8 FAIL 0.15x
+    after    B=1 exact 0.71x | B=2 exact 1.41x | B=4 exact 2.56x | B=8 exact 5.03x
+
+Cause: the three batched matmat kernels accumulated into `float s[QB_MAX]` through loops
+bounded by the runtime batch size. With a runtime bound the compiler cannot prove the index
+range, so it spilled the accumulator to local memory, which on a GPU is backed by global
+memory. That one detail produced all of it at once — `max|batched - single| = 2.93e+01`,
+~11k illegal memory accesses per run, and throughput collapsing to 0.06x. compute-sanitizer's
+"Invalid __global__ write of size 4 bytes" inside `k_matmat_bf16`, at an address far outside
+every allocation, was the spilled accumulator rather than the `Y` it appeared to target — which
+is why every pointer in the batch state dumped as valid. Fixed in `c55d298` by unrolling the
+per-sequence loops over the compile-time `QB_MAX` with a `b<B` guard.
+
+Note the new trade-off this creates: `s[QB_MAX]` now lives in registers, so raising `QB_MAX`
+above 8 costs registers per thread and therefore occupancy. It is no longer a free constant to
+raise; it needs measuring.
+
+Server verification, B=8 with four concurrent requests (the case that used to crash): **0
+illegal memory accesses** (was 10792) and **GPU utilisation 51-71%** (was 0%). The device is
+finally doing work.
+
+## 11. But lockstep batching is worse than the naive seam for this workload
+
+A 4-minute soak at concurrency 4 on the repaired resident path, against the earlier mini-soak of
+the naive per-op seam at the same concurrency:
+
+| | naive seam | resident batched B=8 | resident batched B=4 |
+| --- | --- | --- | --- |
+| RTF p50 | 0.56-0.60 | 0.79-0.80 | 0.77-0.81 |
+| RTF p95 | 0.61-0.68 | 0.83-0.85 | 0.83-0.87 |
+| TTFB p50 | 37 ms | 33-36 ms | 33-35 ms |
+| TTFA p50 | 98-119 ms | 98-134 ms | 96-110 ms |
+| safe_play_start p50/p95 | 118 / 280 ms | 419 / 600 ms | 413 / 562 ms |
+| **stall@250** | **1%** | **61%** | **62%** |
+| stall@500 | 0% | 0% | 0% |
+| GPU | 15% | ~70% | ~70% |
+
+Latency KPI and resource stability PASS in every arm; zero illegal accesses.
+
+**Matching the batch size to the concurrency changes nothing** (61% vs 62%), so the wasted-lane
+hypothesis is refuted and a dynamic `B_eff` would not fix this. The engine already compacts
+active slots (`qwen_batch_pack_active` fills `bb->act_idx` and sets `bb->B_eff`, used by
+`qwen_batch_proj`); wiring that into CUDA remains reasonable work, but it is not the cure for
+these stalls. Note also that compaction is not simply "pass B_eff": the KV cache is indexed per
+slot, so compacted lanes need a lane->slot map for cache addressing even while activations stay
+dense.
+
+The cause is **lockstep**: every lane advances one frame together, so a short request waits on
+the longest in the group. The stall distribution says so — 62% at 250 ms and **0% at 500 ms**,
+i.e. gaps that are regular and bounded rather than a heavy tail, which is the shape of a
+cadence hiccup, on a bank with five length classes.
+
+**Conclusion for the serving lane.** The batched path is now correct and 5x better in raw
+throughput, but at C4 it delivers worse playback than the simple seam. It should NOT become the
+CUDA server default on these numbers. What would change the picture is genuine continuous
+batching, where requests join and leave without forcing a shared frame cadence — which is the
+architecture vLLM-Omni describes, and a substantially larger piece of work than either the
+`B_eff` compaction or raising `QB_MAX`.
