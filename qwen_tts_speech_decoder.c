@@ -2328,23 +2328,35 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
                                  float *signal, int cur_ch, int cur_len,
                                  float **audio_out, int *n_samples_out) {
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
+    /* The caller allocates `signal` with sd_tmp_alloc(), which hands out interior pointers of
+     * the decoder arena when one is active.  Those must be released through sd_tmp_free(),
+     * which knows to ignore them (the arena is freed in one go by sd_arena_reset); passing one
+     * to free() aborts with "munmap_chunk(): invalid pointer".  Every buffer allocated below
+     * comes from aligned_calloc() -- posix_memalign under the hood -- and IS free()-able, so
+     * only the incoming pointer needs the arena-aware path.
+     *
+     * This was latent on the CPU: the windowed branch that calls this function is only reached
+     * when sd_exact_stream_enabled() is false, which the default CPU build never does. Enabling
+     * the GPU-resident conv decoder forces exactly that branch, which is how it surfaced. */
+    float *const signal_in = signal;
+#define SD_RELEASE_SIGNAL() do { if (signal == signal_in) sd_tmp_free(signal); else free(signal); } while (0)
 #ifdef QWEN_HAVE_CUDA
     if (g_cuda_decoder_conv_on) {
         int rc = qwen_cuda_conv_decoder_run(ctx, signal, cur_ch, cur_len, audio_out, n_samples_out);
-        free(signal);
+        SD_RELEASE_SIGNAL();
         return rc;
     }
 #endif
 
     for (int b = 0; b < 2; b++) {
         qwen_sd_convnext_t *cn = &sd->convnext[b];
-        if (!cn->conv_weight) { free(signal); return -1; }
+        if (!cn->conv_weight) { SD_RELEASE_SIGNAL(); return -1; }
 
         int new_len = conv_transpose1d_out_len(cur_len, 2, 2);
         float *up_out = (float *)aligned_calloc((int64_t)cur_ch * new_len, sizeof(float));
         causal_conv_transpose1d(up_out, signal, cn->conv_weight, cn->conv_bias,
                                  cur_ch, cur_ch, cur_len, new_len, 2, 2);
-        free(signal); signal = up_out; cur_len = new_len;
+        SD_RELEASE_SIGNAL(); signal = up_out; cur_len = new_len;
 
         float *dw_out = (float *)aligned_calloc((int64_t)cur_ch * cur_len, sizeof(float));
         for (int c = 0; c < cur_ch; c++) {
@@ -2365,13 +2377,13 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
         free(residual);
     }
 
-    if (!sd->initial_conv_weight) { free(signal); return -1; }
+    if (!sd->initial_conv_weight) { SD_RELEASE_SIGNAL(); return -1; }
     int new_ch = 1536;
     int new_len = conv1d_out_len(cur_len, 7, 1, 6);
     float *conv_out = (float *)aligned_calloc((int64_t)new_ch * new_len, sizeof(float));
     causal_conv1d(conv_out, signal, sd->initial_conv_weight, sd->initial_conv_bias,
                   cur_ch, new_ch, cur_len, 7, 1);
-    free(signal); signal = conv_out; cur_ch = new_ch; cur_len = new_len;
+    SD_RELEASE_SIGNAL(); signal = conv_out; cur_ch = new_ch; cur_len = new_len;
 
     int up_rates[4] = {8, 5, 4, 3};
     int out_channels[4] = {768, 384, 192, 96};
@@ -2382,7 +2394,7 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
         int kernel = rate * 2;
         int out_ch = out_channels[b];
 
-        if (!ub->upsample.conv_weight) { free(signal); return -1; }
+        if (!ub->upsample.conv_weight) { SD_RELEASE_SIGNAL(); return -1; }
 
         if (ub->upsample.snake_alpha && ub->upsample.snake_beta)
             snake_activation(signal, cur_ch, cur_len, ub->upsample.snake_alpha, ub->upsample.snake_beta);
@@ -2391,7 +2403,7 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
         float *up_out = (float *)aligned_calloc((int64_t)out_ch * up_len, sizeof(float));
         causal_conv_transpose1d(up_out, signal, ub->upsample.conv_weight, ub->upsample.conv_bias,
                                  cur_ch, out_ch, cur_len, up_len, kernel, rate);
-        free(signal); signal = up_out; cur_ch = out_ch; cur_len = up_len;
+        SD_RELEASE_SIGNAL(); signal = up_out; cur_ch = out_ch; cur_len = up_len;
 
         int dilations[3] = {1, 3, 9};
         for (int r = 0; r < 3; r++) {
@@ -2427,7 +2439,7 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
         }
     }
 
-    if (!sd->final_snake.alpha || !sd->final_conv_weight) { free(signal); return -1; }
+    if (!sd->final_snake.alpha || !sd->final_conv_weight) { SD_RELEASE_SIGNAL(); return -1; }
     snake_activation(signal, cur_ch, cur_len, sd->final_snake.alpha, sd->final_snake.beta);
 
     int audio_len = conv1d_out_len(cur_len, 7, 1, 6);
@@ -2443,7 +2455,7 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
         }
         audio[t] = sum;
     }
-    free(signal);
+    SD_RELEASE_SIGNAL();
 
     for (int i = 0; i < audio_len; i++) {
         if (audio[i] < -1.0f) audio[i] = -1.0f;
@@ -2454,6 +2466,7 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
     *n_samples_out = audio_len;
     return 0;
 }
+#undef SD_RELEASE_SIGNAL
 
 static void cs_save_tail(float *tail, const float *in, int in_ch, int len, int tail_cols) {
     if (len >= tail_cols) {
