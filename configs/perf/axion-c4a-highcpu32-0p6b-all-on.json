@@ -276,8 +276,9 @@
         "why": "reserve the measured Arm decoder lane split"
       },
       "QWEN_SD_MULTISLOT": {
-        "value": "2",
-        "why": "measured 2-slot shared-weight cohort for this host/model policy"
+        "value": "0",
+        "why": "RETIRED on this host 2026-09-15. Three independent measurements agree. (1) Isolated decode_quantum_bench, chunk 4, taskset 0-7: one singleton 34.6 ms, two sequential singletons 70.1 ms, one ragged cohort 84.3 ms = 1.20x the sequential cost (the same shape as Graviton4, where it is 1.63x; the penalty is the shared Arm dotprod multi-slot leaf, whose runtime-indexed accumulators spill where the single-slot kernel keeps them in registers). (2) Paired serving screen at the previously recommended 1.7B C12, cohort ON vs OFF: STREAM p95 0.653 -> 0.621, TTFA p95 164 -> 149 ms, safe-play-start p95 229 -> 189 ms, completions 582 -> 609. (3) Paired serving screen at 0.6B C16: STREAM p95 0.884 -> 0.833, TTFA 221 -> 196 ms, safe-start 424 -> 366 ms, completions 603 -> 653. Per-item int8 DOTPROD is the qualified decoder leaf here. The audio is unaffected: the multi-slot kernel is exact against the single-slot oracle in --self-test, and a paired concurrency-4 audio gate on the sibling Arm host measured mel_corr 1.00000 on every pair.",
+        "revert": "QWEN_SD_MULTISLOT=2 only after an exact S==2 named-accumulator kernel lands and beats sequential singleton decode in decode_quantum_bench on this host"
       },
       "QWEN_SD_RES1_V2": {
         "value": "1",

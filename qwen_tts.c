@@ -2626,6 +2626,14 @@ typedef struct dec_job {
     struct dec_job *next;
 } dec_job_t;
 
+/* Diagnostic-only, one record per bounded lane slot.  The producer writes READY
+ * before enqueue; the lane publishes START/DONE; the main loop records when that
+ * completion is first observed and when forward progress resumes. */
+typedef struct {
+    atomic_ullong ready_us, enqueue_us, start_us, done_us;
+    atomic_int active, pending, target, pause_run, cohort;
+} dec_life_t;
+
 typedef struct {
     pthread_mutex_t m;
     pthread_cond_t  cv;
@@ -2638,8 +2646,12 @@ typedef struct {
     int batch;
     int first_group;
     int trace;
+    int lifecycle_trace;
+    dec_life_t *life;
     int lane;                 /* QWEN_SD_LANE_SPLIT: pinned private team, one unit in flight per slot */
     int multislot;             /* QWEN_SD_MULTISLOT=2..3: shape-compatible lane cohort */
+    int cohort_max_b;          /* QWEN_SD_COHORT_MAX_B: form cohorts only while n_active <= this (0 = no cap) */
+    int nonblock;              /* QWEN_SD_LANE_NONBLOCK: defer a busy slot instead of stalling the frame loop */
     pthread_cond_t done_cv;   /* broadcast when a slot's busy count drops (the bounded mailbox) */
     int elastic;              /* width full <-> step_width while a unit is queued or running */
     int step_width;
@@ -2662,6 +2674,48 @@ static double dec_wait_idle(dec_pool_t *dp, int slot) {
         pthread_cond_wait(&dp->done_cv, &dp->m);
     pthread_mutex_unlock(&dp->m);
     return qwen_mono_ms() - t0;
+}
+
+static int dec_stream_target_frames(int decpos, int n_active, int stream_chunk, int busy_chunk) {
+    if (decpos == 0) return 1;
+    if (decpos < 4) return 2;
+    if (decpos < 12) return 4;
+    if (busy_chunk && n_active > 1) return busy_chunk;
+    return stream_chunk;
+}
+
+static unsigned long long dec_life_now_us(void) {
+    return (unsigned long long)(qwen_mono_ms() * 1000.0 + 0.5);
+}
+
+static void dec_life_ready(dec_pool_t *dp, int slot, int active, int pending,
+                           int target, unsigned int pause_run) {
+    if (!dp->lifecycle_trace || !dp->life || slot < 0) return;
+    dec_life_t *life = &dp->life[slot];
+    atomic_store(&life->ready_us, dec_life_now_us());
+    atomic_store(&life->enqueue_us, 0);
+    atomic_store(&life->start_us, 0);
+    atomic_store(&life->done_us, 0);
+    atomic_store(&life->active, active);
+    atomic_store(&life->pending, pending);
+    atomic_store(&life->target, target);
+    atomic_store(&life->pause_run, pause_run);
+    atomic_store(&life->cohort, 0);
+}
+
+static void dec_life_enqueue(dec_pool_t *dp, int slot, int cohort) {
+    if (!dp->lifecycle_trace || !dp->life || slot < 0) return;
+    dec_life_t *life = &dp->life[slot];
+    const unsigned long long now = dec_life_now_us();
+    atomic_store(&life->enqueue_us, now);
+    atomic_store(&life->cohort, cohort);
+    fprintf(stderr, "[DECLIFE] v=1 pid=%d event=ENQUEUE slot=%d ready_us=%llu enqueue_us=%llu "
+                    "ready_to_enqueue_us=%llu active=%d pending=%d target=%d cohort=%d pause_run=%d\n",
+            (int)getpid(), slot,
+            atomic_load(&life->ready_us), now,
+            now - atomic_load(&life->ready_us), atomic_load(&life->active),
+            atomic_load(&life->pending), atomic_load(&life->target), cohort,
+            atomic_load(&life->pause_run));
 }
 
 static void dec_push(dec_pool_t *dp, dec_job_t *j) {
@@ -2717,6 +2771,19 @@ static void *dec_worker_main(void *arg) {
         }
         pthread_mutex_unlock(&dp->m);
 
+        if (dp->lifecycle_trace && dp->life) {
+            const unsigned long long now = dec_life_now_us();
+            for (int i = 0; i < ng; i++) {
+                dec_life_t *life = &dp->life[grp[i]->slot];
+                atomic_store(&life->start_us, now);
+                fprintf(stderr, "[DECLIFE] v=1 pid=%d event=START slot=%d enqueue_us=%llu start_us=%llu "
+                                "enqueue_to_start_us=%llu active=%d pending=%d target=%d cohort=%d pause_run=%d\n",
+                        (int)getpid(), grp[i]->slot, atomic_load(&life->enqueue_us), now,
+                        now - atomic_load(&life->enqueue_us), atomic_load(&life->active),
+                        atomic_load(&life->pending), atomic_load(&life->target), ng,
+                        atomic_load(&life->pause_run));
+            }
+        }
         int _dw_first = 0;
         for (int i = 0; i < ng; i++) if (grp[i]->first) { _dw_first = 1; break; }
         double _dw_t0 = dp->trace ? qwen_mono_ms() : 0.0;
@@ -2756,12 +2823,32 @@ static void *dec_worker_main(void *arg) {
             else { free(aud); dp->sink->on_done(dp->sink->ud, j->tag, NULL, 0); }
         }
         if (dp->trace) {
+            char slots[DEC_GROUP_MAX * 4 + 1];
+            size_t used = 0;
+            slots[0] = '\0';
+            for (int i = 0; i < ng && used + 4 < sizeof(slots); i++) {
+                int wrote = snprintf(slots + used, sizeof(slots) - used,
+                                     "%s%d", i ? "," : "", grp[i]->slot);
+                if (wrote < 0) break;
+                used += (size_t)wrote;
+            }
             fprintf(stderr, "[DECODE] v=1 pid=%d placement=THREADED clock=CLOCK_MONOTONIC "
-                            "domain=S group=%d first=%d batch=%d first_group=%d dur_ms=%.3f\n",
-                    (int)getpid(), ng, _dw_first, dp->batch, dp->first_group,
+                            "domain=S group=%d slots=%s first=%d batch=%d first_group=%d dur_ms=%.3f\n",
+                    (int)getpid(), ng, slots, _dw_first, dp->batch, dp->first_group,
                     qwen_mono_ms() - _dw_t0);
         }
 
+        if (dp->lifecycle_trace && dp->life) {
+            const unsigned long long now = dec_life_now_us();
+            for (int i = 0; i < ng; i++) {
+                dec_life_t *life = &dp->life[grp[i]->slot];
+                atomic_store(&life->done_us, now);
+                fprintf(stderr, "[DECLIFE] v=1 pid=%d event=DONE slot=%d start_us=%llu done_us=%llu "
+                                "compute_us=%llu cohort=%d\n",
+                        (int)getpid(), grp[i]->slot, atomic_load(&life->start_us), now,
+                        now - atomic_load(&life->start_us), ng);
+            }
+        }
         for (int i = 0; i < ng; i++) {
             dec_job_t *g = grp[i];
             if (g->stream && g->is_final) {
@@ -2815,6 +2902,7 @@ static void dec_enqueue(dec_pool_t *dp, int slot, const int *codes, int nframes,
     }
     j->slot = slot; j->nframes = nframes; j->tag = tag;
     j->is_final = is_final; j->stream = stream; j->first = first;
+    dec_life_enqueue(dp, slot, 1);
     atomic_fetch_add(&dp->busy[slot], 1);
     if (dp->lane) {
         pthread_mutex_lock(&dp->m);
@@ -2851,6 +2939,7 @@ static int dec_enqueue_cohort(dec_pool_t *dp, const int *slots, const int *nfram
         memcpy(j->codes, codes[i], (size_t)nframes[i] * 16 * sizeof(int));
         j->slot = slot; j->nframes = nframes[i]; j->tag = tags[i];
         j->stream = 1; j->first = first ? first[i] : 0;
+        dec_life_enqueue(dp, slot, n);
         members[i] = j;
         atomic_fetch_add(&dp->busy[slot], 1);
     }
@@ -2984,8 +3073,13 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     const float *tts_pad = ctx->cached_tts_pad_embed;
     int n_active = 0;
 
-    dec_pool_t dpool; pthread_t dec_thr; int dec_on = 0;
+    dec_pool_t dpool = {0}; pthread_t dec_thr; int dec_on = 0;
     atomic_int *dec_busy = (atomic_int *)calloc(B, sizeof(atomic_int));
+    dec_life_t *dec_life = (getenv("QWEN_DEC_LIFECYCLE_TRACE") &&
+                            atoi(getenv("QWEN_DEC_LIFECYCLE_TRACE")) != 0) ?
+                           (dec_life_t *)calloc(B, sizeof(dec_life_t)) : NULL;
+    unsigned long long *dec_resume_us = dec_life ?
+        (unsigned long long *)calloc(B, sizeof(unsigned long long)) : NULL;
     int lane_team = qwen_lane_team_start();   /* 0 unless QWEN_SD_LANE_SPLIT prepared the split */
     if ((getenv("QWEN_DECODER_THREAD") || lane_team > 0) && dec_busy) {
         memset(&dpool, 0, sizeof dpool);
@@ -2996,6 +3090,20 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         dpool.multislot = dpool.lane ? atoi(getenv("QWEN_SD_MULTISLOT") ? getenv("QWEN_SD_MULTISLOT") : "0") : 0;
         if (!qwen_sd_multislot_active() || dpool.multislot < 2) dpool.multislot = 0;
         if (dpool.multislot > 3) dpool.multislot = 3;
+        /* ARM-SOAK-8 experiment, default off.  On the Arm ragged path a decoder cohort is a
+         * pure loss: the isolated decode_quantum_bench measures chunk-4 group 2 at 132.1 ms
+         * against 81.0 ms for two sequential singletons (group 1 = 40.6 ms), and an allocator
+         * arm ruled out allocation as the cause.  When this cap is set, a worker that already
+         * carries more than `cohort_max_b` active streams dispatches singleton decoder units
+         * immediately instead of pairing them, which is the crude form of dynamic cohort
+         * admission.  0 keeps the current unconditional cohort behaviour. */
+        { const char *cm = getenv("QWEN_SD_COHORT_MAX_B");
+          dpool.cohort_max_b = (dpool.multislot >= 2 && cm) ? atoi(cm) : 0;
+          if (dpool.cohort_max_b < 0) dpool.cohort_max_b = 0; }
+        dpool.nonblock = dpool.lane && getenv("QWEN_SD_LANE_NONBLOCK")
+                       ? atoi(getenv("QWEN_SD_LANE_NONBLOCK")) : 0;
+        if (dpool.nonblock < 0) dpool.nonblock = 0;
+        if (dpool.nonblock > 2) dpool.nonblock = 2;
         dpool.elastic = dpool.lane && qwen_lane_elastic();
         { const char *sq = getenv("QWEN_SD_LANE_SUBQ"); dpool.subq = (dpool.lane && sq) ? atoi(sq) : 0; }
         dpool.step_width = qwen_get_threads() - lane_team;   /* the STEP cpus: caller + step_width-1 workers */
@@ -3007,8 +3115,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                        atoi(getenv("QWEN_DECODER_BATCH")) != 0) ? 1 : 0;
         dpool.first_group = (getenv("QWEN_DEC_FIRSTCHUNK_GROUP") &&
                              atoi(getenv("QWEN_DEC_FIRSTCHUNK_GROUP")) != 0) ? 1 : 0;
-        dpool.trace = (getenv("QWEN_TTFA_TRACE") &&
-                       atoi(getenv("QWEN_TTFA_TRACE")) != 0) ? 1 : 0;
+        dpool.trace = ((getenv("QWEN_TTFA_TRACE") && atoi(getenv("QWEN_TTFA_TRACE")) != 0) ||
+                       (getenv("QWEN_STAGE_TRACE") && atoi(getenv("QWEN_STAGE_TRACE")) != 0)) ? 1 : 0;
+        dpool.lifecycle_trace = dpool.lane && dec_life ? 1 : 0;
+        dpool.life = dec_life;
         dpool.ctx = qwen_tts_clone_for_worker(ctx);
         if (dpool.ctx && pthread_create(&dec_thr, NULL, dec_worker_main, &dpool) == 0) {
             dec_on = 1;
@@ -3017,10 +3127,13 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 if (dpool.elastic)
                     fprintf(stderr, "[serve] decoder LANE ENABLED (ELASTIC): engine pool %d threads on all cpus; while a "
                                     "decoder unit runs on %s (team %d) the engine narrows to %s (%d threads) · "
-                                    "mailbox 1 unit/slot, cohort <= %d, preallocated, lead <= 1 quantum%s\n",
+                                    "mailbox 1 unit/slot, cohort <= %d%s, preallocated, lead <= 1 quantum%s%s\n",
                             qwen_get_threads(), lm_dec, lane_team, lm_step, dpool.step_width,
                             dpool.multislot > 0 ? dpool.multislot : 1,
-                            dpool.subq > 0 ? " · units decoded in sub-calls (QWEN_SD_LANE_SUBQ)" : "");
+                            dpool.cohort_max_b > 0 ? " (only while n_active <= QWEN_SD_COHORT_MAX_B)" : "",
+                            dpool.subq > 0 ? " · units decoded in sub-calls (QWEN_SD_LANE_SUBQ)" : "",
+                            dpool.nonblock == 1 ? " · busy slots defer instead of blocking (EXPERIMENTAL)" :
+                            dpool.nonblock == 2 ? " · bounded async mailbox scheduling (EXPERIMENTAL)" : "");
                 else
                     fprintf(stderr, "[serve] decoder LANE ENABLED: step cpus %s (engine pool %d threads) · "
                             "decoder cpus %s (private team %d) · mailbox 1 unit/slot, cohort <= %d, lead <= 1 quantum\n",
@@ -3109,6 +3222,36 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     if (st_bd > B) st_bd = B;
     uint8_t *width_mask = st_bt ? (uint8_t *)calloc(B, 1) : NULL;
     if (st_bt && !width_mask) st_bt = 0;
+    uint8_t *dec_mask = dpool.nonblock >= 2 ? (uint8_t *)calloc(B, 1) : NULL;
+    uint8_t *dec_paused = dpool.nonblock >= 2 ? (uint8_t *)calloc(B, 1) : NULL;
+    unsigned long long *dec_pause_count = dpool.nonblock >= 2 ?
+        (unsigned long long *)calloc(B, sizeof(unsigned long long)) : NULL;
+    unsigned int *dec_pause_run = dpool.nonblock >= 2 ?
+        (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    unsigned int *dec_pause_run_max = dpool.nonblock >= 2 ?
+        (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    unsigned int *dec_last_pause_run = dpool.nonblock >= 2 ?
+        (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    if (dpool.nonblock >= 2 && (!dec_mask || !dec_paused || !dec_pause_count ||
+                                !dec_pause_run || !dec_pause_run_max || !dec_last_pause_run)) {
+        fprintf(stderr, "[serve] bounded async mailbox mask allocation failed; using defer-only experiment\n");
+        dpool.nonblock = 1;
+    }
+    /* Diagnostic-only cooperative selection.  The sink currently exposes a lead gate,
+     * not a numeric audio lead, so priority below is an explicit proxy: progress age
+     * first, then ready decoder backlog.  It only constrains B>2 turns; B<=2 retains
+     * the normal batched path. */
+    int sd_sched_urgency = dpool.nonblock >= 2 && getenv("QWEN_SD_SCHED") &&
+                           !strcmp(getenv("QWEN_SD_SCHED"), "urgency");
+    int *sched_order = sd_sched_urgency ? (int *)calloc(B, sizeof(int)) : NULL;
+    unsigned int *sched_age = sd_sched_urgency ? (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    unsigned long long *sched_skip_count = sd_sched_urgency ?
+        (unsigned long long *)calloc(B, sizeof(unsigned long long)) : NULL;
+    if (sd_sched_urgency && (!sched_order || !sched_age || !sched_skip_count)) {
+        fprintf(stderr, "[serve] urgency scheduler allocation failed; using bounded async only\n");
+        sd_sched_urgency = 0;
+    }
+    unsigned long long sched_turn = 0;
     uint8_t *m1_mask = (uint8_t *)calloc(B, 1);
     int rr_cursor = 0;
     int st_th_base = qwen_get_threads();
@@ -3486,7 +3629,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         double st_admit0 = pf_admit, st_head0 = pf_head, st_samp0 = pf_samp;
         double st_cp0 = pf_cp, st_decode0 = pf_decode, st_talker0 = pf_talker;
         double st_wait0 = pf_wait, st_prefill_ms = 0, st_write_ms = 0;
-        int st_dec_calls = 0, st_dec_group_max = 0, st_dec_frames = 0;
+        int st_dec_calls = 0, st_dec_group_max = 0, st_dec_frames = 0, st_dec_defer_busy = 0, st_dec_pause_busy = 0;
+        int st_dec_pause_run_max = 0, st_sched_selected = 0, st_sched_skipped = 0, st_sched_age_max = 0;
         int st_dec_ragged = 0, st_dec_per_item = 0, st_dec_external = 0;
         double st_dec_wait = 0.0;
         int st_overlap = (dec_on && dpool.lane) ? (dpool.elastic ? (qwen_pool_width() != 0) : (dpool.queued > 0)) : 0;
@@ -3776,6 +3920,106 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             }
             step_active = width_mask;
         }
+        if (dpool.nonblock >= 2) {
+            /* Keep at most one decoder quantum ready behind an in-flight unit.  This
+             * is the bounded form of the nonblocking mailbox experiment: a busy slot
+             * is paused before it accumulates an unbounded code backlog, while other
+             * runnable slots still advance. */
+            memset(dec_mask, 0, (size_t)B);
+            n_step = 0;
+            for (int b = 0; b < B; b++) {
+                if (!active[b]) { dec_paused[b] = 0; continue; }
+                if (!step_active[b]) continue;
+                int pending = chframes[b] - decpos[b];
+                int target = dec_stream_target_frames(decpos[b], n_active,
+                                                      g_stream_dec_chunk, g_dec_chunk_busy);
+                if (dpool.lane && atomic_load(&dpool.busy[b]) != 0 && pending >= target - 1) {
+                    if (!dec_paused[b] && stage_trace)
+                        fprintf(stderr, "[DECQOS] v=1 pid=%d event=PAUSE slot=%d pending=%d target=%d busy=%d active=%d\n",
+                                (int)getpid(), b, pending, target,
+                                atomic_load(&dpool.busy[b]), n_active);
+                    dec_paused[b] = 1;
+                    dec_pause_count[b]++;
+                    dec_pause_run[b]++;
+                    if (dec_pause_run[b] > dec_pause_run_max[b])
+                        dec_pause_run_max[b] = dec_pause_run[b];
+                    if ((int)dec_pause_run[b] > st_dec_pause_run_max)
+                        st_dec_pause_run_max = (int)dec_pause_run[b];
+                    st_dec_pause_busy++;
+                    continue;
+                }
+                if (dec_paused[b] && stage_trace)
+                    fprintf(stderr, "[DECQOS] v=1 pid=%d event=RESUME slot=%d pending=%d target=%d busy=%d active=%d\n",
+                            (int)getpid(), b, pending, target,
+                            atomic_load(&dpool.busy[b]), n_active);
+                if (dec_paused[b] && dpool.lifecycle_trace && dpool.life) {
+                    dec_life_t *life = &dpool.life[b];
+                    const unsigned long long now = dec_life_now_us();
+                    const unsigned long long done = atomic_load(&life->done_us);
+                    fprintf(stderr, "[DECLIFE] v=1 pid=%d event=COMPLETE_SEEN slot=%d done_us=%llu seen_us=%llu "
+                                    "done_to_seen_us=%llu active=%d pending=%d target=%d\n",
+                            (int)getpid(), b, done, now, done ? now - done : 0ULL,
+                            n_active, pending, target);
+                    if (dec_resume_us) {
+                        dec_resume_us[b] = now;
+                        fprintf(stderr, "[DECLIFE] v=1 pid=%d event=RESUME slot=%d resume_us=%llu "
+                                        "seen_to_resume_us=0 pause_run=%u\n",
+                                (int)getpid(), b, now, dec_pause_run[b]);
+                    }
+                }
+                dec_paused[b] = 0;
+                dec_last_pause_run[b] = dec_pause_run[b];
+                dec_pause_run[b] = 0;
+                dec_mask[b] = 1;
+                n_step++;
+            }
+            step_active = dec_mask;
+            if (n_step == 0) {
+                struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+                nanosleep(&pause, NULL);
+                continue;
+            }
+        }
+        if (sd_sched_urgency) {
+            /* First urgency A/B: preserve every runnable slot and the existing batch
+             * width/decoder target.  Only the enqueue order changes.  A slot which
+             * was mailbox-paused accrues age; on resume it is placed ahead of an
+             * equally runnable peer. */
+            int sched_n = 0;
+            for (int b = 0; b < B; b++) {
+                if (!active[b]) { sched_age[b] = 0; continue; }
+                if (!step_active[b]) {
+                    if (dec_paused && dec_paused[b]) {
+                        sched_age[b]++;
+                        sched_skip_count[b]++;
+                        st_sched_skipped++;
+                        if ((int)sched_age[b] > st_sched_age_max)
+                            st_sched_age_max = (int)sched_age[b];
+                    }
+                    continue;
+                }
+                unsigned long long score = (unsigned long long)sched_age[b] * 16u;
+                if (chframes[b] > decpos[b]) score += 4u; /* decoder backlog proxy */
+                if (sframe[b] == 0) score += 2u;          /* preserve first-audio progress */
+                int at = sched_n++;
+                while (at > 0) {
+                    int prev = sched_order[at - 1];
+                    unsigned long long prev_score = (unsigned long long)sched_age[prev] * 16u;
+                    if (chframes[prev] > decpos[prev]) prev_score += 4u;
+                    if (sframe[prev] == 0) prev_score += 2u;
+                    if (prev_score >= score) break;
+                    sched_order[at] = prev;
+                    at--;
+                }
+                sched_order[at] = b;
+            }
+            sched_turn++;
+            st_sched_selected = sched_n;
+            if (stage_trace && (sched_turn & 255u) == 1u)
+                fprintf(stderr, "[DECQOS] v=1 pid=%d event=SCHED turn=%llu active=%d runnable=%d selected=%d "
+                                "proxy=age+pending+first_audio mode=enqueue-order-only\n",
+                        (int)getpid(), sched_turn, n_active, n_step, sched_n);
+        }
         if (ttfa_prio) {
             for (int b = 0; b < B; b++)
                 frozen[b] = (active[b] && (!lead_gate || lead_mask[b]) && !step_active[b])
@@ -3816,25 +4060,26 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         PF_START();
         if (st_td) qwen_set_threads_soft(st_td);
         int cohort_n = 0;
+        /* one decision per frame turn: n_active is fixed for the turn, so a cohort is never
+         * left half-built across the cap boundary */
+        const int cohort_allowed = dpool.cohort_max_b <= 0 || n_active <= dpool.cohort_max_b;
         int cohort_slots[3] = { 0, 0, 0 }, cohort_frames[3] = { 0, 0, 0 };
         int *cohort_codes[3] = { NULL, NULL, NULL };
         void *cohort_tags[3] = { NULL, NULL, NULL };
         int cohort_first[3] = { 0, 0, 0 };
-        for (int b = 0; b < B; b++) {
-            if (!step_active[b]) {
+        for (int b = 0; b < B; b++)
+            if (!step_active[b])
                 memset(step_embed + (size_t)b * h, 0, (size_t)h * sizeof(float));
-                continue;
-            }
+        int decode_order_n = sd_sched_urgency ? st_sched_selected : B;
+        for (int oi = 0; oi < decode_order_n; oi++) {
+            int b = sd_sched_urgency ? sched_order[oi] : oi;
+            if (!step_active[b]) continue;
             RECORD_FRAME_AND_EMBED(b);
 
             if (want_stream[b] || amort) {
                 int pending = chframes[b] - decpos[b];
-                int target;
-                if      (decpos[b] == 0) target = 1;
-                else if (decpos[b] < 4)  target = 2;
-                else if (decpos[b] < 12) target = 4;
-                else if (g_dec_chunk_busy && n_active > 1) target = g_dec_chunk_busy;
-                else                     target = g_stream_dec_chunk;
+                int target = dec_stream_target_frames(decpos[b], n_active,
+                                                      g_stream_dec_chunk, g_dec_chunk_busy);
                 if (ttfa_trace && t2_frame1[b] == 0.0 && pending > 0) t2_frame1[b] = qwen_mono_ms();
                 if (dec_batch) {
                     db_pending[b] = pending;
@@ -3843,6 +4088,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 if (pending < target) continue;
                 if (dec_on && want_stream[b]) {
+                    dec_life_ready(&dpool, b, n_active, pending, target,
+                                   dec_last_pause_run ? dec_last_pause_run[b] : 0);
+                    if (dec_last_pause_run) dec_last_pause_run[b] = 0;
                     if (stage_trace && !(dpool.lane && dpool.multislot >= 2)) {
                         st_dec_calls++; st_dec_group_max = 1;
                         st_dec_frames += pending; st_dec_external = 1;
@@ -3851,10 +4099,17 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     if (dpool.lane) {
                         /* one unit in flight per slot: a second quantum is ready, so this
                          * slot's producer waits for its decoder, and only this slot's */
+                        if (dpool.nonblock && atomic_load(&dpool.busy[b]) != 0) {
+                            /* QoS experiment: never let one full mailbox stall the entire
+                             * frame turn.  The pending codes stay in this slot and are
+                             * considered again on the next turn after the lane signals idle. */
+                            st_dec_defer_busy++;
+                            continue;
+                        }
                         double _dw = dec_wait_idle(&dpool, b);
                         st_dec_wait += _dw; pf_decwait += _dw;
                     }
-                    if (dpool.lane && dpool.multislot >= 2) {
+                    if (dpool.lane && dpool.multislot >= 2 && cohort_allowed) {
                         /* Keep one candidate until a same-length peer is ready.  A
                          * different pending length is flushed as an ordinary unit;
                          * it must never enter a scalar-length multi kernel. */
@@ -4142,7 +4397,18 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             }
             break;
         }
-        for (int b = 0; b < B; b++) if (step_active[b]) { pos[b]++; sframe[b]++; }
+        for (int b = 0; b < B; b++) if (step_active[b]) {
+            pos[b]++; sframe[b]++;
+            if (dpool.lifecycle_trace && dec_resume_us && dec_resume_us[b]) {
+                const unsigned long long now = dec_life_now_us();
+                fprintf(stderr, "[DECLIFE] v=1 pid=%d event=NEXT_PROGRESS slot=%d resume_us=%llu progress_us=%llu "
+                                "resume_to_progress_us=%llu active=%d decpos=%d produced=%d\n",
+                        (int)getpid(), b, dec_resume_us[b], now, now - dec_resume_us[b],
+                        n_active, decpos[b], chframes[b]);
+                dec_resume_us[b] = 0;
+            }
+            if (sd_sched_urgency) sched_age[b] = 0;
+        }
         if (stage_trace) {
             st_n_step = n_step;
             double st_end = qwen_mono_ms();
@@ -4162,14 +4428,16 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     "sample_ms=%.3f cp_ms=%.3f decode_ms=%.3f talker_ms=%.3f "
                     "output_ms=%.3f queue_wait_ms=%.3f serial_ms=%.3f wall_ms=%.3f "
                     "dec_calls=%d dec_group_max=%d dec_frames=%d dec_ragged=%d "
-                    "dec_per_item=%d dec_external=%d dec_wait_ms=%.3f overlap=%d "
+                    "dec_per_item=%d dec_external=%d dec_wait_ms=%.3f dec_defer_busy=%d dec_pause_busy=%d "
+                    "dec_pause_run_max=%d sched_selected=%d sched_skipped=%d sched_age_max=%d overlap=%d "
                     "prefill_slice=%d prefill_pending=%d prefill_done=%d\n",
                     (int)getpid(),
                     (unsigned long long)atomic_load_explicit(&g_admit_seq, memory_order_relaxed),
                     st_iter_start, st_end, st_n_active, st_n_step, st_admit, st_prefill_ms, st_head, st_samp,
                     st_cp, st_decode, st_talker, st_write_ms, st_wait, st_serial, st_wall,
                     st_dec_calls, st_dec_group_max, st_dec_frames, st_dec_ragged,
-                    st_dec_per_item, st_dec_external, st_dec_wait, st_overlap,
+                    st_dec_per_item, st_dec_external, st_dec_wait, st_dec_defer_busy, st_dec_pause_busy,
+                    st_dec_pause_run_max, st_sched_selected, st_sched_skipped, st_sched_age_max, st_overlap,
                     adm_slice, adm.active, adm.active ? adm.done : 0);
         }
     }
@@ -4267,7 +4535,6 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         if (dpool.lane) { qwen_pool_set_width(0); qwen_lane_team_stop(); free(dpool.slot_job); free(dpool.slot_codes); }
         dec_on = 0;
     }
-    free(dec_busy);
     free(db_pending); free(db_target); free(db_slot); free(db_items);
     free(t2_admitted); free(t2_pf_start); free(t2_pf_done); free(t2_state_rdy);
     free(t2_step1); free(t2_talker1); free(t2_decode1);
@@ -4275,6 +4542,20 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     free(t2_audio1); free(t2_seed); free(t2_helper); free(t2_batch_at_inst);
     free(t2_qdepth_at_pop); free(t2_emitted); free(t2_adm_seq);
     free(width_mask);
+    free(dec_mask);
+    if (stage_trace && dpool.nonblock >= 2)
+        for (int b = 0; b < B; b++)
+            fprintf(stderr, "[DECQOS] v=1 pid=%d event=SUMMARY slot=%d pauses=%llu pause_run_max=%u "
+                            "sched_skips=%llu progress_age=%u busy=%d pending=%d decpos=%d produced=%d\n",
+                    (int)getpid(), b, dec_pause_count[b], dec_pause_run_max[b],
+                    sd_sched_urgency ? sched_skip_count[b] : 0ULL,
+                    sd_sched_urgency ? sched_age[b] : 0u,
+                    atomic_load(&dec_busy[b]), chframes[b] - decpos[b], decpos[b], chframes[b]);
+    free(dec_paused); free(dec_pause_count); free(dec_pause_run); free(dec_pause_run_max); free(dec_last_pause_run);
+    free(sched_order); free(sched_age); free(sched_skip_count);
+    free(dec_resume_us);
+    free(dec_life);
+    free(dec_busy);
     free(m1_mask);
     free(lead_mask);
     free(prio_mask); free(frozen);

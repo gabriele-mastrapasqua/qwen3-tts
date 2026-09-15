@@ -68,6 +68,7 @@ the AMX tile unit is per physical core they also serialised on it.
 | server launch for measurement | `tools/perf_profile.py command <profile> --model DIR --port N` (prints the exact `./qwen_tts … --prefork W --prefork-threads K --cpu-mask … --batch-size B` line); the harnesses below launch it themselves from `--profile` | never hand-typed from memory | authoritative |
 | WAVE (finite screening) | `tests/serve_parallel_wave.py --profile P --topo WxK --conc 1,4 --waves N …`; wrappers `make bench-topo`, `make bench-suite` (rungs realistic / fast / short-diverse / long-diverse, identity gate `tests/serve_identity_gate.py`) | topology and knob screening, A/B arms | canonical WAVE; screening only |
 | SOAK (sustained, fixed concurrency) | `make bench-soak SOAK_PROFILE=P SOAK_CONCURRENCY=C SOAK_MINUTES=M …` → `tests/serve_soak.py` (+ `tests/soak_client.py`), analysed by `tests/soak_drift.py` → `soak_summary.json`; `--strict-kpi` for the production gate | the production qualification | **canonical SOAK; the only production gate** |
+| SOAK-FAST (adaptive knee SCREEN) | `make soak-fast SOAK_PROFILE=P SOAKFAST_LADDER=8:12 …` → `tests/soak_fast.py`, which drives `tests/serve_soak.py` at 30 s warm-up + 2x90 s measured per point, classifies CLEAR / HEALTHY / KNEE against a rule fixed in advance, stops at the first knee and prints the recommended qualification point; writes `screen_summary.json` with `"is_qualification": false` | before spending 30-minute soaks: to find WHICH concurrency deserves the canonical run | **SCREEN only, never a gate** — short windows cannot assess drift, per-class tails or resource growth, so `serve_soak.py` reports `PARTIAL` by construction |
 | POISSON / overload | `tests/load_test.py --arrival poisson --rate R` (also `uniform`, `all-at-once`) | only when open-arrival behaviour is the question | available, on request; not part of `bench-suite` |
 | lightweight profiling | `make profile-cpu` (shape census, `tools/census_report.py`), `make cost-map` (C1 only; `tools/costmap_parity.sh`), external `perf stat` / `perf record -F 499 -p <pids>` by hand | DIAGNOSTIC runs only | never a qualification number; no tracked wrapper for `perf` |
 | result summarisation | `tests/soak_drift.py` (`soak_summary.json`), `tools/envelope_report.py` (`make envelope WAVE_JSON=…`), `tools/topology_report.py`, `tools/census_report.py`, `tools/costmap_report.py` | after the run, from its artifacts | authoritative readers of the canonical artifacts |
@@ -118,6 +119,8 @@ F. runtime dispatch in the profile's env (`cpu-check CPU_PROFILE=…`, `dispatch
 G. single-request sanity (`make test-selftest`, `make test-golden`, one `curl` against the
    profile's server) ·
 H. finite WAVE screening (`bench-topo` / `bench-suite`, C=1 and the target C) ·
+H2. adaptive knee SCREEN (`make soak-fast`) when the capacity ladder is unknown: minutes per
+   point instead of 30, to choose the points worth qualifying — never a gate itself ·
 I. sustained canonical SOAK (`bench-soak --strict-kpi`, 5 minutes minimum for a gate) ·
 J. POISSON only when specifically required.
 Never start at I on an unknown box.

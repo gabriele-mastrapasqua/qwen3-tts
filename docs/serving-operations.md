@@ -507,6 +507,50 @@ Two rules that have each cost a day:
 
 ---
 
+## 8b. Recommended decoder setup, split by ISA
+
+The decoder is the one place where the right answer genuinely differs between x86 and Arm,
+so keep the two lanes separate rather than carrying one "all-on" set across both.
+
+### Arm (Neoverse-V2 / Graviton4 / Axion, KleidiAI)
+
+| Knob | Setting | Why |
+|---|---|---|
+| decoder precision | `QWEN_SD_INT8=1` | per-item int8 DOTPROD is the qualified leaf; `--dispatch-map` must resolve `per-item-int8-dotprod` |
+| residual convs | `QWEN_SD_RES1_V2=1` | DL-4 direct dilated int8; serves res1, res2 and the initial/pre convs |
+| decoder lane | `QWEN_SD_LANE_SPLIT=4`, `QWEN_SD_LANE_ELASTIC=1` | private decoder team; engine narrows only while a unit is in flight. Linux-only, not ISA-specific |
+| **stream cohort** | **`QWEN_SD_MULTISLOT=0`** | **retired on Arm.** Pairing two streams into one batched call costs 1.63x the sequential decode on Graviton4 and 1.20x on Axion. Numerically free to disable (`mel_corr 1.00000`) |
+| Design D / fused residual | unsupported | x86 AMX only; the gates read `UNSUPPORTED`, which is correct, not a fallback |
+| ConvT stack / ConvNeXt int8 | off unless separately qualified | `QWEN_SD_CONVT_STACK`, `QWEN_SD_CONVT_I8`, `QWEN_SD_CNEXT_I8` change numerics and need their own paired audio gate |
+
+Reference profiles: `arm-product`, `aws-c8g-8xlarge-32c-arm-v2-all-on`,
+`axion-c4a-highcpu32-0p6b-all-on`, `axion-16c-ttfa` &mdash; all four now ship
+`QWEN_SD_MULTISLOT=0`.
+
+### x86 (AVX-512 VNNI / AMX)
+
+| Knob | Setting | Why |
+|---|---|---|
+| decoder precision | `QWEN_SD_INT8=1` (default on VNNI) | the VNNI leaf is the qualified default; AMX hosts add Design D |
+| Design D | `QWEN_SD_AMX_D=1` on AMX hosts | persistent int8 packs, the AMX decoder path |
+| residual convs | `QWEN_SD_RES1_V2=1` | same DL-4 leaf, VNNI twin |
+| **stream cohort** | **`QWEN_SD_MULTISLOT=2` on the Turin product profile** | **kept, but on weaker evidence than the Arm retirement.** It was promoted from a combined lane+V2+cohort smoke, never from an isolated arm, and the VNNI multi kernel has the same runtime-indexed accumulator structure that spills on Arm. Treat as provisional until the three-cell microbench runs on x86 |
+| control arm | `turin-c8a-32c-vnni-control` | the committed A/B arm: `QWEN_SD_RES1_V2=0`, `QWEN_SD_MULTISLOT=0` |
+
+### The one-command check that the ISA lane is what you think
+
+```bash
+./qwen_tts --dispatch-map | grep -iE "decoder|multislot|res1"
+python3 tools/serving_profile.py preflight <profile> --binary ./qwen_tts
+```
+
+The preflight records `multislot_active`, `feature_status.multislot` and
+`resolved_decoder_mode`; a profile whose parity block lists `["ACTIVE", "VALID FALLBACK"]`
+stays valid with the cohort either way, so the preflight passing is **not** on its own
+evidence that the cohort is on or off. Read the recorded value.
+
+---
+
 ## 9. A worked example: a 16-core Arm host
 
 ```bash

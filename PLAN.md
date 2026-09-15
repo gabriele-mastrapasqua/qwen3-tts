@@ -201,6 +201,186 @@ sustained qualification.
       screen completed 128 with zero functional errors but STREAM p95 `1.084`, safe-start
       p95 `1.876 s`, stall@250/500 `46.8%/14.7%` (**FAIL playback**). These are diagnostic
       screens only, not G4 qualifications or capacity promotion.
+- [ ] ARM-SOAK-8 **P0 decoder-lane lifecycle/QoS** (2026-09-14): on the scalable 4x8
+      Arm control, C10 reaches the playback knee at B=3. Synchronous mailbox waiting was
+      causal; bounded async removes that wait but leaves pause/resume tails. The first
+      default-off urgency ordering A/B (`QWEN_SD_SCHED=urgency`) retained every runnable
+      slot and only changed decoder enqueue order; it was **REJECTED** (STREAM p95 1.077,
+      stall@250/500 14.0%/6.1%, TTFA p95 335 ms). Trace shows repeated slot pause/resume
+      and mostly singleton decoder groups, not a permanently lost slot. Active baseline
+      diagnostic: event-only READY→ENQUEUE→START→DONE→COMPLETE_SEEN→RESUME→NEXT_PROGRESS
+      timing attributes the residual tail to lane queue/dispatch plus paired cohort work:
+      B3 enqueue→start p95 `213.77 ms` vs B2 `55.56 ms`; pair compute p95 `272.05 ms`
+      vs singleton `86.33 ms`; completion-seen and resume-progress stay ~35–40 ms p95.
+      **CONFIRMED**: do not tune urgency or completion polling. Singleton-only (`MULTISLOT=1`)
+      kept all controls fixed and moved B3 enqueue→start p95 to `135.13 ms`, B3 compute p95
+      to `83.49 ms`, STREAM p95 `1.058→0.829`, stall@250/500 `10.0%/3.6%→0%/0%`,
+      TTFA p95 `312→159 ms`, safe-start p95 `1049→415 ms`, completions `120→126`.
+      Paired cohorts are causally poisoning B3. Static audit of the two decoder paths plus
+      an isolated `decode_quantum_bench` A/B then closed the "why": `ng>1` selects a second,
+      separately written decoder implementation, and on Graviton4 at the product quantum a
+      cohort costs **1.63x two sequential singletons** (chunk 4: group 1 `40.6 ms`, group 2
+      `81.0 ms` at `MULTISLOT=0` vs `132.1 ms` at `MULTISLOT=2`; group 1 identical across
+      arms). The one clearly accidental difference found statically -- the ragged path never
+      sets `g_sd_arena`, so ~40 multi-MB `posix_memalign`/`free` cycles per call replace the
+      per-slot bump arena -- was **REFUTED** by a zero-code allocator arm (0% at chunk 4,
+      ~5% at chunk 8). **CONFIRMED: the pair is intrinsically expensive on the Arm ragged
+      path, and it is a pure loss at B=2 too, at zero queue pressure.** Option B is closed;
+      no ragged-kernel project is justified by this evidence. Next is option A, dynamic
+      cohort admission, implemented default-off as `QWEN_SD_COHORT_MAX_B` (cohorts only
+      while `n_active <= N`, decided once per frame turn).
+      **A/B RESULT (2026-09-14), KEEP default-off:** at C10 the cap removed the knee --
+      STREAM p95 `1.035 -> 0.847`, safe-start p95 `1032 -> 504 ms`, stall@250/@500
+      `11%/2% -> 0%/0%`, TTFA p95 flat `301.7 -> 307.8 ms`, 0/0/0 errors, resources PASS;
+      the trace proves the mechanism fired and nothing else moved (B=3 cohorts `460 -> 0`,
+      B=2 cohorts preserved `32 -> 108`, B=3 enqueue->start p95 `213.59 -> 134.93 ms`,
+      reproducing the singleton-only arm's 135.13). Cost: completions `133 -> 122` (~-5%
+      throughput). At C8 it is correctly **inert** (every delta inside single-window noise;
+      per-worker occupancy there is essentially B=2, so only 8 B=3 cohorts existed to cap).
+      NOT promoted: one measured window per arm, `SOAK RESULT PARTIAL`, no per-class KPI,
+      no audio gate. **Open decision, do not skip to a slack formula:** microbench and the
+      C8 server trace both say a cohort loses at B=2 too (B=2 pair compute p95 ~252-264 ms
+      vs singleton ~86-89 ms), so the next one-change A/B is `COHORT_MAX_B=1` vs `=2`; if
+      1 wins, the cohort mechanism has no operating point on the Arm ragged path and should
+      be retired there rather than tuned.
+      **Architectural review (2026-09-14, G4 box, no code change):** three independent
+      decompositions agree the penalty is one kernel, not the ragged structure -- cost map
+      puts 100% of the +49.9 ms in `conv_stack`; `QWEN_SD_PHASE` puts +42.5 ms in res1 and
+      +7.1 ms in res2 (the two `qwen_conv1d_int8_v2_multi` call sites) with convt/transformer
+      at parity or better; `objdump` shows `sd_dconv_multi_worker` spilling its runtime-indexed
+      accumulators (40 q-stores / 33 q-loads around 30 `sdot`) where the single kernel has 0.
+      The penalty is ~1.6x sequential in **every** regime (chunk 1/2/4/8: 1.59/1.65/1.63/1.71;
+      S=3: 1.61/1.67); the mechanism's sharing ceiling from weight sizes and measured
+      bandwidth is a few ms per pair on G4 or G5; the DL-4 unit-cost gate was never recorded
+      as passed and Turin never isolated the cohort. Eight attempts to falsify retirement all
+      failed. **Answer: no server condition where ng>1 wins; one concrete fix exists (S==2
+      named-accumulator specialisation, exact by self-test) but its best case is parity, so it
+      is not a reason to keep cohorts. Decide with `COHORT_MAX_B=1` vs `=2` at C8 then C10
+      (pre-registered rule in the .work file; a null result counts against the cohort); if no
+      win above noise, express retirement as `QWEN_SD_MULTISLOT=0` in the Arm profile.**
+      x86/Turin untouched (`MULTISLOT=2` stays); the VNNI twin shares the array structure
+      and deserves the same three-cell microbench when a Turin box is next rented.
+      **Decision A/B run (2026-09-14): `COHORT_MAX_B=2` vs `=1`, C8 then C10, same binary.**
+      Mechanism proven (B=2 cohorts 82/56 in cap 2, 0 in cap 1; pair compute p95 ~260-270 ms
+      vs singleton ~87 ms). Pre-registered rule NOT met: STREAM p95 C8 0.625 vs **0.612**
+      (cap 1 better), C10 0.831 vs 0.835 (tie); stalls 0/0 everywhere; completions +4 cap 2
+      at C8, +5 cap 1 at C10; TTFA/safe-start deltas ~20-45 ms flip sign between points --
+      noise at the predicted ~1.5% effect size. **VERDICT: RETIRE cohorts on Arm.**
+      Recommended expression, NOT applied yet (qualification-level): `QWEN_SD_MULTISLOT=0` in
+      the Arm all-on profile; `COHORT_MAX_B` stays a default-off diagnostic; Turin/VNNI
+      untouched. Next: multi-window soak + per-class KPI on that profile before promotion.
+      **PRODUCTION DECISION APPLIED + QUALIFIED (2026-09-15).** `QWEN_SD_MULTISLOT` set to `0`
+      in `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json` only (Turin/Axion/arm-product
+      untouched; `COHORT_MAX_B` stays a default-off diagnostic in no profile). Full qualification
+      on the G4 box, profile as committed: caps/self-test/dispatch-map/strict preflight PASS
+      (`multislot_active:false`, `feature_status.multislot:"VALID FALLBACK"`,
+      `per-item-int8-dotprod`); **C8 30-min SOAK PASS** (3805 done, 0/0/0, STREAM p95 0.562,
+      safe-start p95 179 ms, stall@250/@500 0%/0%, per-class + latency + resource PASS) and
+      **C10 30-min SOAK PASS** (3892 done, 0/0/0, STREAM p95 0.805, safe-start p95 361 ms,
+      stall@250/@500 0%/0%, all KPI PASS). Paired against the previous private measurement
+      generation on the same host/commit with cohorts ON: C8 STREAM p95 `0.801 -> 0.562`, completions +13.9%;
+      **C10 `OVER LIMIT -> PASS`**, STREAM p95 `1.04 -> 0.805`, safe-start `723 -> 361 ms`,
+      stall@250 `19.3% -> 0%`, completions +19.9%. **0.6B sustained recommendation moves
+      C8 -> C10 (+25% density).** Only TTFA p95 at C8 regressed (+25.6 ms); at C10 it improved
+      96 ms. No regression attributable to singleton decode, so cohort tuning stays closed.
+      Detail: `.work/arm-sustained-soak-regression-20260913.md`.
+- [x] ARM-SOAK-11 **`make soak-fast` — adaptive knee SCREEN in the suite** (2026-09-15):
+      `tests/soak_fast.py` drives the canonical `serve_soak.py` at 30 s warm-up + 2x90 s per
+      point, classifies CLEAR/HEALTHY/KNEE against a pre-fixed rule, stops at the knee and
+      names the point worth a 30-minute run; `screen_summary.json` carries
+      `"is_qualification": false`. Registered in `docs/BENCHMARKING.md` (tool table + new step
+      **H2**). Screen-vs-soak calibration is OPEN: the one direct same-point pair (Axion 1.7B
+      C12 cohorts-ON, 30-min `0.67` vs 180 s screen `0.653`) says screens are approximately
+      faithful; the G4 "one step optimistic" reading was interpolated, not measured. Pick the
+      highest CLEAR anyway — it costs nothing. **RESOLVED 2026-09-15: screens are faithful.**
+      Same-point pairs: G4 0.6B C12 screen `0.829` vs 30-min `0.8364`; G4 1.7B C10 screen
+      `0.830` vs 30-min `0.8307`; Axion 1.7B C12 screen `0.653` vs previous 30-min `0.67`.
+      The "one step optimistic" reading compared different points and is withdrawn.
+- [x] ARM-SOAK-12 **G4 knee screens** (2026-09-15, production profile `MULTISLOT=0`):
+      0.6B C11 CLEAR `0.803`, **C12 CLEAR `0.829`**, C13 **KNEE `1.013`**; 1.7B C8 CLEAR
+      `0.698`, **C10 CLEAR `0.830`**, C11 HEALTHY `0.829`, C12 HEALTHY `0.842`. Canonical
+      30-minute qualification launched at **0.6B C12** and **1.7B C10**. Screens are not
+      qualifications and are not reportable operating points.
+- [x] ARM-SOAK-13 **G4 v2 canonical qualification — both points PASS** (2026-09-15):
+      **0.6B C12** (3962 done, 0/0/0, STREAM p95 `0.836`, TTFA p95 198 ms, safe-start p95
+      356 ms, stall@250/@500 `0%/0%`) and **1.7B C10** (3665 done, 0/0/0, STREAM p95 `0.831`,
+      TTFA p95 207 ms, safe-start p95 364 ms, stall@250/@500 `0%/0%`); latency, per-class (5)
+      and resource KPI PASS on both, threads flat at 92. Operating points move **C8/C8 ->
+      0.6B C12 (+50%) / 1.7B C10 (+25%)**. Caveat to carry into any report: `stall@100` is
+      22-23% at these densities, so the points are safe for a >= 250 ms client prebuffer
+      (consistent with safe-start p95 356/364 ms), not for a 100 ms one.
+- [x] ARM-SOAK-9 **CLOSING ITEM A — DONE (2026-09-15): qualified operating point published into
+      the G4 profile.** `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json`:
+      `objective.preferred_concurrency` `"unspecified" -> "0.6B C12; 1.7B C10 (per checkpoint
+      size)"`, `concurrency_range` `[1,16] -> [1,12]`, a new
+      `objective.preferred_concurrency_evidence` carrying both 30-minute soak results and the
+      >= 250 ms prebuffer assumption, and the stale `parity.notes` sentence ("does not promote a
+      concurrency point before the host-specific audio and soak gates pass") replaced by the
+      promoted points. Original item text:
+      After the 30-minute canonical qualifications at the screened winning points, update
+      `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json`: `profile.objective.preferred_concurrency`
+      (today `"unspecified"`) and the `server` block / notes must carry the qualified point per
+      model size, with the soak evidence path in the `why`. Today the file still reads "does not
+      promote a concurrency point before the host-specific audio and soak gates pass" — those
+      gates have now passed for 0.6B C8 and C10, so that sentence has to be replaced by the real
+      number rather than left stale. Do not promote a point that only has a SCREEN behind it.
+- [x] ARM-SOAK-14 **Axion v2 qualification — both points PASS** (2026-09-15): **1.7B C16**
+      (5207 done, 0/0/0, STREAM p95 `0.789`, TTFA p95 175 ms, safe-start p95 332 ms,
+      stall@250/@500 `0%/0%`) and **0.6B C16** (5281 done, 0/0/0, STREAM p95 `0.845`, TTFA p95
+      195 ms, safe-start p95 371 ms, `0%/0%`); all KPI PASS, threads flat at 216. 1.7B moves
+      **C12 -> C16 (+33%)**; 0.6B keeps C16 but gains the sustained gate it never had (the
+      previous generation recommended it on true-wave evidence alone). Knee at C18 for both.
+      Audio gate 12/12 `mel_corr 1.00000` against a cohort-ON control. **Attribution caveat:**
+      the paired screens say the cohort retirement alone is worth ~-17.5% safe-start / +4.6%
+      completions at 1.7B C12; most of the C12 -> C16 move is that the ladder had never been
+      walked past C12. Do not credit the flag with the whole jump.
+- [x] ARM-SOAK-10 **CLOSING ITEM B — DONE (2026-09-15).** Axion measured, not assumed: the
+      three-cell microbench gave `1.20x` (vs `1.63x` on Graviton4) and two paired serving
+      screens agreed, so `axion-c4a-highcpu32-0p6b-all-on.json` moved to `QWEN_SD_MULTISLOT=0`
+      with all three measurements recorded in its `why` and a `revert` condition. Every Arm
+      profile now ships the per-item decoder; `turin-c8a-32c-vnni-product` stays at `2` until
+      its own isolated microbench. Original item text:
+      Audit after the G4 retirement: `arm-product.json` **0**, `axion-16c-ttfa.json` **0**,
+      `aws-c8g-8xlarge-32c-arm-v2-all-on.json` **0** (retired 2026-09-14/15), and
+      **`axion-c4a-highcpu32-0p6b-all-on.json` is the only Arm profile still at `QWEN_SD_MULTISLOT=2`**.
+      x86 is out of scope: `turin-c8a-32c-vnni-product` stays `2` until its own isolated microbench.
+      Two independent reasons to expect the same verdict on Axion: the pathology is in the shared
+      Arm dotprod leaf (`sd_dconv_multi_worker` spills its runtime-indexed accumulators — 40 q-stores /
+      33 q-loads around 30 `sdot` versus 0 in the single-slot kernel), and `arm-product.json`'s own
+      `why` already records that its short 0.6B/1.7B 2-slot and 3-slot A/B was **2.8-3.9% slower**.
+      **Do not flip it blind.** The cheap discriminator is ~2 minutes on an Axion box:
+      `decode_quantum_bench` three cells (g1/c4 singleton, g2/c4 at `MULTISLOT=0` = two sequential
+      singletons, g2/c4 at `MULTISLOT=2` = ragged cohort) with the profile env applied correctly
+      — see the void-run warning above about the comma-joined `server-env` string. If it reproduces
+      the ~1.6x penalty, retire there too (`QWEN_SD_MULTISLOT=0`, the preflight-valid fallback) and
+      confirm with `make soak-fast` before any 30-minute run. Keep the flag, kernel and multi-slot
+      self-test cases in the tree either way.
+- [ ] X86-COHORT-1 **Does the same cohort retirement pay on x86/Turin?** The Arm campaign
+      retired `QWEN_SD_MULTISLOT` on four profiles after measuring a per-call loss; x86 still
+      ships `2` on `turin-c8a-32c-vnni-product` and that value rests on weaker evidence than
+      the Arm retirement now does. Two reasons to suspect it:
+      (a) the VNNI multi worker has the **same source structure** that costs Arm its margin —
+      `acc[3][4][2]` / `facc[3][4][2]` / `xv[3][2]` indexed by a runtime `S` and `mn`, where
+      the single-slot kernel uses named registers; on Arm `objdump` showed 40 q-stores /
+      33 q-loads around 30 `sdot` versus 0 loads in the single-slot twin.
+      (b) the Turin cohort was promoted from a **combined** lane+RES1_V2+cohort smoke, never
+      from an isolated arm; the DL-4 spec's own unit-cost gate (`conv_up` at 1 slot vs 2) is
+      not recorded as passed anywhere in `.work`.
+      Cost to answer: ~2 minutes. Recipe, exactly as used on both Arm hosts:
+      `tests/decode_quantum_bench.c` patched for one cell, three runs at chunk 4 with the
+      profile env applied as **separate assignments** (see the void-run warning: the profile
+      emits one comma-joined line and `env $BASE` silently sets a single malformed variable) —
+      g1/`MULTISLOT=2`, g2/`MULTISLOT=0` (two sequential singletons), g2/`MULTISLOT=2` (cohort).
+      If the cohort is >= the sequential pair, disassemble `sd_dconv_multi_worker`'s VNNI twin
+      to confirm the spill, then run `make soak-fast` on the Turin ladder before any 30-minute
+      soak. Arm found +50%/+25%/+33% of density this way; x86 may well have some too.
+      **Do not flip the Turin profile on the Arm result alone** — the Arm retirement itself was
+      only taken after this host's own microbench plus two paired serving screens.
+- [ ] X86-COHORT-2 **If X86-COHORT-1 confirms**: re-walk the Turin capacity ladder with
+      `make soak-fast` (the C12 gate has been chased for a long time at a fixed concurrency;
+      the Arm campaign showed the previous recommendation was simply below the knee on one
+      host and that the ladder had never been walked past it). Then qualify only the winning
+      point, and regenerate the x86 customer-facing numbers if they move.
 - [ ] ARM-SOAK-5 **P1 admission concurrency cap**: test max one concurrent admission/prefill,
       accepting some fresh-request TTFA increase in exchange for existing-stream safety.
 - [ ] ARM-SOAK-6 **P1 cohort preservation**: measure active cohort size, phase skew and

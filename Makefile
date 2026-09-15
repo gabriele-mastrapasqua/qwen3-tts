@@ -770,6 +770,25 @@ bench-soak: $(TARGET)
 
 server-soak: bench-soak
 
+# SOAK-FAST: adaptive short SCREEN that finds the playback knee in minutes, so the
+# 30-minute canonical soak is only ever spent on a point that already looks like a winner.
+# A screen is never a qualification -- see the header of tests/soak_fast.py.
+SOAKFAST_LADDER   ?= 2:8
+SOAKFAST_OUT      ?= $(BENCH_OUT)/soak-fast
+SOAKFAST_WARMUP_S ?= 30
+SOAKFAST_WINDOW_S ?= 90
+SOAKFAST_WINDOWS  ?= 2
+SOAKFAST_ARGS     ?=
+
+soak-fast: $(TARGET)
+	@python3 tests/soak_fast.py --model "$(SOAK_MODEL)" --bin "./$(TARGET)" \
+	  --bank "$(SOAK_BANK)" --speaker "$(SOAK_SPEAKER)" --language "$(SOAK_LANGUAGE)" \
+	  --ladder "$(SOAKFAST_LADDER)" --precision "$(SOAK_PRECISION)" \
+	  --warmup-s "$(SOAKFAST_WARMUP_S)" --window-s "$(SOAKFAST_WINDOW_S)" \
+	  --min-windows "$(SOAKFAST_WINDOWS)" --out "$(SOAKFAST_OUT)" \
+	  $(if $(SOAK_PROFILE),--profile "$(SOAK_PROFILE)",--no-profile "$(SOAK_NO_PROFILE)") \
+	  $(SOAKFAST_ARGS)
+
 bench-suite-full: bench-suite
 	@$(MAKE) bench-soak
 
