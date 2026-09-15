@@ -1098,6 +1098,43 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       edge case. The PR also adds a `decoder_convT_packed` self-test. MERGE IT WITH
       `gh pr merge 29 --merge` — never a local `git merge --squash` + commit, which reassigns
       authorship away from the contributor.
+- [x] CUDA-8 **Batched GPU Talker: wrong results, illegal memory accesses and 0.12x
+      throughput — FIXED.** `--gpu-batch-bench` bisected it cleanly: exact at B<=2, broken at
+      B>=4, with correctness and speed failing at the same threshold. The three batched matmat
+      kernels accumulated into `float s[QB_MAX]` through loops bounded by the runtime batch
+      size; with a runtime bound the compiler spilled the accumulator to local memory, which on
+      a GPU is backed by global memory. That one detail produced `max|batched-single| = 2.93e+01`
+      (the engine's own gate printed FAIL), ~11k illegal accesses per run, and a collapse to
+      0.06x. compute-sanitizer's "Invalid __global__ write" inside `k_matmat_bf16` at an address
+      far outside every allocation was the spilled accumulator, not the `Y` it appeared to
+      target — which is why every pointer in the batch state dumped as valid.
+      Fixed in `c55d298` by unrolling the per-sequence loops over the compile-time `QB_MAX`.
+      After: exact at every B, **5.03x at B=8** (33x better), zero illegal accesses, and the
+      server case that used to crash now runs with the GPU at 51-71% instead of 0%.
+      NOTE the new trade-off: `s[QB_MAX]` now lives in registers, so raising `QB_MAX` above 8
+      costs registers and occupancy. It is no longer a free constant.
+- [x] CUDA-9 **Best measured serving configuration: all three CUDA paths on together.**
+      `QWEN_CUDA_FUSED_TALKER=1 QWEN_CUDA_BATCH=1 QWEN_CUDA_CONVDEC=1` with `--backend cuda`,
+      single process, had never been run in combination — every earlier arm enabled a subset.
+      At C4, 3-minute soaks: stall@100 1%, **stall@250 0%**, safe_play_start 93/236 ms,
+      max_gap p95 0.502 s, zero illegal accesses — against 100% / 95% / 532/681 ms for the
+      plain seam. Owner confirmed by ear that the audio captured **under load** at C4 is good.
+      Not yet a qualification: these are 3-minute screens, and `--precision default` is
+      mandatory (see CUDA-11).
+- [ ] CUDA-10 **Next target is the code predictor, not the talker scheduler.** Per-stage
+      profile at C4 (`QWEN_SERVE_PROFILE=1`): code predictor **49.7%**, talker step 34.9%,
+      speech decode 11.4% (it was 37.8% before CONVDEC). So continuous batching of the talker —
+      which was about to be written — has a **measured ceiling of ~35%**, and the bulk is in the
+      CP. Our own stage note calls it "15 sequential passes per frame; re-reads its weights
+      16x"; vLLM-Omni independently aims both of its headline optimisations at the same
+      component (re-prefill instead of a KV cache, since its sequences reach only ~16 tokens,
+      and fusing ~60 kernels). Size any talker-scheduler work against the 35% ceiling.
+- [ ] CUDA-11 **Measurement trap, cost us a whole wrong conclusion once already.**
+      `tests/serve_soak.py` defaults `--precision` to int8 (`:561`), and the backend seam is
+      bf16-only, so a CUDA soak without `--precision default` runs with the GPU at 0% while
+      looking healthy. Also: never compare two arms that differ in more than one flag — the
+      "seam beats resident" conclusion recorded earlier was really CONVDEC on versus off, and
+      had to be withdrawn. Detail: `.work/cuda-parity-track-20260915.md` §12.
 - [ ] CUDA-7 **The Metal batched path has the same defect as the CUDA one, unfixed.**
       `qwen_batch_talker_step_ragged` (`qwen_tts_talker.c`) and `batch_cp_transformer_step`
       (`qwen_tts_code_predictor.c`) each have a Metal branch a few lines below the CUDA branch
