@@ -174,3 +174,62 @@ divergent mode and generated 14.08 s of audio where CPU produced 11.12 s.
 does nothing: measured `utilization.gpu = 0%` while the run looked healthy. The startup NOTE
 added in CUDA-1 is what caught it. Any GPU serving measurement must pass `--precision default`
 and be confirmed by GPU utilisation, not by the presence of a CUDA banner.
+
+## 6. GPU design: what we already have, and where the time actually goes
+
+### 6.1 Correction: CUDA graphs are NOT missing
+
+An earlier reading of this track listed "CUDA Graph" as a gap. That is wrong.
+`qwen_tts_cuda_talker.cu` already captures and replays two graphs: one for the 28-layer
+talker step (`:229`, capture/instantiate at `:380-388`) and one for the 5-layer code-predictor
+step (`:720`). Both are stream-captured once and replayed with `cudaGraphLaunch`.
+
+What is true is **where** they live. The graph-backed step runs only when all of these hold
+(`qwen_tts_talker.c:689`): `QWEN_CUDA_FUSED_TALKER` is set (`main.c:1695`), the context is the
+single `g_gpu_fused_owner`, and no steering vector is active. The server uses the batched
+paths and never reaches it, so on a serving workload the graphs are simply not in play.
+
+### 6.2 The per-frame host round-trip, which a graph does not fix
+
+`qwen_cuda_talker_step()` brackets each graph launch with synchronous transfers:
+
+    cudaMemcpy(s->x, embed, H*4, H2D)        // synchronous
+    cudaMemcpy(s->d_pos, &pos, 4, H2D)       // synchronous
+    cudaGraphLaunch(exec, stream)
+    cudaStreamSynchronize(stream)            // full sync, every frame
+    cudaMemcpy(hidden_out, s->xn, H*4, D2H)  // synchronous
+
+So every generated frame costs three synchronous copies and one full stream synchronisation.
+The graph removes kernel-launch overhead *inside* the step; it does nothing about the
+host/device round trip *around* it. At ~12 Hz frame rate over a multi-second utterance this is
+the dominant structural cost of the fused path, and it is the first thing to attack — not the
+absence of graphs.
+
+### 6.3 What vLLM-Omni does differently (external reference, for direction only)
+
+vLLM-Omni serves Qwen3-TTS as a two-stage pipeline (Talker -> Code2Wav) and reports RTF 0.16
+single-stream and 0.29 at concurrency 10 on an H200. Techniques it names: continuous batching
+on the Talker with static batching on the vocoder; async chunking that forwards codec segments
+(default 25 frames) downstream so decode overlaps generation; a **dynamic initial chunk**
+(2-16 frames, sized by server load) that cut time-to-first-packet from 733 ms to 64 ms; CUDA
+graphs; kernel fusion in the code predictor; and re-prefill instead of a KV cache for the code
+predictor, on the grounds that its sequences reach only ~16 tokens so O(T^2) attention is
+cheaper than block-table bookkeeping.
+
+Mapping that onto this engine: continuous batching, cross-stage overlap and decoder batching we
+already have; CUDA graphs we have but only on the unreachable fused path; the dynamic initial
+chunk we do **not** have, and it is a scheduling policy rather than a kernel, so it would help
+the CPU lane too. Our code predictor uses a KV cache (`cp_kv_max = 64`), the opposite of their
+choice — worth measuring rather than assuming either way.
+
+Sources: docs.vllm.ai/projects/vllm-omni (Qwen3-Omni TTS performance optimization; Qwen3-TTS
+online serving) and the vLLM blog post of 2026-07-01.
+
+### 6.4 Constraint on any of this work
+
+The owner's standing rule: **the CPU lane must never regress.** Every GPU-specific change goes
+behind `#ifdef QWEN_HAVE_CUDA` *and* a default-off env flag declared in
+`g_qwen_reported_flags[]`, exactly as the existing `QWEN_CUDA_*` levers are. `make blas` must
+not even compile the new code, and `make test-all` with the golden gate remains the regression
+net. The two fixes landed today follow that shape: the TQ-7 guard and the offload NOTE are
+inside the GPU `#if` and absent from the CPU build.
