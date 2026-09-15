@@ -678,11 +678,25 @@ void qwen_admit_probe_read(unsigned long long *seq, double *ts_ms, double *last_
 /* Prefork admission health exported through a MAP_SHARED page.  The parent only
  * reads this small signal; the child updates it at the existing iteration
  * boundary.  A NULL binding leaves the normal/default path unchanged. */
+#ifdef __cplusplus
+/* nvcc compiles the .cu translation units as C++, where _Atomic is not a keyword, so the
+ * C11 spelling below fails to parse and the whole CUDA build breaks on a struct those units
+ * never touch.  They only need this header to parse and the layout to agree: on every target
+ * we build, _Atomic unsigned long long and _Atomic double have the same size and alignment
+ * as their plain counterparts, so the plain form is layout-compatible.  Atomic access stays
+ * in the C side, which sees the _Atomic version. */
+typedef struct {
+    unsigned long long seq;
+    double ts_ms;
+    double last_iter_ms;
+} qwen_admission_health_t;
+#else
 typedef struct {
     _Atomic unsigned long long seq;
     _Atomic double ts_ms;
     _Atomic double last_iter_ms;
 } qwen_admission_health_t;
+#endif
 
 void qwen_admission_health_bind(qwen_admission_health_t *health, int worker_id);
 
