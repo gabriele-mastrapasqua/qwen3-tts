@@ -617,7 +617,7 @@ extern void qwen_metal_cp_batch_step(void *state, float *x, const int *pos_arr);
 #endif
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_cp_step(void *state, float *x, int pos);
-extern void qwen_cuda_cp_batch_step(void *state, float *x, const int *pos_arr);
+extern void qwen_cuda_cp_batch_step(void *state, float *x, const int *pos_arr, const uint8_t *active);
 #endif
 
 static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos) {
@@ -1242,7 +1242,9 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     extern void *g_cuda_cp_batch_state;
     if (g_cuda_cp_batch_state && B <= 16) {
         int pos_arr[16]; for (int b = 0; b < B; b++) pos_arr[b] = pos;
-        qwen_cuda_cp_batch_step(g_cuda_cp_batch_state, x, pos_arr);
+        /* `active` must reach the device: a lane the caller is not stepping keeps a stale
+         * position, and cp_kv_max is 64, so indexing with it runs off the cache. */
+        qwen_cuda_cp_batch_step(g_cuda_cp_batch_state, x, pos_arr, active);
         return;
     }
 #endif

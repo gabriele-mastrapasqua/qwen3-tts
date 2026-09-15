@@ -670,7 +670,7 @@ extern void qwen_metal_talker_get_dec_x(void *state, float *out);
 extern void qwen_metal_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
 #endif
 #ifdef QWEN_HAVE_CUDA
-extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
+extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out, const uint8_t *active);
 extern void qwen_cuda_talker_step(void *state, const float *embed, float *hidden_out, int pos);
 extern void qwen_cuda_talker_get_dec_x(void *state, float *out);
 #endif
@@ -2801,7 +2801,10 @@ int qwen_batch_talker_step_ragged(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 #ifdef QWEN_HAVE_CUDA
     extern void *g_cuda_talker_batch_state;
     if (g_cuda_talker_batch_state) {
-        qwen_cuda_talker_batch_step(g_cuda_talker_batch_state, embeds, pos_arr, hidden_out);
+        /* `active` must reach the device.  Lanes the caller is not stepping keep a stale
+         * pos_arr[b] from the request that last held the slot, and every position-indexed
+         * kernel derives an address from it. */
+        qwen_cuda_talker_batch_step(g_cuda_talker_batch_state, embeds, pos_arr, hidden_out, active);
         return 0;
     }
 #endif

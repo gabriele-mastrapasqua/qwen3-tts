@@ -488,24 +488,32 @@ __global__ void k_rmsnorm_ph_b(float *X,const float *w,int head_dim,int nh,int s
     for(int i=tid;i<head_dim;i+=tc) xh[i]=xh[i]*inv*w[i];
 }
 __global__ void k_rope_neox_b(float *X,const float *cos_base,const float *sin_base,
-                              int n_heads,int head_dim,const int *d_pos,int stride,int B){
+                              int n_heads,int head_dim,const int *d_pos,int stride,int B,
+                              const unsigned char *d_act){
     int half=head_dim/2, per=n_heads*half, gid=blockIdx.x*blockDim.x+threadIdx.x;
     if(gid>=B*per) return; int b=gid/per, rem=gid%per;
+    if(d_act && !d_act[b]) return;   /* lane is not stepping: d_pos[b] is stale, do not index with it */
     const float *cosp=cos_base+(size_t)d_pos[b]*half, *sinp=sin_base+(size_t)d_pos[b]*half;
     int h=rem/half, i=rem%half; float *xh=X+(size_t)b*stride+(size_t)h*head_dim;
     float c=cosp[i], sn=sinp[i], x1=xh[i], x2=xh[i+half];
     xh[i]=x1*c-x2*sn; xh[i+half]=x2*c+x1*sn;
 }
 /* KV per sequence: kc/vc layer base = [B][kv_max][kvd]; K/V = [B][kvd] */
-__global__ void k_kv_store_b(float *kc,float *vc,const float *K,const float *V,int kvd,const int *d_pos,int kv_max,int B){
+__global__ void k_kv_store_b(float *kc,float *vc,const float *K,const float *V,int kvd,const int *d_pos,int kv_max,int B,
+                             const unsigned char *d_act){
     int gid=blockIdx.x*blockDim.x+threadIdx.x; if(gid>=B*kvd) return; int b=gid/kvd, i=gid%kvd;
+    if(d_act && !d_act[b]) return;   /* never write a paused slot's KV: it owns that position */
     size_t off=(size_t)b*kv_max*kvd+(size_t)d_pos[b]*kvd+i;
     kc[off]=K[(size_t)b*kvd+i]; vc[off]=V[(size_t)b*kvd+i];
 }
 /* one block per (b,head): blk=b*n_heads+h, blockDim=hd. KV base per seq = [kv_max][kvd] */
 __global__ void k_attn_b(const float *Q,const float *K,const float *V,float *O,
-                         int n_heads,int n_kv,int hd,float scale,const int *d_pos,int kv_max,int qd,int kvd){
+                         int n_heads,int n_kv,int hd,float scale,const int *d_pos,int kv_max,int qd,int kvd,
+                         const unsigned char *d_act){
     int blk=blockIdx.x, b=blk/n_heads, h=blk%n_heads, t=threadIdx.x; if(t>=hd) return;
+    /* whole block shares b (blk = b*n_heads + h), so this return is uniform and the
+     * __syncthreads() below stay collective */
+    if(d_act && !d_act[b]) return;
     int kvh=h/(n_heads/n_kv), valid=d_pos[b]+1;
     const float *Kb=K+(size_t)b*kv_max*kvd, *Vb=V+(size_t)b*kv_max*kvd;
     float qt=Q[(size_t)b*qd+(size_t)h*hd+t];
@@ -533,6 +541,7 @@ typedef struct {
     float *kcache,*vcache;                            /* [L][B][kv_max][kvd] */
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;      /* [B][dim] */
     int prec; int *d_pos;                             /* device int[B] */
+    unsigned char *d_act;                             /* device uint8[B]: which lanes step */
 } cuda_talker_batch_t;
 
 static void talker_body_batch(cuda_talker_batch_t *s){
@@ -545,13 +554,13 @@ static void talker_body_batch(cuda_talker_batch_t *s){
         mvB(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H,B);
         k_rmsnorm_ph_b<<<B*nh,TPB,TPB*sizeof(float)>>>(s->q,s->qn[l],hd,nh,qd,s->eps);
         k_rmsnorm_ph_b<<<B*nkv,TPB,TPB*sizeof(float)>>>(s->k,s->kn[l],hd,nkv,kvd,s->eps);
-        k_rope_neox_b<<<CEIL(B*nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos,qd,B);
-        k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B);
+        k_rope_neox_b<<<CEIL(B*nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos,qd,B,s->d_act);
+        k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B,s->d_act);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->k,B*kvd);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
         float *Kl=s->kcache+(size_t)l*B*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*B*s->kv_max*kvd;
-        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B);
-        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd);
+        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act);
+        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act);
         mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -585,13 +594,21 @@ extern "C" void *qwen_cuda_talker_batch_init(void *single, int B){
     CK(cudaMalloc(&s->proj,(size_t)B*H*sizeof(float))); CK(cudaMalloc(&s->gate,(size_t)B*inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)B*2*inter*sizeof(float)));
     CK(cudaMalloc(&s->d_pos,B*sizeof(int)));
+    CK(cudaMalloc(&s->d_act,(size_t)B));
     return s;
 }
 /* embeds=[B][H] host, pos_arr=[B] host; hidden_out=[B][H] host (final-normed). */
-extern "C" void qwen_cuda_talker_batch_step(void *st,const float *embeds,const int *pos_arr,float *hidden_out){
+extern "C" void qwen_cuda_talker_batch_step(void *st,const float *embeds,const int *pos_arr,float *hidden_out,
+                                           const unsigned char *active){
     cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; int B=s->B,H=s->hidden;
     CK(cudaMemcpy(s->x,embeds,(size_t)B*H*sizeof(float),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(s->d_pos,pos_arr,B*sizeof(int),cudaMemcpyHostToDevice));
+    /* Lanes the caller is not stepping keep a stale pos_arr[b] from whatever request last
+     * used the slot.  Every position-indexed kernel derives an address from it, so without
+     * this mask an idle lane reads and writes out of bounds -- observed as
+     * "an illegal memory access was encountered".  NULL means every lane steps. */
+    { unsigned char all[QB_MAX]; if(!active){ for(int i=0;i<B;++i) all[i]=1; }
+      CK(cudaMemcpy(s->d_act, active?active:all, (size_t)B, cudaMemcpyHostToDevice)); }
     talker_body_batch(s);
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     if(hidden_out) CK(cudaMemcpy(hidden_out,s->xn,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
@@ -617,7 +634,7 @@ extern "C" void qwen_cuda_talker_batch_free(void *st){
     cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; if(!s) return;
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
     cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
-    cudaFree(s->gu);cudaFree(s->d_pos); free(s);   /* weights are shared — not freed here */
+    cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act); free(s);   /* weights are shared — not freed here */
 }
 
 /* Correctness (batched row b MUST equal a single-stream run with the same embeds/pos) +
@@ -625,7 +642,7 @@ extern "C" void qwen_cuda_talker_batch_free(void *st){
 static double now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e3+t.tv_nsec/1e6; }
 extern "C" void qwen_cuda_talker_free(void *);   /* defined below (after the CP section) */
 extern "C" void *qwen_cuda_cp_batch_init(void *, int);   /* defined below (CP section) */
-extern "C" void  qwen_cuda_cp_batch_step(void *, float *, const int *);
+extern "C" void  qwen_cuda_cp_batch_step(void *, float *, const int *, const unsigned char *);
 extern "C" void  qwen_cuda_cp_batch_free(void *);
 extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
     int H=ctx->config.hidden_size, kvm=ctx->kv_max;
@@ -641,7 +658,7 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
         for(int i=0;i<H;++i) e1[i]=0.02f*sinf(0.11f*(i+1)+0.3f*p);
         for(int b=0;b<B;++b){ memcpy(eB+(size_t)b*H,e1,H*sizeof(float)); posB[b]=p; }
         qwen_cuda_talker_step(S,e1,h1,p);
-        qwen_cuda_talker_batch_step(Bs,eB,posB,hB);
+        qwen_cuda_talker_batch_step(Bs,eB,posB,hB,NULL);
         for(int b=0;b<B;++b) for(int i=0;i<H;++i){ double d=fabs(hB[(size_t)b*H+i]-h1[i]); if(d>maxdiff)maxdiff=d; }
     }
     fprintf(stderr,"batch selftest: correctness max|batched-single|=%.2e over %d steps (%s)\n",
@@ -651,10 +668,10 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
     S=qwen_cuda_talker_init(ctx); Bs=qwen_cuda_talker_batch_init(S,B);
     for(int i=0;i<H;++i) e1[i]=0.02f*sinf(0.11f*(i+1));
     for(int b=0;b<B;++b){ memcpy(eB+(size_t)b*H,e1,H*sizeof(float)); posB[b]=0; }
-    qwen_cuda_talker_step(S,e1,h1,0); qwen_cuda_talker_batch_step(Bs,eB,posB,hB);  /* warmup */
+    qwen_cuda_talker_step(S,e1,h1,0); qwen_cuda_talker_batch_step(Bs,eB,posB,hB,NULL);  /* warmup */
     double t0=now_ms(); for(int p=1;p<=frames;++p) qwen_cuda_talker_step(S,e1,h1,p);
     double ts=(now_ms()-t0)/frames;
-    t0=now_ms(); for(int p=1;p<=frames;++p){ for(int b=0;b<B;++b) posB[b]=p; qwen_cuda_talker_batch_step(Bs,eB,posB,hB); }
+    t0=now_ms(); for(int p=1;p<=frames;++p){ for(int b=0;b<B;++b) posB[b]=p; qwen_cuda_talker_batch_step(Bs,eB,posB,hB,NULL); }
     double tb=(now_ms()-t0)/frames;
     fprintf(stderr,"batch Talker throughput (B=%d, %d frames): single %.2f ms/f (1 seq) | batched %.2f ms/f (%d seq) | per-seq %.2f ms | GAIN %.2fx\n",
             B,frames,ts,tb,B,tb/B, B*ts/tb);
@@ -675,7 +692,7 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
             float v; for(int i=0;i<cph;++i){ v=0.02f*sinf(0.13f*(i+1)+0.2f*p); cx1[i]=v; for(int b=0;b<B;++b) cxB[(size_t)b*cph+i]=v; }
             for(int b=0;b<B;++b) cpos[b]=p;
             qwen_cuda_cp_step(CS,cx1,p);
-            qwen_cuda_cp_batch_step(CB,cxB,cpos);
+            qwen_cuda_cp_batch_step(CB,cxB,cpos,NULL);
             for(int b=0;b<B;++b) for(int i=0;i<cph;++i){ double d=fabs(cxB[(size_t)b*cph+i]-cx1[i]); if(d>cdiff)cdiff=d; }
         }
         fprintf(stderr,"batch selftest: CP correctness max|batched-single|=%.2e over %d steps (%s)\n",
@@ -684,13 +701,13 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
         int passes=cpkv<16?cpkv:16;
         for(int i=0;i<cph;++i){ float v=0.02f*sinf(0.13f*(i+1)); cx1[i]=v; for(int b=0;b<B;++b) cxB[(size_t)b*cph+i]=v; }
         for(int p=0;p<passes;++p) qwen_cuda_cp_step(CS,cx1,p);                 /* warmup */
-        for(int p=0;p<passes;++p){ for(int b=0;b<B;++b) cpos[b]=p; qwen_cuda_cp_batch_step(CB,cxB,cpos); }
+        for(int p=0;p<passes;++p){ for(int b=0;b<B;++b) cpos[b]=p; qwen_cuda_cp_batch_step(CB,cxB,cpos,NULL); }
         int NF=frames/4; if(NF<10) NF=10;
         double c0=now_ms();
         for(int f=0;f<NF;++f) for(int p=0;p<passes;++p) qwen_cuda_cp_step(CS,cx1,p);
         double cs=(now_ms()-c0)/NF;
         c0=now_ms();
-        for(int f=0;f<NF;++f) for(int p=0;p<passes;++p){ for(int b=0;b<B;++b) cpos[b]=p; qwen_cuda_cp_batch_step(CB,cxB,cpos); }
+        for(int f=0;f<NF;++f) for(int p=0;p<passes;++p){ for(int b=0;b<B;++b) cpos[b]=p; qwen_cuda_cp_batch_step(CB,cxB,cpos,NULL); }
         double cb=(now_ms()-c0)/NF;
         fprintf(stderr,"batch CP throughput (B=%d, %d passes/frame): single %.2f ms/f (1 seq) | batched %.2f ms/f (%d seq) | GAIN %.2fx\n",
                 B,passes,cs,cb,B, B*cs/cb);
@@ -820,6 +837,7 @@ typedef struct {
     float **inorm,**pnorm,**qn,**kn; float *rope_cos,*rope_sin;
     float *kcache,*vcache; float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;
     int prec; int *d_pos;
+    unsigned char *d_act;                             /* device uint8[B]: which lanes step */
 } cuda_cp_batch_t;
 
 static void cp_body_batch(cuda_cp_batch_t *s){
@@ -832,13 +850,13 @@ static void cp_body_batch(cuda_cp_batch_t *s){
         mvB(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H,B);
         k_rmsnorm_ph_b<<<B*nh,TPB,TPB*sizeof(float)>>>(s->q,s->qn[l],hd,nh,qd,s->eps);
         k_rmsnorm_ph_b<<<B*nkv,TPB,TPB*sizeof(float)>>>(s->k,s->kn[l],hd,nkv,kvd,s->eps);
-        k_rope_neox_b<<<CEIL(B*nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos,qd,B);
-        k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B);
+        k_rope_neox_b<<<CEIL(B*nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos,qd,B,s->d_act);
+        k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B,s->d_act);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->k,B*kvd);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
         float *Kl=s->kcache+(size_t)l*B*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*B*s->kv_max*kvd;
-        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B);
-        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd);
+        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act);
+        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act);
         mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -867,14 +885,19 @@ extern "C" void *qwen_cuda_cp_batch_init(void *single, int B){
     CK(cudaMalloc(&s->proj,(size_t)B*H*sizeof(float))); CK(cudaMalloc(&s->gate,(size_t)B*inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)B*2*inter*sizeof(float)));
     CK(cudaMalloc(&s->d_pos,B*sizeof(int)));
+    CK(cudaMalloc(&s->d_act,(size_t)B));
     return s;
 }
 /* x=[B][cp_h] host (each row = the caller's per-seq embed/residual seed), pos_arr=[B] host;
  * x updated in place with the B residual streams (caller norms + argmaxes each). */
-extern "C" void qwen_cuda_cp_batch_step(void *st,float *x,const int *pos_arr){
+extern "C" void qwen_cuda_cp_batch_step(void *st,float *x,const int *pos_arr,const unsigned char *active){
     cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; int B=s->B,H=s->hidden;
     CK(cudaMemcpy(s->x,x,(size_t)B*H*sizeof(float),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(s->d_pos,pos_arr,B*sizeof(int),cudaMemcpyHostToDevice));
+    /* Same stale-position hazard as the talker, and worse here: cp_kv_max is 64, so any
+     * leftover position >= 64 indexes outside the cache immediately. */
+    { unsigned char all[QB_MAX]; if(!active){ for(int i=0;i<B;++i) all[i]=1; }
+      CK(cudaMemcpy(s->d_act, active?active:all, (size_t)B, cudaMemcpyHostToDevice)); }
     cp_body_batch(s);
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(x,s->x,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
@@ -883,7 +906,7 @@ extern "C" void qwen_cuda_cp_batch_free(void *st){
     cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; if(!s) return;
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
     cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
-    cudaFree(s->gu);cudaFree(s->d_pos); free(s);
+    cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act); free(s);
 }
 
 extern "C" void qwen_cuda_cp_free(void *st) {
