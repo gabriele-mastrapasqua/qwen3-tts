@@ -414,3 +414,54 @@ CUDA server default on these numbers. What would change the picture is genuine c
 batching, where requests join and leave without forcing a shared frame cadence — which is the
 architecture vLLM-Omni describes, and a substantially larger piece of work than either the
 `B_eff` compaction or raising `QB_MAX`.
+
+## 12. Correction, and where the time actually goes
+
+**A correction first.** Section 11 compared the naive seam at 1% stall@250 against the resident
+batched path at 61%, and concluded the batched path served worse. That comparison was
+confounded: the seam arm was running with `QWEN_CUDA_CONVDEC=1` and the resident arm was not,
+so it measured the GPU speech decoder being on or off, not seam versus resident. Run with both
+arms identical (no CONVDEC, batch-size 4, concurrency 4), the order reverses — resident 59%
+stall@250 against seam 95%. The conclusion in section 11 is withdrawn.
+
+**Per-stage profile at C4** (`QWEN_SERVE_PROFILE=1`, share of work):
+
+| stage | seam | resident | +CONVDEC | all three |
+| --- | --- | --- | --- | --- |
+| talker step (batched) | 20.7% | 22.1% | 29.8% | 34.9% |
+| **code predictor** | 38.7% | 32.8% | **57.0%** | **49.7%** |
+| speech decode + embed | 37.8% | 42.0% | 9.7% | 11.4% |
+| everything else | ~3% | ~3% | ~3% | ~4% |
+
+**The talker is about a fifth to a third of the time.** Continuous batching of the talker —
+the change that was about to be written — addresses only that slice, so even making it free
+caps out around a 21-35% gain. The bulk is elsewhere, and the ordering is now measured rather
+than assumed.
+
+## 13. All three CUDA paths on: the best configuration measured, and it was never tried
+
+Talker and CP resident+batched together WITH the GPU-resident conv decoder had not been run in
+combination before; every earlier arm enabled a subset. At concurrency 4, 3-minute soaks:
+
+| | seam | CONVDEC only | **all three** |
+| --- | --- | --- | --- |
+| stall@100 | 100% | 8% | **1%** |
+| stall@250 | 95% | 1% | **0%** |
+| stall@500 | 0% | 0% | 0% |
+| safe_play_start p50/p95 | 532 / 681 ms | 124 / 291 ms | **93 / 236 ms** |
+| max_gap p95 | 0.668 s | 0.562 s | **0.502 s** |
+| illegal accesses | 0 | 0 | 0 |
+
+`SOAK RESULT` is PASS for CONVDEC-only and FAIL on TTFA p95 alone for the combination, on a
+3-minute screen; every other KPI passes and the playback envelope is the best of any arm.
+
+**Consequence for the work order.** The next target is the code predictor at ~50% of the time,
+not the talker scheduler. Our own stage note describes it as "15 sequential passes per frame;
+re-reads its weights 16x", and vLLM-Omni independently names the same component for its two
+headline optimisations (re-prefill instead of a KV cache, since its sequences reach only ~16
+tokens, and fusing ~60 kernels). Two systems arriving at the same component from different
+directions is the strongest signal available here.
+
+Continuous batching of the talker remains a legitimate piece of work, but it is third in line
+behind the code predictor and behind simply shipping the three-path configuration, and it
+should be sized against a measured 35% ceiling rather than an assumed one.
