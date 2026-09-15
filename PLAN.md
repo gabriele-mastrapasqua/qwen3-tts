@@ -355,7 +355,20 @@ sustained qualification.
       the ~1.6x penalty, retire there too (`QWEN_SD_MULTISLOT=0`, the preflight-valid fallback) and
       confirm with `make soak-fast` before any 30-minute run. Keep the flag, kernel and multi-slot
       self-test cases in the tree either way.
-- [ ] X86-COHORT-1 **Does the same cohort retirement pay on x86/Turin?** The Arm campaign
+- [x] X86-COHORT-1 **ANSWERED 2026-09-15: the cohort loses on x86 too, but the change was NOT
+      made.** Fresh Zen5 Turin (EPYC 9R45, VNNI, no AMX), OSS checkpoints, English bank.
+      Microbench confirmed the prediction on a third host and a second ISA: chunk 4 gives
+      `24.1 / 47.6 / 65.0 ms` = **1.37x**, chunk 8 **1.41x**, sequential pair exactly linear.
+      So the penalty is the shared multi-kernel source shape, not the ISA. **But the serving
+      evidence is mixed**, unlike Arm: at 1.7B C12 retiring the cohort zeroes stall@250
+      (1.03% -> 0%) while STREAM p95 gets slightly worse (0.903 -> 0.923), and nothing on the
+      ladder reached CLEAR (every point 0.90-0.99 against 0.83 for the qualified Arm points).
+      **Owner's decision: stop.** `turin-c8a-32c-vnni-product` keeps `MULTISLOT=2` and its
+      C12/C20 recommendations. Note these screens used OSS checkpoints and an English bank,
+      not the customer workload, so they locate the knee for THIS workload and are **not**
+      evidence against the earlier x86 recommendations. Revisit only if the exact `S == 2`
+      named-accumulator kernel is written: x86 has the most per-call headroom left (1.37-1.41x).
+      Detail: `.work/arm-sustained-soak-regression-20260913.md`. Original item text: The Arm campaign
       retired `QWEN_SD_MULTISLOT` on four profiles after measuring a per-call loss; x86 still
       ships `2` on `turin-c8a-32c-vnni-product` and that value rests on weaker evidence than
       the Arm retirement now does. Two reasons to suspect it:
@@ -376,7 +389,9 @@ sustained qualification.
       soak. Arm found +50%/+25%/+33% of density this way; x86 may well have some too.
       **Do not flip the Turin profile on the Arm result alone** — the Arm retirement itself was
       only taken after this host's own microbench plus two paired serving screens.
-- [ ] X86-COHORT-2 **If X86-COHORT-1 confirms**: re-walk the Turin capacity ladder with
+- [x] X86-COHORT-2 **CLOSED UNSTARTED 2026-09-15**: the ladder was walked far enough to see the
+      knee (1.7B OFF C16, 0.6B ON past C20) and the answer did not justify a 30-minute
+      qualification. Original item text: re-walk the Turin capacity ladder with
       `make soak-fast` (the C12 gate has been chased for a long time at a fixed concurrency;
       the Arm campaign showed the previous recommendation was simply below the knee on one
       host and that the ladder had never been walked past it). Then qualify only the winning

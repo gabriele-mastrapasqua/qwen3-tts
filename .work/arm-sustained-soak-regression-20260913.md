@@ -1191,3 +1191,58 @@ numerically free.
 
 Both customer reports were regenerated as version 2 from this evidence and are retained
 privately outside the repository.
+
+## x86 / Turin Zen5: the cohort loses there too, but the serving case does not justify a change
+
+`X86-COHORT-1` run 2026-09-15 on a fresh AWS EPYC 9R45 (Zen5 Turin, 32 cores, SMT off, 4 CCX
+x 32 MiB L3, AVX-512 VNNI+BF16, **no AMX**), OSS 0.6B/1.7B checkpoints, English bank, `ryan`,
+`SIMD=avx512bf16`, `--self-test` 0 failures, `check-isa` PASS.
+
+**Microbench — the prediction was right.** Same three cells, `taskset -c 0-7`, profile env:
+
+| cell | Turin x86 VNNI | Graviton4 | Axion |
+|---|---:|---:|---:|
+| 1 singleton (chunk 4) | 24.1 ms | 40.6 ms | 34.6 ms |
+| 2 sequential singletons | 47.6 ms | 81.0 ms | 70.1 ms |
+| 1 ragged cohort | **65.0 ms** | 132.1 ms | 84.3 ms |
+| penalty | **1.37x** | 1.63x | 1.20x |
+
+chunk 8 confirms: `41.8 / 83.1 / 117.4 ms` = **1.41x**, and the sequential pair is again exactly
+linear (2 x 24.1 = 48.2 against 47.6 measured). **CONFIRMED on a third host and a second ISA:
+the ragged cohort is a per-call loss everywhere it has been measured.** The cost is the shared
+source structure of the multi kernel, not the instruction set — which is what the x86 twin's
+identical `acc[3][4][2]` / runtime-`S` shape predicted.
+
+**Serving — and this is why nothing was changed.** Paired screens, one variable, cap raised
+4 -> 8 on every arm so admission is not fail-fast limited:
+
+| arm | C | STREAM p95 | stall@250 | verdict |
+|---|---:|---:|---:|---|
+| 1.7B cohort ON | 12 | 0.903 | 1.03% | KNEE |
+| 1.7B cohort OFF | 12 | 0.923 | **0%** | HEALTHY |
+| 1.7B cohort OFF | 14 | 0.967 | 0.95% | HEALTHY |
+| 1.7B cohort OFF | 16 | 0.991 | 1.45% | KNEE |
+| 0.6B cohort ON | 20 | 0.973 | 3.55% | KNEE |
+
+Unlike Arm, the x86 result is **mixed**: retiring the cohort takes stall@250 from 1.03% to zero
+at 1.7B C12 but makes STREAM p95 slightly *worse* (0.903 -> 0.923). Nothing on the ladder
+reached CLEAR; every point sits between 0.90 and 0.99, against 0.83 for the Arm points that
+were qualified. A 30-minute gate here would have roughly 3% of realtime margin instead of 17%.
+
+**DECISION (owner's call, 2026-09-15): stop, and leave x86 alone.** `turin-c8a-32c-vnni-product`
+keeps `QWEN_SD_MULTISLOT=2` and its `C12 / C20` recommendations. The reasoning is sound and is
+recorded so it is not re-opened by accident:
+
+* the previously reported x86 operating points were produced with the **customer checkpoints and
+  a mixed qualification workload**. This campaign used OSS checkpoints and an English bank, so
+  these screens say where the knee is **for this workload**; they are not evidence that the
+  earlier x86 recommendations were wrong, and must never be quoted as such;
+* the measurable serving gain on x86 is small and mixed, so the change does not pay for the
+  instance time to qualify it, let alone for disturbing a shipped product profile;
+* the microbench result is nevertheless real and is now documented. It stays on the books as a
+  known, unexploited inefficiency: **if the exact `S == 2` named-accumulator kernel is ever
+  written, x86 is the host with the most per-call headroom left to reclaim (1.37-1.41x)**, and
+  that is the point at which to revisit the profile — not before.
+
+`X86-COHORT-2` (re-walking the Turin ladder) is therefore **closed unstarted**: the ladder was
+walked far enough to see the knee, and the answer did not justify a qualification.
