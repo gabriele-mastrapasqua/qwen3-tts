@@ -52,7 +52,19 @@ void *qwen_cuda_init(void) {
     if (cublasCreate(&c->handle) != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "CUDA: cublasCreate failed\n"); free(c); return NULL;
     }
-    cublasSetMathMode(c->handle, CUBLAS_TF32_TENSOR_OP_MATH);
+    /* TF32 keeps only a 10-bit mantissa.  It is fast, but it is also why this backend's
+     * matvec self-test reports rel ~1e-3 on Blackwell against ~1e-7 on the CPU, and why a
+     * CUDA run forks to a different sampled trajectory than the CPU reference.  Make it a
+     * lever instead of a hardcoded choice: QWEN_CUDA_TF32=0 selects full fp32 math.
+     * Default keeps the historical behaviour (TF32 on) so nothing changes unless asked. */
+    {
+        const char *t = getenv("QWEN_CUDA_TF32");
+        int tf32 = !(t && *t == '0');
+        cublasSetMathMode(c->handle, tf32 ? CUBLAS_TF32_TENSOR_OP_MATH
+                                          : CUBLAS_DEFAULT_MATH);
+        if (getenv("QWEN_CUDA_VERBOSE"))
+            fprintf(stderr, "CUDA: cublas math mode = %s\n", tf32 ? "TF32 tensor op" : "fp32");
+    }
     return c;
 }
 
