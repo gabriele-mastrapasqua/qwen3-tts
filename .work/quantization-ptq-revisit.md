@@ -61,3 +61,35 @@ failure rather than as a trade-off to be tuned later.
 Prefill is a real cost at admission, and weight storage sets the memory floor per worker,
 which is what bounds workers per box. Either would matter. Neither matters enough to spend
 quality on, which is why this sits behind the C12-WIN ladder rather than inside it.
+
+## 6. UPDATE 2026-09-15 — §2 is answered, and the track is redirected
+
+A literature and own-source review is recorded in
+`.work/quant-prefill-int8-analysis-20260915.md`. It does **not** change §1 (the earlier
+verdicts remain implementation-scoped) or §4 (the gate stands unweakened). It changes §2
+and §3.
+
+- **§2 hypothesis: answered NO at 8 bits.** Calibration/optimization-aware rounding has no
+  headroom there. Intel's own INT8/W8A8 table has AutoRound **0.86 pt below plain RTN** on
+  Llama-3.1-8B-Instruct for ~10x the time; tuning at 8-bit weights buys +0.0008/+0.0003
+  average; the tool auto-disables its own scale search at `bits>=8`; neither AutoRound paper
+  evaluates 8 bits in five versions; Intel ships 58 int4 models and one int8, built with
+  tuning off. Corroborated independently by Dettmers arXiv 2212.09720 App. C.3, ZeroQuant-V2,
+  the Qwen3 quantization study, and llama.cpp discarding the imatrix at `q8_0`.
+  **The hypothesis remains live and valuable at 2-4 bits**, i.e. for track 2, not track 1.
+- **A second exclusion.** Our granularity is already what INT8 hardware permits at best —
+  per-output-channel weights x per-token dynamic activations, the same scheme AutoRound's
+  own `INT8` preset resolves to, and the recipe behind the strongest published W8A8 recovery
+  (99.75 %). No CPU instruction accepts a scale that varies along K, so nothing finer exists
+  for a single exact integer reduction.
+- **Redirection.** With the rounding rule and the bit width both excluded and the ear verdict
+  standing, the live candidate is **activation range on a small set of prefix tokens**:
+  the `down_proj` input in a SwiGLU block, on BOS/newline/apostrophe, where a per-token
+  absmax is crushed by one channel outlier on the attention-sink token. Three cures need no
+  calibration at all (per-K-block activation scales, a BF16 prefix, layer exclusion), so
+  track 3's "offline calibration only" constraint is not even reached by the first
+  candidates.
+- **Ordering note for track 1.** Take an activation-range profile and build a teacher-forced
+  KL/flip distance gate *before* proposing any candidate. The mel-corr figure recorded in
+  `docs/runtime-map-c8a-c4.md` is uninformative on its own (trajectory divergence, not
+  damage); the listening verdict is the one that rejected the path, and it is not in doubt.

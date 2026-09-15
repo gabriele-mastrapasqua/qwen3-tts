@@ -368,6 +368,12 @@ sustained qualification.
       not the customer workload, so they locate the knee for THIS workload and are **not**
       evidence against the earlier x86 recommendations. Revisit only if the exact `S == 2`
       named-accumulator kernel is written: x86 has the most per-call headroom left (1.37-1.41x).
+      **No x86 regression from the Arm parity work** — the other thing this run had to
+      establish. The Zen5 box was built from the same tree that carries every Arm change
+      (`--self-test` 0 failures, `check-isa` PASS on the 23-file VNNI+AMX compile pass, VNNI
+      resolved native in `--caps`), and with the cohort either ON or OFF the screened envelope
+      sits in the same region the earlier x86 report described. Nothing in the Arm campaign
+      moved x86 behaviour.
       Detail: `.work/arm-sustained-soak-regression-20260913.md`. Original item text: The Arm campaign
       retired `QWEN_SD_MULTISLOT` on four profiles after measuring a per-call loss; x86 still
       ships `2` on `turin-c8a-32c-vnni-product` and that value rests on weaker evidence than
@@ -751,18 +757,28 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       and `unqualified` until the numerical/audio delta is fixed or explicitly accepted.
       Detail: `.work/c4a-arm-v2-0p6b-profile-qualification-report-20260912.md`.
 
-- [ ] TURIN-POST-ARM quick regression safety screen (before the next cross-ISA release
-      claim or paid capacity ladder): rerun the current VNNI control and yesterday's
-      promoted feature profile at C6/C8, including one short FAST and the existing
-      TTFB/TTFA/STREAM/TOTAL comparison. The Arm-only applicability gate says this is
-      not required to attribute the Arm result, but the screen is retained as the
-      requested regression check; record any drift separately from the Arm report.
+- [x] TURIN-POST-ARM **DONE 2026-09-15** — satisfied by the X86-COHORT-1 run on a fresh Zen5
+      Turin box built from the tree that carries every Arm change. Gates: `--self-test` 0
+      failures, `check-isa` PASS, `--caps` resolves VNNI/BF16 native, strict preflight valid.
+      Screens compared the committed VNNI product profile against a one-variable cohort-OFF
+      arm on both checkpoint sizes. **No regression attributable to the Arm parity work.**
+      Deviations from the original wording, stated so the closure is auditable: the screen ran
+      at **C12-C16 / C20** rather than C6/C8 (the ladder had to reach the knee to be useful),
+      and used **OSS checkpoints with an English bank** rather than the customer workload, so
+      it is a regression-safety screen and not a capacity claim. Detail and numbers:
+      `.work/arm-sustained-soak-regression-20260913.md`.
 
-- [ ] ARM optional-feature promotion: qualify BF16 pre-up, multi-slot and CNEXT-I8 as
-      separate paired A/Bs only after the Graviton baseline. BF16 and multi-slot remain
-      default-off: the existing Arm quality/perf evidence is not a promotion, and the
-      current multi-slot short A/B was negative. Do not bundle these into the baseline
-      claim or change the Arm JSON defaults without paired audio plus serving evidence.
+- [ ] ARM optional-feature promotion: qualify BF16 pre-up and CNEXT-I8 as separate paired
+      A/Bs. **Multi-slot is CLOSED (2026-09-15): retired on every Arm profile with a measured
+      per-call loss, paired serving screens and a 1.00000 mel-corr audio gate** — this item's
+      note that "the current multi-slot short A/B was negative" was right and has now been
+      settled with host-specific evidence, see ARM-SOAK-10/14. BF16 pre-up and CNEXT-I8 remain
+      unqualified: do not bundle them into a baseline claim without paired audio plus serving
+      evidence. **Open discrepancy to resolve before any release claim that quotes them:** the
+      host-scoped all-on Arm profiles set `QWEN_SD_BF16_PREUP=1`, while `docs/feature-flags.md`
+      still describes that flag as "failed its x86 audio gate and stays off". Both statements
+      can be true (x86 gate failed, Arm host-scoped policy enables it) but the doc does not say
+      so, and a reader cannot tell. Fix the doc row or the profile, and say which.
 
 ### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
 
@@ -789,6 +805,67 @@ CP-overlap share down -> sustained tail down. Codex owns implementation; no push
       and listening -- waveform/mel/duration equality is necessary and not sufficient, since
       the earlier rejections passed exactly those. Start only after the C12-WIN items and
       the report qualification work. Detail: `.work/quantization-ptq-revisit.md`.
+
+- [x] QP-0 **AutoRound / calibration-aware rounding evaluated — CLOSED NO at 8 bits**
+      (2026-09-15). The revisit note's §2 hypothesis is answered. At 8 bits the rounding
+      rule has no headroom: Intel's own INT8/W8A8 table puts AutoRound **0.86 pt BELOW plain
+      RTN** on Llama-3.1-8B-Instruct (70.06 vs 70.92, BF16 70.42) for ~10x the time and ~16x
+      the VRAM; 8-bit weight tuning buys +0.0008/+0.0003 average; `auto_round` auto-disables
+      its own scale search at `bits>=8` and recommends `iters=0`; neither AutoRound paper
+      evaluates 8 bits across five versions; Intel publishes 58 int4 models and **one** int8,
+      built with tuning off. Independently corroborated by Dettmers arXiv 2212.09720 App. C.3
+      ("No scaling improvements for 6 to 8-bit models"), ZeroQuant-V2 (<0.05 ppl), the Qwen3
+      quantization study, and llama.cpp discarding the imatrix at `q8_0`. **Also excluded:**
+      our granularity is already the INT8 hardware maximum (per-output-channel weights x
+      per-token dynamic activations = AutoRound's own `INT8` preset), and the BF16->INT8
+      prefill speed ceiling is **2.0x on every ISA we run** (Arm N2/V1/V2, AMX, Zen4/5,
+      M4 SME) against the **1.8x we already measure** -- there is no second speedup behind a
+      better quantizer. AutoRound stays live and valuable at **2-4 bits only** (track 2).
+      Redirection, ideas backlog and citations:
+      `.work/quant-prefill-int8-analysis-20260915.md`.
+- [ ] QP-1 **Activation-range profile (do this first, blocks QP-3/4/5).** Per linear layer,
+      per token position, `max/median` ratio, across languages, with and without a voice
+      prefix, prefix vs generated positions. ~20 lines of C behind a flag, no default change.
+      Hypothesis under test: the SwiGLU activation-spike signature (arXiv 2405.14428) on the
+      `down_proj` input, concentrated on BOS/newline/apostrophe -- tokens that live in the
+      text prefix the PREFILL carries and that the acoustic-token DECODE never sees. If the
+      signature is absent, QP-3/4/5 lose their rationale and the track needs a new hypothesis.
+- [ ] QP-2 **Distance gate before any candidate.** Teacher-forced `KL(bf16 || int8)` per
+      decode step plus flip rate, on the BF16 token stream, on LONG utterances, PER LANGUAGE,
+      at temperature > 0; reuse `tools/quant/fakequant_cp.py` + `tests/quant_ladder.py`
+      (references: int8 79.4 %, int4 46.3 %). Rationale: arXiv 2407.09141 -- aggregate
+      accuracy and perplexity are structurally blind to the damage that matters, distance
+      metrics are not. This does **not** replace the ear/ASR gate in the parent note; it makes
+      it affordable by filtering candidates before a listener spends time on them.
+      ⚠️ The `mel-corr 0.39-0.60` figure in `docs/runtime-map-c8a-c4.md` is uninformative on
+      its own (trajectory divergence of a sampled AR model, not damage). The INT8-prefill
+      rejection was an EAR verdict and it stands -- do not re-open the path on the metric.
+- [ ] QP-3 **Per-K-block activation quantization in the prefill** (B=32, then 128) instead of
+      one absmax over the whole K per token. No calibration, no new format; reuses the per-32
+      machinery already written for Q4_0. Confines an outlier channel to its own block instead
+      of crushing the token's whole row; overhead O(1/B). Cheapest real candidate.
+- [ ] QP-4 **QFeP: first N prefix tokens in BF16, INT8 from there.** Removes the spike tokens
+      by construction, and covers the attention-sink token that Mix-Quant's
+      attention-concentration defence (arXiv 2605.20315) does not reach.
+- [ ] QP-5 **QFeM: exclude the 1-3 worst layers** from the INT8 prefill, selected by QP-1's
+      max/median ratio, `down_proj` first. Static and AMX/VNNI-friendly, unlike LLM.int8()
+      dynamic column decomposition (which breaks tiling and is rejected).
+- [ ] QP-6 **SmoothQuant alpha-sweep folded into RMSNorm / `v_proj` / `up_proj`** -- verify
+      foldability against our block graph first. Free at runtime if it folds, but the first
+      idea needing calibration data: start ONLY if QP-3/4/5 fall short.
+- [ ] QP-7 **KV-seam control arm**: INT8 prefill everywhere except the K/V projections.
+      Demoted from hypothesis to control (Mix-Quant rejects KV poisoning as the mechanism);
+      cheap enough to run inside the QP-3 A/B.
+- [ ] QP-8 **`iq4_nl` revisit — belongs to the INT4 track, not this one.** Same 4.5 bpw and
+      the same 18-byte block as our Q4_0, a 16-entry LUT; QErr 1.10 % vs Q4_0's 1.84 %; our
+      own measurement recorded +8.8 pt on the CP with the kernel parked. AutoRound **cannot**
+      emit it; llama.cpp can. Already named as the cheap follow-up in `docs/quant-sub4.md` §5.
+- [ ] QP-9 **Offline quantizer via `ggml_quantize_chunk()`** if the INT4 track restarts: link
+      `ggml-quants.c`, feed an imatrix (diagonal of the activation second moment), consume
+      `q4_K`/`iq4_xs`/`q6_K` blocks in our own kernels. No Python, no GGUF parsing.
+      Side finding worth reading regardless: auto-round ships a Qwen3-TTS GGUF converter
+      (`export_to_gguf/conversion/qwen3tts.py`) documenting an independent llama.cpp mapping
+      of our model's structure.
 
 ### P1 Cadence truth (current binary, Tier A only) — detail: `.work/p1-cadence-truth-20260907.md`
 
