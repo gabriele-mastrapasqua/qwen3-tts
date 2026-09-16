@@ -792,6 +792,39 @@ static void cp_mtp_project(qwen_tts_ctx_t *ctx, float *dst, const float *src) {
 }
 
 static double cpx_embed, cpx_proj, cpx_step, cpx_norm, cpx_head;
+
+/* Batched-path breakdown.  The cpx_* counters above only instrument qwen_cp_predict, the
+ * single-request path; the server runs qwen_batch_cp_predict, and serving profiles put that
+ * at roughly half of all work with no way to see inside it.  QWEN_CP_PROFILE=1 splits it into
+ * the three things the loop actually alternates between, 15 times per frame:
+ *   seed   - embedding lookup / MTP projection that feeds the next codebook  (CPU)
+ *   step   - the 5-layer transformer pass                                    (GPU when batched)
+ *   head   - rms_norm + lm_head + argmax over the codebook                   (CPU)
+ * `step` on the CUDA path also carries three synchronous copies and a full stream sync per
+ * call, so a large `step` share does not by itself mean the GPU is busy. */
+static double cpb_seed, cpb_step, cpb_head;
+static long   cpb_frames;
+static int cpb_on(void) {
+    static int t = -1;
+    if (t < 0) { const char *e = getenv("QWEN_CP_PROFILE"); t = (e && e[0] && e[0] != '0'); }
+    return t;
+}
+static double cpb_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+static void cpb_report(void) {
+    double sum = cpb_seed + cpb_step + cpb_head;
+    if (sum <= 0.0) return;
+    fprintf(stderr,
+            "[CP] frames=%ld  seed %.0f ms (%.1f%%)  step %.0f ms (%.1f%%)  head %.0f ms (%.1f%%)"
+            "  | per frame: seed %.3f  step %.3f  head %.3f ms\n",
+            cpb_frames, cpb_seed, 100.0*cpb_seed/sum, cpb_step, 100.0*cpb_step/sum,
+            cpb_head, 100.0*cpb_head/sum,
+            cpb_frames ? cpb_seed/(double)cpb_frames : 0.0,
+            cpb_frames ? cpb_step/(double)cpb_frames : 0.0,
+            cpb_frames ? cpb_head/(double)cpb_frames : 0.0);
+}
 static int cpx_on(void) {
     static int t = -1;
     if (t < 0) { const char *e = getenv("QWEN_TTFA_TRACE"); t = (e && e[0] && e[0] != '0'); }
@@ -1603,6 +1636,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
     }
 
+    double _cpb_g0 = cpb_on() ? cpb_now() : 0.0;   /* start of pass g's seed section */
     for (int g = 1; g < 15; g++) {
         int pos = g + 1;
         {
@@ -1628,7 +1662,11 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                 if (!done) cp_mtp_project(ctx, cx + (size_t)b * ch, srcs[b]);
             }
         }
+        const int _cpb = cpb_on();
+        double _cpb_m = _cpb ? cpb_now() : 0.0;
+        if (_cpb) { cpb_seed += _cpb_m - _cpb_g0; }
         batch_cp_transformer_step(ctx, bb, cx, cxn, pos, active);
+        if (_cpb) { double _t = cpb_now(); cpb_step += _t - _cpb_m; _cpb_m = _t; }
         {
             qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
             for (int b = 0; b < B; b++) {
@@ -1642,7 +1680,9 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                 }
             qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
         }
+        if (_cpb) { cpb_head += cpb_now() - _cpb_m; _cpb_g0 = cpb_now(); }
     }
+    if (cpb_on()) { cpb_frames++; if ((cpb_frames % 500) == 0) cpb_report(); }
     qwen_mm_component(prev_comp);
     qwen_region_end(QWEN_RGN_CP_DECODE);
     return 0;
