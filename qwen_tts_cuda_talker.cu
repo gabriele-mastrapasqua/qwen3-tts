@@ -501,33 +501,60 @@ static int mm_unroll(void){
              if(u!=4&&u!=8&&u!=16) u=4; }
     return u;
 }
-__global__ void k_matmat_int8(const int8_t *W,const float *scale,const float *X,float *Y,int rows,int cols,int B){
+/* Same two treatments the bf16 kernel got, for the same two measured reasons: NB as a template
+ * parameter so s[] is not sized at QB_MAX, and four weight loads in flight because one load
+ * feeding the very next instruction leaves the kernel latency-bound.
+ *
+ * Without them int8 was a trap. Halving the weight bytes made the SINGLE-stream path 22% faster
+ * exactly as expected -- Talker 5.23 -> 4.64 ms/frame, CP 7.70 -> 5.97 -- while the BATCHED path
+ * collapsed, Talker 4.82 -> 15.24 and CP 10.60 -> 40.48, purely because this kernel had been
+ * left behind. A quantisation that helps one lane and cripples eight would have read as "int8 is
+ * no good on the GPU". */
+template<int U,int NB>
+__global__ void k_matmat_int8_u(const int8_t *__restrict__ W,const float *__restrict__ scale,
+                                const float *__restrict__ X,float *__restrict__ Y,int rows,int cols,int B){
     int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
-    const int8_t *wr=W+(size_t)row*cols; float s[QB_MAX];
+    const int8_t *wr=W+(size_t)row*cols; float s[NB];
     #pragma unroll
-    for(int b=0;b<QB_MAX;++b) s[b]=0.f;
-    for(int i=lane;i<cols;i+=32){ float w=(float)wr[i];
+    for(int b=0;b<NB;++b) s[b]=0.f;
+    int i=lane; const int span=32*U;
+    for(;i+span-32<cols;i+=span){
+        float w[U];
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+i]; }
+        for(int u=0;u<U;++u) w[u]=(float)wr[i+32*u];
+        #pragma unroll
+        for(int b=0;b<NB;++b) if(b<B){ const float *xb=X+(size_t)b*cols;
+            /* one at a time, in the scalar loop's order -- see k_matmat_bf16_u */
+            #pragma unroll
+            for(int u=0;u<U;++u) s[b]+=w[u]*xb[i+32*u]; }
+    }
+    for(;i<cols;i+=32){ float wv=(float)wr[i];
+        #pragma unroll
+        for(int b=0;b<NB;++b) if(b<B) s[b]+=wv*X[(size_t)b*cols+i]; }
     float sc=scale[row];
     #pragma unroll
-    for(int b=0;b<QB_MAX;++b){ if(b>=B) break; float v=s[b];
+    for(int b=0;b<NB;++b){ if(b>=B) break; float v=s[b];
         #pragma unroll
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=sc*v; }
 }
-__global__ void k_matmat_q4_0(const q4blk *W,const float *X,float *Y,int rows,int cols,int B){
+/* NB templated for the same reason; the four-way unroll is left out because each lane's loads
+ * here are nibbles inside a shared block header, not independent addresses, so the pattern does
+ * not transfer unchanged and no measurement justifies guessing at it yet. */
+template<int NB>
+__global__ void k_matmat_q4_0_u(const q4blk *__restrict__ W,const float *__restrict__ X,
+                                float *__restrict__ Y,int rows,int cols,int B){
     int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
-    int nb=cols>>5; const q4blk *wr=W+(size_t)row*nb; float s[QB_MAX];
+    int nb=cols>>5; const q4blk *wr=W+(size_t)row*nb; float s[NB];
     #pragma unroll
-    for(int b=0;b<QB_MAX;++b) s[b]=0.f;
+    for(int b=0;b<NB;++b) s[b]=0.f;
     for(int c=lane;c<cols;c+=32){ const q4blk *bk=wr+(c>>5); int ic=c&31;
         unsigned char byte=bk->qs[ic>>1]; int nib=(ic&1)?(byte>>4):(byte&0x0F);
         float w=(float)(nib-8)*__half2float(bk->scale);
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+c]; }
+        for(int b=0;b<NB;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+c]; }
     #pragma unroll
-    for(int b=0;b<QB_MAX;++b){ if(b>=B) break; float v=s[b];
+    for(int b=0;b<NB;++b){ if(b>=B) break; float v=s[b];
         #pragma unroll
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=v; }
@@ -609,8 +636,22 @@ static inline void mvB(int prec,const void*W,const float*scale,const float*X,flo
     }
 
     int grid=CEIL(rows*32,TPB);
-    if(prec==2) k_matmat_q4_0<<<grid,TPB>>>((const q4blk*)W,X,Y,rows,cols,B);
-    else if(prec==1) k_matmat_int8<<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B);
+    if(prec!=0){
+#define MMQ(NB) do{ if(prec==2) k_matmat_q4_0_u<NB><<<grid,TPB>>>((const q4blk*)W,X,Y,rows,cols,B); \
+                    else { int u=mm_unroll(); \
+                           if(u==16)     k_matmat_int8_u<16,NB><<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
+                           else if(u==8) k_matmat_int8_u< 8,NB><<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
+                           else          k_matmat_int8_u< 4,NB><<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B); } }while(0)
+      switch(B){
+        case  1: MMQ( 1); break;  case  2: MMQ( 2); break;  case  3: MMQ( 3); break;
+        case  4: MMQ( 4); break;  case  5: MMQ( 5); break;  case  6: MMQ( 6); break;
+        case  7: MMQ( 7); break;  case  8: MMQ( 8); break;  case  9: MMQ( 9); break;
+        case 10: MMQ(10); break;  case 11: MMQ(11); break;  case 12: MMQ(12); break;
+        case 13: MMQ(13); break;  case 14: MMQ(14); break;  case 15: MMQ(15); break;
+        default: MMQ(QB_MAX); break;
+      }
+#undef MMQ
+    }
     else { int u=mm_unroll();
 #define MM_U(NB) do{ if(u==16)     k_matmat_bf16_u<16,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
                      else if(u==8) k_matmat_bf16_u< 8,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
