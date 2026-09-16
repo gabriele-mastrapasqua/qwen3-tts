@@ -47,6 +47,7 @@
     "max_queue": 1,
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
     "worker_affinity": "contiguous core slices, one per worker"
   },
   "streaming": {

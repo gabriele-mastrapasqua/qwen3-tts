@@ -1,6 +1,7 @@
 /* qwen_tts_talker.c - Talker LLM forward pass with KV cache */
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_costmap.h"
 #include "qwen_tts_thread.h"
 #include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
@@ -669,7 +670,7 @@ extern void qwen_metal_talker_get_dec_x(void *state, float *out);
 extern void qwen_metal_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
 #endif
 #ifdef QWEN_HAVE_CUDA
-extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
+extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out, const uint8_t *active);
 extern void qwen_cuda_talker_step(void *state, const float *embed, float *hidden_out, int pos);
 extern void qwen_cuda_talker_get_dec_x(void *state, float *out);
 #endif
@@ -705,6 +706,7 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
 
     if (kv_cache_grow(ctx, pos + 1) != 0) return -1;
 
+    qwen_region_begin(QWEN_RGN_TK_DECODE);
     actmap_init(c->num_layers, h);
 
     memcpy(ctx->dec_x, embed, h * sizeof(float));
@@ -820,13 +822,61 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
     if (g_actmap_path) { actmap_accum(c->num_layers, hidden_out, h); g_actmap_frames++; }
 
     ctx->kv_len = pos + 1;
+    qwen_region_end(QWEN_RGN_TK_DECODE);
     return 0;
+}
+
+static int qwen_prefill_qkv_share_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("QWEN_PREFILL_QKV_SHARE"); on = (e && e[0] == '1'); }
+    return on;
+}
+
+/* QWEN_PREFILL_INT8MM=1: run the prefill projections on the SAME int8 weights the decode
+ * step streams, through the batched int8 matmat (16-token chunks).  Half the bytes of the
+ * bf16 pass and the VNNI compute rate; the prefill activations are quantised per token
+ * exactly as every decode token already is.  Opt-in: it changes the prefill numerics, so
+ * it is a measured candidate, not the reference configuration. */
+static int prefill_int8mm_enabled(void) {
+    static atomic_int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("QWEN_PREFILL_INT8MM"); v = (e && e[0] == '1');
+                 atomic_store_explicit(&on, v, memory_order_relaxed); }
+    return v;
+}
+/* QWEN_PREFILL_CHUNK (16..64, default 16): tokens per bf16 prefill matmat call.  Wider
+ * chunks mean fewer traversals of the bf16 weights for a prompt; the AVX-512 driver
+ * sweeps each weight row once per chunk, bit-identical to 16-wide calls. */
+static int prefill_chunk_tokens(void) {
+    static atomic_int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) { const char *e = getenv("QWEN_PREFILL_CHUNK"); c = e ? atoi(e) : 16;
+                 if (c < 16) c = 16; if (c > 64) c = 64;
+                 if (c > 16 && !qwen_matmat_bf16_wide_available(256, 2048)) c = 16;
+                 atomic_store_explicit(&v, c, memory_order_relaxed); }
+    return c;
+}
+
+static void prefill_proj_matmat_i8(float *Y, const int8_t *Wi, const float *Ws, const float *Xn,
+                                   int seq, int in_dim, int out_dim, float *xT, float *yT) {
+    for (int s0 = 0; s0 < seq; s0 += 16) {
+        int B = seq - s0; if (B > 16) B = 16;
+        for (int b = 0; b < B; b++) {
+            const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
+            for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
+        }
+        qwen_matmat_int8(yT, Wi, Ws, xT, out_dim, in_dim, B);
+        for (int b = 0; b < B; b++) {
+            float *yr = Y + (int64_t)(s0 + b) * out_dim;
+            for (int o = 0; o < out_dim; o++) yr[o] = yT[(int64_t)o * B + b];
+        }
+    }
 }
 
 static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
                                 int seq, int in_dim, int out_dim,
                                 float *xT, float *yT) {
-    qwen_census_op("prefill_bf16_native", out_dim, in_dim, seq);
+    qwen_census_op(QWEN_PATH_PREFILL_BF16_NATIVE, out_dim, in_dim, seq);
     if (qwen_kleidi_prefill_enabled() &&
         qwen_kleidi_matmul_bf16_native(Y, W, Xn,
                                        (size_t)in_dim * sizeof(float),
@@ -837,18 +887,73 @@ static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
                                    (long long)out_dim * in_dim * seq);
         return;
     }
-    for (int s0 = 0; s0 < seq; s0 += 16) {
-        int B = seq - s0; if (B > 16) B = 16;
-        for (int b = 0; b < B; b++) {
-            const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
-            for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
+    const int CH = prefill_chunk_tokens();
+    for (int s0 = 0; s0 < seq; s0 += CH) {
+        int B = seq - s0; if (B > CH) B = CH;
+        /* A1: the AVX-512 bf16 kernel wants [B][in_dim]; Xn already is that.
+         * Going through qwen_matmat_bf16() would transpose to [in_dim][B] and
+         * then undo it while converting, so hand it the rows directly when
+         * that entry accepts the shape.  Returns 0 on every other backend. */
+        if (!qwen_matmat_bf16_rows(yT, W, Xn + (int64_t)s0 * in_dim, in_dim,
+                                   out_dim, in_dim, B)) {
+            qwen_region_begin2(QWEN_RGN_TK_PF_LAYOUT_IN);
+            for (int b = 0; b < B; b++) {
+                const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
+                for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
+            }
+            qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_IN);
+            if (B <= 16 || !qwen_matmat_bf16_wide(yT, W, xT, out_dim, in_dim, B))
+                qwen_matmat_bf16(yT, W, xT, out_dim, in_dim, B);
         }
-        qwen_matmat_bf16(yT, W, xT, out_dim, in_dim, B);
+        qwen_region_begin2(QWEN_RGN_TK_PF_LAYOUT_OUT);
         for (int b = 0; b < B; b++) {
             float *yr = Y + (int64_t)(s0 + b) * out_dim;
             for (int o = 0; o < out_dim; o++) yr[o] = yT[(int64_t)o * B + b];
         }
+        qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_OUT);
     }
+}
+
+/* A2a: Q, K and V all project the SAME pref_x_norm, so the bf16 activation
+ * block is identical for the three.  Build it once per chunk and run the three
+ * GEMMs against it.  Only the pack is shared: the GEMMs stay separate, the
+ * output layout is unchanged.  Falls back to three independent calls whenever
+ * the row-major AVX-512 path is not the one that would run. */
+static void prefill_proj_matmat_qkv(float *Yq, float *Yk, float *Yv,
+                                    const uint16_t *Wq, const uint16_t *Wk,
+                                    const uint16_t *Wv, const float *Xn,
+                                    int seq, int in_dim, int q_dim, int kv_dim,
+                                    float *xT, float *yT) {
+    if (!qwen_prefill_qkv_share_enabled()) goto fallback;
+    for (int s0 = 0; s0 < seq; s0 += 16) {
+        int B = seq - s0; if (B > 16) B = 16;
+        if (!qwen_matmat_bf16_rows_usable(q_dim,  in_dim, B) ||
+            !qwen_matmat_bf16_rows_usable(kv_dim, in_dim, B)) goto fallback;
+    }
+    qwen_census_op(QWEN_PATH_PREFILL_BF16_NATIVE, q_dim + 2 * kv_dim, in_dim, seq);
+    for (int s0 = 0; s0 < seq; s0 += 16) {
+        int B = seq - s0; if (B > 16) B = 16;
+        /* xT is sized for >= 16 * max(in_dim, 2*inter) floats, i.e. at least
+         * 2x the uint16_t elements this needs. */
+        uint16_t *Xb = (uint16_t *)xT;
+        qwen_bf16_pack_rows(Xb, Xn + (int64_t)s0 * in_dim, in_dim, in_dim, B);
+        qwen_census_op(QWEN_PATH_BF16_ROWPACK_SHARED, in_dim, in_dim, B);
+        const struct { float *Y; const uint16_t *W; int rows; } p[3] = {
+            { Yq, Wq, q_dim }, { Yk, Wk, kv_dim }, { Yv, Wv, kv_dim }
+        };
+        for (int i = 0; i < 3; i++) {
+            qwen_matmat_bf16_packed(yT, p[i].W, Xb, p[i].rows, in_dim, B);
+            for (int b = 0; b < B; b++) {
+                float *yr = p[i].Y + (int64_t)(s0 + b) * p[i].rows;
+                for (int o = 0; o < p[i].rows; o++) yr[o] = yT[(int64_t)o * B + b];
+            }
+        }
+    }
+    return;
+fallback:
+    prefill_proj_matmat(Yq, Wq, Xn, seq, in_dim, q_dim,  xT, yT);
+    prefill_proj_matmat(Yk, Wk, Xn, seq, in_dim, kv_dim, xT, yT);
+    prefill_proj_matmat(Yv, Wv, Xn, seq, in_dim, kv_dim, xT, yT);
 }
 
 static int tk_layer_fully_quantized(const qwen_talker_layer_t *l) {
@@ -1004,6 +1109,131 @@ void qwen_kleidi_prepack(qwen_tts_ctx_t *ctx) {
                                     ctx->cp_emb_dim, QWEN_KAI_COMP_CP, QWEN_KAI_FAM_OTHER);
 }
 
+static void qwen_amx_prepack_one(const void *w, int rows, int cols, int kind) {
+    if (w) (void)qwen_amx_prepack_weight(w, rows, cols, kind);
+}
+
+/* Pack a weight only if the INT8 AMX gate could ever select it.  The gate judges a fused QKV
+ * member on the combined height q+2kv, so pass that as gate_rows for wq/wk/wv. */
+static int g_amx_prepack_threads = 0;
+static void qwen_amx_prepack_i8(const int8_t *w, int rows, int cols, int gate_rows) {
+    if (w && qwen_amx_int8_pack_worth(rows, cols, gate_rows, g_amx_prepack_threads))
+        qwen_amx_prepack_one(w, rows, cols, QWEN_AMX_WEIGHT_INT8);
+}
+
+void qwen_amx_prepack_model_nt(qwen_tts_ctx_t *ctx, int serving_threads) {
+    const char *e = getenv("QWEN_AMX_PREPACK");
+    if (!ctx || !e || e[0] != '1') return;
+    g_amx_prepack_threads = serving_threads > 0 ? serving_threads : qwen_get_threads();
+
+    const qwen_tts_config_t *c = &ctx->config;
+    const int h = c->hidden_size;
+    const int q_dim = c->num_heads * c->head_dim;
+    const int kv_dim = c->num_kv_heads * c->head_dim;
+    const int inter = c->intermediate_size;
+    for (int i = 0; i < c->num_layers; i++) {
+        const qwen_talker_layer_t *l = &ctx->layers[i];
+        qwen_amx_prepack_one(l->wq_bf16, q_dim, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wk_bf16, kv_dim, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wv_bf16, kv_dim, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wo_bf16, h, q_dim, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->gate_up_fused_bf16, 2 * inter, h, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->down_bf16, h, inter, QWEN_AMX_WEIGHT_BF16);
+        const int qkv_rows = q_dim + 2 * kv_dim;
+        qwen_amx_prepack_i8(l->wq_int8, q_dim, h, qkv_rows);
+        qwen_amx_prepack_i8(l->wk_int8, kv_dim, h, qkv_rows);
+        qwen_amx_prepack_i8(l->wv_int8, kv_dim, h, qkv_rows);
+        qwen_amx_prepack_i8(l->wo_int8, h, q_dim, h);
+        qwen_amx_prepack_i8(l->gate_up_fused_int8, 2 * inter, h, 2 * inter);
+        qwen_amx_prepack_i8(l->down_int8, h, inter, h);
+    }
+
+    const int ch = c->cp_hidden_size;
+    const int cq = c->cp_num_heads * c->cp_head_dim;
+    const int ckv = c->cp_num_kv_heads * c->cp_head_dim;
+    const int ci = c->cp_intermediate_size;
+    for (int i = 0; i < c->cp_num_layers; i++) {
+        const qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        qwen_amx_prepack_one(l->wq_bf16, cq, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wk_bf16, ckv, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wv_bf16, ckv, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->wo_bf16, ch, cq, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->gate_up_fused_bf16, 2 * ci, ch, QWEN_AMX_WEIGHT_BF16);
+        qwen_amx_prepack_one(l->down_bf16, ch, ci, QWEN_AMX_WEIGHT_BF16);
+        const int cp_qkv_rows = cq + 2 * ckv;
+        qwen_amx_prepack_i8(l->wq_int8, cq, ch, cp_qkv_rows);
+        qwen_amx_prepack_i8(l->wk_int8, ckv, ch, cp_qkv_rows);
+        qwen_amx_prepack_i8(l->wv_int8, ckv, ch, cp_qkv_rows);
+        qwen_amx_prepack_i8(l->wo_int8, ch, cq, ch);
+        qwen_amx_prepack_i8(l->gate_up_fused_int8, 2 * ci, ch, 2 * ci);
+        qwen_amx_prepack_i8(l->down_int8, ch, ci, ch);
+    }
+
+    int n = 0;
+    size_t bytes = 0;
+    qwen_amx_prepack_stats(&n, &bytes);
+    if (n > 0)
+        fprintf(stderr, "[amx-prepack] parent: %d matrices, %.0f MB; inherited by prefork workers "
+                        "(INT8 packed only where the gate can select it, at %d threads)\n",
+                n, (double)bytes / (1024.0 * 1024.0), g_amx_prepack_threads);
+}
+
+void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx) { qwen_amx_prepack_model_nt(ctx, 0); }
+
+static void qwen_vnni_prepack_one(const int8_t *w, int rows, int cols) {
+    if (w) (void)qwen_vnni_prepack_weight(w, rows, cols);
+}
+
+void qwen_vnni_prepack_model(qwen_tts_ctx_t *ctx) {
+    const char *e = getenv("QWEN_VNNI_PREPACK");
+    if (!ctx || !e || (e[0] != '1' && strcmp(e, "all") &&
+                       strcmp(e, "cp") && strcmp(e, "talker"))) return;
+
+    const qwen_tts_config_t *c = &ctx->config;
+    const int h = c->hidden_size;
+    const int q_dim = c->num_heads * c->head_dim;
+    const int kv_dim = c->num_kv_heads * c->head_dim;
+    const int inter = c->intermediate_size;
+    const int cp_only = !strcmp(e, "cp");
+    const int talker_only = !strcmp(e, "talker");
+    if (!cp_only) {
+        for (int i = 0; i < c->num_layers; i++) {
+            const qwen_talker_layer_t *l = &ctx->layers[i];
+            qwen_vnni_prepack_one(l->wq_int8, q_dim, h);
+            qwen_vnni_prepack_one(l->wk_int8, kv_dim, h);
+            qwen_vnni_prepack_one(l->wv_int8, kv_dim, h);
+            qwen_vnni_prepack_one(l->wo_int8, h, q_dim);
+            qwen_vnni_prepack_one(l->gate_up_fused_int8, 2 * inter, h);
+            qwen_vnni_prepack_one(l->down_int8, h, inter);
+        }
+    }
+
+    const int ch = c->cp_hidden_size;
+    const int cq = c->cp_num_heads * c->cp_head_dim;
+    const int ckv = c->cp_num_kv_heads * c->cp_head_dim;
+    const int ci = c->cp_intermediate_size;
+    if (!talker_only) {
+        for (int i = 0; i < c->cp_num_layers; i++) {
+            const qwen_cp_layer_t *l = &ctx->cp_layers[i];
+            qwen_vnni_prepack_one(l->wq_int8, cq, ch);
+            qwen_vnni_prepack_one(l->wk_int8, ckv, ch);
+            qwen_vnni_prepack_one(l->wo_int8, ch, cq);
+            qwen_vnni_prepack_one(l->gate_up_fused_int8, 2 * ci, ch);
+            qwen_vnni_prepack_one(l->down_int8, ch, ci);
+        }
+        for (int g = 0; g < 15; g++)
+            qwen_vnni_prepack_one(ctx->cp_lm_head_int8[g], c->codebook_size, ch);
+        qwen_vnni_prepack_one(ctx->cp_mtp_proj_int8, ch, ctx->cp_emb_dim);
+    }
+
+    int n = 0;
+    size_t bytes = 0;
+    qwen_vnni_prepack_stats(&n, &bytes);
+    if (n > 0)
+        fprintf(stderr, "[vnni-prepack] parent: %d matrices, %.0f MB; inherited by prefork workers\n",
+                n, (double)bytes / (1024.0 * 1024.0));
+}
+
 typedef struct {
     int   len, n_layers, kv_dim;
     int   speaker_id, language_id, think_mode;
@@ -1098,9 +1328,87 @@ static double pf_ph[9];
 #define PF_T0()      (pf_mark = trace ? pfx_now_ms() : 0.0)
 #define PF_ACC(i_)   do { if (trace && pf_mark > 0.0) pf_ph[(i_)] += pfx_now_ms() - pf_mark; } while (0)
 
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+static int prefill_env_one(const char *name) {
+    const char *e = getenv(name);
+    return e && e[0] == '1';
+}
+#endif
+
+/* Report whether the prefill has an actually usable native BF16 matrix unit.  This is
+ * deliberately separate from the raw ISA report: AMX can be compiled but declined by
+ * QWEN_NO_AMX*, and AVX-512 BF16 can be compiled but declined by QWEN_NO_BF16_MATMUL.
+ * The explicit environment must never turn an absent/disabled unit into a fake ON state.
+ */
+static int qwen_prefill_native_bf16_available(const char **why) {
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if (qwen_amx_bf16_available() && !prefill_env_one("QWEN_NO_AMX") &&
+        !prefill_env_one("QWEN_NO_AMX_BF16")) {
+        if (why) *why = "amx_bf16_available";
+        return 1;
+    }
+#endif
+    if (qwen_arm_bf16_matmat_available()) {
+        if (why) *why = "arm_bf16_matmat_available (BFMMLA)";
+        return 1;
+    }
+    if (qwen_avx512_bf16_matmat_available()) {
+        if (why) *why = "avx512_bf16_matmat_available (VDPBF16PS)";
+        return 1;
+    }
+    if (why) *why = "no compiled/runtime-enabled native BF16 matmat unit";
+    return 0;
+}
+
+/* THE prefill dispatch predicate.  One definition, used by the prefill itself and
+ * by --dispatch-map, so the report can never disagree with the runtime.  The
+ * 2026-09-03 AVX-512-BF16 bug (prefill silently on the f32/SGEMM fallback for
+ * ~400 ms of TTFA) lived exactly here and was printed nowhere.
+ *
+ * An explicit QWEN_PREFILL_MATMAT=1 is a request, not a capability override.  If the
+ * binary does not contain a usable native unit, a BLAS build must resolve to the
+ * auditable f32/SGEMM path and the dispatch gate must reject the profile.  Previously
+ * it returned ON and entered the generic BF16 twin, which looked like native matmat
+ * while neither AVX-512 BF16 nor AMX had been compiled.
+ */
+int qwen_prefill_matmat_resolved(const char **why) {
+    const char *native_why = NULL;
+    const int native = qwen_prefill_native_bf16_available(&native_why);
+    const char *e = getenv("QWEN_PREFILL_MATMAT");
+    if (e) {
+        if (e[0] != '1') {
+            if (why) *why = "explicit env QWEN_PREFILL_MATMAT=0";
+            return 0;
+        }
+        if (native) {
+            if (why) *why = native_why;
+            return 1;
+        }
+#ifdef USE_BLAS
+        if (why) *why = "explicit QWEN_PREFILL_MATMAT=1 but no native BF16 unit -> f32 convert + SGEMM fallback";
+        return 0;
+#else
+        if (why) *why = "explicit QWEN_PREFILL_MATMAT=1 but no native unit; no BLAS build, generic BF16 fallback";
+        return 1;
+#endif
+    }
+#ifdef USE_BLAS
+    if (native) {
+        if (why) *why = native_why;
+        return 1;
+    }
+    if (why) *why = "no bf16 matmat unit -> f32 convert + SGEMM (BLAS) prefill";
+    return 0;
+#else
+    if (why) *why = "no BLAS build: bf16 matmat is the only prefill path";
+    return 1;
+#endif
+}
+
 int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     double pf_mark = 0.0;
     qwen_mm_component(QWEN_COMP_TALKER);
+    qwen_region_begin(QWEN_RGN_TK_PREFILL);
     static int trace = -1;
     if (trace < 0) { const char *e = getenv("QWEN_TTFA_TRACE"); trace = (e && e[0] && e[0] != '0'); }
     double pfx_t0 = trace ? pfx_now_ms() : 0.0;
@@ -1119,15 +1427,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     float eps = c->rms_norm_eps;
 
     static __thread int mm_env = -1;
-    if (mm_env < 0) {
-        const char *e = getenv("QWEN_PREFILL_MATMAT");
-        if (e) mm_env = (e[0] == '1');
-#ifdef USE_BLAS
-        else mm_env = qwen_amx_bf16_available() || qwen_arm_bf16_matmat_available();
-#else
-        else mm_env = 1;
-#endif
-    }
+    if (mm_env < 0) mm_env = qwen_prefill_matmat_resolved(NULL);
     int use_matmat = mm_env;
     int pref_quant = !use_matmat && tk_prefill_quant_enabled();
     if (pref_quant) tk_release_bf16(ctx);
@@ -1136,10 +1436,11 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     if (use_matmat) {
         int need_in = (h > inter ? h : inter);
         int need_out = 2 * inter;
-        int cap = (need_in > need_out ? need_in : need_out) * 16;
+        const int CH = prefill_chunk_tokens();
+        int cap = (need_in > need_out ? need_in : need_out) * CH;
         if (cap > pp_cap) {
-            float *nx = (float *)realloc(pp_xT, (size_t)need_in * 16 * sizeof(float));
-            float *ny = (float *)realloc(pp_yT, (size_t)need_out * 16 * sizeof(float));
+            float *nx = (float *)realloc(pp_xT, (size_t)need_in * CH * sizeof(float));
+            float *ny = (float *)realloc(pp_yT, (size_t)need_out * CH * sizeof(float));
             if (nx) pp_xT = nx;
             if (ny) pp_yT = ny;
             if (!pp_xT || !pp_yT) { use_matmat = 0; } else { pp_cap = cap; }
@@ -1191,6 +1492,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         !pref_attn_out || !pref_gate || !pref_proj ||
         !wq_f32 || !wk_f32 || !wv_f32 || !wo_f32 || !gate_up_f32 || !down_f32) {
         fprintf(stderr, "Error: prefill allocation failed\n");
+        qwen_region_end(QWEN_RGN_TK_PREFILL);
         return -1;
     }
 
@@ -1245,6 +1547,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 
         if (!use_matmat) {
+            qwen_region_begin(QWEN_RGN_TK_PF_WEIGHT_PREP);
             tk_prefill_weight_f32(wq_f32, PREFW(l, wq), l->wq_int8, l->wq_scale,
                                   l->wq_q4, l->wq_q6, q_dim, h, pref_quant);
             tk_prefill_weight_f32(wk_f32, PREFW(l, wk), l->wk_int8, l->wk_scale,
@@ -1259,28 +1562,39 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                                   2 * inter, h, pref_quant);
             tk_prefill_weight_f32(down_f32, PREFW(l, down), l->down_int8, l->down_scale,
                                   l->down_q4, l->down_q6, h, inter, pref_quant);
+            qwen_region_end(QWEN_RGN_TK_PF_WEIGHT_PREP);
         }
 
         PF_ACC(8); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
         qwen_rms_norm(pref_x_norm, residual, l->input_norm, n_new, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
 
         PF_ACC(0); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_QKV);
         if (use_matmat) {
             double _p = trace ? pfx_now_ms() : 0.0;
-            prefill_proj_matmat(pref_q, PREFW(l, wq), pref_x_norm, n_new, h, q_dim,  pp_xT, pp_yT);
-            if (trace) { pj_q_ms += pfx_now_ms() - _p; _p = pfx_now_ms(); }
-            prefill_proj_matmat(pref_kn, PREFW(l, wk), pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
-            if (trace) { pj_k_ms += pfx_now_ms() - _p; _p = pfx_now_ms(); }
-            prefill_proj_matmat(pref_vn, PREFW(l, wv), pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
-            if (trace) { pj_v_ms += pfx_now_ms() - _p; pj_calls++; }
+            if (prefill_int8mm_enabled() && l->wq_int8 && l->wk_int8 && l->wv_int8) {
+                prefill_proj_matmat_i8(pref_q,  l->wq_int8, l->wq_scale, pref_x_norm, n_new, h, q_dim,  pp_xT, pp_yT);
+                prefill_proj_matmat_i8(pref_kn, l->wk_int8, l->wk_scale, pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
+                prefill_proj_matmat_i8(pref_vn, l->wv_int8, l->wv_scale, pref_x_norm, n_new, h, kv_dim, pp_xT, pp_yT);
+            } else
+            prefill_proj_matmat_qkv(pref_q, pref_kn, pref_vn,
+                                    PREFW(l, wq), PREFW(l, wk), PREFW(l, wv),
+                                    pref_x_norm, n_new, h, q_dim, kv_dim,
+                                    pp_xT, pp_yT);
+            if (trace) { pj_q_ms += pfx_now_ms() - _p; pj_calls++; }
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, q_dim, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, q_dim, h, 1.0f,
                     pref_x_norm, h, wq_f32, h, 0.0f, pref_q, q_dim);
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, kv_dim, h, 1.0f,
                     pref_x_norm, h, wk_f32, h, 0.0f, pref_kn, kv_dim);
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, kv_dim, h, 1.0f,
                     pref_x_norm, h, wv_f32, h, 0.0f, pref_vn, kv_dim);
@@ -1312,7 +1626,10 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_QKV);
+
         PF_ACC(1); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_QKROPEKV);
         qwen_rms_norm_per_head(pref_q, l->q_norm, n_new, c->num_heads, c->head_dim, eps);
         qwen_rms_norm_per_head(pref_kn, l->k_norm, n_new, c->num_kv_heads, c->head_dim, eps);
 
@@ -1336,21 +1653,30 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         f32_to_bf16_vec(ctx->kv_cache_k + cache_base, pref_k, (int64_t)seq_len * kv_dim);
         f32_to_bf16_vec(ctx->kv_cache_v + cache_base, pref_v, (int64_t)seq_len * kv_dim);
 
+        qwen_region_end(QWEN_RGN_TK_PF_QKROPEKV);
+
         PF_ACC(4); PF_T0();
         float scale = 1.0f / sqrtf((float)c->head_dim);
+        qwen_region_begin(QWEN_RGN_TK_PF_ATTN);
         qwen_causal_attention_prefill(pref_attn_out, pref_q, pref_k, pref_v,
                               n_new, seq_len, c->num_heads, c->num_kv_heads,
                               c->head_dim, scale, pos0);
+        qwen_region_end(QWEN_RGN_TK_PF_ATTN);
 
         PF_ACC(5); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_OPROJ);
         if (use_matmat) {
             double _p = trace ? pfx_now_ms() : 0.0;
+            if (prefill_int8mm_enabled() && l->wo_int8)
+                prefill_proj_matmat_i8(pref_proj, l->wo_int8, l->wo_scale, pref_attn_out, n_new, q_dim, h, pp_xT, pp_yT);
+            else
             prefill_proj_matmat(pref_proj, PREFW(l, wo), pref_attn_out, n_new, q_dim, h, pp_xT, pp_yT);
             if (trace) pj_o_ms += pfx_now_ms() - _p;
             for (int64_t i = 0; i < (int64_t)n_new * h; i++)
                 residual[i] += pref_proj[i];
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, q_dim, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, h, q_dim, 1.0f,
                     pref_attn_out, q_dim, wo_f32, q_dim, 0.0f, pref_proj, h);
@@ -1370,14 +1696,23 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_OPROJ);
+
         PF_ACC(6); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
         qwen_rms_norm(pref_x_norm, residual, l->post_attn_norm, n_new, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
 
         PF_ACC(7); PF_T0();
+        qwen_region_begin(QWEN_RGN_TK_PF_GATEUP);
         if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->gate_up_fused_int8)
+                prefill_proj_matmat_i8(pref_gate, l->gate_up_fused_int8, l->gate_up_fused_scale, pref_x_norm, n_new, h, 2 * inter, pp_xT, pp_yT);
+            else
             prefill_proj_matmat(pref_gate, PREFW(l, gate_up_fused), pref_x_norm, n_new, h, 2 * inter, pp_xT, pp_yT);
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, 2 * inter, h, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, 2 * inter, h, 1.0f,
                     pref_x_norm, h, gate_up_f32, h, 0.0f, pref_gate, 2 * inter);
@@ -1395,6 +1730,9 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
 #endif
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_GATEUP);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_FFN_ACT);
         for (int s = 0; s < n_new; s++) {
             float *src = pref_gate + (int64_t)s * 2 * inter;
             float *dst = pref_gate + (int64_t)s * inter;
@@ -1409,7 +1747,13 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             }
         }
 
+        qwen_region_end(QWEN_RGN_TK_PF_FFN_ACT);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_DOWN);
         if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->down_int8)
+                prefill_proj_matmat_i8(pref_proj, l->down_int8, l->down_scale, pref_gate, n_new, inter, h, pp_xT, pp_yT);
+            else
             prefill_proj_matmat(pref_proj, l->down_bf16, pref_gate, n_new, inter, h, pp_xT, pp_yT);
             { double _t = trace ? pfx_now_ms() : 0.0;
               for (int64_t i = 0; i < (int64_t)n_new * h; i++)
@@ -1417,6 +1761,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
               if (trace) ffn_resid_ms += pfx_now_ms() - _t; }
         } else {
 #ifdef USE_BLAS
+        qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, inter, n_new); qwen_census_leaf(QWEN_LEAF_BLAS);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     n_new, h, inter, 1.0f,
                     pref_gate, inter, down_f32, inter, 0.0f, pref_proj, h);
@@ -1435,6 +1780,8 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 #endif
         }
+
+        qwen_region_end(QWEN_RGN_TK_PF_DOWN);
 
         if (ctx->debug) {
             fprintf(stderr, "  Layer %d/%d done", layer + 1, c->num_layers);
@@ -1507,8 +1854,370 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                 "unacc=%.3f\n", n_new, pf_ph[0],pf_ph[1],pf_ph[2],pf_ph[3],pf_ph[4],
                 pf_ph[5],pf_ph[6],pf_ph[7],pf_ph[8], _sum, _tot, _tot-_sum);
     }
+    qwen_region_end(QWEN_RGN_TK_PREFILL);
     return 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * Sliced prefill (C12-WIN-10).
+ *
+ * qwen_talker_prefill computes every layer over every new token in one call, so
+ * an admission holds the frame loop for the whole prompt.  The two functions
+ * below compute the SAME thing in token-range slices: qwen_talker_prefill_plan
+ * establishes the resume boundary once (prefix positions materialised in the
+ * bf16 KV cache, buffers sized, kv cache grown) and qwen_talker_prefill_range
+ * runs the 28 layers over the new-token rows [t0, t1) only.
+ *
+ * Why this is a valid boundary: a token's residual stream never crosses a slice
+ * (each token walks all 28 layers inside its own slice), and a slice reads the
+ * earlier tokens only through ctx->kv_cache_{k,v}, which the slices before it
+ * have already filled for every layer.  The one intended difference from the
+ * monolithic path is that a new token attends to the earlier positions of the
+ * SAME prompt through the bf16 cache instead of the f32 pref_k/pref_v staging
+ * buffer -- the same precision the decode step already attends over.
+ *
+ * The prefix cache is used (a hit is materialised once by _plan) but never
+ * FILLED from this path: filling needs the f32 K/V of the prefix positions of
+ * every layer alive at the end of the request, which is exactly the state the
+ * slicing must not carry.  _plan reports that case and the caller runs the
+ * monolithic path for that one admission (a handful of times per worker life,
+ * at cold start).
+ * ------------------------------------------------------------------------- */
+
+int qwen_talker_prefill_plan(qwen_tts_ctx_t *ctx, int seq_len, int *pos0_out) {
+    qwen_tts_config_t *c = &ctx->config;
+    int h = c->hidden_size;
+    int q_dim = c->num_heads * c->head_dim;
+    int kv_dim = c->num_kv_heads * c->head_dim;
+    int inter = c->intermediate_size;
+
+    if (pos0_out) *pos0_out = 0;
+    if (seq_len <= 0) return -1;
+    if (kv_cache_grow(ctx, seq_len) != 0) return -1;
+
+    const qwen_prefix_cache_t *pfx = qwen_prefix_cache_enabled() ? pfx_find(ctx) : NULL;
+    const int pos0 = pfx ? pfx->len : 0;
+    if (pos0 >= seq_len) return -1;               /* nothing new to compute */
+
+    /* A prompt that would populate an empty prefix slot must take the monolithic
+     * path: see the header comment.  Report it instead of faking the fill. */
+    if (qwen_prefix_cache_enabled() && !pfx && ctx->pfx_len > 0 && ctx->pfx_len < seq_len) {
+        for (int i = 0; i < QWEN_PFX_SLOTS; i++)
+            if (atomic_load_explicit(&g_pfx_state[i], memory_order_acquire) == PFX_EMPTY)
+                return 1;                          /* caller: run inline this once */
+    }
+
+    if (seq_len > ctx->pref_seq_cap) {
+        free(ctx->pref_residual); free(ctx->pref_q); free(ctx->pref_k); free(ctx->pref_v);
+        free(ctx->pref_x_norm); free(ctx->pref_attn_out); free(ctx->pref_gate); free(ctx->pref_proj);
+        ctx->pref_residual = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_q = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+        ctx->pref_k = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+        ctx->pref_v = (float *)aligned_malloc((int64_t)seq_len * kv_dim * sizeof(float));
+        ctx->pref_x_norm = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_attn_out = (float *)aligned_malloc((int64_t)seq_len * q_dim * sizeof(float));
+        ctx->pref_gate = (float *)aligned_malloc((int64_t)seq_len * 2 * inter * sizeof(float));
+        ctx->pref_proj = (float *)aligned_malloc((int64_t)seq_len * h * sizeof(float));
+        ctx->pref_seq_cap = seq_len;
+    }
+    if (!ctx->pref_wq_f32) {
+        ctx->pref_wq_f32 = (float *)aligned_malloc((int64_t)q_dim * h * sizeof(float));
+        ctx->pref_wk_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+        ctx->pref_wv_f32 = (float *)aligned_malloc((int64_t)kv_dim * h * sizeof(float));
+        ctx->pref_wo_f32 = (float *)aligned_malloc((int64_t)h * q_dim * sizeof(float));
+        ctx->pref_gate_up_f32 = (float *)aligned_malloc((int64_t)2 * inter * h * sizeof(float));
+        ctx->pref_down_f32 = (float *)aligned_malloc((int64_t)h * inter * sizeof(float));
+    }
+    if (!ctx->pref_residual || !ctx->pref_q || !ctx->pref_k || !ctx->pref_v ||
+        !ctx->pref_x_norm || !ctx->pref_attn_out || !ctx->pref_gate || !ctx->pref_proj ||
+        !ctx->pref_wq_f32 || !ctx->pref_wk_f32 || !ctx->pref_wv_f32 || !ctx->pref_wo_f32 ||
+        !ctx->pref_gate_up_f32 || !ctx->pref_down_f32) {
+        fprintf(stderr, "Error: sliced prefill allocation failed\n");
+        return -1;
+    }
+
+    /* Materialise the prefix hit into the bf16 cache once, for every layer. */
+    if (pos0 > 0) {
+        long n = atomic_fetch_add_explicit(&g_pfx_hits, 1, memory_order_relaxed) + 1;
+        if (n == 1 || !ctx->silent)
+            fprintf(stderr, "  Prefix cache HIT: %d/%d positions reused, computing %d\n",
+                    pos0, seq_len, seq_len - pos0);
+        for (int layer = 0; layer < c->num_layers; layer++) {
+            int64_t cache_base = (int64_t)layer * ctx->kv_max * kv_dim;
+            size_t off = (size_t)layer * pos0 * kv_dim;
+            f32_to_bf16_vec(ctx->kv_cache_k + cache_base, pfx->k + off, (int64_t)pos0 * kv_dim);
+            f32_to_bf16_vec(ctx->kv_cache_v + cache_base, pfx->v + off, (int64_t)pos0 * kv_dim);
+        }
+    } else if (qwen_prefix_cache_enabled() && ctx->pfx_len > 0) {
+        atomic_fetch_add_explicit(&g_pfx_miss, 1, memory_order_relaxed);
+    }
+
+    ctx->kv_len = pos0;
+    ctx->ml_steer_w_eff = 0.0f;
+    if (pos0_out) *pos0_out = pos0;
+    return 0;
+}
+
+int qwen_talker_prefill_range(qwen_tts_ctx_t *ctx, const float *input_embeds, int seq_len,
+                              int pos0, int t0, int t1) {
+    qwen_tts_config_t *c = &ctx->config;
+    int h = c->hidden_size;
+    int q_dim = c->num_heads * c->head_dim;
+    int kv_dim = c->num_kv_heads * c->head_dim;
+    int inter = c->intermediate_size;
+    float eps = c->rms_norm_eps;
+    const int n_new = seq_len - pos0;
+
+    if (t0 < 0 || t1 > n_new || t0 >= t1) return -1;
+    const int n = t1 - t0;
+    const int abs0 = pos0 + t0;                    /* first absolute position of the slice */
+
+    qwen_mm_component(QWEN_COMP_TALKER);
+    qwen_region_begin(QWEN_RGN_TK_PREFILL);
+
+    static __thread int mm_env = -1;
+    if (mm_env < 0) mm_env = qwen_prefill_matmat_resolved(NULL);
+    int use_matmat = mm_env;
+    int pref_quant = !use_matmat && tk_prefill_quant_enabled();
+    if (pref_quant) tk_release_bf16(ctx);
+    static __thread float *rg_xT = NULL, *rg_yT = NULL;
+    static __thread int rg_cap = 0;
+    if (use_matmat) {
+        int need_in = (h > inter ? h : inter);
+        int need_out = 2 * inter;
+        const int CH = prefill_chunk_tokens();
+        int cap = (need_in > need_out ? need_in : need_out) * CH;
+        if (cap > rg_cap) {
+            float *nx = (float *)realloc(rg_xT, (size_t)need_in * CH * sizeof(float));
+            float *ny = (float *)realloc(rg_yT, (size_t)need_out * CH * sizeof(float));
+            if (nx) rg_xT = nx;
+            if (ny) rg_yT = ny;
+            if (!rg_xT || !rg_yT) { use_matmat = 0; } else { rg_cap = cap; }
+        }
+    }
+
+    float *residual     = ctx->pref_residual;
+    float *pref_q       = ctx->pref_q;
+    float *pref_k       = ctx->pref_k;
+    float *pref_v       = ctx->pref_v;
+    float *pref_x_norm  = ctx->pref_x_norm;
+    float *pref_attn_out= ctx->pref_attn_out;
+    float *pref_gate    = ctx->pref_gate;
+    float *pref_proj    = ctx->pref_proj;
+    float *wq_f32       = ctx->pref_wq_f32;
+    float *wk_f32       = ctx->pref_wk_f32;
+    float *wv_f32       = ctx->pref_wv_f32;
+    float *wo_f32       = ctx->pref_wo_f32;
+    float *gate_up_f32  = ctx->pref_gate_up_f32;
+    float *down_f32     = ctx->pref_down_f32;
+    if (!residual || !pref_q || !pref_k || !pref_v || !pref_x_norm || !pref_attn_out ||
+        !pref_gate || !pref_proj) {
+        qwen_region_end(QWEN_RGN_TK_PREFILL);
+        return -1;
+    }
+
+    memcpy(residual, input_embeds + (int64_t)abs0 * h, (int64_t)n * h * sizeof(float));
+
+    for (int layer = 0; layer < c->num_layers; layer++) {
+        qwen_talker_layer_t *l = &ctx->layers[layer];
+        int64_t cache_base = (int64_t)layer * ctx->kv_max * kv_dim;
+
+        if (!use_matmat) {
+            qwen_region_begin(QWEN_RGN_TK_PF_WEIGHT_PREP);
+            tk_prefill_weight_f32(wq_f32, PREFW(l, wq), l->wq_int8, l->wq_scale,
+                                  l->wq_q4, l->wq_q6, q_dim, h, pref_quant);
+            tk_prefill_weight_f32(wk_f32, PREFW(l, wk), l->wk_int8, l->wk_scale,
+                                  l->wk_q4, l->wk_q6, kv_dim, h, pref_quant);
+            tk_prefill_weight_f32(wv_f32, PREFW(l, wv), l->wv_int8, l->wv_scale,
+                                  l->wv_q4, l->wv_q6, kv_dim, h, pref_quant);
+            tk_prefill_weight_f32(wo_f32, PREFW(l, wo), l->wo_int8, l->wo_scale,
+                                  l->wo_q4, l->wo_q6, h, q_dim, pref_quant);
+            tk_prefill_weight_f32(gate_up_f32, PREFW(l, gate_up_fused),
+                                  l->gate_up_fused_int8, l->gate_up_fused_scale,
+                                  l->gate_up_fused_q4, l->gate_up_fused_q6,
+                                  2 * inter, h, pref_quant);
+            tk_prefill_weight_f32(down_f32, PREFW(l, down), l->down_int8, l->down_scale,
+                                  l->down_q4, l->down_q6, h, inter, pref_quant);
+            qwen_region_end(QWEN_RGN_TK_PF_WEIGHT_PREP);
+        }
+
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
+        qwen_rms_norm(pref_x_norm, residual, l->input_norm, n, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_QKV);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->wq_int8 && l->wk_int8 && l->wv_int8) {
+                prefill_proj_matmat_i8(pref_q, l->wq_int8, l->wq_scale, pref_x_norm, n, h, q_dim,  rg_xT, rg_yT);
+                prefill_proj_matmat_i8(pref_k, l->wk_int8, l->wk_scale, pref_x_norm, n, h, kv_dim, rg_xT, rg_yT);
+                prefill_proj_matmat_i8(pref_v, l->wv_int8, l->wv_scale, pref_x_norm, n, h, kv_dim, rg_xT, rg_yT);
+            } else
+            prefill_proj_matmat_qkv(pref_q, pref_k, pref_v,
+                                    PREFW(l, wq), PREFW(l, wk), PREFW(l, wv),
+                                    pref_x_norm, n, h, q_dim, kv_dim, rg_xT, rg_yT);
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, q_dim, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, q_dim, h, 1.0f,
+                        pref_x_norm, h, wq_f32, h, 0.0f, pref_q, q_dim);
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, kv_dim, h, 1.0f,
+                        pref_x_norm, h, wk_f32, h, 0.0f, pref_k, kv_dim);
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, kv_dim, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, kv_dim, h, 1.0f,
+                        pref_x_norm, h, wv_f32, h, 0.0f, pref_v, kv_dim);
+#else
+            for (int s = 0; s < n; s++) {
+                const float *xs = pref_x_norm + (int64_t)s * h;
+                float *qs = pref_q + (int64_t)s * q_dim;
+                float *ks = pref_k + (int64_t)s * kv_dim;
+                float *vs = pref_v + (int64_t)s * kv_dim;
+                for (int o = 0; o < q_dim; o++) {
+                    float sum = 0.0f; const float *row = wq_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    qs[o] = sum;
+                }
+                for (int o = 0; o < kv_dim; o++) {
+                    float sum = 0.0f; const float *row = wk_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    ks[o] = sum;
+                }
+                for (int o = 0; o < kv_dim; o++) {
+                    float sum = 0.0f; const float *row = wv_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    vs[o] = sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_QKV);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_QKROPEKV);
+        qwen_rms_norm_per_head(pref_q, l->q_norm, n, c->num_heads, c->head_dim, eps);
+        qwen_rms_norm_per_head(pref_k, l->k_norm, n, c->num_kv_heads, c->head_dim, eps);
+        for (int s = 0; s < n; s++) {
+            apply_rope_neox_inplace(pref_q + (int64_t)s * q_dim, c->num_heads, c->head_dim,
+                                    ctx->rope_cos, ctx->rope_sin, abs0 + s);
+            apply_rope_neox_inplace(pref_k + (int64_t)s * kv_dim, c->num_kv_heads, c->head_dim,
+                                    ctx->rope_cos, ctx->rope_sin, abs0 + s);
+        }
+        /* The slice's own K/V must be visible to its own causal attention below. */
+        f32_to_bf16_vec(ctx->kv_cache_k + cache_base + (int64_t)abs0 * kv_dim, pref_k,
+                        (int64_t)n * kv_dim);
+        f32_to_bf16_vec(ctx->kv_cache_v + cache_base + (int64_t)abs0 * kv_dim, pref_v,
+                        (int64_t)n * kv_dim);
+        qwen_region_end(QWEN_RGN_TK_PF_QKROPEKV);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_ATTN);
+        qwen_causal_attention_bf16kv_prefill(pref_attn_out, pref_q,
+                                             ctx->kv_cache_k + cache_base,
+                                             ctx->kv_cache_v + cache_base,
+                                             n, abs0 + n, c->num_heads, c->num_kv_heads,
+                                             c->head_dim, 1.0f / sqrtf((float)c->head_dim),
+                                             abs0);
+        qwen_region_end(QWEN_RGN_TK_PF_ATTN);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_OPROJ);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->wo_int8)
+                prefill_proj_matmat_i8(pref_proj, l->wo_int8, l->wo_scale, pref_attn_out, n, q_dim, h, rg_xT, rg_yT);
+            else
+                prefill_proj_matmat(pref_proj, PREFW(l, wo), pref_attn_out, n, q_dim, h, rg_xT, rg_yT);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, q_dim, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, h, q_dim, 1.0f,
+                        pref_attn_out, q_dim, wo_f32, q_dim, 0.0f, pref_proj, h);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+#else
+            for (int s = 0; s < n; s++) {
+                float *xs = residual + (int64_t)s * h;
+                const float *attn = pref_attn_out + (int64_t)s * q_dim;
+                for (int o = 0; o < h; o++) {
+                    float sum = 0.0f; const float *row = wo_f32 + (int64_t)o * q_dim;
+                    for (int i = 0; i < q_dim; i++) sum += row[i] * attn[i];
+                    xs[o] += sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_OPROJ);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_NORM);
+        qwen_rms_norm(pref_x_norm, residual, l->post_attn_norm, n, h, eps);
+        qwen_region_end(QWEN_RGN_TK_PF_NORM);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_GATEUP);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->gate_up_fused_int8)
+                prefill_proj_matmat_i8(pref_gate, l->gate_up_fused_int8, l->gate_up_fused_scale, pref_x_norm, n, h, 2 * inter, rg_xT, rg_yT);
+            else
+                prefill_proj_matmat(pref_gate, PREFW(l, gate_up_fused), pref_x_norm, n, h, 2 * inter, rg_xT, rg_yT);
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, 2 * inter, h, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, 2 * inter, h, 1.0f,
+                        pref_x_norm, h, gate_up_f32, h, 0.0f, pref_gate, 2 * inter);
+#else
+            for (int s = 0; s < n; s++) {
+                const float *xs = pref_x_norm + (int64_t)s * h;
+                float *o2 = pref_gate + (int64_t)s * 2 * inter;
+                for (int o = 0; o < 2 * inter; o++) {
+                    float sum = 0.0f; const float *row = gate_up_f32 + (int64_t)o * h;
+                    for (int i = 0; i < h; i++) sum += row[i] * xs[i];
+                    o2[o] = sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_GATEUP);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_FFN_ACT);
+        for (int s = 0; s < n; s++) {
+            float *src = pref_gate + (int64_t)s * 2 * inter;
+            float *dst = pref_gate + (int64_t)s * inter;
+            qwen_swiglu_prefill(src, ctx->swiglu_tmp, inter);
+            if (dst != src) memcpy(dst, src, inter * sizeof(float));
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_FFN_ACT);
+
+        qwen_region_begin(QWEN_RGN_TK_PF_DOWN);
+        if (use_matmat) {
+            if (prefill_int8mm_enabled() && l->down_int8)
+                prefill_proj_matmat_i8(pref_proj, l->down_int8, l->down_scale, pref_gate, n, inter, h, rg_xT, rg_yT);
+            else
+                prefill_proj_matmat(pref_proj, l->down_bf16, pref_gate, n, inter, h, rg_xT, rg_yT);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+        } else {
+#ifdef USE_BLAS
+            qwen_census_op(QWEN_PATH_PREFILL_F32_SGEMM, h, inter, n); qwen_census_leaf(QWEN_LEAF_BLAS);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, h, inter, 1.0f,
+                        pref_gate, inter, down_f32, inter, 0.0f, pref_proj, h);
+            for (int64_t i = 0; i < (int64_t)n * h; i++) residual[i] += pref_proj[i];
+#else
+            for (int s = 0; s < n; s++) {
+                float *xs = residual + (int64_t)s * h;
+                const float *gs = pref_gate + (int64_t)s * inter;
+                for (int o = 0; o < h; o++) {
+                    float sum = 0.0f; const float *row = down_f32 + (int64_t)o * inter;
+                    for (int i = 0; i < inter; i++) sum += row[i] * gs[i];
+                    xs[o] += sum;
+                }
+            }
+#endif
+        }
+        qwen_region_end(QWEN_RGN_TK_PF_DOWN);
+    }
+
+    ctx->kv_len = abs0 + n;
+    if (t1 == n_new)
+        memcpy(ctx->dec_x, residual + (int64_t)(n - 1) * h, h * sizeof(float));
+
+    qwen_region_end(QWEN_RGN_TK_PREFILL);
+    return 0;
+}
+
 
 static void batch_gather(float *Xt, const float *src, int n, int dim, int srcstride,
                          const int *idx) {
@@ -1586,8 +2295,8 @@ void qwen_batch_proj_q(float *dst,
         int contig = 1;
         if (idx) for (int j = 0; j < B; j++) if (idx[j] != j) { contig = 0; break; }
         if (contig) {
-            if (Wi) qwen_census_op("matmat_int8_native", rows, cols, B);
-            else if (!Wq) qwen_census_op("matmat_bf16_native", rows, cols, B);
+            if (Wi) qwen_census_op(QWEN_PATH_MATMAT_INT8_NATIVE, rows, cols, B);
+            else if (!Wq) qwen_census_op(QWEN_PATH_MATMAT_BF16_NATIVE, rows, cols, B);
             if (Wi && qwen_kleidi_matmul_i8_native(dst, Wi, src,
                                                    (size_t)srcstride * sizeof(float),
                                                    (size_t)rows * sizeof(float),
@@ -1633,7 +2342,7 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
                                              (size_t)srcstride * sizeof(float),
                                              cols, q_rows, kv_rows, B)) {
             if (qwen_census_enabled())
-                qwen_census_op("matmat_int8_qkv_native", q_rows + 2 * kv_rows, cols, B);
+                qwen_census_op(QWEN_PATH_MATMAT_INT8_QKV_NATIVE, q_rows + 2 * kv_rows, cols, B);
             if (qwen_matmat_stats_enabled() || qwen_census_enabled()) {
                 qwen_matmat_stats_note(QWEN_MMK_KLEIDI_I8,
                                        (long long)(q_rows + 2 * kv_rows) * cols * B);
@@ -1642,6 +2351,38 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
                     qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
                     qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
             }
+            return;
+        }
+        batch_gather(Xt, src, B, cols, srcstride, idx);
+        if (qwen_matmat_int8_qkv(Yt, Yt + (size_t)q_rows * B,
+                                 Yt + (size_t)(q_rows + kv_rows) * B,
+                                 Wqi, Wqs, Wki, Wks, Wvi, Wvs,
+                                 Xt, cols, q_rows, kv_rows, B)) {
+            batch_scatter(dq, Yt, B, q_rows, NULL);
+            batch_scatter(dk, Yt + (size_t)q_rows * B, B, kv_rows, NULL);
+            batch_scatter(dv, Yt + (size_t)(q_rows + kv_rows) * B, B, kv_rows, NULL);
+            if (qwen_matmat_stats_enabled())
+                qwen_matmat_stats_note_bytes(
+                    qwen_proj_weight_bytes(Wqb, Wqi, Wqq, q_rows, cols) +
+                    qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
+                    qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
+            return;
+        }
+    }
+    if (B > 1 && contig && !force_matvec && !g_batch_nomatmul &&
+        Wqb && Wkb && Wvb && !Wqq && !Wkq && !Wvq) {
+        batch_gather(Xt, src, B, cols, srcstride, idx);
+        if (qwen_matmat_bf16_qkv(Yt, Yt + (size_t)q_rows * B,
+                                 Yt + (size_t)(q_rows + kv_rows) * B,
+                                 Wqb, Wkb, Wvb, Xt, cols, q_rows, kv_rows, B)) {
+            batch_scatter(dq, Yt, B, q_rows, NULL);
+            batch_scatter(dk, Yt + (size_t)q_rows * B, B, kv_rows, NULL);
+            batch_scatter(dv, Yt + (size_t)(q_rows + kv_rows) * B, B, kv_rows, NULL);
+            if (qwen_matmat_stats_enabled())
+                qwen_matmat_stats_note_bytes(
+                    qwen_proj_weight_bytes(Wqb, Wqi, Wqq, q_rows, cols) +
+                    qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
+                    qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
             return;
         }
     }
@@ -1755,6 +2496,215 @@ void qwen_batch_free(qwen_batch_t *bb) {
     free(bb);
 }
 
+/* ---- one batched Talker step as ONE persistent parallel region -------------------------
+ * Same design as the code-predictor region: the team enters the pool once per step, the
+ * four projections of every layer run as the VNNI row blocks the dispatched path uses,
+ * and the per-slot sections (input norm, q/k norm, rope, KV store, attention, residual
+ * norms, swiglu) run one slot per thread between spin barriers.  Eight barriers per layer,
+ * one dispatch per step instead of 112.  Kernels and partition are unchanged, so the
+ * hidden states are bit-identical.  QWEN_TK_REGION=0 restores the dispatched path. */
+typedef struct {
+    qwen_tts_ctx_t *ctx; qwen_batch_t *bb; const int *pos_arr; const uint8_t *active;
+    int BW; const int *idx; float scale;
+    int8_t *qx; float *swtmp; float sx[16];
+    int arm_kai;                 /* 1: KleidiAI prepared-state runner (Arm) */
+    const void *kai_lhs_packed;  /* one pack shared by the whole region team */
+    int kai_prep_failed;
+    qwen_barrier_t bar;
+} tk_region_t;
+
+/* The two runners want different activation layouts.  The x86 in-region row blocks take a
+ * k-major int8 panel with per-column scales; KleidiAI quantises the activation itself and
+ * wants it row-major [B][cols] float -- the "second gather shape" the prepared-state API
+ * was written for and never got.  Same kernels either way: the dispatched Arm path already
+ * calls kai_i8_try, so this changes the runner, not the arithmetic. */
+static void tk_region_gather(tk_region_t *r, const float *src, int b, int j, int cols, int srcstride) {
+    const float *s = src + (size_t)b * srcstride;
+    if (r->arm_kai) {
+        memcpy(r->bb->Xt + (size_t)j * cols, s, (size_t)cols * sizeof(float));
+        return;
+    }
+    float *Xt = r->bb->Xt;
+    for (int k = 0; k < cols; k++) Xt[(size_t)k * r->BW + j] = s[k];
+    r->sx[j] = qwen_region_i8_quant_col(r->qx + (size_t)j * cols, Xt, cols, r->BW, j);
+}
+static void tk_region_scatter(tk_region_t *r, float *dst, const float *Y, int b, int j, int rows) {
+    float *d = dst + (size_t)b * rows;
+    if (r->arm_kai) { memcpy(d, Y + (size_t)j * rows, (size_t)rows * sizeof(float)); return; }
+    for (int i = 0; i < rows; i++) d[i] = Y[(size_t)i * r->BW + j];
+}
+/* The old region path packed the same activation independently in every worker because
+ * qwen_kleidi_*_region_prep() returns the caller's TLS scratch.  Packing once on the
+ * region leader is safe: the barrier keeps that TLS buffer alive while every worker runs
+ * its own n-tile slice, and the caller's barrier after this function completes the phase
+ * before the leader can reuse the scratch for the next projection. */
+static const void *tk_region_kai_prep(tk_region_t *r, int cols, size_t tid) {
+    if (tid == 0) {
+        r->kai_lhs_packed = qwen_kleidi_i8_region_prep(
+            r->bb->Xt, (size_t)cols * sizeof(float), cols, r->BW);
+        r->kai_prep_failed = (r->kai_lhs_packed == NULL);
+    }
+    qwen_barrier_wait(&r->bar);
+    if (r->kai_prep_failed) {
+        if (tid == 0) fprintf(stderr, "[talker] KAI region LHS prep failed\n");
+        abort();
+    }
+    return r->kai_lhs_packed;
+}
+
+static void tk_region_run_proj(tk_region_t *r, const int8_t *W, const float *sw,
+                               int rows, int cols, size_t tid, size_t nt) {
+    if (r->arm_kai) {
+        const void *lp = tk_region_kai_prep(r, cols, tid);
+        qwen_kleidi_i8_region_run(W, r->bb->Yt, (size_t)rows * sizeof(float), lp,
+                                  rows, cols, r->BW, tid, nt);
+        return;
+    }
+    qwen_region_i8_run(r->bb->Yt, W, sw, r->qx, r->sx, rows, cols, r->BW, tid, nt);
+}
+static void tk_region_run_qkv(tk_region_t *r, const int8_t *Wq, const float *sq,
+                              const int8_t *Wk, const float *sk,
+                              const int8_t *Wv, const float *sv,
+                              float *Yk, float *Yv, int q_rows, int kv_rows, int cols,
+                              size_t tid, size_t nt) {
+    if (r->arm_kai) {
+        const void *lp = tk_region_kai_prep(r, cols, tid);
+        qwen_kleidi_i8_qkv_region_run(Wq, Wk, Wv, r->bb->Yt, Yk, Yv, lp,
+                                      q_rows, kv_rows, cols, r->BW, tid, nt);
+        return;
+    }
+    qwen_region_i8_run_qkv(r->bb->Yt, Yk, Yv, Wq, sq, Wk, sk, Wv, sv,
+                           r->qx, r->sx, q_rows, kv_rows, cols, r->BW, tid, nt);
+}
+
+static void tk_region_task(size_t tid, size_t nt, void *v) {
+    tk_region_t *r = (tk_region_t *)v;
+    qwen_tts_ctx_t *ctx = r->ctx; qwen_batch_t *bb = r->bb; qwen_tts_config_t *c = &ctx->config;
+    const int BW = r->BW, h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
+    const float eps = c->rms_norm_eps, scale = r->scale;
+    float *Yt = bb->Yt;
+#define TSLOT(j) (r->idx ? r->idx[j] : (j))
+#define TMINE(j) ((size_t)(j) % nt == tid)
+#define TPOS(b)  (r->pos_arr ? r->pos_arr[b] : bb->kv_len)
+    for (int j = 0; j < BW; j++) if (TMINE(j)) {
+        int b = TSLOT(j);
+        qwen_rms_norm(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h, ctx->layers[0].input_norm, 1, h, eps);
+        tk_region_gather(r, bb->x_norm, b, j, h, h);
+    }
+    qwen_barrier_wait(&r->bar);
+    for (int L = 0; L < c->num_layers; L++) {
+        qwen_talker_layer_t *l = &ctx->layers[L];
+        float *Yk = Yt + (size_t)qd * BW, *Yv = Yt + (size_t)(qd + kvd) * BW;
+        tk_region_run_qkv(r, l->wq_int8, l->wq_scale, l->wk_int8, l->wk_scale,
+                              l->wv_int8, l->wv_scale, Yk, Yv, qd, kvd, h, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j), pos = TPOS(b);
+            tk_region_scatter(r, bb->q, Yt, b, j, qd);
+            tk_region_scatter(r, bb->k, Yk, b, j, kvd);
+            tk_region_scatter(r, bb->v, Yv, b, j, kvd);
+            qwen_rms_norm_per_head(bb->q + (size_t)b * qd,  l->q_norm, 1, c->num_heads,    c->head_dim, eps);
+            qwen_rms_norm_per_head(bb->k + (size_t)b * kvd, l->k_norm, 1, c->num_kv_heads, c->head_dim, eps);
+            apply_rope_neox_inplace(bb->q + (size_t)b * qd,  c->num_heads,    c->head_dim, ctx->rope_cos, ctx->rope_sin, pos);
+            apply_rope_neox_inplace(bb->k + (size_t)b * kvd, c->num_kv_heads, c->head_dim, ctx->rope_cos, ctx->rope_sin, pos);
+            size_t kvbase = ((size_t)b * bb->num_layers + L) * bb->kv_max * kvd + (size_t)pos * kvd;
+            f32_to_bf16_vec(bb->kv_k + kvbase, bb->k + (size_t)b * kvd, kvd);
+            f32_to_bf16_vec(bb->kv_v + kvbase, bb->v + (size_t)b * kvd, kvd);
+            size_t lbase = ((size_t)b * bb->num_layers + L) * bb->kv_max * kvd;
+            qwen_causal_attention_bf16kv(bb->attn_out + (size_t)b * qd, bb->q + (size_t)b * qd,
+                                         bb->kv_k + lbase, bb->kv_v + lbase, 1, pos + 1,
+                                         c->num_heads, c->num_kv_heads, c->head_dim, scale, pos);
+            tk_region_gather(r, bb->attn_out, b, j, qd, qd);
+        }
+        qwen_barrier_wait(&r->bar);
+        tk_region_run_proj(r, l->wo_int8, l->wo_scale, h, qd, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j);
+            tk_region_scatter(r, bb->proj_out, Yt, b, j, h);
+            qwen_rms_norm_residual(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h,
+                                   bb->proj_out + (size_t)b * h, l->post_attn_norm, h, eps);
+            tk_region_gather(r, bb->x_norm, b, j, h, h);
+        }
+        qwen_barrier_wait(&r->bar);
+        tk_region_run_proj(r, l->gate_up_fused_int8, l->gate_up_fused_scale, 2 * inter, h, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j);
+            tk_region_scatter(r, bb->gate, Yt, b, j, 2 * inter);
+            qwen_swiglu_inplace(bb->gate + (size_t)b * 2 * inter, r->swtmp + (size_t)j * inter, inter);
+            tk_region_gather(r, bb->gate, b, j, inter, 2 * inter);
+        }
+        qwen_barrier_wait(&r->bar);
+        tk_region_run_proj(r, l->down_int8, l->down_scale, h, inter, tid, nt);
+        qwen_barrier_wait(&r->bar);
+        for (int j = 0; j < BW; j++) if (TMINE(j)) {
+            int b = TSLOT(j);
+            tk_region_scatter(r, bb->proj_out, Yt, b, j, h);
+            if (L + 1 < c->num_layers) {
+                qwen_rms_norm_residual(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h,
+                                       bb->proj_out + (size_t)b * h, ctx->layers[L + 1].input_norm, h, eps);
+                tk_region_gather(r, bb->x_norm, b, j, h, h);
+            } else {
+                float *xb = bb->x + (size_t)b * h, *pb = bb->proj_out + (size_t)b * h;
+                for (int i = 0; i < h; i++) xb[i] += pb[i];
+            }
+        }
+        qwen_barrier_wait(&r->bar);
+    }
+#undef TSLOT
+#undef TMINE
+#undef TPOS
+}
+
+/* Returns 1 when the whole layer stack ran as one region (the caller skips its loop). */
+static int tk_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const int *pos_arr,
+                         const uint8_t *active, float scale) {
+    static int region_mode = -1;   /* 0 off, 1 x86 in-region row blocks, 2 Arm KAI prepared state */
+    qwen_tts_config_t *c = &ctx->config;
+    int BW = bb->B_eff > 0 ? bb->B_eff : bb->B;
+    int h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
+    if (region_mode < 0) {
+        const char *e = getenv("QWEN_TK_REGION");
+        qwen_talker_layer_t *l = &ctx->layers[0];
+        const int want = !(e && e[0] == '0') && qwen_parallel_team() >= 2 && bb->B >= 2 &&
+                    l->wq_int8 && l->wk_int8 && l->wv_int8 && l->wo_int8 && l->gate_up_fused_int8 && l->down_int8 &&
+                    !l->wq_q4 && !l->wk_q4 && !l->wv_q4 && !l->wo_q4 && !l->gate_up_fused_q4 && !l->down_q4;
+        const int vnni = want && qwen_region_i8_qkv_usable(qd, kvd, h, 2) &&
+                    qwen_region_i8_usable(h, qd, 2) &&
+                    qwen_region_i8_usable(2 * inter, h, 2) && qwen_region_i8_usable(h, inter, 2);
+        /* The KleidiAI prepared-state runner was written for exactly this and never had
+         * a consumer: same kernels the dispatched Arm path calls (kai_i8_try), reached
+         * between the region's own barriers instead of one pool entry per projection. */
+        const int kai = !vnni && want &&
+                    qwen_kleidi_i8_qkv_region_usable(l->wq_int8, l->wk_int8, l->wv_int8, qd, kvd, h, 2) &&
+                    qwen_kleidi_i8_region_usable(l->wo_int8, h, qd, 2) &&
+                    qwen_kleidi_i8_region_usable(l->gate_up_fused_int8, 2 * inter, h, 2) &&
+                    qwen_kleidi_i8_region_usable(l->down_int8, h, inter, 2);
+        region_mode = vnni ? 1 : (kai ? 2 : 0);
+        fprintf(stderr, "[talker] batched step as one parallel region: %s (team %d)\n",
+                region_mode == 1 ? "ON" : region_mode == 2 ? "ON (KleidiAI prepared state)" : "off",
+                qwen_parallel_team());
+    }
+    if (region_mode == 0 || bb->force_matvec || BW < 2 || BW > 16) return 0;
+    if (region_mode == 1 && !(qwen_region_i8_qkv_usable(qd, kvd, h, BW) && qwen_region_i8_usable(h, qd, BW) &&
+          qwen_region_i8_usable(2 * inter, h, BW) && qwen_region_i8_usable(h, inter, BW))) return 0;
+    static int8_t *qx = NULL; static float *swtmp = NULL; static size_t qx_cap = 0, sw_cap = 0;
+    size_t maxc = (size_t)(inter > qd ? inter : qd); if (maxc < (size_t)h) maxc = h;
+    size_t need = (size_t)BW * maxc + 64, swn = (size_t)BW * inter;
+    if (need > qx_cap) { free(qx); qx = (int8_t *)aligned_alloc(64, (need + 63) & ~(size_t)63); qx_cap = qx ? need : 0; }
+    if (swn > sw_cap) { free(swtmp); swtmp = (float *)malloc(swn * sizeof(float)); sw_cap = swtmp ? swn : 0; }
+    if (!qx || !swtmp) return 0;
+    tk_region_t r; memset(&r, 0, sizeof r);
+    r.ctx = ctx; r.bb = bb; r.pos_arr = pos_arr; r.active = active; r.BW = BW; r.idx = bb->act_idx;
+    r.scale = scale; r.qx = qx; r.swtmp = swtmp; r.arm_kai = (region_mode == 2);
+    int team = qwen_parallel_team();
+    qwen_barrier_init(&r.bar, team);
+    qwen_parallel((size_t)team, tk_region_task, &r);
+    (void)c;
+    return 1;
+}
+
 static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                   const float *embeds, const int *pos_arr,
                                   const uint8_t *active, float *hidden_out) {
@@ -1762,9 +2712,15 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     int B = bb->B, h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
     float eps = c->rms_norm_eps;
     if (ctx->layers[0].wq_bf16 == NULL) return -2;
+    qwen_region_begin(QWEN_RGN_TK_DECODE);
     int maxpos = 0;
     for (int b = 0; b < B; b++) { int p = pos_arr ? pos_arr[b] : bb->kv_len; if (p > maxpos) maxpos = p; }
-    if (maxpos + 1 > bb->kv_max) return -1;
+    if (maxpos + 1 > bb->kv_max) { qwen_region_end(QWEN_RGN_TK_DECODE); return -1; }
+
+    /* Same attribution bug the batched CP had: without this the batched Talker's
+     * kernels inherit whatever component ran last (the decoder thread). */
+    const int prev_comp = qwen_mm_component_get();
+    qwen_mm_component(QWEN_COMP_TALKER);
 
     qwen_batch_pack_active(bb, active);
     #define POS_B(b) (pos_arr ? pos_arr[b] : bb->kv_len)
@@ -1772,7 +2728,8 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     memcpy(bb->x, embeds, (size_t)B * h * sizeof(float));
     float scale = 1.0f / sqrtf((float)c->head_dim);
 
-    for (int layer = 0; layer < c->num_layers; layer++) {
+    const int region_done = tk_region_run(ctx, bb, pos_arr, active, scale);
+    for (int layer = 0; layer < c->num_layers && !region_done; layer++) {
         qwen_talker_layer_t *l = &ctx->layers[layer];
         for (int b = 0; b < B; b++)
             qwen_rms_norm(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h, l->input_norm, 1, h, eps);
@@ -1828,6 +2785,8 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     if (!pos_arr) bb->kv_len = bb->kv_len + 1;
     #undef POS_B
     #undef ACTIVE_B
+    qwen_mm_component(prev_comp);
+    qwen_region_end(QWEN_RGN_TK_DECODE);
     return 0;
 }
 
@@ -1842,7 +2801,10 @@ int qwen_batch_talker_step_ragged(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 #ifdef QWEN_HAVE_CUDA
     extern void *g_cuda_talker_batch_state;
     if (g_cuda_talker_batch_state) {
-        qwen_cuda_talker_batch_step(g_cuda_talker_batch_state, embeds, pos_arr, hidden_out);
+        /* `active` must reach the device.  Lanes the caller is not stepping keep a stale
+         * pos_arr[b] from the request that last held the slot, and every position-indexed
+         * kernel derives an address from it. */
+        qwen_cuda_talker_batch_step(g_cuda_talker_batch_state, embeds, pos_arr, hidden_out, active);
         return 0;
     }
 #endif

@@ -1,6 +1,14 @@
+#if defined(__linux__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>
+#include <unistd.h>
+#endif
 /* main.c - Qwen3-TTS CLI */
 
 #include "qwen_tts.h"
+#include "qwen_tts_thread.h"
 #include "qwen_tts_audio.h"
 #include "qwen_tts_emotion.h"
 #include "qwen_tts_compose.h"
@@ -758,6 +766,7 @@ int main(int argc, char **argv) {
     int serve_batch = 1;
     int serve_prefork = 1;
     int serve_prefork_threads = 0;
+    const char *serve_cpu_mask = NULL;   /* --cpu-mask: benchmark control, see below */
     int serve_max_queue = -1;
     int serve_queue_timeout = 0;
     int serve_max_request_s = -1;
@@ -773,6 +782,9 @@ int main(int argc, char **argv) {
     int run_self_test = 0;
     int run_matmat_bench = 0;
     int run_matmat_tune = 0;
+    int run_dispatch_map = 0;
+    int run_effective_config = 0;
+    int prefill_slice_check = 0;
     int run_gpu_selftest = 0;
     int run_gpu_selftest_talker = 0;
     int run_gpu_batch_bench = 0; int gpu_batch_B = 4;
@@ -888,6 +900,7 @@ int main(int argc, char **argv) {
         {"workers",       required_argument, 0, 1026},
         {"batch-size",    required_argument, 0, 1043},
         {"prefork",         required_argument, 0, 1810},
+        {"cpu-mask",        required_argument, 0, 1813},
         {"prefork-threads", required_argument, 0, 1811},
         {"prefork-elastic", no_argument,       0, 1812},
         {"ml-steer",      required_argument, 0, 1044},
@@ -896,8 +909,11 @@ int main(int argc, char **argv) {
         {"ml-decay",      required_argument, 0, 1047},
         {"ml-frames",     required_argument, 0, 1048},
         {"self-test",     no_argument,       0, 1027},
+        {"prefill-slice-check", required_argument, 0, 1099},
         {"matmat-bench",  no_argument,       0, 1038},
         {"matmat-tune",   no_argument,       0, 1096},
+        {"dispatch-map",  no_argument,       0, 1097},
+        {"effective-config", no_argument,  0, 1098},
         {"gpu-selftest",  no_argument,       0, 1070},
         {"backend",       required_argument, 0, 1071},
         {"gpu-selftest-talker", no_argument, 0, 1072},
@@ -1027,6 +1043,7 @@ int main(int argc, char **argv) {
             case 1043: serve_batch = atoi(optarg); if (serve_batch < 1) serve_batch = 1; break;
             case 1810: serve_prefork = atoi(optarg); if (serve_prefork < 1) serve_prefork = 1; break;
             case 1811: serve_prefork_threads = atoi(optarg); break;
+            case 1813: serve_cpu_mask = optarg; break;
             case 1812: setenv("QWEN_PREFORK_ELASTIC", "1", 1); break;
             case 1044: ml_steer_path = optarg; break;
             case 1045: ml_steer_weight = atof(optarg); break;
@@ -1034,8 +1051,11 @@ int main(int argc, char **argv) {
             case 1047: ml_decay = (float)atof(optarg); break;
             case 1048: ml_frames = atoi(optarg); break;
             case 1027: run_self_test = 1; break;
+            case 1099: prefill_slice_check = atoi(optarg); if (prefill_slice_check < 1) prefill_slice_check = 1; break;
             case 1038: run_matmat_bench = 1; break;
             case 1096: run_matmat_tune = 1; break;
+            case 1097: run_dispatch_map = 1; break;
+            case 1098: run_effective_config = 1; break;
             case 1070: run_gpu_selftest = 1; break;
             case 1071: gpu_backend_str = optarg; break;
             case 1072: run_gpu_selftest_talker = 1; break;
@@ -1090,8 +1110,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --eos-topk <n>             topk only: rank to lift EOS to (50)\n");
                 fprintf(stderr, "  --emotion-weight <w>       dose the steer --emotion applies (recipe: 12).\n");
                 fprintf(stderr, "                             w12 was calibrated on CLONES, which resist emoting.\n");
-                fprintf(stderr, "                             A full finetune is already plastic, so w12 can\n");
-                fprintf(stderr, "                             overshoot — and the excess shows up as lost accent.\n");
+                fprintf(stderr, "                             A model that emotes easily can overshoot at w12,\n");
+                fprintf(stderr, "                             and the excess shows up as degraded output.\n");
                 fprintf(stderr, "  --emotion-layers <A-B>     steer band for --emotion (recipe: 21-25)\n");
                 fprintf(stderr, "  -j, --threads <int>        Number of threads (0=auto)\n");
                 fprintf(stderr, "  -I, --instruct <text>      Style instruction (1.7B only)\n");
@@ -1112,9 +1132,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
                 fprintf(stderr, "  --list-speakers            List the speakers this model declares, then exit\n");
                 fprintf(stderr, "  --speaker-map <dir|json>   Take the name->slot table from ANOTHER model.\n");
-                fprintf(stderr, "                             For GRAFTS: a grafted model has the finetune's\n");
+                fprintf(stderr, "                             For GRAFTS: a grafted model has the donor model's\n");
                 fprintf(stderr, "                             weights but the parent's config, so -s <name>\n");
-                fprintf(stderr, "                             cannot resolve. Point this at the source finetune\n");
+                fprintf(stderr, "                             cannot resolve. Point this at the source model\n");
                 fprintf(stderr, "                             and names work again (slots come from that file).\n");
                 fprintf(stderr, "  --speaker-id <n>           Select a codec slot directly (bypasses name lookup;\n");
                 fprintf(stderr, "                             pool slots are not contiguous — read voices.json)\n");
@@ -1139,7 +1159,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --quant-mixed              int4 Talker + int8 CP (best CUDA quant: q4 Talker win, no CP degradation)\n");
-                fprintf(stderr, "  --quant-mixed-cpu          int8 Talker + int4 CP (best CPU quant: sub-realtime AND keeps the accent;\n");
+                fprintf(stderr, "  --quant-mixed-cpu          int8 Talker + int4 CP (best CPU quant: sub-realtime AND keeps output quality;\n");
                 fprintf(stderr, "                             an int4 Talker drops the language ~1 seed in 5)\n");
                 fprintf(stderr, "  --quant-mixed-int6[=SPEC]  PER-LAYER Talker map: int8 on the layers the sensitivity profile\n");
                 fprintf(stderr, "                             marked critical, q6_0 (6-bit, fp16 scale/32) on the rest.\n");
@@ -1182,6 +1202,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --self-test                Run kernel numeric self-test (matvec vs f32 ref) and exit\n");
                 fprintf(stderr, "  --matmat-bench             Time batched matmat vs B*matvec per precision and exit\n");
                 fprintf(stderr, "  --matmat-tune              Measure the kernel-gate thresholds for this box and exit\n");
+                fprintf(stderr, "  --dispatch-map             Print every dispatch decision RESOLVED for this host+env\n");
+        fprintf(stderr, "  --effective-config         Per declared flag: requested vs effective, and why they differ\n");
+                fprintf(stderr, "                             (compiled/supported/env/resolved/reason; QWEN_DISPATCH_JSON=path) and exit\n");
                 return opt == 'h' ? 0 : 1;
         }
     }
@@ -1189,6 +1212,10 @@ int main(int argc, char **argv) {
 #define QWEN_DIAG_INIT_THREADS() do { \
         if (threads > 0) qwen_set_threads(threads); else qwen_init_threads(); \
     } while (0)
+
+    /* Validate operator-selected scheduler policy before any diagnostic or serving path.
+     * An invalid pool value must not be silently interpreted as the private fallback. */
+    qwen_sd_pool_validate();
 
     if (show_caps) {
         QWEN_DIAG_INIT_THREADS();
@@ -1199,6 +1226,28 @@ int main(int argc, char **argv) {
     if (run_self_test) {
         QWEN_DIAG_INIT_THREADS();
         return qwen_kernel_selftest(stdout);
+    }
+
+    /* Resolve the experimental serving flags that must be rejected BEFORE the server
+     * forks its workers: a worker that exits on a bad value is simply respawned, and the
+     * parent would keep serving the control arm while the operator believes the treatment
+     * is on. */
+    (void)qwen_prefill_slice_tokens();
+
+    if (run_dispatch_map) {
+        /* A profile preflight probes the decoder lane the way a prefork worker would: split
+         * the mask this process inherited (a --cpu-mask, or a taskset) before the pool exists,
+         * so the decoder.lane row resolves instead of reading OFF in every probe. */
+        if (getenv("QWEN_SD_LANE_SPLIT"))
+            qwen_lane_split_prepare(NULL);
+        QWEN_DIAG_INIT_THREADS();
+        return qwen_dispatch_map_report(stdout, getenv("QWEN_DISPATCH_JSON"));
+    }
+
+    if (run_effective_config) {
+        QWEN_DIAG_INIT_THREADS();
+        (void)qwen_effective_config_report(stdout);
+        return 0;
     }
 
     if (run_matmat_bench) {
@@ -1275,7 +1324,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: --model-dir is required\n");
         return 1;
     }
-    int create_voice_only = (save_voice && !text && serve_port <= 0);
+    int create_voice_only = (save_voice && !text && serve_port <= 0) || prefill_slice_check > 0;
     if (!export_q4lsq && !text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test && !run_batch_bench
         && !run_gpu_selftest_talker && !run_gpu_batch_bench && !list_speakers) {
         fprintf(stderr, "Error: --text, --compose or --serve is required\n");
@@ -1338,6 +1387,81 @@ int main(int argc, char **argv) {
 
     qwen_check_runtime_isa();
 
+    /* --cpu-mask: EXPLICIT execution domain for a qualification run.  It exists because
+       `--prefork 1` never reaches the prefork path and therefore never calls
+       sched_setaffinity, so "1x8" used to mean "8 threads free to roam every cpu of the
+       host" — which on a multi-CCX part is a different bandwidth domain from a pinned
+       8-core worker, not a smaller one.  Without this flag a single-worker control is
+       scientifically undefined.
+
+       It changes NOTHING by default: absent, the process keeps whatever mask it inherited,
+       exactly as before.  It is refused together with --prefork > 1, where the per-worker
+       split already owns the affinity; silently letting one override the other is how a
+       topology label stops describing the run.
+
+       Applied HERE, before the thread pool exists: pthreads inherit the creating thread's
+       affinity, so a mask set after the pool started would leave the workers outside it. */
+    if (serve_cpu_mask) {
+#if defined(__linux__)
+        if (serve_prefork > 1) {
+            fprintf(stderr, "--cpu-mask is for a single-worker qualification run; with "
+                            "--prefork %d the per-worker split already sets affinity.\n",
+                    serve_prefork);
+            return 2;
+        }
+        cpu_set_t set; CPU_ZERO(&set);
+        int ok = 1;
+        { char buf[512]; snprintf(buf, sizeof buf, "%s", serve_cpu_mask);
+          for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+              int a2, b2;
+              if (sscanf(tok, "%d-%d", &a2, &b2) == 2) { for (int c2 = a2; c2 <= b2; c2++) CPU_SET(c2, &set); }
+              else if (sscanf(tok, "%d", &a2) == 1)    { CPU_SET(a2, &set); }
+              else { ok = 0; break; }
+          } }
+        if (!ok || CPU_COUNT(&set) == 0) {
+            fprintf(stderr, "--cpu-mask: cannot parse '%s' (expected e.g. 0-7 or 0,2,4)\n",
+                    serve_cpu_mask);
+            return 2;
+        }
+        if (sched_setaffinity(0, sizeof set, &set) != 0) {
+            perror("--cpu-mask: sched_setaffinity");
+            return 2;
+        }
+        fprintf(stderr, "cpu-mask: process pid %d confined to cpus %s (%d cpus)\n",
+                (int)getpid(), serve_cpu_mask, CPU_COUNT(&set));
+        /* QWEN_SD_LANE_SPLIT: split this single worker's mask now, before the pool exists */
+        { int lane_threads = 0;
+          if (qwen_lane_split_prepare(&lane_threads)) threads = lane_threads; }
+#else
+        fprintf(stderr, "--cpu-mask is only supported on Linux\n");
+        return 2;
+#endif
+    }
+
+#if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
+    /* A GPU backend and --prefork are mutually exclusive, and the combination used to fail
+       SILENTLY.  qwen_backend_init() and the resident CUDA Talker/CP state are created below
+       in THIS process; qwen_tts_serve_prefork() forks afterwards.  Neither a CUDA nor a Metal
+       context survives fork() — the child inherits a handle it may not use — so the workers
+       either fell back to the CPU without saying so or produced a wrong answer, while the
+       startup banner still advertised GPU offload.  Refusing is the honest outcome: a silently
+       wrong answer is worse than a failed launch.
+
+       Per-worker GPU contexts are a real design (fork first, initialise inside each child),
+       not a bug fix; until that exists, --batch-size raises GPU serving throughput within the
+       single process that owns the context.
+
+       Inert without --backend: gpu_backend_str stays NULL, so the CPU path is unchanged. */
+    if (gpu_backend_str && serve_port > 0 && serve_prefork > 1) {
+        fprintf(stderr,
+                "--backend %s cannot be combined with --prefork %d: a GPU context does not "
+                "survive fork(), so the prefork workers would not run on the GPU.\n"
+                "Run a single process and raise --batch-size instead.\n",
+                gpu_backend_str, serve_prefork);
+        return 2;
+    }
+#endif
+
     /* --prefork 1 runs a single server, which never reaches the prefork path: without this
        its pool would silently keep the default size while the invocation asked for K. */
     if (threads <= 0 && serve_port > 0 && serve_prefork <= 1 && serve_prefork_threads > 0)
@@ -1395,6 +1519,10 @@ int main(int argc, char **argv) {
     }
 
     qwen_kleidi_prepack(ctx);
+    /* Judge pack-worthiness with the threads a SERVING worker will have, not this process's. */
+    qwen_amx_prepack_model_nt(ctx, serve_prefork > 1 && serve_prefork_threads > 0
+                                       ? serve_prefork_threads : 0);
+    qwen_vnni_prepack_model(ctx);
     if (!silent) {
         extern void qwen_report_model_sources(qwen_tts_ctx_t *, const char *);
         qwen_report_model_sources(ctx, model_dir);
@@ -1553,6 +1681,16 @@ int main(int argc, char **argv) {
             if (!metal_fused) qwen_backend_install_global(gpu_backend);
             fprintf(stderr, "GPU offload: bf16 matvec via '%s' backend "
                             "(EXPERIMENTAL; CPU stays default elsewhere)\n", gpu_backend->name);
+            /* The global seam carries bf16 only (qwen_tts_backend.h exposes matvec_bf16 and
+             * matmat_bf16 and nothing else), so with quantized weights there is nothing for it
+             * to take.  Say so: the line above otherwise advertises an offload that does not
+             * happen, which is how a run manifest ends up claiming GPU work it never did. */
+            if (use_int8 || use_int4)
+                fprintf(stderr, "  NOTE: --%s keeps the weights quantized and the backend seam "
+                                "is bf16-only, so this offloads NOTHING. Drop the quantization "
+                                "flag, or use the resident CUDA paths (QWEN_CUDA_FUSED_TALKER / "
+                                "QWEN_CUDA_DECODER / QWEN_CUDA_CONVDEC).\n",
+                        use_int4 ? "int4" : "int8");
 #if defined(QWEN_HAVE_CUDA)
             if (bk == QWEN_BACKEND_CUDA && getenv("QWEN_CUDA_FUSED_TALKER")) {
                 extern void *g_cuda_talker_state, *g_cuda_cp_state, *g_gpu_fused_owner;
@@ -1591,6 +1729,22 @@ int main(int argc, char **argv) {
             }
 #endif
         }
+    }
+#else
+    /* No GPU backend is compiled into this binary, so the whole block above is gone and
+     * --backend would be parsed and then silently ignored: the run would produce CPU audio
+     * while the caller believed it asked for a GPU.  That is the same failure the quantized
+     * offload NOTE above exists to prevent, and it is worth refusing rather than warning --
+     * a benchmark arm that thinks it enabled the treatment and did not is worse than one that
+     * stops.  A COMPILE-time absence, distinct from a GPU that is compiled in but unusable at
+     * runtime, which qwen_backend_init() reports separately. */
+    /* String compare, not qwen_backend_kind_from_str(): qwen_tts_backend.h is itself included
+     * only in GPU builds, so its enum is not declared here. */
+    if (gpu_backend_str && strcmp(gpu_backend_str, "cpu") != 0) {
+        fprintf(stderr, "--backend %s: this binary has no GPU backend compiled in.\n"
+                        "Rebuild with `make cuda` (NVIDIA) or `make metal CC=clang` (Apple), "
+                        "or drop --backend to run on the CPU.\n", gpu_backend_str);
+        return 2;
     }
 #endif
 
@@ -1685,6 +1839,153 @@ int main(int argc, char **argv) {
     if (ctx_greedy_warmup > 0) ctx->greedy_warmup = ctx_greedy_warmup;
     if (icl_frames > 0) ctx->icl_frames_cap = icl_frames;
     ctx->graft_mode = graft;
+
+
+    /* --prefill-slice-check <S>: the STATE oracle for C12-WIN-10.
+     *
+     * The audio cannot answer this question.  A WAV is a function of integer codes, so a
+     * correct slicing and a slicing that never ran both produce an identical file, while a
+     * last-bit difference that flips one argmax produces a completely different — and
+     * equally valid — utterance.  What must be compared is the Talker state the prefill
+     * leaves behind: the KV cache it filled and the final hidden dec_x the first decode
+     * step consumes.  Everything here runs on one process, one thread of control, with no
+     * server and no sampling. */
+    if (prefill_slice_check > 0) {
+        extern int qwen_talker_prefill(qwen_tts_ctx_t *, float *, int);
+        extern int qwen_talker_prefill_plan(qwen_tts_ctx_t *, int, int *);
+        extern int qwen_talker_prefill_range(qwen_tts_ctx_t *, const float *, int, int, int, int);
+        const char *probe = text ? text : "Il treno delle nove parte dal binario tre e "
+                                          "arriva in stazione centrale poco prima di mezzogiorno.";
+        int kvd = ctx->config.num_kv_heads * ctx->config.head_dim;
+        int nl = ctx->config.num_layers, hh = ctx->config.hidden_size;
+
+        ctx->prev_prefill_len = 0; ctx->prefill_only = 1; ctx->prefill_defer = 1;
+        int rc = qwen_tts_generate(ctx, probe, NULL, NULL);
+        ctx->prefill_only = 0; ctx->prefill_defer = 0;
+        if (rc != 0 || !ctx->prefill_embeds || ctx->prefill_seq_len <= 0) {
+            fprintf(stderr, "prefill-slice-check: could not build the prompt (rc=%d)\n", rc);
+            qwen_tts_unload(ctx); return 1;
+        }
+        int seq_len = ctx->prefill_seq_len;
+        float *embeds = (float *)malloc((size_t)seq_len * hh * sizeof(float));
+        memcpy(embeds, ctx->prefill_embeds, (size_t)seq_len * hh * sizeof(float));
+
+        /* arm 1: the monolithic control */
+        ctx->kv_len = 0;
+        if (qwen_talker_prefill(ctx, embeds, seq_len) != 0) {
+            fprintf(stderr, "prefill-slice-check: monolithic prefill failed\n");
+            qwen_tts_unload(ctx); return 1;
+        }
+        int ref_kv_len = ctx->kv_len;
+        float *ref_dec = (float *)malloc((size_t)hh * sizeof(float));
+        memcpy(ref_dec, ctx->dec_x, (size_t)hh * sizeof(float));
+        size_t kvn = (size_t)nl * ctx->kv_max * kvd;
+        uint16_t *ref_k = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+        uint16_t *ref_v = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+        memcpy(ref_k, ctx->kv_cache_k, kvn * sizeof(uint16_t));
+        memcpy(ref_v, ctx->kv_cache_v, kvn * sizeof(uint16_t));
+
+        int slices[4] = { seq_len, prefill_slice_check, 1, 0 };
+        int fails = 0;
+        /* A bf16 K/V element carries an 8-bit mantissa, so nothing below ~2^-8 relative is
+         * representable in the cache the sliced path attends over.  A deviation at or under
+         * that floor is the KV quantisation, not an error in the slicing. */
+        const double BF16_ULP = 1.0 / 256.0;
+        float *first_dec = NULL; uint16_t *first_k = NULL, *first_v = NULL; int first_kv = 0;
+        printf("prefill-slice-check: prompt %d positions, %d layers, kv_dim %d\n",
+               seq_len, nl, kvd);
+        printf("  vs MONOLITHIC (f32 attention) -- deviation floor is one bf16 ulp %.2e\n", BF16_ULP);
+        printf("  arm                 kv_len   dec_x max|d|/max|ref|   K rows differing   V rows differing\n");
+        for (int si = 0; slices[si] > 0; si++) {
+            int S = slices[si];
+            int pos0 = 0;
+            int plan = qwen_talker_prefill_plan(ctx, seq_len, &pos0);
+            if (plan != 0) {
+                printf("  slice=%-6d        SKIP (plan=%d: this prompt takes the monolithic path)\n",
+                       S, plan);
+                continue;
+            }
+            int n_new = seq_len - pos0, bad = 0, nslices = 0;
+            for (int t = 0; t < n_new && !bad; ) {
+                int step = qwen_prefill_slice_next(n_new - t, S);   /* the serving rule */
+                if (qwen_talker_prefill_range(ctx, embeds, seq_len, pos0, t, t + step) != 0) bad = 1;
+                t += step; nslices++;
+            }
+            (void)nslices;
+            if (bad) { printf("  slice=%-6d        FAIL (range returned an error)\n", S); fails++; continue; }
+
+            double num = 0.0, den = 0.0;
+            for (int i = 0; i < hh; i++) {
+                double d = fabs((double)ctx->dec_x[i] - (double)ref_dec[i]);
+                double r = fabs((double)ref_dec[i]);
+                if (d > num) num = d;
+                if (r > den) den = r;
+            }
+            long kdiff = 0, vdiff = 0;
+            for (int L = 0; L < nl; L++) {
+                size_t base = (size_t)L * ctx->kv_max * kvd;
+                for (int t = 0; t < ref_kv_len; t++) {
+                    if (memcmp(ref_k + base + (size_t)t * kvd, ctx->kv_cache_k + base + (size_t)t * kvd,
+                               (size_t)kvd * sizeof(uint16_t)) != 0) kdiff++;
+                    if (memcmp(ref_v + base + (size_t)t * kvd, ctx->kv_cache_v + base + (size_t)t * kvd,
+                               (size_t)kvd * sizeof(uint16_t)) != 0) vdiff++;
+                }
+            }
+            double rel = den > 0 ? num / den : num;
+            int ok = (ctx->kv_len == ref_kv_len) && rel <= BF16_ULP;
+            printf("  slice=%-6d %s   %6d   %18.3e   %8ld/%-8d   %8ld/%-8d  %s\n",
+                   S, S == seq_len ? "(one) " : (S == 1 ? "(every)" : "       "),
+                   ctx->kv_len, rel, kdiff, ref_kv_len * nl, vdiff, ref_kv_len * nl,
+                   ok ? "PASS" : "FAIL");
+            if (!ok) fails++;
+
+            /* The decisive split: arm against the FIRST sliced arm.  Both attend over the
+             * same bf16 cache, so any difference here is the SLICING itself, not the KV
+             * precision.  Exactness here means resume-equals-uninterrupted. */
+            if (!first_dec) {
+                first_kv = ctx->kv_len;
+                first_dec = (float *)malloc((size_t)hh * sizeof(float));
+                memcpy(first_dec, ctx->dec_x, (size_t)hh * sizeof(float));
+                first_k = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+                first_v = (uint16_t *)malloc(kvn * sizeof(uint16_t));
+                memcpy(first_k, ctx->kv_cache_k, kvn * sizeof(uint16_t));
+                memcpy(first_v, ctx->kv_cache_v, kvn * sizeof(uint16_t));
+            } else {
+                long kd2 = 0, vd2 = 0; double n2 = 0.0, d2 = 0.0;
+                for (int i = 0; i < hh; i++) {
+                    double d = fabs((double)ctx->dec_x[i] - (double)first_dec[i]);
+                    double r = fabs((double)first_dec[i]);
+                    if (d > n2) n2 = d;
+                    if (r > d2) d2 = r;
+                }
+                for (int L = 0; L < nl; L++) {
+                    size_t base = (size_t)L * ctx->kv_max * kvd;
+                    for (int t = 0; t < first_kv; t++) {
+                        if (memcmp(first_k + base + (size_t)t * kvd, ctx->kv_cache_k + base + (size_t)t * kvd,
+                                   (size_t)kvd * sizeof(uint16_t)) != 0) kd2++;
+                        if (memcmp(first_v + base + (size_t)t * kvd, ctx->kv_cache_v + base + (size_t)t * kvd,
+                                   (size_t)kvd * sizeof(uint16_t)) != 0) vd2++;
+                    }
+                }
+                double rel2 = d2 > 0 ? n2 / d2 : n2;
+                int ok2 = (ctx->kv_len == first_kv) && kd2 == 0 && vd2 == 0 && rel2 == 0.0;
+                /* A slice of one token cannot be exact and is not required to be: at M=1
+                 * the shared projection kernels take the matvec path.  The serving rule
+                 * never emits a 1-token slice unless the whole remainder is one token. */
+                int one_row = (S == 1);
+                printf("     ^ vs slice=%d (SLICING ONLY, must be exact): dec_x %.3e  "
+                       "K %ld  V %ld  %s\n",
+                       seq_len, rel2, kd2, vd2,
+                       ok2 ? "PASS" : (one_row ? "EXPECTED-DIFFERENT (M=1 matvec path)" : "FAIL"));
+                if (!ok2 && !one_row) fails++;
+            }
+        }
+        free(embeds); free(ref_dec); free(ref_k); free(ref_v);
+        free(first_dec); free(first_k); free(first_v);
+        printf("%s\n", fails ? "PREFILL-SLICE STATE: FAIL" : "PREFILL-SLICE STATE: PASS");
+        qwen_tts_unload(ctx);
+        return fails ? 1 : 0;
+    }
 
     int compose_from_text = 0;
     if (!compose_spec && !no_compose && text && qwen_compose_has_markup(text)) {
@@ -2824,6 +3125,9 @@ int main(int argc, char **argv) {
             qwen_tts_server_set_max_request_ms(serve_max_request_s * 1000);
         if (serve_max_text_chars > 0)
             qwen_tts_server_set_max_text_chars(serve_max_text_chars);
+        if (serve_prefork <= 1)
+            qwen_topology_emit(0, qwen_get_threads(),
+                               serve_cpu_mask ? serve_cpu_mask : "inherited", "single");
         if (serve_prefork > 1) {
             ret = qwen_tts_serve_prefork(ctx, serve_port, serve_prefork,
                                          serve_prefork_threads, serve_batch);

@@ -46,10 +46,11 @@ for name in ("twin", "matvec"):
     d = json.load(open(f)); rows[name] = d[0] if isinstance(d, list) else d
 if len(rows) < 2:
     print("un braccio non ha prodotto dati"); sys.exit(1)
-print(f"\n{'braccio':<10}{'err':>5}{'Q':>9}{'TTFA p50':>11}{'p95':>9}{'RTF p50':>10}{'p95':>9}")
+print(f"\n{'braccio':<10}{'err':>5}{'Q':>9}{'TTFB p50':>11}{'p95':>9}{'TTFA p50':>11}{'p95':>9}{'RTF p50':>10}{'p95':>9}")
 for n, s in rows.items():
-    print(f"{n:<10}{s['errors']:>5}{s['throughput_Q']:>9.2f}{s['ttfa_p50']:>11.0f}"
-          f"{s['ttfa_p95']:>9.0f}{s['rtf_p50']:>10.2f}{s['rtf_p95']:>9.2f}")
+    print(f"{n:<10}{s['errors']:>5}{s['throughput_Q']:>9.2f}"
+          f"{s.get('ttfb_p50', float('nan')):>11.0f}{s.get('ttfb_p95', float('nan')):>9.0f}"
+          f"{s['ttfa_p50']:>11.0f}{s['ttfa_p95']:>9.0f}{s['rtf_p50']:>10.2f}{s['rtf_p95']:>9.2f}")
 t, m = rows["twin"], rows["matvec"]
 dq = (m["throughput_Q"] / t["throughput_Q"] - 1) * 100 if t["throughput_Q"] else float("nan")
 dr = (m["rtf_p50"] / t["rtf_p50"] - 1) * 100 if t["rtf_p50"] else float("nan")

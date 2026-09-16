@@ -171,6 +171,15 @@ static void kai_ops_parse(void) {
         }
     }
 }
+/* QWEN_KAI_NCHUNK: rows per work chunk of the bf16 GEMM (default 384). One reader, so
+ * the --dispatch-map value and the kernel cannot disagree. */
+static int kai_nchunk(void) {
+    static int nchunk = -1;
+    if (nchunk < 0) { const char *e2 = getenv("QWEN_KAI_NCHUNK"); nchunk = (e2 && *e2) ? atoi(e2) : 384; }
+    return nchunk;
+}
+int qwen_kleidi_nchunk_value(void) { return kai_nchunk(); }
+
 static inline int kai_op_on(int comp, int fam) {
     kai_ops_parse();
     if (comp < 0 || comp >= QWEN_KAI_COMP_N) comp = QWEN_KAI_COMP_TALKER;
@@ -496,6 +505,7 @@ static int kai_lhs_sym_mode(void) {
     }
     return v;
 }
+int qwen_kleidi_lhs_sym(void) { return kai_lhs_sym_mode(); }
 
 static int kai_i8_run_packed(const kai_entry_t *e, float *dst, const void *lhs_packed,
                              size_t dst_stride, int rows, int cols, int B, int gemm) {
@@ -517,6 +527,45 @@ static int kai_i8_run(const kai_entry_t *e, float *dst, const float *lhs,
         : kai_i8_pack_lhs(lhs, lhs_stride, cols, B, gemm);
     if (!lp) return 0;
     return kai_i8_run_packed(e, dst, lp, dst_stride, rows, cols, B, gemm);
+}
+
+/* ---- prepared-state interface for a persistent region --------------------------------
+ * The dispatched KleidiAI int8 call is already two phases: pack the B activations once
+ * (kai_i8_pack_lhs*, weights were packed at registration), then run n-tiles of the GEMM
+ * from that prepared state (kai_i8_task, partitioned by tid/nt).  Only the second phase
+ * was reachable from outside, and only through qwen_parallel, which is what stopped a
+ * held team from running the same work between its own barriers.
+ *
+ * These three entries expose exactly the phases that already exist.  Same pack, same
+ * kernel, same n-tile partition, so the values are the ones the dispatcher produces --
+ * this is not an SMMLA substitution and it changes no arithmetic.  The CP/Talker regions
+ * gather row-major [B][cols] for this interface, and the region leader packs that
+ * activation once into its TLS scratch before the team runs the shared n-tile work.
+ *
+ * Contract: the region leader calls prep, every thread calls run with its tid, and the
+ * caller places a barrier after run before the leader reuses its TLS scratch. */
+int qwen_kleidi_i8_region_usable(const void *key, int rows, int cols, int B) {
+    if (!qwen_kleidi_i8_enabled() || B < 1 || g_kai_bypass) return 0;
+    const kai_entry_t *e = kai_lookup_kind(key, KAI_KIND_I8);
+    if (!e || e->rows != rows || e->cols != cols) return 0;
+    return kai_op_on(e->comp, e->fam);
+}
+
+const void *qwen_kleidi_i8_region_prep(const float *lhs, size_t lhs_stride,
+                                       int cols, int B) {
+    const int gemm = (B > 1);
+    return kai_lhs_sym_mode() ? kai_i8_pack_lhs_sym(lhs, lhs_stride, cols, B, gemm)
+                              : kai_i8_pack_lhs(lhs, lhs_stride, cols, B, gemm);
+}
+
+void qwen_kleidi_i8_region_run(const void *key, float *dst, size_t dst_stride,
+                               const void *lhs_packed, int rows, int cols, int B,
+                               size_t tid, size_t nt) {
+    const kai_entry_t *e = kai_lookup_kind(key, KAI_KIND_I8);
+    if (!e || !lhs_packed || nt == 0) return;
+    kai_i8_job_t job = { e, lhs_packed, dst, (size_t)B, (size_t)rows, (size_t)cols,
+                         dst_stride, (B > 1) };
+    kai_i8_task(tid, nt, &job);
 }
 
 typedef struct {
@@ -573,6 +622,52 @@ static int kai_qkv_fused(void) {
         atomic_store_explicit(&cached, v, memory_order_relaxed);
     }
     return v;
+}
+int qwen_kleidi_qkv_fused_on(void) { return kai_qkv_fused(); }
+
+/* Same two phases for the fused Q/K/V projection the regions use for attention: prep is
+ * shared with the plain entry above (one activation pack feeds all three weights, which is
+ * the whole point of the fused call), and run executes this thread's slice of the combined
+ * n-tile space.  Job layout built exactly as qwen_kleidi_matmul_i8_qkv_native() builds it. */
+int qwen_kleidi_i8_qkv_region_usable(const void *keyq, const void *keyk, const void *keyv,
+                                     int q_rows, int kv_rows, int cols, int B) {
+    if (!qwen_kleidi_i8_enabled() || g_kai_bypass || B < 1) return 0;
+    if (!kai_qkv_fused()) return 0;
+    const kai_entry_t *eq = kai_lookup_kind(keyq, KAI_KIND_I8);
+    const kai_entry_t *ek = kai_lookup_kind(keyk, KAI_KIND_I8);
+    const kai_entry_t *ev = kai_lookup_kind(keyv, KAI_KIND_I8);
+    if (!eq || !ek || !ev) return 0;
+    if (eq->rows != q_rows || ek->rows != kv_rows || ev->rows != kv_rows) return 0;
+    if (eq->cols != cols || ek->cols != cols || ev->cols != cols) return 0;
+    return kai_op_on(eq->comp, eq->fam);
+}
+
+void qwen_kleidi_i8_qkv_region_run(const void *keyq, const void *keyk, const void *keyv,
+                                   float *dq, float *dk, float *dv,
+                                   const void *lhs_packed,
+                                   int q_rows, int kv_rows, int cols, int B,
+                                   size_t tid, size_t nt) {
+    const kai_entry_t *eq = kai_lookup_kind(keyq, KAI_KIND_I8);
+    const kai_entry_t *ek = kai_lookup_kind(keyk, KAI_KIND_I8);
+    const kai_entry_t *ev = kai_lookup_kind(keyv, KAI_KIND_I8);
+    if (!eq || !ek || !ev || !lhs_packed || nt == 0) return;
+    const int gemm = (B > 1);
+    kai_i8_qkv_job_t job;
+    job.e[0] = eq; job.e[1] = ek; job.e[2] = ev;
+    job.dst[0] = dq; job.dst[1] = dk; job.dst[2] = dv;
+    job.dst_stride[0] = (size_t)q_rows  * sizeof(float);
+    job.dst_stride[1] = (size_t)kv_rows * sizeof(float);
+    job.dst_stride[2] = (size_t)kv_rows * sizeof(float);
+    job.n[0] = (size_t)q_rows; job.n[1] = (size_t)kv_rows; job.n[2] = (size_t)kv_rows;
+    job.lhs_packed = lhs_packed;
+    job.m = (size_t)B; job.k = (size_t)cols; job.gemm = gemm;
+    const size_t n_step = gemm ? KI8_GEMM(get_n_step)() : KI8_GEMV(get_n_step)();
+    job.cum[0] = 0;
+    for (int i = 0; i < 3; i++) {
+        job.tiles[i] = (job.n[i] + n_step - 1) / n_step;
+        job.cum[i + 1] = job.cum[i] + job.tiles[i];
+    }
+    kai_i8_qkv_task(tid, nt, &job);
 }
 
 int qwen_kleidi_matmul_i8_qkv_native(float *dq, float *dk, float *dv,
@@ -750,6 +845,28 @@ int qwen_kleidi_register_bf16_fam(const void *key, const uint16_t *W, int rows, 
     return kai_insert_fam(key, rhs, rows, cols, KAI_KIND_BF16, sz, comp, fam);
 }
 
+/* Decoder BF16 copies are owner-scoped and may be torn down before a later model
+ * load reuses their addresses.  Remove only the exact prepared entry; the other
+ * persistent KAI registrations (Q4/I8 and unrelated BF16 owners) stay intact. */
+int qwen_kleidi_unregister_bf16(const void *key) {
+    if (!key) return 0;
+    pthread_mutex_lock(&g_kai_mx);
+    for (int i = 0; i < g_kai_n; i++) {
+        if (g_kai[i].key != key || g_kai[i].kind != KAI_KIND_BF16) continue;
+        free(g_kai[i].rhs);
+        g_kai_bytes -= g_kai[i].bytes;
+        g_kai_bytes_kind[KAI_KIND_BF16] -= g_kai[i].bytes;
+        if (g_kai_n_kind[KAI_KIND_BF16] > 0) g_kai_n_kind[KAI_KIND_BF16]--;
+        memmove(&g_kai[i], &g_kai[i + 1], (size_t)(g_kai_n - i - 1) * sizeof(*g_kai));
+        g_kai_n--;
+        atomic_store_explicit((_Atomic int *)&g_kai_n, g_kai_n, memory_order_release);
+        pthread_mutex_unlock(&g_kai_mx);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_kai_mx);
+    return 0;
+}
+
 typedef struct {
     const kai_entry_t *e;
     const void *lhs_packed;
@@ -844,8 +961,7 @@ static int kai_bf_run(const kai_entry_t *e, float *dst, const float *lhs,
                                                        lhs, lhs_stride, lhs_packed);
     if (tr) { qwen_kbf_pack_ms += kbf_now_ms() - t0; t0 = kbf_now_ms(); }
 
-    static int nchunk = -1;
-    if (nchunk < 0) { const char *e2 = getenv("QWEN_KAI_NCHUNK"); nchunk = (e2 && *e2) ? atoi(e2) : 384; }
+    int nchunk = kai_nchunk();
     kai_bf_job_t job = { e, lhs_packed, dst, (size_t)B, (size_t)rows, (size_t)cols,
                          dst_stride, (size_t)(nchunk > 0 ? nchunk : 0), gemm };
     size_t nt = (size_t)qwen_get_threads();
@@ -918,6 +1034,45 @@ static int kai_bf_run(const kai_entry_t *e, float *dst, const float *lhs,
     return 1;
 }
 
+/* Prepared-state pair for a persistent region: exactly the two phases kai_bf_run already
+ * runs (pack the B activations once, then this thread's n-tiles of the same kernel), so a
+ * held team can run the pre-transformer without dispatching qwen_parallel per projection.
+ * Same pack, same n-tile partition, same values as the dispatched path. */
+int qwen_kleidi_bf16_region_usable(const void *key, int rows, int cols, int B) {
+    if (!qwen_kleidi_bf16_enabled() || B < 1 || g_kai_bypass) return 0;
+    const kai_entry_t *e = kai_lookup_kind(key, KAI_KIND_BF16);
+    if (!e || e->rows != rows || e->cols != cols) return 0;
+    return kai_op_on(e->comp, e->fam);
+}
+const void *qwen_kleidi_bf16_region_prep(const float *lhs, size_t lhs_stride,
+                                         int cols, int B) {
+    if (!qwen_kleidi_bf16_enabled() || g_kai_bypass) return NULL;
+    const int gemm = (B > 1);
+    const size_t mr = gemm ? KBF_GEMM(get_mr)() : KBF_GEMV(get_mr)();
+    const size_t kr = gemm ? KBF_GEMM(get_kr)() : KBF_GEMV(get_kr)();
+    const size_t sr = gemm ? KBF_GEMM(get_sr)() : KBF_GEMV(get_sr)();
+    size_t lhs_sz = gemm
+        ? kai_get_lhs_packed_size_lhs_quant_pack_bf16p8x4_f32_neon((size_t)B, (size_t)cols, mr, kr, sr)
+        : kai_get_lhs_packed_size_lhs_quant_pack_bf16p1x4_f32_neon((size_t)B, (size_t)cols, mr, kr, sr);
+    uint8_t *p = kai_scratch_bflhs(lhs_sz);
+    if (!p) return NULL;
+    if (gemm) kai_run_lhs_quant_pack_bf16p8x4_f32_neon((size_t)B, (size_t)cols, mr, kr, sr, 0,
+                                                       lhs, lhs_stride, p);
+    else      kai_run_lhs_quant_pack_bf16p1x4_f32_neon((size_t)B, (size_t)cols, mr, kr, sr, 0,
+                                                       lhs, lhs_stride, p);
+    return p;
+}
+void qwen_kleidi_bf16_region_run(const void *key, float *dst, size_t dst_stride,
+                                 const void *lhs_packed, int rows, int cols, int B,
+                                 size_t tid, size_t nt) {
+    const kai_entry_t *e = kai_lookup_kind(key, KAI_KIND_BF16);
+    if (!e || !lhs_packed || nt == 0) return;
+    int nchunk = kai_nchunk();
+    kai_bf_job_t job = { e, lhs_packed, dst, (size_t)B, (size_t)rows, (size_t)cols,
+                         dst_stride, (size_t)(nchunk > 0 ? nchunk : 0), (B > 1) };
+    kai_bf_task(tid, nt, &job);
+}
+
 int qwen_kleidi_matmul_bf16_native(float *dst, const void *key, const float *lhs,
                                    size_t lhs_stride, size_t dst_stride,
                                    int rows, int cols, int B) {
@@ -954,9 +1109,20 @@ int qwen_kleidi_matmul_bf16(float *Y, const void *key, const float *X,
 }
 #else
 int qwen_kleidi_bf16_enabled(void) { return 0; }
+int qwen_kleidi_bf16_region_usable(const void *k, int r, int c, int B) {
+    (void)k; (void)r; (void)c; (void)B; return 0;
+}
+const void *qwen_kleidi_bf16_region_prep(const float *l, size_t ls, int c, int B) {
+    (void)l; (void)ls; (void)c; (void)B; return NULL;
+}
+void qwen_kleidi_bf16_region_run(const void *k, float *d, size_t ds, const void *lp,
+                                 int r, int c, int B, size_t tid, size_t nt) {
+    (void)k; (void)d; (void)ds; (void)lp; (void)r; (void)c; (void)B; (void)tid; (void)nt;
+}
 int qwen_kleidi_register_bf16(const void *k, const uint16_t *W, int r, int c) {
     (void)k; (void)W; (void)r; (void)c; return 0;
 }
+int qwen_kleidi_unregister_bf16(const void *k) { (void)k; return 0; }
 int qwen_kleidi_matmul_bf16(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
 }
@@ -990,6 +1156,16 @@ int qwen_kleidi_selfcheck(const void *k, int r, int c, float *a, float *rel) {
 void qwen_kleidi_stats(int *n, size_t *b) { if (n) *n = 0; if (b) *b = 0; }
 int qwen_kleidi_i8_enabled(void) { return 0; }
 int qwen_kleidi_bf16_enabled(void) { return 0; }
+int qwen_kleidi_bf16_region_usable(const void *k, int r, int c, int B) {
+    (void)k; (void)r; (void)c; (void)B; return 0;
+}
+const void *qwen_kleidi_bf16_region_prep(const float *l, size_t ls, int c, int B) {
+    (void)l; (void)ls; (void)c; (void)B; return NULL;
+}
+void qwen_kleidi_bf16_region_run(const void *k, float *d, size_t ds, const void *lp,
+                                 int r, int c, int B, size_t tid, size_t nt) {
+    (void)k; (void)d; (void)ds; (void)lp; (void)r; (void)c; (void)B; (void)tid; (void)nt;
+}
 int qwen_kleidi_register_i8(const void *k, const int8_t *W, const float *s, int r, int c) {
     (void)k; (void)W; (void)s; (void)r; (void)c; return 0;
 }
@@ -1002,8 +1178,31 @@ int qwen_kleidi_register_bf16_fam(const void *k, const uint16_t *W, int r, int c
     (void)k; (void)W; (void)r; (void)c; (void)cm; (void)f; return 0;
 }
 int qwen_kleidi_prefill_enabled(void) { return 0; }
+int qwen_kleidi_nchunk_value(void) { return -1; }
+int qwen_kleidi_lhs_sym(void) { return 0; }
+int qwen_kleidi_qkv_fused_on(void) { return 0; }
 int qwen_kleidi_matmul_i8(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
+}
+int qwen_kleidi_i8_region_usable(const void *k, int r, int c, int B) {
+    (void)k; (void)r; (void)c; (void)B; return 0;
+}
+const void *qwen_kleidi_i8_region_prep(const float *l, size_t ls, int c, int B) {
+    (void)l; (void)ls; (void)c; (void)B; return NULL;
+}
+int qwen_kleidi_i8_qkv_region_usable(const void *a, const void *b, const void *c,
+                                     int q, int kv, int co, int B) {
+    (void)a; (void)b; (void)c; (void)q; (void)kv; (void)co; (void)B; return 0;
+}
+void qwen_kleidi_i8_qkv_region_run(const void *a, const void *b, const void *c,
+                                   float *dq, float *dk, float *dv, const void *lp,
+                                   int q, int kv, int co, int B, size_t tid, size_t nt) {
+    (void)a; (void)b; (void)c; (void)dq; (void)dk; (void)dv; (void)lp;
+    (void)q; (void)kv; (void)co; (void)B; (void)tid; (void)nt;
+}
+void qwen_kleidi_i8_region_run(const void *k, float *d, size_t ds, const void *lp,
+                               int r, int c, int B, size_t tid, size_t nt) {
+    (void)k; (void)d; (void)ds; (void)lp; (void)r; (void)c; (void)B; (void)tid; (void)nt;
 }
 int qwen_kleidi_matmul_i8_native(float *d, const void *k, const float *l, size_t ls,
                                  size_t ds, int r, int c, int B) {
@@ -1023,6 +1222,7 @@ int qwen_kleidi_matmul_i8_qkv(float *q, float *k, float *v, const void *a, const
 int qwen_kleidi_register_bf16(const void *k, const uint16_t *W, int r, int c) {
     (void)k; (void)W; (void)r; (void)c; return 0;
 }
+int qwen_kleidi_unregister_bf16(const void *k) { (void)k; return 0; }
 int qwen_kleidi_matmul_bf16(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
 }
@@ -1035,3 +1235,20 @@ void qwen_kleidi_stats_by_kind(int *a, size_t *b, int *c, size_t *d, int *e, siz
 }
 
 #endif
+
+/* Owner-declared inertness for --effective-config, same contract as qwen_pool_flag_inert().
+ *
+ * KleidiAI is excluded at the MAKEFILE level on non-Arm targets, not with an #if the flag
+ * scanner can see, so every QWEN_KAI_* knob looked reachable everywhere. On a build without
+ * the kernels these parse and steer nothing. */
+const char *qwen_kleidi_flag_inert(const char *flag) {
+#if QWEN_KLEIDI_BUILD
+    (void)flag;
+    return NULL;
+#else
+    if (!flag) return NULL;
+    if (!strncmp(flag, "QWEN_KAI_", 9) || !strcmp(flag, "QWEN_NO_KLEIDI"))
+        return "KleidiAI is not compiled into this build (needs an Arm i8mm target)";
+    return NULL;
+#endif
+}

@@ -25,10 +25,65 @@ void qwen_threadpool_start(int n_threads);
 void qwen_threadpool_stop(void);
 void qwen_pool_stats_report(void);
 
-int qwen_parallel_is_reentrant(void);
+/* Two capability questions the pool must answer honestly, because three callers used to
+ * ask one predicate that meant something different on each backend (on pthread it read the
+ * QWEN_PREFILL_HELPER opt-in, which is a feature flag and not a capability at all).
+ *
+ * nested_dispatch_ok: may a task ALREADY running on the pool call qwen_parallel again?
+ * concurrent_submit_ok: may two independent threads submit to the pool at the same time? */
+int qwen_pool_nested_dispatch_ok(void);
+int qwen_pool_concurrent_submit_ok(void);
+/* Does qwen_parallel_set_low_until() actually deprioritise a submitter on this backend, or
+ * is it a no-op?  A knob that silently does nothing is worse than one that says so. */
+int qwen_pool_priority_ok(void);
+/* 1 while the calling thread is executing a chunk of a qwen_parallel region (worker or
+ * caller).  A nested dispatch from there would deadlock on the pool's single job slot, so
+ * code that may run in both contexts asks this and runs its work inline when set. */
+int qwen_parallel_active(void);
+/* Dispatch priority.  A thread whose deadline is in the future submits LOW: its dispatch
+ * waits while a normal (HIGH) submitter has dispatched within the last window, so LOW work
+ * only fills the pool's idle windows between the frame loop's own dispatches.  Past the
+ * deadline the thread is ordinary again, which bounds how long LOW work can be starved.
+ * until_ms is CLOCK_MONOTONIC milliseconds (qwen_parallel_now_ms); 0 = HIGH (default). */
+void   qwen_parallel_set_low_until(double until_ms);
+double qwen_parallel_now_ms(void);
+
+/* Persistent parallel regions.  qwen_parallel_team() is the number of threads that take
+ * part in a dispatch of exactly that many chunks (the caller plus every pool worker), so a
+ * region dispatched with nt == team can keep the whole team inside one task and separate
+ * dependent phases with qwen_barrier_wait instead of leaving and re-dispatching.  A team
+ * of 1 means the pool cannot promise that and the caller must use plain dispatches. */
+int qwen_parallel_team(void);
+
+/* Decoder lane (QWEN_SD_LANE_SPLIT=N): the worker's cpu mask is split into a STEP part
+ * (engine pool: Talker, CP, prefill) and a DECODER part (a private team that never touches
+ * the engine pool or its submit lock).  Prepare BEFORE the engine pool is created; the
+ * calling thread is confined to the STEP cpus so the pool inherits them.  Linux only;
+ * elsewhere prepare returns 0 and nothing changes. */
+int  qwen_lane_split_prepare(int *engine_threads);      /* 1 = split active, *engine_threads = STEP cpus */
+int  qwen_lane_team_start(void);                        /* creates the pinned decoder team; returns its size or 0 */
+void qwen_lane_team_stop(void);
+int  qwen_lane_team_size(void);                         /* 0 when there is no lane */
+void qwen_lane_thread_join(void);                       /* the decoder thread: pin to the DECODER cpus, mark TLS */
+int  qwen_lane_thread_here(void);                       /* 1 on the decoder thread or a lane worker */
+void qwen_lane_masks(const char **step, const char **dec);
+/* Elastic lane (QWEN_SD_LANE_ELASTIC=1 with QWEN_SD_LANE_SPLIT=N): the engine pool keeps
+ * every cpu of the worker, its workers are pinned one per cpu, and while a decoder unit is
+ * in flight the pool's dispatch WIDTH is capped so that only the STEP cpus take engine work;
+ * the lane team on the DECODER cpus runs the unit.  When the decoder queue drains the width
+ * returns to the full team.  Regions re-read qwen_parallel_team() per frame, so they follow. */
+int  qwen_lane_elastic(void);                           /* 1 when the elastic mode was prepared */
+void qwen_pool_set_width(int width);                    /* 0 = full team; N = at most N participants (caller + N-1 workers) */
+int  qwen_pool_width(void);
+void qwen_lane_unit_active(int on);                     /* decoder thread: a unit is running (lane workers stay hot) */
+typedef struct { volatile int arrived; volatile int phase; int nt; } qwen_barrier_t;
+void qwen_barrier_init(qwen_barrier_t *b, int nt);
+void qwen_barrier_wait(qwen_barrier_t *b);
 
 #ifdef __cplusplus
 }
 #endif
+
+const char *qwen_pool_flag_inert(const char *flag);
 
 #endif

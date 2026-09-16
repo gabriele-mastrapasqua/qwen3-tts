@@ -7,6 +7,7 @@
 !tests/golden/*.wav
 *.py
 !tests/*.py
+!tools/*.py
 qwen_tts
 qwen_tts_py/
 venv/
@@ -21,6 +22,13 @@ tools/para/.venv/
 # wildcard: '*.py' is ignored by default here, and a tool that lands in tools/ without an
 # entry is silently absent from the repository while looking present on disk.
 !tools/perf_profile.py
+!tools/dispatch_gate.py
+!tools/profile_check.py
+!tools/costmap_report.py
+!tools/topology.py
+!tools/roofs.py
+!tools/topology_report.py
+!tools/envelope_report.py
 !tools/wav_qc.py
 !tools/onset_report.py
 # No trailing slash: these may be symlinks rather than real directories.
@@ -83,14 +91,30 @@ tests/test_ingot_parity
 
 # Local working material.
 /private/
+# make cpu-check / profile-cpu artifacts (one dir per run, promoted by hand into docs/).
+/profiles/
+# generated build identity (tools/source_fingerprint.sh -> Makefile -> the binary)
+/qwen_build_id.h
+/qwen_build_id.h.tmp
+/.source_fingerprint
 
-# Local-only working notes.
-/CLAUDE.md
-/AGENTS.md
-/PLAN.md
+# Local-only working notes.  PLAN.md, CLAUDE.md, AGENTS.md and the reviewed .work/*.md
+# addenda are TRACKED control plane, see ENGINEERING.md §2.
 /plan_*.md
 /TODO.md
 
 # Local listening/experiment notes that land under samples/.
 samples/*.md
 samples/ingot_v101_check/
+
+# Per-task working addenda (ENGINEERING.md §2): the public-safe *.md notes are tracked one
+# reviewed file at a time; the raw evidence they summarise never is.
+/.work/evidence/
+/.work/private/
+/.work/**/*.json
+/.work/**/*.csv
+/.work/**/*.log
+/.work/**/*.txt
+
+# make flag stamp: rewritten when SIMD/ARCH_FLAGS change
+/.build_state/

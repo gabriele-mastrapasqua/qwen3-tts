@@ -100,16 +100,17 @@ import csv, json, sys, glob, os
 out, arm, streams = sys.argv[1], sys.argv[2], int(sys.argv[3])
 pss, used = int(sys.argv[4]), int(sys.argv[5])
 
-ttfa = []
+ttfa, ttfb = [], []
 for f in sorted(glob.glob(os.path.join(out, arm + "_c*.csv"))):
     with open(f, newline="", encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
-            v = r.get("ttfa_ms", "")
-            if v not in ("", None):
-                try:
-                    ttfa.append(float(v))
-                except ValueError:
-                    pass
+            for key, dst in (("ttfa_ms", ttfa), ("ttfb_ms", ttfb)):
+                v = r.get(key, "")
+                if v not in ("", None):
+                    try:
+                        dst.append(float(v))
+                    except ValueError:
+                        pass
 audio = wall = 0.0
 for f in sorted(glob.glob(os.path.join(out, arm + "_c*.json"))):
     d = json.load(open(f))
@@ -117,7 +118,7 @@ for f in sorted(glob.glob(os.path.join(out, arm + "_c*.json"))):
         if isinstance(lvl, dict):
             audio += lvl.get("audio_s", 0.0)
             wall = max(wall, lvl.get("wall_s", 0.0))
-ttfa.sort()
+ttfa.sort(); ttfb.sort()
 
 def pct(v, q):
     if not v:
@@ -125,8 +126,8 @@ def pct(v, q):
     return v[min(len(v) - 1, int(round(q * (len(v) - 1))))]
 
 qq = audio / wall if wall else float("nan")
-print("  %-6s TTFA p50 %6.0f ms . p95 %6.0f ms . samples %2d . Q %.2f . PSS %d MB . system %d MB"
-      % (arm, pct(ttfa, 0.5), pct(ttfa, 0.95), len(ttfa), qq, pss, used))
+print("  %-6s TTFB p50 %6.0f ms . p95 %6.0f ms . TTFA p50 %6.0f ms . p95 %6.0f ms . samples %2d . Q %.2f . PSS %d MB . system %d MB"
+      % (arm, pct(ttfb, 0.5), pct(ttfb, 0.95), pct(ttfa, 0.5), pct(ttfa, 0.95), len(ttfa), qq, pss, used))
 PYEOF
 }
 

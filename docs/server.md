@@ -4,6 +4,13 @@
 > finding the `W x K` topology for a given box before quoting anything from it, the deployment
 > profile, the benchmark suite and what its numbers mean — see
 > [`serving-operations.md`](serving-operations.md).
+>
+> **The endpoints and the streaming contract on this page are backend-independent.** Everything
+> operational below assumes the CPU backend, which is the qualified one. The same server also runs
+> on `--backend cuda`, with different sizing, different flags and a different maturity level
+> (implemented and runtime-verified, not performance-qualified) — see
+> [`cuda-performance.md` § CUDA streaming server](cuda-performance.md). Do not carry a number
+> between the two.
 
 
 The built-in HTTP server loads the model once at startup and keeps weights in memory
@@ -131,6 +138,18 @@ curl -s http://localhost:8080/v1/speakers | python3 -m json.tool
 curl -s http://localhost:8080/v1/health
 ```
 
+`200` with `"status":"ok"` means the server can take work; `503` with
+`"status":"unavailable"` means it cannot, and only a **batched** server can say so — its
+scheduler thread is the part that can die under it. `mode` says which server answered:
+
+| mode | `scheduler` | when |
+|---|---|---|
+| `single` | `none` | the plain server (`--serve` without `--batch-size`). There is no scheduler to report, and its absence is not a fault |
+| `batched` | `running` / `down` | `--batch-size N`. `down` before the scheduler has come up, and after it has failed — the one case where health answers `503` |
+
+The counters (`admitted`, `done`, `rejected_queue_full`, `rejected_queue_timeout`, `timed_out`)
+are cumulative for the life of the process, and with `--prefork` each worker keeps its own.
+
 ## Request Body
 
 ```json
@@ -171,6 +190,79 @@ top-k/p, rep-penalty, seed) **and clears any prior emotion steering**, so nothin
 > `ctx->dec_x` left over on a full-prefix match; the fix forces a fresh prefill in that case (the
 > partial-match delta-prefill optimization is preserved). Regression-guarded by `make test-serve-repro`
 > (3 identical requests, bit-identical) and `make test-serve-concurrent` (per-worker clones, corr=1.0).
+
+## Limits, validation and errors
+
+Every POST goes through the same two functions — one precheck on the HTTP envelope, one parse of
+the JSON body — so `/v1/tts`, `/v1/tts/stream` and `/v1/audio/speech` answer identically, and so
+do the plain server and the batched one (`--batch-size`, `--prefork`). A client can be written
+against one table.
+
+| status | when |
+|---|---|
+| `400` | body is not a JSON object, malformed JSON, nesting deeper than 16, a number longer than 40 characters, an **unknown field**, `text` missing or empty, `text` over the length limit, `speed` outside 0.25–4.0, an unknown speaker, `voice_design` on a model that has none |
+| `405` | right path, wrong method — `GET /v1/tts` |
+| `413` | request body larger than the read buffer, refused from the `Content-Length` before the body is read |
+| `415` | a `Content-Type` other than `application/json`: no form data, no multipart, no file upload |
+| `503` | queue full at admission, or a queued request that waited past `--queue-timeout-ms` |
+
+Errors carry an OpenAI-shaped body, and the message says which bound was hit rather than that one
+was:
+
+```json
+{"error":{"message":"unknown field 'voise' - this server implements: text, speaker, language, seed, temperature, top_k, top_p, rep_penalty, instruct, emotion, volume, rate","type":"invalid_request_error","param":null,"code":null}}
+```
+
+An unknown field is **rejected, not ignored**: a typo'd `"voise"` that is silently dropped
+produces a perfectly successful request in the wrong voice, and nothing in the response says so.
+Parameters that have a sensible range are clamped instead of refused — `temperature` to 0–2,
+`top_p` to 0–1, `top_k` to the codec vocabulary, `rep_penalty` to 0.5–2 — because a value out of
+range there has an obvious intent, while an unknown key does not.
+
+### The input-length limit is derived, not a constant
+
+`8192` characters is the compiled ceiling, not the answer. The effective limit is the smaller of
+what a batch slot's prompt budget holds (`QWEN_BATCH_MAX_PROMPT × 3.5` characters, so 1792 at the
+default 512) and what the server can finish inside its per-request cap
+(`--max-request-seconds × 30` characters per second, so 1800 at the default 60 s), floored at 200
+so a tight cap cannot make the server refuse ordinary sentences. A request that could not have
+finished is refused at the door, with a message naming the bound it hit, instead of being killed
+at minute two with a slot already spent:
+
+```json
+{"error":{"message":"text too long: 2000 characters, maximum 1792 - a longer prompt does not fit a batch slot's 512-token budget (QWEN_BATCH_MAX_PROMPT)","type":"invalid_request_error","param":null,"code":null}}
+```
+
+Both ends are configurable — `--max-request-seconds N` / `QWEN_MAX_REQUEST_S` (default 60, `0`
+disables the cap) and `--max-text-chars N` / `QWEN_MAX_TEXT_CHARS` — and the server prints the
+effective pair at startup, so a log can be audited after the fact:
+
+```
+[serve] per-request generation cap: 60 s -> text limit 1792 characters, frame cap 750 = 60.0 s of audio (from --max-request-seconds); a request that reaches the frame cap is TRUNCATED and logged (--max-request-seconds N / --max-text-chars N; 0 disables the text cap)
+```
+
+The seconds bound the generation as well as the text: the batched engine stops a request at
+`--max-request-seconds × 12.5` codec frames (`QWEN_BATCH_MAX_FRAMES` overrides it, and a
+too-large value is clamped to the RoPE cache). Reaching that cap is **not** an end-of-speech:
+the audio ends where the model was cut. The server says so rather than letting the stream look
+complete — one `[serve] WARNING: request TRUNCATED after N frames (S s of audio)` line per
+request on stderr, and `truncated=1` in the `[REQ]` trace when `QWEN_REQ_TRACE` is on. Until
+2026-09-08 this cap was a silent 600 frames (48 s) regardless of `--max-request-seconds`, so a
+long prompt admitted under the 60 s text limit came back truncated with no trace at all.
+
+`GET /v1/health` reports the same numbers live, which is how a client discovers the limits it is
+subject to instead of hard-coding them:
+
+```json
+{"status":"ok","mode":"batched","scheduler":"running","num_requests_running":0,
+ "num_requests_waiting":0,"queue_max":1,"queue_timeout_ms":0,"max_request_ms":60000,
+ "max_text_chars":1792,"admitted":12,"done":12,"rejected_queue_full":0,
+ "rejected_queue_timeout":0,"timed_out":0}
+```
+
+A deployment profile records the same two knobs, so what a machine was qualified with travels
+with it: see [`configs/perf/README.md`](../configs/perf/README.md) and
+[`serving-operations.md`](serving-operations.md).
 
 ## Performance
 

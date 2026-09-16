@@ -53,23 +53,27 @@ def _read(p):
         return ""
 
 def one_request(port, results, lock):
-    """POST to /v1/tts/stream and time the FIRST BYTE. On the streaming endpoint that
-    is the first-audio instant, which is what TTFA means; the total is what RTF needs."""
+    """POST to /v1/tts/stream and time both the first byte of the HTTP response (TTFB:
+    urlopen returns once the status line + headers are in) and the first audio chunk
+    (TTFA). On this server the 200 header travels with the first chunk, so the two agree
+    today; they are kept apart because TTFB is the number other TTS servers quote."""
     body = json.dumps({"text": TEXT, "speaker": "ryan", "language": "English",
                        "seed": 42}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/tts/stream", data=body,
                                  headers={"Content-Type": "application/json"})
     t0 = time.time()
     ttfb = None
+    ttfa = None
     n = 0
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
+            ttfb = time.time() - t0
             while True:
                 chunk = r.read1(65536)
                 if not chunk:
                     break
-                if ttfb is None:
-                    ttfb = time.time() - t0
+                if ttfa is None:
+                    ttfa = time.time() - t0
                 n += len(chunk)
     except Exception as e:
         with lock:
@@ -78,7 +82,7 @@ def one_request(port, results, lock):
     total = time.time() - t0
     secs = n / 2.0 / 24000.0
     with lock:
-        results.append({"ttfa": ttfb, "total": total, "bytes": n, "audio_s": secs,
+        results.append({"ttfb": ttfb, "ttfa": ttfa, "total": total, "bytes": n, "audio_s": secs,
                         "rtf": total / secs if secs > 0 else float("nan")})
 
 def parse_server_log(txt):
@@ -177,6 +181,8 @@ def cell(args, kai_on, conc, port):
         "tag": tag, "kai": kai_on, "conc": conc,
         "n_ok": len(ok), "n_err": len(errs), "err_sample": errs[0]["err"] if errs else "",
         "wall_s": wall, "req_s": len(ok) / wall if wall > 0 else 0,
+        "ttfb_p50": pct([r["ttfb"] for r in ok if r.get("ttfb")], 0.50),
+        "ttfb_p95": pct([r["ttfb"] for r in ok if r.get("ttfb")], 0.95),
         "ttfa_p50": pct([r["ttfa"] for r in ok if r["ttfa"]], 0.50),
         "ttfa_p95": pct([r["ttfa"] for r in ok if r["ttfa"]], 0.95),
         "rtf_p50": pct([r["rtf"] for r in ok], 0.50),
@@ -221,7 +227,7 @@ def main():
             port += 1
             json.dump(rows, open(os.path.join(a.out, "matrix.json"), "w"), indent=1)
 
-    hdr = (f"{'cell':<10}{'req/s':>7}{'TTFA50':>8}{'TTFA95':>8}{'RTF50':>7}{'RTF95':>7}"
+    hdr = (f"{'cell':<10}{'req/s':>7}{'TTFB50':>8}{'TTFB95':>8}{'TTFA50':>8}{'TTFA95':>8}{'RTF50':>7}{'RTF95':>7}"
            f"{'tk ms/f':>9}{'cp ms/f':>9}{'B':>6}{'GEMM%':>7}{'csw/s':>9}{'CPU':>6}"
            f"{'migr':>7}{'RSS MB':>8}")
     print("\n" + hdr); print("-" * len(hdr))
@@ -229,7 +235,8 @@ def main():
         if "error" in r:
             print(f"{r['tag']:<10} ERROR {r['error']}"); continue
         f = lambda k, d=0.0: (r.get(k) if r.get(k) is not None else d)
-        print(f"{r['tag']:<10}{f('req_s'):>7.2f}{f('ttfa_p50'):>8.2f}{f('ttfa_p95'):>8.2f}"
+        print(f"{r['tag']:<10}{f('req_s'):>7.2f}{f('ttfb_p50'):>8.2f}{f('ttfb_p95'):>8.2f}"
+              f"{f('ttfa_p50'):>8.2f}{f('ttfa_p95'):>8.2f}"
               f"{f('rtf_p50'):>7.2f}{f('rtf_p95'):>7.2f}{f('talker_msf'):>9.2f}"
               f"{f('cp_msf'):>9.2f}{f('mean_slots'):>6.2f}{f('gemm_pct'):>7.1f}"
               f"{f('csw_s'):>9.0f}{f('cpu_util'):>6.1f}{f('migr'):>7.0f}{f('rss_mb'):>8.0f}")

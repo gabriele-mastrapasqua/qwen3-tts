@@ -1,6 +1,9 @@
 /* qwen_tts_kernels.c - Kernel implementations */
 
 #include <pthread.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_kleidi.h"
 #include "qwen_tts_q8repack.h"
@@ -11,6 +14,7 @@
     } while (0)
 
 #include "qwen_tts_thread.h"
+#include "qwen_tts_costmap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +42,10 @@
 #include <sys/syscall.h>
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
+static int qwen_x86_nchunk(int mmk, int B);
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -63,11 +71,64 @@ void qwen_ftz_on(void) {
 static int g_n_threads = 1;
 #if defined(__GNUC__) && !defined(__APPLE__)
 extern void openblas_set_num_threads(int) __attribute__((weak));
+extern int  openblas_get_num_threads(void) __attribute__((weak));
 #endif
+
+static int g_blas_own = -1;   /* -1 = not decided: env, else the default set by the server */
+int qwen_blas_own_get(void) {
+    if (g_blas_own < 0) { const char *e = getenv("QWEN_BLAS_OWN"); g_blas_own = (e && e[0] == '1') ? 1 : 0; }
+    return g_blas_own;
+}
+void qwen_blas_own(int on) {
+    /* A default from the server; an explicit QWEN_BLAS_OWN in the environment wins. */
+    if (!getenv("QWEN_BLAS_OWN")) g_blas_own = on ? 1 : 0;
+    qwen_blas_set_threads(g_n_threads);
+}
+/* Owning the BLAS is a CLAIM; this is the fact.  qwen_blas_set_threads() below is compiled
+ * out where the vendor BLAS has no thread control (Accelerate, or a build without the
+ * OpenBLAS symbol), so there "own" never caps anything and slicing the SGEMM across the
+ * engine pool would run on top of the BLAS's own team instead of replacing it. */
+int qwen_blas_own_effective(void) {
+#if defined(__GNUC__) && !defined(__APPLE__)
+    /* An OPENBLAS_NUM_THREADS in the environment used to mean "we are not really in control",
+     * which was true while qwen_blas_set_threads() returned early on seeing it.  It no longer
+     * does: ownership overrides the variable and holds BLAS at one thread, so counting the env
+     * as a loss of control made this report the opposite of what the engine was doing. */
+    return qwen_blas_own_get() && openblas_set_num_threads != NULL;
+#else
+    return 0;
+#endif
+}
+int qwen_blas_threads_now(void) {
+#if defined(__GNUC__) && !defined(__APPLE__)
+    return openblas_get_num_threads ? openblas_get_num_threads() : -1;
+#else
+    return -1;
+#endif
+}
+
+/* Set when an OPENBLAS_NUM_THREADS in the environment was overridden because the engine owns
+ * the budget, so --effective-config can say so instead of leaving it to be discovered. */
+static atomic_int g_blas_env_overridden;
+int qwen_blas_env_overridden(void) {
+    return atomic_load_explicit(&g_blas_env_overridden, memory_order_relaxed);
+}
 
 void qwen_blas_set_threads(int n) {
 #if defined(__GNUC__) && !defined(__APPLE__)
-    if (getenv("OPENBLAS_NUM_THREADS")) return;
+    const char *env = getenv("OPENBLAS_NUM_THREADS");
+    if (qwen_blas_own_get()) {
+        /* Engine ownership is structural, not advisory.  This used to RETURN when the variable
+         * was present, so an exported OPENBLAS_NUM_THREADS silently left OpenBLAS with its own
+         * compute team while the engine believed it owned the budget -- two schedulers in one
+         * process, decided by whether someone remembered a variable.  The engine now wins and
+         * the override is reported. */
+        if (env && *env && atoi(env) != 1)
+            atomic_store_explicit(&g_blas_env_overridden, 1, memory_order_relaxed);
+        if (openblas_set_num_threads) openblas_set_num_threads(1);
+        return;
+    }
+    if (env) return;                  /* not owned: an explicit control experiment may set it */
     if (openblas_set_num_threads) openblas_set_num_threads(n > 0 ? n : 1);
 #else
     (void)n;
@@ -187,6 +248,18 @@ int qwen_amx_bf16_available(void) {
 #endif
 }
 
+int qwen_amx_int8_available(void) {
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    return qwen_amx_int8_ready();
+#else
+    return 0;
+#endif
+}
+
+#if !defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+int qwen_arm_bfdot_on(void) { return 0; }
+#endif
+
 int qwen_arm_bf16_matmat_available(void) {
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) && !defined(__APPLE__)
     const char *e = getenv("QWEN_NO_BFMMLA");
@@ -196,32 +269,105 @@ int qwen_arm_bf16_matmat_available(void) {
 #endif
 }
 
+/* AVX-512 BF16 without AMX still has a real batched bf16 matmat
+ * (QWEN_MMK_BF16_AVX512, VDPBF16PS).  Without this the prefill default fell back
+ * to converting every weight matrix to f32 and calling SGEMM, which is ~3x the
+ * memory traffic on the TTFA critical path. */
+int qwen_avx512_bf16_matmat_available(void) {
+#if defined(__AVX512BF16__)
+    if (!__builtin_cpu_supports("avx512bf16")) return 0;
+    const char *e = getenv("QWEN_NO_BF16_MATMUL");
+    return !(e && e[0] == '1');
+#else
+    return 0;
+#endif
+}
+
+#include "qwen_build_id.h"
 #ifndef QWEN_GIT_REV
-#define QWEN_GIT_REV "unknown"
+#define QWEN_GIT_REV QWEN_BUILD_GIT_REV
+#endif
+#ifndef QWEN_SOURCE_FP
+#define QWEN_SOURCE_FP QWEN_BUILD_SOURCE_FP
 #endif
 #ifndef QWEN_SIMD_PROFILE
 #define QWEN_SIMD_PROFILE "unknown"
 #endif
 
 static const char *const g_qwen_reported_flags[] = {
-    "QWEN_SD_INT8", "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_DECODER_BATCH",
-    "QWEN_DECODER_THREAD", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
-    "QWEN_NO_AMX", "QWEN_NO_VNNI", "QWEN_NO_SDOT", "QWEN_NO_BF16DOT",
-    "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_TTFA_PRIORITY",
-    "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN",
-    "QWEN_AMX_MIN_B", "QWEN_VNNI_MIN_B", "QWEN_BATCH_STATS", "QWEN_THP", "QWEN_POOL_SPIN",
-    "QWEN_ARM_BFDOT",
-    "QWEN_TTFA_TRACE", "QWEN_PREFIX_CACHE", "QWEN_SD_PHASE", "QWEN_LIFE_TRACE",
-    "QWEN_REQ_TRACE", "QWEN_ADMIT_M1", "QWEN_KAI_OPS", "QWEN_SERVE_PROFILE",
-    "QWEN_CP_Q2_FFN", "QWEN_CP_PREC", "QWEN_ICL_FRAMES", "QWEN_KAI_NCHUNK",
-    "QWEN_KAI_REPEAT", "QWEN_TF_CODES", "QWEN_TF_PREFIX",
+    /* kernel dispatch — which GEMM, dot or conv actually runs */
+    "QWEN_NO_AMX", "QWEN_NO_AMX_BF16", "QWEN_NO_AMX_INT8", "QWEN_NO_AMX_Q4", "QWEN_NO_VNNI",
+    "QWEN_NO_VNNI_TILE", "QWEN_NO_VNNI_QKV", "QWEN_NO_X86_QKV", "QWEN_NO_VNNI_ROWSUM",
+    "QWEN_NO_VNNI_ACT_QUANT", "QWEN_VNNI_PREPACK", "QWEN_VNNI_TILE_N8",
+    "QWEN_VNNI_TILE_M4N2", "QWEN_VNNI_GEMV_MR", "QWEN_VNNI_UACT",
+    "QWEN_PREFILL_ROWPACK", "QWEN_PREFILL_QKV_SHARE",
+    "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_AMX_PREPACK_KINDS", "QWEN_AMX_B32", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
+    "QWEN_NO_BF16_MATMUL", "QWEN_NO_SDOT", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA", "QWEN_ARM_BFDOT",
+    "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
+    "QWEN_Q6_SCALAR", "QWEN_Q8_SCALAR_ACT", "QWEN_NO_SIMD_QUANT", "QWEN_NO_Q8REPACK", "QWEN_NO_SIN_POLY",
+    "QWEN_AVX2_INT8_GEMV", "QWEN_AVX2_Q4_GEMV",
+    /* kernel gates and tiling — when a kernel may run, and how it tiles */
+    "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B", "QWEN_AMX_MIN_ROWS",
+    "QWEN_AMX_BF16_MIN_COLS", "QWEN_AMX_INT8_MIN_COLS", "QWEN_AMX_Q4_MIN_COLS",
+    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_AMX_INT8_MIN_ROWS_PER_THREAD", "QWEN_VNNI_MIN_B",
+    "QWEN_AVX2MM_MIN_B", "QWEN_BF16_MATMUL_MIN_B", "QWEN_BFMMLA_MIN_B", "QWEN_SMMLA_MIN_B",
+    "QWEN_INT8_SDOT_MIN_B", "QWEN_KLEIDI_MIN_B", "QWEN_X86_NCHUNK", "QWEN_AMX_NCHUNK",
+    "QWEN_VNNI_NCHUNK", "QWEN_AVX512_NCHUNK", "QWEN_KAI_NCHUNK",
+    /* ARM KleidiAI */
+    "QWEN_NO_KLEIDI", "QWEN_NO_KAI_BF16", "QWEN_NO_KAI_I8", "QWEN_KAI_OPS", "QWEN_KAI_QKV_FUSED",
+    "QWEN_KAI_LHS", "QWEN_KAI_REPEAT",
+    /* prefill */
+    "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_PREFILL_HELPER", "QWEN_GGUF_QUANT_PREFILL",
+    "QWEN_PREFILL_SLICE",
+    "QWEN_PREFIX_CACHE", "QWEN_TTS_STREAM_LAYOUT",
+    /* code predictor */
+    "QWEN_CP_PREC", "QWEN_CP_LAYER_PREC", "QWEN_CP_LMHEAD_PREC", "QWEN_CP_PREFILL2",
+    "QWEN_CP_Q2_FFN",
+    /* speech decoder and streaming */
+    "QWEN_SD_INT8", "QWEN_SD_AMX", "QWEN_SD_AMX_D", "QWEN_SD_AMX_BF16", "QWEN_SD_BF16_PREUP", "QWEN_SD_STREAM_STRIP", "QWEN_SD_DIRECT_CONVT", "QWEN_SD_DIRECT_DWCONV", "QWEN_SD_DIRECT_INPUT", "QWEN_SD_FUSED_RESIDUAL", "QWEN_SD_INT8_BLK", "QWEN_SD_CONV_NC", "QWEN_SD_RAG_MIN_PANELS", "QWEN_SD_THREADS", "QWEN_SD_WINDOWED", "QWEN_SD_PHASE", "QWEN_SD_RAG_STATS",
+    "QWEN_SD_POOL", "QWEN_BLAS_OWN", "QWEN_SD_SGEMM_CENSUS", "QWEN_PREFILL_LOW_MS", "QWEN_POOL_HI_WINDOW_US", "QWEN_CP_REGION", "QWEN_CP_BATCH_HEAD", "QWEN_CP_FRAME_REGION", "QWEN_TK_REGION", "QWEN_PREFILL_INT8MM", "QWEN_PREFILL_CHUNK", "QWEN_SD_SCRATCH_STATS",
+    "QWEN_STREAM_DECODE_CHUNK", "QWEN_STREAM_DECODE_CHUNK_BUSY", "QWEN_DECODER_BATCH",
+    "QWEN_DECODER_THREAD", "QWEN_DEC_LIFECYCLE_TRACE", "QWEN_DECODER_GANG_LEAD", "QWEN_DECODER_GANG_MIN", "QWEN_SD_LANE_SPLIT", "QWEN_SD_LANE_ELASTIC", "QWEN_SD_LANE_SUBQ", "QWEN_SD_LANE_NONBLOCK", "QWEN_SD_SCHED", "QWEN_SD_MULTISLOT", "QWEN_SD_COHORT_MAX_B", "QWEN_SD_NTA", "QWEN_SD_RES1_V2", "QWEN_SD_GLUE", "QWEN_SD_CONVT_STACK", "QWEN_SD_CNEXT_I8", "QWEN_SD_CONVT_I8",
+    "QWEN_DEC_FIRSTCHUNK_GROUP", "QWEN_SERVER_NO_DECODER_BATCH",
+    /* server, admission and request batching */
+    "QWEN_ADMIT_M1", "QWEN_SERVE_BLAS", "QWEN_SERVE_BLAS_BUSY", "QWEN_SERVER_STRICT",
+    "QWEN_QUEUE_PREFILL", "QWEN_QUEUE_UNBOUNDED", "QWEN_MAX_REQUEST_S", "QWEN_MAX_TEXT_CHARS",
+    "QWEN_CANCEL_ON_DISCONNECT", "QWEN_PREFORK_ELASTIC", "QWEN_TTFA_PRIORITY",
+    "QWEN_TTFA_PRIO_STRICT", "QWEN_TTFA_FREEZE_CAP", "QWEN_BATCH_B", "QWEN_BATCH_SEQ",
+    "QWEN_BATCH_TALKER", "QWEN_BATCH_DECODER", "QWEN_BATCH_FORCE_MATVEC", "QWEN_BATCH_MAX_FRAMES",
+    "QWEN_BATCH_MAX_PROMPT", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
+    "QWEN_SERVER_ASYNC_OUTPUT", "QWEN_STREAM_OUTPUT_MAX_BYTES",
+    "QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS",
+    "QWEN_STREAM_LEAD_GATE", "QWEN_STREAM_LEAD_TARGET_MS",
+    "QWEN_ADMIT_UTIL", "QWEN_ADMIT_UTIL_LIMIT_MS", "QWEN_ADMIT_UTIL_TRACE",
+    /* threading, pool and memory */
+    "QWEN_POOL_SPIN", "QWEN_POOL_NARROW", "QWEN_THREADS_TALKER", "QWEN_THREADS_DECODER",
+    "QWEN_BLAS_GEN_THREADS", "QWEN_THP", "QWEN_NO_OVERLAP", "QWEN_NO_AMORT", "QWEN_AMORT_CPU",
+    "QWEN_NO_PREWARM", "QWEN_FREE_BF16",
+    /* precision, voice and conditioning */
+    "QWEN_TALKER_PREC", "QWEN_TALKER_MIXED_INT6", "QWEN_ICL_FRAMES", "QWEN_ICL_TRIM_FRAMES",
+    "QWEN_NO_REF_TRIM", "QWEN_SPK_SCALE", "QWEN_GRAFT_NO_WOVR", "QWEN_ACT_MAP",
+    "QWEN_FFN_SPARSITY", "QWEN_TF_CODES", "QWEN_TF_PREFIX", "QWEN_TF_CB_KEEP",
+    /* GPU backends */
+    "QWEN_CUDA_BATCH", "QWEN_CUDA_CONVDEC", "QWEN_CUDA_DECODER", "QWEN_CUDA_FUSED_TALKER",
+    "QWEN_CUDA_TF32", "QWEN_CUDA_VERBOSE", "QWEN_CUDA_BATCH_COMPACT", "QWEN_CP_PROFILE",
+    "QWEN_CUDA_BATCH_GRAPH", "QWEN_CUDA_CP_HEAD", "QWEN_CUDA_MM_UNROLL", "QWEN_CUDA_CUBLAS", "QWEN_CUDA_MM_TPB", "QWEN_CUDA_SEAM_STATS", "QWEN_CUDA_TC",
+    "QWEN_CUDA_DP4A", "QWEN_DEC_NAIVE7", "QWEN_DEC_NAIVET",
+    "QWEN_METAL_BATCH", "QWEN_METAL_BATCH_NOCP", "QWEN_METAL_BATCH_MMA", "QWEN_METAL_CP_NOSYNC",
+    "QWEN_METAL_CP_PERPASS", "QWEN_METAL_FUSED_TALKER", "QWEN_METAL_PROFILE", "QWEN_METAL_Q4_VEC",
+    /* diagnostics — never in a run that produces a number */
+    "QWEN_BATCH_STATS", "QWEN_SHAPE_CENSUS", "QWEN_SERVE_PROFILE", "QWEN_STAGE_TRACE", "QWEN_TTFA_TRACE",
+    "QWEN_LIFE_TRACE", "QWEN_REQ_TRACE", "QWEN_KERNEL_TIMING", "QWEN_VNNI_PHASE_TIMING", "QWEN_DUMP_CODE0", "QWEN_DUMP_CODES", "QWEN_EXPR_DEBUG",
+    "QWEN_SD_DEBUG", "QWEN_SPK_DEBUG", "QWEN_TUNE_JSON", "QWEN_TUNE_QUICK",
+    "QWEN_DISPATCH_MAP", "QWEN_DISPATCH_JSON", "QWEN_CENSUS_JSON",
+    "QWEN_COST_MAP", "QWEN_COSTMAP_JSON",
     NULL
 };
 
 void qwen_provenance_report(void *out) {
     FILE *f = out ? (FILE *)out : stderr;
-    fprintf(f, "  build:            %s · SIMD=%s · %s %s\n",
-            QWEN_GIT_REV, QWEN_SIMD_PROFILE, __DATE__, __TIME__);
+    fprintf(f, "  build:            %s · SIMD=%s · src=%s · %s %s\n",
+            QWEN_GIT_REV, QWEN_SIMD_PROFILE, QWEN_SOURCE_FP, __DATE__, __TIME__);
     int n = 0;
     for (int i = 0; g_qwen_reported_flags[i]; i++) {
         const char *v = getenv(g_qwen_reported_flags[i]);
@@ -272,8 +418,12 @@ void qwen_caps_report(void *out) {
 #else
     fprintf(f, "  int8 dot:         dequant->FMA (no SDOT/VNNI)\n");
 #endif
+#if defined(__AVX512VNNI__)
+    fprintf(f, "  VNNI GEMM tile:   MR=4/NR=4 for B=2..4; MR=2/NR=4 for compact B=5..8\n");
+#endif
 #if defined(__AVX512BF16__)
     fprintf(f, "  bf16 dot:         VDPBF16PS _mm512_dpbf16_ps (native; QWEN_NO_BF16DOT=1 disables)\n");
+    fprintf(f, "  bf16 matmat:      AVX-512 BF16 tiles (QWEN_NO_BF16_MATMUL=1 disables)\n");
 #elif defined(__x86_64__)
     fprintf(f, "  bf16 dot:         widen->FMA (no AVX-512-BF16)\n");
 #endif
@@ -331,10 +481,25 @@ void qwen_caps_report(void *out) {
             __builtin_cpu_supports("avx512vnni") ? " avx512vnni"   : "",
             __builtin_cpu_supports("avx512bf16") ? " avx512bf16"   : "",
             amx_str);
-    fprintf(f, "  lever (x86):      %s\n",
-            __builtin_cpu_supports("avx512vnni") ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
-          : __builtin_cpu_supports("avx2")       ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
-          :                                        "no AVX2 — scalar; rebuild SIMD=scalar");
+    /* The lever is a property of THIS BINARY, not of the CPU: a SIMD=avx512 or SIMD=portable
+     * build running on a VNNI host has no VNNI dot to recommend, and used to advertise one. */
+    {
+#if defined(__AVX512VNNI__)
+        const int vnni_built = 1;
+#else
+        const int vnni_built = 0;
+#endif
+        const int vnni_cpu = __builtin_cpu_supports("avx512vnni") ? 1 : 0;
+        fprintf(f, "  lever (x86):      %s\n",
+                (vnni_built && vnni_cpu)
+                  ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
+              : (vnni_cpu && !vnni_built)
+                  ? "this CPU has VNNI but this build does NOT — rebuild SIMD=avx512vnni "
+                    "(or avx512bf16/amx) to get the native int8 dot"
+              : __builtin_cpu_supports("avx2")
+                  ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
+                  : "no AVX2 — scalar; rebuild SIMD=scalar");
+    }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     fprintf(f, "  x86 amx int8:     %s\n",
             qwen_amx_int8_ready()
@@ -889,12 +1054,30 @@ static inline void qwen_acc_wt_bf16_avx2(float *o, const uint16_t *v, float w, i
 
 #if defined(__AVX512BF16__)
 enum { QWEN_BF16DOT_XMAX = 8192 };
+/* A1: opt-in row-major activation entry for the AVX-512 bf16 matmat.
+ * The generic qwen_matmat_bf16() takes X as [cols][B] because AMX and the ARM
+ * kernels want that layout; the AVX-512 branch then immediately builds
+ * Xb[b][k] = bf16(X[k][b]), i.e. it undoes the transpose.  A caller that
+ * already holds row-major activations therefore pays a transpose and an
+ * inverse transpose to produce a plain contiguous convert.  Default off. */
+static int qwen_prefill_rowpack_enabled(void) {
+    static atomic_int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_PREFILL_ROWPACK");
+        v = (e && e[0] == '1');
+        atomic_store_explicit(&on, v, memory_order_relaxed);
+    }
+    return v;
+}
+
 static int qwen_bf16dot_disabled(void) {
     static atomic_int off = -1;
     int v = atomic_load_explicit(&off, memory_order_relaxed);
     if (v < 0) { const char *e = getenv("QWEN_NO_BF16DOT"); v = (e && e[0] == '1'); atomic_store_explicit(&off, v, memory_order_relaxed); }
     return v;
 }
+int qwen_bf16dot_enabled(void) { return !qwen_bf16dot_disabled(); }
 static inline __m512bh qwen_loadu_pbh(const uint16_t *p) {
     union { __m512i i; __m512bh bh; } u;
     u.i = _mm512_loadu_si512((const void *)p);
@@ -958,6 +1141,135 @@ static void bf16_matvec_dpbf16(float *y, const uint16_t *xb, const float *x,
 }
 #endif
 
+#if defined(__AVX512BF16__)
+static inline uint16_t qwen_f32_to_bf16_scalar(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof bits);
+    return (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+}
+
+static void bf16_matmat_avx512_m4(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                  int r, int cols, int B, int ldy) {
+    __m512 acc[4][4];
+    for (int m = 0; m < 4; m++)
+        for (int b = 0; b < B; b++) acc[m][b] = _mm512_setzero_ps();
+    int k = 0, kfull = cols & ~31;
+    for (; k < kfull; k += 32) {
+        __m512bh w0 = qwen_loadu_pbh(W + (size_t)(r + 0) * cols + k);
+        __m512bh w1 = qwen_loadu_pbh(W + (size_t)(r + 1) * cols + k);
+        __m512bh w2 = qwen_loadu_pbh(W + (size_t)(r + 2) * cols + k);
+        __m512bh w3 = qwen_loadu_pbh(W + (size_t)(r + 3) * cols + k);
+        for (int b = 0; b < B; b++) {
+            __m512bh x = qwen_loadu_pbh(Xb + (size_t)b * cols + k);
+            acc[0][b] = _mm512_dpbf16_ps(acc[0][b], w0, x);
+            acc[1][b] = _mm512_dpbf16_ps(acc[1][b], w1, x);
+            acc[2][b] = _mm512_dpbf16_ps(acc[2][b], w2, x);
+            acc[3][b] = _mm512_dpbf16_ps(acc[3][b], w3, x);
+        }
+    }
+    for (int m = 0; m < 4; m++) {
+        const uint16_t *w = W + (size_t)(r + m) * cols;
+        float *y = Y + (size_t)(r + m) * ldy;
+        for (int b = 0; b < B; b++) {
+            float s = _mm512_reduce_add_ps(acc[m][b]);
+            const uint16_t *x = Xb + (size_t)b * cols;
+            for (int i = kfull; i < cols; i++) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+            y[b] = s;
+        }
+    }
+}
+
+static void bf16_matmat_avx512_m2(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                  int r, int cols, int B, int ldy) {
+    __m512 acc[2][8];
+    for (int m = 0; m < 2; m++)
+        for (int b = 0; b < B; b++) acc[m][b] = _mm512_setzero_ps();
+    int k = 0, kfull = cols & ~31;
+    for (; k < kfull; k += 32) {
+        __m512bh w0 = qwen_loadu_pbh(W + (size_t)(r + 0) * cols + k);
+        __m512bh w1 = qwen_loadu_pbh(W + (size_t)(r + 1) * cols + k);
+        for (int b = 0; b < B; b++) {
+            __m512bh x = qwen_loadu_pbh(Xb + (size_t)b * cols + k);
+            acc[0][b] = _mm512_dpbf16_ps(acc[0][b], w0, x);
+            acc[1][b] = _mm512_dpbf16_ps(acc[1][b], w1, x);
+        }
+    }
+    for (int m = 0; m < 2; m++) {
+        const uint16_t *w = W + (size_t)(r + m) * cols;
+        float *y = Y + (size_t)(r + m) * ldy;
+        for (int b = 0; b < B; b++) {
+            float s = _mm512_reduce_add_ps(acc[m][b]);
+            const uint16_t *x = Xb + (size_t)b * cols;
+            for (int i = kfull; i < cols; i++) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+            y[b] = s;
+        }
+    }
+}
+
+static void bf16_matmat_avx512_m1(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                  int r, int cols, int B, int ldy) {
+    __m512 acc[16];
+    for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_ps();
+    const uint16_t *w = W + (size_t)r * cols;
+    int k = 0, kfull = cols & ~31;
+    for (; k < kfull; k += 32) {
+        __m512bh wv = qwen_loadu_pbh(w + k);
+        for (int b = 0; b < B; b++)
+            acc[b] = _mm512_dpbf16_ps(acc[b], wv,
+                                      qwen_loadu_pbh(Xb + (size_t)b * cols + k));
+    }
+    float *y = Y + (size_t)r * ldy;
+    for (int b = 0; b < B; b++) {
+        float s = _mm512_reduce_add_ps(acc[b]);
+        const uint16_t *x = Xb + (size_t)b * cols;
+        for (int i = kfull; i < cols; i++) s += bf16_to_f32(w[i]) * bf16_to_f32(x[i]);
+        y[b] = s;
+    }
+}
+
+static void bf16_matmat_avx512_slice(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                     int r0, int r1, int cols, int B) {
+    MMSTAT(QWEN_MMK_BF16_AVX512, r1 - r0, cols, B);
+    int r = r0;
+    if (B > 16) {
+        /* Wider than the register tile: sweep each weight row once and run the 16-column
+         * kernel per column block, so the row leaves DRAM once for all B columns.  Every
+         * (row, column) accumulates in the same k order as a 16-wide call, so the result
+         * is bit-identical to running the blocks as separate matmats. */
+        for (; r < r1; r++)
+            for (int b0 = 0; b0 < B; b0 += 16) {
+                int nb = B - b0 < 16 ? B - b0 : 16;
+                bf16_matmat_avx512_m1(Y + b0, W, Xb + (size_t)b0 * cols, r, cols, nb, B);
+            }
+        return;
+    }
+    if (B <= 4) {
+        for (; r + 3 < r1; r += 4) bf16_matmat_avx512_m4(Y, W, Xb, r, cols, B, B);
+    } else if (B <= 8) {
+        for (; r + 1 < r1; r += 2) bf16_matmat_avx512_m2(Y, W, Xb, r, cols, B, B);
+    }
+    for (; r < r1; r++) bf16_matmat_avx512_m1(Y, W, Xb, r, cols, B, B);
+}
+
+typedef struct {
+    float *Y; const uint16_t *W; const uint16_t *Xb; int rows, cols, B;
+} bf16_avx512_ctx;
+static void bf16_avx512_task(size_t tid, size_t nt, void *vc) {
+    bf16_avx512_ctx *c = (bf16_avx512_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_BF16_AVX512, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            bf16_matmat_avx512_slice(c->Y, c->W, c->Xb, r, e, c->cols, c->B);
+        }
+    } else {
+        bf16_matmat_avx512_slice(c->Y, c->W, c->Xb, r0, r1, c->cols, c->B);
+    }
+}
+#endif
+
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
 enum { QWEN_ARM_BFDOT_XMAX = 8192 };
 static void qwen_arm_f32_to_bf16_row(uint16_t *dst, const float *src, int n) {
@@ -974,6 +1286,7 @@ static int qwen_arm_bfdot_enabled(void) {
     }
     return cached;
 }
+int qwen_arm_bfdot_on(void) { return qwen_arm_bfdot_enabled(); }
 static void bf16_matvec_bfdot(float *y, const uint16_t *xb, const uint16_t *W,
                               int in_dim, int out_dim) {
     const bfloat16_t *xv = (const bfloat16_t *)xb;
@@ -1023,11 +1336,21 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
     int o = 0;
 #if defined(__AVX512BF16__)
     if (!qwen_bf16dot_disabled() && in_dim <= QWEN_BF16DOT_XMAX) {
+        qwen_census_leaf(QWEN_LEAF_DPBF16);
         uint16_t xb[QWEN_BF16DOT_XMAX];
         qwen_f32_to_bf16_row(xb, x, in_dim);
         bf16_matvec_dpbf16(y, xb, x, W, in_dim, out_dim);
         return;
     }
+#endif
+#if defined(__AVX512F__)
+    qwen_census_leaf(QWEN_LEAF_AVX512F);
+#elif defined(__ARM_NEON)
+    qwen_census_leaf(QWEN_LEAF_NEON);
+#elif defined(__AVX2__)
+    qwen_census_leaf(QWEN_LEAF_AVX2);
+#else
+    qwen_census_leaf(QWEN_LEAF_SCALAR);
 #endif
 #if defined(__AVX512F__)
     for (; o + 1 < out_dim; o += 2) {
@@ -1270,30 +1593,55 @@ static void bf16_mv_task(size_t tid, size_t nt, void *vc) {
 }
 void (*g_qwen_matvec_bf16_hook)(float *, const uint16_t *, const float *, int, int) = NULL;
 
+/* Forward declarations for the optional complete-call timing census.  The
+ * implementation lives with the other matmul counters below, while the BF16
+ * matvec entry point is intentionally kept near its dispatch helpers. */
+enum { QWEN_KT_INT8 = 0, QWEN_KT_BF16, QWEN_KT_KIND_COUNT };
+enum { QWEN_KT_B1 = 0, QWEN_KT_B2, QWEN_KT_B34, QWEN_KT_B58, QWEN_KT_B9P, QWEN_KT_BUCKET_COUNT };
+static double qwen_mm_now_s(void);
+static int qwen_kernel_timing_enabled(void);
+static void qwen_kernel_timing_note(int kind, int B, int rows, int cols,
+                                    double start_s);
+static void qwen_vnni_phase_report(FILE *out);
+
 void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
-    qwen_census_op("matvec_bf16", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_BF16, rows, cols, 1);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     if (qwen_q8r_matmul(y, (const void *)W, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_Q8_REPACK_GEMV, rows, cols, 1);
-        return;
+        goto qwen_matvec_bf16_timed_done;
     }
     if (kai_bf16_try(y, W, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_KLEIDI_BF16_GEMV, rows, cols, 1);
-        return;
+        goto qwen_matvec_bf16_timed_done;
     }
     MMSTAT(QWEN_MMK_BF16_GEMV, rows, cols, 1);
 
-    if (g_qwen_matvec_bf16_hook) { g_qwen_matvec_bf16_hook(y, W, x, rows, cols); return; }
+    if (g_qwen_matvec_bf16_hook) {
+        g_qwen_matvec_bf16_hook(y, W, x, rows, cols);
+        goto qwen_matvec_bf16_timed_done;
+    }
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         bf16_mv_ctx c = { y, W, x, rows, cols };
         qwen_parallel((size_t)nt, bf16_mv_task, &c);
-        return;
+        goto qwen_matvec_bf16_timed_done;
     }
     bf16_matvec_fused(y, x, W, cols, rows);
+
+qwen_matvec_bf16_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_BF16, 1, rows, cols, kt_t0);
 }
 
 static atomic_int g_mm_stats = -1;
 static atomic_llong g_mm_macs[QWEN_MMK_COUNT];
+/* Which arm of the fixed-width switch a twin actually took. A dispatcher that never
+   reaches the twin at all leaves both at zero, which is the answer to "does this kernel
+   change anything on this build" - and it is not visible from the per-kernel MAC table,
+   because that is recorded before the width switch. */
+static atomic_llong g_mm_fixedw[2];   /* [0] bf16, [1] int8 */
+static atomic_llong g_mm_generic[2];
 static atomic_llong g_mm_calls[QWEN_MMK_COUNT];
 static atomic_llong g_mm_wbytes;
 static _Atomic double g_mm_wb_t0, g_mm_wb_t1;
@@ -1302,10 +1650,203 @@ static double qwen_mm_now_s(void) {
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 
+/*
+ * Diagnostic wall-time census for the complete public matvec/matmat calls.
+ * This deliberately measures the caller-visible interval, including activation
+ * preparation, dispatch, worker-pool wait, dot product, scaling and stores. It
+ * is not a kernel benchmark and must never be enabled for a timing claim.
+ * Weight bytes are the one-read lower bound (rows * cols * element_size), not
+ * a hardware counter or a claim that the implementation made one DRAM pass.
+ */
+typedef struct {
+    atomic_llong calls;
+    atomic_llong wall_ns;
+    atomic_llong macs;
+    atomic_llong weight_bytes;
+} qwen_kernel_timing_cell_t;
+static qwen_kernel_timing_cell_t
+    g_kernel_timing[QWEN_COMP_COUNT][QWEN_KT_KIND_COUNT][QWEN_KT_BUCKET_COUNT];
+static atomic_int g_kernel_timing_on = -1;
+
+static void qwen_kernel_timing_atexit(void);
+
+static int qwen_kernel_timing_enabled(void) {
+    int v = atomic_load_explicit(&g_kernel_timing_on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_KERNEL_TIMING");
+        v = e && e[0] && e[0] != '0';
+        static atomic_int registered = 0;
+        if (v && !atomic_exchange_explicit(&registered, 1, memory_order_relaxed))
+            atexit(qwen_kernel_timing_atexit);
+        atomic_store_explicit(&g_kernel_timing_on, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_kernel_timing_bucket(int B) {
+    if (B <= 1) return QWEN_KT_B1;
+    if (B == 2) return QWEN_KT_B2;
+    if (B <= 4) return QWEN_KT_B34;
+    if (B <= 8) return QWEN_KT_B58;
+    return QWEN_KT_B9P;
+}
+
+static void qwen_kernel_timing_note(int kind, int B, int rows, int cols,
+                                    double start_s) {
+    if (!start_s || rows <= 0 || cols <= 0 || kind < 0 || kind >= QWEN_KT_KIND_COUNT)
+        return;
+    const double elapsed = qwen_mm_now_s() - start_s;
+    const long long ns = elapsed > 0.0 ? (long long)(elapsed * 1e9) : 0;
+    int comp = qwen_tls_tag_get();
+    if (comp < 0 || comp >= QWEN_COMP_COUNT) comp = QWEN_COMP_OTHER;
+    qwen_kernel_timing_cell_t *cell =
+        &g_kernel_timing[comp][kind][qwen_kernel_timing_bucket(B)];
+    atomic_fetch_add_explicit(&cell->calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->wall_ns, ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->macs,
+                              (long long)rows * (long long)cols * (long long)(B > 0 ? B : 1),
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->weight_bytes,
+                              (long long)rows * (long long)cols *
+                              (long long)(kind == QWEN_KT_BF16 ? sizeof(uint16_t) : sizeof(int8_t)),
+                              memory_order_relaxed);
+}
+
+void qwen_kernel_timing_report(void *out) {
+    static const char *const cname[QWEN_COMP_COUNT] = { "other", "talker", "cp", "decoder" };
+    static const char *const kname[QWEN_KT_KIND_COUNT] = { "int8", "bf16" };
+    static const char *const bname[QWEN_KT_BUCKET_COUNT] = { "B1", "B2", "B3-4", "B5-8", "B9+" };
+    FILE *f = out ? (FILE *)out : stderr;
+    int any = 0;
+    for (int c = 0; c < QWEN_COMP_COUNT; c++)
+        for (int k = 0; k < QWEN_KT_KIND_COUNT; k++)
+            for (int b = 0; b < QWEN_KT_BUCKET_COUNT; b++)
+                if (atomic_load_explicit(&g_kernel_timing[c][k][b].calls,
+                                         memory_order_relaxed) > 0) any = 1;
+    if (any) {
+        fprintf(f, "\n[kernel-timing] v=1 pid=%d complete public matvec/matmat wall time\n",
+                (int)getpid());
+        fprintf(f, "# csv: component,kind,bucket,calls,wall_ms,wall_ms_per_call,gmac,"
+                        "nominal_weight_gb,nominal_weight_gbps\n");
+        for (int c = 0; c < QWEN_COMP_COUNT; c++)
+            for (int k = 0; k < QWEN_KT_KIND_COUNT; k++)
+                for (int b = 0; b < QWEN_KT_BUCKET_COUNT; b++) {
+                    qwen_kernel_timing_cell_t *cell = &g_kernel_timing[c][k][b];
+                    long long calls = atomic_load_explicit(&cell->calls, memory_order_relaxed);
+                    if (!calls) continue;
+                    long long ns = atomic_load_explicit(&cell->wall_ns, memory_order_relaxed);
+                    long long macs = atomic_load_explicit(&cell->macs, memory_order_relaxed);
+                    long long bytes = atomic_load_explicit(&cell->weight_bytes, memory_order_relaxed);
+                    double sec = (double)ns / 1e9;
+                    double gb = (double)bytes / 1e9;
+                    fprintf(f, "timing,%s,%s,%s,%lld,%.3f,%.3f,%.6f,%.6f,%.3f\n",
+                            cname[c], kname[k], bname[b], calls, (double)ns / 1e6,
+                            calls ? (double)ns / 1e6 / (double)calls : 0.0,
+                            (double)macs / 1e9, gb, sec > 0.0 ? gb / sec : 0.0);
+                }
+        fprintf(f, "[kernel-timing] nominal_weight_gbps is a one-read lower-bound rate; "
+                        "it excludes non-weight traffic and does not measure DRAM bytes.\n");
+    }
+    qwen_vnni_phase_report(f);
+    fflush(f);
+}
+static void qwen_kernel_timing_atexit(void) { qwen_kernel_timing_report(NULL); }
+
+/*
+ * Optional phase census for the AVX-512 VNNI B=1 path.  Unlike the public
+ * kernel-timing census, this is deliberately a diagnostic: phase times are
+ * aggregated across worker tasks and therefore are not a critical-path
+ * attribution.  It is disabled unless QWEN_VNNI_PHASE_TIMING=1.
+ */
+enum {
+    QWEN_VP_QUANT = 0,
+    QWEN_VP_ROWSUM,
+    QWEN_VP_DOT,
+    QWEN_VP_EPILOGUE,
+    QWEN_VP_PARALLEL,
+    QWEN_VP_COUNT
+};
+typedef struct {
+    atomic_llong calls;
+    atomic_llong wall_ns;
+    atomic_llong work_bytes;
+} qwen_vnni_phase_cell_t;
+static qwen_vnni_phase_cell_t
+    g_vnni_phase[QWEN_COMP_COUNT][QWEN_VP_COUNT];
+static atomic_int g_vnni_phase_on = -1;
+
+#if defined(__GNUC__) || defined(__clang__)
+#define QWEN_VNNI_PHASE_UNUSED __attribute__((unused))
+#else
+#define QWEN_VNNI_PHASE_UNUSED
+#endif
+
+static int QWEN_VNNI_PHASE_UNUSED qwen_vnni_phase_timing_enabled(void) {
+    int v = atomic_load_explicit(&g_vnni_phase_on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_VNNI_PHASE_TIMING");
+        v = e && e[0] && e[0] != '0';
+        atomic_store_explicit(&g_vnni_phase_on, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static void QWEN_VNNI_PHASE_UNUSED qwen_vnni_phase_note(
+    int phase, long long work_bytes, double start_s) {
+    if (!start_s || phase < 0 || phase >= QWEN_VP_COUNT) return;
+    const double elapsed = qwen_mm_now_s() - start_s;
+    const long long ns = elapsed > 0.0 ? (long long)(elapsed * 1e9) : 0;
+    int comp = qwen_tls_tag_get();
+    if (comp < 0 || comp >= QWEN_COMP_COUNT) comp = QWEN_COMP_OTHER;
+    qwen_vnni_phase_cell_t *cell = &g_vnni_phase[comp][phase];
+    atomic_fetch_add_explicit(&cell->calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cell->wall_ns, ns, memory_order_relaxed);
+    if (work_bytes > 0)
+        atomic_fetch_add_explicit(&cell->work_bytes, work_bytes, memory_order_relaxed);
+}
+
+static void qwen_vnni_phase_report(FILE *f) {
+    static const char *const cname[QWEN_COMP_COUNT] = {
+        "other", "talker", "cp", "decoder"
+    };
+    static const char *const pname[QWEN_VP_COUNT] = {
+        "activation_quant", "row_sum_lookup_or_build", "vnni_dot",
+        "scale_store_epilogue", "parallel_span"
+    };
+    int any = 0;
+    for (int c = 0; c < QWEN_COMP_COUNT; c++)
+        for (int p = 0; p < QWEN_VP_COUNT; p++)
+            if (atomic_load_explicit(&g_vnni_phase[c][p].calls,
+                                     memory_order_relaxed) > 0) any = 1;
+    if (!any) return;
+    fprintf(f, "\n[vnni-phase] v=1 pid=%d AVX-512 VNNI B=1 diagnostic\n",
+            (int)getpid());
+    fprintf(f, "# csv: component,phase,calls,wall_ms,wall_ms_per_call,work_gb,effective_gbps\n");
+    for (int c = 0; c < QWEN_COMP_COUNT; c++)
+        for (int p = 0; p < QWEN_VP_COUNT; p++) {
+            qwen_vnni_phase_cell_t *cell = &g_vnni_phase[c][p];
+            long long calls = atomic_load_explicit(&cell->calls, memory_order_relaxed);
+            if (!calls) continue;
+            long long ns = atomic_load_explicit(&cell->wall_ns, memory_order_relaxed);
+            long long bytes = atomic_load_explicit(&cell->work_bytes, memory_order_relaxed);
+            double sec = (double)ns / 1e9;
+            double gb = (double)bytes / 1e9;
+            fprintf(f, "phase,%s,%s,%lld,%.3f,%.6f,%.6f,%.3f\n",
+                    cname[c], pname[p], calls, (double)ns / 1e6,
+                    (double)ns / 1e6 / (double)calls, gb,
+                    sec > 0.0 ? gb / sec : 0.0);
+        }
+    fprintf(f, "[vnni-phase] calls are timed output-group regions; aggregate wall is across calls/tasks, not a critical-path sum.\n");
+    fprintf(f, "[vnni-phase] vnni_dot work_gb is the one-read INT8 weight byte count, not measured DRAM traffic.\n");
+    fflush(f);
+}
+#undef QWEN_VNNI_PHASE_UNUSED
+
 enum { MMC_GEMM = 0, MMC_TWIN, MMC_MATVEC, MMC_SOLO, MMC_GEMV, MMC_NCLS };
 static const struct { const char *name; int cls; } g_mmk_info[QWEN_MMK_COUNT] = {
     { "(none)",                 MMC_TWIN   },
     { "bf16 BFMMLA (arm)",      MMC_GEMM   },
+    { "bf16 AVX-512 dpbf16",    MMC_GEMM   },
     { "bf16 fixed-B twin",      MMC_TWIN   },
     { "bf16 generic twin",      MMC_TWIN   },
     { "int8 AMX tiles",         MMC_GEMM   },
@@ -1367,16 +1908,83 @@ static atomic_llong g_mm_calls_c[QWEN_COMP_COUNT][QWEN_MMK_COUNT];
 
 #define QWEN_CENSUS_MAX 256
 typedef struct {
-    const char *entry;
+    int path;
     int comp, rows, cols, B;
     atomic_llong calls, macs;
-    atomic_uint  kmask;
+    atomic_uint  kmask;     /* QWEN_MMK_* that ran (matmat dispatch) */
+    /* kmask is an OR of every kernel this shape ever used, so it cannot say HOW MUCH ran on
+     * each one: a row that took AMX once and VNNI a thousand times looks identical to a row
+     * that is pure AMX.  A coverage share read off the mask is an upper bound, not a
+     * measurement, so keep MACs and calls PER KERNEL as well. */
+    atomic_llong kmacs[QWEN_MMK_COUNT];
+    atomic_llong kcalls[QWEN_MMK_COUNT];
+    atomic_uint  lmask;     /* QWEN_LEAF_* that ran (branch inside the entry) */
 } qwen_census_row_t;
 static qwen_census_row_t g_census[QWEN_CENSUS_MAX];
 static atomic_int   g_census_n;
 static atomic_int   g_census_on = -1;
 static atomic_llong g_census_frames;
-static _Atomic(qwen_census_row_t *) g_census_cur;
+/* The row the CURRENT THREAD is attributing to.  Was one global: under the pool a
+ * worker's kernel mask landed on whatever row another thread had just opened. */
+static __thread qwen_census_row_t *t_census_cur;
+
+static const struct { int id; const char *name; int kind; } g_path_info[] = {
+    { QWEN_PATH_MATVEC_BF16, "matvec_bf16", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_BF16_QKV, "matvec_bf16_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_INT8, "matvec_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_INT8_QKV, "matvec_int8_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q4_0, "matvec_q4_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q4_0_QKV, "matvec_q4_0_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q2_0, "matvec_q2_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q6_0, "matvec_q6_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATVEC_Q6_0_QKV, "matvec_q6_0_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_ARGMAX_MATVEC_BF16, "argmax_matvec_bf16", QWEN_PATHK_CALL },
+    { QWEN_PATH_ARGMAX_MATVEC_INT8, "argmax_matvec_int8", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_ARGMAX_MATVEC_Q4_0, "argmax_matvec_q4_0", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_MATMAT_BF16, "matmat_bf16", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_BF16_ROWS, "matmat_bf16_rows", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_BF16_QKV, "matmat_bf16_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_INT8, "matmat_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_INT8_QKV, "matmat_int8_qkv", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_Q4_0, "matmat_q4_0", QWEN_PATHK_CALL },
+    { QWEN_PATH_MATMAT_INT8_VNNI_PACKED_SLICE, "matmat_int8_vnni_packed.slice", QWEN_PATHK_SLICE },
+    { QWEN_PATH_MATMAT_INT8_VNNI_M4N2_SLICE, "matmat_int8_vnni_m4n2.slice", QWEN_PATHK_SLICE },
+    { QWEN_PATH_PREFILL_BF16_NATIVE, "prefill_bf16_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_PREFILL_F32_SGEMM, "prefill_f32_sgemm", QWEN_PATHK_CALL },
+    { QWEN_PATH_BF16_ROWPACK_SHARED, "bf16_rowpack_shared", QWEN_PATHK_TRANSFORM },
+    { QWEN_PATH_MATMAT_INT8_NATIVE, "matmat_int8_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_MATMAT_BF16_NATIVE, "matmat_bf16_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_MATMAT_INT8_QKV_NATIVE, "matmat_int8_qkv_native", QWEN_PATHK_WRAPPER },
+    { QWEN_PATH_DECODER_SGEMM, "decoder_sgemm", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_INT8, "decoder_conv_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_AMX_INT8, "decoder_conv_amx_int8", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_AMX_INT8_D, "decoder_conv_amx_int8_design_d", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_AMX_BF16, "decoder_conv_amx_bf16", QWEN_PATHK_CALL },
+    { QWEN_PATH_DECODER_CONV_NAIVE, "decoder_conv_naive", QWEN_PATHK_CALL },
+};
+const char *qwen_path_name(int path) {
+    for (size_t i = 0; i < sizeof g_path_info / sizeof g_path_info[0]; i++)
+        if (g_path_info[i].id == path) return g_path_info[i].name;
+    return "unknown_path";
+}
+int qwen_path_kind(int path) {
+    for (size_t i = 0; i < sizeof g_path_info / sizeof g_path_info[0]; i++)
+        if (g_path_info[i].id == path) return g_path_info[i].kind;
+    return QWEN_PATHK_CALL;
+}
+static const char *const g_leaf_name[QWEN_LEAF_COUNT] = {
+    "none", "vnni", "dpbf16", "sdot", "avx512f", "avx2", "neon", "scalar", "blas",
+    "f32_fused", "kleidi", "amx", "delegated", "avx2-int8-emulated-dot-gemv",
+    "avx2-q4-emulated-dot-gemv", "arm-sdot-matmat"
+};
+const char *qwen_leaf_name(int leaf) {
+    return (leaf > 0 && leaf < QWEN_LEAF_COUNT) ? g_leaf_name[leaf] : "none";
+}
+void qwen_census_leaf(int leaf) {
+    if (leaf <= 0 || leaf >= QWEN_LEAF_COUNT) return;
+    if (atomic_load_explicit(&g_census_on, memory_order_relaxed) <= 0) return;
+    if (t_census_cur) atomic_fetch_or_explicit(&t_census_cur->lmask, 1u << leaf, memory_order_relaxed);
+}
 static pthread_mutex_t g_census_mu = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int   g_census_overflow;
 
@@ -1404,7 +2012,16 @@ void qwen_census_frame_at(int site) {
 }
 void qwen_census_frame(void) { qwen_census_frame_at(0); }
 
-void qwen_census_op(const char *entry, int rows, int cols, int B) {
+static void qwen_census_op_impl(int path, int rows, int cols, int B, long long macs);
+void qwen_census_op(int path, int rows, int cols, int B) {
+    qwen_census_op_impl(path, rows, cols, B, (long long)rows * (long long)cols * (long long)B);
+}
+void qwen_census_op_len(int path, int rows, int cols, int len) {
+    if (len <= 0) return;
+    int b = 1; while (b < len) b <<= 1;          /* key = next power of two of the length */
+    qwen_census_op_impl(path, rows, cols, b, (long long)rows * (long long)cols * (long long)len);
+}
+static void qwen_census_op_impl(int path, int rows, int cols, int B, long long macs) {
     if (!qwen_census_enabled() || B <= 0) return;
     const int comp = qwen_tls_tag_get();
     const int n = atomic_load_explicit(&g_census_n, memory_order_acquire);
@@ -1412,7 +2029,7 @@ void qwen_census_op(const char *entry, int rows, int cols, int B) {
     for (int i = 0; i < n; i++) {
         qwen_census_row_t *r = &g_census[i];
         if (r->rows == rows && r->cols == cols && r->B == B &&
-            r->comp == comp && r->entry == entry) { hit = r; break; }
+            r->comp == comp && r->path == path) { hit = r; break; }
     }
     if (!hit) {
         pthread_mutex_lock(&g_census_mu);
@@ -1420,7 +2037,7 @@ void qwen_census_op(const char *entry, int rows, int cols, int B) {
         for (int i = n; i < m && !hit; i++) {
             qwen_census_row_t *r = &g_census[i];
             if (r->rows == rows && r->cols == cols && r->B == B &&
-                r->comp == comp && r->entry == entry) hit = r;
+                r->comp == comp && r->path == path) hit = r;
         }
         if (!hit) {
             if (m >= QWEN_CENSUS_MAX) {
@@ -1429,17 +2046,15 @@ void qwen_census_op(const char *entry, int rows, int cols, int B) {
                 return;
             }
             hit = &g_census[m];
-            hit->entry = entry; hit->comp = comp;
+            hit->path = path; hit->comp = comp;
             hit->rows = rows; hit->cols = cols; hit->B = B;
             atomic_store_explicit(&g_census_n, m + 1, memory_order_release);
         }
         pthread_mutex_unlock(&g_census_mu);
     }
     atomic_fetch_add_explicit(&hit->calls, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&hit->macs,
-                              (long long)rows * (long long)cols * (long long)B,
-                              memory_order_relaxed);
-    atomic_store_explicit(&g_census_cur, hit, memory_order_relaxed);
+    atomic_fetch_add_explicit(&hit->macs, macs, memory_order_relaxed);
+    t_census_cur = hit;
 }
 
 void qwen_census_report(void *out) {
@@ -1454,37 +2069,109 @@ void qwen_census_report(void *out) {
             atomic_load_explicit(&g_census_frames_at[1], memory_order_relaxed),
             atomic_load_explicit(&g_census_frames_at[2], memory_order_relaxed),
             g_n_threads);
-    fprintf(f, "# csv: comp,entry,N,K,B,calls,calls_per_frame,gmac,gmac_per_frame,kernels\n");
+    fprintf(f, "# csv: comp,path,N,K,B,calls,calls_per_frame,gmac,gmac_per_frame,kernels,leaves,kind\n");
+    /* Per-kernel split, emitted as its own record type: the "kernels" column above is an OR
+     * mask and cannot carry a share. */
+    fprintf(f, "# csv2: kcensus,comp,path,N,K,B,kernel,kernel_calls,kernel_gmac\n");
     for (int i = 0; i < n; i++) {
         qwen_census_row_t *r = &g_census[i];
         long long c = atomic_load_explicit(&r->calls, memory_order_relaxed);
         long long m = atomic_load_explicit(&r->macs,  memory_order_relaxed);
         unsigned km = atomic_load_explicit(&r->kmask, memory_order_relaxed);
+        unsigned lm = atomic_load_explicit(&r->lmask, memory_order_relaxed);
         char kbuf[256]; kbuf[0] = 0;
         for (int k = 1; k < QWEN_MMK_COUNT; k++) {
             if (!(km & (1u << k))) continue;
             if (kbuf[0]) strncat(kbuf, "+", sizeof kbuf - strlen(kbuf) - 1);
             strncat(kbuf, g_mmk_info[k].name, sizeof kbuf - strlen(kbuf) - 1);
         }
-        fprintf(f, "census,%s,%s,%d,%d,%d,%lld,%.3f,%.4f,%.6f,%s\n",
-                cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp], r->entry,
+        char lbuf[128]; lbuf[0] = 0;
+        for (int k = 1; k < QWEN_LEAF_COUNT; k++) {
+            if (!(lm & (1u << k))) continue;
+            if (lbuf[0]) strncat(lbuf, "+", sizeof lbuf - strlen(lbuf) - 1);
+            strncat(lbuf, g_leaf_name[k], sizeof lbuf - strlen(lbuf) - 1);
+        }
+        for (int k = 1; k < QWEN_MMK_COUNT; k++) {
+            long long kc = atomic_load_explicit(&r->kcalls[k], memory_order_relaxed);
+            if (!kc) continue;
+            fprintf(f, "kcensus,%s,%s,%d,%d,%d,%s,%lld,%.4f\n",
+                    cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp], qwen_path_name(r->path), r->rows, r->cols, r->B,
+                    g_mmk_info[k].name, kc,
+                    (double)atomic_load_explicit(&r->kmacs[k], memory_order_relaxed) / 1e9);
+        }
+        fprintf(f, "census,%s,%s,%d,%d,%d,%lld,%.3f,%.4f,%.6f,%s,%s,%s\n",
+                cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp], qwen_path_name(r->path),
                 r->rows, r->cols, r->B, c,
                 frames ? (double)c / (double)frames : 0.0,
                 (double)m / 1e9,
                 frames ? (double)m / 1e9 / (double)frames : 0.0,
-                kbuf[0] ? kbuf : "(none)");
+                kbuf[0] ? kbuf : "(none)", lbuf[0] ? lbuf : "(none)",
+                qwen_path_kind(r->path) == QWEN_PATHK_CALL      ? "call"
+              : qwen_path_kind(r->path) == QWEN_PATHK_SLICE     ? "slice"
+              : qwen_path_kind(r->path) == QWEN_PATHK_WRAPPER   ? "wrapper" : "transform");
     }
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    { void qwen_sd_amx_rej_report(void); qwen_sd_amx_rej_report(); }
+#endif
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    { void qwen_sd_amx_bf16_report(void); qwen_sd_amx_bf16_report(); }
+#endif
     int ov = atomic_load_explicit(&g_census_overflow, memory_order_relaxed);
     if (ov) fprintf(f, "[shape-census] WARNING: %d ops dropped, table full (%d rows)\n",
                     ov, QWEN_CENSUS_MAX);
     fflush(f);
+
+    /* Machine-readable twin: QWEN_CENSUS_JSON=path, "%d" -> pid (prefork workers each
+       write their own).  Counters are cumulative, so the last dump is the whole run. */
+    const char *jp = getenv("QWEN_CENSUS_JSON");
+    if (jp && jp[0]) {
+        char path[1024];
+        const char *pct = strstr(jp, "%d");
+        if (pct) snprintf(path, sizeof path, "%.*s%d%s", (int)(pct - jp), jp, (int)getpid(), pct + 2);
+        else     snprintf(path, sizeof path, "%s", jp);
+        FILE *j = fopen(path, "w");
+        if (j) {
+            fprintf(j, "{\n  \"v\": 1,\n  \"pid\": %d,\n  \"threads\": %d,\n  \"frames\": %lld,\n"
+                       "  \"frames_single\": %lld,\n  \"frames_batched\": %lld,\n  \"frames_batched_slot\": %lld,\n"
+                       "  \"dropped_ops\": %d,\n  \"rows\": [\n",
+                    (int)getpid(), g_n_threads, frames,
+                    atomic_load_explicit(&g_census_frames_at[0], memory_order_relaxed),
+                    atomic_load_explicit(&g_census_frames_at[1], memory_order_relaxed),
+                    atomic_load_explicit(&g_census_frames_at[2], memory_order_relaxed), ov);
+            for (int i = 0; i < n; i++) {
+                qwen_census_row_t *r = &g_census[i];
+                long long c = atomic_load_explicit(&r->calls, memory_order_relaxed);
+                long long m = atomic_load_explicit(&r->macs,  memory_order_relaxed);
+                unsigned km = atomic_load_explicit(&r->kmask, memory_order_relaxed);
+                unsigned lm = atomic_load_explicit(&r->lmask, memory_order_relaxed);
+                fprintf(j, "    {\"path_id\": %d, \"path\": \"%s\", \"kind\": %d, \"comp\": \"%s\", "
+                           "\"N\": %d, \"K\": %d, \"B\": %d, \"calls\": %lld, \"macs\": %lld, \"kernels\": [",
+                        r->path, qwen_path_name(r->path), qwen_path_kind(r->path),
+                        cname[r->comp < 0 || r->comp >= QWEN_COMP_COUNT ? 0 : r->comp],
+                        r->rows, r->cols, r->B, c, m);
+                int first = 1;
+                for (int k = 1; k < QWEN_MMK_COUNT; k++)
+                    if (km & (1u << k)) { fprintf(j, "%s\"%s\"", first ? "" : ", ", g_mmk_info[k].name); first = 0; }
+                fprintf(j, "], \"leaves\": [");
+                first = 1;
+                for (int k = 1; k < QWEN_LEAF_COUNT; k++)
+                    if (lm & (1u << k)) { fprintf(j, "%s\"%s\"", first ? "" : ", ", g_leaf_name[k]); first = 0; }
+                fprintf(j, "]}%s\n", i + 1 < n ? "," : "");
+            }
+            fprintf(j, "  ]\n}\n");
+            fclose(j);
+        }
+    }
 }
 
 void qwen_matmat_stats_note(int k, long long macs) {
     if (k <= 0 || k >= QWEN_MMK_COUNT) return;
     if (atomic_load_explicit(&g_census_on, memory_order_relaxed) > 0) {
-        qwen_census_row_t *cur = atomic_load_explicit(&g_census_cur, memory_order_relaxed);
-        if (cur) atomic_fetch_or_explicit(&cur->kmask, 1u << k, memory_order_relaxed);
+        if (t_census_cur) {
+            atomic_fetch_or_explicit(&t_census_cur->kmask, 1u << k, memory_order_relaxed);
+            atomic_fetch_add_explicit(&t_census_cur->kmacs[k], macs, memory_order_relaxed);
+            atomic_fetch_add_explicit(&t_census_cur->kcalls[k], 1, memory_order_relaxed);
+        }
     }
     atomic_fetch_add_explicit(&g_mm_macs[k], macs, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_mm_calls[k], 1, memory_order_relaxed);
@@ -1553,6 +2240,18 @@ void qwen_matmat_stats_report(void *out) {
         }
     }
     fprintf(f, "  ---\n");
+    {
+        long long bf = atomic_load_explicit(&g_mm_fixedw[0], memory_order_relaxed);
+        long long bg = atomic_load_explicit(&g_mm_generic[0], memory_order_relaxed);
+        long long qf = atomic_load_explicit(&g_mm_fixedw[1], memory_order_relaxed);
+        long long qg = atomic_load_explicit(&g_mm_generic[1], memory_order_relaxed);
+        if (bf || bg || qf || qg)
+            fprintf(f, "  fallback twin dispatch: bf16 %lld fixed-width / %lld generic  ·  "
+                       "int8 %lld fixed-width / %lld generic\n", bf, bg, qf, qg);
+        else
+            fprintf(f, "  fallback twin dispatch: never reached (a wider matmat took every "
+                       "batched call on this build)\n");
+    }
     fprintf(f, "  matrix-matrix %5.1f%%  ·  batched twin %5.1f%%  ·  B x matvec %5.1f%%  ·  single-slot %5.1f%%  ·  GEMV %5.1f%%\n",
             100.0 * (double)by_cls[MMC_GEMM]   / (double)tot,
             100.0 * (double)by_cls[MMC_TWIN]   / (double)tot,
@@ -1604,10 +2303,35 @@ static int qwen_mm_env_int(const char *name, int dflt, int lo, int hi) {
     return (v >= lo && v <= hi) ? v : dflt;
 }
 
+static const char *qwen_mm_specific_minb_env(int mmk) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (mmk == QWEN_MMK_BF16_AMX) return "QWEN_AMX_BF16_MIN_B";
+    if (mmk == QWEN_MMK_INT8_AMX) return "QWEN_AMX_INT8_MIN_B";
+#else
+    (void)mmk;
+#endif
+    return NULL;
+}
+
+static int qwen_mm_minb_value(int mmk, const qwen_mm_gate_t *g) {
+    int v = qwen_mm_env_int(g->minb_env, g->min_b, 1, 64);
+    const char *specific = qwen_mm_specific_minb_env(mmk);
+    if (specific) v = qwen_mm_env_int(specific, v, 1, 64);
+    return v;
+}
+
 static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_BF16_BFMMLA] = { "QWEN_NO_BFMMLA",   NULL,                "QWEN_BFMMLA_MIN_B",  NULL,                NULL,                     2, 64,  0,  0, 0, 1 },
+    [QWEN_MMK_BF16_AVX512] = { "QWEN_NO_BF16_MATMUL", NULL,              "QWEN_BF16_MATMUL_MIN_B", NULL,             NULL,                     1, 16,  0,  0, 0, 0 },
     [QWEN_MMK_BF16_AMX]    = { "QWEN_NO_AMX_BF16", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_BF16_MIN_COLS", 4, 16, 32, 32, 1, 0 },
-    [QWEN_MMK_INT8_AMX]    = { "QWEN_NO_AMX_INT8", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_INT8_MIN_COLS", 4, 16, 32, 64, 1, 0 },
+    /* INT8 AMX starts at B=3, not 4: the batched server measured B 0.9-3.8 per prefork worker
+     * across C=1..8, so a B>=4 gate left the tile path essentially unused in production.  At
+     * B=3 with the rows-per-thread rule below, the paired measurement gives CP Gate/Up -14.5%,
+     * TK Gate/Up -12.4%, TK Down -4.4%, TK WO -3.0% and QKV neutral, while the two projections
+     * that lose there (CP WO +19.9%, CP Down +7.0%) are the ones the rule already excludes.
+     * B=2 stays VNNI: the wins shrink to -3..-5% and more shapes turn negative.  BF16 AMX
+     * keeps its own default. */
+    [QWEN_MMK_INT8_AMX]    = { "QWEN_NO_AMX_INT8", NULL,                "QWEN_AMX_MIN_B",     "QWEN_AMX_MIN_ROWS", "QWEN_AMX_INT8_MIN_COLS", 3, 16, 32, 64, 1, 0 },
     [QWEN_MMK_INT8_VNNI]   = { "QWEN_NO_VNNI",     NULL,                "QWEN_VNNI_MIN_B",    NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_INT8_AVX2]   = { "QWEN_NO_AVX2MM",   NULL,                "QWEN_AVX2MM_MIN_B",  NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_INT8_SMMLA]  = { "QWEN_NO_SMMLA",    NULL,                "QWEN_SMMLA_MIN_B",   NULL,                NULL,                     2, 16,  0,  0, 0, 1 },
@@ -1617,6 +2341,8 @@ static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_Q4_AVX2]     = { "QWEN_NO_AVX2MM",   NULL,                "QWEN_AVX2MM_MIN_B",  NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_Q4_SMMLA]    = { "QWEN_NO_SMMLA",    NULL,                "QWEN_SMMLA_MIN_B",   NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_KLEIDI_Q4]   = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
+    [QWEN_MMK_KLEIDI_I8]   = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
+    [QWEN_MMK_KLEIDI_BF16] = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
 };
 static atomic_int g_mm_gate_on[QWEN_MMK_COUNT];
 static atomic_int g_mm_gate_minb[QWEN_MMK_COUNT];
@@ -1625,17 +2351,67 @@ static atomic_int g_mm_gate_mincols[QWEN_MMK_COUNT];
 
 static atomic_int g_mm_force;
 static void qwen_mm_force_kernel(int mmk) QWEN_MAYBE_UNUSED;
+/* Bench hook: pin the batched dispatcher to ONE kernel so two arms can be interleaved inside
+ * a single process.  Comparing arms across processes on a shared box measured 14% swings on an
+ * unchanged configuration -- larger than the effect under test -- so a paired design is the
+ * only honest way to time these. 0 restores normal dispatch. */
+void qwen_mm_force(int mmk) { qwen_mm_force_kernel(mmk); }
 static void qwen_mm_force_kernel(int mmk) {
     atomic_store_explicit(&g_mm_force, mmk, memory_order_relaxed);
 }
 
+/* AMX INT8 needs a WORK-PER-THREAD condition, not only a batch one.  Measured on a Xeon
+ * Platinum 8581C (Emerald Rapids, 12 physical cores, SMT off) with the complete in-region contract (activation pack + packed RHS + matmul + scale)
+ * against the VNNI row blocks, on the real 1.7B projections, paired and interleaved inside one
+ * process, median of 7 rounds, B=4.  The AMX arm is the winner marked (+ means AMX is slower):
+ *
+ *   rows/thread   projection (threads)              AMX vs VNNI
+ *          85     CP WO (12), CP Down (12)          +38.3%, +13.4%   VNNI
+ *         128     CP WO  (8), CP Down  (8)           +9.6%,  +1.3%   VNNI
+ *         170     TK WO (12), TK Down (12)           +1.1%,  +1.2%   VNNI
+ *         170     CP QKV(12), TK QKV  (12)           -7.9%,  -6.0%   AMX (fused, see below)
+ *         256     CP QKV (8), TK QKV (8), TK WO (8), TK Down (8), CP Down (4)
+ *                                                    -16.4% .. -5.2% AMX
+ *         512+    QKV/WO/Down (4), Gate/Up (all)     -28.2% .. -3.8% AMX
+ *
+ * The tile path needs enough output rows PER WORKER to amortise its tile setup and its
+ * activation pack; below roughly 256 it cannot, and the same projection flips sign purely by
+ * changing the thread count -- CP Down is -17.3% at 4 threads and +1.3% at 8.  A rows-vs-cols
+ * rule looked convincing on unpaired numbers and was wrong: TK Down (2048x6144) is AMX -5.2%
+ * at 8 threads despite being three times deeper than tall.  rows/thread >= 256 agrees with 23
+ * of the 24 measured cells (the exception is CP WO at 4 threads, +4.4%).
+ *
+ * 0 disables the rule.  Thread count is the engine's, which in a prefork worker is that
+ * worker's slice -- the same workers that will split these rows. */
+static int qwen_amx_int8_rows_ok_nt(long long rows, int nt) QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_rows_ok_nt(long long rows, int nt) {
+    static atomic_int rpt = 0;
+    int v = atomic_load_explicit(&rpt, memory_order_relaxed);
+    if (v == 0) {
+        v = qwen_mm_env_int("QWEN_AMX_INT8_MIN_ROWS_PER_THREAD", 256, 0, 1 << 20) + 1;
+        atomic_store_explicit(&rpt, v, memory_order_relaxed);
+    }
+    v -= 1;
+    if (v <= 0) return 1;
+    if (nt < 1) nt = 1;
+    return rows >= (long long)v * nt;
+}
+static int qwen_amx_int8_rows_ok(long long rows) QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_rows_ok(long long rows) {
+    return qwen_amx_int8_rows_ok_nt(rows, qwen_get_threads());
+}
+
+static int qwen_mm_use_(int mmk, int B, int rows, int cols, int amx_shape) QWEN_MAYBE_UNUSED;
 static int qwen_mm_use(int mmk, int B, int rows, int cols) QWEN_MAYBE_UNUSED;
 static int qwen_mm_use(int mmk, int B, int rows, int cols) {
+    return qwen_mm_use_(mmk, B, rows, cols, 1);
+}
+static int qwen_mm_use_(int mmk, int B, int rows, int cols, int amx_shape) {
     if (mmk <= 0 || mmk >= QWEN_MMK_COUNT) return 0;
-    int force = atomic_load_explicit(&g_mm_force, memory_order_relaxed);
-    if (force != 0) return force == mmk;
     const qwen_mm_gate_t *g = &g_mm_gate[mmk];
     if (g->max_b == 0) return 0;
+    int force = atomic_load_explicit(&g_mm_force, memory_order_relaxed);
+    if (force != 0) return force == mmk && B <= g->max_b;
     int st = atomic_load_explicit(&g_mm_gate_on[mmk], memory_order_relaxed);
     if (st == 0) {
         int on = 1;
@@ -1652,7 +2428,7 @@ static int qwen_mm_use(int mmk, int B, int rows, int cols) {
     if (st != 1) return 0;
     int minb = atomic_load_explicit(&g_mm_gate_minb[mmk], memory_order_relaxed);
     if (minb == 0) {
-        minb = qwen_mm_env_int(g->minb_env, g->min_b, 1, 64);
+        minb = qwen_mm_minb_value(mmk, g);
         atomic_store_explicit(&g_mm_gate_minb[mmk], minb, memory_order_relaxed);
     }
     int minr = atomic_load_explicit(&g_mm_gate_minrows[mmk], memory_order_relaxed);
@@ -1665,21 +2441,184 @@ static int qwen_mm_use(int mmk, int B, int rows, int cols) {
         minc = qwen_mm_env_int(g->mincols_env, g->min_cols, 0, 1 << 20) + 1;
         atomic_store_explicit(&g_mm_gate_mincols[mmk], minc, memory_order_relaxed);
     }
-    return B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1;
+    if (!(B >= minb && B <= g->max_b && rows >= minr - 1 && cols >= minc - 1)) return 0;
+#if defined(__x86_64__) || defined(_M_X64)
+    if (amx_shape && mmk == QWEN_MMK_INT8_AMX && !qwen_amx_int8_rows_ok(rows)) return 0;
+#else
+    (void)amx_shape;
+#endif
+    return 1;
 }
+
+/* --dispatch-map: which gate rows are compiled into THIS binary.  Mirrors the
+ * candidate lists of qwen_kernel_selection_report(); a row that is not compiled
+ * can never be selected whatever the env says. */
+static int qwen_mmk_compiled(int mmk) {
+    switch (mmk) {
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    case QWEN_MMK_BF16_AMX: return 1;
+#endif
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    case QWEN_MMK_BF16_BFMMLA: return 1;
+#endif
+#if defined(__AVX512BF16__)
+    case QWEN_MMK_BF16_AVX512: return 1;
+#endif
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    case QWEN_MMK_INT8_AMX: case QWEN_MMK_Q4_AMX: return 1;
+#endif
+#if defined(__AVX512VNNI__)
+    case QWEN_MMK_INT8_VNNI: case QWEN_MMK_Q4_VNNI: return 1;
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    case QWEN_MMK_INT8_SMMLA: case QWEN_MMK_Q4_SMMLA: case QWEN_MMK_KLEIDI_Q4: return 1;
+    case QWEN_MMK_KLEIDI_I8: case QWEN_MMK_KLEIDI_I8_GEMV: return 1;
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    case QWEN_MMK_KLEIDI_BF16: case QWEN_MMK_KLEIDI_BF16_GEMV: return 1;
+#endif
+#endif
+#if defined(__AVX2__)
+    case QWEN_MMK_INT8_AVX2: case QWEN_MMK_Q4_AVX2: return 1;
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    case QWEN_MMK_INT8_SDOT: return 1;
+#endif
+    default: return 0;
+    }
+}
+
+/* Does the CPU we are running on have the instructions this row needs?  Independent
+ * of the env: the env decides "on", this decides "could it ever be on". */
+static int qwen_mmk_supported(int mmk) {
+    switch (mmk) {
+    case QWEN_MMK_BF16_AMX:  return qwen_amx_bf16_available();
+    case QWEN_MMK_INT8_AMX: case QWEN_MMK_Q4_AMX: return qwen_amx_int8_available();
+#if defined(__x86_64__) || defined(_M_X64)
+    case QWEN_MMK_BF16_AVX512: return __builtin_cpu_supports("avx512bf16") ? 1 : 0;
+    case QWEN_MMK_INT8_VNNI: case QWEN_MMK_Q4_VNNI: return __builtin_cpu_supports("avx512vnni") ? 1 : 0;
+    case QWEN_MMK_INT8_AVX2: case QWEN_MMK_Q4_AVX2: return __builtin_cpu_supports("avx2") ? 1 : 0;
+#endif
+    case QWEN_MMK_KLEIDI_Q4: return qwen_kleidi_supported();
+    case QWEN_MMK_KLEIDI_I8: case QWEN_MMK_KLEIDI_I8_GEMV:
+    case QWEN_MMK_KLEIDI_BF16: case QWEN_MMK_KLEIDI_BF16_GEMV: return qwen_kleidi_supported();
+    default: return qwen_mmk_compiled(mmk);   /* -march=native: compiled == the host has it */
+    }
+}
+
+/* The env-side explanation of a gate row.  This is a DESCRIPTION for the report;
+ * the truth (`on`) comes from calling qwen_mm_use() itself, never from here. */
+static const char *qwen_mm_gate_reason(const qwen_mm_gate_t *g, int on) {
+    const char *e;
+    if (g->on_env) {
+        e = getenv(g->on_env);
+        if (!(e && e[0] == '1')) return "opt-in, env unset";
+    }
+    if (g->off_env && (e = getenv(g->off_env)) && e[0] == '1') return "off_env=1";
+    if (g->amx && (e = getenv("QWEN_NO_AMX")) && e[0] == '1') return "QWEN_NO_AMX=1";
+#if defined(__APPLE__)
+    if (g->apple_off) {
+        e = getenv("QWEN_APPLE_MMLA");
+        return (e && e[0] == '1') ? "QWEN_APPLE_MMLA=1" : "default OFF on Apple (QWEN_APPLE_MMLA=1)";
+    }
+#endif
+    if (g->on_env) return "opt-in env set";
+    return on ? "default ON" : "gate refused at probe shape";
+}
+
+int qwen_mm_gate_describe(int mmk, qwen_mm_gate_desc_t *d) {
+    if (!d || mmk <= 0 || mmk >= QWEN_MMK_COUNT) return 0;
+    const qwen_mm_gate_t *g = &g_mm_gate[mmk];
+    if (g->max_b == 0) return 0;
+    memset(d, 0, sizeof *d);
+    d->mmk = mmk;
+    d->name = g_mmk_info[mmk].name;
+    d->off_env = g->off_env; d->on_env = g->on_env; d->minb_env = g->minb_env;
+    d->minrows_env = g->minrows_env; d->mincols_env = g->mincols_env;
+    d->compiled_min_b = g->min_b; d->max_b = g->max_b;
+    d->compiled_min_rows = g->min_rows; d->compiled_min_cols = g->min_cols;
+    d->amx = g->amx; d->apple_off = g->apple_off;
+    d->compiled = qwen_mmk_compiled(mmk);
+    d->supported = d->compiled ? qwen_mmk_supported(mmk) : 0;
+    d->min_b = qwen_mm_minb_value(mmk, g);
+    d->min_rows = qwen_mm_env_int(g->minrows_env, g->min_rows, 0, 1 << 20);
+    d->min_cols = qwen_mm_env_int(g->mincols_env, g->min_cols, 0, 1 << 20);
+    /* the real predicate, at the smallest B and a shape past every row/col floor */
+    d->on = qwen_mm_use(mmk, d->min_b, 1 << 16, 1 << 16);
+    d->reason = qwen_mm_gate_reason(g, d->on);
+    return 1;
+}
+
+int qwen_amx_prepack_requested(void) {
+    const char *e = getenv("QWEN_AMX_PREPACK");
+    return e && e[0] == '1';
+}
+int qwen_vnni_prepack_requested(void) {
+    const char *e = getenv("QWEN_VNNI_PREPACK");
+    return e && (e[0] == '1' || !strcmp(e, "all") || !strcmp(e, "cp") ||
+                 !strcmp(e, "talker"));
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+static atomic_int g_x86_nchunk = -1;
+static atomic_int g_amx_nchunk = -1;
+static atomic_int g_vnni_nchunk = -1;
+static atomic_int g_avx512_nchunk = -1;
+
+static int qwen_x86_nchunk_value(const char *specific, atomic_int *cache) {
+    int v = atomic_load_explicit(cache, memory_order_relaxed);
+    if (v >= 0) return v;
+    v = qwen_mm_env_int(specific, -1, 0, 1 << 20);
+    if (v < 0) v = qwen_mm_env_int("QWEN_X86_NCHUNK", 0, 0, 1 << 20);
+    atomic_store_explicit(cache, v, memory_order_relaxed);
+    return v;
+}
+
+static int qwen_x86_nchunk(int mmk, int B) {
+    const char *specific = NULL;
+    atomic_int *cache = &g_x86_nchunk;
+    int align = 16;
+    if (mmk == QWEN_MMK_INT8_AMX || mmk == QWEN_MMK_BF16_AMX) {
+        specific = "QWEN_AMX_NCHUNK";
+        cache = &g_amx_nchunk;
+    } else if (mmk == QWEN_MMK_INT8_VNNI) {
+        specific = "QWEN_VNNI_NCHUNK";
+        cache = &g_vnni_nchunk;
+        align = B <= 4 ? 4 : 2;
+    } else if (mmk == QWEN_MMK_BF16_AVX512) {
+        specific = "QWEN_AVX512_NCHUNK";
+        cache = &g_avx512_nchunk;
+        align = B <= 4 ? 4 : 2;
+    } else {
+        return 0;
+    }
+    int v = qwen_x86_nchunk_value(specific, cache);
+    v = (v / align) * align;
+    return v >= align ? v : 0;
+}
+#endif
 
 void qwen_kernel_selection_report(void *out, int rows, int cols) {
     FILE *f = out ? (FILE *)out : stderr;
     if (rows <= 0) rows = 2048;
     if (cols <= 0) cols = 2048;
 
-    int bf16_c[4], int8_c[6], q4_c[6];
+    int bf16_c[5], int8_c[6], q4_c[6];
     int nbf = 0, nint8 = 0, nq4 = 0;
 #if defined(__AMX_BF16__) && defined(__AMX_TILE__)
     if (qwen_amx_bf16_ready()) bf16_c[nbf++] = QWEN_MMK_BF16_AMX;
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    /* ARM-5: KleidiAI bf16 first -- qwen_matvec_bf16 / qwen_matmat_bf16 call kai_bf16_try()
+     * before the in-house BFMMLA kernel, and qwen_matmat_family_bf16() lists it first too.
+     * KAI's bf16 ukernels only ship when i8mm is also present (Makefile: KAI_DIR is gated
+     * on __ARM_FEATURE_MATMUL_INT8), hence the inner guard. */
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    bf16_c[nbf++] = QWEN_MMK_KLEIDI_BF16;
+#endif
     bf16_c[nbf++] = QWEN_MMK_BF16_BFMMLA;
+#endif
+#if defined(__AVX512BF16__)
+    bf16_c[nbf++] = QWEN_MMK_BF16_AVX512;
 #endif
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     if (qwen_amx_int8_ready()) { int8_c[nint8++] = QWEN_MMK_INT8_AMX; q4_c[nq4++] = QWEN_MMK_Q4_AMX; }
@@ -1688,6 +2627,11 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
     int8_c[nint8++] = QWEN_MMK_INT8_VNNI;  q4_c[nq4++] = QWEN_MMK_Q4_VNNI;
 #endif
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+    /* ARM-5: KleidiAI FIRST -- that is the order the dispatcher itself tries
+     * (qwen_matmat_int8 -> kai_i8_try before any gate) and the order
+     * qwen_matmat_family_int8() reports.  Without these entries --caps names the
+     * in-house SMMLA fallback for shapes KleidiAI serves. */
+    int8_c[nint8++] = QWEN_MMK_KLEIDI_I8;  q4_c[nq4++] = QWEN_MMK_KLEIDI_Q4;
     int8_c[nint8++] = QWEN_MMK_INT8_SMMLA; q4_c[nq4++] = QWEN_MMK_Q4_SMMLA;
 #endif
 #if defined(__AVX2__)
@@ -1699,21 +2643,29 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
 
     fprintf(f, "  kernel selection (shape %dx%d, asked to the dispatcher):\n", rows, cols);
 
+    const char *int8_b1 = "f32-accum fused";
+    const char *q4_b1 = "f32 dequant";
+#if defined(__ARM_FEATURE_DOTPROD)
+    int8_b1 = getenv("QWEN_NO_SDOT") ? "f32-accum (SDOT off)" : "SDOT vdotq_s32";
+    q4_b1 = getenv("QWEN_NO_SDOT") ? "f32 dequant" : "SDOT vdotq_s32";
+#elif defined(__AVX512VNNI__)
+    int8_b1 = qwen_avx2_int8_gemv_enabled() ? "AVX2 signed-widening dot (experimental)" :
+              (getenv("QWEN_NO_VNNI") ? "f32-accum (VNNI off)" : "VNNI vpdpbusd");
+    q4_b1 = qwen_avx2_q4_gemv_enabled() ? "AVX2 signed-widening Q4 dot (experimental)" :
+            (getenv("QWEN_NO_VNNI") ? "f32 dequant" : "VNNI vpdpbusd");
+#elif defined(__AVX2__)
+    int8_b1 = qwen_avx2_int8_gemv_enabled() ? "AVX2 signed-widening dot (experimental)" :
+              "AVX2 FMA widen/dequant";
+    q4_b1 = qwen_avx2_q4_gemv_enabled() ? "AVX2 signed-widening Q4 dot (experimental)" :
+            "AVX2 unpack/dequant FMA";
+#endif
     fprintf(f, "    B=1  (CLI, server c=1) matvec: bf16 -> %s | int8 -> %s | q4_0 -> %s\n",
 #if defined(__ARM_FEATURE_BF16) && !defined(__APPLE__)
             getenv("QWEN_ARM_BFDOT") ? "BFDOT" : "NEON 2-row fused",
 #else
             "NEON/scalar 2-row fused",
 #endif
-#if defined(__ARM_FEATURE_DOTPROD)
-            getenv("QWEN_NO_SDOT") ? "f32-accum (SDOT off)" : "SDOT vdotq_s32",
-            getenv("QWEN_NO_SDOT") ? "f32 dequant"          : "SDOT vdotq_s32"
-#elif defined(__AVX512VNNI__)
-            getenv("QWEN_NO_VNNI") ? "f32-accum (VNNI off)" : "VNNI vpdpbusd",
-            getenv("QWEN_NO_VNNI") ? "f32 dequant"          : "VNNI vpdpbusd"
-#else
-            "f32-accum fused", "f32 dequant"
-#endif
+            int8_b1, q4_b1
             );
 
     const struct { const char *what; const int *c; int n; const char *fallback; } rows_[] = {
@@ -1761,6 +2713,209 @@ typedef struct {
     uint8_t  rows[8];
     uint8_t  reserved2[8];
 } qwen_amx_tilecfg;
+
+static int qwen_amx_persistent_config(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AMX_PERSIST_CFG");
+        v = !(e && e[0] == '0');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static _Thread_local unsigned qwen_amx_cfg_key;
+static _Thread_local int qwen_amx_cfg_valid;
+
+static void qwen_amx_prepare_config(const qwen_amx_tilecfg *cfg, unsigned key) {
+    if (!qwen_amx_persistent_config() || !qwen_amx_cfg_valid ||
+        qwen_amx_cfg_key != key) {
+        _tile_loadconfig(cfg);
+        if (qwen_amx_persistent_config()) {
+            qwen_amx_cfg_key = key;
+            qwen_amx_cfg_valid = 1;
+        }
+    }
+}
+
+static void qwen_amx_finish_config(void) {
+    if (!qwen_amx_persistent_config()) {
+        _tile_release();
+        qwen_amx_cfg_valid = 0;
+    }
+}
+
+enum {
+    QWEN_AMX_WEIGHT_CACHE_MAX = 512,
+};
+
+typedef struct {
+    const void *source;
+    int rows;
+    int cols;
+    int kind;
+    size_t bytes;
+    void *packed;
+} qwen_amx_weight_entry;
+
+static qwen_amx_weight_entry g_amx_weights[QWEN_AMX_WEIGHT_CACHE_MAX];
+static atomic_int g_amx_weight_count;
+static pthread_mutex_t g_amx_weight_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int qwen_amx_prepack_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AMX_PREPACK");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_amx_prepack_kind_enabled(int kind) {
+    const char *e = getenv("QWEN_AMX_PREPACK_KINDS");
+    if (!e || !*e || !strcmp(e, "both") || !strcmp(e, "all")) return 1;
+    const char *want = kind == QWEN_AMX_WEIGHT_BF16 ? "bf16" : "int8";
+    size_t want_len = strlen(want);
+    for (const char *p = e; *p;) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if ((size_t)(end - start) == want_len && !strncmp(start, want, want_len)) return 1;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+static int qwen_amx_b32_enabled(void) {
+    const char *e = getenv("QWEN_AMX_B32");
+    return e && e[0] == '1';
+}
+
+static void *qwen_amx_pack_weights(const void *source, int rows, int cols, int kind) {
+    if (!qwen_amx_prepack_enabled() || !qwen_amx_prepack_kind_enabled(kind) ||
+        !source || rows < 16 || cols <= 0) return NULL;
+    const int kstep = kind == QWEN_AMX_WEIGHT_BF16 ? 32 : 64;
+    const size_t elem_size = kind == QWEN_AMX_WEIGHT_BF16 ? sizeof(uint16_t) : sizeof(int8_t);
+    const int row_blocks = rows / 16;
+    const int col_blocks = cols / kstep;
+    if (row_blocks <= 0 || col_blocks <= 0) return NULL;
+    const size_t tile_bytes = (size_t)16 * (size_t)kstep * elem_size;
+    if ((size_t)row_blocks > SIZE_MAX / (size_t)col_blocks ||
+        (size_t)row_blocks * (size_t)col_blocks > SIZE_MAX / tile_bytes)
+        return NULL;
+    const size_t bytes = (size_t)row_blocks * (size_t)col_blocks * tile_bytes;
+
+    int n = atomic_load_explicit(&g_amx_weight_count, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        const qwen_amx_weight_entry *e = &g_amx_weights[i];
+        if (e->source == source && e->rows == rows && e->cols == cols && e->kind == kind)
+            return e->packed;
+    }
+
+    pthread_mutex_lock(&g_amx_weight_mu);
+    n = atomic_load_explicit(&g_amx_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        qwen_amx_weight_entry *e = &g_amx_weights[i];
+        if (e->source == source && e->rows == rows && e->cols == cols && e->kind == kind) {
+            void *packed = e->packed;
+            pthread_mutex_unlock(&g_amx_weight_mu);
+            return packed;
+        }
+    }
+    if (n >= QWEN_AMX_WEIGHT_CACHE_MAX) {
+        pthread_mutex_unlock(&g_amx_weight_mu);
+        return NULL;
+    }
+
+    void *packed = NULL;
+    if (posix_memalign(&packed, 64, bytes) != 0) {
+        pthread_mutex_unlock(&g_amx_weight_mu);
+        return NULL;
+    }
+    const size_t source_stride = (size_t)cols * elem_size;
+    for (int rb = 0; rb < row_blocks; rb++) {
+        for (int cb = 0; cb < col_blocks; cb++) {
+            uint8_t *dst = (uint8_t *)packed +
+                           ((size_t)rb * (size_t)col_blocks + (size_t)cb) * tile_bytes;
+            for (int m = 0; m < 16; m++) {
+                const uint8_t *src = (const uint8_t *)source +
+                                     (size_t)(rb * 16 + m) * source_stride +
+                                     (size_t)cb * (size_t)kstep * elem_size;
+                memcpy(dst + (size_t)m * (size_t)kstep * elem_size,
+                       src, (size_t)kstep * elem_size);
+            }
+        }
+    }
+    g_amx_weights[n].source = source;
+    g_amx_weights[n].rows = rows;
+    g_amx_weights[n].cols = cols;
+    g_amx_weights[n].kind = kind;
+    g_amx_weights[n].bytes = bytes;
+    g_amx_weights[n].packed = packed;
+    atomic_store_explicit(&g_amx_weight_count, n + 1, memory_order_release);
+    pthread_mutex_unlock(&g_amx_weight_mu);
+    return packed;
+}
+
+int qwen_amx_prepack_weight(const void *source, int rows, int cols, int kind) {
+    if (!source || rows <= 0 || cols <= 0 ||
+        (kind != QWEN_AMX_WEIGHT_BF16 && kind != QWEN_AMX_WEIGHT_INT8)) return 0;
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if (kind == QWEN_AMX_WEIGHT_BF16 && !qwen_amx_bf16_ready()) return 0;
+#elif !defined(__AMX_BF16__)
+    if (kind == QWEN_AMX_WEIGHT_BF16) return 0;
+#endif
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (kind == QWEN_AMX_WEIGHT_INT8 && !qwen_amx_int8_ready()) return 0;
+#elif !defined(__AMX_INT8__)
+    if (kind == QWEN_AMX_WEIGHT_INT8) return 0;
+#endif
+    return qwen_amx_pack_weights(source, rows, cols, kind) != NULL;
+}
+
+void qwen_amx_prepack_stats(int *n_packed, size_t *bytes) {
+    int n = 0;
+    size_t total = 0;
+    pthread_mutex_lock(&g_amx_weight_mu);
+    n = atomic_load_explicit(&g_amx_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) total += g_amx_weights[i].bytes;
+    pthread_mutex_unlock(&g_amx_weight_mu);
+    if (n_packed) *n_packed = n;
+    if (bytes) *bytes = total;
+}
+
+void qwen_amx_weight_cache_reset(void) {
+    pthread_mutex_lock(&g_amx_weight_mu);
+    int n = atomic_load_explicit(&g_amx_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        free(g_amx_weights[i].packed);
+        g_amx_weights[i].source = NULL;
+        g_amx_weights[i].rows = 0;
+        g_amx_weights[i].cols = 0;
+        g_amx_weights[i].kind = 0;
+        g_amx_weights[i].bytes = 0;
+        g_amx_weights[i].packed = NULL;
+    }
+    atomic_store_explicit(&g_amx_weight_count, 0, memory_order_release);
+    pthread_mutex_unlock(&g_amx_weight_mu);
+}
+#endif
+
+#if !((defined(__AMX_INT8__) || defined(__AMX_BF16__)) && defined(__AMX_TILE__))
+int qwen_amx_prepack_weight(const void *source, int rows, int cols, int kind) {
+    (void)source; (void)rows; (void)cols; (void)kind;
+    return 0;
+}
+void qwen_amx_prepack_stats(int *n_packed, size_t *bytes) {
+    if (n_packed) *n_packed = 0;
+    if (bytes) *bytes = 0;
+}
+void qwen_amx_weight_cache_reset(void) {}
 #endif
 
 static void bf16_matmat_generic(float *Y, const uint16_t *W, const float *X,
@@ -1839,12 +2994,28 @@ DEFINE_MATMAT_FIXED_B(5)
 DEFINE_MATMAT_FIXED_B(6)
 DEFINE_MATMAT_FIXED_B(7)
 DEFINE_MATMAT_FIXED_B(8)
+/* 9..15 existed only as the generic fallback, and it costs about 10x the fixed-width kernel:
+   measured on an M1, one 2048x2048 call is 2.6 ms at B=8 and B=16 but 21-26 ms at B=9..15.
+   A prefill's last chunk is B = positions mod 16, so seven input lengths in every sixteen were
+   paying that. */
+DEFINE_MATMAT_FIXED_B(9)
+DEFINE_MATMAT_FIXED_B(10)
+DEFINE_MATMAT_FIXED_B(11)
+DEFINE_MATMAT_FIXED_B(12)
+DEFINE_MATMAT_FIXED_B(13)
+DEFINE_MATMAT_FIXED_B(14)
+DEFINE_MATMAT_FIXED_B(15)
 DEFINE_MATMAT_FIXED_B(16)
 #undef DEFINE_MATMAT_FIXED_B
 
 static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
                               int r0, int r1, int cols, int B) {
     MMSTAT(QWEN_MMK_BF16_FIXEDB, r1 - r0, cols, B);
+    if (qwen_matmat_stats_enabled() || qwen_census_enabled()) {
+        int fixed = (B >= 1 && B <= 16);
+        atomic_fetch_add_explicit(&g_mm_fixedw[0], fixed, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mm_generic[0], !fixed, memory_order_relaxed);
+    }
     switch (B) {
         case 1:  bf16_matmat_b1 (Y, W, X, r0, r1, cols); return;
         case 2:  bf16_matmat_b2 (Y, W, X, r0, r1, cols); return;
@@ -1854,6 +3025,13 @@ static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
         case 6:  bf16_matmat_b6 (Y, W, X, r0, r1, cols); return;
         case 7:  bf16_matmat_b7 (Y, W, X, r0, r1, cols); return;
         case 8:  bf16_matmat_b8 (Y, W, X, r0, r1, cols); return;
+        case 9:  bf16_matmat_b9 (Y, W, X, r0, r1, cols); return;
+        case 10: bf16_matmat_b10(Y, W, X, r0, r1, cols); return;
+        case 11: bf16_matmat_b11(Y, W, X, r0, r1, cols); return;
+        case 12: bf16_matmat_b12(Y, W, X, r0, r1, cols); return;
+        case 13: bf16_matmat_b13(Y, W, X, r0, r1, cols); return;
+        case 14: bf16_matmat_b14(Y, W, X, r0, r1, cols); return;
+        case 15: bf16_matmat_b15(Y, W, X, r0, r1, cols); return;
         case 16: bf16_matmat_b16(Y, W, X, r0, r1, cols); return;
         default: bf16_matmat_generic(Y, W, X, r0, r1, cols, B); return;
     }
@@ -2002,13 +3180,15 @@ static void amx_pack_act_bf16(uint16_t *pXb, const uint16_t *Xb, int cols, int k
     }
 }
 
-static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *pXb,
-                                  const uint16_t *Xb, int r0, int r1, int cols, int B) {
+static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint8_t *pW,
+                                  const uint16_t *pXb, const uint16_t *Xb,
+                                  int r0, int r1, int cols, int B) {
     MMSTAT(QWEN_MMK_BF16_AMX, r1 - r0, cols, B);
     const int kfull   = cols & ~31;
     const int nchunk  = kfull >> 5;
     const int cstride = B * 4;
     const size_t wstride = (size_t)cols * sizeof(uint16_t);
+    const int wblocks = cols >> 5;
 
     qwen_amx_tilecfg cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -2018,7 +3198,7 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *p
     cfg.rows[2] = 16; cfg.colsb[2] = 64;
     cfg.rows[3] = 16; cfg.colsb[3] = 64;
     cfg.rows[4] = 16; cfg.colsb[4] = (uint16_t)cstride;
-    _tile_loadconfig(&cfg);
+    qwen_amx_prepare_config(&cfg, 0x10000u | (unsigned)cstride);
 
     float cbuf[2][16 * 16] __attribute__((aligned(64)));
 
@@ -2027,8 +3207,14 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *p
         _tile_zero(0); _tile_zero(1);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXb + (size_t)kc * 32 * (size_t)B, cstride);
-            _tile_loadd(2, W + (size_t)r * cols + (size_t)kc * 32, wstride);
-            _tile_loadd(3, W + (size_t)(r + 16) * cols + (size_t)kc * 32, wstride);
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 32);
+            const void *w1 = pW
+                ? (const void *)(pW + ((size_t)((r >> 4) + 1) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)(r + 16) * cols + (size_t)kc * 32);
+            _tile_loadd(2, w0, pW ? 64 : wstride);
+            _tile_loadd(3, w1, pW ? 64 : wstride);
             _tile_dpbf16ps(0, 2, 4);
             _tile_dpbf16ps(1, 3, 4);
         }
@@ -2051,7 +3237,10 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *p
         _tile_zero(0);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXb + (size_t)kc * 32 * (size_t)B, cstride);
-            _tile_loadd(2, W + (size_t)r * cols + (size_t)kc * 32, wstride);
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 32);
+            _tile_loadd(2, w0, pW ? 64 : wstride);
             _tile_dpbf16ps(0, 2, 4);
         }
         _tile_stored(0, cbuf[0], cstride);
@@ -2067,7 +3256,7 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *p
             }
         }
     }
-    _tile_release();
+    qwen_amx_finish_config();
 
     for (; r < r1; r++) {
         const uint16_t *w = W + (size_t)r * cols;
@@ -2079,8 +3268,10 @@ static void bf16_matmat_amx_slice(float *Y, const uint16_t *W, const uint16_t *p
         }
     }
 }
+
 typedef struct {
-    float *Y; const uint16_t *W; const uint16_t *pXb; const uint16_t *Xb;
+    float *Y; const uint16_t *W; const uint8_t *pW;
+    const uint16_t *pXb; const uint16_t *Xb;
     int rows, cols, B;
 } bf16_amx_ctx;
 static void bf16_amx_task(size_t tid, size_t nt, void *vc) {
@@ -2088,13 +3279,24 @@ static void bf16_amx_task(size_t tid, size_t nt, void *vc) {
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     r0 &= ~15; if (tid + 1 < nt) r1 &= ~15;
-    bf16_matmat_amx_slice(c->Y, c->W, c->pXb, c->Xb, r0, r1, c->cols, c->B);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_BF16_AMX, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            bf16_matmat_amx_slice(c->Y, c->W, c->pW, c->pXb, c->Xb,
+                                  r, e, c->cols, c->B);
+        }
+    } else {
+        bf16_matmat_amx_slice(c->Y, c->W, c->pW, c->pXb, c->Xb,
+                              r0, r1, c->cols, c->B);
+    }
 }
 #endif
 
 #define QWEN_MM_SCRATCH(name, type)                                                      \
     static __thread type *g_mms_##name = NULL;                                           \
     static __thread size_t g_mms_cap_##name = 0;                                         \
+    static type *mm_scratch_##name(size_t nelem) QWEN_MAYBE_UNUSED;                      \
     static type *mm_scratch_##name(size_t nelem) {                                       \
         size_t need = nelem * sizeof(type);                                              \
         if (need > g_mms_cap_##name) {                                                   \
@@ -2108,51 +3310,85 @@ static void bf16_amx_task(size_t tid, size_t nt, void *vc) {
 QWEN_MM_SCRATCH(qx,   int8_t)
 QWEN_MM_SCRATCH(pack, int8_t)
 QWEN_MM_SCRATCH(packb, uint16_t)
+QWEN_MM_SCRATCH(sdcolf, float)
+QWEN_MM_SCRATCH(sdcolq, int8_t)
+QWEN_MM_SCRATCH(sdcolb, uint16_t)
+QWEN_MM_SCRATCH(sdamxacc, float)
+QWEN_MM_SCRATCH(sdsa, float)
 QWEN_MM_SCRATCH(corr, int)
+QWEN_MM_SCRATCH(xb,   uint16_t)
+QWEN_MM_SCRATCH(xcol, float)
+QWEN_MM_SCRATCH(ycol, float)
+QWEN_MM_SCRATCH(snk,  float)
 
 void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
-    qwen_census_op("matmat_bf16", rows, cols, B);
-    if (g_qwen_matmat_bf16_hook) { g_qwen_matmat_bf16_hook(Y, W, X, rows, cols, B); return; }
+    qwen_census_op(QWEN_PATH_MATMAT_BF16, rows, cols, B);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
+    if (g_qwen_matmat_bf16_hook) {
+        g_qwen_matmat_bf16_hook(Y, W, X, rows, cols, B);
+        goto qwen_matmat_bf16_timed_done;
+    }
     if (B <= 0) return;
     if (kai_bf16_try(Y, W, X, rows, cols, B)) {
         MMSTAT(B > 1 ? QWEN_MMK_KLEIDI_BF16 : QWEN_MMK_KLEIDI_BF16_GEMV, rows, cols, B);
-        return;
+        goto qwen_matmat_bf16_timed_done;
     }
     if (qwen_q8r_matmul(Y, (const void *)W, X, rows, cols, B)) {
         MMSTAT(QWEN_MMK_Q8_REPACK_I8MM, rows, cols, B);
-        return;
+        goto qwen_matmat_bf16_timed_done;
     }
     if (B > 64) B = 64;
     int nt = g_n_threads;
 #if defined(__AMX_BF16__) && defined(__AMX_TILE__)
     if (qwen_mm_use(QWEN_MMK_BF16_AMX, B, rows, cols) && qwen_amx_bf16_ready()) {
         const size_t kfull = (size_t)(cols & ~31);
-        uint16_t *Xb  = (uint16_t *)malloc((size_t)B * cols * sizeof(uint16_t));
+        uint16_t *Xb  = mm_scratch_xb((size_t)B * cols);
         uint16_t *pXb = NULL;
         if (Xb) pXb = mm_scratch_packb(kfull * (size_t)B);
         if (Xb && pXb) {
+            const uint8_t *pW = (const uint8_t *)qwen_amx_pack_weights(
+                W, rows, cols, QWEN_AMX_WEIGHT_BF16);
             for (int b = 0; b < B; b++)
                 for (int k = 0; k < cols; k++) {
                     uint32_t u; memcpy(&u, &X[(size_t)k * B + b], 4);
                     Xb[(size_t)b * cols + k] = (uint16_t)(u >> 16);
                 }
             amx_pack_act_bf16(pXb, Xb, cols, (int)kfull, B);
+            bf16_amx_ctx c = { Y, W, pW, pXb, Xb, rows, cols, B };
             if (nt > 1 && rows >= 256) {
-                bf16_amx_ctx c = { Y, W, pXb, Xb, rows, cols, B };
                 qwen_parallel((size_t)nt, bf16_amx_task, &c);
             } else {
-                bf16_matmat_amx_slice(Y, W, pXb, Xb, 0, rows, cols, B);
+                bf16_amx_task(0, 1, &c);
             }
-              free(Xb);
-            return;
+            goto qwen_matmat_bf16_timed_done;
         }
-          free(Xb);
+    }
+#endif
+#if defined(__AVX512BF16__)
+    if (B <= 16 && cols >= 32 && !qwen_bf16dot_disabled() &&
+        qwen_mm_use(QWEN_MMK_BF16_AVX512, B, rows, cols)) {
+        uint16_t *Xb = mm_scratch_packb((size_t)B * cols);
+        if (Xb) {
+            for (int b = 0; b < B; b++)
+                for (int k = 0; k < cols; k++)
+                    Xb[(size_t)b * cols + k] =
+                        qwen_f32_to_bf16_scalar(X[(size_t)k * B + b]);
+            bf16_avx512_ctx c = { Y, W, Xb, rows, cols, B };
+            if (nt > 1 && rows >= 256) {
+                qwen_parallel((size_t)nt, bf16_avx512_task, &c);
+            } else {
+                bf16_avx512_task(0, 1, &c);
+            }
+            goto qwen_matmat_bf16_timed_done;
+        }
     }
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
     {
         if (qwen_mm_use(QWEN_MMK_BF16_BFMMLA, B, rows, cols)) {
-            uint16_t *Xb = (uint16_t *)malloc((size_t)B * cols * sizeof(uint16_t));
+            uint16_t *Xb = mm_scratch_xb((size_t)B * cols);
             if (Xb) {
                 for (int b = 0; b < B; b++)
                     for (int k = 0; k < cols; k++) {
@@ -2165,8 +3401,7 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
                 } else {
                     bf16_matmat_bfmmla_slice(Y, W, Xb, 0, rows, cols, B);
                 }
-                free(Xb);
-                return;
+                goto qwen_matmat_bf16_timed_done;
             }
         }
     }
@@ -2174,9 +3409,87 @@ void qwen_matmat_bf16(float *Y, const uint16_t *W, const float *X, int rows, int
     if (nt > 1 && rows >= 256) {
         bf16_mm_ctx c = { Y, W, X, rows, cols, B };
         qwen_parallel((size_t)nt, bf16_mm_task, &c);
-        return;
+        goto qwen_matmat_bf16_timed_done;
     }
     bf16_matmat_slice(Y, W, X, 0, rows, cols, B);
+
+qwen_matmat_bf16_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, rows, cols, kt_t0);
+}
+
+/* Returns 1 when it handled the call, 0 when the caller must fall back to
+ * qwen_matmat_bf16() with a [cols][B] buffer.  The guard mirrors the AVX-512
+ * branch of qwen_matmat_bf16() AND the four dispatch steps that precede it;
+ * the two must be kept in sync. */
+int qwen_matmat_bf16_rows_usable(int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    if (!qwen_prefill_rowpack_enabled()) return 0;
+    if (g_qwen_matmat_bf16_hook) return 0;           /* GPU hook owns the call */
+    if (qwen_kleidi_bf16_enabled()) return 0;        /* KleidiAI runs first    */
+    if (qwen_q8r_enabled()) return 0;                /* q8 repack runs first   */
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_BF16_AMX, B, rows, cols) && qwen_amx_bf16_ready())
+        return 0;                                    /* AMX branch runs first  */
+#endif
+    return B >= 1 && B <= 16 && cols >= 32 && !qwen_bf16dot_disabled() &&
+           qwen_mm_use(QWEN_MMK_BF16_AVX512, B, rows, cols);
+#else
+    (void)rows; (void)cols; (void)B; return 0;
+#endif
+}
+
+/* [B][cols] f32 rows with stride ldx -> [B][cols] bf16, the layout the AVX-512
+ * kernel consumes.  Depends only on (Xr, ldx, cols, B): callers that run several
+ * projections over the same activation can build this once. */
+void qwen_bf16_pack_rows(uint16_t *Xb, const float *Xr, int ldx, int cols, int B) {
+    for (int b = 0; b < B; b++) {
+        const float *xr = Xr + (size_t)b * (size_t)ldx;
+        uint16_t *dst = Xb + (size_t)b * (size_t)cols;
+#if defined(__AVX512BF16__)
+        for (int k = 0; k < cols; k++) dst[k] = qwen_f32_to_bf16_scalar(xr[k]);
+#else
+        /* qwen_f32_to_bf16_scalar lives in the AVX-512-BF16 section; this entry is never
+           selected elsewhere (qwen_matmat_bf16_rows_usable() returns 0) but it must link. */
+        for (int k = 0; k < cols; k++) {
+            uint32_t u; memcpy(&u, &xr[k], sizeof u);
+            u += 0x7FFFu + ((u >> 16) & 1u);
+            dst[k] = (uint16_t)(u >> 16);
+        }
+#endif
+    }
+}
+
+void qwen_matmat_bf16_packed(float *Y, const uint16_t *W, const uint16_t *Xb,
+                             int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    qwen_census_op(QWEN_PATH_MATMAT_BF16_ROWS, rows, cols, B);
+    MMSTAT(QWEN_MMK_BF16_AVX512, rows, cols, B);
+    bf16_avx512_ctx c = { Y, W, (uint16_t *)Xb, rows, cols, B };
+    const int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) qwen_parallel((size_t)nt, bf16_avx512_task, &c);
+    else                       bf16_avx512_task(0, 1, &c);
+#else
+    (void)Y; (void)W; (void)Xb; (void)rows; (void)cols; (void)B;
+#endif
+}
+
+/* Returns 1 when it handled the call, 0 when the caller must fall back to
+ * qwen_matmat_bf16() with a [cols][B] buffer.  The guard mirrors the AVX-512
+ * branch of qwen_matmat_bf16() AND the four dispatch steps that precede it;
+ * the two must be kept in sync. */
+int qwen_matmat_bf16_rows(float *Y, const uint16_t *W, const float *Xr,
+                          int ldx, int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    if (!qwen_matmat_bf16_rows_usable(rows, cols, B)) return 0;
+    uint16_t *Xb = mm_scratch_packb((size_t)B * cols);
+    if (!Xb) return 0;
+    qwen_bf16_pack_rows(Xb, Xr, ldx, cols, B);
+    qwen_matmat_bf16_packed(Y, W, Xb, rows, cols, B);
+    return 1;
+#else
+    (void)Y; (void)W; (void)Xr; (void)ldx; (void)rows; (void)cols; (void)B;
+    return 0;
+#endif
 }
 
 static void int8_matmat_generic(float *Y, const int8_t *W, const float *scale,
@@ -2235,18 +3548,47 @@ DEFINE_MATMAT_INT8_FIXED_B(3)
 DEFINE_MATMAT_INT8_FIXED_B(4)
 DEFINE_MATMAT_INT8_FIXED_B(6)
 DEFINE_MATMAT_INT8_FIXED_B(8)
+/* 1, 5, 7 and 9..15 were reaching int8_matmat_generic, which measures 5-10x the fixed-width
+   kernel on the same shape: 2.6 ms at B=8 against 14.5 at B=5, 25.4 at B=7 and 20-26 across
+   9..15. This is the fallback twin, so it is what runs wherever no VNNI, AMX, SDOT or SMMLA
+   matmat takes the call - and the widths it was missing are ordinary ones. */
+DEFINE_MATMAT_INT8_FIXED_B(1)
+DEFINE_MATMAT_INT8_FIXED_B(5)
+DEFINE_MATMAT_INT8_FIXED_B(7)
+DEFINE_MATMAT_INT8_FIXED_B(9)
+DEFINE_MATMAT_INT8_FIXED_B(10)
+DEFINE_MATMAT_INT8_FIXED_B(11)
+DEFINE_MATMAT_INT8_FIXED_B(12)
+DEFINE_MATMAT_INT8_FIXED_B(13)
+DEFINE_MATMAT_INT8_FIXED_B(14)
+DEFINE_MATMAT_INT8_FIXED_B(15)
 DEFINE_MATMAT_INT8_FIXED_B(16)
 #undef DEFINE_MATMAT_INT8_FIXED_B
 static void int8_matmat_slice(float *Y, const int8_t *W, const float *scale,
                               const float *X, int r0, int r1, int cols, int B) {
     MMSTAT(QWEN_MMK_INT8_F32TWIN, r1 - r0, cols, B);
+    if (qwen_matmat_stats_enabled() || qwen_census_enabled()) {
+        int fixed = (B >= 1 && B <= 16);
+        atomic_fetch_add_explicit(&g_mm_fixedw[1], fixed, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mm_generic[1], !fixed, memory_order_relaxed);
+    }
     qwen_ftz_on();
     switch (B) {
         case 2:  int8_matmat_b2 (Y, W, scale, X, r0, r1, cols); return;
         case 3:  int8_matmat_b3 (Y, W, scale, X, r0, r1, cols); return;
         case 4:  int8_matmat_b4 (Y, W, scale, X, r0, r1, cols); return;
         case 6:  int8_matmat_b6 (Y, W, scale, X, r0, r1, cols); return;
+        case 1:  int8_matmat_b1 (Y, W, scale, X, r0, r1, cols); return;
+        case 5:  int8_matmat_b5 (Y, W, scale, X, r0, r1, cols); return;
+        case 7:  int8_matmat_b7 (Y, W, scale, X, r0, r1, cols); return;
         case 8:  int8_matmat_b8 (Y, W, scale, X, r0, r1, cols); return;
+        case 9:  int8_matmat_b9 (Y, W, scale, X, r0, r1, cols); return;
+        case 10: int8_matmat_b10(Y, W, scale, X, r0, r1, cols); return;
+        case 11: int8_matmat_b11(Y, W, scale, X, r0, r1, cols); return;
+        case 12: int8_matmat_b12(Y, W, scale, X, r0, r1, cols); return;
+        case 13: int8_matmat_b13(Y, W, scale, X, r0, r1, cols); return;
+        case 14: int8_matmat_b14(Y, W, scale, X, r0, r1, cols); return;
+        case 15: int8_matmat_b15(Y, W, scale, X, r0, r1, cols); return;
         case 16: int8_matmat_b16(Y, W, scale, X, r0, r1, cols); return;
         default: int8_matmat_generic(Y, W, scale, X, r0, r1, cols, B); return;
     }
@@ -2293,7 +3635,71 @@ static void int8_smm_task(size_t tid, size_t nt, void *vc) {
 }
 #endif
 
+/* The matmat input is [cols][B], so each activation column is strided by B. */
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static int qwen_vnni_col_quant_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_VNNI_ACT_QUANT");
+        v = !(e && e[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+/* |x| via an integer AND, not _mm512_andnot_ps: the float-domain logic ops are AVX512DQ,
+ * and the plain AVX-512F profile (SIMD=avx512: F/BW/VL, no DQ, no VNNI) must build too.
+ * Same bits, same kernel -- 0x7FFFFFFF clears the sign exactly as andnot(-0.0f, v) does. */
+static float quantize_act_int8_col_avx512(int8_t *qb, const float *X,
+                                         int cols, int B, int b) {
+    const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
+    const __m512i offsets = _mm512_setr_epi32(
+        0 * B, 1 * B, 2 * B, 3 * B, 4 * B, 5 * B, 6 * B, 7 * B,
+        8 * B, 9 * B, 10 * B, 11 * B, 12 * B, 13 * B, 14 * B, 15 * B);
+    __m512 vmax = _mm512_setzero_ps();
+    int k = 0;
+    for (; k + 16 <= cols; k += 16) {
+        const __m512i idx = _mm512_add_epi32(offsets, _mm512_set1_epi32(k * B));
+        const __m512 v = B == 1
+            ? _mm512_loadu_ps(X + b + k)
+            : _mm512_i32gather_ps(idx, X + b, 4);
+        vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
+    }
+    float amax = _mm512_reduce_max_ps(vmax);
+    for (; k < cols; k++) {
+        const float a = fabsf(X[(size_t)k * B + b]);
+        if (a > amax) amax = a;
+    }
+    if (amax == 0.0f) { memset(qb, 0, (size_t)cols); return 0.0f; }
+
+    const __m512 inv = _mm512_set1_ps(127.0f / amax);
+    k = 0;
+    for (; k + 16 <= cols; k += 16) {
+        const __m512i idx = _mm512_add_epi32(offsets, _mm512_set1_epi32(k * B));
+        const __m512 v = B == 1
+            ? _mm512_loadu_ps(X + b + k)
+            : _mm512_i32gather_ps(idx, X + b, 4);
+        __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(v, inv));
+        q = _mm512_max_epi32(q, _mm512_set1_epi32(-128));
+        q = _mm512_min_epi32(q, _mm512_set1_epi32(127));
+        _mm_storeu_si128((__m128i *)(void *)(qb + k), _mm512_cvtsepi32_epi8(q));
+    }
+    for (; k < cols; k++) {
+        const int v = (int)lrintf(X[(size_t)k * B + b] * (127.0f / amax));
+        qb[k] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    return amax / 127.0f;
+}
+#endif
+
+static float quantize_act_int8_col(int8_t *qb, const float *X, int cols, int B, int b) QWEN_MAYBE_UNUSED;
 static float quantize_act_int8_col(int8_t *qb, const float *X, int cols, int B, int b) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (qwen_vnni_col_quant_enabled() && cols >= 16)
+        return quantize_act_int8_col_avx512(qb, X, cols, B, b);
+#endif
     float amax = 0.0f;
     for (int k = 0; k < cols; k++) { float a = fabsf(X[(size_t)k * B + b]); if (a > amax) amax = a; }
     if (amax == 0.0f) { memset(qb, 0, (size_t)cols); return 0.0f; }
@@ -2318,13 +3724,15 @@ static void amx_pack_act_int8(int8_t *pXt, const int8_t *qXt, int cols, int kpac
     }
 }
 
-static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
-                                  const int8_t *pXt, const int8_t *qXt, const float *sx,
+static void int8_matmat_amx_slice(float *Y, const int8_t *W, const uint8_t *pW,
+                                  const float *scale, const int8_t *pXt,
+                                  const int8_t *qXt, const float *sx,
                                   int r0, int r1, int cols, int B) {
     MMSTAT(QWEN_MMK_INT8_AMX, r1 - r0, cols, B);
     const int kfull   = cols & ~63;
     const int nchunk  = kfull >> 6;
     const int cstride = B * 4;
+    const int wblocks = cols >> 6;
 
     qwen_amx_tilecfg cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -2334,7 +3742,7 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
     cfg.rows[2] = 16; cfg.colsb[2] = 64;
     cfg.rows[3] = 16; cfg.colsb[3] = 64;
     cfg.rows[4] = 16; cfg.colsb[4] = (uint16_t)cstride;
-    _tile_loadconfig(&cfg);
+    qwen_amx_prepare_config(&cfg, 0x20000u | (unsigned)cstride);
 
     int32_t cbuf[2][16 * 16] __attribute__((aligned(64)));
 
@@ -2343,8 +3751,14 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
         _tile_zero(0); _tile_zero(1);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXt + (size_t)kc * 64 * (size_t)B, cstride);
-            _tile_loadd(2, W + (size_t)r * cols + (size_t)kc * 64, cols);
-            _tile_loadd(3, W + (size_t)(r + 16) * cols + (size_t)kc * 64, cols);
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 64);
+            const void *w1 = pW
+                ? (const void *)(pW + ((size_t)((r >> 4) + 1) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)(r + 16) * cols + (size_t)kc * 64);
+            _tile_loadd(2, w0, pW ? 64 : cols);
+            _tile_loadd(3, w1, pW ? 64 : cols);
             _tile_dpbssd(0, 2, 4);
             _tile_dpbssd(1, 3, 4);
         }
@@ -2367,7 +3781,10 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
         _tile_zero(0);
         for (int kc = 0; kc < nchunk; kc++) {
             _tile_loadd(4, pXt + (size_t)kc * 64 * (size_t)B, cstride);
-            _tile_loadd(2, W + (size_t)r * cols + (size_t)kc * 64, cols);
+            const void *w0 = pW
+                ? (const void *)(pW + ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 64);
+            _tile_loadd(2, w0, pW ? 64 : cols);
             _tile_dpbssd(0, 2, 4);
         }
         _tile_stored(0, cbuf[0], cstride);
@@ -2383,7 +3800,7 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
             }
         }
     }
-    _tile_release();
+    qwen_amx_finish_config();
 
     for (; r < r1; r++) {
         const int8_t *w = W + (size_t)r * cols;
@@ -2396,8 +3813,85 @@ static void int8_matmat_amx_slice(float *Y, const int8_t *W, const float *scale,
         }
     }
 }
+
+static int int8_matmat_amx_b32_run(float *Y, const int8_t *W, const float *scale,
+                                   const float *X, int rows, int cols) {
+    if (!Y || !W || !scale || !X || rows < 16 || (rows & 15) != 0 || cols < 64)
+        return 0;
+
+    const int B = 32;
+    const int kfull = cols & ~63;
+    const int nchunk = kfull >> 6;
+    if (nchunk <= 0) return 0;
+
+    int8_t *qXt = mm_scratch_qx((size_t)B * cols);
+    int8_t *pXt = mm_scratch_pack((size_t)kfull * B);
+    if (!qXt || !pXt) return 0;
+    float sx[32];
+    for (int b = 0; b < B; b++)
+        sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+    amx_pack_act_int8(pXt, qXt, cols, kfull, 16);
+    amx_pack_act_int8(pXt + (size_t)kfull * 16,
+                      qXt + (size_t)16 * cols, cols, kfull, 16);
+
+    const uint8_t *pW = (const uint8_t *)qwen_amx_pack_weights(
+        W, rows, cols, QWEN_AMX_WEIGHT_INT8);
+    const int wblocks = cols >> 6;
+    qwen_amx_tilecfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.palette_id = 1;
+    cfg.rows[0] = 16; cfg.colsb[0] = 64;
+    cfg.rows[1] = 16; cfg.colsb[1] = 64;
+    cfg.rows[2] = 16; cfg.colsb[2] = 64;
+    cfg.rows[4] = 16; cfg.colsb[4] = 64;
+    cfg.rows[5] = 16; cfg.colsb[5] = 64;
+    qwen_amx_prepare_config(&cfg, 0x40000u);
+
+    int32_t cbuf0[16 * 16] __attribute__((aligned(64)));
+    int32_t cbuf1[16 * 16] __attribute__((aligned(64)));
+    for (int r = 0; r < rows; r += 16) {
+        _tile_zero(0);
+        _tile_zero(1);
+        for (int kc = 0; kc < nchunk; kc++) {
+            const size_t act_offset = (size_t)kc * 64 * 16;
+            _tile_loadd(4, pXt + act_offset, 64);
+            _tile_loadd(5, pXt + (size_t)kfull * 16 + act_offset, 64);
+            const void *w = pW
+                ? (const void *)((const uint8_t *)pW +
+                                 ((size_t)(r >> 4) * wblocks + (size_t)kc) * 1024)
+                : (const void *)(W + (size_t)r * cols + (size_t)kc * 64);
+            _tile_loadd(2, w, pW ? 64 : cols);
+            _tile_dpbssd(0, 2, 4);
+            _tile_dpbssd(1, 2, 5);
+        }
+        _tile_stored(0, cbuf0, 64);
+        _tile_stored(1, cbuf1, 64);
+        for (int m = 0; m < 16; m++) {
+            const int rr = r + m;
+            const int8_t *w = W + (size_t)rr * cols;
+            const float s = scale[rr];
+            for (int b = 0; b < B; b++) {
+                int32_t sum = b < 16 ? cbuf0[m * 16 + b] : cbuf1[m * 16 + b - 16];
+                const int8_t *qb = qXt + (size_t)b * cols;
+                for (int kk = kfull; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
+                Y[(size_t)rr * B + b] = (float)sum * s * sx[b];
+            }
+        }
+    }
+    qwen_amx_finish_config();
+    return 1;
+}
+
+int qwen_matmat_int8_amx_b32(float *Y, const int8_t *W, const float *scale,
+                             const float *X, int rows, int cols) {
+    if (qwen_amx_b32_enabled() && qwen_amx_int8_ready() &&
+        int8_matmat_amx_b32_run(Y, W, scale, X, rows, cols)) return 1;
+    qwen_matmat_int8(Y, W, scale, X, rows, cols, 32);
+    return 0;
+}
+
 typedef struct {
-    float *Y; const int8_t *W; const float *scale;
+    float *Y; const int8_t *W; const uint8_t *pW; const float *scale;
     const int8_t *pXt; const int8_t *qXt; const float *sx;
     int rows, cols, B;
 } int8_amx_ctx;
@@ -2406,7 +3900,17 @@ static void int8_amx_task(size_t tid, size_t nt, void *vc) {
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     r0 &= ~15; if (tid + 1 < nt) r1 &= ~15;
-    int8_matmat_amx_slice(c->Y, c->W, c->scale, c->pXt, c->qXt, c->sx, r0, r1, c->cols, c->B);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_INT8_AMX, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            int8_matmat_amx_slice(c->Y, c->W, c->pW, c->scale, c->pXt, c->qXt, c->sx,
+                                  r, e, c->cols, c->B);
+        }
+    } else {
+        int8_matmat_amx_slice(c->Y, c->W, c->pW, c->scale, c->pXt, c->qXt, c->sx,
+                              r0, r1, c->cols, c->B);
+    }
 }
 
 static inline void amx_q4_unpack16(int8_t *stage, const q4_0_block_t *W,
@@ -2438,7 +3942,7 @@ static void q4_matmat_amx_slice(float *Y, const q4_0_block_t *W, const int8_t *p
     cfg.rows[3] = 16; cfg.colsb[3] = 32;
     cfg.rows[4] =  8; cfg.colsb[4] = (uint16_t)cstride;
     cfg.rows[5] =  8; cfg.colsb[5] = (uint16_t)cstride;
-    _tile_loadconfig(&cfg);
+    qwen_amx_prepare_config(&cfg, 0x30000u | (unsigned)cstride);
 
     int8_t  stage[2][16 * 32] __attribute__((aligned(64)));
     int32_t cbuf[2][16 * 16]  __attribute__((aligned(64)));
@@ -2487,7 +3991,7 @@ static void q4_matmat_amx_slice(float *Y, const q4_0_block_t *W, const int8_t *p
             for (int b = 0; b < B; b++)
                 Y[(size_t)(r + m) * B + b] = acc[m * B + b] * sx[b];
     }
-    _tile_release();
+    qwen_amx_finish_config();
 
     for (; r < r1; r++) {
         const q4_0_block_t *wr = W + (size_t)r * nb;
@@ -2520,43 +4024,607 @@ static void q4_amx_task(size_t tid, size_t nt, void *vc) {
 
 #endif
 
+#if !defined(__AMX_INT8__) || !defined(__AMX_TILE__)
+int qwen_matmat_int8_amx_b32(float *Y, const int8_t *W, const float *scale,
+                             const float *X, int rows, int cols) {
+    qwen_matmat_int8(Y, W, scale, X, rows, cols, 32);
+    return 0;
+}
+#endif
+
 #if defined(__AVX512VNNI__)
-static void int8_matmat_vnni_slice(float *Y, const int8_t *W, const float *scale,
-                                   const int8_t *qXt, const float *sx,
-                                   int r0, int r1, int cols, int B) {
-    MMSTAT(QWEN_MMK_INT8_VNNI, r1 - r0, cols, B);
+#if defined(__GNUC__) || defined(__clang__)
+#define QWEN_VNNI_NOINLINE __attribute__((noinline))
+#else
+#define QWEN_VNNI_NOINLINE
+#endif
+
+static const int32_t *qwen_vnni_row_sums(const int8_t *W, int rows, int cols);
+
+enum { QWEN_VNNI_WEIGHT_CACHE_MAX = 512 };
+typedef struct {
+    const int8_t *weights;
+    int rows;
+    int cols;
+    size_t bytes;
+    int8_t *packed;
+} qwen_vnni_weight_entry_t;
+
+static qwen_vnni_weight_entry_t g_vnni_weights[QWEN_VNNI_WEIGHT_CACHE_MAX];
+static atomic_int g_vnni_weight_count;
+static pthread_mutex_t g_vnni_weight_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int qwen_vnni_prepack_enabled(void) {
+    const char *e = getenv("QWEN_VNNI_PREPACK");
+    return e && (e[0] == '1' || !strcmp(e, "all") || !strcmp(e, "cp") ||
+                 !strcmp(e, "talker"));
+}
+
+static int8_t *qwen_vnni_pack_n16_k4(const int8_t *source, int rows, int cols) {
+    if (!source || rows < 16 || (rows & 15) || cols <= 0 || (cols & 63)) return NULL;
+    const size_t bytes = (size_t)rows * (size_t)cols;
+    int8_t *packed = (int8_t *)aligned_malloc(bytes);
+    if (!packed) return NULL;
+
+    size_t at = 0;
+    for (int r0 = 0; r0 < rows; r0 += 16) {
+        for (int k = 0; k < cols; k += 4) {
+            for (int r = 0; r < 16; r++) {
+                memcpy(packed + at, source + (size_t)(r0 + r) * cols + k, 4);
+                at += 4;
+            }
+        }
+    }
+    return packed;
+}
+
+int qwen_vnni_prepack_weight(const int8_t *source, int rows, int cols) {
+    if (!qwen_vnni_prepack_enabled() || !source || rows < 16 || (rows & 15) ||
+        cols <= 0 || (cols & 63)) return 0;
+
+    pthread_mutex_lock(&g_vnni_weight_mu);
+    int n = atomic_load_explicit(&g_vnni_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        qwen_vnni_weight_entry_t *e = &g_vnni_weights[i];
+        if (e->weights == source && e->rows == rows && e->cols == cols) {
+            pthread_mutex_unlock(&g_vnni_weight_mu);
+            return 1;
+        }
+    }
+    if (n >= QWEN_VNNI_WEIGHT_CACHE_MAX) {
+        pthread_mutex_unlock(&g_vnni_weight_mu);
+        return 0;
+    }
+
+    int8_t *packed = qwen_vnni_pack_n16_k4(source, rows, cols);
+    if (!packed) {
+        pthread_mutex_unlock(&g_vnni_weight_mu);
+        return 0;
+    }
+    g_vnni_weights[n].weights = source;
+    g_vnni_weights[n].rows = rows;
+    g_vnni_weights[n].cols = cols;
+    g_vnni_weights[n].bytes = (size_t)rows * (size_t)cols;
+    g_vnni_weights[n].packed = packed;
+    atomic_store_explicit(&g_vnni_weight_count, n + 1, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_weight_mu);
+    (void)qwen_vnni_row_sums(source, rows, cols);
+    return 1;
+}
+
+static const int8_t *qwen_vnni_packed_lookup(const int8_t *source, int rows, int cols) {
+    if (!qwen_vnni_prepack_enabled() || !source || rows < 16 || (rows & 15) ||
+        cols <= 0 || (cols & 63)) return NULL;
+    int n = atomic_load_explicit(&g_vnni_weight_count, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        const qwen_vnni_weight_entry_t *e = &g_vnni_weights[i];
+        if (e->weights == source && e->rows == rows && e->cols == cols)
+            return e->packed;
+    }
+    return NULL;
+}
+
+void qwen_vnni_prepack_stats(int *n_packed, size_t *bytes) {
+    int n = 0;
+    size_t total = 0;
+    pthread_mutex_lock(&g_vnni_weight_mu);
+    n = atomic_load_explicit(&g_vnni_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) total += g_vnni_weights[i].bytes;
+    pthread_mutex_unlock(&g_vnni_weight_mu);
+    if (n_packed) *n_packed = n;
+    if (bytes) *bytes = total;
+}
+
+void qwen_vnni_weight_cache_reset(void) {
+    pthread_mutex_lock(&g_vnni_weight_mu);
+    int n = atomic_load_explicit(&g_vnni_weight_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        free(g_vnni_weights[i].packed);
+        g_vnni_weights[i].weights = NULL;
+        g_vnni_weights[i].rows = 0;
+        g_vnni_weights[i].cols = 0;
+        g_vnni_weights[i].bytes = 0;
+        g_vnni_weights[i].packed = NULL;
+    }
+    atomic_store_explicit(&g_vnni_weight_count, 0, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_weight_mu);
+}
+
+static void int8_matmat_vnni_row(float *Y, const int8_t *W, const float *scale,
+                                 const int8_t *qXt, const float *sx,
+                                 const int32_t *row_sums,
+                                 int r, int cols, int B) {
     const __m512i ones = _mm512_set1_epi8(1);
     const __m512i v128 = _mm512_set1_epi8((char)128);
-    for (int r = r0; r < r1; r++) {
-        const int8_t *w = W + (size_t)r * cols;
-        __m512i acc[16], ws = _mm512_setzero_si512();
+    const int8_t *w = W + (size_t)r * cols;
+    __m512i acc[16], ws = _mm512_setzero_si512();
+    for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_si512();
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i wv = _mm512_loadu_si512((const void *)(w + k));
+        if (!row_sums) ws = _mm512_dpbusd_epi32(ws, ones, wv);
+        for (int b = 0; b < B; b++) {
+            __m512i ua = _mm512_add_epi8(
+                _mm512_loadu_si512((const void *)(qXt + (size_t)b * cols + k)), v128);
+            acc[b] = _mm512_dpbusd_epi32(acc[b], ua, wv);
+        }
+    }
+    int sw = row_sums ? row_sums[r] : _mm512_reduce_add_epi32(ws);
+    for (int b = 0; b < B; b++) {
+        int sum = _mm512_reduce_add_epi32(acc[b]) - 128 * sw;
+        const int8_t *qb = qXt + (size_t)b * cols;
+        for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
+        Y[(size_t)r * B + b] = (float)sum * scale[r] * sx[b];
+    }
+}
+
+static inline void int8_matmat_vnni_store(float *Y, const int8_t *W, const float *scale,
+                                          const int8_t *qXt, const float *sx,
+                                          int r, int b, int cols, int k,
+                                          __m512i acc, int sw, int B) {
+    const int8_t *w = W + (size_t)r * cols;
+    int sum = _mm512_reduce_add_epi32(acc) - 128 * sw;
+    const int8_t *qb = qXt + (size_t)b * cols;
+    for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
+    Y[(size_t)r * B + b] = (float)sum * scale[r] * sx[b];
+}
+
+static inline __m512i qwen_vnni_broadcast_q4(const int8_t *x) {
+    uint32_t q;
+    memcpy(&q, x, sizeof(q));
+    return _mm512_set1_epi32((int)q);
+}
+
+/* The packed layout is 16 output rows x 4 K values per 64-byte block. */
+static void int8_matmat_vnni_packed_slice(float *Y, const int8_t *W,
+                                          const int8_t *pW, const float *scale,
+                                          const int8_t *qXt, const float *sx,
+                                          const int32_t *row_sums,
+                                          int r0, int r1, int rows, int cols, int B) {
+    qwen_census_op(QWEN_PATH_MATMAT_INT8_VNNI_PACKED_SLICE, r1 - r0, cols, B);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    int start = (r0 + 15) & ~15;
+    int end = r1 & ~15;
+    if (start > r1) start = r1;
+    if (end < start) end = start;
+
+    for (int r = r0; r < start; r++)
+        int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+
+    for (int r0b = start; r0b < end; r0b += 16) {
+        const int8_t *p = pW + (size_t)(r0b / 16) * (size_t)cols * 16;
+        __m512i acc[8];
         for (int b = 0; b < B; b++) acc[b] = _mm512_setzero_si512();
-        int k = 0;
-        for (; k + 64 <= cols; k += 64) {
-            __m512i wv = _mm512_loadu_si512((const void *)(w + k));
-            ws = _mm512_dpbusd_epi32(ws, ones, wv);
+
+        for (int k = 0; k < cols; k += 4) {
+            const __m512i wv = _mm512_loadu_si512((const void *)p);
+            p += 64;
             for (int b = 0; b < B; b++) {
-                __m512i ua = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qXt + (size_t)b * cols + k)), v128);
+                const __m512i ua = _mm512_add_epi8(
+                    qwen_vnni_broadcast_q4(qXt + (size_t)b * cols + k), v128);
                 acc[b] = _mm512_dpbusd_epi32(acc[b], ua, wv);
             }
         }
-        int sw = _mm512_reduce_add_epi32(ws);
-        float s = scale[r];
-        for (int b = 0; b < B; b++) {
-            int sum = _mm512_reduce_add_epi32(acc[b]) - 128 * sw;
-            const int8_t *qb = qXt + (size_t)b * cols;
-            for (int kk = k; kk < cols; kk++) sum += (int)w[kk] * (int)qb[kk];
-            Y[(size_t)r * B + b] = (float)sum * s * sx[b];
+
+        int32_t sums[8][16];
+        for (int b = 0; b < B; b++) _mm512_storeu_si512(sums[b], acc[b]);
+        for (int r = 0; r < 16; r++) {
+            const int rr = r0b + r;
+            const int correction = 128 * row_sums[rr];
+            const float sr = scale[rr];
+            float *dst = Y + (size_t)rr * B;
+            for (int b = 0; b < B; b++)
+                dst[b] = (float)(sums[b][r] - correction) * sr * sx[b];
         }
     }
+
+    for (int r = end; r < r1; r++)
+        int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+    (void)rows;
 }
+
+static void int8_matmat_vnni_tile_m4n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m4n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
+    __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+    __m512i a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+    __m512i a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+    __m512i ws0 = a00, ws1 = a00, ws2 = a00, ws3 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 0) * cols + k)), v128);
+        __m512i ua1 = _mm512_setzero_si512(), ua2 = ua1, ua3 = ua1;
+        if (nb > 1) ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 1) * cols + k)), v128);
+        if (nb > 2) ua2 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 2) * cols + k)), v128);
+        if (nb > 3) ua3 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 3) * cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        if (nb > 1) a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+        if (nb > 2) a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
+        if (nb > 3) a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        if (nb > 1) a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+        if (nb > 2) a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
+        if (nb > 3) a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 2) * cols + k));
+        if (!row_sums) ws2 = _mm512_dpbusd_epi32(ws2, ones, wv);
+        a20 = _mm512_dpbusd_epi32(a20, ua0, wv);
+        if (nb > 1) a21 = _mm512_dpbusd_epi32(a21, ua1, wv);
+        if (nb > 2) a22 = _mm512_dpbusd_epi32(a22, ua2, wv);
+        if (nb > 3) a23 = _mm512_dpbusd_epi32(a23, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 3) * cols + k));
+        if (!row_sums) ws3 = _mm512_dpbusd_epi32(ws3, ones, wv);
+        a30 = _mm512_dpbusd_epi32(a30, ua0, wv);
+        if (nb > 1) a31 = _mm512_dpbusd_epi32(a31, ua1, wv);
+        if (nb > 2) a32 = _mm512_dpbusd_epi32(a32, ua2, wv);
+        if (nb > 3) a33 = _mm512_dpbusd_epi32(a33, ua3, wv);
+    }
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    const int sw2 = row_sums ? row_sums[row0 + 2] : _mm512_reduce_add_epi32(ws2);
+    const int sw3 = row_sums ? row_sums[row0 + 3] : _mm512_reduce_add_epi32(ws3);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, sw0, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, sw0, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, sw0, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, sw1, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, sw1, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, sw1, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 0, cols, k, a20, sw2, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 1, cols, k, a21, sw2, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 2, cols, k, a22, sw2, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, b0 + 3, cols, k, a23, sw2, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 0, cols, k, a30, sw3, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 1, cols, k, a31, sw3, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 2, cols, k, a32, sw3, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, b0 + 3, cols, k, a33, sw3, B);
+}
+
+static void int8_matmat_vnni_tile_m2n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m2n4(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int b0, int nb, int cols,
+                                       int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
+    __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+    __m512i ws0 = a00, ws1 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 0) * cols + k)), v128);
+        __m512i ua1 = _mm512_setzero_si512(), ua2 = ua1, ua3 = ua1;
+        if (nb > 1) ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 1) * cols + k)), v128);
+        if (nb > 2) ua2 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 2) * cols + k)), v128);
+        if (nb > 3) ua3 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)(b0 + 3) * cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        if (nb > 1) a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+        if (nb > 2) a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
+        if (nb > 3) a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        if (nb > 1) a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+        if (nb > 2) a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
+        if (nb > 3) a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
+    }
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 0, cols, k, a00, sw0, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 1, cols, k, a01, sw0, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 2, cols, k, a02, sw0, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, b0 + 3, cols, k, a03, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 0, cols, k, a10, sw1, B);
+    if (nb > 1) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 1, cols, k, a11, sw1, B);
+    if (nb > 2) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 2, cols, k, a12, sw1, B);
+    if (nb > 3) int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, b0 + 3, cols, k, a13, sw1, B);
+}
+
+static void int8_matmat_vnni_tile_m2n8(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m2n8(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
+    __m512i a04 = a00, a05 = a00, a06 = a00, a07 = a00;
+    __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+    __m512i a14 = a00, a15 = a00, a16 = a00, a17 = a00;
+    __m512i ws0 = a00, ws1 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)0 * cols + k)), v128);
+        __m512i ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)1 * cols + k)), v128);
+        __m512i ua2 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)2 * cols + k)), v128);
+        __m512i ua3 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)3 * cols + k)), v128);
+        __m512i ua4 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)4 * cols + k)), v128);
+        __m512i ua5 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)5 * cols + k)), v128);
+        __m512i ua6 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)6 * cols + k)), v128);
+        __m512i ua7 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)7 * cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 0) * cols + k));
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+        a02 = _mm512_dpbusd_epi32(a02, ua2, wv);
+        a03 = _mm512_dpbusd_epi32(a03, ua3, wv);
+        a04 = _mm512_dpbusd_epi32(a04, ua4, wv);
+        a05 = _mm512_dpbusd_epi32(a05, ua5, wv);
+        a06 = _mm512_dpbusd_epi32(a06, ua6, wv);
+        a07 = _mm512_dpbusd_epi32(a07, ua7, wv);
+
+        wv = _mm512_loadu_si512((const void *)(W + (size_t)(row0 + 1) * cols + k));
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+        a12 = _mm512_dpbusd_epi32(a12, ua2, wv);
+        a13 = _mm512_dpbusd_epi32(a13, ua3, wv);
+        a14 = _mm512_dpbusd_epi32(a14, ua4, wv);
+        a15 = _mm512_dpbusd_epi32(a15, ua5, wv);
+        a16 = _mm512_dpbusd_epi32(a16, ua6, wv);
+        a17 = _mm512_dpbusd_epi32(a17, ua7, wv);
+    }
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 0, cols, k, a00, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 1, cols, k, a01, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 2, cols, k, a02, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 3, cols, k, a03, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 4, cols, k, a04, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 5, cols, k, a05, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 6, cols, k, a06, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 7, cols, k, a07, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 0, cols, k, a10, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 1, cols, k, a11, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 2, cols, k, a12, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 3, cols, k, a13, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 4, cols, k, a14, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 5, cols, k, a15, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 6, cols, k, a16, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 7, cols, k, a17, sw1, B);
+}
+
+/* A fixed B=2 tile, analogous to the ARM SMMLA 2x2 cross-product path.
+ * Unlike the general M4xN4 helper, this has no inactive batch accumulators or
+ * nb branches.  It remains opt-in because the best M dimension is ISA- and
+ * shape-dependent; the default dispatcher is unchanged. */
+static void int8_matmat_vnni_tile_m4n2(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) QWEN_VNNI_NOINLINE;
+static void int8_matmat_vnni_tile_m4n2(float *Y, const int8_t *W, const float *scale,
+                                       const int8_t *qXt, const float *sx,
+                                       const int32_t *row_sums,
+                                       int row0, int cols, int B) {
+    const __m512i ones = _mm512_set1_epi8(1);
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    __m512i a00 = _mm512_setzero_si512(), a01 = a00;
+    __m512i a10 = a00, a11 = a00;
+    __m512i a20 = a00, a21 = a00;
+    __m512i a30 = a00, a31 = a00;
+    __m512i ws0 = a00, ws1 = a00, ws2 = a00, ws3 = a00;
+    int k = 0;
+    for (; k + 64 <= cols; k += 64) {
+        const __m512i ua0 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + k)), v128);
+        const __m512i ua1 = _mm512_add_epi8(
+            _mm512_loadu_si512((const void *)(qXt + (size_t)cols + k)), v128);
+
+        __m512i wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 0) * cols + k));
+        if (!row_sums) ws0 = _mm512_dpbusd_epi32(ws0, ones, wv);
+        a00 = _mm512_dpbusd_epi32(a00, ua0, wv);
+        a01 = _mm512_dpbusd_epi32(a01, ua1, wv);
+
+        wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 1) * cols + k));
+        if (!row_sums) ws1 = _mm512_dpbusd_epi32(ws1, ones, wv);
+        a10 = _mm512_dpbusd_epi32(a10, ua0, wv);
+        a11 = _mm512_dpbusd_epi32(a11, ua1, wv);
+
+        wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 2) * cols + k));
+        if (!row_sums) ws2 = _mm512_dpbusd_epi32(ws2, ones, wv);
+        a20 = _mm512_dpbusd_epi32(a20, ua0, wv);
+        a21 = _mm512_dpbusd_epi32(a21, ua1, wv);
+
+        wv = _mm512_loadu_si512(
+            (const void *)(W + (size_t)(row0 + 3) * cols + k));
+        if (!row_sums) ws3 = _mm512_dpbusd_epi32(ws3, ones, wv);
+        a30 = _mm512_dpbusd_epi32(a30, ua0, wv);
+        a31 = _mm512_dpbusd_epi32(a31, ua1, wv);
+    }
+    const int sw0 = row_sums ? row_sums[row0 + 0] : _mm512_reduce_add_epi32(ws0);
+    const int sw1 = row_sums ? row_sums[row0 + 1] : _mm512_reduce_add_epi32(ws1);
+    const int sw2 = row_sums ? row_sums[row0 + 2] : _mm512_reduce_add_epi32(ws2);
+    const int sw3 = row_sums ? row_sums[row0 + 3] : _mm512_reduce_add_epi32(ws3);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 0, cols, k, a00, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 0, 1, cols, k, a01, sw0, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 0, cols, k, a10, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 1, 1, cols, k, a11, sw1, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, 0, cols, k, a20, sw2, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 2, 1, cols, k, a21, sw2, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, 0, cols, k, a30, sw3, B);
+    int8_matmat_vnni_store(Y, W, scale, qXt, sx, row0 + 3, 1, cols, k, a31, sw3, B);
+}
+
+static int qwen_vnni_tile_n8_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_VNNI_TILE_N8");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_vnni_tile_m4n2_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_VNNI_TILE_M4N2");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_vnni_tile_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *off = getenv("QWEN_NO_VNNI_TILE");
+        v = !(off && off[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static void int8_matmat_vnni_slice(float *Y, const int8_t *W, const float *scale,
+                                   const int8_t *qXt, const float *sx,
+                                   int r0, int r1, int rows, int cols, int B) {
+    MMSTAT(QWEN_MMK_INT8_VNNI, r1 - r0, cols, B);
+    const int32_t *row_sums = qwen_vnni_row_sums(W, rows, cols);
+    const int8_t *pW = qwen_vnni_packed_lookup(W, rows, cols);
+    if (pW && row_sums && B >= 2 && B <= 8) {
+        int8_matmat_vnni_packed_slice(Y, W, pW, scale, qXt, sx, row_sums,
+                                      r0, r1, rows, cols, B);
+        return;
+    }
+    if (B == 2 && qwen_vnni_tile_m4n2_enabled() &&
+        qwen_vnni_tile_enabled() && cols >= 64) {
+        qwen_census_op(QWEN_PATH_MATMAT_INT8_VNNI_M4N2_SLICE, r1 - r0, cols, B);
+        int r = r0;
+        for (; r + 4 <= r1; r += 4)
+            int8_matmat_vnni_tile_m4n2(Y, W, scale, qXt, sx, row_sums,
+                                       r, cols, B);
+        for (; r < r1; r++)
+            int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+        return;
+    }
+    const int compact = B <= 4 || (B <= 8 && rows <= 2048 && cols <= 3072);
+    const int tile_n8 = B == 8 && qwen_vnni_tile_n8_enabled();
+    if (!qwen_vnni_tile_enabled() || cols < 64 || B < 2 || B > 8 ||
+        (!compact && !tile_n8)) {
+        for (int r = r0; r < r1; r++)
+            int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+        return;
+    }
+
+    int r = r0;
+    if (tile_n8) {
+        for (; r + 2 <= r1; r += 2)
+            int8_matmat_vnni_tile_m2n8(Y, W, scale, qXt, sx, row_sums,
+                                        r, cols, B);
+        for (; r < r1; r++)
+            int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+        return;
+    }
+    if (B <= 4) {
+        for (; r + 4 <= r1; r += 4)
+            for (int b0 = 0; b0 < B; b0 += 4) {
+                const int nb = (B - b0 < 4) ? (B - b0) : 4;
+                int8_matmat_vnni_tile_m4n4(Y, W, scale, qXt, sx, row_sums,
+                                            r, b0, nb, cols, B);
+            }
+    } else {
+        for (; r + 2 <= r1; r += 2)
+            for (int b0 = 0; b0 < B; b0 += 4) {
+                const int nb = (B - b0 < 4) ? (B - b0) : 4;
+                int8_matmat_vnni_tile_m2n4(Y, W, scale, qXt, sx, row_sums,
+                                            r, b0, nb, cols, B);
+            }
+    }
+    for (; r < r1; r++)
+        int8_matmat_vnni_row(Y, W, scale, qXt, sx, row_sums, r, cols, B);
+}
+
 typedef struct { float *Y; const int8_t *W; const float *scale; const int8_t *qXt; const float *sx; int rows, cols, B; } int8_vmm_ctx;
 static void int8_vmm_task(size_t tid, size_t nt, void *vc) {
     int8_vmm_ctx *c = (int8_vmm_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
-    int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx, r0, r1, c->cols, c->B);
+    int chunk = qwen_x86_nchunk(QWEN_MMK_INT8_VNNI, c->B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx,
+                                   r, e, c->rows, c->cols, c->B);
+        }
+    } else {
+        int8_matmat_vnni_slice(c->Y, c->W, c->scale, c->qXt, c->sx,
+                               r0, r1, c->rows, c->cols, c->B);
+    }
 }
+#undef QWEN_VNNI_NOINLINE
 #endif
 
 #if defined(__AVX2__)
@@ -2735,11 +4803,14 @@ static void int8_smmla_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B) {
-    qwen_census_op("matmat_int8", rows, cols, B);
+    qwen_census_op(QWEN_PATH_MATMAT_INT8, rows, cols, B);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
     if (B <= 0) return;
     if (kai_i8_try(Y, W, scale, X, rows, cols, B)) {
         MMSTAT(B > 1 ? QWEN_MMK_KLEIDI_I8 : QWEN_MMK_KLEIDI_I8_GEMV, rows, cols, B);
-        return;
+        goto qwen_matmat_int8_timed_done;
     }
     if (B > 64) B = 64;
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -2750,18 +4821,20 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
             int8_t *pXt = NULL;
             if (qXt) pXt = mm_scratch_pack(kfull * (size_t)B);
             if (qXt && pXt) {
+                const uint8_t *pW = (const uint8_t *)qwen_amx_pack_weights(
+                    W, rows, cols, QWEN_AMX_WEIGHT_INT8);
                 float sx[16];
                 for (int b = 0; b < B; b++)
                     sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
                 amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
                 int nt = g_n_threads;
+                int8_amx_ctx c = { Y, W, pW, scale, pXt, qXt, sx, rows, cols, B };
                 if (nt > 1 && rows >= 256) {
-                    int8_amx_ctx c = { Y, W, scale, pXt, qXt, sx, rows, cols, B };
                     qwen_parallel((size_t)nt, int8_amx_task, &c);
                 } else {
-                    int8_matmat_amx_slice(Y, W, scale, pXt, qXt, sx, 0, rows, cols, B);
+                    int8_amx_task(0, 1, &c);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -2775,13 +4848,13 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 for (int b = 0; b < B; b++)
                     sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
                 int nt = g_n_threads;
+                int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
                 if (nt > 1 && rows >= 256) {
-                    int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
                     qwen_parallel((size_t)nt, int8_vmm_task, &c);
                 } else {
-                    int8_matmat_vnni_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
+                    int8_vmm_task(0, 1, &c);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -2804,7 +4877,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 } else {
                     int8_matmat_avx2_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -2824,7 +4897,7 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 } else {
                     int8_matmat_smmla_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -2849,12 +4922,14 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 }
                 int nt = g_n_threads;
                 if (nt > 1 && rows >= 256) {
+                    qwen_census_leaf(QWEN_LEAF_SDOT_MATMAT);
                     int8_smm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
                     qwen_parallel((size_t)nt, int8_smm_task, &c);
                 } else {
+                    qwen_census_leaf(QWEN_LEAF_SDOT_MATMAT);
                     int8_matmat_sdot_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
-                return;
+                goto qwen_matmat_int8_timed_done;
             }
         }
     }
@@ -2863,9 +4938,338 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
     if (nt > 1 && rows >= 256) {
         int8_mm_ctx c = { Y, W, scale, X, rows, cols, B };
         qwen_parallel((size_t)nt, int8_mm_task, &c);
-        return;
+        goto qwen_matmat_int8_timed_done;
     }
     int8_matmat_slice(Y, W, scale, X, 0, rows, cols, B);
+
+qwen_matmat_int8_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_INT8, kt_B, rows, cols, kt_t0);
+}
+
+static int qwen_x86_qkv_disabled(void) QWEN_MAYBE_UNUSED;
+static int qwen_x86_qkv_disabled(void) {
+    static atomic_int disabled = -1;
+    int v = atomic_load_explicit(&disabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_X86_QKV");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&disabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim)
+    QWEN_MAYBE_UNUSED;
+static int qwen_amx_int8_qkv_allowed(int B, int q_dim, int kv_dim, int in_dim) {
+    if (!qwen_mm_use_(QWEN_MMK_INT8_AMX, B, q_dim, in_dim, 0) ||
+        !qwen_mm_use_(QWEN_MMK_INT8_AMX, B, kv_dim, in_dim, 0)) return 0;
+    /* Q, K and V share ONE activation pack and one tile configuration here, so the work-per-
+     * thread rule belongs to their combined height, not to k and v on their own.  That is also
+     * what the measurement shows: at 12 threads both QKV projections are AMX wins (-7.9% and
+     * -6.0%) while the plain 2048-row projections at the same rows/thread are VNNI. */
+    if (!qwen_amx_int8_rows_ok((long long)q_dim + 2LL * (long long)kv_dim)) return 0;
+
+    /* QKV has a different working set from the other projections.  This is an
+     * additional lower bound for that fused path; the general AMX INT8 gate
+     * remains authoritative and still applies to every other projection. */
+    int base = qwen_mm_minb_value(QWEN_MMK_INT8_AMX,
+                                  &g_mm_gate[QWEN_MMK_INT8_AMX]);
+    int qkv = qwen_mm_env_int("QWEN_AMX_INT8_QKV_MIN_B", base, 1, 64);
+    if (qkv < base) qkv = base;
+    return B >= qkv;
+}
+
+typedef struct {
+    float *Y[3];
+    const int8_t *W[3];
+    const uint8_t *pW[3];
+    const float *scale[3];
+    const int8_t *pXt, *qXt;
+    const float *sx;
+    int rows[3], cols, B;
+} int8_qkv_mm_ctx;
+
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+static void int8_qkv_amx_run(float *Y, const int8_t *W, const uint8_t *pW,
+                             const float *scale,
+                             const int8_t *pXt, const int8_t *qXt, const float *sx,
+                             int r0, int r1, int cols, int B) {
+    int chunk = qwen_x86_nchunk(QWEN_MMK_INT8_AMX, B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            int8_matmat_amx_slice(Y, W, pW, scale, pXt, qXt, sx, r, e, cols, B);
+        }
+    } else {
+        int8_matmat_amx_slice(Y, W, pW, scale, pXt, qXt, sx, r0, r1, cols, B);
+    }
+}
+
+static void int8_qkv_amx_task(size_t tid, size_t nt, void *vc) {
+    int8_qkv_mm_ctx *c = (int8_qkv_mm_ctx *)vc;
+    const int total = c->rows[0] + c->rows[1] + c->rows[2];
+    const int tiles = total / 16;
+    const int t0 = (int)(tid * (size_t)tiles / nt);
+    const int t1 = (int)((tid + 1) * (size_t)tiles / nt);
+    const int g0 = t0 * 16, g1 = t1 * 16;
+    int base = 0;
+    for (int i = 0; i < 3; i++) {
+        int lo = g0 > base ? g0 : base;
+        int hi = g1 < base + c->rows[i] ? g1 : base + c->rows[i];
+        if (hi > lo)
+            int8_qkv_amx_run(c->Y[i], c->W[i], c->pW[i], c->scale[i], c->pXt, c->qXt,
+                             c->sx, lo - base, hi - base, c->cols, c->B);
+        base += c->rows[i];
+    }
+}
+#endif
+
+#if defined(__AVX512VNNI__)
+static void int8_qkv_vnni_run(float *Y, const int8_t *W, const float *scale,
+                               const int8_t *qXt, const float *sx,
+                               int r0, int r1, int rows, int cols, int B) {
+    int chunk = qwen_x86_nchunk(QWEN_MMK_INT8_VNNI, B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            int8_matmat_vnni_slice(Y, W, scale, qXt, sx, r, e, rows, cols, B);
+        }
+    } else {
+        int8_matmat_vnni_slice(Y, W, scale, qXt, sx, r0, r1, rows, cols, B);
+    }
+}
+
+static void int8_qkv_vnni_mm_task(size_t tid, size_t nt, void *vc) {
+    int8_qkv_mm_ctx *c = (int8_qkv_mm_ctx *)vc;
+    const int total = c->rows[0] + c->rows[1] + c->rows[2];
+    const int g0 = (int)(tid * (size_t)total / nt);
+    const int g1 = (int)((tid + 1) * (size_t)total / nt);
+    int base = 0;
+    for (int i = 0; i < 3; i++) {
+        int lo = g0 > base ? g0 : base;
+        int hi = g1 < base + c->rows[i] ? g1 : base + c->rows[i];
+        if (hi > lo)
+            int8_qkv_vnni_run(c->Y[i], c->W[i], c->scale[i], c->qXt, c->sx,
+                              lo - base, hi - base, c->rows[i], c->cols, c->B);
+        base += c->rows[i];
+    }
+}
+#endif
+
+int qwen_matmat_int8_qkv(float *q, float *k, float *v,
+                         const int8_t *Wq, const float *sq,
+                         const int8_t *Wk, const float *sk,
+                         const int8_t *Wv, const float *sv,
+                         const float *X, int in_dim, int q_dim, int kv_dim, int B) {
+    const int total = q_dim + 2 * kv_dim;
+    qwen_census_op(QWEN_PATH_MATMAT_INT8_QKV, total, in_dim, B);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
+#if !defined(__x86_64__) && !defined(_M_X64)
+    (void)q; (void)k; (void)v; (void)Wq; (void)sq; (void)Wk; (void)sk;
+    (void)Wv; (void)sv; (void)X; (void)in_dim; (void)q_dim; (void)kv_dim; (void)B;
+    return 0;
+#else
+    if (qwen_x86_qkv_disabled() || B <= 1 || B > 16 || in_dim <= 0 ||
+        q_dim <= 0 || kv_dim <= 0 || !Wq || !Wk || !Wv) return 0;
+
+    int8_t *qXt = mm_scratch_qx((size_t)B * in_dim);
+    if (!qXt) return 0;
+    float sx[16];
+    for (int b = 0; b < B; b++)
+        sx[b] = quantize_act_int8_col(qXt + (size_t)b * in_dim, X, in_dim, B, b);
+
+    int8_qkv_mm_ctx c = {
+        { q, k, v }, { Wq, Wk, Wv }, { NULL, NULL, NULL }, { sq, sk, sv },
+        NULL, qXt, sx, { q_dim, kv_dim, kv_dim }, in_dim, B
+    };
+    const int nt = g_n_threads;
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if ((q_dim & 15) == 0 && (kv_dim & 15) == 0 &&
+        qwen_amx_int8_qkv_allowed(B, q_dim, kv_dim, in_dim) &&
+        qwen_amx_int8_ready()) {
+        const size_t kfull = (size_t)(in_dim & ~63);
+        c.pXt = mm_scratch_pack(kfull * (size_t)B);
+        if (c.pXt) {
+            c.pW[0] = (const uint8_t *)qwen_amx_pack_weights(
+                Wq, q_dim, in_dim, QWEN_AMX_WEIGHT_INT8);
+            c.pW[1] = (const uint8_t *)qwen_amx_pack_weights(
+                Wk, kv_dim, in_dim, QWEN_AMX_WEIGHT_INT8);
+            c.pW[2] = (const uint8_t *)qwen_amx_pack_weights(
+                Wv, kv_dim, in_dim, QWEN_AMX_WEIGHT_INT8);
+            amx_pack_act_int8((int8_t *)c.pXt, qXt, in_dim, (int)kfull, B);
+            if (nt > 1 && total >= 256)
+                qwen_parallel((size_t)nt, int8_qkv_amx_task, &c);
+            else
+                int8_qkv_amx_task(0, 1, &c);
+            qwen_kernel_timing_note(QWEN_KT_INT8, kt_B, total, in_dim, kt_t0);
+            return 1;
+        }
+    }
+#endif
+#if defined(__AVX512VNNI__)
+    if (qwen_mm_use(QWEN_MMK_INT8_VNNI, B, q_dim, in_dim) &&
+        qwen_mm_use(QWEN_MMK_INT8_VNNI, B, kv_dim, in_dim)) {
+        if (nt > 1 && total >= 256)
+            qwen_parallel((size_t)nt, int8_qkv_vnni_mm_task, &c);
+        else
+            int8_qkv_vnni_mm_task(0, 1, &c);
+        qwen_kernel_timing_note(QWEN_KT_INT8, kt_B, total, in_dim, kt_t0);
+        return 1;
+    }
+#endif
+    return 0;
+#endif
+}
+
+typedef struct {
+    float *Y[3];
+    const uint16_t *W[3];
+    const uint8_t *pW[3];
+    const uint16_t *pXb, *Xb;
+    int rows[3], cols, B;
+} bf16_qkv_mm_ctx;
+
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+static void bf16_qkv_amx_run(float *Y, const uint16_t *W, const uint8_t *pW,
+                             const uint16_t *pXb, const uint16_t *Xb,
+                             int r0, int r1, int cols, int B) {
+    int chunk = qwen_x86_nchunk(QWEN_MMK_BF16_AMX, B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            bf16_matmat_amx_slice(Y, W, pW, pXb, Xb, r, e, cols, B);
+        }
+    } else {
+        bf16_matmat_amx_slice(Y, W, pW, pXb, Xb, r0, r1, cols, B);
+    }
+}
+
+static void bf16_qkv_amx_task(size_t tid, size_t nt, void *vc) {
+    bf16_qkv_mm_ctx *c = (bf16_qkv_mm_ctx *)vc;
+    const int total = c->rows[0] + c->rows[1] + c->rows[2];
+    const int tiles = total / 16;
+    const int t0 = (int)(tid * (size_t)tiles / nt);
+    const int t1 = (int)((tid + 1) * (size_t)tiles / nt);
+    const int g0 = t0 * 16, g1 = t1 * 16;
+    int base = 0;
+    for (int i = 0; i < 3; i++) {
+        int lo = g0 > base ? g0 : base;
+        int hi = g1 < base + c->rows[i] ? g1 : base + c->rows[i];
+        if (hi > lo)
+            bf16_qkv_amx_run(c->Y[i], c->W[i], c->pW[i], c->pXb, c->Xb,
+                             lo - base, hi - base, c->cols, c->B);
+        base += c->rows[i];
+    }
+}
+#endif
+
+#if defined(__AVX512BF16__)
+static void bf16_qkv_avx512_run(float *Y, const uint16_t *W, const uint16_t *Xb,
+                                int r0, int r1, int rows, int cols, int B) {
+    int chunk = qwen_x86_nchunk(QWEN_MMK_BF16_AVX512, B);
+    if (chunk > 0) {
+        for (int r = r0; r < r1; r += chunk) {
+            int e = r + chunk < r1 ? r + chunk : r1;
+            bf16_matmat_avx512_slice(Y, W, Xb, r, e, cols, B);
+        }
+    } else {
+        bf16_matmat_avx512_slice(Y, W, Xb, r0, r1, cols, B);
+    }
+    (void)rows;
+}
+
+static void bf16_qkv_avx512_task(size_t tid, size_t nt, void *vc) {
+    bf16_qkv_mm_ctx *c = (bf16_qkv_mm_ctx *)vc;
+    const int total = c->rows[0] + c->rows[1] + c->rows[2];
+    const int g0 = (int)(tid * (size_t)total / nt);
+    const int g1 = (int)((tid + 1) * (size_t)total / nt);
+    int base = 0;
+    for (int i = 0; i < 3; i++) {
+        int lo = g0 > base ? g0 : base;
+        int hi = g1 < base + c->rows[i] ? g1 : base + c->rows[i];
+        if (hi > lo)
+            bf16_qkv_avx512_run(c->Y[i], c->W[i], c->Xb,
+                                lo - base, hi - base, c->rows[i], c->cols, c->B);
+        base += c->rows[i];
+    }
+}
+#endif
+
+int qwen_matmat_bf16_qkv(float *q, float *k, float *v,
+                         const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
+                         const float *X, int in_dim, int q_dim, int kv_dim, int B) {
+    const int total = q_dim + 2 * kv_dim;
+    qwen_census_op(QWEN_PATH_MATMAT_BF16_QKV, total, in_dim, B);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int kt_B = B;
+#if !defined(__x86_64__) && !defined(_M_X64)
+    (void)q; (void)k; (void)v; (void)Wq; (void)Wk; (void)Wv; (void)X;
+    (void)in_dim; (void)q_dim; (void)kv_dim; (void)B;
+    return 0;
+#else
+    if (qwen_x86_qkv_disabled() || B <= 1 || B > 16 || in_dim <= 0 ||
+        q_dim <= 0 || kv_dim <= 0 || !Wq || !Wk || !Wv) return 0;
+
+    uint16_t *Xb = mm_scratch_xb((size_t)B * in_dim);
+    if (!Xb) return 0;
+    for (int b = 0; b < B; b++)
+        for (int i = 0; i < in_dim; i++) {
+            uint32_t u;
+            memcpy(&u, &X[(size_t)i * B + b], sizeof u);
+#if defined(__AVX512BF16__)
+            Xb[(size_t)b * in_dim + i] =
+                (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+#else
+            Xb[(size_t)b * in_dim + i] = (uint16_t)(u >> 16);
+#endif
+        }
+
+    bf16_qkv_mm_ctx c = {
+        { q, k, v }, { Wq, Wk, Wv }, { NULL, NULL, NULL }, NULL, Xb,
+        { q_dim, kv_dim, kv_dim }, in_dim, B
+    };
+    const int nt = g_n_threads;
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if ((q_dim & 15) == 0 && (kv_dim & 15) == 0 &&
+        qwen_mm_use(QWEN_MMK_BF16_AMX, B, q_dim, in_dim) &&
+        qwen_mm_use(QWEN_MMK_BF16_AMX, B, kv_dim, in_dim) &&
+        qwen_amx_bf16_ready()) {
+        const size_t kfull = (size_t)(in_dim & ~31);
+        c.pXb = mm_scratch_packb(kfull * (size_t)B);
+        if (c.pXb) {
+            c.pW[0] = (const uint8_t *)qwen_amx_pack_weights(
+                Wq, q_dim, in_dim, QWEN_AMX_WEIGHT_BF16);
+            c.pW[1] = (const uint8_t *)qwen_amx_pack_weights(
+                Wk, kv_dim, in_dim, QWEN_AMX_WEIGHT_BF16);
+            c.pW[2] = (const uint8_t *)qwen_amx_pack_weights(
+                Wv, kv_dim, in_dim, QWEN_AMX_WEIGHT_BF16);
+            amx_pack_act_bf16((uint16_t *)c.pXb, Xb, in_dim, (int)kfull, B);
+            if (nt > 1 && total >= 256)
+                qwen_parallel((size_t)nt, bf16_qkv_amx_task, &c);
+            else
+                bf16_qkv_amx_task(0, 1, &c);
+            qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, total, in_dim, kt_t0);
+            return 1;
+        }
+    }
+#endif
+#if defined(__AVX512BF16__)
+    if (!qwen_bf16dot_disabled() &&
+        qwen_mm_use(QWEN_MMK_BF16_AVX512, B, q_dim, in_dim) &&
+        qwen_mm_use(QWEN_MMK_BF16_AVX512, B, kv_dim, in_dim)) {
+        if (nt > 1 && total >= 256)
+            qwen_parallel((size_t)nt, bf16_qkv_avx512_task, &c);
+        else
+            bf16_qkv_avx512_task(0, 1, &c);
+        qwen_kernel_timing_note(QWEN_KT_BF16, kt_B, total, in_dim, kt_t0);
+        return 1;
+    }
+#endif
+    return 0;
+#endif
 }
 
 static void q4_matmat_generic(float *Y, const q4_0_block_t *W, const float *X,
@@ -3166,7 +5570,7 @@ static void q4_smmla_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                       int rows, int cols, int B) {
-    qwen_census_op("matmat_q4_0", rows, cols, B);
+    qwen_census_op(QWEN_PATH_MATMAT_Q4_0, rows, cols, B);
     if (B <= 0) return;
     if (B > 64) B = 64;
     if (qwen_mm_use(QWEN_MMK_KLEIDI_Q4, B, rows, cols) &&
@@ -3296,8 +5700,8 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
     }
 #elif defined(__ARM_FEATURE_DOTPROD)
     if (cols % Q4_0_BLOCK_SIZE == 0) {
-        float *xcol = (float *)malloc((size_t)cols * sizeof(float));
-        float *ycol = (float *)malloc((size_t)rows * sizeof(float));
+        float *xcol = mm_scratch_xcol((size_t)cols);
+        float *ycol = mm_scratch_ycol((size_t)rows);
         if (xcol && ycol) {
             MMSTAT(QWEN_MMK_Q4_BMATVEC, rows, cols, B);
             for (int b = 0; b < B; b++) {
@@ -3305,10 +5709,8 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                 qwen_matvec_q4_0(ycol, W, xcol, rows, cols);
                 for (int r = 0; r < rows; r++) Y[(size_t)r * B + b] = ycol[r];
             }
-            free(xcol); free(ycol);
             return;
         }
-        free(xcol); free(ycol);
     }
 #endif
     int nt = g_n_threads;
@@ -3356,7 +5758,7 @@ static void bf16_qkv_task(size_t tid, size_t nt, void *vc) {
 void qwen_matvec_bf16_qkv(float *q, float *k, float *v,
                            const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_bf16_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_BF16_QKV, q_dim + 2 * kv_dim, in_dim, 1);
     if (qwen_q8r_matmul(q, (const void *)Wq, x, q_dim,  in_dim, 1) &&
         qwen_q8r_matmul(k, (const void *)Wk, x, kv_dim, in_dim, 1) &&
         qwen_q8r_matmul(v, (const void *)Wv, x, kv_dim, in_dim, 1)) {
@@ -3632,6 +6034,84 @@ static void int8_matvec_fused(float *y, const float *x, const int8_t *W,
 #endif
 }
 
+/*
+ * Legacy x86 candidate: quantise the activation exactly as the other INT8
+ * paths, then compute a signed INT8 dot without PMADDUBSW. PMADDUBSW is a
+ * saturating unsigned-byte*signed-byte pairwise multiply-add; it is useful for
+ * the existing B>1 packing, but its intermediate int16 saturation is not a
+ * safe assumption for arbitrary legal INT8 operands. Widening both operands
+ * to signed int16 and using PMADDWD gives the exact pair sum in int32.
+ *
+ * This is intentionally a GEMV-only candidate. It is opt-in through
+ * QWEN_AVX2_INT8_GEMV=1 and falls back to the existing FMA GEMV for dimensions
+ * outside the bounded activation scratch contract.
+ */
+#if defined(__AVX2__)
+enum { QWEN_AVX2_INT8_GEMV_MAX_COLS = 8192 };
+
+static int32_t avx2_int8_dot_exact(const int8_t *w, const int8_t *qx, int cols) {
+    __m256i acc = _mm256_setzero_si256();
+    int k = 0;
+    for (; k + 32 <= cols; k += 32) {
+        __m128i w0 = _mm_loadu_si128((const __m128i *)(w + k));
+        __m128i x0 = _mm_loadu_si128((const __m128i *)(qx + k));
+        __m128i w1 = _mm_loadu_si128((const __m128i *)(w + k + 16));
+        __m128i x1 = _mm_loadu_si128((const __m128i *)(qx + k + 16));
+        __m256i w0s = _mm256_cvtepi8_epi16(w0);
+        __m256i x0s = _mm256_cvtepi8_epi16(x0);
+        __m256i w1s = _mm256_cvtepi8_epi16(w1);
+        __m256i x1s = _mm256_cvtepi8_epi16(x1);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(w0s, x0s));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(w1s, x1s));
+    }
+    int32_t sum = (int32_t)avx2_hsum_epi32(acc);
+    for (; k < cols; k++) sum += (int32_t)w[k] * (int32_t)qx[k];
+    return sum;
+}
+
+static int int8_matvec_avx2_emulated_dot(float *y, const float *x,
+                                          const int8_t *W, const float *scale,
+                                          int in_dim, int out_dim) {
+    if (in_dim <= 0 || in_dim > QWEN_AVX2_INT8_GEMV_MAX_COLS) return 0;
+    int8_t qx[QWEN_AVX2_INT8_GEMV_MAX_COLS];
+    float sx = quantize_act_int8_col(qx, x, in_dim, 1, 0);
+    qwen_ftz_on();
+    for (int r = 0; r < out_dim; r++) {
+        const int8_t *row = W + (size_t)r * in_dim;
+        int32_t dot = avx2_int8_dot_exact(row, qx, in_dim);
+        y[r] = (float)dot * scale[r] * sx;
+    }
+    return 1;
+}
+#endif
+
+int qwen_avx2_int8_gemv_compiled(void) {
+#if defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_int8_gemv_supported(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_int8_gemv_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AVX2_INT8_GEMV");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v && qwen_avx2_int8_gemv_compiled() && qwen_avx2_int8_gemv_supported();
+}
+
 #if defined(__ARM_FEATURE_DOTPROD)
 static float quantize_act_int8(int8_t *qx, const float *x, int n) {
     float amax = 0.0f;
@@ -3720,7 +6200,110 @@ static void int8_matvec_sdot(float *y, const int8_t *qx, float sx,
 
 #if defined(__AVX512VNNI__)
 
-static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
+enum { QWEN_VNNI_ROWSUM_MAX = 512 };
+typedef struct {
+    const int8_t *weights;
+    int rows;
+    int cols;
+    int32_t *sums;
+} qwen_vnni_rowsum_entry_t;
+
+static qwen_vnni_rowsum_entry_t g_vnni_rowsums[QWEN_VNNI_ROWSUM_MAX];
+static atomic_int g_vnni_rowsum_count;
+static pthread_mutex_t g_vnni_rowsum_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int qwen_vnni_rowsum_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_VNNI_ROWSUM");
+        v = !(e && e[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static int qwen_vnni_gemv_mr(void) {
+    static atomic_int mr = -1;
+    int v = atomic_load_explicit(&mr, memory_order_relaxed);
+    if (v < 0) {
+        v = qwen_mm_env_int("QWEN_VNNI_GEMV_MR", 2, 2, 4);
+        if (v != 4) v = 2;
+        atomic_store_explicit(&mr, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static const int32_t *qwen_vnni_row_sums(const int8_t *W, int rows, int cols) {
+    if (!qwen_vnni_rowsum_enabled() || !W || rows <= 0 || cols <= 0) return NULL;
+    const int full_cols = cols & ~63;
+    if (full_cols == 0) return NULL;
+    int n = atomic_load_explicit(&g_vnni_rowsum_count, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        const qwen_vnni_rowsum_entry_t *e = &g_vnni_rowsums[i];
+        if (e->weights == W && e->rows == rows && e->cols == cols) return e->sums;
+    }
+
+    pthread_mutex_lock(&g_vnni_rowsum_mu);
+    n = atomic_load_explicit(&g_vnni_rowsum_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        qwen_vnni_rowsum_entry_t *e = &g_vnni_rowsums[i];
+        if (e->weights == W && e->rows == rows && e->cols == cols) {
+            const int32_t *sums = e->sums;
+            pthread_mutex_unlock(&g_vnni_rowsum_mu);
+            return sums;
+        }
+    }
+    if (n >= QWEN_VNNI_ROWSUM_MAX) {
+        pthread_mutex_unlock(&g_vnni_rowsum_mu);
+        return NULL;
+    }
+    int32_t *sums = (int32_t *)malloc((size_t)rows * sizeof(*sums));
+    if (!sums) {
+        pthread_mutex_unlock(&g_vnni_rowsum_mu);
+        return NULL;
+    }
+    for (int r = 0; r < rows; r++) {
+        const int8_t *row = W + (size_t)r * cols;
+        int32_t sum = 0;
+        for (int k = 0; k < full_cols; k++) sum += (int32_t)row[k];
+        sums[r] = sum;
+    }
+    g_vnni_rowsums[n].weights = W;
+    g_vnni_rowsums[n].rows = rows;
+    g_vnni_rowsums[n].cols = cols;
+    g_vnni_rowsums[n].sums = sums;
+    atomic_store_explicit(&g_vnni_rowsum_count, n + 1, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_rowsum_mu);
+    return sums;
+}
+
+void qwen_vnni_row_sums_reset(void) {
+    pthread_mutex_lock(&g_vnni_rowsum_mu);
+    int n = atomic_load_explicit(&g_vnni_rowsum_count, memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        free(g_vnni_rowsums[i].sums);
+        g_vnni_rowsums[i].weights = NULL;
+        g_vnni_rowsums[i].rows = 0;
+        g_vnni_rowsums[i].cols = 0;
+        g_vnni_rowsums[i].sums = NULL;
+    }
+    atomic_store_explicit(&g_vnni_rowsum_count, 0, memory_order_release);
+    pthread_mutex_unlock(&g_vnni_rowsum_mu);
+}
+
+static int qwen_vnni_act_quant_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_NO_VNNI_ACT_QUANT");
+        v = !(e && e[0] == '1');
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+static float quantize_act_int8_x86_scalar(int8_t *qx, const float *x, int n) {
     float amax = 0.0f;
     for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     if (amax == 0.0f) { memset(qx, 0, (size_t)n); return 0.0f; }
@@ -3732,17 +6315,129 @@ static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
     return amax / 127.0f;
 }
 
-static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
-                             const int8_t *W, const float *scale,
-                             int in_dim, int out_dim) {
+static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (qwen_vnni_act_quant_enabled() && n >= 16) {
+        const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
+        __m512 vmax = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
+        }
+        float amax = _mm512_reduce_max_ps(vmax);
+        for (; i < n; i++) {
+            float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0.0f) { memset(qx, 0, (size_t)n); return 0.0f; }
+
+        const __m512 inv = _mm512_set1_ps(127.0f / amax);
+        i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(v, inv));
+            q = _mm512_max_epi32(q, _mm512_set1_epi32(-128));
+            q = _mm512_min_epi32(q, _mm512_set1_epi32(127));
+            _mm_storeu_si128((__m128i *)(void *)(qx + i), _mm512_cvtsepi32_epi8(q));
+        }
+        for (; i < n; i++) {
+            int v = (int)lrintf(x[i] * (127.0f / amax));
+            qx[i] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+        }
+        return amax / 127.0f;
+    }
+#endif
+    return quantize_act_int8_x86_scalar(qx, x, n);
+}
+
+/* A1: opt-in pre-biased (unsigned) activation for the VNNI B=1 GEMV path.
+ *
+ * vpdpbusd takes an UNSIGNED first operand, so the signed int8 activation has
+ * to be shifted by +128 before it can be fed to the instruction.  The default
+ * kernels redo that _mm512_add_epi8 for every output-row group and every K
+ * chunk, i.e. out_dim/MR times more often than necessary.  With QWEN_VNNI_UACT=1
+ * the shift is applied once, while the activation is quantized, and the kernels
+ * consume the biased bytes directly.  The integer math is unchanged: the
+ * existing "- 128 * row_sum" correction already accounts for the bias, so the
+ * results are bit-identical to the signed path.
+ */
+static int qwen_vnni_uact_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        v = qwen_mm_env_int("QWEN_VNNI_UACT", 0, 0, 1);
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
+/* Same quantization as quantize_act_int8_x86(), storing q + 128 as u8. */
+static float quantize_act_u8_x86(uint8_t *ux, const float *x, int n) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (qwen_vnni_act_quant_enabled() && n >= 16) {
+        const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
+        __m512 vmax = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(
+            _mm512_and_si512(_mm512_castps_si512(v), absmask)));
+        }
+        float amax = _mm512_reduce_max_ps(vmax);
+        for (; i < n; i++) {
+            float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0.0f) { memset(ux, 128, (size_t)n); return 0.0f; }
+
+        const __m512 inv = _mm512_set1_ps(127.0f / amax);
+        const __m128i bias = _mm_set1_epi8((char)128);
+        i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 v = _mm512_loadu_ps(x + i);
+            __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(v, inv));
+            q = _mm512_max_epi32(q, _mm512_set1_epi32(-128));
+            q = _mm512_min_epi32(q, _mm512_set1_epi32(127));
+            _mm_storeu_si128((__m128i *)(void *)(ux + i),
+                             _mm_add_epi8(_mm512_cvtsepi32_epi8(q), bias));
+        }
+        for (; i < n; i++) {
+            int v = (int)lrintf(x[i] * (127.0f / amax));
+            v = v > 127 ? 127 : (v < -128 ? -128 : v);
+            ux[i] = (uint8_t)(v + 128);
+        }
+        return amax / 127.0f;
+    }
+#endif
+    {
+        float amax = 0.0f;
+        for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+        if (amax == 0.0f) { memset(ux, 128, (size_t)n); return 0.0f; }
+        float inv = 127.0f / amax;
+        for (int i = 0; i < n; i++) {
+            int v = (int)lrintf(x[i] * inv);
+            v = v > 127 ? 127 : (v < -128 ? -128 : v);
+            ux[i] = (uint8_t)(v + 128);
+        }
+        return amax / 127.0f;
+    }
+}
+
+static void int8_matvec_vnni_legacy(float *y, const int8_t *qx, float sx,
+                                    const int8_t *W, const float *scale,
+                                    int in_dim, int out_dim) {
     const __m512i v128 = _mm512_set1_epi8((char)128);
     const __m512i ones = _mm512_set1_epi8(1);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
     int o = 0;
     for (; o + 1 < out_dim; o += 2) {
         const int8_t *w0 = W + (size_t)o * in_dim;
         const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
         __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
         __m512i ws0  = _mm512_setzero_si512(), ws1  = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         int k = 0;
         for (; k + 64 <= in_dim; k += 64) {
             __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
@@ -3756,12 +6451,16 @@ static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
         int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
         int s1 = _mm512_reduce_add_epi32(acc1) - 128 * _mm512_reduce_add_epi32(ws1);
         for (; k < in_dim; k++) { s0 += (int)w0[k] * qx[k]; s1 += (int)w1[k] * qx[k]; }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)2 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         y[o]     = (float)s0 * scale[o]     * sx;
         y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
     }
     if (o < out_dim) {
         const int8_t *w0 = W + (size_t)o * in_dim;
         __m512i acc0 = _mm512_setzero_si512(), ws0 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
         int k = 0;
         for (; k + 64 <= in_dim; k += 64) {
             __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
@@ -3771,20 +6470,373 @@ static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
         }
         int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
         for (; k < in_dim; k++) s0 += (int)w0[k] * qx[k];
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o] = (float)s0 * scale[o] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+}
+
+static void int8_matvec_vnni_rowsum(float *y, const int8_t *qx, float sx,
+                                    const int8_t *W, const float *scale,
+                                    const int32_t *row_sums,
+                                    int in_dim, int out_dim) {
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            __m512i wv1 = _mm512_loadu_si512((const void *)(w1 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+            acc1 = _mm512_dpbusd_epi32(acc1, ua, wv1);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        for (; k < in_dim; k++) { s0 += (int)w0[k] * qx[k]; s1 += (int)w1[k] * qx[k]; }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)2 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+    if (o < out_dim) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        __m512i acc0 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        for (; k < in_dim; k++) s0 += (int)w0[k] * qx[k];
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o] = (float)s0 * scale[o] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+}
+
+static void int8_matvec_vnni_rowsum_mr4(float *y, const int8_t *qx, float sx,
+                                        const int8_t *W, const float *scale,
+                                        const int32_t *row_sums,
+                                        int in_dim, int out_dim) {
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        const int8_t *w2 = w1 + in_dim;
+        const int8_t *w3 = w2 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512(), acc3 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_add_epi8(
+                _mm512_loadu_si512((const void *)(qx + k)), v128);
+            acc0 = _mm512_dpbusd_epi32(acc0, ua,
+                                       _mm512_loadu_si512((const void *)(w0 + k)));
+            acc1 = _mm512_dpbusd_epi32(acc1, ua,
+                                       _mm512_loadu_si512((const void *)(w1 + k)));
+            acc2 = _mm512_dpbusd_epi32(acc2, ua,
+                                       _mm512_loadu_si512((const void *)(w2 + k)));
+            acc3 = _mm512_dpbusd_epi32(acc3, ua,
+                                       _mm512_loadu_si512((const void *)(w3 + k)));
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        int s2 = _mm512_reduce_add_epi32(acc2) - 128 * row_sums[o + 2];
+        int s3 = _mm512_reduce_add_epi32(acc3) - 128 * row_sums[o + 3];
+        for (; k < in_dim; k++) {
+            const int q = qx[k];
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+            s2 += (int)w2[k] * q;
+            s3 += (int)w3[k] * q;
+        }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)4 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        y[o + 2] = (float)s2 * scale[o + 2] * sx;
+        y[o + 3] = (float)s3 * scale[o + 3] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+    if (o < out_dim)
+        int8_matvec_vnni_rowsum(y + o, qx, sx, W + (size_t)o * in_dim,
+                                scale + o, row_sums + o, in_dim, out_dim - o);
+}
+
+static void int8_matvec_vnni_legacy_mr4(float *y, const int8_t *qx, float sx,
+                                        const int8_t *W, const float *scale,
+                                        int in_dim, int out_dim) {
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    const __m512i ones = _mm512_set1_epi8(1);
+    const int phase_on = qwen_vnni_phase_timing_enabled();
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        const int8_t *w2 = w1 + in_dim;
+        const int8_t *w3 = w2 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512(), acc3 = _mm512_setzero_si512();
+        __m512i ws0 = _mm512_setzero_si512(), ws1 = _mm512_setzero_si512();
+        __m512i ws2 = _mm512_setzero_si512(), ws3 = _mm512_setzero_si512();
+        double dot_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_add_epi8(
+                _mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            __m512i wv1 = _mm512_loadu_si512((const void *)(w1 + k));
+            __m512i wv2 = _mm512_loadu_si512((const void *)(w2 + k));
+            __m512i wv3 = _mm512_loadu_si512((const void *)(w3 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+            acc1 = _mm512_dpbusd_epi32(acc1, ua, wv1);
+            acc2 = _mm512_dpbusd_epi32(acc2, ua, wv2);
+            acc3 = _mm512_dpbusd_epi32(acc3, ua, wv3);
+            ws0 = _mm512_dpbusd_epi32(ws0, ones, wv0);
+            ws1 = _mm512_dpbusd_epi32(ws1, ones, wv1);
+            ws2 = _mm512_dpbusd_epi32(ws2, ones, wv2);
+            ws3 = _mm512_dpbusd_epi32(ws3, ones, wv3);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * _mm512_reduce_add_epi32(ws1);
+        int s2 = _mm512_reduce_add_epi32(acc2) - 128 * _mm512_reduce_add_epi32(ws2);
+        int s3 = _mm512_reduce_add_epi32(acc3) - 128 * _mm512_reduce_add_epi32(ws3);
+        for (; k < in_dim; k++) {
+            const int q = qx[k];
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+            s2 += (int)w2[k] * q;
+            s3 += (int)w3[k] * q;
+        }
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_DOT, (long long)4 * in_dim, dot_t0);
+        double ep_t0 = phase_on ? qwen_mm_now_s() : 0.0;
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        y[o + 2] = (float)s2 * scale[o + 2] * sx;
+        y[o + 3] = (float)s3 * scale[o + 3] * sx;
+        if (phase_on) qwen_vnni_phase_note(QWEN_VP_EPILOGUE, 0, ep_t0);
+    }
+    if (o < out_dim)
+        int8_matvec_vnni_legacy(y + o, qx, sx, W + (size_t)o * in_dim,
+                                scale + o, in_dim, out_dim - o);
+}
+
+/* A1 kernels: identical to int8_matvec_vnni_rowsum{,_mr4} except that the
+ * activation arrives pre-biased, so the per-row-group _mm512_add_epi8 and the
+ * extra activation load are gone from the inner loop. */
+static void int8_matvec_vnni_urowsum(float *y, const uint8_t *ux, float sx,
+                                     const int8_t *W, const float *scale,
+                                     const int32_t *row_sums,
+                                     int in_dim, int out_dim) {
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_loadu_si512((const void *)(ux + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua,
+                                       _mm512_loadu_si512((const void *)(w0 + k)));
+            acc1 = _mm512_dpbusd_epi32(acc1, ua,
+                                       _mm512_loadu_si512((const void *)(w1 + k)));
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        for (; k < in_dim; k++) {
+            const int q = (int)ux[k] - 128;
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+        }
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+    }
+    if (o < out_dim) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        __m512i acc0 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64)
+            acc0 = _mm512_dpbusd_epi32(
+                acc0, _mm512_loadu_si512((const void *)(ux + k)),
+                _mm512_loadu_si512((const void *)(w0 + k)));
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        for (; k < in_dim; k++) s0 += (int)w0[k] * ((int)ux[k] - 128);
         y[o] = (float)s0 * scale[o] * sx;
     }
 }
 
+static void int8_matvec_vnni_urowsum_mr4(float *y, const uint8_t *ux, float sx,
+                                         const int8_t *W, const float *scale,
+                                         const int32_t *row_sums,
+                                         int in_dim, int out_dim) {
+    int o = 0;
+    for (; o + 3 < out_dim; o += 4) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = w0 + in_dim;
+        const int8_t *w2 = w1 + in_dim;
+        const int8_t *w3 = w2 + in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        __m512i acc2 = _mm512_setzero_si512(), acc3 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua = _mm512_loadu_si512((const void *)(ux + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua,
+                                       _mm512_loadu_si512((const void *)(w0 + k)));
+            acc1 = _mm512_dpbusd_epi32(acc1, ua,
+                                       _mm512_loadu_si512((const void *)(w1 + k)));
+            acc2 = _mm512_dpbusd_epi32(acc2, ua,
+                                       _mm512_loadu_si512((const void *)(w2 + k)));
+            acc3 = _mm512_dpbusd_epi32(acc3, ua,
+                                       _mm512_loadu_si512((const void *)(w3 + k)));
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * row_sums[o];
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * row_sums[o + 1];
+        int s2 = _mm512_reduce_add_epi32(acc2) - 128 * row_sums[o + 2];
+        int s3 = _mm512_reduce_add_epi32(acc3) - 128 * row_sums[o + 3];
+        for (; k < in_dim; k++) {
+            const int q = (int)ux[k] - 128;
+            s0 += (int)w0[k] * q;
+            s1 += (int)w1[k] * q;
+            s2 += (int)w2[k] * q;
+            s3 += (int)w3[k] * q;
+        }
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+        y[o + 2] = (float)s2 * scale[o + 2] * sx;
+        y[o + 3] = (float)s3 * scale[o + 3] * sx;
+    }
+    if (o < out_dim)
+        int8_matvec_vnni_urowsum(y + o, ux, sx, W + (size_t)o * in_dim,
+                                 scale + o, row_sums + o, in_dim, out_dim - o);
+}
+
+static void int8_matvec_vnni_u(float *y, const uint8_t *ux, float sx,
+                               const int8_t *W, const float *scale,
+                               const int32_t *row_sums,
+                               int in_dim, int out_dim) {
+    if (qwen_vnni_gemv_mr() == 4)
+        int8_matvec_vnni_urowsum_mr4(y, ux, sx, W, scale, row_sums,
+                                     in_dim, out_dim);
+    else
+        int8_matvec_vnni_urowsum(y, ux, sx, W, scale, row_sums, in_dim, out_dim);
+}
+
+static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
+                             const int8_t *W, const float *scale,
+                             const int32_t *row_sums,
+                             int in_dim, int out_dim) {
+    if (row_sums) {
+        if (qwen_vnni_gemv_mr() == 4)
+            int8_matvec_vnni_rowsum_mr4(y, qx, sx, W, scale, row_sums,
+                                        in_dim, out_dim);
+        else
+            int8_matvec_vnni_rowsum(y, qx, sx, W, scale, row_sums, in_dim, out_dim);
+        return;
+    }
+    if (qwen_vnni_gemv_mr() == 4)
+        int8_matvec_vnni_legacy_mr4(y, qx, sx, W, scale, in_dim, out_dim);
+    else
+        int8_matvec_vnni_legacy(y, qx, sx, W, scale, in_dim, out_dim);
+}
+
 typedef struct {
-    float *y; const int8_t *qx; float sx; const int8_t *W; const float *scale; int rows, cols;
+    float *y; const int8_t *qx; float sx; const int8_t *W; const float *scale;
+    const int32_t *row_sums; int rows, cols; const uint8_t *ux;
 } int8_vnni_ctx;
 static void int8_vnni_task(size_t tid, size_t nt, void *vc) {
     int8_vnni_ctx *c = (int8_vnni_ctx *)vc;
     int r0 = (int)(tid * (size_t)c->rows / nt);
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    if (c->ux) {
+        int8_matvec_vnni_u(c->y + r0, c->ux, c->sx, c->W + (size_t)r0 * c->cols,
+                           c->scale + r0, c->row_sums + r0, c->cols, r1 - r0);
+        return;
+    }
     int8_matvec_vnni(c->y + r0, c->qx, c->sx, c->W + (size_t)r0 * c->cols,
-                     c->scale + r0, c->cols, r1 - r0);
+                     c->scale + r0, c->row_sums ? c->row_sums + r0 : NULL,
+                     c->cols, r1 - r0);
 }
+
+typedef struct {
+    float *q, *k, *v;
+    const int8_t *qx; float sx;
+    const int8_t *Wq, *Wk, *Wv;
+    const float *sq, *sk, *sv;
+    const int32_t *row_sums_q, *row_sums_k, *row_sums_v;
+    int in_dim, q_dim, kv_dim;
+    const uint8_t *ux;
+} int8_qkv_vnni_ctx;
+
+static void int8_qkv_vnni_task(size_t tid, size_t nt, void *vc) {
+    int8_qkv_vnni_ctx *c = (int8_qkv_vnni_ctx *)vc;
+    const int total = c->q_dim + 2 * c->kv_dim;
+    const int g0 = (int)(tid * (size_t)total / nt);
+    const int g1 = (int)((tid + 1) * (size_t)total / nt);
+    const struct { float *y; const int8_t *W; const float *scale; int base, rows; } seg[3] = {
+        { c->q, c->Wq, c->sq, 0,                        c->q_dim  },
+        { c->k, c->Wk, c->sk, c->q_dim,                 c->kv_dim },
+        { c->v, c->Wv, c->sv, c->q_dim + c->kv_dim,     c->kv_dim },
+    };
+    for (int i = 0; i < 3; i++) {
+        const int lo = seg[i].base > g0 ? seg[i].base : g0;
+        const int hi0 = seg[i].base + seg[i].rows;
+        const int hi = hi0 < g1 ? hi0 : g1;
+        if (hi <= lo) continue;
+        const int r0 = lo - seg[i].base;
+        const int32_t *row_sums = i == 0 ? c->row_sums_q :
+                                   (i == 1 ? c->row_sums_k : c->row_sums_v);
+        if (c->ux) {
+            int8_matvec_vnni_u(seg[i].y + r0, c->ux, c->sx,
+                               seg[i].W + (size_t)r0 * c->in_dim,
+                               seg[i].scale + r0, row_sums + r0,
+                               c->in_dim, hi - lo);
+            continue;
+        }
+        int8_matvec_vnni(seg[i].y + r0, c->qx, c->sx,
+                         seg[i].W + (size_t)r0 * c->in_dim, seg[i].scale + r0,
+                         row_sums ? row_sums + r0 : NULL,
+                         c->in_dim, hi - lo);
+    }
+}
+
+static int qwen_vnni_qkv_disabled(void) {
+    static atomic_int disabled = -1;
+    int v = atomic_load_explicit(&disabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *no_vnni = getenv("QWEN_NO_VNNI");
+        const char *no_qkv = getenv("QWEN_NO_VNNI_QKV");
+        v = (no_vnni && no_vnni[0] == '1') || (no_qkv && no_qkv[0] == '1');
+        atomic_store_explicit(&disabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+#endif
+
+#if !defined(__AVX512VNNI__)
+void qwen_vnni_row_sums_reset(void) {}
+int qwen_vnni_prepack_weight(const int8_t *source, int rows, int cols) {
+    (void)source; (void)rows; (void)cols;
+    return 0;
+}
+void qwen_vnni_prepack_stats(int *n_packed, size_t *bytes) {
+    if (n_packed) *n_packed = 0;
+    if (bytes) *bytes = 0;
+}
+void qwen_vnni_weight_cache_reset(void) {}
 #endif
 
 typedef struct {
@@ -3840,29 +6892,53 @@ static void int8_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
                       const float *x, int rows, int cols) {
-    qwen_census_op("matvec_int8", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_INT8, rows, cols, 1);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
     if (kai_i8_try(y, W, scale, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_KLEIDI_I8_GEMV, rows, cols, 1);
-        return;
+        goto qwen_matvec_int8_timed_done;
     }
     MMSTAT(QWEN_MMK_INT8_GEMV, rows, cols, 1);
 
+#if defined(__AVX2__)
+    if (qwen_avx2_int8_gemv_enabled() &&
+        int8_matvec_avx2_emulated_dot(y, x, W, scale, cols, rows)) {
+        qwen_census_leaf(QWEN_LEAF_AVX2_INT8_GEMV);
+        goto qwen_matvec_int8_timed_done;
+    }
+#endif
+
 #if defined(__AVX512VNNI__)
     enum { QXV_MAX = 8192 };
+    const int vp_on = qwen_vnni_phase_timing_enabled();
     static atomic_int vnni_off = -1;
     int vnni_o = atomic_load_explicit(&vnni_off, memory_order_relaxed);
     if (vnni_o < 0) { const char *e = getenv("QWEN_NO_VNNI"); vnni_o = (e && e[0] == '1'); atomic_store_explicit(&vnni_off, vnni_o, memory_order_relaxed); }
     if (!vnni_o && cols <= QXV_MAX) {
+        qwen_census_leaf(QWEN_LEAF_VNNI);
         int8_t qx_buf[QXV_MAX];
-        float sx = quantize_act_int8_x86(qx_buf, x, cols);
+        double vp_rs = vp_on ? qwen_mm_now_s() : 0.0;
+        const int32_t *row_sums = qwen_vnni_row_sums(W, rows, cols);
+        if (vp_on) qwen_vnni_phase_note(QWEN_VP_ROWSUM, 0, vp_rs);
+        const int uact = row_sums && qwen_vnni_uact_enabled();
+        const uint8_t *ux = uact ? (const uint8_t *)qx_buf : NULL;
+        double vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
+        float sx = uact ? quantize_act_u8_x86((uint8_t *)qx_buf, x, cols)
+                        : quantize_act_int8_x86(qx_buf, x, cols);
+        if (vp_on) qwen_vnni_phase_note(
+            QWEN_VP_QUANT, (long long)cols * (long long)sizeof(float), vp_t0);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
-            int8_vnni_ctx c = { y, qx_buf, sx, W, scale, rows, cols };
+            int8_vnni_ctx c = { y, qx_buf, sx, W, scale, row_sums, rows, cols, ux };
+            vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
             qwen_parallel((size_t)nt, int8_vnni_task, &c);
-            return;
+            if (vp_on) qwen_vnni_phase_note(QWEN_VP_PARALLEL, 0, vp_t0);
+            goto qwen_matvec_int8_timed_done;
         }
-        int8_matvec_vnni(y, qx_buf, sx, W, scale, cols, rows);
-        return;
+        if (uact) int8_matvec_vnni_u(y, ux, sx, W, scale, row_sums, cols, rows);
+        else      int8_matvec_vnni(y, qx_buf, sx, W, scale, row_sums, cols, rows);
+        goto qwen_matvec_int8_timed_done;
     }
 #endif
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -3873,23 +6949,28 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
     if (!sdot_o && cols <= QX_MAX) {
         int8_t qx_buf[QX_MAX];
         float sx = quantize_act_int8(qx_buf, x, cols);
+        qwen_census_leaf(QWEN_LEAF_SDOT);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
             int8_sdot_ctx c = { y, qx_buf, sx, W, scale, rows, cols };
             qwen_parallel((size_t)nt, int8_sdot_task, &c);
-            return;
+            goto qwen_matvec_int8_timed_done;
         }
         int8_matvec_sdot(y, qx_buf, sx, W, scale, cols, rows);
-        return;
+        goto qwen_matvec_int8_timed_done;
     }
 #endif
+    qwen_census_leaf(QWEN_LEAF_F32_FUSED);
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         int8_mv_ctx c = { y, x, W, scale, rows, cols };
         qwen_parallel((size_t)nt, int8_mv_task, &c);
-        return;
+        goto qwen_matvec_int8_timed_done;
     }
     int8_matvec_fused(y, x, W, scale, cols, rows);
+
+qwen_matvec_int8_timed_done:
+    qwen_kernel_timing_note(QWEN_KT_INT8, 1, rows, cols, kt_t0);
 }
 
 void qwen_matvec_int8_qkv(float *q, float *k, float *v,
@@ -3897,10 +6978,14 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
                            const int8_t *Wk, const float *sk,
                            const int8_t *Wv, const float *sv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_int8_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_INT8_QKV, q_dim + 2 * kv_dim, in_dim, 1);
+    const int kt_on = qwen_kernel_timing_enabled();
+    const double kt_t0 = kt_on ? qwen_mm_now_s() : 0.0;
+    const int total = q_dim + 2 * kv_dim;
     if (qwen_kleidi_i8_enabled() &&
         qwen_kleidi_matmul_i8_qkv(q, k, v, Wq, Wk, Wv, x, in_dim, q_dim, kv_dim)) {
-        MMSTAT(QWEN_MMK_KLEIDI_I8_GEMV, q_dim + 2 * kv_dim, in_dim, 1);
+        MMSTAT(QWEN_MMK_KLEIDI_I8_GEMV, total, in_dim, 1);
+        qwen_kernel_timing_note(QWEN_KT_INT8, 1, total, in_dim, kt_t0);
         return;
     }
     MMSTAT(QWEN_MMK_INT8_GEMV, q_dim + 2 * kv_dim, in_dim, 1);
@@ -3915,6 +7000,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
         if (!qo && in_dim <= QX_MAX_QKV && nt > 1 && (q_dim + 2 * kv_dim) >= 256) {
             int8_t qx_buf[QX_MAX_QKV];
             float sx = quantize_act_int8(qx_buf, x, in_dim);
+            qwen_census_leaf(QWEN_LEAF_SDOT);
             int8_qkv_sdot_ctx c = { q, k, v, qx_buf, sx, Wq, Wk, Wv, sq, sk, sv,
                                     in_dim, q_dim, kv_dim };
             qwen_parallel((size_t)nt, int8_qkv_sdot_task, &c);
@@ -3922,6 +7008,44 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
         }
     }
 #endif
+#if defined(__AVX512VNNI__)
+    {
+        enum { QX_MAX_QKV = 8192 };
+        const int total = q_dim + 2 * kv_dim;
+        if (!qwen_vnni_qkv_disabled() && in_dim <= QX_MAX_QKV) {
+            qwen_census_leaf(QWEN_LEAF_VNNI);
+            int8_t qx_buf[QX_MAX_QKV];
+            const int vp_on = qwen_vnni_phase_timing_enabled();
+            const int nt = g_n_threads;
+            double vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
+            const int32_t *row_sums_q = qwen_vnni_row_sums(Wq, q_dim, in_dim);
+            const int32_t *row_sums_k = qwen_vnni_row_sums(Wk, kv_dim, in_dim);
+            const int32_t *row_sums_v = qwen_vnni_row_sums(Wv, kv_dim, in_dim);
+            if (vp_on) qwen_vnni_phase_note(QWEN_VP_ROWSUM, 0, vp_t0);
+            const int uact = row_sums_q && row_sums_k && row_sums_v &&
+                             qwen_vnni_uact_enabled();
+            const uint8_t *ux = uact ? (const uint8_t *)qx_buf : NULL;
+            vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
+            const float sx = uact ? quantize_act_u8_x86((uint8_t *)qx_buf, x, in_dim)
+                                  : quantize_act_int8_x86(qx_buf, x, in_dim);
+            if (vp_on) qwen_vnni_phase_note(
+                QWEN_VP_QUANT, (long long)in_dim * (long long)sizeof(float), vp_t0);
+            int8_qkv_vnni_ctx c = { q, k, v, qx_buf, sx, Wq, Wk, Wv,
+                                    sq, sk, sv, row_sums_q, row_sums_k, row_sums_v,
+                                    in_dim, q_dim, kv_dim, ux };
+            if (nt > 1 && total >= 256) {
+                vp_t0 = vp_on ? qwen_mm_now_s() : 0.0;
+                qwen_parallel((size_t)nt, int8_qkv_vnni_task, &c);
+                if (vp_on) qwen_vnni_phase_note(QWEN_VP_PARALLEL, 0, vp_t0);
+            } else {
+                int8_qkv_vnni_task(0, 1, &c);
+            }
+            qwen_kernel_timing_note(QWEN_KT_INT8, 1, total, in_dim, kt_t0);
+            return;
+        }
+    }
+#endif
+    qwen_census_leaf(QWEN_LEAF_DELEGATED);   /* the three rows below carry the work */
     qwen_matvec_int8(q, Wq, sq, x, q_dim, in_dim);
     qwen_matvec_int8(k, Wk, sk, x, kv_dim, in_dim);
     qwen_matvec_int8(v, Wv, sv, x, kv_dim, in_dim);
@@ -3929,7 +7053,7 @@ void qwen_matvec_int8_qkv(float *q, float *k, float *v,
 
 int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
                             int in_dim, int out_dim) {
-    qwen_census_op("argmax_matvec_int8", out_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_ARGMAX_MATVEC_INT8, out_dim, in_dim, 1);
     static __thread float *y = NULL;
     static __thread int y_cap = 0;
     if (out_dim > y_cap) {
@@ -3946,7 +7070,7 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 }
 
 int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, int out_dim) {
-    qwen_census_op("argmax_matvec_q4_0", out_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_ARGMAX_MATVEC_Q4_0, out_dim, in_dim, 1);
     static __thread float *y = NULL;
     static __thread int y_cap = 0;
     if (out_dim > y_cap) {
@@ -4102,6 +7226,90 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
 #endif
         y[o] = sum;
     }
+}
+
+/* Legacy x86 Q4 GEMV candidate.  Q4_0 stores two unsigned nibbles per byte;
+ * the mathematical weight is (nibble - 8) * block_scale.  The AVX2 B>1
+ * implementation already uses the safe range of PMADDUBSW here: nibble (0..15)
+ * times signed activation (-128..127), summed in pairs, cannot approach int16
+ * saturation.  Keep the B=1 path separate so its complete-call quantisation,
+ * correction and output-row tail are measurable independently. */
+#if defined(__AVX2__)
+enum { QWEN_AVX2_Q4_GEMV_MAX_COLS = 8192 };
+
+static int32_t avx2_q4_dot_block(const uint8_t *qs, const int8_t *qx) {
+    const __m128i raw = _mm_loadu_si128((const __m128i *)qs);
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    const __m128i lo = _mm_and_si128(raw, lomask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
+    const __m256i weights = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                                              _mm_unpacklo_epi8(lo, hi));
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i products = _mm256_maddubs_epi16(
+        weights, _mm256_loadu_si256((const __m256i *)qx));
+    const __m256i pair_sums = _mm256_madd_epi16(products, ones);
+    int32_t dot = avx2_hsum_epi32(pair_sums);
+
+    /* Correction for the stored nibble representation: (q - 8) * x. */
+    const __m128i xlo = _mm_loadu_si128((const __m128i *)qx);
+    const __m128i xhi = _mm_loadu_si128((const __m128i *)(qx + 16));
+    const __m256i xlo16 = _mm256_cvtepi8_epi16(xlo);
+    const __m256i xhi16 = _mm256_cvtepi8_epi16(xhi);
+    const int32_t qsum = avx2_hsum_epi32(_mm256_add_epi32(
+        _mm256_madd_epi16(xlo16, ones), _mm256_madd_epi16(xhi16, ones)));
+    return dot - 8 * qsum;
+}
+
+static void avx2_q4_matvec_integer_qx(float *y, const int8_t *qx, float sx,
+                                      const q4_0_block_t *W, int cols, int rows) {
+    const int nb = cols / Q4_0_BLOCK_SIZE;
+    for (int o = 0; o < rows; o++) {
+        const q4_0_block_t *row = W + (size_t)o * nb;
+        float sum = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            sum += qwen_f16_to_f32(row[b].scale_f16) *
+                   (float)avx2_q4_dot_block(row[b].qs, qx + b * Q4_0_BLOCK_SIZE);
+        }
+        y[o] = sum * sx;
+    }
+}
+
+static int avx2_q4_matvec_integer(float *y, const float *x,
+                                  const q4_0_block_t *W, int cols, int rows) {
+    if (cols <= 0 || cols > QWEN_AVX2_Q4_GEMV_MAX_COLS ||
+        cols % Q4_0_BLOCK_SIZE != 0) return 0;
+    int8_t qx[QWEN_AVX2_Q4_GEMV_MAX_COLS];
+    const float sx = quantize_act_int8_col(qx, x, cols, 1, 0);
+    avx2_q4_matvec_integer_qx(y, qx, sx, W, cols, rows);
+    return 1;
+}
+#endif
+
+int qwen_avx2_q4_gemv_compiled(void) {
+#if defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_q4_gemv_supported(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_q4_gemv_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AVX2_Q4_GEMV");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v && qwen_avx2_q4_gemv_compiled() && qwen_avx2_q4_gemv_supported();
 }
 
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -4369,6 +7577,7 @@ static int q4_vnni_v4_on(void) {
                  atomic_store_explicit(&v, r, memory_order_relaxed); }
     return r;
 }
+int qwen_q4_vnni_variant(void) { return q4_vnni_v4_on() ? 4 : (q4_vnni_v3_on() ? 3 : 2); }
 
 static inline void q4_vnni_rows(float *y, const int8_t *qx, float sx,
                                 const q4_0_block_t *W, int cols, int rows) {
@@ -4389,17 +7598,25 @@ static void q4_0_vnni_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
-    qwen_census_op("matvec_q4_0", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q4_0, rows, cols, 1);
     if (qwen_mm_use(QWEN_MMK_KLEIDI_Q4, 1, rows, cols) &&
         qwen_kleidi_matmul_q4(y, (const void *)W, x, rows, cols, 1)) {
         MMSTAT(QWEN_MMK_KLEIDI_Q4, rows, cols, 1);
         return;
     }
     MMSTAT(QWEN_MMK_Q4_GEMV, rows, cols, 1);
+#if defined(__AVX2__)
+    if (qwen_avx2_q4_gemv_enabled() &&
+        avx2_q4_matvec_integer(y, x, W, cols, rows)) {
+        qwen_census_leaf(QWEN_LEAF_AVX2_Q4_GEMV);
+        return;
+    }
+#endif
 #if defined(__AVX512VNNI__)
     if (!q4_sdot_disabled() && cols <= Q4_QX_MAX && cols % Q4_0_BLOCK_SIZE == 0) {
         int8_t qx_buf[Q4_QX_MAX];
         float sx = quantize_act_int8_x86(qx_buf, x, cols);
+        qwen_census_leaf(QWEN_LEAF_VNNI);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
             q4_0_vnni_ctx c = { y, qx_buf, sx, W, rows, cols };
@@ -4415,6 +7632,7 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
         int8_t qx_buf[Q4_QX_MAX];
         float sx = quantize_act_int8(qx_buf, x, cols);
         int nt = g_n_threads;
+        qwen_census_leaf(QWEN_LEAF_SDOT);
         if (nt > 1 && rows >= 256) {
             q4_0_sdot_ctx c = { y, qx_buf, sx, W, rows, cols };
             qwen_parallel((size_t)nt, q4_0_sdot_task, &c);
@@ -4424,6 +7642,7 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
         return;
     }
 #endif
+    qwen_census_leaf(QWEN_LEAF_F32_FUSED);
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         q4_0_mv_ctx c = { y, W, x, rows, cols, cols / Q4_0_BLOCK_SIZE };
@@ -4534,7 +7753,7 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_q4_0_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q4_0_QKV, q_dim + 2 * kv_dim, in_dim, 1);
     if (qwen_mm_use(QWEN_MMK_KLEIDI_Q4, 1, q_dim, in_dim) &&
         qwen_kleidi_matmul_q4(q, (const void *)Wq, x, q_dim,  in_dim, 1) &&
         qwen_kleidi_matmul_q4(k, (const void *)Wk, x, kv_dim, in_dim, 1) &&
@@ -4549,6 +7768,7 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
     int qkv_o = atomic_load_explicit(&qkv_off, memory_order_relaxed);
     if (qkv_o < 0) { const char *e = getenv("QWEN_NO_VNNI_QKV"); qkv_o = (e && e[0] == '1'); atomic_store_explicit(&qkv_off, qkv_o, memory_order_relaxed); }
     if (!qkv_o && !q4_sdot_disabled() && in_dim <= Q4_QX_MAX && in_dim % Q4_0_BLOCK_SIZE == 0) {
+        qwen_census_leaf(QWEN_LEAF_VNNI);
         int8_t qx_buf[Q4_QX_MAX];
         float sx = quantize_act_int8_x86(qx_buf, x, in_dim);
         int nt = g_n_threads;
@@ -4619,7 +7839,7 @@ void qwen_quantize_bf16_to_q2_0(const uint16_t *src_bf16, int rows, int cols,
 
 void qwen_matvec_q2_0(float *y, const q2_0_block_t *W, const float *x,
                       int rows, int cols) {
-    qwen_census_op("matvec_q2_0", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q2_0, rows, cols, 1);
     int bpr = cols / Q2_0_BLOCK_SIZE;
     for (int o = 0; o < rows; o++) {
         const q2_0_block_t *wr = W + (size_t)o * bpr;
@@ -4913,7 +8133,7 @@ static int q6_scalar_forced(void) {
 
 void qwen_matvec_q6_0(float *y, const q6_0_block_t *W, const float *x,
                        int rows, int cols) {
-    qwen_census_op("matvec_q6_0", rows, cols, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q6_0, rows, cols, 1);
     int8_t qx_buf[Q6_QX_MAX];
     int32_t sumx_buf[Q6_QX_MAX / Q6_0_BLOCK_SIZE];
     if (cols > Q6_QX_MAX || cols % Q6_0_BLOCK_SIZE != 0) {
@@ -4981,7 +8201,7 @@ void qwen_matvec_q6_0_qkv(float *q, float *k, float *v,
                           const q6_0_block_t *Wq, const q6_0_block_t *Wk,
                           const q6_0_block_t *Wv,
                           const float *x, int in_dim, int q_dim, int kv_dim) {
-    qwen_census_op("matvec_q6_0_qkv", q_dim + 2 * kv_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_MATVEC_Q6_0_QKV, q_dim + 2 * kv_dim, in_dim, 1);
     if (in_dim > Q6_QX_MAX || in_dim % Q6_0_BLOCK_SIZE != 0) {
         qwen_matvec_q6_0(q, Wq, x, q_dim, in_dim);
         qwen_matvec_q6_0(k, Wk, x, kv_dim, in_dim);
@@ -5294,15 +8514,20 @@ void qwen_causal_attention_windowed(float *out, const float *Q, const float *K, 
     }
 }
 
-void qwen_causal_attention_bf16kv(float *out, const float *Q,
-                                  const uint16_t *K_bf16, const uint16_t *V_bf16,
-                                  int seq_q, int seq_k, int n_heads, int n_kv_heads,
-                                  int head_dim, float scale, int q_offset) {
+/* Head-ranged body of the bf16-KV attention.  Split out of
+ * qwen_causal_attention_bf16kv so a multi-row query block (a sliced prefill) can
+ * be spread over the pool exactly the way qwen_causal_attention_prefill spreads
+ * the f32 one.  Called with [0, n_heads) it is the previous function verbatim. */
+void qwen_causal_attention_bf16kv_heads(float *out, const float *Q,
+                                        const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                        int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                        int head_dim, float scale, int q_offset,
+                                        int h_lo, int h_hi) {
     int heads_per_kv = n_heads / n_kv_heads;
     int q_hidden = n_heads * head_dim;
     int kv_hidden = n_kv_heads * head_dim;
 
-    for (int h = 0; h < n_heads; h++) {
+    for (int h = h_lo; h < h_hi; h++) {
         int kv_h = h / heads_per_kv;
 
         for (int i = 0; i < seq_q; i++) {
@@ -5435,6 +8660,52 @@ void qwen_causal_attention_bf16kv(float *out, const float *Q,
     }
 }
 
+void qwen_causal_attention_bf16kv(float *out, const float *Q,
+                                  const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                  int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                  int head_dim, float scale, int q_offset) {
+    qwen_causal_attention_bf16kv_heads(out, Q, K_bf16, V_bf16, seq_q, seq_k,
+                                       n_heads, n_kv_heads, head_dim, scale, q_offset,
+                                       0, n_heads);
+}
+
+typedef struct {
+    float *out; const float *Q; const uint16_t *K, *V;
+    int seq_q, seq_k, n_heads, n_kv_heads, head_dim, q_offset;
+    float scale;
+} qwen_attn_bf16kv_job_t;
+
+static void qwen_attn_bf16kv_task(size_t tid, size_t nt, void *ctx) {
+    const qwen_attn_bf16kv_job_t *j = (const qwen_attn_bf16kv_job_t *)ctx;
+    int per = (j->n_heads + (int)nt - 1) / (int)nt;
+    int h0 = (int)tid * per, h1 = h0 + per;
+    if (h0 >= j->n_heads) return;
+    if (h1 > j->n_heads) h1 = j->n_heads;
+    qwen_causal_attention_bf16kv_heads(j->out, j->Q, j->K, j->V, j->seq_q, j->seq_k,
+                                       j->n_heads, j->n_kv_heads, j->head_dim, j->scale,
+                                       j->q_offset, h0, h1);
+}
+
+/* Multi-row query block against a bf16 KV cache, parallel over heads.  The head
+ * split is a pure partition of the output rows, so the result does not depend on
+ * the thread count. */
+void qwen_causal_attention_bf16kv_prefill(float *out, const float *Q,
+                                          const uint16_t *K_bf16, const uint16_t *V_bf16,
+                                          int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                          int head_dim, float scale, int q_offset) {
+    int nt = qwen_get_threads();
+    if (nt > n_heads) nt = n_heads;
+    if (nt > 1 && seq_q > 1) {
+        qwen_attn_bf16kv_job_t job = { out, Q, K_bf16, V_bf16, seq_q, seq_k, n_heads,
+                                       n_kv_heads, head_dim, q_offset, scale };
+        qwen_parallel((size_t)nt, qwen_attn_bf16kv_task, &job);
+        return;
+    }
+    qwen_causal_attention_bf16kv_heads(out, Q, K_bf16, V_bf16, seq_q, seq_k,
+                                       n_heads, n_kv_heads, head_dim, scale, q_offset,
+                                       0, n_heads);
+}
+
 void qwen_silu(float *x, int n) {
     for (int i = 0; i < n; i++)
         x[i] = x[i] / (1.0f + expf(-x[i]));
@@ -5552,6 +8823,11 @@ void qwen_bf16_to_f32_vec(float *dst, const uint16_t *src_bf16, int n) {
     }
 }
 
+/* Capability, split from policy.  _available says the int8 decoder-convolution kernels are
+ * compiled for this build; _usable adds the shapes those kernels actually cover, which the
+ * decoder used to spell out at its call site (in_ch == out_ch && in_ch <= 768) even though
+ * the constraint belongs to the kernel.  Neither answers whether the path is ENABLED --
+ * that is a per-backend policy decision and lives with the decoder. */
 int qwen_sd_int8_available(void) {
 #if defined(__ARM_FEATURE_DOTPROD)
     return 1;
@@ -5561,8 +8837,233 @@ int qwen_sd_int8_available(void) {
     return 0;
 #endif
 }
+/* Which family actually serves a B>1 matmat on THIS build, in the order the dispatcher
+ * tries them.  The gate table already prints compiled/supported per family, but it cannot
+ * say which one wins, and it has no row at all for the unconditional B-twin fallback -- so
+ * on a build where every gate is off (AVX2 and AVX-512F for bf16, any non-VNNI x86 for the
+ * integer paths) the map used to say nothing about what runs.  Evaluated at a representative
+ * large shape so the thresholds in g_mm_gate[] are applied rather than duplicated here. */
+/* One probe shape, so say which: a family row answers "who serves this dtype at a batched
+ * shape", not "who serves every shape".  A gate with a higher min_b or a rows/cols floor can
+ * still decline the real projection, and the per-gate table below carries those numbers. */
+#define QWEN_MMK_PROBE_B    4
+#define QWEN_MMK_PROBE_ROWS 4096
+#define QWEN_MMK_PROBE_COLS 4096
+static const char *mmk_first_available(const int *cand, int n, const char *none,
+                                       char *buf, size_t bsz) {
+    enum { RB = QWEN_MMK_PROBE_B, RR = QWEN_MMK_PROBE_ROWS, RC = QWEN_MMK_PROBE_COLS };
+    for (int i = 0; i < n; i++) {
+        int k = cand[i];
+        if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) && qwen_mm_use(k, RB, RR, RC)) {
+            snprintf(buf, bsz, "%s (probe B=%d %dx%d)", g_mmk_info[k].name, RB, RR, RC);
+            return buf;
+        }
+    }
+    snprintf(buf, bsz, "%s (probe B=%d %dx%d)", none, RB, RR, RC);
+    return buf;
+}
+const char *qwen_matmat_family_int8(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
+                                QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };
+    static char buf[96];
+    return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
+                               "int8 f32-accum twin (no int8 GEMM gate on this build)",
+                               buf, sizeof buf);
+}
+const char *qwen_matmat_family_q4(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_Q4, QWEN_MMK_Q4_AMX, QWEN_MMK_Q4_VNNI,
+                                QWEN_MMK_Q4_AVX2, QWEN_MMK_Q4_SMMLA, QWEN_MMK_Q4_BMATVEC };
+    static char buf[96];
+    return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
+                               "q4 generic twin (no q4 GEMM gate on this build)",
+                               buf, sizeof buf);
+}
+/* Largest B the int8 matmat family still accepts, probed at the same shape as the family
+ * rows.  It matters because --batch-size is NOT clamped to it: every batched int8 gate has
+ * max_b = 16, and above that they all decline, so a server started with --batch-size 24
+ * steps its slots through one GEMV each -- exactly the work batching was asked to avoid --
+ * without a word.  Prefill already chunks itself to 16 (prefill_proj_matmat); the batched
+ * decode path passes the live slot count straight through, and chunking it here would move
+ * a remainder column onto the B=1 dequant twin, i.e. change its arithmetic.  So this is
+ * reported, not silently corrected. */
+/* Which in-region int8 runner a build/host can hold, named.  The persistent CP and Talker
+ * regions are the largest backend difference we have -- present on VNNI and AMX, absent on
+ * AVX2/AVX-512F and (until the gather shape lands) on Arm -- and until now the only place
+ * that said so was a one-shot stderr line printed by the engine at the first batched step,
+ * i.e. after traffic.  The model's own shapes still decide; this answers the prior question
+ * of whether the runner exists at all. */
+static const char *region_i8_backend_at(int B) {
+    enum { RR = QWEN_MMK_PROBE_ROWS, RC = QWEN_MMK_PROBE_COLS };
+#if defined(__AVX512VNNI__)
+    if (!qwen_region_i8_usable(RR, RC, B)) return "none";
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, RR, RC) && qwen_amx_int8_ready())
+        return "AMX int8 tiles";
+#endif
+    return "VNNI row blocks";
+#else
+    (void)B; return "none";
+#endif
+}
+
+const char *qwen_region_i8_backend(void) {
+    /* Report BOTH batch widths: the AMX gate starts at B=4, so an AMX host answers "VNNI row
+     * blocks" at B=2 and "AMX int8 tiles" at B=4, and a single-B row would hide half of that. */
+    static char buf[112];
+    const char *b2 = region_i8_backend_at(2), *b4 = region_i8_backend_at(4);
+    if (!strcmp(b2, "none") && !strcmp(b4, "none")) {
+#if defined(__AVX512VNNI__)
+        return "none: the int8 gate declines at the probe shape for B=2 and B=4";
+#else
+        return "none: no in-region int8 runner in this build (needs VNNI or AMX; Arm wiring open)";
+#endif
+    }
+    if (!strcmp(b2, b4)) snprintf(buf, sizeof buf, "%s (B=2 and B=4)", b2);
+    else                 snprintf(buf, sizeof buf, "%s at B=2, %s at B=4", b2, b4);
+    return buf;
+}
+
+/* Would the INT8 AMX gate ever select this projection on this host?  Prepacking a weight the
+ * gate can never choose costs its whole size in RAM and buys nothing: `gate_rows` is the height
+ * the gate actually judges, which for a fused QKV member is q+2kv, not that member's own rows. */
+int qwen_amx_int8_pack_worth(int rows, int cols, int gate_rows, int threads) {
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (!qwen_amx_int8_ready()) return 0;
+    if (gate_rows <= 0) gate_rows = rows;
+    /* threads is the SERVING worker's count, not the packing process's: the parent prepacks
+     * before it forks, and a prefork worker runs with --prefork-threads, so asking
+     * qwen_get_threads() here would judge the gate with the wrong denominator. */
+    if (!qwen_amx_int8_rows_ok_nt(gate_rows, threads)) return 0;
+    /* B is irrelevant to the shape half of the gate; probe at the kernel's own minimum. */
+    return qwen_mm_use_(QWEN_MMK_INT8_AMX, qwen_mm_minb_value(QWEN_MMK_INT8_AMX,
+                                                              &g_mm_gate[QWEN_MMK_INT8_AMX]),
+                        rows, cols, 0);
+#else
+    (void)rows; (void)cols; (void)gate_rows; (void)threads; return 0;
+#endif
+}
+
+/* Ground truth for --effective-config, better than any static inference: the gate table
+ * already maps a flag name to the kernel it controls, and qwen_mmk_compiled() knows whether
+ * that kernel exists in this build.  A QWEN_NO_VNNI on an Arm binary is not "honoured", it
+ * controls a kernel that was never compiled.  Returns 1 when the flag belongs to a gate,
+ * writing 1/0 into *compiled; 0 when the flag is not a gate flag at all. */
+int qwen_flag_gate_status(const char *flag, int *compiled, const char **kernel) {
+    if (!flag || !*flag) return 0;
+    for (int k = 1; k < QWEN_MMK_COUNT; k++) {
+        const qwen_mm_gate_t *g = &g_mm_gate[k];
+        const char *names[5] = { g->off_env, g->on_env, g->minb_env, g->minrows_env, g->mincols_env };
+        for (int i = 0; i < 5; i++) {
+            if (names[i] && !strcmp(names[i], flag)) {
+                if (compiled) *compiled = qwen_mmk_compiled(k);
+                if (kernel) *kernel = g_mmk_info[k].name;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+int qwen_matmat_int8_max_b(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_I8, QWEN_MMK_INT8_AMX, QWEN_MMK_INT8_VNNI,
+                                QWEN_MMK_INT8_AVX2, QWEN_MMK_INT8_SMMLA, QWEN_MMK_INT8_SDOT };
+    const int n = (int)(sizeof cand / sizeof cand[0]);
+    int best = 0;
+    for (int B = 1; B <= 64; B++)
+        for (int i = 0; i < n; i++) {
+            int k = cand[i];
+            if (qwen_mmk_compiled(k) && qwen_mmk_supported(k) &&
+                qwen_mm_use(k, B, QWEN_MMK_PROBE_ROWS, QWEN_MMK_PROBE_COLS)) { best = B; break; }
+        }
+    return best;
+}
+
+const char *qwen_matmat_family_bf16(void) {
+    static const int cand[] = { QWEN_MMK_KLEIDI_BF16, QWEN_MMK_BF16_AMX,
+                                QWEN_MMK_BF16_AVX512, QWEN_MMK_BF16_BFMMLA };
+    static char buf[96];
+    return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
+                               "bf16 fixed-B twin (no bf16 GEMM gate on this build)",
+                               buf, sizeof buf);
+}
+
+/* Does B=1 reach a native integer kernel on this build, or the f32 fused twin?
+ * The AVX2 and AVX-512F(-no-VNNI) builds have int8/q4 GEMM but no integer GEMV, so every
+ * B=1 call dequantises into the f32 path.  That is a missing kernel, not accidental
+ * overhead -- there is no wasted conversion to remove, and reusing the int8 GEMM at B=1
+ * would change the arithmetic -- so the honest fix here is to stop being silent about it.
+ * These mirror the ladders in qwen_matvec_int8 / qwen_matvec_q4_0, disable envs included. */
+int qwen_int8_gemv_native(void) {
+    if (qwen_mmk_compiled(QWEN_MMK_KLEIDI_I8_GEMV) && qwen_kleidi_i8_enabled()) return 1;
+#if defined(__AVX512VNNI__)
+    { const char *e = getenv("QWEN_NO_VNNI"); if (!(e && e[0] == '1')) return 1; }
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    { const char *e = getenv("QWEN_NO_SDOT"); if (!(e && e[0] == '1')) return 1; }
+#endif
+    return 0;
+}
+int qwen_q4_gemv_native(void) {
+    /* the gate row exists on every build; only qwen_mmk_compiled() knows if the kernel does */
+    if (qwen_mmk_compiled(QWEN_MMK_KLEIDI_Q4) && qwen_mmk_supported(QWEN_MMK_KLEIDI_Q4) &&
+        qwen_mm_use(QWEN_MMK_KLEIDI_Q4, 1, 4096, 4096)) return 1;
+#if defined(__AVX512VNNI__)
+    if (!q4_sdot_disabled()) return 1;
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    if (!q4_sdot_disabled()) return 1;
+#endif
+    return 0;
+}
+/* QWEN_SD_NTA=1: non-temporal prefetch of the decoder conv weight rows inside the VNNI tile
+ * (DL-3d falsifier: does the decoder's weight stream evict the CP's L3-resident rows?) */
+static int sd_nta_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_SD_NTA"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v;
+}
+int qwen_sd_int8_usable(int in_ch, int out_ch) {
+    return qwen_sd_int8_available() && in_ch == out_ch && in_ch > 0 && in_ch <= 768;
+}
 
 int qwen_int8_kp(int K, int blk) { return (K + blk - 1) / blk * blk; }
+
+/* The x86 half of the activation-panel quantiser.
+ *
+ * Note what the reference actually is: the scalar tail rounds HALF AWAY FROM ZERO
+ * ((int)(q >= 0 ? q + 0.5f : q - 0.5f), i.e. add the signed half then truncate toward zero)
+ * and clamps to [-127, 127].  It is not lrintf, which rounds half to even.  x86 had no SIMD
+ * path at all, so on x86 every byte this function has ever produced came from that scalar
+ * expression -- it is the contract to preserve here, and the code below reproduces it
+ * exactly rather than using _mm512_cvtps_epi32, whose round-half-to-even would differ on
+ * every value that lands on a .5 boundary.  amax is a max reduction, which is
+ * order-independent, so vectorising it is exact by construction.
+ *
+ * The NEON body rounds half to EVEN (vcvtnq_s32_f32) and saturates to [-128, 127].  So the
+ * two platforms have DIFFERENT rounding contracts, and normalising them is a separate
+ * decision -- ARM audio was qualified with half-to-even, x86 with half-away.  What is not
+ * defensible is the body and the TAIL of the same kernel disagreeing, which is what
+ * quant_round_i32() below fixes: each platform now rounds one way everywhere, so a value
+ * quantises the same whether its index lands in the vector body or the remainder.  (The
+ * -128 saturation is unreachable either way: inv = 127/amax bounds |q| by 127.)
+ *
+ * QWEN_NO_SIMD_QUANT=1 forces the scalar path on both x86 and ARM; the self-test uses it to
+ * compare the two, which is only a real comparison because the tail follows the platform. */
+static inline int quant_round_i32(float q) {
+#ifdef __ARM_NEON
+    return (int)vcvtns_s32_f32(q);              /* nearest, ties to even: what the body does */
+#else
+    return (int)(q >= 0 ? q + 0.5f : q - 0.5f); /* nearest, ties away: what x86 always did */
+#endif
+}
+static int g_quant_simd_off = -1;
+static int quant_simd_off(void) {
+    if (g_quant_simd_off < 0) {
+        const char *e = getenv("QWEN_NO_SIMD_QUANT");
+        g_quant_simd_off = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_quant_simd_off;
+}
 
 void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
                           int rows, int K, int Kp, int blk) {
@@ -5577,18 +9078,49 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
             if (kn <= 0) { sc[b] = 1.0f; memset(d + k0, 0, blk); continue; }
             float amax = 0.0f;
             int i = 0;
+#if defined(__AVX512F__)
+            if (!quant_simd_off()) {
+                const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
+                __m512 vmax = _mm512_setzero_ps();
+                for (; i + 15 < kn; i += 16) {
+                    __m512i v = _mm512_castps_si512(_mm512_loadu_ps(s + k0 + i));
+                    vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(_mm512_and_si512(v, absmask)));
+                }
+                amax = _mm512_reduce_max_ps(vmax);
+            }
+#endif
 #ifdef __ARM_NEON
-            float32x4_t vmax = vdupq_n_f32(0.0f);
-            for (; i + 3 < kn; i += 4)
-                vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(s + k0 + i)));
-            amax = vmaxvq_f32(vmax);
+            if (!quant_simd_off()) {
+                float32x4_t vmax = vdupq_n_f32(0.0f);
+                for (; i + 3 < kn; i += 4)
+                    vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(s + k0 + i)));
+                amax = vmaxvq_f32(vmax);
+            }
 #endif
             for (; i < kn; i++) { float a = fabsf(s[k0 + i]); if (a > amax) amax = a; }
             float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
             float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
             sc[b] = scale;
             i = 0;
+#if defined(__AVX512F__)
+            if (!quant_simd_off()) {
+                const __m512i signbit = _mm512_set1_epi32((int)0x80000000);
+                const __m512i halfbits = _mm512_castps_si512(_mm512_set1_ps(0.5f));
+                const __m512 vinv = _mm512_set1_ps(inv);
+                const __m512i clo = _mm512_set1_epi32(-127), chi = _mm512_set1_epi32(127);
+                for (; i + 15 < kn; i += 16) {
+                    __m512 q = _mm512_mul_ps(_mm512_loadu_ps(s + k0 + i), vinv);
+                    /* the signed half the scalar adds: copysign(0.5f, q) */
+                    __m512 bias = _mm512_castsi512_ps(_mm512_or_si512(
+                        _mm512_and_si512(_mm512_castps_si512(q), signbit), halfbits));
+                    __m512i v = _mm512_cvttps_epi32(_mm512_add_ps(q, bias));  /* toward zero */
+                    v = _mm512_max_epi32(_mm512_min_epi32(v, chi), clo);
+                    _mm_storeu_si128((__m128i *)(d + k0 + i), _mm512_cvtsepi32_epi8(v));
+                }
+            }
+#endif
 #ifdef __ARM_NEON
+            if (!quant_simd_off()) {
             float32x4_t vinv = vdupq_n_f32(inv);
             for (; i + 15 < kn; i += 16) {
                 int32x4_t q0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(s + k0 + i),      vinv));
@@ -5599,10 +9131,11 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
                 int16x8_t p1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
                 vst1q_s8(d + k0 + i, vcombine_s8(vqmovn_s16(p0), vqmovn_s16(p1)));
             }
+            }
 #endif
             for (; i < kn; i++) {
                 float q = s[k0 + i] * inv;
-                int v = (int)(q >= 0 ? q + 0.5f : q - 0.5f);
+                int v = quant_round_i32(q);
                 if (v > 127) v = 127;
                 if (v < -127) v = -127;
                 d[k0 + i] = (int8_t)v;
@@ -5625,7 +9158,21 @@ static int sdp_pending = 0;
 static void (*sdp_fn)(void *) = NULL;
 static void *sdp_ctx = NULL;
 
+/* Name the thread for /proc and top: the thread ownership table of a worker is then
+ * readable without a debugger.  Zero cost after creation. */
+static void qwen_thread_name_k(const char *prefix) {
+    static _Atomic int counter = 0;
+    char name[16];
+    int n = atomic_fetch_add(&counter, 1);
+    snprintf(name, sizeof name, "%.9s-%d", prefix, n);
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    prctl(PR_SET_NAME, name, 0, 0, 0);
+#endif
+}
 static void *sdp_worker_main(void *arg) {
+    qwen_thread_name_k("sd-pool");
     (void)arg;
     qwen_ftz_on();
     unsigned seen = 0;
@@ -5648,6 +9195,10 @@ static void *sdp_worker_main(void *arg) {
 static int sd_pool_threads(void) {
     static int cfg = -1;
     if (cfg < 0) { const char *e = getenv("QWEN_SD_THREADS"); cfg = e ? atoi(e) : 0; }
+    /* on the decoder lane the team IS the lane: panel sizing and the pool report must see 4,
+     * not the engine's 8 (elastic mode), or every conv layer runs twice the panels and
+     * re-reads its weights twice */
+    if (qwen_lane_thread_here()) { int lt = qwen_lane_team_size(); if (lt > 0) return lt; }
     return cfg > 0 ? cfg : qwen_get_threads();
 }
 
@@ -5658,12 +9209,117 @@ static void sd_gcd_task(size_t tid, size_t nt, void *vj) {
     j->fn(j->ctx);
 }
 
+static int g_sd_pool_mode = -1;
+
+/* Keep the historical spellings that were actually used by the runtime/documentation, but
+ * do not keep the old "anything else means private" behaviour: a typo in a qualification
+ * command must never silently select a different scheduler. */
+static int qwen_sd_pool_parse(const char *value, int *mode) {
+    if (!value || !*value) return -1;
+    if (!strcmp(value, "engine") || !strcmp(value, "qwen") || !strcmp(value, "q") ||
+        !strcmp(value, "1")) {
+        if (mode) *mode = 1;
+        return 0;
+    }
+    if (!strcmp(value, "private") || !strcmp(value, "0")) {
+        if (mode) *mode = 0;
+        return 0;
+    }
+    return -1;
+}
+
+static void qwen_sd_pool_fatal(const char *value) {
+    fprintf(stderr,
+            "qwen-tts: FATAL — QWEN_SD_POOL=%s is invalid; expected engine or private "
+            "(legacy aliases: qwen, q, 1, 0)\n",
+            value && *value ? value : "<empty>");
+    exit(2);
+}
+
+void qwen_sd_pool_validate(void) {
+    const char *e = getenv("QWEN_SD_POOL");
+    if (e && qwen_sd_pool_parse(e, NULL) != 0) qwen_sd_pool_fatal(e);
+}
+
+void qwen_sd_pool_default(int mode) {
+    if (getenv("QWEN_SD_POOL")) {
+        qwen_sd_pool_validate();
+    } else {
+        g_sd_pool_mode = mode ? 1 : 0;
+    }
+}
+
+int qwen_sd_pool_mode(void) {
+    if (g_sd_pool_mode < 0) {
+        const char *e = getenv("QWEN_SD_POOL");
+        if (e) {
+            if (qwen_sd_pool_parse(e, &g_sd_pool_mode) != 0) qwen_sd_pool_fatal(e);
+        } else {
+            g_sd_pool_mode = 0;
+        }
+    }
+    return g_sd_pool_mode;
+}
+
+/* One execution budget, decided in one place.
+ *
+ * The CLI, the plain server and the batched server all drive the same engine, but only the
+ * batched server used to claim the budget.  The other two could therefore run three compute
+ * teams over the same cores at once: the engine pool, the decoder's private team and the
+ * BLAS's own team.  The rule is not "copy the batched server's defaults everywhere"; it is:
+ * when the engine already owns a usable multi-thread pool, the decoder tiles and the decoder
+ * SGEMM run on THAT pool instead of raising teams beside it.
+ *
+ * Both setters yield to an explicit QWEN_SD_POOL / QWEN_BLAS_OWN, so a user override
+ * survives.  With one thread there is no budget to own and this does nothing.  Idempotent:
+ * a prefork child calls it again after its own qwen_set_threads(). */
+void qwen_exec_budget_engine_owned(const char *who) {
+    qwen_sd_pool_validate();
+    if (qwen_get_threads() <= 1) return;
+    qwen_sd_pool_default(1);
+    qwen_blas_own(1);
+    /* Report once per process, not once per request: a prefork child is a new pid and says
+     * it again, an entry point that claims the budget after another one stays quiet. */
+    static pid_t reported = 0;
+    if (reported == getpid()) return;
+    reported = getpid();
+    fprintf(stderr, "[%s] execution budget: decoder pool requested=%s resolved=%s · blas=%s · openblas threads now %d\n",
+            who ? who : "engine",
+            getenv("QWEN_SD_POOL") ? getenv("QWEN_SD_POOL") : "unset",
+            qwen_sd_pool_mode() ? "engine" : "private",
+            qwen_blas_own_effective() ? "serial+partitioned"
+                                      : (qwen_blas_own_get() ? "claimed but no thread control"
+                                                             : "own team"),
+            qwen_blas_threads_now());
+}
+
 static void sd_pool_run(void (*fn)(void *), void *ctx) {
+    if (qwen_lane_thread_here()) {
+        /* Decoder lane: the lane team, through the redirect in qwen_parallel(); never the
+         * engine pool, never the private sdp_ team. */
+        int lt = qwen_lane_team_size();
+        if (lt <= 1 || qwen_parallel_active()) { fn(ctx); return; }
+        sd_gcd_job_t j = { fn, ctx };
+        qwen_parallel((size_t)lt, sd_gcd_task, &j);
+        return;
+    }
     int nt = sd_pool_threads();
     if (nt < 1) nt = 1;
     if (nt == 1) { fn(ctx); return; }
+    if (qwen_sd_pool_mode()) {
+        /* The engine pool owns the CPU budget.  Every worker body pulls its tiles from an
+         * atomic counter, so running it once per chunk on the pool is the same schedule the
+         * private team used; inside an existing region one worker drains all tiles. */
+        if (qwen_parallel_active()) { fn(ctx); return; }
+        sd_gcd_job_t j = { fn, ctx };
+        qwen_parallel((size_t)nt, sd_gcd_task, &j);
+        return;
+    }
 
-    if (qwen_parallel_is_reentrant()) {
+    /* Private mode, but the pool can still absorb this without a second team: only where a
+     * nested dispatch is actually safe, and never from inside a held team. */
+    if (qwen_parallel_active()) { fn(ctx); return; }
+    if (qwen_pool_nested_dispatch_ok()) {
         sd_gcd_job_t j = { fn, ctx };
         qwen_parallel((size_t)nt, sd_gcd_task, &j);
         return;
@@ -5690,6 +9346,10 @@ static void sd_pool_run(void (*fn)(void *), void *ctx) {
     pthread_mutex_lock(&sdp_mu);
     while (sdp_pending > 0) pthread_cond_wait(&sdp_done_cv, &sdp_mu);
     pthread_mutex_unlock(&sdp_mu);
+}
+
+void qwen_sd_pool_run(void (*fn)(void *), void *ctx) {
+    sd_pool_run(fn, ctx);
 }
 
 #if defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__)
@@ -5790,6 +9450,7 @@ static inline void sd_tile_2x4(float *out, int out_ld, int m, int tcol,
 
     __m512 f0[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
     __m512 f1[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
+    const int nta = sd_nta_enabled();
 
     for (int b = 0; b < nblk; b++) {
         __m512i a0[4] = { _mm512_setzero_si512(), _mm512_setzero_si512(),
@@ -5800,6 +9461,12 @@ static inline void sd_tile_2x4(float *out, int out_ld, int m, int tcol,
         for (int k = b * blk; k < kend; k += 64) {
             int rem = kend - k;
             __mmask64 msk = rem >= 64 ? ~(__mmask64)0 : (((__mmask64)1 << rem) - 1);
+            if (nta) {
+                /* DL-3d: pull the next weight lines with the non-temporal hint so the decoder's
+                 * weight stream stays out of the L2/L3 the CP on the other cpus depends on */
+                _mm_prefetch((const char *)(w0 + k + 512), _MM_HINT_NTA);
+                _mm_prefetch((const char *)(w1 + k + 512), _MM_HINT_NTA);
+            }
             __m512i wv0 = _mm512_maskz_loadu_epi8(msk, w0 + k);
             __m512i wv1 = _mm512_maskz_loadu_epi8(msk, w1 + k);
             for (int c = 0; c < 4; c++) {
@@ -5869,6 +9536,606 @@ static inline void sd_tile_1xN(float *out, int out_ld, int m, int tcol,
 
 #endif
 
+/* ---- decoder AMX INT8 -------------------------------------------------------------
+ *
+ * The decoder conv is the largest matrix block in a request (76.6% of MACs at C=4) and it
+ * never reached the matmat dispatcher, so it has run at 0% AMX.  Its geometry is already
+ * tile-friendly: M = out_ch = 96 (six 16-row blocks), N = panel columns, and the quantised
+ * buffers are padded to Kp = 768, which is a whole number of both 64-byte INT8 K-steps (12)
+ * and 32-byte BF16 K-steps (24), so NO K-tail path is needed.  qwen_int8_quant_rows zero-fills
+ * the padding on weights and activations alike, so [K, Kp) contributes exactly zero.
+ *
+ * The arithmetic contract of sd_gemm_panel is preserved: per 256-wide quant block accumulate
+ * in int32, convert, apply that block's swb[m][b] * sab[c][b], and accumulate into fp32 in the
+ * same block order.  The one deliberate difference is the zero-point term: VNNI only has
+ * dpbusd (u8 x s8), so the scalar path biases the activation by +128 and subtracts
+ * 128 * wsum[m][b] afterwards.  AMX has tdpbssd (s8 x s8), so both the bias and its correction
+ * disappear.  The integer products are identical; removing the correction removes a
+ * AMX signed x signed avoids the VNNI u8 offset/correction formulation entirely.  Numerical
+ * equivalence against the existing decoder path is established by the parity harness, not
+ * asserted here.
+ *
+ * Tiles: tmm0..5 hold the six 16x16 int32 accumulators (one per row block), tmm6 the 16x64
+ * weight tile, tmm7 the packed activation tile.  Exactly the eight the ISA has.
+ *
+ * The Talker/CP `rows/thread >= 256` rule is deliberately NOT consulted: M=96 would fail it
+ * outright.  This kernel is chosen on decoder geometry, and the parallelism is over column
+ * panels, which the caller already owns.
+ */
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+
+static atomic_llong g_sd_amx_rej[5];
+static atomic_llong g_sd_amx_packs, g_sd_amx_pack_bytes, g_sd_amx_kcalls;
+static atomic_llong g_sd_amx_d_pack_count, g_sd_amx_d_pack_bytes, g_sd_amx_d_kcalls;
+void qwen_sd_amx_rej_report(void) {
+    fprintf(stderr, "[SDAMX] packs=%lld pack_MB=%.1f tdpbssd_tiles=%lld | D_weight_packs=%lld D_weight_MB=%.1f D_tdpbssd_tiles=%lld | reject M%%16=%lld Kp%%64=%lld blk%%64=%lld nc=%lld noamx=%lld\n",
+            (long long)atomic_load(&g_sd_amx_packs),
+            (double)atomic_load(&g_sd_amx_pack_bytes) / 1e6,
+            (long long)atomic_load(&g_sd_amx_kcalls),
+            (long long)atomic_load(&g_sd_amx_d_pack_count),
+            (double)atomic_load(&g_sd_amx_d_pack_bytes) / 1e6,
+            (long long)atomic_load(&g_sd_amx_d_kcalls),
+            (long long)atomic_load(&g_sd_amx_rej[0]), (long long)atomic_load(&g_sd_amx_rej[1]),
+            (long long)atomic_load(&g_sd_amx_rej[2]), (long long)atomic_load(&g_sd_amx_rej[3]),
+            (long long)atomic_load(&g_sd_amx_rej[4]));
+}
+#define SD_AMX_MAX_KS 16            /* K-steps per quant block; blk=256 gives 4 */
+#define SD_AMX_MB 6                      /* 16-row accumulator tiles = 96 rows per pass */
+
+/* Pack one 64-K x ncol slab of the activation panel into the AMX B layout:
+ * row i of the tile carries k = 4i..4i+3 for every column, i.e. [i][n*4 + j]. */
+static inline void sd_amx_pack_act(int8_t *dst, const int8_t *Xq, int Kp,
+                                   int c0, int ncol, int k0) {
+    const int cstride = ncol * 4;
+    for (int i = 0; i < 16; i++) {
+        int8_t *d = dst + (size_t)i * cstride;
+        for (int n = 0; n < ncol; n++)
+            memcpy(d + n * 4, Xq + (size_t)(c0 + n) * Kp + k0 + i * 4, 4);
+    }
+}
+
+/* Design D weight representation.  Wq is [rows][Kp], while AMX sees the activation
+ * panel as A=[Ntile][64] and needs B=[16 K-groups][16 output-columns].  A tile therefore
+ * contains four consecutive int8 K values for each output row, interleaved by K-group:
+ *   dst[k_group][output_row][4]
+ * The layout is immutable after load and is independent of N, so every decoder panel reuses
+ * it without touching the activation representation. */
+int8_t *qwen_sd_amx_int8_pack_weights(const int8_t *Wq, int rows, int Kp,
+                                      size_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (!Wq || rows <= 0 || Kp <= 0 || (rows & 15) || (Kp & 63)) return NULL;
+    const size_t row_tiles = (size_t)rows / 16;
+    const size_t k_tiles = (size_t)Kp / 64;
+    const size_t tile_bytes = (size_t)16 * 64;
+    if (row_tiles > SIZE_MAX / k_tiles || row_tiles * k_tiles > SIZE_MAX / tile_bytes)
+        return NULL;
+    const size_t bytes = row_tiles * k_tiles * tile_bytes;
+    int8_t *packed = (int8_t *)aligned_malloc(bytes);
+    if (!packed) return NULL;
+    for (size_t rb = 0; rb < row_tiles; rb++) {
+        for (size_t kt = 0; kt < k_tiles; kt++) {
+            int8_t *dst = packed + (rb * k_tiles + kt) * tile_bytes;
+            for (int kg = 0; kg < 16; kg++) {
+                for (int m = 0; m < 16; m++) {
+                    const int8_t *src = Wq + ((rb * 16 + (size_t)m) * (size_t)Kp)
+                                      + kt * 64 + kg * 4;
+                    memcpy(dst + (size_t)kg * 64 + (size_t)m * 4, src, 4);
+                }
+            }
+        }
+    }
+    if (bytes_out) *bytes_out = bytes;
+    atomic_fetch_add(&g_sd_amx_d_pack_count, 1);
+    atomic_fetch_add(&g_sd_amx_d_pack_bytes, (long long)bytes);
+    return packed;
+}
+
+void qwen_sd_amx_int8_free_weights(int8_t *packed) { free(packed); }
+
+/* Same inputs as sd_gemm_panel.  Returns 0 when the geometry is not supported, so the caller
+ * falls straight back to the existing path.
+ *
+ * M is covered in groups of 96 rows (six 16-row accumulator tiles), so the same eight-tile
+ * design handles every decoder conv width: 96 is one group, 192 two, 384 four, 768 eight.
+ * The activation slab is packed per K-step inside the quant-block loop: packing every K-step
+ * up front would need 86 KB of stack at the widest real conv (Kp=5376), so the pack is
+ * repeated per row group instead.  That is a memcpy, and v1 buys correctness across every
+ * shape with it; hoisting it is a tuning step once the exact-shape numbers exist. */
+static int sd_gemm_panel_amx(float *out, int out_ld, int M,
+                             const int8_t *Wq, const float *swb, const int32_t *wsum,
+                             const float *bias,
+                             const int8_t *Xq, const float *sab,
+                             int tcol0, int nc, int Kp, int blk) {
+    (void)wsum;                          /* tdpbssd needs no zero-point correction */
+    if (M % 16)            { atomic_fetch_add(&g_sd_amx_rej[0], 1); return 0; }
+    if (Kp % 64)           { atomic_fetch_add(&g_sd_amx_rej[1], 1); return 0; }
+    if (blk % 64)          { atomic_fetch_add(&g_sd_amx_rej[2], 1); return 0; }
+    if (nc <= 0 || M <= 0) { atomic_fetch_add(&g_sd_amx_rej[3], 1); return 0; }
+    if (!qwen_amx_int8_available()) { atomic_fetch_add(&g_sd_amx_rej[4], 1); return 0; }
+
+    const int nblk   = Kp / blk;
+    const int ksteps = blk / 64;         /* 64-byte INT8 K-steps inside one quant block */
+
+    if (ksteps > SD_AMX_MAX_KS) { atomic_fetch_add(&g_sd_amx_rej[3], 1); return 0; }
+
+    /* fp32 running sum for the whole panel column tile, [M][16]; on scratch because M reaches
+     * 768 and 49 KB does not belong on the stack. */
+    float *acc = mm_scratch_sdamxacc((size_t)M * 16);
+    if (!acc) return 0;
+    int32_t cbuf[16 * 16] __attribute__((aligned(64)));
+    int8_t  bpack[SD_AMX_MAX_KS][16 * 64] __attribute__((aligned(64)));
+
+    for (int c0 = 0; c0 < nc; c0 += 16) {
+        const int ncol    = nc - c0 < 16 ? nc - c0 : 16;
+        const int cstride = ncol * 4;
+
+        qwen_amx_tilecfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.palette_id = 1;
+        for (int t = 0; t < SD_AMX_MB; t++) { cfg.rows[t] = 16; cfg.colsb[t] = (uint16_t)cstride; }
+        cfg.rows[6] = 16; cfg.colsb[6] = 64;                 /* weights, 64 int8 of K */
+        cfg.rows[7] = 16; cfg.colsb[7] = (uint16_t)cstride;  /* packed activation */
+        qwen_amx_prepare_config(&cfg, 0x53440000u | (unsigned)cstride);
+
+        memset(acc, 0, (size_t)M * 16 * sizeof(float));
+
+        for (int b = 0; b < nblk; b++) {
+            /* The activation tile depends on (column tile, K), NOT on the row group, so it is
+             * packed ONCE per quant block and reused by every 96-row group.  Packing inside the
+             * row loop would repeat this eight times at M=768 for no reason. */
+            for (int ks = 0; ks < ksteps; ks++)
+                sd_amx_pack_act(bpack[ks], Xq, Kp, c0, ncol, (b * ksteps + ks) * 64);
+            atomic_fetch_add(&g_sd_amx_packs, ksteps);
+            atomic_fetch_add(&g_sd_amx_pack_bytes, (long long)ksteps * 16 * cstride);
+
+            for (int m0 = 0; m0 < M; m0 += SD_AMX_MB * 16) {
+                const int rows_left = M - m0;
+                const int mb = rows_left / 16 < SD_AMX_MB ? rows_left / 16 : SD_AMX_MB;
+
+                for (int t = 0; t < mb; t++) {
+                    switch (t) {
+                        case 0: _tile_zero(0); break;
+                        case 1: _tile_zero(1); break;
+                        case 2: _tile_zero(2); break;
+                        case 3: _tile_zero(3); break;
+                        case 4: _tile_zero(4); break;
+                        default: _tile_zero(5); break;
+                    }
+                }
+
+                for (int ks = 0; ks < ksteps; ks++) {
+                    const int k = (b * ksteps + ks) * 64;
+                    _tile_loadd(7, bpack[ks], cstride);
+                    for (int t = 0; t < mb; t++) {
+                        _tile_loadd(6, Wq + (size_t)(m0 + t * 16) * Kp + k, Kp);
+                        switch (t) {
+                            case 0: _tile_dpbssd(0, 6, 7); break;
+                            case 1: _tile_dpbssd(1, 6, 7); break;
+                            case 2: _tile_dpbssd(2, 6, 7); break;
+                            case 3: _tile_dpbssd(3, 6, 7); break;
+                            case 4: _tile_dpbssd(4, 6, 7); break;
+                            default: _tile_dpbssd(5, 6, 7); break;
+                        }
+                    }
+                }
+                atomic_fetch_add(&g_sd_amx_kcalls, (long long)mb * ksteps);
+
+                /* same epilogue order as the scalar path: convert this block, scale by
+                 * swb[m][b] * sab[c][b], accumulate */
+                for (int t = 0; t < mb; t++) {
+                    switch (t) {
+                        case 0: _tile_stored(0, cbuf, cstride); break;
+                        case 1: _tile_stored(1, cbuf, cstride); break;
+                        case 2: _tile_stored(2, cbuf, cstride); break;
+                        case 3: _tile_stored(3, cbuf, cstride); break;
+                        case 4: _tile_stored(4, cbuf, cstride); break;
+                        default: _tile_stored(5, cbuf, cstride); break;
+                    }
+                    for (int r = 0; r < 16; r++) {
+                        const int m = m0 + t * 16 + r;
+                        const float sw = swb[(size_t)m * nblk + b];
+                        for (int n = 0; n < ncol; n++)
+                            acc[(size_t)m * 16 + n] += (float)cbuf[r * ncol + n] *
+                                                       (sw * sab[(size_t)(c0 + n) * nblk + b]);
+                    }
+                }
+            }
+        }
+
+        for (int m = 0; m < M; m++) {
+            float *o = out + (size_t)m * out_ld + tcol0 + c0;
+            const float bb = bias ? bias[m] : 0.0f;
+            for (int n = 0; n < ncol; n++) o[n] = acc[(size_t)m * 16 + n] + bb;
+        }
+    }
+
+    qwen_amx_finish_config();
+    qwen_census_op(QWEN_PATH_DECODER_CONV_AMX_INT8, M, Kp, nc);
+    MMSTAT(QWEN_MMK_INT8_AMX, M, Kp, nc);
+    t_census_cur = NULL;
+    return 1;
+}
+
+/* Design D: Xq is already laid out as [N][Kp], so it is loaded directly as AMX A.  The
+ * persistent Wpack is the transposed/interleaved AMX B operand produced above.  This swaps
+ * the v1 operand roles and removes the per-(panel,K-step) activation memcpy entirely. */
+static int sd_gemm_panel_amx_d(float *out, int out_ld, int M,
+                               const int8_t *Wpack, const float *swb,
+                               const int32_t *wsum, const float *bias,
+                               const int8_t *Xq, const float *sab,
+                               const float *residual,
+                               int tcol0, int nc, int Kp, int blk) {
+    (void)wsum;
+    if (M % 16)            { atomic_fetch_add(&g_sd_amx_rej[0], 1); return 0; }
+    if (Kp % 64)           { atomic_fetch_add(&g_sd_amx_rej[1], 1); return 0; }
+    if (blk % 64)          { atomic_fetch_add(&g_sd_amx_rej[2], 1); return 0; }
+    if (!Wpack || !Xq || !sab || nc <= 0 || M <= 0) {
+        atomic_fetch_add(&g_sd_amx_rej[3], 1); return 0;
+    }
+    if (!qwen_amx_int8_available()) { atomic_fetch_add(&g_sd_amx_rej[4], 1); return 0; }
+
+    const int nblk = Kp / blk;
+    const int ksteps = blk / 64;
+    const int ktiles = Kp / 64;
+    if (ksteps <= 0 || ksteps > SD_AMX_MAX_KS) {
+        atomic_fetch_add(&g_sd_amx_rej[3], 1); return 0;
+    }
+
+    float *acc = mm_scratch_sdamxacc((size_t)M * 16);
+    if (!acc) return 0;
+    int32_t cbuf[16 * 16] __attribute__((aligned(64)));
+    const size_t tile_bytes = (size_t)16 * 64;
+
+    for (int c0 = 0; c0 < nc; c0 += 16) {
+        const int ncol = nc - c0 < 16 ? nc - c0 : 16;
+        qwen_amx_tilecfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.palette_id = 1;
+        for (int t = 0; t < SD_AMX_MB; t++) {
+            cfg.rows[t] = (uint8_t)ncol;
+            cfg.colsb[t] = 64;                 /* sixteen output columns */
+        }
+        cfg.rows[6] = (uint8_t)ncol; cfg.colsb[6] = 64;   /* direct Xq A tile */
+        cfg.rows[7] = 16;             cfg.colsb[7] = 64;  /* packed W B tile */
+        qwen_amx_prepare_config(&cfg, 0x53444400u | (unsigned)ncol);
+
+        memset(acc, 0, (size_t)M * 16 * sizeof(float));
+        for (int b = 0; b < nblk; b++) {
+            const int kbase = b * ksteps;
+            const int8_t *xbase = Xq + (size_t)c0 * (size_t)Kp;
+            for (int m0 = 0; m0 < M; m0 += SD_AMX_MB * 16) {
+                int mb = (M - m0) / 16;
+                if (mb > SD_AMX_MB) mb = SD_AMX_MB;
+                for (int t = 0; t < mb; t++) {
+                    switch (t) {
+                        case 0: _tile_zero(0); break;
+                        case 1: _tile_zero(1); break;
+                        case 2: _tile_zero(2); break;
+                        case 3: _tile_zero(3); break;
+                        case 4: _tile_zero(4); break;
+                        default: _tile_zero(5); break;
+                    }
+                }
+
+                for (int ks = 0; ks < ksteps; ks++) {
+                    const int k = (kbase + ks) * 64;
+                    _tile_loadd(6, xbase + k, Kp);
+                    for (int t = 0; t < mb; t++) {
+                        const int rb = m0 / 16 + t;
+                        const int8_t *bp = Wpack + ((size_t)rb * (size_t)ktiles
+                                                    + (size_t)(kbase + ks)) * tile_bytes;
+                        _tile_loadd(7, bp, 64);
+                        switch (t) {
+                            case 0: _tile_dpbssd(0, 6, 7); break;
+                            case 1: _tile_dpbssd(1, 6, 7); break;
+                            case 2: _tile_dpbssd(2, 6, 7); break;
+                            case 3: _tile_dpbssd(3, 6, 7); break;
+                            case 4: _tile_dpbssd(4, 6, 7); break;
+                            default: _tile_dpbssd(5, 6, 7); break;
+                        }
+                    }
+                }
+                atomic_fetch_add(&g_sd_amx_d_kcalls, (long long)mb * ksteps);
+
+                for (int t = 0; t < mb; t++) {
+                    switch (t) {
+                        case 0: _tile_stored(0, cbuf, 64); break;
+                        case 1: _tile_stored(1, cbuf, 64); break;
+                        case 2: _tile_stored(2, cbuf, 64); break;
+                        case 3: _tile_stored(3, cbuf, 64); break;
+                        case 4: _tile_stored(4, cbuf, 64); break;
+                        default: _tile_stored(5, cbuf, 64); break;
+                    }
+                    for (int n = 0; n < ncol; n++) {
+                        for (int m = 0; m < 16; m++) {
+                            const int row = m0 + t * 16 + m;
+                            acc[(size_t)row * 16 + n] +=
+                                (float)cbuf[n * 16 + m] *
+                                (swb[(size_t)row * nblk + b] *
+                                 sab[(size_t)(c0 + n) * nblk + b]);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int m = 0; m < M; m++) {
+            float *o = out + (size_t)m * out_ld + tcol0 + c0;
+            const float bb = bias ? bias[m] : 0.0f;
+            const float *rr = residual ? residual + (size_t)m * out_ld + tcol0 + c0 : NULL;
+            for (int n = 0; n < ncol; n++)
+                o[n] = acc[(size_t)m * 16 + n] + bb + (rr ? rr[n] : 0.0f);
+        }
+    }
+
+    qwen_amx_finish_config();
+    qwen_census_op(QWEN_PATH_DECODER_CONV_AMX_INT8_D, M, Kp, nc);
+    MMSTAT(QWEN_MMK_INT8_AMX, M, Kp, nc);
+    t_census_cur = NULL;
+    return 1;
+}
+
+static int sd_amx_enabled(void) {
+    static atomic_int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        const char *e = getenv("QWEN_SD_AMX");
+        c = (e && e[0] && e[0] != '0');
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c;
+}
+#else
+static int sd_amx_enabled(void) { return 0; }
+#endif  /* __AMX_INT8__ */
+
+#endif  /* x86 VNNI / Arm dot-product decoder kernels */
+
+/* ---- decoder AMX BF16 -------------------------------------------------------------
+ *
+ * This is deliberately a decoder-specific representation.  The generic AMX BF16 path
+ * keeps weights in the A operand layout and packs the activation as B.  The decoder has
+ * the opposite useful lifetime: an im2col panel is made for one request, while the
+ * decoder weights live for the model lifetime.  Keep the activation as A, so it can be
+ * loaded directly from the [N][Kp] panel, and persist the transposed B tiles below.
+ *
+ * A tile:  [ncol][32 BF16]       (one row per output time column)
+ * B tile:  [16 K-pairs][16 output rows * 2 BF16]
+ * C tile:  [ncol][16 FP32]
+ *
+ * The B tile is 1024 bytes.  For B row kg and output row m, the two BF16 values for
+ * K=(kt*32 + kg*2) and K+1 are at [kg][m*2].  This is the layout required by
+ * TDPBF16PS when the activation is its first operand.
+ */
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+
+static atomic_llong g_sd_amx_bf16_pack_count;
+static atomic_llong g_sd_amx_bf16_pack_bytes;
+static atomic_llong g_sd_amx_bf16_convert_panels;
+static atomic_llong g_sd_amx_bf16_convert_bytes;
+static atomic_llong g_sd_amx_bf16_kcalls;
+
+static inline uint16_t sd_f32_to_bf16(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof u);
+    /* Round-to-nearest-even, matching the usual float32 -> BF16 conversion. */
+    u += 0x7fffU + ((u >> 16) & 1U);
+    return (uint16_t)(u >> 16);
+}
+
+static inline float sd_bf16_to_f32(uint16_t x) {
+    uint32_t u = (uint32_t)x << 16;
+    float f;
+    memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+uint16_t *qwen_sd_amx_bf16_pack_weights(const float *W, int rows, int K,
+                                        int *Kp_out, size_t *bytes_out) {
+    if (Kp_out) *Kp_out = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (!W || rows <= 0 || K <= 0 || (rows & 15)) return NULL;
+    const int Kp = (K + 31) & ~31;
+    const size_t row_tiles = (size_t)rows / 16;
+    const size_t k_tiles = (size_t)Kp / 32;
+    /* B has 16 K-pair rows and 16 output columns, with two BF16 values per
+     * output column: 16 * 32 uint16_t = 1024 bytes. */
+    const size_t tile_bytes = (size_t)16 * 32 * sizeof(uint16_t);
+    if (row_tiles > SIZE_MAX / k_tiles ||
+        row_tiles * k_tiles > SIZE_MAX / tile_bytes)
+        return NULL;
+    const size_t bytes = row_tiles * k_tiles * tile_bytes;
+    uint16_t *packed = (uint16_t *)aligned_malloc(bytes);
+    if (!packed) return NULL;
+    memset(packed, 0, bytes); /* includes [K,Kp), which must contribute zero */
+
+    for (size_t rb = 0; rb < row_tiles; rb++) {
+        for (size_t kt = 0; kt < k_tiles; kt++) {
+            uint16_t *dst = packed +
+                (rb * k_tiles + kt) * (tile_bytes / sizeof(uint16_t));
+            for (int kg = 0; kg < 16; kg++) {
+                for (int m = 0; m < 16; m++) {
+                    const int k = (int)kt * 32 + kg * 2;
+                    uint16_t *d = dst + (size_t)kg * 32 + (size_t)m * 2;
+                    if (k < K)
+                        d[0] = sd_f32_to_bf16(W[(size_t)(rb * 16 + (size_t)m) * K + k]);
+                    if (k + 1 < K)
+                        d[1] = sd_f32_to_bf16(W[(size_t)(rb * 16 + (size_t)m) * K + k + 1]);
+                }
+            }
+        }
+    }
+    if (Kp_out) *Kp_out = Kp;
+    if (bytes_out) *bytes_out = bytes;
+    atomic_fetch_add(&g_sd_amx_bf16_pack_count, 1);
+    atomic_fetch_add(&g_sd_amx_bf16_pack_bytes, (long long)bytes);
+    return packed;
+}
+
+void qwen_sd_amx_bf16_free_weights(uint16_t *packed) { free(packed); }
+
+static inline const uint16_t *sd_bf16_weight_tile(const uint16_t *Wpack,
+                                                   int Kp, int m, int k) {
+    const int ktiles = Kp / 32;
+    const size_t tile_words = (size_t)16 * 32;
+    return Wpack + (((size_t)(m / 16) * (size_t)ktiles + (size_t)(k / 32)) * tile_words)
+                       + (size_t)((k % 32) / 2) * 32
+                       + (size_t)(m % 16) * 2 + (k & 1);
+}
+
+/* Cold fallback used only if the AMX capability disappears or a malformed shape reaches
+ * this experimental entry point.  It decodes the same persistent B representation, so it
+ * cannot silently use a different weight layout. */
+static void sd_bf16_panel_fallback(float *out, int out_ld, int M,
+                                   const uint16_t *Wpack, const float *bias,
+                                   const uint16_t *Xb, int tcol0, int nc,
+                                   int Kp) {
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < nc; n++) {
+            float sum = bias ? bias[m] : 0.0f;
+            const uint16_t *x = Xb + (size_t)n * Kp;
+            for (int k = 0; k < Kp; k++)
+                sum += sd_bf16_to_f32(*sd_bf16_weight_tile(Wpack, Kp, m, k)) *
+                       sd_bf16_to_f32(x[k]);
+            out[(size_t)m * out_ld + tcol0 + n] = sum;
+        }
+    }
+}
+
+static int sd_gemm_panel_amx_bf16(float *out, int out_ld, int M,
+                                  const uint16_t *Wpack, const float *bias,
+                                  const uint16_t *Xb, int tcol0, int nc,
+                                  int K, int Kp) {
+    if (M % 16 || Kp % 32 || !Wpack || !Xb || nc <= 0 || M <= 0 || K <= 0)
+        return 0;
+    if (!qwen_amx_bf16_available()) return 0;
+
+    const int ktiles = Kp / 32;
+    float *acc = mm_scratch_sdamxacc((size_t)M * 16);
+    if (!acc) return 0;
+    float cbuf[16 * 16] __attribute__((aligned(64)));
+    const size_t tile_bytes = (size_t)16 * 32 * sizeof(uint16_t);
+
+    for (int c0 = 0; c0 < nc; c0 += 16) {
+        const int ncol = nc - c0 < 16 ? nc - c0 : 16;
+        qwen_amx_tilecfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.palette_id = 1;
+        for (int t = 0; t < 6; t++) {
+            cfg.rows[t] = (uint8_t)ncol;
+            cfg.colsb[t] = 64;                 /* sixteen FP32 output columns */
+        }
+        cfg.rows[6] = (uint8_t)ncol; cfg.colsb[6] = 64;   /* direct BF16 activation A */
+        cfg.rows[7] = 16;             cfg.colsb[7] = 64;  /* persistent BF16 weight B */
+        qwen_amx_prepare_config(&cfg, 0x53444216u | (unsigned)ncol);
+
+        memset(acc, 0, (size_t)M * 16 * sizeof(float));
+        for (int m0 = 0; m0 < M; m0 += 6 * 16) {
+            int mb = (M - m0) / 16;
+            if (mb > 6) mb = 6;
+            for (int t = 0; t < mb; t++) {
+                switch (t) {
+                    case 0: _tile_zero(0); break;
+                    case 1: _tile_zero(1); break;
+                    case 2: _tile_zero(2); break;
+                    case 3: _tile_zero(3); break;
+                    case 4: _tile_zero(4); break;
+                    default: _tile_zero(5); break;
+                }
+            }
+
+            for (int kt = 0; kt < ktiles; kt++) {
+                const uint16_t *ap = Xb + (size_t)(c0 * Kp + kt * 32);
+                _tile_loadd(6, ap, (size_t)Kp * sizeof(uint16_t));
+                for (int t = 0; t < mb; t++) {
+                    const int rb = m0 / 16 + t;
+                    const uint16_t *bp = Wpack +
+                        ((size_t)rb * (size_t)ktiles + (size_t)kt) * tile_bytes / sizeof(uint16_t);
+                    _tile_loadd(7, bp, 64);
+                    switch (t) {
+                        case 0: _tile_dpbf16ps(0, 6, 7); break;
+                        case 1: _tile_dpbf16ps(1, 6, 7); break;
+                        case 2: _tile_dpbf16ps(2, 6, 7); break;
+                        case 3: _tile_dpbf16ps(3, 6, 7); break;
+                        case 4: _tile_dpbf16ps(4, 6, 7); break;
+                        default: _tile_dpbf16ps(5, 6, 7); break;
+                    }
+                }
+            }
+            atomic_fetch_add(&g_sd_amx_bf16_kcalls, (long long)mb * ktiles);
+
+            for (int t = 0; t < mb; t++) {
+                switch (t) {
+                    case 0: _tile_stored(0, cbuf, 64); break;
+                    case 1: _tile_stored(1, cbuf, 64); break;
+                    case 2: _tile_stored(2, cbuf, 64); break;
+                    case 3: _tile_stored(3, cbuf, 64); break;
+                    case 4: _tile_stored(4, cbuf, 64); break;
+                    default: _tile_stored(5, cbuf, 64); break;
+                }
+                for (int n = 0; n < ncol; n++) {
+                    for (int m = 0; m < 16; m++) {
+                        const int row = m0 + t * 16 + m;
+                        acc[(size_t)row * 16 + n] += cbuf[n * 16 + m];
+                    }
+                }
+            }
+        }
+
+        for (int m = 0; m < M; m++) {
+            float *o = out + (size_t)m * out_ld + tcol0 + c0;
+            const float bb = bias ? bias[m] : 0.0f;
+            for (int n = 0; n < ncol; n++) o[n] = acc[(size_t)m * 16 + n] + bb;
+        }
+    }
+
+    qwen_amx_finish_config();
+    qwen_census_op(QWEN_PATH_DECODER_CONV_AMX_BF16, M, K, nc);
+    MMSTAT(QWEN_MMK_BF16_AMX, M, K, nc);
+    t_census_cur = NULL;
+    return 1;
+}
+
+void qwen_sd_amx_bf16_report(void) {
+    fprintf(stderr, "[SDAMX-BF16] weight_packs=%lld weight_MB=%.1f conversion_panels=%lld conversion_MB=%.1f tdpbf16_tiles=%lld\n",
+            (long long)atomic_load(&g_sd_amx_bf16_pack_count),
+            (double)atomic_load(&g_sd_amx_bf16_pack_bytes) / 1e6,
+            (long long)atomic_load(&g_sd_amx_bf16_convert_panels),
+            (double)atomic_load(&g_sd_amx_bf16_convert_bytes) / 1e6,
+            (long long)atomic_load(&g_sd_amx_bf16_kcalls));
+}
+
+#endif  /* __AMX_BF16__ && __AMX_TILE__ */
+
+#ifndef SD_INT8_NC
+#define SD_INT8_NC 128
+#endif
+
+/* Shared by the INT8 and BF16 decoder panel workers.  Keep the decomposition helper
+ * independent of the VNNI INT8 implementation so an AMX-BF16-only build still links the
+ * real BF16 path rather than being forced through a scalar stub. */
+#define SD_INT8_NC_MIN 24
+static int sd_conv_nc(int length, int nt) {
+    static atomic_int forced = 0;                 /* QWEN_SD_CONV_NC=128 restores the old fixed
+                                                   * panel, which is how this is A/B'd */
+    int f = atomic_load_explicit(&forced, memory_order_relaxed);
+    if (f == 0) {
+        const char *e = getenv("QWEN_SD_CONV_NC");
+        int v = e && *e ? atoi(e) : 0;
+        f = (v >= SD_INT8_NC_MIN && v <= SD_INT8_NC) ? v + 1 : 1;
+        atomic_store_explicit(&forced, f, memory_order_relaxed);
+    }
+    if (f > 1) return f - 1;
+    if (nt < 2 || length <= SD_INT8_NC) return SD_INT8_NC;
+    int want = (length + nt - 1) / nt;
+    if (want >= SD_INT8_NC) return SD_INT8_NC;
+    if (want < SD_INT8_NC_MIN) want = SD_INT8_NC_MIN;
+    want = (want + 3) & ~3;
+    if (want > SD_INT8_NC) want = SD_INT8_NC;
+    return want;
+}
+
+#if defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__)
 static void sd_gemm_panel(float *out, int out_ld, int M,
                           const int8_t *Wq, const float *swb, const int32_t *wsum,
                           const float *bias,
@@ -5891,47 +10158,123 @@ static void sd_gemm_panel(float *out, int out_ld, int M,
     }
 }
 
-#define SD_INT8_NC 128
-
 typedef struct {
     float *out;
     const float *in;
-    const int8_t *Wq; const float *sw; const int32_t *wsum; const float *bias;
-    int in_ch, out_ch, length, kernel, dilation, Kp, blk;
+    const float *residual;
+    const float *split_prefix;
+    const float *split_suffix;
+    const int8_t *Wq; const int8_t *Wpack;
+    const float *sw; const int32_t *wsum; const float *bias;
+    int in_ch, out_ch, length, input_length, input_offset;
+    int split_prefix_length, split_suffix_length;
+    int kernel, dilation, Kp, blk;
     _Atomic int next_panel;
+    _Atomic int entered;      /* workers that reached the body: the honest denominator */
     int n_panels;
+    int nc;                 /* output columns per panel: the parallel unit, see sd_conv_nc() */
 } sd_conv_job_t;
+
+/* The decoder conv parallelises over OUTPUT COLUMNS only, one panel per work item, so a short
+ * layer cannot fill the pool.  The shared helper above sizes the panel from the work while
+ * preserving the per-column quantisation/convert contract for both AMX precisions. */
 
 static void sd_conv1d_worker(void *vj) {
     sd_conv_job_t *j = (sd_conv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
     int K = j->in_ch * j->kernel;
-    int nblk = j->Kp / j->blk;
+    const int nblk = j->Kp / j->blk;
+    const int input_length = j->input_length > 0 ? j->input_length : j->length;
     int pad_left = (j->kernel - 1) * j->dilation;
-    float *colf = (float *)aligned_malloc((size_t)SD_INT8_NC * K * sizeof(float));
-    int8_t *colq = (int8_t *)aligned_malloc((size_t)SD_INT8_NC * j->Kp);
-    float *sa = (float *)aligned_malloc((size_t)SD_INT8_NC * nblk * sizeof(float));
+    /* per-thread, grow-once: the worker runs one panel at a time, so the column scratch is
+     * reused across panels, conv layers and chunks instead of being re-allocated per call */
+    float *colf = mm_scratch_sdcolf((size_t)SD_INT8_NC * K);
+    int8_t *colq = mm_scratch_sdcolq((size_t)SD_INT8_NC * j->Kp);
+    float *sa = mm_scratch_sdsa((size_t)SD_INT8_NC * nblk);
+    long long claimed = 0;      /* accumulate locally: ONE profiler hook per worker, not
+                                 * one per panel -- the per-unit call was 20% of all
+                                 * instrumentation events and buys nothing a sum cannot give */
     for (;;) {
         int p = atomic_fetch_add(&j->next_panel, 1);
         if (p >= j->n_panels) break;
-        int t0 = p * SD_INT8_NC;
-        int nc = j->length - t0 < SD_INT8_NC ? j->length - t0 : SD_INT8_NC;
+        claimed++;
+        int t0 = p * j->nc;
+        int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
         for (int c = 0; c < nc; c++) {
             float *dst = colf + (size_t)c * K;
-            int tt = t0 + c - pad_left;
-            for (int ic = 0; ic < j->in_ch; ic++) {
-                const float *src = j->in + (size_t)ic * j->length;
-                float *dk = dst + (size_t)ic * j->kernel;
-                for (int kk = 0; kk < j->kernel; kk++) {
-                    int pos = tt + kk * j->dilation;
-                    dk[kk] = (pos >= 0 && pos < j->length) ? src[pos] : 0.0f;
+            int tt = j->input_offset + t0 + c - pad_left;
+            if (j->split_prefix) {
+                /* Positions increase with kk.  Derive the source intervals once per
+                 * output column, then keep the inner channel/tap loops branch-free.
+                 * The first implementation selected prefix/suffix for every scalar;
+                 * that erased much of the copy saved by the split representation. */
+                int k_valid = tt < 0 ? (-tt + j->dilation - 1) / j->dilation : 0;
+                int k_prefix = tt < j->split_prefix_length
+                             ? (j->split_prefix_length - tt + j->dilation - 1) / j->dilation
+                             : 0;
+                int k_suffix = tt < input_length
+                             ? (input_length - tt + j->dilation - 1) / j->dilation
+                             : 0;
+                if (k_valid < 0) k_valid = 0;
+                if (k_valid > j->kernel) k_valid = j->kernel;
+                if (k_prefix < k_valid) k_prefix = k_valid;
+                if (k_prefix > j->kernel) k_prefix = j->kernel;
+                if (k_suffix < k_prefix) k_suffix = k_prefix;
+                if (k_suffix > j->kernel) k_suffix = j->kernel;
+                for (int ic = 0; ic < j->in_ch; ic++) {
+                    float *dk = dst + (size_t)ic * j->kernel;
+                    for (int kk = 0; kk < k_valid; kk++) dk[kk] = 0.0f;
+                    for (int kk = k_valid; kk < k_prefix; kk++) {
+                        int pos = tt + kk * j->dilation;
+                        dk[kk] = j->split_prefix[(size_t)ic * j->split_prefix_length + pos];
+                    }
+                    for (int kk = k_prefix; kk < k_suffix; kk++) {
+                        int pos = tt + kk * j->dilation - j->split_prefix_length;
+                        dk[kk] = j->split_suffix[(size_t)ic * j->split_suffix_length + pos];
+                    }
+                    for (int kk = k_suffix; kk < j->kernel; kk++) dk[kk] = 0.0f;
+                }
+            } else {
+                for (int ic = 0; ic < j->in_ch; ic++) {
+                    const float *src = j->in + (size_t)ic * input_length;
+                    float *dk = dst + (size_t)ic * j->kernel;
+                    for (int kk = 0; kk < j->kernel; kk++) {
+                        int pos = tt + kk * j->dilation;
+                        dk[kk] = (pos >= 0 && pos < input_length) ? src[pos] : 0.0f;
+                    }
                 }
             }
         }
         qwen_int8_quant_rows(colq, sa, colf, nc, K, j->Kp, j->blk);
-        sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
-                      colq, sa, t0, nc, j->Kp, j->blk);
+        int amx_fused = 0;
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+        if (j->Wpack) {
+            amx_fused = sd_gemm_panel_amx_d(j->out, j->length, j->out_ch, j->Wpack,
+                                            j->sw, j->wsum, j->bias, colq, sa,
+                                            j->residual, t0, nc, j->Kp, j->blk);
+            if (!amx_fused)
+                if (!sd_amx_enabled() ||
+                    !sd_gemm_panel_amx(j->out, j->length, j->out_ch, j->Wq, j->sw,
+                                       j->wsum, j->bias, colq, sa, t0, nc,
+                                       j->Kp, j->blk))
+                    sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw,
+                                  j->wsum, j->bias, colq, sa, t0, nc, j->Kp, j->blk);
+        } else if (!sd_amx_enabled() ||
+                   !sd_gemm_panel_amx(j->out, j->length, j->out_ch, j->Wq, j->sw,
+                                      j->wsum, j->bias, colq, sa, t0, nc,
+                                      j->Kp, j->blk))
+#endif
+            sd_gemm_panel(j->out, j->length, j->out_ch, j->Wq, j->sw, j->wsum, j->bias,
+                          colq, sa, t0, nc, j->Kp, j->blk);
+        if (j->residual && !amx_fused) {
+            for (int m = 0; m < j->out_ch; m++) {
+                float *dst = j->out + (size_t)m * j->length + t0;
+                const float *src = j->residual + (size_t)m * j->length + t0;
+                for (int n = 0; n < nc; n++) dst[n] += src[n];
+            }
+        }
     }
-    free(colf); free(colq); free(sa);
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
 }
 
 void qwen_conv1d_int8(float *out, const float *in,
@@ -5939,16 +10282,1066 @@ void qwen_conv1d_int8(float *out, const float *in,
                       const float *bias,
                       int in_ch, int out_ch, int length, int kernel, int dilation,
                       int Kp, int blk) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, out_ch, in_ch * kernel, length);
+#if defined(__ARM_FEATURE_DOTPROD)
+    qwen_census_leaf(QWEN_LEAF_SDOT);
+#elif defined(__AVX512VNNI__)
+    qwen_census_leaf(QWEN_LEAF_VNNI);
+#elif defined(__AVX512F__)
+    qwen_census_leaf(QWEN_LEAF_AVX512F);
+#else
+    qwen_census_leaf(QWEN_LEAF_SCALAR);
+#endif
     sd_conv_job_t job = {
-        .out = out, .in = in, .Wq = Wq, .sw = sw, .wsum = wsum, .bias = bias,
+        .out = out, .in = in, .Wq = Wq, .Wpack = NULL,
+        .sw = sw, .wsum = wsum, .bias = bias,
         .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .input_length = length, .input_offset = 0,
         .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
-        .n_panels = (length + SD_INT8_NC - 1) / SD_INT8_NC,
     };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
     atomic_store(&job.next_panel, 0);
+    /* The decomposition itself, so a report can say 2 of 6 workers instead of only a
+     * wall time: this layer's panels are the parallel unit, and a short layer cannot
+     * fill the pool no matter how fast the kernel is. */
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
     sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
 }
 
+/* ------------------------------------------------------------------------------------
+ * DL-4: direct dilated causal conv1d, int8 VNNI, for the decoder residual convs.
+ *
+ * The panel path builds a 7-tap f32 im2col column per output position, quantises it and
+ * runs a 2x4 GEMM tile that re-reads every weight row 32 times per panel.  Here the input
+ * is transposed+quantised ONCE per position (one tap, one scale per position, u8 = x+128
+ * stored flipped so the inner loop has no XOR), the weights live per (channel, tap) with
+ * their own scale, and a 4-channel x 4-position register tile walks the taps directly:
+ * each weight vector feeds 4 positions, each activation vector 4 channels, and a time
+ * block reads the layer's weights once.  Per tap the int32 partials are scaled by
+ * s[position] x sw[channel][tap] into f32 accumulators (the scale depends on the input
+ * position, so it cannot be applied after the taps); the u8 offset is removed with
+ * 128 x wsum[channel][tap] x the same scale.
+ * ---------------------------------------------------------------------------------- */
+#if defined(__AVX512VNNI__)
+QWEN_MM_SCRATCH(dcq, uint8_t)
+QWEN_MM_SCRATCH(dcs, float)
+QWEN_MM_SCRATCH(dcf, float)
+typedef struct {
+    float *out; const float *in;
+    const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
+    int in_ch, out_ch, length, kernel, dilation, Cp, tb;
+    const float *tail; int tail_cols;   /* left context [ch][tail_cols] for positions < 0 (NULL: zero rows) */
+    const float *residual;              /* [ch][length] added in the epilogue (NULL: none) */
+    _Atomic int next; _Atomic int entered; int n_blocks;
+} sd_dconv_job_t;
+
+static inline int sd_dconv_round(float q) { return (int)(q >= 0 ? q + 0.5f : q - 0.5f); }
+
+/* WHY THESE WORKERS OPT OUT OF REASSOCIATION AND AUTO-VECTORIZATION.
+ *
+ * The epilogue computes `reduce(facc) - corr + bias` and, when a residual is supplied,
+ * adds it: a four-term float sum.  The build uses -ffast-math, so the compiler is free to
+ * re-associate that sum -- and it does, but only in the four-term case, because the
+ * three-term one has nothing to move.  The two arms then round differently in the last
+ * bit.  That would be harmless in most kernels; here it is not, because the residual
+ * unit's output is re-quantised per position by the NEXT unit: one ulp can shift `amax`,
+ * which shifts the scale for every channel at that position.  Measured end to end on
+ * Turin the drift reached 115 LSB on a 9550 peak (~1.2 %, mel-corr 0.99847) -- far above
+ * the -90 dB the engine treats as benign.
+ *
+ * Disabling reassociation and GCC's loop vectorizer for these workers restores the
+ * contract the fused path is supposed to honour: the single-slot 4x4 and multi-slot
+ * 4x2 tiles then produce the same float sequence, so the multi-slot oracle is bit-exact.
+ * The two attributes are narrow: explicit AVX-512 intrinsics remain vectorized, while
+ * the scalar correction bookkeeping is kept in source order.  The rest of -ffast-math
+ * and every other kernel remain untouched.
+ *
+ * If a compiler ignores the attribute the failure is loud, not silent: the
+ * `conv1d_int8_v2 ... ctx+residual` and multi-slot self-test cases demand bit-equality
+ * and fail. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
+#endif
+static void sd_dconv_worker(void *vj) {
+    sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
+    const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
+    const int pad = (K - 1) * dil;
+    const int maxrows = j->tb + pad + 4;
+    uint8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
+    float *sc = mm_scratch_dcs((size_t)maxrows);
+    float *frow = mm_scratch_dcf((size_t)Cp);
+    long long claimed = 0;
+    if (!q || !sc || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
+    __m512 facc[16];
+    for (;;) {
+        int b = atomic_fetch_add(&j->next, 1);
+        if (b >= j->n_blocks) break;
+        claimed++;
+        const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
+        const int nrows = (t1 - t0) + pad + 4;
+        for (int r = 0; r < nrows; r++) {
+            const int p = t0 - pad + r;
+            uint8_t *qr = q + (size_t)r * Cp;
+            const float *src; size_t sstride;
+            if (p >= 0 && p < L) { src = j->in + p; sstride = (size_t)L; }
+            else if (p < 0 && j->tail && -p <= j->tail_cols) { src = j->tail + (j->tail_cols + p); sstride = (size_t)j->tail_cols; }
+            else { memset(qr, 0x80, (size_t)Cp); sc[r] = 0.0f; continue; }
+            float amax = 0.0f;
+            for (int ic = 0; ic < in_ch; ic++) { float v = src[(size_t)ic * sstride]; frow[ic] = v; float a = fabsf(v); if (a > amax) amax = a; }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+            sc[r] = scale;
+            int ic = 0;
+            for (; ic + 16 <= in_ch; ic += 16) {
+                __m512 v = _mm512_mul_ps(_mm512_loadu_ps(frow + ic), _mm512_set1_ps(inv));
+                __m512i qi = _mm512_cvtps_epi32(_mm512_roundscale_ps(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                qi = _mm512_add_epi32(_mm512_max_epi32(_mm512_min_epi32(qi, _mm512_set1_epi32(127)), _mm512_set1_epi32(-127)), _mm512_set1_epi32(128));
+                _mm_storeu_si128((__m128i *)(qr + ic), _mm512_cvtepi32_epi8(qi));
+            }
+            for (; ic < in_ch; ic++) { int v = sd_dconv_round(frow[ic] * inv); if (v > 127) v = 127; if (v < -127) v = -127; qr[ic] = (uint8_t)(v + 128); }
+            for (; ic < Cp; ic++) qr[ic] = 0x80;
+        }
+        for (int m0 = 0; m0 < out_ch; m0 += 4) {
+            const int mn = out_ch - m0 < 4 ? out_ch - m0 : 4;
+            for (int t = t0; t < t1; t += 4) {
+                const int tn = t1 - t < 4 ? t1 - t : 4;
+                float corr[4][4] = {{0}};
+                for (int i = 0; i < 16; i++) facc[i] = _mm512_setzero_ps();
+                for (int kk = 0; kk < K; kk++) {
+                    /* tap kk reads input position t - (K-1-kk)*dil: kk = 0 is the oldest
+                     * tap, kk = K-1 the current position (the panel builder's order) */
+                    const uint8_t *x0 = q + (size_t)((t + 0) - t0 + kk * dil) * Cp;
+                    const uint8_t *x1 = x0 + Cp, *x2 = x0 + 2 * Cp, *x3 = x0 + 3 * Cp;
+                    const int8_t *w0 = j->wq + ((size_t)(m0 + 0) * K + kk) * Cp;
+                    const int8_t *w1 = mn > 1 ? j->wq + ((size_t)(m0 + 1) * K + kk) * Cp : w0;
+                    const int8_t *w2 = mn > 2 ? j->wq + ((size_t)(m0 + 2) * K + kk) * Cp : w0;
+                    const int8_t *w3 = mn > 3 ? j->wq + ((size_t)(m0 + 3) * K + kk) * Cp : w0;
+                    __m512i a00 = _mm512_setzero_si512(), a01 = a00, a02 = a00, a03 = a00;
+                    __m512i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+                    __m512i a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+                    __m512i a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+                    for (int k = 0; k < Cp; k += 64) {
+                        const __m512i xv0 = _mm512_loadu_si512((const void *)(x0 + k));
+                        const __m512i xv1 = _mm512_loadu_si512((const void *)(x1 + k));
+                        const __m512i xv2 = _mm512_loadu_si512((const void *)(x2 + k));
+                        const __m512i xv3 = _mm512_loadu_si512((const void *)(x3 + k));
+                        __m512i wv = _mm512_loadu_si512((const void *)(w0 + k));
+                        a00 = _mm512_dpbusd_epi32(a00, xv0, wv); a01 = _mm512_dpbusd_epi32(a01, xv1, wv);
+                        a02 = _mm512_dpbusd_epi32(a02, xv2, wv); a03 = _mm512_dpbusd_epi32(a03, xv3, wv);
+                        wv = _mm512_loadu_si512((const void *)(w1 + k));
+                        a10 = _mm512_dpbusd_epi32(a10, xv0, wv); a11 = _mm512_dpbusd_epi32(a11, xv1, wv);
+                        a12 = _mm512_dpbusd_epi32(a12, xv2, wv); a13 = _mm512_dpbusd_epi32(a13, xv3, wv);
+                        wv = _mm512_loadu_si512((const void *)(w2 + k));
+                        a20 = _mm512_dpbusd_epi32(a20, xv0, wv); a21 = _mm512_dpbusd_epi32(a21, xv1, wv);
+                        a22 = _mm512_dpbusd_epi32(a22, xv2, wv); a23 = _mm512_dpbusd_epi32(a23, xv3, wv);
+                        wv = _mm512_loadu_si512((const void *)(w3 + k));
+                        a30 = _mm512_dpbusd_epi32(a30, xv0, wv); a31 = _mm512_dpbusd_epi32(a31, xv1, wv);
+                        a32 = _mm512_dpbusd_epi32(a32, xv2, wv); a33 = _mm512_dpbusd_epi32(a33, xv3, wv);
+                    }
+                    const __m512i *acc[16] = { &a00, &a01, &a02, &a03, &a10, &a11, &a12, &a13,
+                                               &a20, &a21, &a22, &a23, &a30, &a31, &a32, &a33 };
+                    for (int i = 0; i < mn; i++) {
+                        const float swv = j->sw[(size_t)(m0 + i) * K + kk];
+                        const float wsv = 128.0f * (float)j->wsum[(size_t)(m0 + i) * K + kk];
+                        for (int jj = 0; jj < 4; jj++) {
+                            const int r = (t + jj) - t0 + kk * dil;
+                            const float g = sc[r] * swv;
+                            facc[i * 4 + jj] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(*acc[i * 4 + jj]), _mm512_set1_ps(g), facc[i * 4 + jj]);
+                            corr[i][jj] += wsv * g;
+                        }
+                    }
+                }
+                for (int i = 0; i < mn; i++) {
+                    const float bv = j->bias ? j->bias[m0 + i] : 0.0f;
+                    float *o = j->out + (size_t)(m0 + i) * L + t;
+                    const float *rs = j->residual ? j->residual + (size_t)(m0 + i) * L + t : NULL;
+                    for (int jj = 0; jj < tn; jj++) {
+                        float v = _mm512_reduce_add_ps(facc[i * 4 + jj]) - corr[i][jj] + bv;
+                        o[jj] = rs ? v + rs[jj] : v;
+                    }
+                }
+            }
+        }
+    }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
+}
+
+int qwen_conv1d_int8_v2_available(void) { return 1; }
+void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
+                             const float *residual,
+                             const int8_t *wq, const float *sw, const int32_t *wsum,
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, in_ch, in_ch * kernel, length);
+    qwen_census_leaf(QWEN_LEAF_VNNI);
+    sd_dconv_job_t job = { .out = out, .in = in, .wq = wq, .sw = sw, .wsum = wsum, .bias = bias,
+                           .in_ch = in_ch, .out_ch = out_ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
+                           .tail = tail, .tail_cols = tail ? tail_cols : 0, .residual = residual };
+    int nt = sd_pool_threads(); if (nt < 1) nt = 1;
+    int tb = (length + nt * 2 - 1) / (nt * 2);
+    if (tb < 32) tb = 32; if (tb > 256) tb = 256; tb = (tb + 3) & ~3;
+    job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
+    atomic_store(&job.next, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_dconv_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+void qwen_conv1d_int8_v2(float *out, const float *in,
+                         const int8_t *wq, const float *sw, const int32_t *wsum,
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, in_ch, out_ch, length, kernel, dilation, Cp);
+}
+
+/* Multi-slot twin: quantise each slot once, then keep the shared weight vector in
+ * the register sweep while two time positions and up to three slots consume it.
+ * The 4x2 tile is deliberately smaller than the single-slot 4x4 tile: 8*S+4
+ * vector values are live at the dot-product point for S<=3. */
+QWEN_MM_SCRATCH(dcmq, uint8_t)
+QWEN_MM_SCRATCH(dcms, float)
+QWEN_MM_SCRATCH(dcmf, float)
+typedef struct {
+    float *const *out; const float *const *in;
+    const float *const *tail; const int *tail_cols;
+    const float *const *residual;
+    const size_t *in_stride; const size_t *out_stride;
+    const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
+    int in_ch, out_ch, nslots, length, kernel, dilation, Cp, tb;
+    _Atomic int next; _Atomic int entered; int n_blocks;
+} sd_dconv_multi_job_t;
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
+#endif
+static void sd_dconv_multi_worker(void *vj) {
+    sd_dconv_multi_job_t *j = (sd_dconv_multi_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
+    const int S = j->nslots, in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp;
+    const int K = j->kernel, dil = j->dilation, L = j->length;
+    const int pad = (K - 1) * dil;
+    const int maxrows = j->tb + pad + 4;
+    uint8_t *qa = mm_scratch_dcmq((size_t)S * maxrows * Cp);
+    float *sa = mm_scratch_dcms((size_t)S * maxrows);
+    float *frow = mm_scratch_dcmf((size_t)Cp);
+    long long claimed = 0;
+    if (!qa || !sa || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
+    for (;;) {
+        int b = atomic_fetch_add(&j->next, 1);
+        if (b >= j->n_blocks) break;
+        claimed++;
+        const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
+        const int nrows = (t1 - t0) + pad + 4;
+        for (int s = 0; s < S; s++) {
+            const size_t istride = j->in_stride ? j->in_stride[s] : (size_t)L;
+            const float *tail = j->tail ? j->tail[s] : NULL;
+            const int tc = j->tail_cols ? j->tail_cols[s] : 0;
+            for (int r = 0; r < nrows; r++) {
+                const int p = t0 - pad + r;
+                uint8_t *qr = qa + ((size_t)s * maxrows + r) * Cp;
+                float *scr = sa + (size_t)s * maxrows + r;
+                const float *src; size_t sstride;
+                if (p >= 0 && p < L) { src = j->in[s] + p; sstride = istride; }
+                else if (p < 0 && tail && -p <= tc) { src = tail + (tc + p); sstride = (size_t)tc; }
+                else { memset(qr, 0x80, (size_t)Cp); *scr = 0.0f; continue; }
+                float amax = 0.0f;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float v = src[(size_t)ic * sstride];
+                    frow[ic] = v;
+                    const float a = fabsf(v); if (a > amax) amax = a;
+                }
+                const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+                const float inv = 1.0f / scale;
+                *scr = scale;
+                int ic = 0;
+                for (; ic + 16 <= in_ch; ic += 16) {
+                    __m512 v = _mm512_mul_ps(_mm512_loadu_ps(frow + ic), _mm512_set1_ps(inv));
+                    __m512i qi = _mm512_cvtps_epi32(_mm512_roundscale_ps(
+                        v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                    qi = _mm512_add_epi32(
+                        _mm512_max_epi32(_mm512_min_epi32(qi, _mm512_set1_epi32(127)),
+                                         _mm512_set1_epi32(-127)), _mm512_set1_epi32(128));
+                    _mm_storeu_si128((__m128i *)(qr + ic), _mm512_cvtepi32_epi8(qi));
+                }
+                for (; ic < in_ch; ic++) {
+                    int v = sd_dconv_round(frow[ic] * inv);
+                    if (v > 127) v = 127;
+                    if (v < -127) v = -127;
+                    qr[ic] = (uint8_t)(v + 128);
+                }
+                for (; ic < Cp; ic++) qr[ic] = 0x80;
+            }
+        }
+
+        for (int m0 = 0; m0 < out_ch; m0 += 4) {
+            const int mn = out_ch - m0 < 4 ? out_ch - m0 : 4;
+            for (int t = t0; t < t1; t += 2) {
+                const int tn = t1 - t < 2 ? t1 - t : 2;
+                __m512 facc[3][4][2];
+                float corr[3][4][2] = {{{0}}};
+                for (int s = 0; s < S; s++)
+                    for (int i = 0; i < mn; i++)
+                        for (int jj = 0; jj < 2; jj++)
+                            facc[s][i][jj] = _mm512_setzero_ps();
+                for (int kk = 0; kk < K; kk++) {
+                    __m512i acc[3][4][2];
+                    for (int s = 0; s < S; s++)
+                        for (int i = 0; i < mn; i++)
+                            for (int jj = 0; jj < 2; jj++)
+                                acc[s][i][jj] = _mm512_setzero_si512();
+                    for (int k = 0; k < Cp; k += 64) {
+                        __m512i xv[3][2];
+                        for (int s = 0; s < S; s++) {
+                            const uint8_t *x0 = qa + ((size_t)s * maxrows + (t - t0 + kk * dil)) * Cp;
+                            xv[s][0] = _mm512_loadu_si512((const void *)(x0 + k));
+                            xv[s][1] = _mm512_loadu_si512((const void *)(x0 + Cp + k));
+                        }
+                        for (int i = 0; i < mn; i++) {
+                            const int8_t *wr = j->wq + ((size_t)(m0 + i) * K + kk) * Cp + k;
+                            const __m512i wv = _mm512_loadu_si512((const void *)wr);
+                            for (int s = 0; s < S; s++) {
+                                acc[s][i][0] = _mm512_dpbusd_epi32(acc[s][i][0], xv[s][0], wv);
+                                acc[s][i][1] = _mm512_dpbusd_epi32(acc[s][i][1], xv[s][1], wv);
+                            }
+                        }
+                    }
+                    for (int s = 0; s < S; s++) {
+                        for (int i = 0; i < mn; i++) {
+                            const float swv = j->sw[(size_t)(m0 + i) * K + kk];
+                            const float wsv = 128.0f * (float)j->wsum[(size_t)(m0 + i) * K + kk];
+                            for (int jj = 0; jj < 2; jj++) {
+                                const int r = (t + jj) - t0 + kk * dil;
+                                const float g = sa[(size_t)s * maxrows + r] * swv;
+                                facc[s][i][jj] = _mm512_fmadd_ps(
+                                    _mm512_cvtepi32_ps(acc[s][i][jj]), _mm512_set1_ps(g), facc[s][i][jj]);
+                                corr[s][i][jj] += wsv * g;
+                            }
+                        }
+                    }
+                }
+                for (int s = 0; s < S; s++) {
+                    const size_t ostride = j->out_stride ? j->out_stride[s] : (size_t)L;
+                    for (int i = 0; i < mn; i++) {
+                        const float bv = j->bias ? j->bias[m0 + i] : 0.0f;
+                        float *o = j->out[s] + (size_t)(m0 + i) * ostride + t;
+                        const float *rs = j->residual && j->residual[s]
+                            ? j->residual[s] + (size_t)(m0 + i) * ostride + t : NULL;
+                        for (int jj = 0; jj < tn; jj++) {
+                            const float v = _mm512_reduce_add_ps(facc[s][i][jj]) - corr[s][i][jj] + bv;
+                            o[jj] = rs ? v + rs[jj] : v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
+}
+
+int qwen_conv1d_int8_v2_multi_available(void) { return 1; }
+void qwen_conv1d_int8_v2_multi_ctx_strided(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const size_t *in_stride, const size_t *out_stride,
+    const int8_t *wq, const float *sw, const int32_t *wsum, const float *bias,
+    int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    if (!out || !in || !wq || !sw || !wsum || in_ch <= 0 || out_ch <= 0 ||
+        nslots < 2 || nslots > 3 || length <= 0 || kernel <= 0 || dilation <= 0 ||
+        Cp < in_ch || (Cp & 63)) return;
+    for (int s = 0; s < nslots; s++) if (!out[s] || !in[s]) return;
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, in_ch, in_ch * kernel, length * nslots);
+    qwen_census_leaf(QWEN_LEAF_VNNI);
+    sd_dconv_multi_job_t job = {
+        .out = out, .in = in, .tail = tail, .tail_cols = tail_cols, .residual = residual,
+        .in_stride = in_stride, .out_stride = out_stride, .wq = wq, .sw = sw, .wsum = wsum,
+        .bias = bias, .in_ch = in_ch, .out_ch = out_ch, .nslots = nslots, .length = length,
+        .kernel = kernel, .dilation = dilation, .Cp = Cp,
+    };
+    int nt = sd_pool_threads(); if (nt < 1) nt = 1;
+    int tb = (length + nt * 2 - 1) / (nt * 2);
+    if (tb < 32) tb = 32;
+    if (tb > 256) tb = 256;
+    tb = (tb + 3) & ~3;
+    job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
+    atomic_store(&job.next, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_dconv_multi_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+void qwen_conv1d_int8_v2_multi_ctx(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const int8_t *wq, const float *sw, const int32_t *wsum,
+    const float *bias, int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    size_t istride[3] = { (size_t)length, (size_t)length, (size_t)length };
+    size_t ostride[3] = { (size_t)length, (size_t)length, (size_t)length };
+    qwen_conv1d_int8_v2_multi_ctx_strided(out, in, tail, tail_cols, residual,
+                                          istride, ostride, wq, sw, wsum, bias,
+                                          in_ch, out_ch, nslots, length, kernel, dilation, Cp);
+}
+#elif defined(__ARM_FEATURE_DOTPROD)
+/* ---- ARM-6: DL-4 direct dilated int8 conv, SDOT leaf --------------------------------
+ * Twin of the VNNI kernel above.  Same panel, same per-position activation scale, same
+ * tap order, same block scheduling.  Activation is int8 (SDOT is s8 x s8), so the u8 +128
+ * bias and its `128 * wsum` correction are dropped: the two cancel exactly over int32. */
+QWEN_MM_SCRATCH(dcq, int8_t)
+QWEN_MM_SCRATCH(dcs, float)
+QWEN_MM_SCRATCH(dcf, float)
+typedef struct {
+    float *out; const float *in;
+    const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
+    int in_ch, out_ch, length, kernel, dilation, Cp, tb;
+    const float *tail; int tail_cols;
+    const float *residual;
+    _Atomic int next; _Atomic int entered; int n_blocks;
+} sd_dconv_job_t;
+
+#if defined(__GNUC__) && !defined(__clang__)
+/* GCC 15 on Neoverse-V3 can reassociate or auto-vectorize the scalar float
+ * bookkeeping differently in the context+residual and multi-slot workers.
+ * Keep the reduction order exact; the explicit SDOT intrinsics remain native
+ * vector code.  This is the ARM counterpart of the VNNI guard above. */
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
+#endif
+static void sd_dconv_worker(void *vj) {
+    sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
+    const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp, K = j->kernel, dil = j->dilation, L = j->length;
+    const int pad = (K - 1) * dil;
+    const int maxrows = j->tb + pad + 4;
+    int8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
+    float  *sc = mm_scratch_dcs((size_t)maxrows);
+    float  *frow = mm_scratch_dcf((size_t)Cp);
+    long long claimed = 0;
+    if (!q || !sc || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
+    for (;;) {
+        int b = atomic_fetch_add(&j->next, 1);
+        if (b >= j->n_blocks) break;
+        claimed++;
+        const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
+        const int nrows = (t1 - t0) + pad + 4;
+        /* one quantised row per INPUT POSITION, with that position's own scale */
+        for (int r = 0; r < nrows; r++) {
+            const int p = t0 - pad + r;
+            int8_t *qr = q + (size_t)r * Cp;
+            const float *src; size_t sstride;
+            if (p >= 0 && p < L)                                        { src = j->in + p; sstride = (size_t)L; }
+            else if (p < 0 && j->tail && -p <= j->tail_cols)            { src = j->tail + (j->tail_cols + p); sstride = (size_t)j->tail_cols; }
+            else { memset(qr, 0, (size_t)Cp); sc[r] = 0.0f; continue; }
+            float amax = 0.0f;
+            for (int ic = 0; ic < in_ch; ic++) {
+                const float v = src[(size_t)ic * sstride];
+                frow[ic] = v;
+                const float a = fabsf(v); if (a > amax) amax = a;
+            }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+            sc[r] = scale;
+            int ic = 0;
+            for (; ic < in_ch; ic++) {
+                /* HALF TO EVEN, not sd_dconv_round's half-away-from-zero.  The VNNI kernel
+                 * quantises its bulk with _mm512_cvtps_epi32 (nearest-even, current mode)
+                 * and only its scalar tail uses sd_dconv_round; the self-test's integer
+                 * reference uses lrintf, i.e. nearest-even.  Rounding half away here makes
+                 * the leaf disagree with that reference on exact .5 ties -- measured as
+                 * rel_L2 1.3e-4 on ch=192 k=7 dil=3 L=67 and 3.1e-5 on ch=768 k=1 L=260,
+                 * zero everywhere else.  lrintf is one instruction on AArch64. */
+                int v = (int)lrintf(frow[ic] * inv);
+                if (v >  127) v =  127;
+                if (v < -127) v = -127;
+                qr[ic] = (int8_t)v;
+            }
+            for (; ic < Cp; ic++) qr[ic] = 0;
+        }
+        for (int m0 = 0; m0 < out_ch; m0 += 4) {
+            const int mn = out_ch - m0 < 4 ? out_ch - m0 : 4;
+            for (int t = t0; t < t1; t += 4) {
+                const int tn = t1 - t < 4 ? t1 - t : 4;
+                float facc[4][4] = {{0.0f}};
+                for (int kk = 0; kk < K; kk++) {
+                    /* kk = 0 is the oldest tap, kk = K-1 the current position */
+                    const int8_t *x0 = q + (size_t)((t + 0) - t0 + kk * dil) * Cp;
+                    const int8_t *x1 = x0 + Cp, *x2 = x0 + 2 * Cp, *x3 = x0 + 3 * Cp;
+                    const int8_t *w0 = j->wq + ((size_t)(m0 + 0) * K + kk) * Cp;
+                    const int8_t *w1 = mn > 1 ? j->wq + ((size_t)(m0 + 1) * K + kk) * Cp : w0;
+                    const int8_t *w2 = mn > 2 ? j->wq + ((size_t)(m0 + 2) * K + kk) * Cp : w0;
+                    const int8_t *w3 = mn > 3 ? j->wq + ((size_t)(m0 + 3) * K + kk) * Cp : w0;
+                    int32x4_t a00 = vdupq_n_s32(0), a01 = a00, a02 = a00, a03 = a00;
+                    int32x4_t a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+                    int32x4_t a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+                    int32x4_t a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+                    for (int k = 0; k < Cp; k += 16) {
+                        const int8x16_t xv0 = vld1q_s8(x0 + k);
+                        const int8x16_t xv1 = vld1q_s8(x1 + k);
+                        const int8x16_t xv2 = vld1q_s8(x2 + k);
+                        const int8x16_t xv3 = vld1q_s8(x3 + k);
+                        int8x16_t wv = vld1q_s8(w0 + k);
+                        a00 = vdotq_s32(a00, xv0, wv); a01 = vdotq_s32(a01, xv1, wv);
+                        a02 = vdotq_s32(a02, xv2, wv); a03 = vdotq_s32(a03, xv3, wv);
+                        wv = vld1q_s8(w1 + k);
+                        a10 = vdotq_s32(a10, xv0, wv); a11 = vdotq_s32(a11, xv1, wv);
+                        a12 = vdotq_s32(a12, xv2, wv); a13 = vdotq_s32(a13, xv3, wv);
+                        wv = vld1q_s8(w2 + k);
+                        a20 = vdotq_s32(a20, xv0, wv); a21 = vdotq_s32(a21, xv1, wv);
+                        a22 = vdotq_s32(a22, xv2, wv); a23 = vdotq_s32(a23, xv3, wv);
+                        wv = vld1q_s8(w3 + k);
+                        a30 = vdotq_s32(a30, xv0, wv); a31 = vdotq_s32(a31, xv1, wv);
+                        a32 = vdotq_s32(a32, xv2, wv); a33 = vdotq_s32(a33, xv3, wv);
+                    }
+                    const int32x4_t acc[16] = { a00, a01, a02, a03, a10, a11, a12, a13,
+                                                a20, a21, a22, a23, a30, a31, a32, a33 };
+                    for (int i = 0; i < mn; i++) {
+                        const float swv = j->sw[(size_t)(m0 + i) * K + kk];
+                        for (int jj = 0; jj < 4; jj++) {
+                            const int r = (t + jj) - t0 + kk * dil;
+                            /* exact int32 reduction, then ONE f32 fma per tap */
+                            facc[i][jj] += (float)vaddvq_s32(acc[i * 4 + jj]) * (sc[r] * swv);
+                        }
+                    }
+                }
+                for (int i = 0; i < mn; i++) {
+                    const float bv = j->bias ? j->bias[m0 + i] : 0.0f;
+                    float *o = j->out + (size_t)(m0 + i) * L + t;
+                    const float *rs = j->residual ? j->residual + (size_t)(m0 + i) * L + t : NULL;
+                    for (int jj = 0; jj < tn; jj++) {
+                        const float v = facc[i][jj] + bv;
+                        o[jj] = rs ? v + rs[jj] : v;
+                    }
+                }
+            }
+        }
+    }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
+}
+
+int qwen_conv1d_int8_v2_available(void) { return 1; }
+void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
+                             const float *residual,
+                             const int8_t *wq, const float *sw, const int32_t *wsum,
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, in_ch, in_ch * kernel, length);
+    qwen_census_leaf(QWEN_LEAF_SDOT);
+    sd_dconv_job_t job = { .out = out, .in = in, .wq = wq, .sw = sw, .wsum = wsum, .bias = bias,
+                           .in_ch = in_ch, .out_ch = out_ch, .length = length, .kernel = kernel, .dilation = dilation, .Cp = Cp,
+                           .tail = tail, .tail_cols = tail ? tail_cols : 0, .residual = residual };
+    int nt = sd_pool_threads(); if (nt < 1) nt = 1;
+    int tb = (length + nt * 2 - 1) / (nt * 2);
+    if (tb < 32) tb = 32; if (tb > 256) tb = 256; tb = (tb + 3) & ~3;
+    job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
+    atomic_store(&job.next, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_dconv_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+void qwen_conv1d_int8_v2(float *out, const float *in,
+                         const int8_t *wq, const float *sw, const int32_t *wsum,
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias, in_ch, out_ch, length, kernel, dilation, Cp);
+}
+
+/* ARM SDOT multi-slot twin.  As on VNNI, each slot owns one quantised activation
+ * panel while the shared weight vector is loaded once for all slots.  A 4x2 time
+ * tile keeps the live register set bounded for the documented S<=3 cohort. */
+QWEN_MM_SCRATCH(dcmq, int8_t)
+QWEN_MM_SCRATCH(dcms, float)
+QWEN_MM_SCRATCH(dcmf, float)
+typedef struct {
+    float *const *out; const float *const *in;
+    const float *const *tail; const int *tail_cols;
+    const float *const *residual;
+    const size_t *in_stride; const size_t *out_stride;
+    const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
+    int in_ch, out_ch, nslots, length, kernel, dilation, Cp, tb;
+    _Atomic int next; _Atomic int entered; int n_blocks;
+} sd_dconv_multi_job_t;
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
+#endif
+static void sd_dconv_multi_worker(void *vj) {
+    sd_dconv_multi_job_t *j = (sd_dconv_multi_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
+    const int S = j->nslots, in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp;
+    const int K = j->kernel, dil = j->dilation, L = j->length;
+    const int pad = (K - 1) * dil;
+    const int maxrows = j->tb + pad + 4;
+    int8_t *qa = mm_scratch_dcmq((size_t)S * maxrows * Cp);
+    float *sa = mm_scratch_dcms((size_t)S * maxrows);
+    float *frow = mm_scratch_dcmf((size_t)Cp);
+    long long claimed = 0;
+    if (!qa || !sa || !frow) {
+        qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, 0);
+        return;
+    }
+    for (;;) {
+        int b = atomic_fetch_add(&j->next, 1);
+        if (b >= j->n_blocks) break;
+        claimed++;
+        const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
+        const int nrows = (t1 - t0) + pad + 4;
+        for (int s = 0; s < S; s++) {
+            const size_t istride = j->in_stride ? j->in_stride[s] : (size_t)L;
+            const float *tail = j->tail ? j->tail[s] : NULL;
+            const int tc = j->tail_cols ? j->tail_cols[s] : 0;
+            for (int r = 0; r < nrows; r++) {
+                const int p = t0 - pad + r;
+                int8_t *qr = qa + ((size_t)s * maxrows + r) * Cp;
+                float *scr = sa + (size_t)s * maxrows + r;
+                const float *src; size_t sstride;
+                if (p >= 0 && p < L) { src = j->in[s] + p; sstride = istride; }
+                else if (p < 0 && tail && -p <= tc) { src = tail + (tc + p); sstride = (size_t)tc; }
+                else { memset(qr, 0, (size_t)Cp); *scr = 0.0f; continue; }
+                float amax = 0.0f;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float v = src[(size_t)ic * sstride];
+                    frow[ic] = v;
+                    const float a = fabsf(v); if (a > amax) amax = a;
+                }
+                const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+                const float inv = 1.0f / scale;
+                *scr = scale;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    int v = (int)lrintf(frow[ic] * inv);
+                    if (v > 127) v = 127;
+                    if (v < -127) v = -127;
+                    qr[ic] = (int8_t)v;
+                }
+                for (int ic = in_ch; ic < Cp; ic++) qr[ic] = 0;
+            }
+        }
+
+        for (int m0 = 0; m0 < out_ch; m0 += 4) {
+            const int mn = out_ch - m0 < 4 ? out_ch - m0 : 4;
+            for (int t = t0; t < t1; t += 2) {
+                const int tn = t1 - t < 2 ? t1 - t : 2;
+                float facc[3][4][2] = {{{0.0f}}};
+                for (int kk = 0; kk < K; kk++) {
+                    int32x4_t acc[3][4][2];
+                    for (int s = 0; s < S; s++)
+                        for (int i = 0; i < mn; i++)
+                            for (int jj = 0; jj < 2; jj++)
+                                acc[s][i][jj] = vdupq_n_s32(0);
+                    for (int k = 0; k < Cp; k += 16) {
+                        int8x16_t xv[3][2];
+                        for (int s = 0; s < S; s++) {
+                            const int8_t *x0 = qa + ((size_t)s * maxrows + (t - t0 + kk * dil)) * Cp;
+                            xv[s][0] = vld1q_s8(x0 + k);
+                            xv[s][1] = vld1q_s8(x0 + Cp + k);
+                        }
+                        for (int i = 0; i < mn; i++) {
+                            const int8_t *wr = j->wq + ((size_t)(m0 + i) * K + kk) * Cp + k;
+                            const int8x16_t wv = vld1q_s8(wr);
+                            for (int s = 0; s < S; s++) {
+                                acc[s][i][0] = vdotq_s32(acc[s][i][0], xv[s][0], wv);
+                                acc[s][i][1] = vdotq_s32(acc[s][i][1], xv[s][1], wv);
+                            }
+                        }
+                    }
+                    for (int s = 0; s < S; s++) {
+                        for (int i = 0; i < mn; i++) {
+                            const float swv = j->sw[(size_t)(m0 + i) * K + kk];
+                            for (int jj = 0; jj < 2; jj++) {
+                                const int r = (t + jj) - t0 + kk * dil;
+                                facc[s][i][jj] += (float)vaddvq_s32(acc[s][i][jj]) *
+                                                   (sa[(size_t)s * maxrows + r] * swv);
+                            }
+                        }
+                    }
+                }
+                for (int s = 0; s < S; s++) {
+                    const size_t ostride = j->out_stride ? j->out_stride[s] : (size_t)L;
+                    for (int i = 0; i < mn; i++) {
+                        const float bv = j->bias ? j->bias[m0 + i] : 0.0f;
+                        float *o = j->out[s] + (size_t)(m0 + i) * ostride + t;
+                        const float *rs = j->residual && j->residual[s]
+                            ? j->residual[s] + (size_t)(m0 + i) * ostride + t : NULL;
+                        for (int jj = 0; jj < tn; jj++) {
+                            const float v = facc[s][i][jj] + bv;
+                            o[jj] = rs ? v + rs[jj] : v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
+}
+
+int qwen_conv1d_int8_v2_multi_available(void) { return 1; }
+void qwen_conv1d_int8_v2_multi_ctx_strided(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const size_t *in_stride, const size_t *out_stride,
+    const int8_t *wq, const float *sw, const int32_t *wsum, const float *bias,
+    int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    if (!out || !in || !wq || !sw || in_ch <= 0 || out_ch <= 0 ||
+        nslots < 2 || nslots > 3 || length <= 0 || kernel <= 0 || dilation <= 0 ||
+        Cp < in_ch || (Cp & 63)) return;
+    for (int s = 0; s < nslots; s++) if (!out[s] || !in[s]) return;
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, in_ch, in_ch * kernel, length * nslots);
+    qwen_census_leaf(QWEN_LEAF_SDOT);
+    sd_dconv_multi_job_t job = {
+        .out = out, .in = in, .tail = tail, .tail_cols = tail_cols, .residual = residual,
+        .in_stride = in_stride, .out_stride = out_stride, .wq = wq, .sw = sw, .wsum = wsum,
+        .bias = bias, .in_ch = in_ch, .out_ch = out_ch, .nslots = nslots, .length = length,
+        .kernel = kernel, .dilation = dilation, .Cp = Cp,
+    };
+    int nt = sd_pool_threads(); if (nt < 1) nt = 1;
+    int tb = (length + nt * 2 - 1) / (nt * 2);
+    if (tb < 32) tb = 32;
+    if (tb > 256) tb = 256;
+    tb = (tb + 3) & ~3;
+    job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
+    atomic_store(&job.next, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_dconv_multi_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+void qwen_conv1d_int8_v2_multi_ctx(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const int8_t *wq, const float *sw, const int32_t *wsum,
+    const float *bias, int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    size_t istride[3] = { (size_t)length, (size_t)length, (size_t)length };
+    size_t ostride[3] = { (size_t)length, (size_t)length, (size_t)length };
+    qwen_conv1d_int8_v2_multi_ctx_strided(out, in, tail, tail_cols, residual,
+                                          istride, ostride, wq, sw, wsum, bias,
+                                          in_ch, out_ch, nslots, length, kernel, dilation, Cp);
+}
+
+#endif
+
+void qwen_conv1d_int8_design_d(float *out, const float *in,
+                               const int8_t *Wq, const float *sw, const int32_t *wsum,
+                               const float *bias, const int8_t *Wpack,
+                               int in_ch, int out_ch, int length, int kernel, int dilation,
+                               int Kp, int blk) {
+    /* The worker records the actual selected path.  Do not emit the legacy INT8/VNNI wrapper
+     * row here: on AMX Design D it would duplicate the MACs and falsely claim a VNNI fallback. */
+    (void)in_ch; (void)out_ch; (void)length; (void)kernel; (void)dilation;
+    sd_conv_job_t job = {
+        .out = out, .in = in, .Wq = Wq, .Wpack = Wpack,
+        .sw = sw, .wsum = wsum, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .input_length = length, .input_offset = 0,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+    };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+
+void qwen_conv1d_int8_design_d_residual(float *out, const float *in,
+                                        const float *residual,
+                                        const int8_t *Wq, const float *sw,
+                                        const int32_t *wsum, const float *bias,
+                                        const int8_t *Wpack,
+                                        int in_ch, int out_ch, int length, int kernel,
+                                        int dilation, int Kp, int blk) {
+    sd_conv_job_t job = {
+        .out = out, .in = in, .residual = residual, .Wq = Wq, .Wpack = Wpack,
+        .sw = sw, .wsum = wsum, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .input_length = length, .input_offset = 0,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+    };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+
+int qwen_conv1d_int8_design_d_range(float *out, const float *in,
+                                    const int8_t *Wq, const float *sw,
+                                    const int32_t *wsum, const float *bias,
+                                    const int8_t *Wpack,
+                                    int in_ch, int out_ch, int input_length,
+                                    int input_offset, int output_length,
+                                    int kernel, int dilation, int Kp, int blk) {
+    if (!out || !in || !Wq || !Wpack || in_ch <= 0 || out_ch <= 0 ||
+        input_length <= 0 || input_offset < 0 || output_length <= 0 ||
+        kernel <= 0 || dilation <= 0 || Kp <= 0 || blk <= 0)
+        return 0;
+    sd_conv_job_t job = {
+        .out = out, .in = in, .Wq = Wq, .Wpack = Wpack,
+        .sw = sw, .wsum = wsum, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = output_length,
+        .input_length = input_length, .input_offset = input_offset,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+    };
+    job.nc = sd_conv_nc(output_length, sd_pool_threads());
+    job.n_panels = (output_length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+    return 1;
+}
+
+int qwen_conv1d_int8_design_d_range_split(float *out,
+                                          const float *prefix, int prefix_length,
+                                          const float *suffix, int suffix_length,
+                                          const int8_t *Wq, const float *sw,
+                                          const int32_t *wsum, const float *bias,
+                                          const int8_t *Wpack,
+                                          int in_ch, int out_ch, int output_length,
+                                          int kernel, int dilation, int Kp, int blk) {
+    if (!out || !prefix || !suffix || prefix_length < 0 || suffix_length <= 0 ||
+        Wq == NULL || Wpack == NULL || in_ch <= 0 || out_ch <= 0 || output_length <= 0 ||
+        kernel <= 0 || dilation <= 0 || Kp <= 0 || blk <= 0 ||
+        output_length != suffix_length)
+        return 0;
+    sd_conv_job_t job = {
+        .out = out, .in = NULL,
+        .split_prefix = prefix, .split_suffix = suffix,
+        .Wq = Wq, .Wpack = Wpack, .sw = sw, .wsum = wsum, .bias = bias,
+        .in_ch = in_ch, .out_ch = out_ch, .length = output_length,
+        .input_length = prefix_length + suffix_length,
+        .input_offset = prefix_length,
+        .split_prefix_length = prefix_length,
+        .split_suffix_length = suffix_length,
+        .kernel = kernel, .dilation = dilation, .Kp = Kp, .blk = blk,
+    };
+    job.nc = sd_conv_nc(output_length, sd_pool_threads());
+    job.n_panels = (output_length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, sd_pool_threads(), job.n_panels);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_conv1d_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+    return 1;
+}
+
+#endif  /* x86 VNNI / Arm dot-product decoder kernels */
+
+/* ---- ARM-1(a): moved OUT of the dot-product/VNNI guard ---------------------------------
+ * Everything below is ISA-neutral C: the ConvT one-GEMM epilogue, its weight restack and
+ * the DL-4 weight quantiser.  It was inside the guard only by position, which made
+ * SIMD=portable / SIMD=scalar / a no-dotprod Arm build fail to LINK on symbols they are
+ * allowed to call.  No behaviour change on VNNI or dot-product builds. */
+
+/* C12-WIN-11 step A: ConvTranspose1d (kernel = 2*stride) from ONE un-expanded GEMM.
+ * R[(j*out_ch + oc)*len + t] = sum_ic Wstack[j*out_ch + oc][ic] * in[ic][t] (computed by the
+ * caller, BLAS or a custom kernel).  Output position o = t*stride + j (j < stride) receives
+ * exactly tap j from input column t and tap j+stride from column t-1 (column -1 = carry of
+ * the previous unit).  Writes out[out_ch][len*stride] in final form (bias folded) and the
+ * new carry[out_ch][stride] = R[(j+stride)*out_ch + oc][len-1].  Same arithmetic count as
+ * the per-tap GEMMs; no input expansion, no full-length intermediate, no scatter pass. */
+typedef struct {
+    float *out; const float *R; float *carry; const float *bias;
+    int out_ch, len, stride; _Atomic int next;
+} sd_convt_epi_job_t;
+static void sd_convt_epi_worker(void *vj) {
+    sd_convt_epi_job_t *j = (sd_convt_epi_job_t *)vj;
+    const int len = j->len, r = j->stride, oc_n = j->out_ch;
+    for (;;) {
+        const int oc = atomic_fetch_add(&j->next, 1);
+        if (oc >= oc_n) break;
+        const float bv = j->bias ? j->bias[oc] : 0.0f;
+        float *o = j->out + (size_t)oc * len * r;
+        float *cr = j->carry ? j->carry + (size_t)oc * r : NULL;
+        for (int t = 0; t < len; t++) {
+            for (int jj = 0; jj < r; jj++) {
+                const float a = j->R[((size_t)jj * oc_n + oc) * len + t];
+                const float b = (t >= 1) ? j->R[((size_t)(jj + r) * oc_n + oc) * len + (t - 1)]
+                                         : (cr ? cr[jj] : 0.0f);
+                o[(size_t)t * r + jj] = a + b + bv;
+            }
+        }
+        if (cr)
+            for (int jj = 0; jj < r; jj++) cr[jj] = j->R[((size_t)(jj + r) * oc_n + oc) * len + (len - 1)];
+    }
+}
+void qwen_convt_stack_epilogue(float *out, const float *R, float *carry, const float *bias,
+                               int out_ch, int len, int stride) {
+    sd_convt_epi_job_t job = { .out = out, .R = R, .carry = carry, .bias = bias,
+                               .out_ch = out_ch, .len = len, .stride = stride };
+    atomic_store(&job.next, 0);
+    sd_pool_run(sd_convt_epi_worker, &job);
+}
+void qwen_convt_pack_stack(float *stack, const float *packed, int in_ch, int out_ch, int kernel) {
+    /* packed[(k*in_ch + ic)*out_ch + oc]  ->  stack[(k*out_ch + oc)*in_ch + ic] */
+    for (int k = 0; k < kernel; k++)
+        for (int ic = 0; ic < in_ch; ic++)
+            for (int oc = 0; oc < out_ch; oc++)
+                stack[((size_t)k * out_ch + oc) * in_ch + ic] = packed[((size_t)k * in_ch + ic) * out_ch + oc];
+}
+
+/* The DL-4 weight layout, one implementation for the decoder and for --self-test:
+ * wq2[m][kk][Cp] with one scale and one weight sum per (m, kk).  The f32 weight is
+ * [out_ch][in_ch][kernel] (kk fastest, the im2col order); tap kk multiplies input position
+ * t - (kernel-1-kk)*dilation.  Cp = qwen_conv1d_int8_v2_cp(ch); the padding lanes are 0. */
+int qwen_conv1d_int8_v2_cp(int ch) { return (ch + 63) & ~63; }
+void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
+                              const float *w, int in_ch, int out_ch, int kernel, int Cp) {
+    for (int m = 0; m < out_ch; m++) {
+        const float *row = w + (size_t)m * in_ch * kernel;
+        for (int kk = 0; kk < kernel; kk++) {
+            float amax = 0.0f;
+            for (int ic = 0; ic < in_ch; ic++) { float a = fabsf(row[(size_t)ic * kernel + kk]); if (a > amax) amax = a; }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+            int8_t *d = q2 + ((size_t)m * kernel + kk) * Cp;
+            int32_t acc = 0;
+            for (int ic = 0; ic < Cp; ic++) {
+                int v = 0;
+                if (ic < in_ch) {
+                    float x = row[(size_t)ic * kernel + kk] * inv;
+                    v = (int)(x >= 0 ? x + 0.5f : x - 0.5f);
+                    if (v > 127) v = 127;
+                    if (v < -127) v = -127;
+                }
+                d[ic] = (int8_t)v; acc += v;
+            }
+            sw2[(size_t)m * kernel + kk] = scale;
+            ws2[(size_t)m * kernel + kk] = acc;
+        }
+    }
+}
+
+
+/* ---- ARM-1(b): fallbacks for the three genuinely ISA-bound V2 entry points -------------
+ * Declared unconditionally in qwen_tts_kernels.h and called unconditionally from
+ * qwen_tts_dispatch.c (the decoder.res1_v2 / decoder.glue_fused rows) and from
+ * qwen_tts_speech_decoder.c.  _available() returning 0 keeps every caller on the control
+ * path -- the same contract as the #else that already exists inside the guard. */
+#if !defined(__ARM_FEATURE_DOTPROD) && !defined(__AVX512VNNI__)
+int qwen_conv1d_int8_v2_available(void) { return 0; }
+void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
+                             const float *residual,
+                             const int8_t *wq, const float *sw, const int32_t *wsum,
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)wq; (void)sw; (void)wsum;
+    (void)bias; (void)in_ch; (void)out_ch; (void)length; (void)kernel; (void)dilation; (void)Cp;
+}
+void qwen_conv1d_int8_v2(float *out, const float *in,
+                         const int8_t *wq, const float *sw, const int32_t *wsum,
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)wq; (void)sw; (void)wsum; (void)bias; (void)in_ch; (void)out_ch; (void)length;
+    (void)kernel; (void)dilation; (void)Cp;
+}
+int qwen_conv1d_int8_v2_multi_available(void) { return 0; }
+void qwen_conv1d_int8_v2_multi_ctx_strided(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const size_t *in_stride, const size_t *out_stride,
+    const int8_t *wq, const float *sw, const int32_t *wsum, const float *bias,
+    int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)in_stride; (void)out_stride;
+    (void)wq; (void)sw; (void)wsum; (void)bias; (void)in_ch; (void)out_ch; (void)nslots;
+    (void)length; (void)kernel; (void)dilation; (void)Cp;
+}
+void qwen_conv1d_int8_v2_multi_ctx(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const int8_t *wq, const float *sw, const int32_t *wsum,
+    const float *bias, int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)wq; (void)sw; (void)wsum;
+    (void)bias; (void)in_ch; (void)out_ch; (void)nslots; (void)length; (void)kernel; (void)dilation; (void)Cp;
+}
+#endif
+
+
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+typedef struct {
+    float *out;
+    const float *in;
+    const float *bias;
+    const uint16_t *Wpack;
+    int in_ch, out_ch, length, kernel, dilation, K, Kp;
+    _Atomic int next_panel;
+    _Atomic int entered;
+    int n_panels;
+    int nc;
+} sd_bf16_conv_job_t;
+
+static void sd_bf16_conv_worker(void *vj) {
+    sd_bf16_conv_job_t *j = (sd_bf16_conv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
+    const int pad_left = (j->kernel - 1) * j->dilation;
+    uint16_t *colb = mm_scratch_sdcolb((size_t)SD_INT8_NC * j->Kp);
+    long long claimed = 0;
+    if (!colb) return;
+
+    for (;;) {
+        const int p = atomic_fetch_add(&j->next_panel, 1);
+        if (p >= j->n_panels) break;
+        claimed++;
+        const int t0 = p * j->nc;
+        const int nc = j->length - t0 < j->nc ? j->length - t0 : j->nc;
+        for (int c = 0; c < nc; c++) {
+            uint16_t *dst = colb + (size_t)c * j->Kp;
+            const int tt = t0 + c - pad_left;
+            for (int ic = 0; ic < j->in_ch; ic++) {
+                const float *src = j->in + (size_t)ic * j->length;
+                uint16_t *dk = dst + (size_t)ic * j->kernel;
+                for (int kk = 0; kk < j->kernel; kk++) {
+                    const int pos = tt + kk * j->dilation;
+                    dk[kk] = (pos >= 0 && pos < j->length)
+                           ? sd_f32_to_bf16(src[pos]) : 0;
+                }
+            }
+            if (j->Kp > j->K)
+                memset(dst + j->K, 0, (size_t)(j->Kp - j->K) * sizeof(uint16_t));
+        }
+        atomic_fetch_add(&g_sd_amx_bf16_convert_panels, 1);
+        atomic_fetch_add(&g_sd_amx_bf16_convert_bytes,
+                         (long long)nc * j->Kp * (long long)sizeof(uint16_t));
+        if (!sd_gemm_panel_amx_bf16(j->out, j->length, j->out_ch, j->Wpack, j->bias,
+                                    colb, t0, nc, j->K, j->Kp)) {
+            sd_bf16_panel_fallback(j->out, j->length, j->out_ch, j->Wpack, j->bias,
+                                   colb, t0, nc, j->Kp);
+            qwen_census_op(QWEN_PATH_DECODER_CONV_NAIVE, j->out_ch, j->K, nc);
+            qwen_census_leaf(QWEN_LEAF_SCALAR);
+            t_census_cur = NULL;
+        }
+    }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_BF16, claimed);
+}
+
+void qwen_conv1d_bf16_amx(float *out, const float *in,
+                          const float *bias, const uint16_t *Wpack,
+                          int in_ch, int out_ch, int length, int kernel, int dilation,
+                          int Kp) {
+    const int K = in_ch * kernel;
+    if (!out || !in || !Wpack || in_ch <= 0 || out_ch <= 0 || length <= 0 || Kp < K) return;
+    sd_bf16_conv_job_t job = {
+        .out = out, .in = in, .bias = bias, .Wpack = Wpack,
+        .in_ch = in_ch, .out_ch = out_ch, .length = length,
+        .kernel = kernel, .dilation = dilation, .K = K, .Kp = Kp,
+    };
+    job.nc = sd_conv_nc(length, sd_pool_threads());
+    job.n_panels = (length + job.nc - 1) / job.nc;
+    atomic_store(&job.next_panel, 0);
+    atomic_store(&job.entered, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_BF16, sd_pool_threads(), job.n_panels);
+    sd_pool_run(sd_bf16_conv_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_BF16, atomic_load(&job.entered));
+}
+#else
+void qwen_conv1d_bf16_amx(float *out, const float *in,
+                          const float *bias, const uint16_t *Wpack,
+                          int in_ch, int out_ch, int length, int kernel, int dilation,
+                          int Kp) {
+    (void)out; (void)in; (void)bias; (void)Wpack;
+    (void)in_ch; (void)out_ch; (void)length; (void)kernel; (void)dilation; (void)Kp;
+}
+#endif
+
+#if defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__)
 typedef struct {
     float *out; int out_ld;
     const int8_t *Wq; const float *sw; const int32_t *wsum;
@@ -5968,6 +11361,14 @@ static void sd_gemm_worker(void *vj) {
         int m1 = m0 + j->rows_per_block < j->M ? m0 + j->rows_per_block : j->M;
         for (int t0 = 0; t0 < j->N; t0 += SD_INT8_NC) {
             int nc = j->N - t0 < SD_INT8_NC ? j->N - t0 : SD_INT8_NC;
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+            if (!sd_amx_enabled() ||
+                !sd_gemm_panel_amx(j->out + (size_t)m0 * j->out_ld, j->out_ld, m1 - m0,
+                          j->Wq + (size_t)m0 * j->Kp, j->sw + (size_t)m0 * nblk,
+                          j->wsum ? j->wsum + (size_t)m0 * nblk : NULL, NULL,
+                          j->Xq + (size_t)t0 * j->Kp, j->sa + (size_t)t0 * nblk,
+                          t0, nc, j->Kp, j->blk))
+#endif
             sd_gemm_panel(j->out + (size_t)m0 * j->out_ld, j->out_ld, m1 - m0,
                           j->Wq + (size_t)m0 * j->Kp, j->sw + (size_t)m0 * nblk,
                           j->wsum ? j->wsum + (size_t)m0 * nblk : NULL, NULL,
@@ -6014,13 +11415,15 @@ void qwen_conv1d_int8(float *out, const float *in,
                       const float *bias,
                       int in_ch, int out_ch, int length, int kernel, int dilation,
                       int Kp, int blk) {
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, out_ch, in_ch * kernel, length);
+    qwen_census_leaf(QWEN_LEAF_SCALAR);   /* the portable fallback: sd_scalar_dot */
     (void)wsum;
     int K = in_ch * kernel;
     int nblk = Kp / blk;
     int pad_left = (kernel - 1) * dilation;
-    float *colf = (float *)aligned_malloc((size_t)K * sizeof(float));
-    int8_t *colq = (int8_t *)aligned_malloc((size_t)Kp);
-    float *sa = (float *)aligned_malloc((size_t)nblk * sizeof(float));
+    float *colf = mm_scratch_sdcolf((size_t)K);
+    int8_t *colq = mm_scratch_sdcolq((size_t)Kp);
+    float *sa = mm_scratch_sdsa((size_t)nblk);
     for (int t = 0; t < length; t++) {
         for (int ic = 0; ic < in_ch; ic++)
             for (int kk = 0; kk < kernel; kk++) {
@@ -6034,7 +11437,59 @@ void qwen_conv1d_int8(float *out, const float *in,
                 sd_scalar_dot(Wq + (size_t)m * Kp, sw + (size_t)m * nblk, colq, sa, Kp, blk)
                 + (bias ? bias[m] : 0.0f);
     }
-    free(colf); free(colq); free(sa);
+}
+
+void qwen_conv1d_int8_design_d(float *out, const float *in,
+                               const int8_t *Wq, const float *sw, const int32_t *wsum,
+                               const float *bias, const int8_t *Wpack,
+                               int in_ch, int out_ch, int length, int kernel, int dilation,
+                               int Kp, int blk) {
+    (void)Wpack;
+    qwen_conv1d_int8(out, in, Wq, sw, wsum, bias, in_ch, out_ch, length,
+                     kernel, dilation, Kp, blk);
+}
+
+void qwen_conv1d_int8_design_d_residual(float *out, const float *in,
+                                        const float *residual,
+                                        const int8_t *Wq, const float *sw,
+                                        const int32_t *wsum, const float *bias,
+                                        const int8_t *Wpack,
+                                        int in_ch, int out_ch, int length, int kernel,
+                                        int dilation, int Kp, int blk) {
+    qwen_conv1d_int8_design_d(out, in, Wq, sw, wsum, bias, Wpack,
+                              in_ch, out_ch, length, kernel, dilation, Kp, blk);
+    if (out && residual)
+        for (int m = 0; m < out_ch; m++)
+            for (int n = 0; n < length; n++)
+                out[(size_t)m * length + n] += residual[(size_t)m * length + n];
+}
+
+int qwen_conv1d_int8_design_d_range(float *out, const float *in,
+                                    const int8_t *Wq, const float *sw,
+                                    const int32_t *wsum, const float *bias,
+                                    const int8_t *Wpack,
+                                    int in_ch, int out_ch, int input_length,
+                                    int input_offset, int output_length,
+                                    int kernel, int dilation, int Kp, int blk) {
+    (void)out; (void)in; (void)Wq; (void)sw; (void)wsum; (void)bias; (void)Wpack;
+    (void)in_ch; (void)out_ch; (void)input_length; (void)input_offset;
+    (void)output_length; (void)kernel; (void)dilation; (void)Kp; (void)blk;
+    return 0;
+}
+
+int qwen_conv1d_int8_design_d_range_split(float *out,
+                                          const float *prefix, int prefix_length,
+                                          const float *suffix, int suffix_length,
+                                          const int8_t *Wq, const float *sw,
+                                          const int32_t *wsum, const float *bias,
+                                          const int8_t *Wpack,
+                                          int in_ch, int out_ch, int output_length,
+                                          int kernel, int dilation, int Kp, int blk) {
+    (void)out; (void)prefix; (void)prefix_length; (void)suffix; (void)suffix_length;
+    (void)Wq; (void)sw; (void)wsum; (void)bias; (void)Wpack;
+    (void)in_ch; (void)out_ch; (void)output_length; (void)kernel; (void)dilation;
+    (void)Kp; (void)blk;
+    return 0;
 }
 
 void qwen_gemm_int8(float *out, int out_ld,
@@ -6051,6 +11506,48 @@ void qwen_gemm_int8(float *out, int out_ld,
 }
 
 #endif
+
+int qwen_sd_amx_int8_panel(float *out, int out_ld, int M,
+                           const int8_t *Wpack, const float *sw,
+                           const int32_t *wsum, const float *bias,
+                           const int8_t *Xq, const float *sa,
+                           int tcol0, int nc, int Kp, int blk) {
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__) && \
+    (defined(__ARM_FEATURE_DOTPROD) || defined(__AVX512VNNI__))
+    return sd_gemm_panel_amx_d(out, out_ld, M, Wpack, sw, wsum, bias,
+                               Xq, sa, NULL, tcol0, nc, Kp, blk);
+#else
+    (void)out; (void)out_ld; (void)M; (void)Wpack; (void)sw; (void)wsum;
+    (void)bias; (void)Xq; (void)sa; (void)tcol0; (void)nc; (void)Kp; (void)blk;
+    return 0;
+#endif
+}
+
+int qwen_sd_amx_bf16_panel(float *out, int out_ld, int M,
+                           const uint16_t *Wpack, const float *bias,
+                           const float *Xf, int tcol0, int nc, int K, int Kp) {
+#if defined(__AMX_BF16__) && defined(__AMX_TILE__)
+    if (!out || !Wpack || !Xf || nc <= 0 || K <= 0 || Kp < K ||
+        (Kp & 31) || !qwen_amx_bf16_available()) return 0;
+    uint16_t *Xb = mm_scratch_sdcolb((size_t)nc * (size_t)Kp);
+    if (!Xb) return 0;
+    for (int n = 0; n < nc; n++) {
+        uint16_t *dst = Xb + (size_t)n * Kp;
+        const float *src = Xf + (size_t)n * K;
+        for (int k = 0; k < K; k++) dst[k] = sd_f32_to_bf16(src[k]);
+        if (Kp > K) memset(dst + K, 0, (size_t)(Kp - K) * sizeof(*dst));
+    }
+    atomic_fetch_add(&g_sd_amx_bf16_convert_panels, 1);
+    atomic_fetch_add(&g_sd_amx_bf16_convert_bytes,
+                     (long long)nc * Kp * (long long)sizeof(uint16_t));
+    return sd_gemm_panel_amx_bf16(out, out_ld, M, Wpack, bias,
+                                  Xb, tcol0, nc, K, Kp);
+#else
+    (void)out; (void)out_ld; (void)M; (void)Wpack; (void)bias; (void)Xf;
+    (void)tcol0; (void)nc; (void)K; (void)Kp;
+    return 0;
+#endif
+}
 
 #if (defined(__ARM_NEON) || defined(__AVX2__)) && !(defined(__APPLE__) && defined(USE_BLAS))
 #define QWEN_SIN_POLY_MAX 8192.0f
@@ -6138,8 +11635,9 @@ static void snake_row(float *data, int c, int length,
 #if defined(__APPLE__) && defined(USE_BLAS)
         {
             int n = length;
-            float *temp = (float *)malloc(n * sizeof(float));
-
+            /* grow-once per thread: this ran once per channel row */
+            float *temp = mm_scratch_snk((size_t)n);
+            if (temp) {
             vDSP_vsmul(row, 1, &a, temp, 1, n);
 
             vvsinf(temp, temp, &n);
@@ -6147,8 +11645,7 @@ static void snake_row(float *data, int c, int length,
             vDSP_vsq(temp, 1, temp, 1, n);
 
             vDSP_vsma(temp, 1, &inv_b, row, 1, row, 1, n);
-
-            free(temp);
+            }
         }
 #elif defined(__ARM_NEON)
         {
@@ -6285,7 +11782,7 @@ void qwen_apply_rope_interleaved(float *x, const float *cos_vals, const float *s
 }
 
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16, int in_dim, int out_dim) {
-    qwen_census_op("argmax_matvec_bf16", out_dim, in_dim, 1);
+    qwen_census_op(QWEN_PATH_ARGMAX_MATVEC_BF16, out_dim, in_dim, 1);
     int best_idx = 0;
     float best_val = -1e30f;
     int o = 0;
@@ -6404,6 +11901,107 @@ int qwen_kernel_selftest(void *out) {
     fprintf(f, "qwen-tts kernel self-test (matvec correctness vs f32 reference)\n");
     qwen_caps_report(f);
     fprintf(f, "  (run with QWEN_NO_VNNI=1 / QWEN_NO_SDOT=1 / QWEN_NO_AMX=1 to test the fallback path)\n\n");
+
+#if defined(__AVX2__)
+    /* Exercise the candidate's exact signed dot directly with the values that
+     * make PMADDUBSW most dangerous. This is intentionally independent of the
+     * runtime opt-in, so --self-test proves the candidate before any A/B run. */
+    {
+        enum { test_rows = 5, test_cols = 67 };
+        static const int8_t extreme[] = { -128, -127, -1, 0, 1, 127 };
+        int8_t w[test_rows * test_cols], qx[test_cols];
+        int64_t expected = 0;
+        for (int k = 0; k < test_cols; k++)
+            qx[k] = extreme[(k * 5 + 1) % (int)(sizeof extreme / sizeof extreme[0])];
+        for (int k = 0; k < test_cols; k++) {
+            w[k] = (int8_t)-128;
+            expected += (int32_t)w[k] * (int32_t)qx[k];
+        }
+        int32_t got = avx2_int8_dot_exact(w, qx, test_cols);
+        int dot_ok = (int64_t)got == expected;
+        fprintf(f, "  [avx2-int8-emulated-dot] signed/widening extreme dot: %s (got=%d ref=%lld)\n",
+                dot_ok ? "PASS" : "FAIL", got, (long long)expected);
+        if (!dot_ok) failures++;
+
+        float x[test_cols], scale[test_rows], y[test_rows];
+        int8_t weights[test_rows * test_cols], qref[test_cols];
+        for (int k = 0; k < test_cols; k++) {
+            x[k] = (float)((k % 9) - 4) * 0.375f;
+            if (k == 3) x[k] = -3.25f;
+            for (int r = 0; r < test_rows; r++)
+                weights[r * test_cols + k] = extreme[(r * 3 + k * 5) %
+                    (int)(sizeof extreme / sizeof extreme[0])];
+        }
+        for (int r = 0; r < test_rows; r++) scale[r] = 0.003f * (float)(r + 1);
+        float sx = quantize_act_int8_col(qref, x, test_cols, 1, 0);
+        int candidate_ok = int8_matvec_avx2_emulated_dot(y, x, weights, scale,
+                                                          test_cols, test_rows);
+        float worst = 0.0f;
+        for (int r = 0; candidate_ok && r < test_rows; r++) {
+            int64_t ref_dot = 0;
+            for (int k = 0; k < test_cols; k++)
+                ref_dot += (int32_t)weights[r * test_cols + k] * (int32_t)qref[k];
+            float ref_y = (float)ref_dot * scale[r] * sx;
+            float err = fabsf(y[r] - ref_y);
+            if (err > worst) worst = err;
+        }
+        candidate_ok = candidate_ok && worst <= 1e-6f;
+        fprintf(f, "  [avx2-int8-emulated-dot] quantized adversarial GEMV: max_abs=%.2e %s\n",
+                worst, candidate_ok ? "PASS" : "FAIL");
+        if (!candidate_ok) failures++;
+    }
+
+    /* Q4 candidate coverage: exercise both nibble extremes, two blocks and an
+     * odd output-row tail.  A non-block-aligned input is intentionally rejected
+     * because Q4_0 has no representation for a partial final block. */
+    {
+        enum { q4_rows = 5, q4_cols = 64, q4_nb = q4_cols / Q4_0_BLOCK_SIZE };
+        float x[q4_cols], y[q4_rows], ref[q4_rows];
+        int8_t qx[q4_cols];
+        q4_0_block_t wq[q4_rows * q4_nb];
+        for (int k = 0; k < q4_cols; k++) x[k] = (float)((k % 11) - 5) * 0.27f;
+        for (int r = 0; r < q4_rows; r++) {
+            for (int b = 0; b < q4_nb; b++) {
+                q4_0_block_t *blk = &wq[r * q4_nb + b];
+                blk->scale_f16 = qwen_f32_to_f16(0.03125f * (float)(r + b + 1));
+                for (int i = 0; i < 16; i++) {
+                    const int lo = (i + r + b) & 15;
+                    const int hi = (15 - i + 2 * r + b) & 15;
+                    blk->qs[i] = (uint8_t)(lo | (hi << 4));
+                }
+            }
+        }
+        const float sx = quantize_act_int8_col(qx, x, q4_cols, 1, 0);
+        avx2_q4_matvec_integer_qx(y, qx, sx, wq, q4_cols, q4_rows);
+        float worst = 0.0f;
+        for (int r = 0; r < q4_rows; r++) {
+            /* The candidate applies the per-block scale while accumulating, so
+             * mirror that order rather than compare against a dequant FMA path. */
+            float s = 0.0f;
+            for (int b = 0; b < q4_nb; b++) {
+                int32_t bd = 0;
+                const q4_0_block_t *blk = &wq[r * q4_nb + b];
+                for (int i = 0; i < 16; i++) {
+                    bd += ((int)(blk->qs[i] & 0x0F) - 8) * qx[b * 32 + 2 * i];
+                    bd += ((int)(blk->qs[i] >> 4) - 8) * qx[b * 32 + 2 * i + 1];
+                }
+                s += qwen_f16_to_f32(blk->scale_f16) * (float)bd;
+            }
+            ref[r] = s * sx;
+            float err = fabsf(y[r] - ref[r]);
+            if (err > worst) worst = err;
+        }
+        float invalid_y[q4_rows];
+        int invalid_rejected = !avx2_q4_matvec_integer(invalid_y, x, wq, 65, q4_rows);
+        int q4_ok = worst <= 1e-6f && invalid_rejected;
+        fprintf(f, "  [avx2-q4-emulated-dot] nibble/extreme/tail parity: max_abs=%.2e invalid-tail=%s %s\n",
+                worst, invalid_rejected ? "rejected" : "accepted", q4_ok ? "PASS" : "FAIL");
+        if (!q4_ok) failures++;
+    }
+#else
+    fprintf(f, "  [avx2-int8-emulated-dot] not compiled on this host (skipped)\n");
+    fprintf(f, "  [avx2-q4-emulated-dot] not compiled on this host (skipped)\n");
+#endif
 
     for (int ci = 0; ci < ncases; ci++) {
         int rows = cases[ci][0], cols = cases[ci][1];
@@ -6677,6 +12275,568 @@ int qwen_kernel_selftest(void *out) {
         }
     }
 
+    if (qwen_conv1d_int8_v2_available()) {
+        /* DL-4 direct dilated conv (QWEN_SD_RES1_V2).  Three contracts per shape and length:
+         *  (a) the kernel equals an integer reference that mirrors its own quantisation
+         *      (per-position activation scale, per-(channel,tap) weight scale) to 1e-5;
+         *  (b) it stays within the quantisation error of the f32 causal conv (a loose gate,
+         *      but a mirrored or shifted tap fails it by two orders of magnitude);
+         *  (c) causality / continuation: output t computed on a window that starts pad
+         *      positions earlier equals the full-sequence output, which is what lets the
+         *      streaming decoder call the conv on a suffix with its left context.
+         * Shapes are the residual convs of the speech decoder (k=7, dilation 1/3/9, and the
+         * 1x1 res2 conv); lengths hit the 4-wide tile tail, a sequence shorter than the
+         * receptive field, one position, and several time blocks across threads. */
+        const int shapes[][3] = { {96, 7, 1}, {192, 7, 3}, {384, 7, 9}, {768, 1, 1}, {96, 7, 9} };
+        const int lengths[] = { 67, 5, 1, 260 };
+        const int nsh = (int)(sizeof(shapes) / sizeof(shapes[0]));
+        const int nln = (int)(sizeof(lengths) / sizeof(lengths[0]));
+        for (int si = 0; si < nsh; si++) {
+            const int ch = shapes[si][0], kern = shapes[si][1], dil = shapes[si][2];
+            const int K = ch * kern, Cp = qwen_conv1d_int8_v2_cp(ch), pad = (kern - 1) * dil;
+            for (int li = 0; li < nln; li++) {
+                const int L = lengths[li];
+                float   *in   = malloc((size_t)ch * L * sizeof(float));
+                float   *wf   = malloc((size_t)ch * K * sizeof(float));
+                float   *bias = malloc((size_t)ch * sizeof(float));
+                int8_t  *q2   = aligned_malloc((size_t)ch * kern * Cp);
+                float   *sw2  = aligned_malloc((size_t)ch * kern * sizeof(float));
+                int32_t *ws2  = aligned_malloc((size_t)ch * kern * sizeof(int32_t));
+                float   *outk = malloc((size_t)ch * L * sizeof(float));
+                float   *outw = malloc((size_t)ch * L * sizeof(float));
+                int8_t  *qa   = malloc((size_t)ch * L);          /* activation q per (ic, pos) */
+                float   *sa   = malloc((size_t)L * sizeof(float)); /* activation scale per pos */
+                if (!in || !wf || !bias || !q2 || !sw2 || !ws2 || !outk || !outw || !qa || !sa) {
+                    fprintf(f, "  [conv1d_int8_v2 ch=%d k=%d] OOM, skipped\n", ch, kern);
+                } else {
+                    for (size_t i = 0; i < (size_t)ch * L; i++) in[i] = NEXT_F;
+                    for (size_t i = 0; i < (size_t)ch * K; i++) wf[i] = NEXT_F;
+                    for (int m = 0; m < ch; m++) bias[m] = 0.25f * NEXT_F;
+                    qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, ch, ch, kern, Cp);
+                    qwen_conv1d_int8_v2(outk, in, q2, sw2, ws2, bias, ch, ch, L, kern, dil, Cp);
+                    /* the kernel's own activation quantisation, per position */
+                    for (int p = 0; p < L; p++) {
+                        float amax = 0.0f;
+                        for (int ic = 0; ic < ch; ic++) { float a = fabsf(in[(size_t)ic * L + p]); if (a > amax) amax = a; }
+                        const float scale = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / scale;
+                        sa[p] = scale;
+                        for (int ic = 0; ic < ch; ic++) {
+                            int v = (int)lrintf(in[(size_t)ic * L + p] * inv);
+                            if (v > 127) v = 127;
+                            if (v < -127) v = -127;
+                            qa[(size_t)ic * L + p] = (int8_t)v;
+                        }
+                    }
+                    double an = 0.0, ad = 0.0, bn = 0.0, bd = 0.0; float aworst = 0.0f;
+                    for (int t = 0; t < L; t++) {
+                        for (int m = 0; m < ch; m++) {
+                            float acc = 0.0f; double f32 = 0.0;
+                            for (int kk = 0; kk < kern; kk++) {
+                                const int pos = t - (kern - 1 - kk) * dil;
+                                if (pos < 0) continue;
+                                const int8_t *wr = q2 + ((size_t)m * kern + kk) * Cp;
+                                int32_t ai = 0;
+                                for (int ic = 0; ic < ch; ic++) {
+                                    ai += (int32_t)wr[ic] * (int32_t)qa[(size_t)ic * L + pos];
+                                    f32 += (double)wf[(size_t)m * K + (size_t)ic * kern + kk] * in[(size_t)ic * L + pos];
+                                }
+                                acc += (float)ai * (sa[pos] * sw2[(size_t)m * kern + kk]);
+                            }
+                            const float got = outk[(size_t)m * L + t];
+                            const float da = got - (acc + bias[m]);
+                            const double db = (double)got - (f32 + bias[m]);
+                            if (fabsf(da) > aworst) aworst = fabsf(da);
+                            an += (double)da * da; ad += (double)(acc + bias[m]) * (acc + bias[m]);
+                            bn += db * db; bd += (f32 + bias[m]) * (f32 + bias[m]);
+                        }
+                    }
+                    const double arel = ad > 0 ? sqrt(an / ad) : 0.0, brel = bd > 0 ? sqrt(bn / bd) : 0.0;
+                    /* (c) continuation: a window that starts pad positions before t0 */
+                    double cworst = -1.0;
+                    if (L > pad + 8) {
+                        /* the window starts s >= 4 positions into the sequence, so its left
+                         * context is real input and its length is never more than L */
+                        const int t0 = pad + (L - pad) / 2, s = t0 - pad, Lw = L - s;
+                        float *inw = malloc((size_t)ch * Lw * sizeof(float));
+                        if (inw) {
+                            for (int ic = 0; ic < ch; ic++)
+                                memcpy(inw + (size_t)ic * Lw, in + (size_t)ic * L + s, (size_t)Lw * sizeof(float));
+                            qwen_conv1d_int8_v2(outw, inw, q2, sw2, ws2, bias, ch, ch, Lw, kern, dil, Cp);
+                            cworst = 0.0;
+                            for (int m = 0; m < ch; m++)
+                                for (int t = t0; t < L; t++) {
+                                    double d = fabs((double)outw[(size_t)m * Lw + (t - s)] - outk[(size_t)m * L + t]);
+                                    double ref = fabs((double)outk[(size_t)m * L + t]) + 1e-3;
+                                    if (d / ref > cworst) cworst = d / ref;
+                                }
+                            free(inw);
+                        }
+                    }
+                    /* (d) DL-glue contract: (tail, in) split context and the residual epilogue must be
+                     * bit-identical to the contiguous [tail|in] path for every new position. */
+                    double dworst = -1.0;
+                    if (L > pad + 8) {
+                        const int t0 = pad + (L - pad) / 2, s = t0 - pad, Lw = L - s, Ln = L - t0;
+                        float *tl = malloc((size_t)ch * pad * sizeof(float));
+                        float *inn = malloc((size_t)ch * Ln * sizeof(float));
+                        float *resid = malloc((size_t)ch * Ln * sizeof(float));
+                        float *outc = malloc((size_t)ch * Ln * sizeof(float));
+                        if (tl && inn && resid && outc) {
+                            for (int ic = 0; ic < ch; ic++) {
+                                memcpy(tl + (size_t)ic * pad, in + (size_t)ic * L + s, (size_t)pad * sizeof(float));
+                                memcpy(inn + (size_t)ic * Ln, in + (size_t)ic * L + t0, (size_t)Ln * sizeof(float));
+                            }
+                            for (size_t i = 0; i < (size_t)ch * Ln; i++) resid[i] = NEXT_F;
+                            qwen_conv1d_int8_v2_ctx(outc, inn, tl, pad, resid, q2, sw2, ws2, bias, ch, ch, Ln, kern, dil, Cp);
+                            dworst = 0.0;
+                            for (int m = 0; m < ch; m++)
+                                for (int t = 0; t < Ln; t++) {
+                                    float want = outk[(size_t)m * L + t0 + t] + resid[(size_t)m * Ln + t];
+                                    double d = fabs((double)outc[(size_t)m * Ln + t] - want);
+                                    if (d > dworst) dworst = d;
+                                }
+                        }
+                        (void)Lw;
+                        free(tl); free(inn); free(resid); free(outc);
+                    }
+                    const int ok_d = dworst <= 0.0;
+                    const int ok_a = arel < 1e-5 && ok_d, ok_b = brel < 3e-2, ok_c = cworst < 1e-5;
+                    fprintf(f, "  [conv1d_int8_v2 ch=%3d k=%d dil=%d L=%3d] vs own-quant ref rel_L2=%.2e max_abs=%.2e | vs f32 conv rel_L2=%.2e | continuation %s | ctx+residual %s  %s\n",
+                            ch, kern, dil, L, arel, aworst, brel,
+                            cworst < 0 ? "n/a" : (ok_c ? "exact" : "MISMATCH"),
+                            dworst < 0 ? "n/a" : (ok_d ? "exact" : "MISMATCH"),
+                            (ok_a && ok_b && ok_c) ? "PASS" : "FAIL");
+                    if (!(ok_a && ok_b && ok_c)) failures++;
+                }
+                free(in); free(wf); free(bias); free(q2); free(sw2); free(ws2);
+                free(outk); free(outw); free(qa); free(sa);
+            }
+        }
+    }
+
+    if (qwen_conv1d_int8_v2_available()) {
+        /* Rectangular/wide shapes the v1 panel path cannot take: initial (1536/1024 k7) and
+         * pre (512 -> 1024 k3) convs.  Same two oracles as above, no continuation case. */
+        const int rect[][4] = { {1536,1024,7,1}, {512,1024,3,1} };
+        for (int ri = 0; ri < (int)(sizeof(rect)/sizeof(rect[0])); ri++) {
+            const int in_ch = rect[ri][0], out_ch = rect[ri][1], kern = rect[ri][2], dil = rect[ri][3];
+            const int K = in_ch * kern, Cp = qwen_conv1d_int8_v2_cp(in_ch), L = 33;
+            float   *in   = malloc((size_t)in_ch * L * sizeof(float));
+            float   *wf   = malloc((size_t)out_ch * K * sizeof(float));
+            float   *bias = malloc((size_t)out_ch * sizeof(float));
+            int8_t  *q2   = aligned_malloc((size_t)out_ch * kern * Cp);
+            float   *sw2  = aligned_malloc((size_t)out_ch * kern * sizeof(float));
+            int32_t *ws2  = aligned_malloc((size_t)out_ch * kern * sizeof(int32_t));
+            float   *outk = malloc((size_t)out_ch * L * sizeof(float));
+            int8_t  *qa   = malloc((size_t)in_ch * L);
+            float   *sa   = malloc((size_t)L * sizeof(float));
+            if (!in || !wf || !bias || !q2 || !sw2 || !ws2 || !outk || !qa || !sa) {
+                fprintf(f, "  [conv1d_int8_v2 rect in=%d out=%d] OOM, skipped\n", in_ch, out_ch);
+            } else {
+                for (size_t i = 0; i < (size_t)in_ch * L; i++) in[i] = NEXT_F;
+                for (size_t i = 0; i < (size_t)out_ch * K; i++) wf[i] = NEXT_F;
+                for (int m = 0; m < out_ch; m++) bias[m] = 0.25f * NEXT_F;
+                qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, in_ch, out_ch, kern, Cp);
+                qwen_conv1d_int8_v2(outk, in, q2, sw2, ws2, bias, in_ch, out_ch, L, kern, dil, Cp);
+                for (int p = 0; p < L; p++) {
+                    float amax = 0.0f;
+                    for (int ic = 0; ic < in_ch; ic++) { float a = fabsf(in[(size_t)ic * L + p]); if (a > amax) amax = a; }
+                    const float sc = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / sc; sa[p] = sc;
+                    for (int ic = 0; ic < in_ch; ic++) {
+                        int v = (int)lrintf(in[(size_t)ic * L + p] * inv);
+                        if (v > 127) v = 127;
+                        if (v < -127) v = -127;
+                        qa[(size_t)ic * L + p] = (int8_t)v;
+                    }
+                }
+                double an = 0.0, ad = 0.0, bn = 0.0, bd = 0.0;
+                for (int t = 0; t < L; t++) for (int m = 0; m < out_ch; m++) {
+                    float acc = 0.0f; double f32 = 0.0;
+                    for (int kk = 0; kk < kern; kk++) {
+                        const int pos = t - (kern - 1 - kk) * dil;
+                        if (pos < 0) continue;
+                        const int8_t *wr = q2 + ((size_t)m * kern + kk) * Cp;
+                        int32_t ai = 0;
+                        for (int ic = 0; ic < in_ch; ic++) {
+                            ai += (int32_t)wr[ic] * (int32_t)qa[(size_t)ic * L + pos];
+                            f32 += (double)wf[(size_t)m * K + (size_t)ic * kern + kk] * in[(size_t)ic * L + pos];
+                        }
+                        acc += (float)ai * (sa[pos] * sw2[(size_t)m * kern + kk]);
+                    }
+                    const float got = outk[(size_t)m * L + t];
+                    const double da = got - (acc + bias[m]), db = (double)got - (f32 + bias[m]);
+                    an += da * da; ad += (double)(acc + bias[m]) * (acc + bias[m]);
+                    bn += db * db; bd += (f32 + bias[m]) * (f32 + bias[m]);
+                }
+                const double arel = ad > 0 ? sqrt(an / ad) : 0.0, brel = bd > 0 ? sqrt(bn / bd) : 0.0;
+                const int ok = arel < 1e-5 && brel < 3e-2;
+                fprintf(f, "  [conv1d_int8_v2 rect in=%d out=%d k=%d dil=%d L=%d] own-quant rel_L2=%.2e | f32 rel_L2=%.2e  %s\n",
+                        in_ch, out_ch, kern, dil, L, arel, brel, ok ? "PASS" : "FAIL");
+                if (!ok) failures++;
+            }
+            free(in); free(wf); free(bias); free(q2); free(sw2); free(ws2); free(outk); free(qa); free(sa);
+        }
+    }
+
+    if (qwen_conv1d_int8_v2_multi_available()) {
+        /* The acceptance oracle is deliberately stronger than a tolerance: for the same
+         * packed weights, tail and residual, multi-slot must be bit-identical to invoking
+         * the already qualified single-slot kernel once per slot.  Include one square and
+         * one rectangular decoder geometry so the old square-only ABI cannot regress here. */
+        const int mcases[][4] = { {96, 96, 7, 1}, {1024, 512, 3, 1} };
+        for (int ci = 0; ci < (int)(sizeof(mcases) / sizeof(mcases[0])); ci++) {
+            const int in_ch = mcases[ci][0], out_ch = mcases[ci][1];
+            const int kern = mcases[ci][2], dil = mcases[ci][3], L = 17, S = 2;
+            const int pad = (kern - 1) * dil, Cp = qwen_conv1d_int8_v2_cp(in_ch);
+            float *in0 = malloc((size_t)in_ch * L * sizeof(float));
+            float *in1 = malloc((size_t)in_ch * L * sizeof(float));
+            float *tl0 = malloc((size_t)in_ch * pad * sizeof(float));
+            float *tl1 = malloc((size_t)in_ch * pad * sizeof(float));
+            float *rs0 = malloc((size_t)out_ch * L * sizeof(float));
+            float *rs1 = malloc((size_t)out_ch * L * sizeof(float));
+            float *om0 = malloc((size_t)out_ch * L * sizeof(float));
+            float *om1 = malloc((size_t)out_ch * L * sizeof(float));
+            float *os0 = malloc((size_t)out_ch * L * sizeof(float));
+            float *os1 = malloc((size_t)out_ch * L * sizeof(float));
+            float *wf = malloc((size_t)out_ch * in_ch * kern * sizeof(float));
+            float *bias = malloc((size_t)out_ch * sizeof(float));
+            int8_t *q2 = aligned_malloc((size_t)out_ch * kern * Cp);
+            float *sw2 = aligned_malloc((size_t)out_ch * kern * sizeof(float));
+            int32_t *ws2 = aligned_malloc((size_t)out_ch * kern * sizeof(int32_t));
+            if (!in0 || !in1 || !tl0 || !tl1 || !rs0 || !rs1 || !om0 || !om1 ||
+                !os0 || !os1 || !wf || !bias || !q2 || !sw2 || !ws2) {
+                fprintf(f, "  [conv1d_int8_v2 multi in=%d out=%d] OOM, skipped\n", in_ch, out_ch);
+            } else {
+                for (size_t i = 0; i < (size_t)in_ch * L; i++) { in0[i] = NEXT_F; in1[i] = NEXT_F; }
+                for (size_t i = 0; i < (size_t)in_ch * pad; i++) { tl0[i] = NEXT_F; tl1[i] = NEXT_F; }
+                for (size_t i = 0; i < (size_t)out_ch * L; i++) { rs0[i] = NEXT_F; rs1[i] = NEXT_F; }
+                for (size_t i = 0; i < (size_t)out_ch * in_ch * kern; i++) wf[i] = NEXT_F;
+                for (int i = 0; i < out_ch; i++) bias[i] = 0.25f * NEXT_F;
+                qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, in_ch, out_ch, kern, Cp);
+                float *outv[2] = { om0, om1 };
+                const float *inv[2] = { in0, in1 };
+                const float *tailv[2] = { tl0, tl1 };
+                const int tail_cols[2] = { pad, pad };
+                const float *resv[2] = { rs0, rs1 };
+                qwen_conv1d_int8_v2_multi_ctx(outv, inv, tailv, tail_cols, resv,
+                                              q2, sw2, ws2, bias, in_ch, out_ch, S,
+                                              L, kern, dil, Cp);
+                qwen_conv1d_int8_v2_ctx(os0, in0, tl0, pad, rs0, q2, sw2, ws2,
+                                        bias, in_ch, out_ch, L, kern, dil, Cp);
+                qwen_conv1d_int8_v2_ctx(os1, in1, tl1, pad, rs1, q2, sw2, ws2,
+                                        bias, in_ch, out_ch, L, kern, dil, Cp);
+                const int ok = !memcmp(om0, os0, (size_t)out_ch * L * sizeof(float)) &&
+                               !memcmp(om1, os1, (size_t)out_ch * L * sizeof(float));
+                fprintf(f, "  [conv1d_int8_v2 multi in=%d out=%d k=%d S=%d L=%d] vs single-slot oracle  %s\n",
+                        in_ch, out_ch, kern, S, L, ok ? "PASS" : "FAIL");
+                if (!ok) failures++;
+
+                /* Production ragged decode passes one channel-major [S][total] workset,
+                 * not S compact tensors.  Exercise that exact strided ABI as well; a
+                 * compact-only oracle cannot catch an offset/stride mix-up between slots. */
+                const int gap = 3, total = 2 * L + gap;
+                float *ing = calloc((size_t)in_ch * total, sizeof(float));
+                float *rsg = calloc((size_t)out_ch * total, sizeof(float));
+                float *og  = calloc((size_t)out_ch * total, sizeof(float));
+                const int off[2] = { 0, L + gap };
+                int stride_ok = ing && rsg && og;
+                if (stride_ok) {
+                    for (int ic = 0; ic < in_ch; ic++) {
+                        memcpy(ing + (size_t)ic * total + off[0], in0 + (size_t)ic * L,
+                               (size_t)L * sizeof(float));
+                        memcpy(ing + (size_t)ic * total + off[1], in1 + (size_t)ic * L,
+                               (size_t)L * sizeof(float));
+                    }
+                    for (int oc = 0; oc < out_ch; oc++) {
+                        memcpy(rsg + (size_t)oc * total + off[0], rs0 + (size_t)oc * L,
+                               (size_t)L * sizeof(float));
+                        memcpy(rsg + (size_t)oc * total + off[1], rs1 + (size_t)oc * L,
+                               (size_t)L * sizeof(float));
+                    }
+                    float *sout[2] = { og + off[0], og + off[1] };
+                    const float *sin[2] = { ing + off[0], ing + off[1] };
+                    const float *stail[2] = { tl0, tl1 };
+                    const float *sres[2] = { rsg + off[0], rsg + off[1] };
+                    const size_t istride[2] = { (size_t)total, (size_t)total };
+                    const size_t ostride[2] = { (size_t)total, (size_t)total };
+                    qwen_conv1d_int8_v2_multi_ctx_strided(
+                        sout, sin, stail, tail_cols, sres, istride, ostride,
+                        q2, sw2, ws2, bias, in_ch, out_ch, S, L, kern, dil, Cp);
+                    for (int oc = 0; oc < out_ch && stride_ok; oc++) {
+                        stride_ok = !memcmp(og + (size_t)oc * total + off[0],
+                                            os0 + (size_t)oc * L, (size_t)L * sizeof(float)) &&
+                                     !memcmp(og + (size_t)oc * total + off[1],
+                                             os1 + (size_t)oc * L, (size_t)L * sizeof(float));
+                    }
+                }
+                fprintf(f, "  [conv1d_int8_v2 multi-strided in=%d out=%d k=%d S=%d L=%d] ragged ABI oracle  %s\n",
+                        in_ch, out_ch, kern, S, L, stride_ok ? "PASS" : "FAIL");
+                if (!stride_ok) failures++;
+                free(ing); free(rsg); free(og);
+            }
+            free(in0); free(in1); free(tl0); free(tl1); free(rs0); free(rs1);
+            free(om0); free(om1); free(os0); free(os1); free(wf); free(bias);
+            free(q2); free(sw2); free(ws2);
+        }
+
+        /* S=3 is the upper edge of the cohort contract.  Keep this case compact so the
+         * self-test also checks the third-slot register and completion lanes without
+         * multiplying the large rectangular allocation above. */
+        {
+            const int in_ch = 96, out_ch = 96, kern = 7, dil = 1, L = 17, S = 3;
+            const int pad = (kern - 1) * dil, Cp = qwen_conv1d_int8_v2_cp(in_ch);
+            float *in3[3] = { NULL, NULL, NULL }, *tl3[3] = { NULL, NULL, NULL };
+            float *rs3[3] = { NULL, NULL, NULL }, *om3[3] = { NULL, NULL, NULL };
+            float *os3[3] = { NULL, NULL, NULL };
+            float *wf = malloc((size_t)out_ch * in_ch * kern * sizeof(float));
+            float *bias = malloc((size_t)out_ch * sizeof(float));
+            int8_t *q2 = aligned_malloc((size_t)out_ch * kern * Cp);
+            float *sw2 = aligned_malloc((size_t)out_ch * kern * sizeof(float));
+            int32_t *ws2 = aligned_malloc((size_t)out_ch * kern * sizeof(int32_t));
+            int ok = wf && bias && q2 && sw2 && ws2;
+            for (int s = 0; s < S && ok; s++) {
+                in3[s] = malloc((size_t)in_ch * L * sizeof(float));
+                tl3[s] = malloc((size_t)in_ch * pad * sizeof(float));
+                rs3[s] = malloc((size_t)out_ch * L * sizeof(float));
+                om3[s] = malloc((size_t)out_ch * L * sizeof(float));
+                os3[s] = malloc((size_t)out_ch * L * sizeof(float));
+                ok = in3[s] && tl3[s] && rs3[s] && om3[s] && os3[s];
+            }
+            if (!ok) {
+                fprintf(f, "  [conv1d_int8_v2 multi in=%d out=%d k=%d S=%d L=%d] OOM, skipped\n",
+                        in_ch, out_ch, kern, S, L);
+            } else {
+                for (int s = 0; s < S; s++) {
+                    for (size_t i = 0; i < (size_t)in_ch * L; i++) in3[s][i] = NEXT_F;
+                    for (size_t i = 0; i < (size_t)in_ch * pad; i++) tl3[s][i] = NEXT_F;
+                    for (size_t i = 0; i < (size_t)out_ch * L; i++) rs3[s][i] = NEXT_F;
+                }
+                for (size_t i = 0; i < (size_t)out_ch * in_ch * kern; i++) wf[i] = NEXT_F;
+                for (int i = 0; i < out_ch; i++) bias[i] = 0.25f * NEXT_F;
+                qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, in_ch, out_ch, kern, Cp);
+                const float *inv[3] = { in3[0], in3[1], in3[2] };
+                const float *tailv[3] = { tl3[0], tl3[1], tl3[2] };
+                const float *resv[3] = { rs3[0], rs3[1], rs3[2] };
+                const int tail_cols[3] = { pad, pad, pad };
+                qwen_conv1d_int8_v2_multi_ctx(om3, inv, tailv, tail_cols, resv,
+                                              q2, sw2, ws2, bias, in_ch, out_ch, S,
+                                              L, kern, dil, Cp);
+                for (int s = 0; s < S; s++)
+                    qwen_conv1d_int8_v2_ctx(os3[s], in3[s], tl3[s], pad, rs3[s],
+                                            q2, sw2, ws2, bias, in_ch, out_ch,
+                                            L, kern, dil, Cp);
+                for (int s = 0; s < S && ok; s++)
+                    ok = !memcmp(om3[s], os3[s], (size_t)out_ch * L * sizeof(float));
+                fprintf(f, "  [conv1d_int8_v2 multi in=%d out=%d k=%d S=%d L=%d] vs single-slot oracle  %s\n",
+                        in_ch, out_ch, kern, S, L, ok ? "PASS" : "FAIL");
+                if (!ok) failures++;
+            }
+            for (int s = 0; s < S; s++) {
+                free(in3[s]); free(tl3[s]); free(rs3[s]); free(om3[s]); free(os3[s]);
+            }
+            free(wf); free(bias); free(q2); free(sw2); free(ws2);
+        }
+    }
+
+    {
+        /* C12-WIN-11: the one-GEMM ConvT epilogue must equal the per-tap scatter + carry + bias
+         * reference on the real block geometries (k = 2*stride), across two consecutive units. */
+        const int geo[][3] = { {1536, 768, 8}, {768, 384, 5}, {384, 192, 4}, {192, 96, 3}, {64, 64, 1} };
+        const int lens[] = { 16, 5, 1 };
+        for (int gi = 0; gi < (int)(sizeof(geo) / sizeof(geo[0])); gi++) {
+            const int in_ch = geo[gi][0] / 8, out_ch = geo[gi][1] / 8, r = geo[gi][2], K = 2 * r;   /* /8: keep the reference cheap */
+            for (int li = 0; li < 3; li++) {
+                const int len = lens[li];
+                float *packed = malloc((size_t)K * in_ch * out_ch * sizeof(float));
+                float *stack  = malloc((size_t)K * out_ch * in_ch * sizeof(float));
+                float *in0 = malloc((size_t)in_ch * len * sizeof(float)), *in1 = malloc((size_t)in_ch * len * sizeof(float));
+                float *bias = malloc((size_t)out_ch * sizeof(float));
+                float *carry_ref = calloc((size_t)out_ch * r, sizeof(float)), *carry_new = calloc((size_t)out_ch * r, sizeof(float));
+                float *R = malloc((size_t)K * out_ch * len * sizeof(float));
+                float *outn = malloc((size_t)out_ch * len * r * sizeof(float));
+                float *full = malloc((size_t)out_ch * ((len - 1) * r + K) * sizeof(float));
+                float *outr = malloc((size_t)out_ch * len * r * sizeof(float));
+                if (!packed || !stack || !in0 || !in1 || !bias || !carry_ref || !carry_new || !R || !outn || !full || !outr) {
+                    fprintf(f, "  [convt_stack] OOM, skipped\n");
+                } else {
+                    for (size_t i = 0; i < (size_t)K * in_ch * out_ch; i++) packed[i] = NEXT_F;
+                    for (size_t i = 0; i < (size_t)in_ch * len; i++) { in0[i] = NEXT_F; in1[i] = NEXT_F; }
+                    for (int oc = 0; oc < out_ch; oc++) bias[oc] = 0.25f * NEXT_F;
+                    qwen_convt_pack_stack(stack, packed, in_ch, out_ch, K);
+                    double worst = 0.0;
+                    const float *ins[2] = { in0, in1 };
+                    for (int u = 0; u < 2; u++) {
+                        const float *in = ins[u];
+                        const int full_len = (len - 1) * r + K;
+                        /* reference: per-tap accumulate into full, carry, bias, new carry (cs_convt contract) */
+                        memset(full, 0, (size_t)out_ch * full_len * sizeof(float));
+                        for (int k = 0; k < K; k++)
+                            for (int oc = 0; oc < out_ch; oc++)
+                                for (int t = 0; t < len; t++) {
+                                    double acc = 0.0;
+                                    for (int ic = 0; ic < in_ch; ic++)
+                                        acc += (double)packed[((size_t)k * in_ch + ic) * out_ch + oc] * in[(size_t)ic * len + t];
+                                    full[(size_t)oc * full_len + t * r + k] += (float)acc;
+                                }
+                        for (int oc = 0; oc < out_ch; oc++) {
+                            for (int i = 0; i < r; i++) full[(size_t)oc * full_len + i] += carry_ref[(size_t)oc * r + i];
+                            for (int o = 0; o < len * r; o++) outr[(size_t)oc * len * r + o] = full[(size_t)oc * full_len + o] + bias[oc];
+                            for (int i = 0; i < r; i++) carry_ref[(size_t)oc * r + i] = full[(size_t)oc * full_len + len * r + i];
+                        }
+                        /* treatment: R = stack x in (naive GEMM here; BLAS in the decoder), then the epilogue */
+                        for (int m = 0; m < K * out_ch; m++)
+                            for (int t = 0; t < len; t++) {
+                                double acc = 0.0;
+                                for (int ic = 0; ic < in_ch; ic++) acc += (double)stack[(size_t)m * in_ch + ic] * in[(size_t)ic * len + t];
+                                R[(size_t)m * len + t] = (float)acc;
+                            }
+                        qwen_convt_stack_epilogue(outn, R, carry_new, bias, out_ch, len, r);
+                        /* relative to the tensor's max magnitude (float32 cancellation noise is
+                         * ~1e-6 here; a wrong tap mapping is O(1)) */
+                        double mx = 1e-12, dd = 0.0;
+                        for (size_t i = 0; i < (size_t)out_ch * len * r; i++) {
+                            if (fabs((double)outr[i]) > mx) mx = fabs((double)outr[i]);
+                            double d = fabs((double)outn[i] - outr[i]); if (d > dd) dd = d;
+                        }
+                        for (size_t i = 0; i < (size_t)out_ch * r; i++) {
+                            if (fabs((double)carry_ref[i]) > mx) mx = fabs((double)carry_ref[i]);
+                            double d = fabs((double)carry_new[i] - carry_ref[i]); if (d > dd) dd = d;
+                        }
+                        if (dd / mx > worst) worst = dd / mx;
+                    }
+                    const int ok = worst < 1e-5;
+                    fprintf(f, "  [convt_stack in=%4d out=%3d k=%2d stride=%d len=%2d] vs per-tap reference, two units: max|diff|/max|ref| %.2e  %s\n",
+                            in_ch, out_ch, K, r, len, worst, ok ? "PASS" : "FAIL");
+                    if (!ok) failures++;
+                }
+                free(packed); free(stack); free(in0); free(in1); free(bias); free(carry_ref); free(carry_new);
+                free(R); free(outn); free(full); free(outr);
+            }
+        }
+    }
+
+    /* ---- activation-panel quantiser: SIMD must equal the scalar reference byte for byte --
+     * The scalar expression is the contract on x86 (it is what this function has always
+     * produced there), so the gate is exact equality of every output byte and every scale
+     * bit, not a tolerance.  Runs both paths over the input classes that can separate them:
+     * zeros, sign extremes, exact .5 rounding boundaries, tails that are not a multiple of
+     * the vector width, and real decoder panel shapes. */
+    {
+        static const struct { int rows, K, blk; const char *what; } qcase[] = {
+            {  1,   64, 32, "zeros"                 },
+            {  1,  128, 32, "exact .5 boundaries"   },
+            {  1,  128, 32, "sign extremes"         },
+            {  3,   77, 32, "tail, K % 16 != 0"      },
+            {  1,  100, 64, "tail, K % blk != 0"     },
+            { 96,  672, 32, "decoder panel 96x7"    },
+            {384, 2688, 32, "decoder panel 384x7"   },
+            {768,  768, 64, "decoder panel 768x1"   },
+        };
+        const int ncase = (int)(sizeof qcase / sizeof qcase[0]);
+#if !defined(__AVX512F__) && !defined(__ARM_NEON)
+        /* Honest instead of a green tautology: with no SIMD path at all both runs execute
+         * the same code here, so the comparison would prove nothing. */
+        fprintf(f, "  [quant_rows] SIMD/scalar parity: n/a, this build has no SIMD "
+                   "quantiser (%d cases skipped)\n", ncase);
+#else
+        /* Real on both sides now: QWEN_NO_SIMD_QUANT gates the NEON body as well as the
+         * AVX-512 one, and the scalar tail follows the platform's rounding contract, so
+         * this compares the vector body against the scalar reference instead of comparing
+         * a half-to-even body against a half-away tail (PLAN P3.11). */
+        for (int c = 0; c < ncase; c++) {
+            const int rows = qcase[c].rows, K = qcase[c].K, blk = qcase[c].blk;
+            const int Kp = qwen_int8_kp(K, blk), nblk = Kp / blk;
+            float *src = (float *)malloc((size_t)rows * K * sizeof(float));
+            int8_t *d1 = (int8_t *)malloc((size_t)rows * Kp);
+            int8_t *d2 = (int8_t *)malloc((size_t)rows * Kp);
+            float *s1 = (float *)malloc((size_t)rows * nblk * sizeof(float));
+            float *s2 = (float *)malloc((size_t)rows * nblk * sizeof(float));
+            if (!src || !d1 || !d2 || !s1 || !s2) {
+                fprintf(f, "  [quant_rows %s] OOM, skipped\n", qcase[c].what);
+                free(src); free(d1); free(d2); free(s1); free(s2); continue;
+            }
+            for (int r = 0; r < rows; r++)
+                for (int k = 0; k < K; k++) {
+                    float v;
+                    switch (c) {
+                        case 0: v = 0.0f; break;
+                        /* amax becomes 127 so inv == 1.0f exactly and q lands on .5 */
+                        case 1: v = (k == 0) ? 127.0f
+                                             : ((k & 1) ? 1.0f : -1.0f) * ((float)((k % 254) / 2) + 0.5f);
+                                break;
+                        case 2: v = (k % 4 == 0) ? 1e30f : (k % 4 == 1) ? -1e30f
+                                  : (k % 4 == 2) ? 1e-30f : -0.0f; break;
+                        default: v = ((float)((k * 37 + r * 11) % 2001) - 1000.0f) / 250.0f; break;
+                    }
+                    src[(size_t)r * K + k] = v;
+                }
+            memset(d1, 0x5A, (size_t)rows * Kp); memset(d2, 0xA5, (size_t)rows * Kp);
+            g_quant_simd_off = 0; qwen_int8_quant_rows(d1, s1, src, rows, K, Kp, blk);
+            g_quant_simd_off = 1; qwen_int8_quant_rows(d2, s2, src, rows, K, Kp, blk);
+            g_quant_simd_off = -1;
+            int bad_b = memcmp(d1, d2, (size_t)rows * Kp) != 0;
+            int bad_s = memcmp(s1, s2, (size_t)rows * nblk * sizeof(float)) != 0;
+            int ok = !bad_b && !bad_s;
+            fprintf(f, "  [quant_rows %-22s rows=%3d K=%4d blk=%2d] SIMD vs scalar: "
+                       "bytes %s scales %s  %s\n",
+                    qcase[c].what, rows, K, blk, bad_b ? "DIFFER" : "equal",
+                    bad_s ? "DIFFER" : "equal", ok ? "PASS" : "FAIL");
+            if (!ok) failures++;
+            free(src); free(d1); free(d2); free(s1); free(s2);
+        }
+#endif
+    }
+
+    /* bf16-KV attention over a multi-row query block (the sliced-prefill entry point).
+     * The head-parallel block form must equal the per-row decode form exactly: same
+     * kernel, same accumulation order per (head, row), only the head partition and the
+     * number of query rows differ.  This is the oracle for the refactor that
+     * qwen_talker_prefill_range depends on. */
+    {
+        const struct { int seq_k, q_off, n_rows, n_heads, n_kv, hd; } acase[] = {
+            {  64,  40,  24, 16,  8, 128 },
+            { 137,  89,  48, 16,  2, 128 },
+            {  17,   0,  17,  8,  8,  64 },
+            { 200, 199,   1, 16,  4, 128 },
+        };
+        for (int c = 0; c < (int)(sizeof(acase) / sizeof(acase[0])); c++) {
+            int seq_k = acase[c].seq_k, q_off = acase[c].q_off, n = acase[c].n_rows;
+            int nh = acase[c].n_heads, nkv = acase[c].n_kv, hd = acase[c].hd;
+            int qh = nh * hd, kvh = nkv * hd;
+            float scale = 1.0f / sqrtf((float)hd);
+            float    *Q  = malloc((size_t)n * qh * sizeof(float));
+            uint16_t *K  = malloc((size_t)seq_k * kvh * sizeof(uint16_t));
+            uint16_t *V  = malloc((size_t)seq_k * kvh * sizeof(uint16_t));
+            float    *o1 = malloc((size_t)n * qh * sizeof(float));
+            float    *o2 = malloc((size_t)n * qh * sizeof(float));
+            if (!Q || !K || !V || !o1 || !o2) {
+                fprintf(f, "  [attn_bf16kv] OOM, skipped\n");
+                free(Q); free(K); free(V); free(o1); free(o2); continue;
+            }
+            for (size_t i = 0; i < (size_t)n * qh; i++) Q[i] = NEXT_F;
+            for (size_t i = 0; i < (size_t)seq_k * kvh; i++) {
+                float a = NEXT_F, b = NEXT_F;
+                uint32_t ba, bb; memcpy(&ba, &a, 4); memcpy(&bb, &b, 4);
+                K[i] = (uint16_t)(ba >> 16); V[i] = (uint16_t)(bb >> 16);
+            }
+            memset(o1, 0x5A, (size_t)n * qh * sizeof(float));
+            memset(o2, 0xA5, (size_t)n * qh * sizeof(float));
+            /* reference: one query row at a time, exactly what the decode step does */
+            for (int r = 0; r < n; r++)
+                qwen_causal_attention_bf16kv(o1 + (size_t)r * qh, Q + (size_t)r * qh, K, V,
+                                             1, seq_k, nh, nkv, hd, scale, q_off + r);
+            qwen_causal_attention_bf16kv_prefill(o2, Q, K, V, n, seq_k, nh, nkv, hd,
+                                                 scale, q_off);
+            int bad = memcmp(o1, o2, (size_t)n * qh * sizeof(float)) != 0;
+            fprintf(f, "  [attn_bf16kv rows=%2d seq_k=%3d q_off=%3d heads=%2d/%-2d hd=%3d] "
+                       "block vs per-row: %s  %s\n",
+                    n, seq_k, q_off, nh, nkv, hd, bad ? "DIFFER" : "bit-identical",
+                    bad ? "FAIL" : "PASS");
+            if (bad) failures++;
+            free(Q); free(K); free(V); free(o1); free(o2);
+        }
+    }
+
     #undef NEXT_F
     fprintf(f, "\n%s (%d case%s failed)\n", failures ? "SELF-TEST FAILED" : "SELF-TEST PASSED",
             failures, failures == 1 ? "" : "s");
@@ -6927,6 +13087,9 @@ static int qtune_kernels(int fmt, qtune_kres_t *out) {
 #endif
 #if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
         PUSHK(QWEN_MMK_BF16_BFMMLA);
+#endif
+#if defined(__AVX512BF16__)
+        PUSHK(QWEN_MMK_BF16_AVX512);
 #endif
     } else if (fmt == 1) {
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
@@ -7280,6 +13443,8 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
     for (int mmk = 1; mmk < QWEN_MMK_COUNT; mmk++) {
         const qwen_mm_gate_t *g = &g_mm_gate[mmk];
         if (g->max_b == 0) continue;
+        const char *minb_env = qwen_mm_specific_minb_env(mmk);
+        if (!minb_env) minb_env = g->minb_env;
         int fmt = -1, slot = -1;
         for (int fq = 0; fq < 3 && fmt < 0; fq++)
             for (int k = 0; k < agg_n[fq]; k++)
@@ -7302,17 +13467,17 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
                 snprintf(why, sizeof(why), "%s never beats B x matvec on any measured shape",
                          agg_name[fmt][slot]);
             }
-        } else if (g->on_env && g->minb_env) {
-            snprintf(line, sizeof(line), "export %s=1 %s=%d", g->on_env, g->minb_env, wf);
+        } else if (g->on_env && minb_env) {
+            snprintf(line, sizeof(line), "export %s=1 %s=%d", g->on_env, minb_env, wf);
             snprintf(why, sizeof(why), "%s is opt-in and DOES win from B>=%d here%s",
                      agg_name[fmt][slot], wf,
                      (w1 <= 0) ? "; POOL-ONLY WIN, see the warning above" : "");
-        } else if (!g->minb_env) {
+        } else if (!minb_env) {
             snprintf(line, sizeof(line), "# %s: wins from B>=%d but has NO min_b env",
                      agg_name[fmt][slot], wf);
             snprintf(why, sizeof(why), "missing minb_env in g_mm_gate[]");
         } else {
-            snprintf(line, sizeof(line), "export %s=%d", g->minb_env, wf);
+            snprintf(line, sizeof(line), "export %s=%d", minb_env, wf);
             snprintf(why, sizeof(why), "%s wins from B>=%d (compiled default %d)%s",
                      agg_name[fmt][slot], wf, g->min_b,
                      (w1 <= 0) ? "; POOL-ONLY WIN, see the warning above" : "");
@@ -7335,6 +13500,8 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
     for (int mmk = 1; mmk < QWEN_MMK_COUNT; mmk++) {
         const qwen_mm_gate_t *g = &g_mm_gate[mmk];
         if (g->max_b == 0) continue;
+        const char *minb_env = qwen_mm_specific_minb_env(mmk);
+        if (!minb_env) minb_env = g->minb_env;
         int avail = 0;
         for (int fq = 0; fq < 3 && !avail; fq++)
             for (int k = 0; k < agg_n[fq]; k++) if (agg_mmk[fq][k] == mmk) { avail = 1; break; }
@@ -7342,7 +13509,7 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
             char df0[24];
             snprintf(df0, sizeof(df0), "%d/%d/%d", g->min_b, g->min_rows, g->min_cols);
             fprintf(f, "   %-24s %-24s %-22s %-8s %s\n", g_mmk_info[mmk].name,
-                    g->minb_env ? g->minb_env : "MISSING",
+                    minb_env ? minb_env : "MISSING",
                     g->min_rows || g->min_cols ? "(see AMX rows below)" : "-", df0,
                     "NOT DISPATCHABLE HERE (ISA / kernel permission) — the box will answer");
             continue;
@@ -7354,7 +13521,7 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
         char df[24];
         snprintf(df, sizeof(df), "%d/%d/%d", g->min_b, g->min_rows, g->min_cols);
         fprintf(f, "   %-24s %-24s %-22s %-8s %s\n", g_mmk_info[mmk].name,
-                g->minb_env ? g->minb_env : "MISSING", rc, df,
+                minb_env ? minb_env : "MISSING", rc, df,
                 g->off_env ? g->off_env : (g->on_env ? g->on_env : "-"));
     }
     fprintf(f,
@@ -7370,4 +13537,151 @@ int qwen_matmat_tune(void *out, const char *model_dir) {
         fprintf(f, "\nJSON: %s\n", jpath);
     }
     return 0;
+}
+
+/* ---- in-region int8 matmat: the dispatched drivers, split into prep + per-thread run ----
+ * Rule 6 of ENGINEERING.md: which implementation ran must be visible.  The in-region
+ * runners bypass the dispatcher (and therefore the census), so each distinct backend
+ * announces itself once per process the first time a region actually uses it. */
+QWEN_MAYBE_UNUSED static void qwen_region_i8_note_backend(const char *what, int rows, int cols, int B) {
+    static const char *seen[8]; static int nseen = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == what) return;
+    if (nseen < 8) seen[nseen++] = what;
+    fprintf(stderr, "[region] int8 in-region runner: %s (first use %dx%d B=%d)\n",
+            what, rows, cols, B);
+}
+
+
+/* A shape is region-usable when SOME in-region row-block runner can execute it, not only
+ * the VNNI one.  The AMX tiles are a valid runner too: qwen_region_i8_run below packs the
+ * activations per thread and calls the same int8_amx_task the dispatched path calls, so the
+ * row results are the ones the dispatcher would have produced.  Returning 0 for AMX shapes
+ * (as this did) silently switched the CP/Talker regions and the batched heads off exactly
+ * when batching got wide enough for AMX. */
+int qwen_region_i8_usable(int rows, int cols, int B) {
+#if defined(__AVX512VNNI__)
+    if (B < 2 || B > 16 || rows < 256) return 0;
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, rows, cols) && qwen_amx_int8_ready()) return 1;
+#endif
+    return qwen_mm_use(QWEN_MMK_INT8_VNNI, B, rows, cols);
+#else
+    (void)rows; (void)cols; (void)B; return 0;
+#endif
+}
+int qwen_region_i8_qkv_usable(int q_rows, int kv_rows, int cols, int B) {
+#if defined(__AVX512VNNI__) && defined(__x86_64__)
+    if (qwen_x86_qkv_disabled() || B <= 1 || B > 16) return 0;
+    if ((q_rows + 2 * kv_rows) < 256) return 0;
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if ((q_rows & 15) == 0 && (kv_rows & 15) == 0 &&
+        qwen_amx_int8_qkv_allowed(B, q_rows, kv_rows, cols) && qwen_amx_int8_ready()) return 1;
+#endif
+    return qwen_mm_use(QWEN_MMK_INT8_VNNI, B, q_rows, cols) &&
+           qwen_mm_use(QWEN_MMK_INT8_VNNI, B, kv_rows, cols);
+#else
+    (void)q_rows; (void)kv_rows; (void)cols; (void)B; return 0;
+#endif
+}
+/* ISA-neutral on purpose: this is the same per-column quantiser the dispatched int8
+ * matmat uses on every backend that has one, so a future ARM/other in-region runner needs
+ * no second copy of it. */
+float qwen_region_i8_quant_col(int8_t *qb, const float *Xt, int cols, int B, int b) {
+    return quantize_act_int8_col(qb, Xt, cols, B, b);
+}
+void qwen_region_i8_run(float *Y, const int8_t *W, const float *scale, const int8_t *qXt,
+                   const float *sx, int rows, int cols, int B, size_t tid, size_t nt) {
+#if defined(__AVX512VNNI__)
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if (qwen_mm_use(QWEN_MMK_INT8_AMX, B, rows, cols) && qwen_amx_int8_ready()) {
+        /* Every thread packs the same B x cols activation into its own scratch: O(B*cols)
+         * against O(rows*cols/nt) of real work, and it keeps the runner allocation-free and
+         * lock-free inside the region.  The weight pack cache is already mutex-guarded. */
+        const size_t kfull = (size_t)(cols & ~63);
+        int8_t *pXt = mm_scratch_pack(kfull * (size_t)B);
+        if (pXt) {
+            const uint8_t *pW = (const uint8_t *)qwen_amx_pack_weights(
+                W, rows, cols, QWEN_AMX_WEIGHT_INT8);
+            amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
+            int8_amx_ctx ac = { Y, W, pW, scale, pXt, qXt, sx, rows, cols, B };
+            if (tid == 0) qwen_region_i8_note_backend("AMX int8 tiles", rows, cols, B);
+            int8_amx_task(tid, nt, &ac);
+            return;
+        }
+    }
+#endif
+    if (tid == 0) qwen_region_i8_note_backend("VNNI row blocks", rows, cols, B);
+    if (tid == 0) qwen_region_pool_at2(QWEN_RGN_MM_REGION_I8, (int)nt, rows);
+    {   /* Every thread that reaches the runner counts as an entry, and reports the rows it
+         * owns: the split is by tid/nt, so a thread with r1 == r0 entered but had nothing to
+         * do -- which is the difference between an idle worker and an unrecorded one. */
+        int r0 = (int)(tid * (size_t)rows / nt), r1 = (int)((tid + 1) * (size_t)rows / nt);
+        qwen_region_workers_at2(QWEN_RGN_MM_REGION_I8, 1);
+        if (r1 > r0) qwen_region_units_at2(QWEN_RGN_MM_REGION_I8, r1 - r0); }
+    int8_vmm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
+    int8_vmm_task(tid, nt, &c);
+#else
+    (void)Y; (void)W; (void)scale; (void)qXt; (void)sx; (void)rows; (void)cols; (void)B; (void)tid; (void)nt;
+#endif
+}
+void qwen_region_i8_run_qkv(float *q, float *k, float *v,
+                       const int8_t *Wq, const float *sq, const int8_t *Wk, const float *sk,
+                       const int8_t *Wv, const float *sv, const int8_t *qXt, const float *sx,
+                       int q_rows, int kv_rows, int cols, int B, size_t tid, size_t nt) {
+#if defined(__AVX512VNNI__) && defined(__x86_64__)
+    int8_qkv_mm_ctx c = {
+        { q, k, v }, { Wq, Wk, Wv }, { NULL, NULL, NULL }, { sq, sk, sv },
+        NULL, qXt, sx, { q_rows, kv_rows, kv_rows }, cols, B
+    };
+#if defined(__AMX_INT8__) && defined(__AMX_TILE__)
+    if ((q_rows & 15) == 0 && (kv_rows & 15) == 0 &&
+        qwen_amx_int8_qkv_allowed(B, q_rows, kv_rows, cols) && qwen_amx_int8_ready()) {
+        const size_t kfull = (size_t)(cols & ~63);
+        int8_t *pXt = mm_scratch_pack(kfull * (size_t)B);
+        if (pXt) {
+            c.pXt = pXt;
+            c.pW[0] = (const uint8_t *)qwen_amx_pack_weights(Wq, q_rows,  cols, QWEN_AMX_WEIGHT_INT8);
+            c.pW[1] = (const uint8_t *)qwen_amx_pack_weights(Wk, kv_rows, cols, QWEN_AMX_WEIGHT_INT8);
+            c.pW[2] = (const uint8_t *)qwen_amx_pack_weights(Wv, kv_rows, cols, QWEN_AMX_WEIGHT_INT8);
+            amx_pack_act_int8(pXt, qXt, cols, (int)kfull, B);
+            if (tid == 0) qwen_region_i8_note_backend("AMX int8 tiles (fused QKV)", q_rows, cols, B);
+            int8_qkv_amx_task(tid, nt, &c);
+            return;
+        }
+    }
+#endif
+    if (tid == 0) qwen_region_i8_note_backend("VNNI row blocks (fused QKV)", q_rows, cols, B);
+    int8_qkv_vnni_mm_task(tid, nt, &c);
+#else
+    (void)q; (void)k; (void)v; (void)Wq; (void)sq; (void)Wk; (void)sk; (void)Wv; (void)sv;
+    (void)qXt; (void)sx; (void)q_rows; (void)kv_rows; (void)cols; (void)B; (void)tid; (void)nt;
+#endif
+}
+
+/* ---- wide bf16 matmat for the prefill only (16 < B <= 64) ------------------------------
+ * A separate entry point, so qwen_matmat_bf16 and every existing caller keep their exact
+ * behaviour.  Same AVX-512 kernels, one weight-row sweep per call for all B columns. */
+int qwen_matmat_bf16_wide_available(int rows, int cols) {
+#if defined(__AVX512BF16__)
+    return cols >= 32 && !qwen_bf16dot_disabled() && qwen_mm_use(QWEN_MMK_BF16_AVX512, 16, rows, cols);
+#else
+    (void)rows; (void)cols; return 0;
+#endif
+}
+int qwen_matmat_bf16_wide(float *Y, const uint16_t *W, const float *X, int rows, int cols, int B) {
+#if defined(__AVX512BF16__)
+    if (B <= 16 || B > 64 || !qwen_matmat_bf16_wide_available(rows, cols)) return 0;
+    uint16_t *Xb = mm_scratch_packb((size_t)B * cols);
+    if (!Xb) return 0;
+    for (int b = 0; b < B; b++)
+        for (int k = 0; k < cols; k++)
+            Xb[(size_t)b * cols + k] = qwen_f32_to_bf16_scalar(X[(size_t)k * B + b]);
+    bf16_avx512_ctx c = { Y, W, Xb, rows, cols, B };
+    int nt = g_n_threads;
+    if (nt > 1 && rows >= 256) qwen_parallel((size_t)nt, bf16_avx512_task, &c);
+    else bf16_avx512_task(0, 1, &c);
+    return 1;
+#else
+    (void)Y; (void)W; (void)X; (void)rows; (void)cols; (void)B; return 0;
+#endif
 }

@@ -28,7 +28,8 @@ int  qwen_compose_render_buffer(qwen_tts_ctx_t *ctx, qwen_cspan_t *spans, int ns
                                 const char *language, float default_pause,
                                 float **out_audio, int *out_n, int silent);
 
-typedef void (*qwen_compose_chunk_cb)(const float *pcm, int n, void *user);
+/* Return non-zero to stop composition (for example, a disconnected stream). */
+typedef int (*qwen_compose_chunk_cb)(const float *pcm, int n, void *user);
 int  qwen_compose_render_stream(qwen_tts_ctx_t *ctx, qwen_cspan_t *spans, int nspans,
                                 const char *language, float default_pause,
                                 qwen_compose_chunk_cb cb, void *user, int silent);

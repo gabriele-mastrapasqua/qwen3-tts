@@ -1,0 +1,376 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "turin-c8a-32c-vnni-product",
+    "description": "Measured Turin product point: AWS c8a.8xlarge (AMD EPYC 9R45 Zen 5, 32 physical cores, no SMT, 4 CCX x 8 cores, 32 MiB L3 each). Four prefork workers pinned one per CCX, four in-flight streams per worker, INT8 VNNI Talker/CP, per-item INT8 VNNI decoder on the elastic decoder lane (DL-2: 8 <-> 4+4 cpus, one bounded decoder unit per slot) with the DL-4 direct dilated conv (QWEN_SD_RES1_V2) and the verified 2-slot shared-weight cohort (QWEN_SD_MULTISLOT=2), native AVX-512 BF16 prefill, decode quantum 4, fail-fast admission (no queue). Derived from vnni-bf16-product; the topology and the lane/conv contracts are the difference.",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [
+        1,
+        16
+      ],
+      "preferred_concurrency": 11,
+      "quality_changes_allowed": false
+    }
+  },
+  "parity": {
+    "lane": "vnni-bf16-product",
+    "isa_classes": [
+      "x86_avx512bf16"
+    ],
+    "decoder": {
+      "requested_batch": 0,
+      "expected_modes": [
+        "per-item-int8-vnni"
+      ],
+      "precision": "int8",
+      "fallback_status": "ACTIVE"
+    },
+    "backends": {
+      "talker_cp": "vnni",
+      "prefill": "bf16-native",
+      "q4": "vnni"
+    },
+    "features": {
+      "design_d": "UNSUPPORTED",
+      "fused_residual": "UNSUPPORTED",
+      "kleidi": "UNSUPPORTED",
+      "res1_v2": "ACTIVE",
+      "decoder_lane": "ACTIVE",
+      "multislot": "ACTIVE"
+    },
+    "quality_gate": {
+      "required": true,
+      "command": "strict profile preflight (tools/serving_profile.py preflight) + --self-test (conv1d_int8_v2 cases) + paired RES1_V2 off/on audio bank (tests/serve_parallel_wave.py --save-audio, tests/compare_audio.py per pair, tools/wav_qc.py, ASR CER) + the serving-generation structural/audio gate",
+      "audio_gate": "same model, voice, language, seed/settings and bank; valid non-empty PCM/WAV, paired mel-correlation and duration against the panel-conv reference, no ASR regression",
+      "reject_on": [
+        "ragged decoder claimed",
+        "FP32 decoder fallback",
+        "wrong prefill policy",
+        "decoder lane OFF",
+        "RES1_V2 OFF",
+        "quality regression"
+      ]
+    },
+    "tunable_flags": [
+      "QWEN_POOL_SPIN",
+      "QWEN_VNNI_GEMV_MR"
+    ],
+    "notes": "QWEN_DECODER_BATCH=0 is the measured request: on the VNNI lane the decoder leaf is per-item whatever the request says, and the DL-1 A/B and the host screen were run with 0. decoder.lane and decoder.res1_v2 must resolve ON in the worker's own [DISPATCH] block (QWEN_SERVE_PROFILE=1 prints it) \u2014 the CLI --dispatch-map probe prepares the lane on the mask it inherits."
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "cpu_family": "AMD EPYC 9R45 (Zen 5, Turin) \u2014 AWS c8a.8xlarge",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 128,
+    "notes": "4 CCX of 8 cores with a private 32 MiB L3 each (cpus 0-7 / 8-15 / 16-23 / 24-31). Measured 2026-09-09: Triad 189.5 GB/s at 32 threads, knee at 16; one CCX ~55 GB/s (saturated by 2-4 VNNI GEMV threads). No AMX."
+  },
+  "build": {
+    "target": "SIMD=avx512bf16",
+    "requirements": {
+      "isa": "AVX-512 VNNI and AVX-512 BF16 runtime support (avx512_bf16 in /proc/cpuinfo); the prefill runs on the native bf16 matmat",
+      "decoder": "per-item INT8 VNNI decoder leaf + qwen_conv1d_int8_v2 (x86 AVX-512 VNNI build)",
+      "os": "Linux (the decoder lane pins with sched_setaffinity)"
+    }
+  },
+  "server": {
+    "prefork_workers": 4,
+    "threads_per_worker": 8,
+    "batch_size": 4,
+    "max_queue": 0,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
+    "worker_affinity": "worker w -> CPUs 8w..8w+7 (one CCX each); inside a worker the lane reserves cpus 4-7 of the CCX for the decoder team while a unit is in flight (QWEN_SD_LANE_SPLIT=4, elastic)"
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 4,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8",
+      "code_predictor_weights": "int8",
+      "speech_decoder_weights": "int8 per-item VNNI",
+      "activations": "fp32 with INT8 decoder panels",
+      "gemm_backend": "AVX-512 VNNI; prefill is explicit FP32/BLAS on this no-BF16 lane"
+    },
+    "environment": {
+      "QWEN_BLAS_OWN": {
+        "value": "1",
+        "why": "engine owns the decoder/BLAS compute budget"
+      },
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "keep the external BLAS pool from spinning against the engine pool"
+      },
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "must be absent so engine-owned BLAS sizing is effective"
+      },
+      "OMP_NUM_THREADS": {
+        "value": null,
+        "why": "must be absent; the engine profile owns the CPU budget"
+      },
+      "QWEN_CP_PREC": {
+        "value": "int8",
+        "why": "pin CP precision"
+      },
+      "QWEN_CP_PREFILL2": {
+        "value": "1",
+        "why": "pin the VNNI CP prefill2 policy"
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "0",
+        "why": "measured request of the DL-1/DL-2/DL-4 A/Bs and the host screen; the VNNI leaf is per-item either way, 0 keeps the per-slot decoder units of the lane explicit",
+        "revert": "QWEN_DECODER_BATCH=1"
+      },
+      "QWEN_KAI_LHS": {
+        "value": null,
+        "why": "Arm-only; must be absent on x86"
+      },
+      "QWEN_KAI_QKV_FUSED": {
+        "value": null,
+        "why": "Arm-only; must be absent on x86"
+      },
+      "QWEN_KAI_NCHUNK": {
+        "value": null,
+        "why": "Arm-only; must be absent on x86"
+      },
+      "QWEN_NO_AMX": {
+        "value": "1",
+        "why": "make the non-AMX product contract explicit"
+      },
+      "QWEN_NO_AMX_BF16": {
+        "value": "1",
+        "why": "no AMX/BF16 decoder or prefill request in this lane"
+      },
+      "QWEN_NO_AMX_INT8": {
+        "value": "1",
+        "why": "no Design-D/AMX INT8 request in this lane"
+      },
+      "QWEN_NO_AMX_Q4": {
+        "value": "1",
+        "why": "force the VNNI Q4 family"
+      },
+      "QWEN_NO_KLEIDI": {
+        "value": "1",
+        "why": "not an Arm lane"
+      },
+      "QWEN_NO_VNNI": {
+        "value": "0",
+        "why": "require native VNNI paths"
+      },
+      "QWEN_NO_VNNI_TILE": {
+        "value": "0",
+        "why": "require native VNNI tile path where gated"
+      },
+      "QWEN_NO_VNNI_QKV": {
+        "value": "0",
+        "why": "do not disable the VNNI QKV path"
+      },
+      "QWEN_NO_X86_QKV": {
+        "value": "0",
+        "why": "do not disable the x86 QKV path"
+      },
+      "QWEN_NO_VNNI_ROWSUM": {
+        "value": "0",
+        "why": "retain cached VNNI GEMV row sums"
+      },
+      "QWEN_NO_VNNI_ACT_QUANT": {
+        "value": "0",
+        "why": "retain VNNI activation quantization"
+      },
+      "QWEN_NO_BF16DOT": {
+        "value": "0",
+        "why": "this lane claims the native BF16 dot/matmat; the VNNI-only policy lives in vnni-product",
+        "revert": "QWEN_NO_BF16DOT=1"
+      },
+      "QWEN_VNNI_MIN_B": {
+        "value": "2",
+        "why": "pin the VNNI matmat gate"
+      },
+      "QWEN_VNNI_NCHUNK": {
+        "value": null,
+        "why": "experimental VNNI row chunking; must remain absent"
+      },
+      "QWEN_X86_NCHUNK": {
+        "value": null,
+        "why": "experimental generic x86 row chunking; must remain absent"
+      },
+      "QWEN_AMX_MIN_B": {
+        "value": null,
+        "why": "AMX-only threshold; must not be inherited in this lane"
+      },
+      "QWEN_AMX_BF16_MIN_B": {
+        "value": null,
+        "why": "AMX-only threshold; must not be inherited in this lane"
+      },
+      "QWEN_AMX_INT8_MIN_B": {
+        "value": null,
+        "why": "AMX-only threshold; must not be inherited in this lane"
+      },
+      "QWEN_AMX_INT8_QKV_MIN_B": {
+        "value": null,
+        "why": "AMX-only threshold; must not be inherited in this lane"
+      },
+      "QWEN_AMX_MIN_ROWS": {
+        "value": null,
+        "why": "AMX-only shape gate; must not be inherited in this lane"
+      },
+      "QWEN_AMX_BF16_MIN_COLS": {
+        "value": null,
+        "why": "AMX-only shape gate; must not be inherited in this lane"
+      },
+      "QWEN_AMX_INT8_MIN_COLS": {
+        "value": null,
+        "why": "AMX-only shape gate; must not be inherited in this lane"
+      },
+      "QWEN_AMX_Q4_MIN_COLS": {
+        "value": null,
+        "why": "AMX-only shape gate; must not be inherited in this lane"
+      },
+      "QWEN_AMX_INT8_MIN_ROWS_PER_THREAD": {
+        "value": null,
+        "why": "AMX-only work-per-thread gate; must not be inherited in this lane"
+      },
+      "QWEN_AMX_NCHUNK": {
+        "value": null,
+        "why": "AMX-only row chunking; must not be inherited in this lane"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "65536",
+        "why": "MEASURED 2026-09-09 on this host class (c8a.8xlarge, Zen5, 4 CCX) 2x16 cap4 C8 1.7B: STREAM p95 0.893 -> 0.808, csw/s 38k -> 7.6k; the 4x8 host screens of 2026-09-10 ran at 4096, the qualification of this profile runs at 65536",
+        "revert": "QWEN_POOL_SPIN=4096"
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "same server semantics as AMX product"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "native AVX-512 BF16 prefill where the CPU has avx512_bf16: measured admission ~58 ms vs ~600 ms on the f32 BLAS fallback (c8a.8xlarge 2026-09-09)",
+        "revert": "QWEN_PREFILL_MATMAT=0"
+      },
+      "QWEN_Q4_NAIVE": {
+        "value": "0",
+        "why": "do not select scalar Q4"
+      },
+      "QWEN_SD_AMX": {
+        "value": null,
+        "why": "legacy decoder switch; must be absent"
+      },
+      "QWEN_SD_AMX_BF16": {
+        "value": "0",
+        "why": "decoder precision is INT8 VNNI"
+      },
+      "QWEN_SD_AMX_D": {
+        "value": "0",
+        "why": "Design-D is unsupported on VNNI"
+      },
+      "QWEN_SD_DIRECT_CONVT": {
+        "value": "0",
+        "why": "AMX-only experiment; not a VNNI claim"
+      },
+      "QWEN_SD_DIRECT_DWCONV": {
+        "value": "0",
+        "why": "AMX-only experiment; not a VNNI claim"
+      },
+      "QWEN_SD_DIRECT_INPUT": {
+        "value": "0",
+        "why": "AMX-only experiment; not a VNNI claim"
+      },
+      "QWEN_SD_FUSED_RESIDUAL": {
+        "value": "0",
+        "why": "no VNNI fused residual implementation exists"
+      },
+      "QWEN_SD_INT8": {
+        "value": "1",
+        "why": "require the explicit per-item INT8 VNNI decoder"
+      },
+      "QWEN_SD_INT8_BLK": {
+        "value": "256",
+        "why": "pin the x86 decoder quantization block"
+      },
+      "QWEN_SD_POOL": {
+        "value": "engine",
+        "why": "same engine-owned decoder pool semantics"
+      },
+      "QWEN_SD_RAG_MIN_PANELS": {
+        "value": "2",
+        "why": "same logical ragged threshold; it cannot create VNNI ragged decoding"
+      },
+      "QWEN_SD_STREAM_STRIP": {
+        "value": "0",
+        "why": "Design-D warm strip is unavailable"
+      },
+      "QWEN_SD_WINDOWED": {
+        "value": "0",
+        "why": "explicitly disable the legacy windowed fallback so the exact streaming decoder semantics are resolved"
+      },
+      "QWEN_SERVER_ASYNC_OUTPUT": {
+        "value": "0",
+        "why": "same synchronous output contract"
+      },
+      "QWEN_SERVER_NO_DECODER_BATCH": {
+        "value": null,
+        "why": "presence flag must remain absent; decoder request is explicit"
+      },
+      "QWEN_TTS_STREAM_LAYOUT": {
+        "value": "1",
+        "why": "same official known-text serving layout as AMX; ICL/clone and live incremental text remain outside this lane"
+      },
+      "QWEN_NO_BF16_MATMUL": {
+        "value": "0",
+        "why": "native BF16 matmat is the prefill backend of this lane",
+        "revert": "QWEN_NO_BF16_MATMUL=1"
+      },
+      "QWEN_SD_LANE_SPLIT": {
+        "value": "4",
+        "why": "DL-1 decoder lane: the last 4 cpus of the worker's CCX form the private decoder team (5+3 and 6+2 measured worse; the decoder needs 4 cores to stay hidden at B4 q4)",
+        "revert": "QWEN_SD_LANE_SPLIT unset (inline decoder)"
+      },
+      "QWEN_SD_LANE_ELASTIC": {
+        "value": "1",
+        "why": "DL-2: the engine pool keeps all 8 cpus and narrows to the 4 step cpus only while a decoder unit is in flight (static 4+4 measured 0.997 vs elastic 0.987 at B4)",
+        "revert": "QWEN_SD_LANE_ELASTIC=0"
+      },
+      "QWEN_SD_RES1_V2": {
+        "value": "1",
+        "why": "DL-4 direct dilated int8 VNNI conv for the residual convs: res1 1.72x, decoder unit on 4 threads 64 -> 50 ms, overlap share 48 -> 39 %, host screen C12 STREAM p95 0.80-0.81 / C16 0.88-0.92 (2026-09-10). Numerics differ from the panel kernel (per-position activation scale): qualified by the paired audio bank of this profile",
+        "revert": "QWEN_SD_RES1_V2=0"
+      },
+      "QWEN_SD_MULTISLOT": {
+        "value": "2",
+        "why": "default the verified DL-4 shared-weight 2-slot lane cohort: three synchronized short waves at C4/C8/C12/C16 and mixed short/long waves at C8/C12 improved the sustained VNNI metrics versus the explicit 0 control, with zero errors/rejects",
+        "revert": "QWEN_SD_MULTISLOT=0 for the committed control/A-B arm"
+      },
+      "QWEN_VNNI_GEMV_MR": {
+        "value": "2",
+        "why": "the two-row VNNI GEMV kernel is what every Turin measurement of this campaign ran (inherited from aws-c8a-16c-vnni-ttfa); the four-row candidate showed no stable end-to-end win",
+        "revert": "QWEN_VNNI_GEMV_MR=4 for an A/B"
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "provisional",
+    "workload": "2026-09-09, c8a.8xlarge (i-09dbe01f7cf251a3a, us-east-1a), revision 28d6436 (binary b0bfe82f), clean tree, strict preflight PASS (decoder.lane ACTIVE elastic, decoder.res1_v2 ACTIVE, bf16 prefill, per-item INT8 VNNI decoder). C12: class waves short/medium/long/mixed (3 waves each), long+short interference wave, overload waves C20/C24, Poisson 1.5 and 2.5 req/s (120 requests each, mixed bank), 30-minute closed-loop SOAK at C12 (temperature 0.9, whole bank). C16 on a second, on-demand c8a.8xlarge (i-027eb619eec9be89e, revision e1b1ec7, binary 63316641): class waves, long+short, overload C24/C28, Poisson 2.0/3.3, 30-min SOAK; plus a C10-C16 sweep and 10-min soaks at C10/C11.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-1.7b, open weights, --int8",
+    "notes": "C12 WAVES (temperature 0, ryan, 36 requests per class): STREAM p95 short 0.848 / medium 0.820 / long 0.816 / mixed 0.830 / long+short 0.848; TTFA p95 269-276 ms, TTFB p95 102-105; prebuffer p95 256-260 ms; safe_play_start p95 466-468 ms; max gap p95 313-316 ms; stall@250 = stall@500 = 0 %; TOTAL p95 0.82 (long) to 0.96 (short); 0 errors, 0 rejects. C12 SOAK 30 min closed-loop (2205 completed, 0 errors/rejects/timeouts, resources PASS, drift PASS): pooled TTFA p95 170 ms, STREAM p50/p95 0.838/0.912, TOTAL p95 0.941, prebuffer p95 262 ms, safe-start p95 408 ms, stall@250 <= 1 %, stall@500 0; per class STREAM p95 short 0.959, conversational 0.914, medium 0.885, italian 0.888, long 0.880; per 5-min window 0.898-0.917. POISSON: 1.5 req/s TTFA p95 172 ms, 1 reject, Q 11.4; 2.5 req/s TTFA p95 175 ms, 28 rejects at 16 in flight (24 clean 503, 4 surfaced as a TCP reset: fail-fast boundary defect recorded in PLAN), Q 12.3. OVERLOAD: C20 accepted 32 / rejected 8, C24 accepted 32 / rejected 16 (per-worker cap 4), accepted streams STREAM p95 0.930/0.954, stall@250 0. DIAGNOSTIC STAGE trace at C12 mixed: overlap share 29.8 %, CP 21.5-22.9 ms outside overlap vs 35.2-35.6 ms inside (the fixed interference tax), decoder unit on the 4-thread lane mean 50.9 / p95 53.7 ms. VERDICT: C12 meets the mandatory serving contract in every workload class (STREAM < 1, prebuffer <= 500 ms, safe-start <= 1 s, stall@500 0, no errors); the preferred STREAM p95 <= 0.90 holds in every wave class and in the medium/long/italian soak classes but NOT for the short (0.959) and conversational (0.914) classes under closed-loop soak. Status stays provisional until (1) a human ear verdict on the paired RES1_V2 bank and (2) the C16 phase on a new host. Quality: 52 paired ref/V2 files, mel-corr >= 0.9948, ASR CER equal, wav_qc equal (automated PASS). C16 (on-demand host): waves STREAM p95 short 0.963 / medium 0.934 / long 0.911 / mixed 0.944, prebuffer p95 374-394, safe-start 636-664, stall@250 <= 2 %; 30-min SOAK FAIL: STREAM p50/p95 0.948/1.004 (short 1.045), 596 per-worker rejects and 111 broken-pipe/reset errors under closed loop, stall@500 0 \u2014 C16 is the hard-capacity boundary, not a product point. Sweep (mixed / short STREAM p95): C10 0.842/0.842, C11 0.830/0.879, C12 0.849/0.862, C13 0.881/0.963, C14 0.924/0.944, C16 0.940/1.005; knee at C13 (first B4 worker). 10-min soaks: C10 pooled 0.878 (short 0.905), C11 0.886 (short 0.917). Capacities: preferred C11 (pooled <= 0.90; short class alone 0.905-0.917), mandatory-qualified C12, hard capacity C16."
+  }
+}

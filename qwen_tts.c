@@ -1,7 +1,13 @@
 /* qwen_tts.c - Qwen3-TTS Pure C Inference Engine */
 #include "qwen_tts.h"
+#if defined(__linux__)
+#include <sys/prctl.h>
+#include <dirent.h>
+#include <unistd.h>
+#endif
 #include "qwen_tts_voice_clone.h"
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_costmap.h"
 #include "ingot/safetensors.h"
 #include "qwen_tts_tokenizer.h"
 #include "qwen_tts_audio.h"
@@ -17,6 +23,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <time.h>
 
 int qwen_verbose = 0;
 
@@ -48,11 +55,18 @@ static double time_ms(void) {
 static _Atomic unsigned long long g_admit_seq = 0;
 static _Atomic double g_admit_ts = 0.0;
 static _Atomic double g_admit_last_iter = 0.0;
+static qwen_admission_health_t *g_admission_health = NULL;
+static int g_admission_worker = -1;
 
 void qwen_admit_probe_read(unsigned long long *seq, double *ts_ms, double *last_iter_ms) {
     if (seq)          *seq          = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
     if (ts_ms)        *ts_ms        = atomic_load_explicit(&g_admit_ts, memory_order_relaxed);
     if (last_iter_ms) *last_iter_ms = atomic_load_explicit(&g_admit_last_iter, memory_order_relaxed);
+}
+
+void qwen_admission_health_bind(qwen_admission_health_t *health, int worker_id) {
+    g_admission_health = health;
+    g_admission_worker = worker_id;
 }
 
 double qwen_mono_ms(void) {
@@ -352,6 +366,9 @@ extern int qwen_talker_load(qwen_tts_ctx_t *ctx);
 extern int qwen_cp_load(qwen_tts_ctx_t *ctx);
 extern int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx);
 extern int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len);
+extern int qwen_talker_prefill_plan(qwen_tts_ctx_t *ctx, int seq_len, int *pos0_out);
+extern int qwen_talker_prefill_range(qwen_tts_ctx_t *ctx, const float *input_embeds,
+                                     int seq_len, int pos0, int t0, int t1);
 extern void qwen_talker_prefix_key(qwen_tts_ctx_t *ctx, int prefix_len, int speaker_id,
                                    int language_id, int think_mode, uint64_t ihash);
 extern uint64_t qwen_prefix_hash(const int *toks, int n);
@@ -367,6 +384,7 @@ extern int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_
 extern int qwen_speech_decoder_decode_streaming_batch(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *items, int n_items);
 extern void qwen_sd_stream_init(qwen_sd_stream_state_t *st);
 extern void qwen_sd_stream_free(qwen_sd_stream_state_t *st);
+extern void qwen_sd_int8_cache_reset(void);
 extern int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float top_p, float rep_penalty, int *prev_tokens, int n_prev);
 extern void qwen_set_seed(uint32_t seed);
 extern uint32_t qwen_get_seed(void);
@@ -468,6 +486,36 @@ static void embed_one_text_token(qwen_tts_ctx_t *ctx, int tid, float *out) {
     embed_one_text_token_compute(ctx, tid, out);
 }
 
+static int qwen_stream_layout_enabled(void) {
+    const char *e = getenv("QWEN_TTS_STREAM_LAYOUT");
+    return e && e[0] && e[0] != '0';
+}
+
+static void qwen_stream_trailing_clear(qwen_tts_ctx_t *ctx) {
+    if (!ctx) return;
+    free(ctx->stream_trailing_text);
+    ctx->stream_trailing_text = NULL;
+    ctx->stream_trailing_len = 0;
+    ctx->stream_trailing_pos = 0;
+}
+
+static int qwen_stream_trailing_alloc(qwen_tts_ctx_t *ctx, int n) {
+    if (!ctx || n < 0) return -1;
+    qwen_stream_trailing_clear(ctx);
+    if (n == 0) return 0;
+    size_t h = (size_t)ctx->config.hidden_size;
+    if ((size_t)n > SIZE_MAX / (h * sizeof(float))) return -1;
+    ctx->stream_trailing_text = (float *)aligned_malloc((size_t)n * h * sizeof(float));
+    if (!ctx->stream_trailing_text) return -1;
+    ctx->stream_trailing_len = n;
+    return 0;
+}
+
+static void qwen_stream_add_text_token(qwen_tts_ctx_t *ctx, int tid,
+                                        float *dst) {
+    embed_one_text_token(ctx, tid, dst);
+}
+
 #define DT_CHUNK_FRAMES 10
 
 typedef struct {
@@ -555,7 +603,10 @@ static void dt_append_audio(decoder_thread_t *dt, const float *samples, int n) {
     dt->audio_len += n;
 }
 
+static void qwen_thread_name(const char *prefix);
 static void *decoder_thread_fn(void *arg) {
+    qwen_thread_name("dec-ovlp");
+    qwen_region_thread_role("decoder");
     decoder_thread_t *dt = (decoder_thread_t *)arg;
     qwen_tts_ctx_t *ctx = dt->ctx;
 
@@ -809,6 +860,10 @@ void qwen_track_override(qwen_tts_ctx_t *ctx, void *ptr) {
 
 void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     if (!ctx) return;
+    qwen_vnni_row_sums_reset();
+    qwen_vnni_weight_cache_reset();
+    qwen_amx_weight_cache_reset();
+    qwen_sd_int8_cache_reset();
     for (int i = 0; i < ctx->n_owned_overrides; i++) free(ctx->owned_overrides[i]);
     free(ctx->owned_overrides);
     for (int i = 0; i < ctx->config.num_layers; i++) free(ctx->layers[i].gate_up_fused_bf16);
@@ -816,6 +871,8 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].down_q2_rough);
     for (int i = 0; i < 16; i++) free(ctx->speech_dec.codebook[i]);
     for (int i = 0; i < 6; i++) free(ctx->speech_dec.convt_packed[i]);
+    for (int i = 0; i < 6; i++) free(ctx->speech_dec.convt_stack[i]);
+    qwen_sd_bf16_preup_free(&ctx->speech_dec, ctx->config.dec_num_layers);
     free(ctx->speech_dec.pre_layers);
     free(ctx->speech_dec.rope_cos); free(ctx->speech_dec.rope_sin);
     ingot_st_close(ctx->safetensors);
@@ -834,6 +891,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx->dec_attn_out); free(ctx->dec_proj_out); free(ctx->dec_gate); free(ctx->dec_up); free(ctx->dec_ffn_out);
     free(ctx->cp_dec_x); free(ctx->cp_dec_q); free(ctx->cp_dec_k); free(ctx->cp_dec_v);
     free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_up); free(ctx->cp_dec_ffn_out);
+    free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
     free(ctx->pref_residual); free(ctx->pref_x_norm); free(ctx->pref_q);
     free(ctx->pref_k); free(ctx->pref_v); free(ctx->pref_attn_out);
     free(ctx->pref_gate); free(ctx->pref_proj);
@@ -846,6 +904,7 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     free(ctx->prev_input_embeds); free(ctx->cached_ref_codes);
+    free(ctx->stream_trailing_text);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
 }
@@ -913,6 +972,9 @@ qwen_tts_ctx_t *qwen_tts_clone_for_worker(const qwen_tts_ctx_t *base) {
     w->codec_codes = NULL; w->codec_frames = 0; w->codec_frames_cap = 0;
     w->prev_tokens = NULL; w->n_prev_tokens = 0; w->prev_tokens_cap = 0;
     w->prev_input_embeds = NULL; w->prev_prefill_len = 0;
+    w->prefill_defer = 0; w->prefill_embeds = NULL; w->prefill_seq_len = 0;
+    w->stream_trailing_text = NULL; w->stream_trailing_len = 0; w->stream_trailing_pos = 0;
+    w->stream_layout_prefill_len = 0;
     w->audio_buf = NULL; w->audio_samples = 0;
     memset(&w->sd_stream, 0, sizeof(w->sd_stream));
 
@@ -935,6 +997,7 @@ void qwen_tts_free_clone(qwen_tts_ctx_t *ctx) {
     free(ctx->swiglu_tmp);
     free(ctx->cp_dec_x); free(ctx->cp_dec_q); free(ctx->cp_dec_k); free(ctx->cp_dec_v);
     free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_up); free(ctx->cp_dec_ffn_out);
+    free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
     free(ctx->pref_residual); free(ctx->pref_x_norm); free(ctx->pref_q);
     free(ctx->pref_k); free(ctx->pref_v); free(ctx->pref_attn_out);
     free(ctx->pref_gate); free(ctx->pref_proj);
@@ -944,6 +1007,7 @@ void qwen_tts_free_clone(qwen_tts_ctx_t *ctx) {
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     free(ctx->prev_input_embeds);
+    free(ctx->stream_trailing_text);
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].down_q2_rough);
     free(ctx->instruct);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
@@ -996,8 +1060,12 @@ static void lookup_codec_embed(qwen_tts_ctx_t *ctx, int token_id, float *out) {
 }
 
 int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples, int *out_n_samples) {
+    qwen_exec_budget_engine_owned("cli");
     double t_start = time_ms();
     int h = ctx->config.hidden_size;
+    qwen_stream_trailing_clear(ctx);
+    ctx->stream_layout_active = qwen_stream_layout_enabled();
+    ctx->stream_layout_prefill_len = 0;
     qwen_set_seed(ctx->seed);
 
     int32_t *instruct_tokens = NULL;
@@ -1186,7 +1254,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     int inst_len = instruct_tokens ? instruct_token_len : 0;
 
     int sec3_len, sec4_len;
-    if (icl_mode) {
+    int stream_text_len = 0, stream_codec_len = 0;
+    if (ctx->stream_layout_active) {
+        stream_text_len = (icl_mode ? ref_text_token_len : 0) + text_content_len + 1;
+        stream_codec_len = icl_mode ? ref_n_frames + 1 : 1;
+        sec3_len = 0;
+        sec4_len = stream_codec_len;
+    } else if (icl_mode) {
         sec3_len = ref_text_token_len + text_content_len + 1;
         sec4_len = ref_n_frames + 1;
     } else {
@@ -1267,7 +1341,87 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         pos++;
     }
 
-    if (icl_mode) {
+    if (ctx->stream_layout_active) {
+        int trailing_len = stream_text_len > stream_codec_len
+                         ? stream_text_len - stream_codec_len : 0;
+        if (qwen_stream_trailing_alloc(ctx, trailing_len) != 0) {
+            fprintf(stderr, "Error: streaming layout trailing text allocation failed\n");
+            free(all_tokens);
+            free(tmp_embed);
+            free(ref_text_tokens);
+            if (ref_codes_owned) free(ref_codes);
+            free(codec_pad_embed);
+            free(codec_bos_embed);
+            free(input_embeds);
+            return -1;
+        }
+
+        if (icl_mode) {
+            /* Official non_streaming_mode=False ICL layout: the common
+             * text/codec prefix is aligned column by column.  Text beyond
+             * the reference-code prefix is kept as one hidden vector per
+             * subsequent generation step. */
+            for (int i = 0; i < stream_codec_len; i++) {
+                float *dst = input_embeds + (int64_t)pos * h;
+                if (i < ref_text_token_len) {
+                    qwen_stream_add_text_token(ctx, ref_text_tokens[i], dst);
+                } else if (i < ref_text_token_len + text_content_len) {
+                    qwen_stream_add_text_token(ctx,
+                                               all_tokens[role_len + (i - ref_text_token_len)], dst);
+                } else if (i == ref_text_token_len + text_content_len) {
+                    memcpy(dst, tts_eos_embed, (size_t)h * sizeof(float));
+                } else {
+                    memcpy(dst, tts_pad_embed, (size_t)h * sizeof(float));
+                }
+
+                if (i == 0) {
+                    for (int j = 0; j < h; j++) dst[j] += codec_bos_embed[j];
+                } else {
+                    int frame = i - 1;
+                    int code0 = ref_codes[frame * 16];
+                    lookup_codec_embed(ctx, code0, tmp_embed);
+                    for (int j = 0; j < h; j++) dst[j] += tmp_embed[j];
+                    for (int g = 0; g < 15; g++) {
+                        int code_g = ref_codes[frame * 16 + g + 1];
+                        if (ctx->cp_codec_emb_bf16[g] && code_g >= 0
+                            && code_g < ctx->config.codebook_size) {
+                            const uint16_t *emb = ctx->cp_codec_emb_bf16[g]
+                                                  + (int64_t)code_g * h;
+                            qwen_bf16_accum_f32(dst, emb, h);
+                        }
+                    }
+                }
+                pos++;
+            }
+            for (int i = stream_codec_len; i < stream_text_len; i++) {
+                float *dst = ctx->stream_trailing_text
+                           + (size_t)(i - stream_codec_len) * h;
+                if (i < ref_text_token_len) {
+                    qwen_stream_add_text_token(ctx, ref_text_tokens[i], dst);
+                } else if (i < ref_text_token_len + text_content_len) {
+                    qwen_stream_add_text_token(ctx,
+                                               all_tokens[role_len + (i - ref_text_token_len)], dst);
+                } else {
+                    memcpy(dst, tts_eos_embed, (size_t)h * sizeof(float));
+                }
+            }
+        } else {
+            /* Official non-ICL streaming layout: first text token + codec
+             * BOS are prefetched, then the remaining text and tts_eos are
+             * supplied alongside successive generated codec frames. */
+            float *dst = input_embeds + (int64_t)pos * h;
+            qwen_stream_add_text_token(ctx, all_tokens[role_len], dst);
+            for (int j = 0; j < h; j++) dst[j] += codec_bos_embed[j];
+            pos++;
+            for (int i = 1; i < stream_text_len; i++) {
+                dst = ctx->stream_trailing_text + (size_t)(i - 1) * h;
+                if (i < text_content_len)
+                    qwen_stream_add_text_token(ctx, all_tokens[role_len + i], dst);
+                else
+                    memcpy(dst, tts_eos_embed, (size_t)h * sizeof(float));
+            }
+        }
+    } else if (icl_mode) {
         for (int i = 0; i < sec3_len; i++) {
             float *dst = input_embeds + (int64_t)pos * h;
             if (i < ref_text_token_len) {
@@ -1331,6 +1485,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(codec_pad_embed);
     free(codec_bos_embed);
 
+    ctx->stream_layout_prefill_len = prefill_len;
+
     if (!ctx->silent) {
         if (ctx->voice_clone)
             fprintf(stderr, "Voice clone: %s (x-vector%s)\n",
@@ -1338,7 +1494,12 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     ctx->xvector_only ? " only" : " + ICL");
         else
             fprintf(stderr, "Speaker: %d, Language: %d\n", ctx->speaker_id, ctx->language_id);
-        if (icl_mode)
+        if (ctx->stream_layout_active)
+            fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, "
+                    "stream_common=%d, trailing_text=%d)\n",
+                    prefill_len, inst_len, role_len, sec2_len,
+                    stream_codec_len, ctx->stream_trailing_len);
+        else if (icl_mode)
             fprintf(stderr, "Prefill: %d positions (instruct=%d, role=%d, codec=%d, "
                     "icl_text=%d, icl_codes=%d)\n",
                     prefill_len, inst_len, role_len, sec2_len, sec3_len, sec4_len);
@@ -1390,7 +1551,20 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "Error: prompt too long (%d tokens > RoPE cache %d); shorten the text.\n",
                 prefill_len, ctx->rope_cache_len);
         free(input_embeds);
+        qwen_stream_trailing_clear(ctx);
         return -1;
+    }
+
+    /* C12-WIN-10: hand the built prompt back and let the caller run the Talker in
+     * token-range slices.  Everything above this point is the prompt builder and is
+     * untouched; nothing below it has run, so the context still holds no KV for this
+     * request beyond the prefix positions the slicing path re-establishes itself. */
+    if (ctx->prefill_defer && ctx->prefill_only) {
+        free(ctx->prefill_embeds);
+        ctx->prefill_embeds = input_embeds;      /* ownership moves to the caller */
+        ctx->prefill_seq_len = prefill_len;
+        ctx->bg_text_content_len = text_content_len;
+        return 0;
     }
 
     double t_prefill = time_ms();
@@ -1399,14 +1573,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             float *dummy_hidden = (float *)malloc(h * sizeof(float));
             for (int t = delta_start; t < prefill_len; t++) {
                 if (qwen_talker_step(ctx, input_embeds + (int64_t)t * h, dummy_hidden) != 0) {
-                    free(input_embeds); free(dummy_hidden);
+                    free(input_embeds); free(dummy_hidden); qwen_stream_trailing_clear(ctx);
                     return -1;
                 }
             }
             free(dummy_hidden);
         } else {
             if (qwen_talker_prefill(ctx, input_embeds, prefill_len) != 0) {
-                free(input_embeds);
+                free(input_embeds); qwen_stream_trailing_clear(ctx);
                 return -1;
             }
         }
@@ -1673,7 +1847,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             }
         }
 
-        for (int j = 0; j < h; j++) step_embed[j] += tts_pad_embed[j];
+        if (ctx->stream_layout_active && frame < ctx->stream_trailing_len) {
+            const float *tail = ctx->stream_trailing_text + (size_t)frame * h;
+            for (int j = 0; j < h; j++) step_embed[j] += tail[j];
+            ctx->stream_trailing_pos = frame + 1;
+        } else {
+            for (int j = 0; j < h; j++) step_embed[j] += tts_pad_embed[j];
+        }
         t_embed_total += time_ms() - t_embed_start;
 
         if (ctx->debug && frame < 2) {
@@ -1697,6 +1877,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
             qwen_blas_set_threads(qwen_get_threads());
             qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
+            qwen_stream_trailing_clear(ctx);
             return -1;
         }
         t_talker_step_total += time_ms() - t_step_start;
@@ -1731,6 +1912,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         qwen_blas_set_threads(qwen_get_threads());
         qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
         *out_samples = NULL; *out_n_samples = 0;
+        qwen_stream_trailing_clear(ctx);
         return 0;
     }
 
@@ -1774,7 +1956,57 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     ttfa_ms, dt_state.chunk_frames);
     }
 
+    qwen_stream_trailing_clear(ctx);
+    qwen_costmap_request_done();
     return 0;
+}
+
+/* C12-WIN-10.  QWEN_PREFILL_SLICE=N runs the Talker prefill of an admission in
+ * resumable slices of at most N new tokens, one slice per frame iteration while other
+ * slots are streaming; an idle worker still runs the whole prompt in one visit, so a
+ * cold-start TTFA does not grow.  Unset or 0 keeps the monolithic inline prefill.
+ *
+ * A NEGATIVE value means |N| and slices even when the worker is idle.  That is a
+ * PARITY-TEST setting, never a product arm: it makes the slice boundary reachable with
+ * one client and one slot, which is what makes "resume equals uninterrupted" testable
+ * deterministically.  Product arms use a positive value.
+ *
+ * An unusable value is fatal rather than silently ignored: a benchmark arm that thinks
+ * it enabled the treatment and did not is worse than a dead worker. */
+/* How many new tokens the next slice takes.  A slice of exactly ONE token is avoided:
+ * at M=1 the shared prefill projection kernels take the matvec path, whose accumulation
+ * order differs from the matmat path, so a 1-token slice would make the prefill depend on
+ * where the slice boundaries happen to fall.  A remainder of one token is absorbed into
+ * the current slice instead, so a slice is at most `slice + 1` tokens and never one.
+ * Measured
+ * 2026-09-10 with --prefill-slice-check: with this rule every partition is bit-identical
+ * to the unsliced arm; without it S=2 and S=4 differ from S=one on a 29-token prompt. */
+int qwen_prefill_slice_next(int remaining, int slice) {
+    int s = (slice < remaining) ? slice : remaining;
+    if (remaining - s == 1) s = remaining;   /* take the last token now, never leave one */
+    return s;
+}
+
+int qwen_prefill_slice_tokens(void) {
+    static atomic_int cached = 0;
+    static atomic_int have = 0;
+    if (!atomic_load_explicit(&have, memory_order_acquire)) {
+        const char *e = getenv("QWEN_PREFILL_SLICE");
+        int v = 0;
+        if (e && e[0]) {
+            char *end = NULL;
+            long n = strtol(e, &end, 10);
+            if (!end || *end != '\0' || n < -100000 || n > 100000) {
+                fprintf(stderr, "Error: QWEN_PREFILL_SLICE=\"%s\" is not a token count "
+                                "in [-100000, 100000]\n", e);
+                exit(1);
+            }
+            v = (int)n;
+        }
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+        atomic_store_explicit(&have, 1, memory_order_release);
+    }
+    return atomic_load_explicit(&cached, memory_order_relaxed);
 }
 
 int qwen_tts_batch_max_prompt(void) {
@@ -1786,18 +2018,36 @@ int qwen_tts_batch_max_prompt(void) {
     }
     return v;
 }
+/* Per-request generation ceiling of the batched/server paths, in codec frames (12.5/s).
+ * Precedence: QWEN_BATCH_MAX_FRAMES (explicit) > the value the server derives from
+ * --max-request-seconds (qwen_tts_set_batch_max_frames) > 600 (48 s).  Reaching it is
+ * NOT an EOS: the request is truncated, and every path that hits it says so on stderr
+ * (qwen_tts_note_frame_cap) instead of ending the stream as if the model had finished. */
+static int g_batch_max_frames_cfg = 0;
+void qwen_tts_set_batch_max_frames(int frames) { g_batch_max_frames_cfg = frames > 0 ? frames : 0; }
+int qwen_tts_batch_max_frames_source(void) {
+    const char *e = getenv("QWEN_BATCH_MAX_FRAMES");
+    if (e && atoi(e) > 0) return 2;               /* explicit env */
+    return g_batch_max_frames_cfg > 0 ? 1 : 0;    /* 1 = server-derived, 0 = compiled default */
+}
 int qwen_tts_batch_max_frames(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("QWEN_BATCH_MAX_FRAMES");
-        v = (e && atoi(e) > 0) ? atoi(e) : 600;
-        if (v < 32) v = 32;
-    }
+    const char *e = getenv("QWEN_BATCH_MAX_FRAMES");
+    int v = (e && atoi(e) > 0) ? atoi(e) : (g_batch_max_frames_cfg > 0 ? g_batch_max_frames_cfg : 600);
+    if (v < 32) v = 32;
     return v;
+}
+static void qwen_tts_note_frame_cap(const char *path, int frames, int cap, int kv_full) {
+    fprintf(stderr, "[%s] WARNING: request TRUNCATED after %d frames (%.1f s of audio): %s. "
+                    "The output ends as if the model had finished. Raise --max-request-seconds "
+                    "(server) or QWEN_BATCH_MAX_FRAMES (now %d frames = %.1f s), or split the text.\n",
+            path, frames, frames / 12.5,
+            kv_full ? "the slot's KV budget (prompt + frames) is full" : "the per-request frame cap was reached",
+            cap, cap / 12.5);
 }
 
 int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                             float chunk_pause, float **out_samples, int *out_n_samples) {
+    qwen_exec_budget_engine_owned("cli");
     if (nc <= 0) { *out_samples = NULL; *out_n_samples = 0; return 0; }
     if (ctx->layers[0].wq_bf16 == NULL) return -2;
     int h = ctx->config.hidden_size;
@@ -1830,6 +2080,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
 
         int *prompt_len = (int *)calloc(B, sizeof(int));
         int *tcl = (int *)calloc(B, sizeof(int));
+        float **stream_tail = (float **)calloc(B, sizeof(float *));
+        int *stream_tail_len = (int *)calloc(B, sizeof(int));
         float *seed_hidden = (float *)malloc((size_t)B * h * sizeof(float));
         uint16_t **tk = (uint16_t **)calloc(B, sizeof(uint16_t *));
         uint16_t **tv = (uint16_t **)calloc(B, sizeof(uint16_t *));
@@ -1839,6 +2091,9 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
             ctx->prev_prefill_len = 0;
             if (qwen_tts_generate(ctx, chunks[g0 + b], NULL, NULL) != 0) { ok = 0; break; }
             int pl = ctx->kv_len; prompt_len[b] = pl; tcl[b] = ctx->bg_text_content_len;
+            stream_tail[b] = ctx->stream_trailing_text;
+            stream_tail_len[b] = ctx->stream_trailing_len;
+            ctx->stream_trailing_text = NULL; ctx->stream_trailing_len = 0; ctx->stream_trailing_pos = 0;
             qwen_rms_norm(seed_hidden + (size_t)b * h, ctx->dec_x, ctx->talker_norm, 1, h, eps);
             size_t bytes = (size_t)num_layers * pl * kvd * sizeof(uint16_t);
             tk[b] = (uint16_t *)malloc(bytes); tv[b] = (uint16_t *)malloc(bytes);
@@ -1854,6 +2109,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
         ctx->prefill_only = 0;
         if (!ok) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden); free(out);
             return -1;
         }
@@ -1863,6 +2120,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
         if (bb && getenv("QWEN_BATCH_FORCE_MATVEC")) bb->force_matvec = 1;
         if (!bb) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden); free(out);
             return -1;
         }
@@ -1913,7 +2172,10 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                 float ft = ctx->temperature; int ftk = ctx->top_k;
                 if (ctx->greedy_warmup > 0 && frame < ctx->greedy_warmup) { ft = 0.0f; ftk = 1; }
                 int c0 = qwen_tts_sample(logits, vocab, ft, ftk, ctx->top_p, ctx->rep_penalty, prev_tok[b], nprev[b]);
-                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) { active[b] = 0; n_active--; code0[b] = 0; continue; }
+                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) {
+                    if (c0 != QWEN_TTS_CODEC_EOS) qwen_tts_note_frame_cap("batch", chframes[b], GEN_CAP, 0);
+                    active[b] = 0; n_active--; code0[b] = 0; continue;
+                }
                 code0[b] = c0; prev_tok[b][nprev[b]++] = c0;
             }
             if (n_active == 0) break;
@@ -1933,7 +2195,12 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                     if (ctx->cp_codec_emb_bf16[g] && cg >= 0 && cg < cb)
                         qwen_bf16_accum_f32(se, ctx->cp_codec_emb_bf16[g] + (size_t)cg * h, h);
                 }
-                for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                if (stream_tail[b] && frame < stream_tail_len[b]) {
+                    const float *tail = stream_tail[b] + (size_t)frame * h;
+                    for (int j = 0; j < h; j++) se[j] += tail[j];
+                } else {
+                    for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                }
             }
 
             if (qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, active, last_hidden) != 0) break;
@@ -1954,6 +2221,8 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
         free(pos); free(active); free(nprev); free(chframes); free(prev_tok); free(chcodes);
         free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
         free(prompt_len); free(tcl); free(seed_hidden);
+        for (int b = 0; b < B; b++) free(stream_tail[b]);
+        free(stream_tail); free(stream_tail_len);
         qwen_batch_free(bb);
     }
 
@@ -1965,6 +2234,7 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
 int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
                                   const qwen_batch_req_t *reqs, int nc,
                                   float **out_samples, int *out_n_samples) {
+    qwen_exec_budget_engine_owned("batch");
     if (nc <= 0) return 0;
     if (ctx->layers[0].wq_bf16 == NULL) return -2;
     int h = ctx->config.hidden_size;
@@ -1985,6 +2255,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
 
         int *prompt_len = (int *)calloc(B, sizeof(int));
         int *tcl = (int *)calloc(B, sizeof(int));
+        float **stream_tail = (float **)calloc(B, sizeof(float *));
+        int *stream_tail_len = (int *)calloc(B, sizeof(int));
         float *seed_hidden = (float *)malloc((size_t)B * h * sizeof(float));
         uint16_t **tk = (uint16_t **)calloc(B, sizeof(uint16_t *));
         uint16_t **tv = (uint16_t **)calloc(B, sizeof(uint16_t *));
@@ -2004,6 +2276,9 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
             ctx->prev_prefill_len = 0;
             if (qwen_tts_generate(ctx, rq->text, NULL, NULL) != 0) { ok = 0; break; }
             int pl = ctx->kv_len; prompt_len[b] = pl; tcl[b] = ctx->bg_text_content_len;
+            stream_tail[b] = ctx->stream_trailing_text;
+            stream_tail_len[b] = ctx->stream_trailing_len;
+            ctx->stream_trailing_text = NULL; ctx->stream_trailing_len = 0; ctx->stream_trailing_pos = 0;
             qwen_rms_norm(seed_hidden + (size_t)b * h, ctx->dec_x, ctx->talker_norm, 1, h, eps);
             p_temp[b] = rq->temperature; p_topk[b] = rq->top_k; p_topp[b] = rq->top_p;
             p_rep[b]  = rq->rep_penalty; p_gw[b] = rq->greedy_warmup; rng[b] = rq->seed;
@@ -2022,6 +2297,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
         ctx->speaker_id = sv_spk; ctx->language_id = sv_lang;
         if (!ok) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden);
             free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
             return -1;
@@ -2032,6 +2309,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
         if (bb && getenv("QWEN_BATCH_FORCE_MATVEC")) bb->force_matvec = 1;
         if (!bb) {
             for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            for (int b = 0; b < B; b++) free(stream_tail[b]);
+            free(stream_tail); free(stream_tail_len);
             free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden);
             free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
             return -1;
@@ -2085,7 +2364,10 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
                 qwen_set_seed(rng[b]);
                 int c0 = qwen_tts_sample(logits, vocab, ft, ftk, p_topp[b], p_rep[b], prev_tok[b], nprev[b]);
                 rng[b] = qwen_get_seed();
-                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) { active[b] = 0; n_active--; code0[b] = 0; continue; }
+                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) {
+                    if (c0 != QWEN_TTS_CODEC_EOS) qwen_tts_note_frame_cap("batch", chframes[b], GEN_CAP, 0);
+                    active[b] = 0; n_active--; code0[b] = 0; continue;
+                }
                 code0[b] = c0; prev_tok[b][nprev[b]++] = c0;
             }
             if (n_active == 0) break;
@@ -2105,7 +2387,12 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
                     if (ctx->cp_codec_emb_bf16[g] && cg >= 0 && cg < cb)
                         qwen_bf16_accum_f32(se, ctx->cp_codec_emb_bf16[g] + (size_t)cg * h, h);
                 }
-                for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                if (stream_tail[b] && frame < stream_tail_len[b]) {
+                    const float *tail = stream_tail[b] + (size_t)frame * h;
+                    for (int j = 0; j < h; j++) se[j] += tail[j];
+                } else {
+                    for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+                }
             }
 
             if (qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, active, last_hidden) != 0) break;
@@ -2127,6 +2414,8 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
         free(pos); free(active); free(nprev); free(chframes); free(prev_tok); free(chcodes);
         free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
         free(prompt_len); free(tcl); free(seed_hidden);
+        for (int b = 0; b < B; b++) free(stream_tail[b]);
+        free(stream_tail); free(stream_tail_len);
         free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
         qwen_batch_free(bb);
     }
@@ -2143,6 +2432,8 @@ typedef struct prefilled_s {
     int tcl;
     uint16_t *kv_k, *kv_v;
     float *last_hidden;
+    float *stream_trailing_text;
+    int stream_trailing_len;
     double ts_admitted;
     double ts_prefill_start;
     double ts_prefill_done;
@@ -2196,7 +2487,8 @@ static void pfq_shutdown(prefill_q_t *q) {
 }
 static void prefilled_free(prefilled_t *p) {
     if (!p) return;
-    free(p->kv_k); free(p->kv_v); free(p->last_hidden); free(p);
+    free(p->kv_k); free(p->kv_v); free(p->last_hidden);
+    free(p->stream_trailing_text); free(p);
 }
 
 typedef struct {
@@ -2207,7 +2499,22 @@ typedef struct {
     float eps;
 } prefill_helper_arg_t;
 
+/* Name the thread for /proc and top: the thread ownership table of a worker is then
+ * readable without a debugger.  Zero cost after creation. */
+static void qwen_thread_name(const char *prefix) {
+    static _Atomic int counter = 0;
+    char name[16];
+    int n = atomic_fetch_add(&counter, 1);
+    snprintf(name, sizeof name, "%.9s-%d", prefix, n);
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    prctl(PR_SET_NAME, name, 0, 0, 0);
+#endif
+}
 static void *prefill_helper_main(void *arg) {
+    qwen_thread_name("pf-helper");
+    qwen_region_thread_role("prefill_helper");
     prefill_helper_arg_t *a = (prefill_helper_arg_t *)arg;
     qwen_tts_ctx_t *pf = a->pf_ctx;
     for (;;) {
@@ -2216,14 +2523,32 @@ static void *prefill_helper_main(void *arg) {
         double _t_admitted = qwen_mono_ms();
         pf->speaker_id = req.speaker_id; pf->language_id = req.language_id;
         pf->prev_prefill_len = 0; pf->prefill_only = 1;
+        /* QWEN_PREFILL_LOW_MS>0: this prefill submits LOW for that long, filling only the
+         * pool windows the frame loop leaves free, so an already-playing stream keeps its
+         * frames; then it becomes ordinary so TTFA stays bounded. */
+        { static double low_ms = -1.0;
+          if (low_ms < 0) {
+              const char *e = getenv("QWEN_PREFILL_LOW_MS");
+              low_ms = e ? atof(e) : 0.0;
+              if (low_ms > 0 && !qwen_pool_priority_ok()) {
+                  fprintf(stderr, "[prefill] QWEN_PREFILL_LOW_MS=%g ignored: this thread pool "
+                                  "has no submit priority\n", low_ms);
+                  low_ms = 0.0;
+              }
+          }
+          if (low_ms > 0) qwen_parallel_set_low_until(qwen_parallel_now_ms() + low_ms); }
         double _t_pf_start = qwen_mono_ms();
         int prc = qwen_tts_generate(pf, req.text, NULL, NULL);
         double _t_pf_done = qwen_mono_ms();
+        qwen_parallel_set_low_until(0.0);
         pf->prefill_only = 0;
         int pl = pf->kv_len;
         prefilled_t *p = (prefilled_t *)calloc(1, sizeof(prefilled_t));
-        if (!p) { a->sink->on_done(a->sink->ud, tag, NULL, 0); continue; }
+        if (!p) { qwen_stream_trailing_clear(pf); a->sink->on_done(a->sink->ud, tag, NULL, 0); continue; }
         p->tag = tag; p->req = req;
+        p->stream_trailing_text = pf->stream_trailing_text;
+        p->stream_trailing_len = pf->stream_trailing_len;
+        pf->stream_trailing_text = NULL; pf->stream_trailing_len = 0; pf->stream_trailing_pos = 0;
         p->reject_reason = (prc != 0) ? "prefill failed"
                          : (pl <= 0)  ? "prefill produced nothing"
                          : (pl > a->MAXPROMPT) ? "prompt too long for a batch slot"
@@ -2257,6 +2582,37 @@ static void *prefill_helper_main(void *arg) {
     return NULL;
 }
 
+/* Core-equivalents per team, from /proc/self/task/<tid>/stat: the decoder team is every
+ * thread named sd-lane-* or dec-thr; everything else (the loop thread, qwen-pool-*, the
+ * server's own threads) is the step side.  Linux only; zeros elsewhere. */
+static void lane_cpu_by_team(double *step_s, double *dec_s, int *nstep, int *ndec) {
+    *step_s = *dec_s = 0; *nstep = *ndec = 0;
+#if defined(__linux__)
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    long hz = sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char path[256]; snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->d_name);
+        FILE *f = fopen(path, "r"); if (!f) continue;
+        char buf[1024]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+        char *lp = strchr(buf, '('), *rp = strrchr(buf, ')');
+        if (!lp || !rp || rp < lp) continue;
+        char comm[64]; size_t cl = (size_t)(rp - lp - 1); if (cl >= sizeof comm) cl = sizeof comm - 1;
+        memcpy(comm, lp + 1, cl); comm[cl] = 0;
+        unsigned long ut = 0, st = 0; char *q = rp + 2;
+        /* fields after ')': state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime */
+        for (int k = 0; k < 11 && q; k++) q = strchr(q, ' ') ? strchr(q, ' ') + 1 : NULL;
+        if (!q || sscanf(q, "%lu %lu", &ut, &st) != 2) continue;
+        double cs = (double)(ut + st) / (double)hz;
+        if (strstr(comm, "sd-lane") || strstr(comm, "dec-thr")) { *dec_s += cs; (*ndec)++; }
+        else { *step_s += cs; (*nstep)++; }
+    }
+    closedir(d);
+#endif
+}
+
 typedef struct dec_job {
     int slot;
     int nframes;
@@ -2265,8 +2621,18 @@ typedef struct dec_job {
     int is_final;
     int stream;
     int first;
+    int cohort_n;                 /* lane multi-slot leader; followers stay off the queue */
+    struct dec_job *cohort[3];
     struct dec_job *next;
 } dec_job_t;
+
+/* Diagnostic-only, one record per bounded lane slot.  The producer writes READY
+ * before enqueue; the lane publishes START/DONE; the main loop records when that
+ * completion is first observed and when forward progress resumes. */
+typedef struct {
+    atomic_ullong ready_us, enqueue_us, start_us, done_us;
+    atomic_int active, pending, target, pause_run, cohort;
+} dec_life_t;
 
 typedef struct {
     pthread_mutex_t m;
@@ -2280,7 +2646,77 @@ typedef struct {
     int batch;
     int first_group;
     int trace;
+    int lifecycle_trace;
+    dec_life_t *life;
+    int lane;                 /* QWEN_SD_LANE_SPLIT: pinned private team, one unit in flight per slot */
+    int multislot;             /* QWEN_SD_MULTISLOT=2..3: shape-compatible lane cohort */
+    int cohort_max_b;          /* QWEN_SD_COHORT_MAX_B: form cohorts only while n_active <= this (0 = no cap) */
+    int nonblock;              /* QWEN_SD_LANE_NONBLOCK: defer a busy slot instead of stalling the frame loop */
+    pthread_cond_t done_cv;   /* broadcast when a slot's busy count drops (the bounded mailbox) */
+    int elastic;              /* width full <-> step_width while a unit is queued or running */
+    int step_width;
+    int queued;               /* units enqueued and not yet finished (under m) */
+    dec_job_t *slot_job;      /* lane: one preallocated job per slot, no heap job per unit */
+    int *slot_codes;          /* lane: per-slot codes buffer, 32 frames x 16 */
+    double overlap_ms;        /* time with the width capped (decoder in flight), for the report */
+    double overlap_t0;
+    int subq;                 /* QWEN_SD_LANE_SUBQ: decode a unit as sub-calls of this many frames (cache footprint /N) */
 } dec_pool_t;
+
+/* The bounded mailbox: block THIS slot's producer until its unit in flight has completed.
+ * Returns the wait in ms.  Only the lane uses it; the legacy decoder thread keeps its
+ * unbounded queue. */
+static double dec_wait_idle(dec_pool_t *dp, int slot) {
+    if (atomic_load(&dp->busy[slot]) == 0) return 0.0;
+    double t0 = qwen_mono_ms();
+    pthread_mutex_lock(&dp->m);
+    while (atomic_load(&dp->busy[slot]) != 0 && dp->running)
+        pthread_cond_wait(&dp->done_cv, &dp->m);
+    pthread_mutex_unlock(&dp->m);
+    return qwen_mono_ms() - t0;
+}
+
+static int dec_stream_target_frames(int decpos, int n_active, int stream_chunk, int busy_chunk) {
+    if (decpos == 0) return 1;
+    if (decpos < 4) return 2;
+    if (decpos < 12) return 4;
+    if (busy_chunk && n_active > 1) return busy_chunk;
+    return stream_chunk;
+}
+
+static unsigned long long dec_life_now_us(void) {
+    return (unsigned long long)(qwen_mono_ms() * 1000.0 + 0.5);
+}
+
+static void dec_life_ready(dec_pool_t *dp, int slot, int active, int pending,
+                           int target, unsigned int pause_run) {
+    if (!dp->lifecycle_trace || !dp->life || slot < 0) return;
+    dec_life_t *life = &dp->life[slot];
+    atomic_store(&life->ready_us, dec_life_now_us());
+    atomic_store(&life->enqueue_us, 0);
+    atomic_store(&life->start_us, 0);
+    atomic_store(&life->done_us, 0);
+    atomic_store(&life->active, active);
+    atomic_store(&life->pending, pending);
+    atomic_store(&life->target, target);
+    atomic_store(&life->pause_run, pause_run);
+    atomic_store(&life->cohort, 0);
+}
+
+static void dec_life_enqueue(dec_pool_t *dp, int slot, int cohort) {
+    if (!dp->lifecycle_trace || !dp->life || slot < 0) return;
+    dec_life_t *life = &dp->life[slot];
+    const unsigned long long now = dec_life_now_us();
+    atomic_store(&life->enqueue_us, now);
+    atomic_store(&life->cohort, cohort);
+    fprintf(stderr, "[DECLIFE] v=1 pid=%d event=ENQUEUE slot=%d ready_us=%llu enqueue_us=%llu "
+                    "ready_to_enqueue_us=%llu active=%d pending=%d target=%d cohort=%d pause_run=%d\n",
+            (int)getpid(), slot,
+            atomic_load(&life->ready_us), now,
+            now - atomic_load(&life->ready_us), atomic_load(&life->active),
+            atomic_load(&life->pending), atomic_load(&life->target), cohort,
+            atomic_load(&life->pause_run));
+}
 
 static void dec_push(dec_pool_t *dp, dec_job_t *j) {
     pthread_mutex_lock(&dp->m);
@@ -2298,7 +2734,10 @@ static void dec_push(dec_pool_t *dp, dec_job_t *j) {
 #define DEC_GROUP_MAX 16
 
 static void *dec_worker_main(void *arg) {
+    qwen_thread_name("dec-thr");
+    qwen_region_thread_role("decoder");
     dec_pool_t *dp = (dec_pool_t *)arg;
+    if (dp->lane) qwen_lane_thread_join();   /* pin to the decoder cpus; every dispatch from here lands on the lane team */
     dec_job_t *grp[DEC_GROUP_MAX];
     qwen_sd_batch_item_t items[DEC_GROUP_MAX];
     for (;;) {
@@ -2310,7 +2749,9 @@ static void *dec_worker_main(void *arg) {
 
         int ng = 0;
         grp[ng++] = j;
-        if (dp->batch && j->stream && j->nframes > 0 &&
+        if (j->cohort_n >= 2 && j->cohort_n <= 3) {
+            for (int i = 1; i < j->cohort_n; i++) grp[ng++] = j->cohort[i];
+        } else if (dp->batch && j->stream && j->nframes > 0 &&
             (dp->first_group || !j->first)) {
             dec_job_t *prev = NULL, *it = dp->head;
             while (it && ng < DEC_GROUP_MAX) {
@@ -2330,9 +2771,23 @@ static void *dec_worker_main(void *arg) {
         }
         pthread_mutex_unlock(&dp->m);
 
+        if (dp->lifecycle_trace && dp->life) {
+            const unsigned long long now = dec_life_now_us();
+            for (int i = 0; i < ng; i++) {
+                dec_life_t *life = &dp->life[grp[i]->slot];
+                atomic_store(&life->start_us, now);
+                fprintf(stderr, "[DECLIFE] v=1 pid=%d event=START slot=%d enqueue_us=%llu start_us=%llu "
+                                "enqueue_to_start_us=%llu active=%d pending=%d target=%d cohort=%d pause_run=%d\n",
+                        (int)getpid(), grp[i]->slot, atomic_load(&life->enqueue_us), now,
+                        now - atomic_load(&life->enqueue_us), atomic_load(&life->active),
+                        atomic_load(&life->pending), atomic_load(&life->target), ng,
+                        atomic_load(&life->pause_run));
+            }
+        }
         int _dw_first = 0;
         for (int i = 0; i < ng; i++) if (grp[i]->first) { _dw_first = 1; break; }
         double _dw_t0 = dp->trace ? qwen_mono_ms() : 0.0;
+        if (dp->lane) qwen_lane_unit_active(1);
         if (ng > 1) {
             for (int i = 0; i < ng; i++) {
                 items[i].st = &dp->sstate[grp[i]->slot];
@@ -2348,10 +2803,15 @@ static void *dec_worker_main(void *arg) {
                 free(items[i].audio);
             }
         } else if (j->stream) {
-            if (j->nframes > 0) {
+            /* DL-3: a unit decoded as sub-calls of `subq` frames keeps the decoder's f32
+             * activation live set 1/N of the unit's, so it evicts less of the CP's L3-resident
+             * rows on the step side.  Same slot, same order, same causal tails. */
+            int sub = (dp->lane && dp->subq > 0 && dp->subq < j->nframes) ? dp->subq : j->nframes;
+            for (int off = 0; off < j->nframes; off += sub) {
+                int nf = j->nframes - off < sub ? j->nframes - off : sub;
                 float *aud = NULL; int an = 0;
                 if (qwen_speech_decoder_decode_streaming_st(dp->ctx, &dp->sstate[j->slot],
-                        j->codes, j->nframes, &aud, &an) == 0 && aud && an > 0)
+                        j->codes + (size_t)off * 16, nf, &aud, &an) == 0 && aud && an > 0)
                     dp->sink->on_chunk(dp->sink->ud, j->tag, aud, an);
                 free(aud);
             }
@@ -2363,48 +2823,147 @@ static void *dec_worker_main(void *arg) {
             else { free(aud); dp->sink->on_done(dp->sink->ud, j->tag, NULL, 0); }
         }
         if (dp->trace) {
+            char slots[DEC_GROUP_MAX * 4 + 1];
+            size_t used = 0;
+            slots[0] = '\0';
+            for (int i = 0; i < ng && used + 4 < sizeof(slots); i++) {
+                int wrote = snprintf(slots + used, sizeof(slots) - used,
+                                     "%s%d", i ? "," : "", grp[i]->slot);
+                if (wrote < 0) break;
+                used += (size_t)wrote;
+            }
             fprintf(stderr, "[DECODE] v=1 pid=%d placement=THREADED clock=CLOCK_MONOTONIC "
-                            "domain=S group=%d first=%d batch=%d first_group=%d dur_ms=%.3f\n",
-                    (int)getpid(), ng, _dw_first, dp->batch, dp->first_group,
+                            "domain=S group=%d slots=%s first=%d batch=%d first_group=%d dur_ms=%.3f\n",
+                    (int)getpid(), ng, slots, _dw_first, dp->batch, dp->first_group,
                     qwen_mono_ms() - _dw_t0);
         }
 
+        if (dp->lifecycle_trace && dp->life) {
+            const unsigned long long now = dec_life_now_us();
+            for (int i = 0; i < ng; i++) {
+                dec_life_t *life = &dp->life[grp[i]->slot];
+                atomic_store(&life->done_us, now);
+                fprintf(stderr, "[DECLIFE] v=1 pid=%d event=DONE slot=%d start_us=%llu done_us=%llu "
+                                "compute_us=%llu cohort=%d\n",
+                        (int)getpid(), grp[i]->slot, atomic_load(&life->start_us), now,
+                        now - atomic_load(&life->start_us), ng);
+            }
+        }
         for (int i = 0; i < ng; i++) {
             dec_job_t *g = grp[i];
             if (g->stream && g->is_final) {
                 qwen_sd_stream_free(&dp->sstate[g->slot]);
                 dp->sink->on_done(dp->sink->ud, g->tag, NULL, 0);
             }
-            free(g->codes);
+            int prealloc = dp->slot_job && g == &dp->slot_job[g->slot];
+            if (!prealloc) free(g->codes);
             if (g->is_final) atomic_store(&dp->busy[g->slot], 0);
             else atomic_fetch_sub(&dp->busy[g->slot], 1);
-            free(g);
+            if (!prealloc) free(g);
+        }
+        if (dp->lane) {
+            qwen_lane_unit_active(0);
+            pthread_mutex_lock(&dp->m);
+            dp->queued -= ng;
+            if (dp->elastic && dp->queued <= 0 && !dp->head) {
+                qwen_pool_set_width(0);          /* decoder idle: the whole team steps again */
+                dp->overlap_ms += qwen_mono_ms() - dp->overlap_t0;
+            }
+            pthread_cond_broadcast(&dp->done_cv);
+            pthread_mutex_unlock(&dp->m);
         }
     }
     return NULL;
 }
 
+static _Atomic long long g_lane_overrun = 0;   /* lane: enqueue while a unit was still in flight (must stay 0) */
 static void dec_enqueue(dec_pool_t *dp, int slot, const int *codes, int nframes,
                         void *tag, int is_final, int stream, int first) {
-    dec_job_t *j = (dec_job_t *)calloc(1, sizeof(dec_job_t));
-    if (!j) return;
+    if (dp->lane && atomic_load(&dp->busy[slot]) != 0) {
+        atomic_fetch_add(&g_lane_overrun, 1);
+        fprintf(stderr, "[lane] MAILBOX OVERRUN slot %d (busy=%d): the bounded contract was violated\n",
+                slot, atomic_load(&dp->busy[slot]));
+    }
+    dec_job_t *j;
+    if (dp->slot_job && nframes <= 32 && atomic_load(&dp->busy[slot]) == 0) {
+        /* one unit in flight per slot: the slot's own job and codes buffer are free here */
+        j = &dp->slot_job[slot];
+        memset(j, 0, sizeof *j);
+        j->codes = dp->slot_codes + (size_t)slot * 32 * 16;
+        if (nframes > 0) memcpy(j->codes, codes, (size_t)nframes * 16 * sizeof(int));   /* <= 2 KB */
+    } else {
+        j = (dec_job_t *)calloc(1, sizeof(dec_job_t));
+        if (!j) return;
+        if (nframes > 0) {
+            j->codes = (int *)malloc((size_t)nframes * 16 * sizeof(int));
+            if (!j->codes) { free(j); return; }
+            memcpy(j->codes, codes, (size_t)nframes * 16 * sizeof(int));
+        }
+    }
     j->slot = slot; j->nframes = nframes; j->tag = tag;
     j->is_final = is_final; j->stream = stream; j->first = first;
-    if (nframes > 0) {
-        j->codes = (int *)malloc((size_t)nframes * 16 * sizeof(int));
-        if (!j->codes) { free(j); return; }
-        memcpy(j->codes, codes, (size_t)nframes * 16 * sizeof(int));
-    }
+    dec_life_enqueue(dp, slot, 1);
     atomic_fetch_add(&dp->busy[slot], 1);
+    if (dp->lane) {
+        pthread_mutex_lock(&dp->m);
+        if (dp->elastic && dp->queued == 0) { qwen_pool_set_width(dp->step_width); dp->overlap_t0 = qwen_mono_ms(); }
+        dp->queued++;
+        pthread_mutex_unlock(&dp->m);
+    }
     dec_push(dp, j);
 }
 
+/* Queue one leader for a cohort of preallocated lane jobs.  The worker consumes
+ * the member pointers as one ragged decode call, so no second mailbox wake-up or
+ * queue turn is introduced for the paired slots.  Return 0 before mutating any
+ * slot when the bounded preallocation contract cannot hold. */
+static int dec_enqueue_cohort(dec_pool_t *dp, const int *slots, const int *nframes,
+                              int n, int *const *codes, void *const *tags,
+                              const int *first) {
+    if (!dp->lane || dp->multislot < 2 || n < 2 || n > 3 || n > dp->multislot ||
+        !dp->slot_job || !dp->slot_codes || !slots || !nframes || !codes || !tags)
+        return 0;
+    for (int i = 0; i < n; i++) {
+        if (slots[i] < 0 || nframes[i] <= 0 || nframes[i] > 32 || !codes[i] ||
+            atomic_load(&dp->busy[slots[i]]) != 0)
+            return 0;
+    }
+    for (int i = 1; i < n; i++)
+        if (nframes[i] != nframes[0]) return 0;
+    dec_job_t *members[3] = { NULL, NULL, NULL };
+    for (int i = 0; i < n; i++) {
+        const int slot = slots[i];
+        dec_job_t *j = &dp->slot_job[slot];
+        memset(j, 0, sizeof *j);
+        j->codes = dp->slot_codes + (size_t)slot * 32 * 16;
+        memcpy(j->codes, codes[i], (size_t)nframes[i] * 16 * sizeof(int));
+        j->slot = slot; j->nframes = nframes[i]; j->tag = tags[i];
+        j->stream = 1; j->first = first ? first[i] : 0;
+        dec_life_enqueue(dp, slot, n);
+        members[i] = j;
+        atomic_fetch_add(&dp->busy[slot], 1);
+    }
+    dec_job_t *leader = members[0];
+    leader->first = 0;
+    for (int i = 0; i < n; i++) if (members[i]->first) leader->first = 1;
+    leader->cohort_n = n;
+    for (int i = 0; i < n; i++) leader->cohort[i] = members[i];
+    pthread_mutex_lock(&dp->m);
+    if (dp->elastic && dp->queued == 0) { qwen_pool_set_width(dp->step_width); dp->overlap_t0 = qwen_mono_ms(); }
+    dp->queued += n;
+    pthread_mutex_unlock(&dp->m);
+    dec_push(dp, leader);
+    return 1;
+}
+
 int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sink) {
+    qwen_region_thread_role("serve");
     if (B < 1) B = 1;
     int want_cuda_batch = 0;
 #ifdef QWEN_HAVE_CUDA
     { extern void *g_cuda_talker_state, *g_cuda_cp_state;
-      want_cuda_batch = (getenv("QWEN_CUDA_BATCH") && g_cuda_talker_state && g_cuda_cp_state && B <= 8); }
+      extern int qwen_cuda_batch_max(void);
+      want_cuda_batch = (getenv("QWEN_CUDA_BATCH") && g_cuda_talker_state && g_cuda_cp_state && B <= qwen_cuda_batch_max()); }
 #endif
     int want_metal_batch = 0;
 #ifdef QWEN_HAVE_METAL
@@ -2422,6 +2981,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     { int lim = qwen_tts_batch_max_frames(); if (GEN_CAP > lim) GEN_CAP = lim; }
     if (GEN_CAP < 32) GEN_CAP = 32;
     const int MAXPROMPT = qwen_tts_batch_max_prompt();
+    if (ctx->rope_cache_len > 0 && GEN_CAP > ctx->rope_cache_len - MAXPROMPT - 8) {
+        int lim = ctx->rope_cache_len - MAXPROMPT - 8;
+        fprintf(stderr, "[serve] frame cap %d exceeds the RoPE cache (%d positions - %d prompt): clamped to %d\n",
+                GEN_CAP, ctx->rope_cache_len, MAXPROMPT, lim);
+        GEN_CAP = lim < 32 ? 32 : lim;
+    }
     int kv_max = MAXPROMPT + GEN_CAP + 4;
     int force_matvec = getenv("QWEN_BATCH_FORCE_MATVEC") ? 1 : 0;
 
@@ -2432,6 +2997,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int cuda_batch = 0;
 #ifdef QWEN_HAVE_CUDA
     extern void *g_cuda_talker_state, *g_cuda_cp_state, *g_cuda_talker_batch_state, *g_cuda_cp_batch_state;
+    extern int  qwen_cuda_batch_max(void);
     extern void *qwen_cuda_talker_batch_init(void *, int);
     extern void *qwen_cuda_cp_batch_init(void *, int);
     extern void  qwen_cuda_talker_batch_upload_slot(void *, int, const uint16_t *, const uint16_t *, int, int);
@@ -2443,8 +3009,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         cuda_batch = (g_cuda_talker_batch_state && g_cuda_cp_batch_state);
         if (cuda_batch) fprintf(stderr, "[serve] GPU batched Talker+CP ENABLED (B=%d, matvec->matmat)\n", B);
         else fprintf(stderr, "[serve] GPU batched init failed — falling back to CPU batch path\n");
-    } else if (getenv("QWEN_CUDA_BATCH") && B > 8) {
-        fprintf(stderr, "[serve] QWEN_CUDA_BATCH: batch-size %d > 8 (QB_MAX) — using CPU batch path\n", B);
+    } else if (getenv("QWEN_CUDA_BATCH") && B > qwen_cuda_batch_max()) {
+        fprintf(stderr, "[serve] QWEN_CUDA_BATCH: batch-size %d > %d (QB_MAX) — using CPU batch path\n",
+                B, qwen_cuda_batch_max());
     }
 #endif
 
@@ -2472,6 +3039,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     void **tag = (void **)calloc(B, sizeof(void *));
     int *pos = (int *)calloc(B, sizeof(int));
     int *tcl = (int *)calloc(B, sizeof(int));
+    float **stream_tail = (float **)calloc(B, sizeof(float *));
+    int *stream_tail_len = (int *)calloc(B, sizeof(int));
+    int *stream_tail_pos = (int *)calloc(B, sizeof(int));
     float *p_temp = (float *)malloc((size_t)B * sizeof(float));
     int *p_topk = (int *)malloc((size_t)B * sizeof(int));
     float *p_topp = (float *)malloc((size_t)B * sizeof(float));
@@ -2491,6 +3061,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int *cpcodes = (int *)malloc((size_t)B * 15 * sizeof(int));
     uint8_t *want_stream = (uint8_t *)calloc(B, 1);
     qwen_sd_stream_state_t *sstate = (qwen_sd_stream_state_t *)calloc(B, sizeof(qwen_sd_stream_state_t));
+    uint8_t *lead_mask = sink->step_allowed ? (uint8_t *)calloc(B, 1) : NULL;
+    int lead_gate = (sink->step_allowed && lead_mask) ? 1 : 0;
+    if (sink->step_allowed && !lead_mask)
+        fprintf(stderr, "[serve] step policy allocation failed; lead gate disabled\n");
     int amort = (cuda_batch || getenv("QWEN_AMORT_CPU")) && !getenv("QWEN_NO_AMORT");
     float **acc_aud = (float **)calloc(B, sizeof(float *));
     int *acc_n = (int *)calloc(B, sizeof(int));
@@ -2502,22 +3076,74 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     const float *tts_pad = ctx->cached_tts_pad_embed;
     int n_active = 0;
 
-    dec_pool_t dpool; pthread_t dec_thr; int dec_on = 0;
+    dec_pool_t dpool = {0}; pthread_t dec_thr; int dec_on = 0;
     atomic_int *dec_busy = (atomic_int *)calloc(B, sizeof(atomic_int));
-    if (getenv("QWEN_DECODER_THREAD") && dec_busy) {
+    dec_life_t *dec_life = (getenv("QWEN_DEC_LIFECYCLE_TRACE") &&
+                            atoi(getenv("QWEN_DEC_LIFECYCLE_TRACE")) != 0) ?
+                           (dec_life_t *)calloc(B, sizeof(dec_life_t)) : NULL;
+    unsigned long long *dec_resume_us = dec_life ?
+        (unsigned long long *)calloc(B, sizeof(unsigned long long)) : NULL;
+    int lane_team = qwen_lane_team_start();   /* 0 unless QWEN_SD_LANE_SPLIT prepared the split */
+    if ((getenv("QWEN_DECODER_THREAD") || lane_team > 0) && dec_busy) {
         memset(&dpool, 0, sizeof dpool);
         pthread_mutex_init(&dpool.m, NULL); pthread_cond_init(&dpool.cv, NULL);
+        pthread_cond_init(&dpool.done_cv, NULL);
         dpool.running = 1; dpool.sink = sink; dpool.sstate = sstate; dpool.busy = dec_busy;
-        dpool.batch = (getenv("QWEN_DECODER_BATCH") &&
+        dpool.lane = lane_team > 0;
+        dpool.multislot = dpool.lane ? atoi(getenv("QWEN_SD_MULTISLOT") ? getenv("QWEN_SD_MULTISLOT") : "0") : 0;
+        if (!qwen_sd_multislot_active() || dpool.multislot < 2) dpool.multislot = 0;
+        if (dpool.multislot > 3) dpool.multislot = 3;
+        /* ARM-SOAK-8 experiment, default off.  On the Arm ragged path a decoder cohort is a
+         * pure loss: the isolated decode_quantum_bench measures chunk-4 group 2 at 132.1 ms
+         * against 81.0 ms for two sequential singletons (group 1 = 40.6 ms), and an allocator
+         * arm ruled out allocation as the cause.  When this cap is set, a worker that already
+         * carries more than `cohort_max_b` active streams dispatches singleton decoder units
+         * immediately instead of pairing them, which is the crude form of dynamic cohort
+         * admission.  0 keeps the current unconditional cohort behaviour. */
+        { const char *cm = getenv("QWEN_SD_COHORT_MAX_B");
+          dpool.cohort_max_b = (dpool.multislot >= 2 && cm) ? atoi(cm) : 0;
+          if (dpool.cohort_max_b < 0) dpool.cohort_max_b = 0; }
+        dpool.nonblock = dpool.lane && getenv("QWEN_SD_LANE_NONBLOCK")
+                       ? atoi(getenv("QWEN_SD_LANE_NONBLOCK")) : 0;
+        if (dpool.nonblock < 0) dpool.nonblock = 0;
+        if (dpool.nonblock > 2) dpool.nonblock = 2;
+        dpool.elastic = dpool.lane && qwen_lane_elastic();
+        { const char *sq = getenv("QWEN_SD_LANE_SUBQ"); dpool.subq = (dpool.lane && sq) ? atoi(sq) : 0; }
+        dpool.step_width = qwen_get_threads() - lane_team;   /* the STEP cpus: caller + step_width-1 workers */
+        if (dpool.lane) {
+            dpool.slot_job = (dec_job_t *)calloc((size_t)B, sizeof(dec_job_t));
+            dpool.slot_codes = (int *)calloc((size_t)B * 32 * 16, sizeof(int));
+        }
+        dpool.batch = (!dpool.lane && getenv("QWEN_DECODER_BATCH") &&
                        atoi(getenv("QWEN_DECODER_BATCH")) != 0) ? 1 : 0;
         dpool.first_group = (getenv("QWEN_DEC_FIRSTCHUNK_GROUP") &&
                              atoi(getenv("QWEN_DEC_FIRSTCHUNK_GROUP")) != 0) ? 1 : 0;
-        dpool.trace = (getenv("QWEN_TTFA_TRACE") &&
-                       atoi(getenv("QWEN_TTFA_TRACE")) != 0) ? 1 : 0;
+        dpool.trace = ((getenv("QWEN_TTFA_TRACE") && atoi(getenv("QWEN_TTFA_TRACE")) != 0) ||
+                       (getenv("QWEN_STAGE_TRACE") && atoi(getenv("QWEN_STAGE_TRACE")) != 0)) ? 1 : 0;
+        dpool.lifecycle_trace = dpool.lane && dec_life ? 1 : 0;
+        dpool.life = dec_life;
         dpool.ctx = qwen_tts_clone_for_worker(ctx);
         if (dpool.ctx && pthread_create(&dec_thr, NULL, dec_worker_main, &dpool) == 0) {
             dec_on = 1;
-            fprintf(stderr, "[serve] decoder thread ENABLED (decode leaves the frame loop)\n");
+            if (dpool.lane) {
+                const char *lm_step, *lm_dec; qwen_lane_masks(&lm_step, &lm_dec);
+                if (dpool.elastic)
+                    fprintf(stderr, "[serve] decoder LANE ENABLED (ELASTIC): engine pool %d threads on all cpus; while a "
+                                    "decoder unit runs on %s (team %d) the engine narrows to %s (%d threads) · "
+                                    "mailbox 1 unit/slot, cohort <= %d%s, preallocated, lead <= 1 quantum%s%s\n",
+                            qwen_get_threads(), lm_dec, lane_team, lm_step, dpool.step_width,
+                            dpool.multislot > 0 ? dpool.multislot : 1,
+                            dpool.cohort_max_b > 0 ? " (only while n_active <= QWEN_SD_COHORT_MAX_B)" : "",
+                            dpool.subq > 0 ? " · units decoded in sub-calls (QWEN_SD_LANE_SUBQ)" : "",
+                            dpool.nonblock == 1 ? " · busy slots defer instead of blocking (EXPERIMENTAL)" :
+                            dpool.nonblock == 2 ? " · bounded async mailbox scheduling (EXPERIMENTAL)" : "");
+                else
+                    fprintf(stderr, "[serve] decoder LANE ENABLED: step cpus %s (engine pool %d threads) · "
+                            "decoder cpus %s (private team %d) · mailbox 1 unit/slot, cohort <= %d, lead <= 1 quantum\n",
+                            lm_step, qwen_get_threads(), lm_dec, lane_team,
+                            dpool.multislot > 0 ? dpool.multislot : 1);
+            } else
+                fprintf(stderr, "[serve] decoder thread ENABLED (decode leaves the frame loop)\n");
         } else {
             if (dpool.ctx) qwen_tts_free_clone(dpool.ctx);
             fprintf(stderr, "[serve] decoder thread requested but clone/thread failed — staying inline\n");
@@ -2534,7 +3160,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     { const char *e = getenv("QWEN_TTFA_FREEZE_CAP"); if (e && atoi(e) >= 0) freeze_cap = atoi(e); }
     int prio_strict = getenv("QWEN_TTFA_PRIO_STRICT") ? 1 : 0;
 
-    int prof_on = (getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_BATCH_STATS")) ? 1 : 0;
+    int stage_trace = (getenv("QWEN_STAGE_TRACE") && atoi(getenv("QWEN_STAGE_TRACE")) != 0);
+    int prof_on = (getenv("QWEN_SERVE_PROFILE") || getenv("QWEN_BATCH_STATS") || stage_trace) ? 1 : 0;
 
     int dec_batch = (getenv("QWEN_DECODER_BATCH") &&
                      atoi(getenv("QWEN_DECODER_BATCH")) != 0) ? 1 : 0;
@@ -2545,6 +3172,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     double *t2_admitted   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pf_start   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pf_done    = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
+    double *t2_step1     = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
+    double *t2_talker1   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
+    double *t2_decode1   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_state_rdy  = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pfq_push   = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
     double *t2_pfq_pop    = ttfa_trace ? (double *)calloc(B, sizeof(double)) : NULL;
@@ -2564,11 +3194,13 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         fprintf(stderr,                                                                      \
             "[TTFA2] v=2 seed=%u path=%s slot=%d clock=CLOCK_MONOTONIC domain=S "            \
             "dec_thread=%d dec_batch=%d admitted=%.3f prefill_start=%.3f prefill_done=%.3f " \
-            "state_ready=%.3f pfq_push=%.3f pfq_pop=%.3f installed=%.3f frame1=%.3f "        \
+            "state_ready=%.3f step1=%.3f talker1=%.3f decode1=%.3f "                         \
+            "pfq_push=%.3f pfq_pop=%.3f installed=%.3f frame1=%.3f "                        \
             "audio1=%.3f batch_at_install=%d pfq_depth_at_pop=%d adm_seq=%llu\n",  \
             t2_seed[(bb_)], t2_helper[(bb_)] ? "HELPER" : "INLINE", (bb_),                   \
             dec_on, dec_batch,                                                               \
             t2_admitted[(bb_)], t2_pf_start[(bb_)], t2_pf_done[(bb_)], t2_state_rdy[(bb_)],  \
+            t2_step1[(bb_)], t2_talker1[(bb_)], t2_decode1[(bb_)],                         \
             t2_pfq_push[(bb_)], t2_pfq_pop[(bb_)], t2_installed[(bb_)], t2_frame1[(bb_)],    \
             t2_audio1[(bb_)], t2_batch_at_inst[(bb_)], t2_qdepth_at_pop[(bb_)],  \
             t2_adm_seq[(bb_)]);  \
@@ -2593,6 +3225,36 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     if (st_bd > B) st_bd = B;
     uint8_t *width_mask = st_bt ? (uint8_t *)calloc(B, 1) : NULL;
     if (st_bt && !width_mask) st_bt = 0;
+    uint8_t *dec_mask = dpool.nonblock >= 2 ? (uint8_t *)calloc(B, 1) : NULL;
+    uint8_t *dec_paused = dpool.nonblock >= 2 ? (uint8_t *)calloc(B, 1) : NULL;
+    unsigned long long *dec_pause_count = dpool.nonblock >= 2 ?
+        (unsigned long long *)calloc(B, sizeof(unsigned long long)) : NULL;
+    unsigned int *dec_pause_run = dpool.nonblock >= 2 ?
+        (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    unsigned int *dec_pause_run_max = dpool.nonblock >= 2 ?
+        (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    unsigned int *dec_last_pause_run = dpool.nonblock >= 2 ?
+        (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    if (dpool.nonblock >= 2 && (!dec_mask || !dec_paused || !dec_pause_count ||
+                                !dec_pause_run || !dec_pause_run_max || !dec_last_pause_run)) {
+        fprintf(stderr, "[serve] bounded async mailbox mask allocation failed; using defer-only experiment\n");
+        dpool.nonblock = 1;
+    }
+    /* Diagnostic-only cooperative selection.  The sink currently exposes a lead gate,
+     * not a numeric audio lead, so priority below is an explicit proxy: progress age
+     * first, then ready decoder backlog.  It only constrains B>2 turns; B<=2 retains
+     * the normal batched path. */
+    int sd_sched_urgency = dpool.nonblock >= 2 && getenv("QWEN_SD_SCHED") &&
+                           !strcmp(getenv("QWEN_SD_SCHED"), "urgency");
+    int *sched_order = sd_sched_urgency ? (int *)calloc(B, sizeof(int)) : NULL;
+    unsigned int *sched_age = sd_sched_urgency ? (unsigned int *)calloc(B, sizeof(unsigned int)) : NULL;
+    unsigned long long *sched_skip_count = sd_sched_urgency ?
+        (unsigned long long *)calloc(B, sizeof(unsigned long long)) : NULL;
+    if (sd_sched_urgency && (!sched_order || !sched_age || !sched_skip_count)) {
+        fprintf(stderr, "[serve] urgency scheduler allocation failed; using bounded async only\n");
+        sd_sched_urgency = 0;
+    }
+    unsigned long long sched_turn = 0;
     uint8_t *m1_mask = (uint8_t *)calloc(B, 1);
     int rr_cursor = 0;
     int st_th_base = qwen_get_threads();
@@ -2622,6 +3284,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
       if (e && atoi(e) > 0) g_dec_chunk_busy = atoi(e);
       if (g_dec_chunk_busy > 32) g_dec_chunk_busy = 32; }
 
+    /* Execution budget of this worker.  Measured on AWS c8a 2x8 (2026-09-04): C4 wave
+     * STREAM p95 0.98 -> 0.95, context switches -48%, 5-min C4 soak p50/p95 1.03/1.11 ->
+     * 1.00/1.06, WAV bit-identical.  The same rule now applies to the CLI and the plain
+     * server; QWEN_SD_POOL=private / QWEN_BLAS_OWN=0 restore the old teams. */
+    qwen_exec_budget_engine_owned("serve");
     int blas_solo = 0, blas_busy = 0, blas_now = 0;
     { const char *e = getenv("QWEN_SERVE_BLAS");      if (e && atoi(e) > 0) blas_solo = atoi(e); }
     { const char *e = getenv("QWEN_SERVE_BLAS_BUSY"); if (e && atoi(e) > 0) blas_busy = atoi(e); }
@@ -2641,17 +3308,26 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 g_stream_dec_chunk, busy, g_gang_lead, g_gang_min);
     }
     double pf_admit = 0, pf_talker = 0, pf_head = 0, pf_cp = 0, pf_decode = 0, pf_wait = 0, pf_samp = 0, pf_final = 0;
+    double pf_decwait = 0;   /* lane: producer time blocked on a full mailbox */
     double pf_m1 = 0;
     const int rq_trace = getenv("QWEN_REQ_TRACE") ? 1 : 0;
     unsigned int *rq_seed = (unsigned int *)calloc((size_t)B, sizeof(unsigned int));
     int *rq_tok = (int *)calloc((size_t)B, sizeof(int));
     double *rq_t0 = (double *)calloc((size_t)B, sizeof(double));
-    double pf_t0_loop = time_ms(), pf_mark = 0;
+    int *rq_capped = (int *)calloc((size_t)B, sizeof(int));   /* 1 = ended at the frame/KV cap, not at EOS */
+    double pf_t0_loop = stage_trace ? qwen_mono_ms() : time_ms(), pf_mark = 0;
     long long pf_frames = 0, pf_slotframes = 0, pf_stepframes = 0;
-    #define PF_START() do { if (prof_on) pf_mark = time_ms(); } while (0)
-    #define PF_END(acc) do { if (prof_on) (acc) += time_ms() - pf_mark; } while (0)
+    /* Decode-occupancy census: how often the batch actually holds >1 slot, and
+     * when it does not, whether that is because the worker's queue was empty. */
+    long long occ_hist[9] = { 0 };
+    long long occ_free_empty = 0, occ_free_decbusy = 0, occ_admits = 0;
+    #define PF_CLOCK() (stage_trace ? qwen_mono_ms() : time_ms())
+    #define PF_START() do { if (prof_on) pf_mark = PF_CLOCK(); } while (0)
+    #define PF_END(acc) do { if (prof_on) (acc) += PF_CLOCK() - pf_mark; } while (0)
 
     #define RELEASE_SLOT(b) do {                                                   \
+        free(stream_tail[b]); stream_tail[b] = NULL;                                \
+        stream_tail_len[b] = 0; stream_tail_pos[b] = 0;                             \
         active[b] = 0; tag[b] = NULL; n_active--;                                  \
     } while (0)
 
@@ -2659,11 +3335,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         double _pf_f0 = prof_on ? time_ms() : 0;                                   \
         if (rq_trace)                                                              \
             fprintf(stderr, "[REQ] pid=%d seed=%u tokens=%d frames=%d audio_s=%.3f " \
-                            "service_ms=%.1f\n", (int)getpid(), rq_seed[b],        \
+                            "service_ms=%.1f truncated=%d\n", (int)getpid(), rq_seed[b], \
                     rq_tok[b], chframes[b], (double)chframes[b] / 12.5,            \
-                    time_ms() - rq_t0[b]);                                         \
+                    time_ms() - rq_t0[b], rq_capped[b]);                           \
         if (dec_on && (want_stream[b] || !amort)) {                                \
-               \
+            if (dpool.lane) pf_decwait += dec_wait_idle(&dpool, b);                 \
             if (want_stream[b])                                                    \
                 dec_enqueue(&dpool, b, chcodes[b] + (size_t)decpos[b] * 16,         \
                             chframes[b] - decpos[b], tag[b], 1, 1, 0);             \
@@ -2719,6 +3395,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                             "service_ms=%.1f cancelled=1 frames_after_cancel=0\n", \
                     (int)getpid(), rq_seed[b], rq_tok[b], chframes[b],              \
                     (double)chframes[b] / 12.5, time_ms() - rq_t0[b]);              \
+        if (dec_on) dec_wait_idle(&dpool, b); /* never free a state the lane is decoding */ \
         qwen_sd_stream_free(&sstate[b]);                                           \
         want_stream[b] = 0;                                                        \
         if (acc_aud[b]) { free(acc_aud[b]); acc_aud[b] = NULL; }                   \
@@ -2744,8 +3421,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         ctx->speaker_id = (req_).speaker_id; ctx->language_id = (req_).language_id;        \
         ctx->prev_prefill_len = 0; ctx->prefill_only = 1;                                  \
         double _tt0 = ttfa_trace ? qwen_mono_ms() : 0;                                     \
+        double _st_pf0 = stage_trace ? qwen_mono_ms() : 0;                                 \
         (prc_) = qwen_tts_generate(ctx, (req_).text, NULL, NULL);                          \
         double _tt1 = ttfa_trace ? qwen_mono_ms() : 0;                                     \
+        if (stage_trace) st_prefill_ms += qwen_mono_ms() - _st_pf0;                         \
         ctx->prefill_only = 0;                                                             \
         if (ttfa_trace) {                                                                  \
                         \
@@ -2753,6 +3432,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             t2_admitted[(b_)] = _tt0;       t2_pf_start[(b_)]  = _tt0;                     \
             t2_pf_done[(b_)]  = _tt1;       t2_state_rdy[(b_)] = _tt1;                     \
             t2_pfq_push[(b_)] = 0;          t2_pfq_pop[(b_)]   = 0;                        \
+            t2_step1[(b_)] = 0; t2_talker1[(b_)] = 0; t2_decode1[(b_)] = 0;                  \
             t2_frame1[(b_)] = 0; t2_audio1[(b_)] = 0; t2_emitted[(b_)] = 0;                \
             t2_batch_at_inst[(b_)] = n_active; t2_qdepth_at_pop[(b_)] = -1;                \
             t2_adm_seq[(b_)] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);   \
@@ -2776,7 +3456,12 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         p_temp[(b_)] = (req_).temperature; p_topk[(b_)] = (req_).top_k;                    \
         p_topp[(b_)] = (req_).top_p; p_rep[(b_)] = (req_).rep_penalty;                     \
         p_gw[(b_)] = (req_).greedy_warmup; rng[(b_)] = (req_).seed;                        \
-        nprev[(b_)] = 0; chframes[(b_)] = 0; sframe[(b_)] = 0; decpos[(b_)] = 0;           \
+        stream_tail[(b_)] = ctx->stream_trailing_text;                                    \
+        stream_tail_len[(b_)] = ctx->stream_trailing_len;                                 \
+        stream_tail_pos[(b_)] = 0;                                                        \
+        ctx->stream_trailing_text = NULL; ctx->stream_trailing_len = 0;                   \
+        ctx->stream_trailing_pos = 0;                                                     \
+        nprev[(b_)] = 0; chframes[(b_)] = 0; sframe[(b_)] = 0; decpos[(b_)] = 0; rq_capped[(b_)] = 0;           \
         if (rq_trace) { rq_seed[(b_)] = (req_).seed; rq_tok[(b_)] = (pl_);                 \
                         rq_t0[(b_)] = time_ms(); }                                         \
         want_stream[(b_)] = ((req_).want_stream && sink->on_chunk) ? 1 : 0;                \
@@ -2810,6 +3495,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         rng[(b_)] = qwen_get_seed();                                                         \
         if (_c0 == QWEN_TTS_CODEC_EOS || chframes[(b_)] >= GEN_CAP ||                        \
             pos[(b_)] >= kv_max - 1) {                                                       \
+            if (_c0 != QWEN_TTS_CODEC_EOS) {                                                 \
+                rq_capped[(b_)] = 1;                                                         \
+                qwen_tts_note_frame_cap("serve", chframes[(b_)], GEN_CAP,                    \
+                                        chframes[(b_)] < GEN_CAP);                           \
+            }                                                                                \
             FINALIZE_SLOT((b_)); code0[(b_)] = 0; (stop_) = 1; break;                         \
         }                                                                                    \
         code0[(b_)] = _c0; prev_tok[(b_)][nprev[(b_)]++] = _c0; (c0_) = _c0;                 \
@@ -2827,10 +3517,55 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             if (ctx->cp_codec_emb_bf16[_g] && _cg >= 0 && _cg < cb)                          \
                 qwen_bf16_accum_f32(_se, ctx->cp_codec_emb_bf16[_g] + (size_t)_cg * h, h);   \
         }                                                                                    \
-        for (int _j = 0; _j < h; _j++) _se[_j] += tts_pad[_j];                               \
+        if (stream_tail[(b_)] && stream_tail_pos[(b_)] < stream_tail_len[(b_)]) {            \
+            const float *_tail = stream_tail[(b_)] + (size_t)stream_tail_pos[(b_)] * h;       \
+            for (int _j = 0; _j < h; _j++) _se[_j] += _tail[_j];                               \
+            stream_tail_pos[(b_)]++;                                                          \
+        } else {                                                                               \
+            for (int _j = 0; _j < h; _j++) _se[_j] += tts_pad[_j];                             \
+        }                                                                                     \
     } while (0)
 
-    int use_helper = qwen_parallel_is_reentrant();
+    /* C12-WIN-10: run the Talker prefill of a newly admitted request as resumable
+     * token-range slices inside the frame loop instead of one monolithic call, so an
+     * admission costs the established streams one slice (~S tokens) instead of the whole
+     * prompt.  0 (the default and the product value) is the monolithic path, byte for byte.
+     * At most one pending admission per worker: no new queue, no extra capacity. */
+    const int adm_slice_raw = qwen_prefill_slice_tokens();
+    const int adm_slice = adm_slice_raw < 0 ? -adm_slice_raw : adm_slice_raw;
+    const int adm_slice_idle = adm_slice_raw < 0;   /* parity testing only */
+    typedef struct {
+        int   active;          /* a prompt is built and partially prefilled          */
+        qwen_batch_req_t req;  /* scalars only; .text is not held past preparation   */
+        void *tag;
+        int   seq_len;         /* total prompt positions (prefix included)           */
+        int   pos0;            /* prefix positions already in the bf16 cache         */
+        int   done;            /* new-token rows completed so far, in [0, seq_len-pos0] */
+        int   slices;
+        double t_admit;
+    } adm_pending_t;
+    adm_pending_t adm;
+    memset(&adm, 0, sizeof(adm));
+    long long adm_slices_total = 0, adm_sliced_reqs = 0, adm_inline_reqs = 0;
+
+    /* Release a pending sliced admission and everything it owns.  why_ = NULL is a
+     * cancellation (the client is gone), a string is a rejection. */
+    #define ADM_DROP(why_) do {                                                          \
+        if (adm.tag) {                                                                   \
+            if ((why_) != NULL && sink->on_reject)                                       \
+                sink->on_reject(sink->ud, adm.tag, (why_));                              \
+            else sink->on_done(sink->ud, adm.tag, NULL, 0);                              \
+        }                                                                                \
+        free(ctx->prefill_embeds); ctx->prefill_embeds = NULL; ctx->prefill_seq_len = 0;  \
+        qwen_stream_trailing_clear(ctx);                                                  \
+        memset(&adm, 0, sizeof(adm));                                                     \
+    } while (0)
+
+    /* The helper submits from its own thread beside the frame loop, so it needs concurrent
+     * submitters (a pool capability) and the QWEN_PREFILL_HELPER opt-in (a feature flag).
+     * One predicate used to stand for both, which made a feature flag change pool policy. */
+    const char *ph = getenv("QWEN_PREFILL_HELPER");
+    int use_helper = (ph && ph[0] == '1') && qwen_pool_concurrent_submit_ok();
     qwen_tts_ctx_t *pf_ctx = use_helper ? qwen_tts_clone_for_worker(ctx) : NULL;
     prefill_q_t pfq; pthread_t pf_thr; prefill_helper_arg_t pf_arg;
     if (pf_ctx) {
@@ -2856,9 +3591,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 
     double _t2_prev_iter = 0.0;
     while (sink->running(sink->ud) || n_active > 0) {
-        if (ttfa_trace) {
+        if (ttfa_trace || g_admission_health) {
             double _now = qwen_mono_ms();
-            {
+            if (ttfa_trace) {
                 long long _fr = 0; for (int _b = 0; _b < B; _b++) _fr += chframes[_b];
                 fprintf(stderr,
                     "[ITER] v=2 pid=%d seq=%llu ts=%.3f clock=CLOCK_MONOTONIC domain=S prof=%d "
@@ -2872,7 +3607,17 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             atomic_store_explicit(&g_admit_last_iter,
                 _t2_prev_iter > 0 ? _now - _t2_prev_iter : 0.0, memory_order_relaxed);
             atomic_store_explicit(&g_admit_ts, _now, memory_order_relaxed);
-            atomic_fetch_add_explicit(&g_admit_seq, 1, memory_order_relaxed);
+            unsigned long long _seq = atomic_fetch_add_explicit(&g_admit_seq, 1,
+                                                                 memory_order_relaxed) + 1;
+            if (g_admission_health && g_admission_worker >= 0) {
+                qwen_admission_health_t *h = &g_admission_health[g_admission_worker];
+                atomic_store_explicit(&h->last_iter_ms,
+                    _t2_prev_iter > 0 ? _now - _t2_prev_iter : 0.0, memory_order_relaxed);
+                atomic_store_explicit(&h->ts_ms, _now, memory_order_relaxed);
+                /* Publish the sequence last so the parent can reject a partially
+                 * refreshed sample as stale without any lock or rendezvous. */
+                atomic_store_explicit(&h->seq, _seq, memory_order_release);
+            }
             _t2_prev_iter = _now;
             if ((m1_tick++ % 1000) == 0)
                 fprintf(stderr, "[M1STAT] v=1 pid=%d ts=%.3f clock=CLOCK_MONOTONIC domain=S "
@@ -2883,10 +3628,156 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                         m1_first_audio, m1_rejected, m1_cancelled, m1_scan, m1_noslot,
                         m1_nojob, pf_m1);
         }
+        double st_iter_start = stage_trace ? qwen_mono_ms() : 0;
+        double st_admit0 = pf_admit, st_head0 = pf_head, st_samp0 = pf_samp;
+        double st_cp0 = pf_cp, st_decode0 = pf_decode, st_talker0 = pf_talker;
+        double st_wait0 = pf_wait, st_prefill_ms = 0, st_write_ms = 0;
+        int st_dec_calls = 0, st_dec_group_max = 0, st_dec_frames = 0, st_dec_defer_busy = 0, st_dec_pause_busy = 0;
+        int st_dec_pause_run_max = 0, st_sched_selected = 0, st_sched_skipped = 0, st_sched_age_max = 0;
+        int st_dec_ragged = 0, st_dec_per_item = 0, st_dec_external = 0;
+        double st_dec_wait = 0.0;
+        int st_overlap = (dec_on && dpool.lane) ? (dpool.elastic ? (qwen_pool_width() != 0) : (dpool.queued > 0)) : 0;
+        int st_n_active = n_active, st_n_step = 0;
         PF_START();
         for (int b = 0; b < B; b++) {
             if (active[b]) continue;
-            if (dec_on && atomic_load(&dec_busy[b]) != 0) continue;
+            if (dec_on && atomic_load(&dec_busy[b]) != 0) { if (prof_on) occ_free_decbusy++; continue; }
+
+            /* ---- C12-WIN-10: sliced admission ------------------------------------
+             * A pending admission owns this block until it completes: exactly one
+             * slice per iteration while other slots stream, the whole remainder in
+             * one visit when the worker is idle (there is nobody to protect, and the
+             * cold-start TTFA must not grow).  While it is pending no other request
+             * is prefilled, because the partial KV of this one lives in ctx->kv_cache
+             * and the prompt state (dec_x, bg_text_content_len, trailing text) lives
+             * in ctx -- a second prompt build would destroy both. */
+            if (adm_slice > 0 && !use_helper) {
+                if (adm.active && sink->cancelled && adm.tag &&
+                    sink->cancelled(sink->ud, adm.tag)) {
+                    ADM_DROP(NULL);
+                    continue;
+                }
+                if (!adm.active) {
+                    if (!sink->running(sink->ud)) break;
+                    int a_block = (n_active == 0);
+                    qwen_batch_req_t a_req;
+                    void *a_tag = NULL;
+                    double a_w0 = prof_on ? time_ms() : 0;
+                    int a_got = sink->next_job(sink->ud, &a_req, &a_tag, a_block);
+                    if (prof_on) { double d = time_ms() - a_w0; pf_wait += d; pf_mark += d; }
+                    if (!a_got) {
+                        if (prof_on) occ_free_empty++;
+                        if (a_block) break;
+                        continue;
+                    }
+                    /* Build the prompt, then stop: prefill_defer hands the embeddings
+                     * back instead of running the Talker. */
+                    int sv_spk = ctx->speaker_id, sv_lang = ctx->language_id;
+                    ctx->speaker_id = a_req.speaker_id; ctx->language_id = a_req.language_id;
+                    ctx->prev_prefill_len = 0; ctx->prefill_only = 1; ctx->prefill_defer = 1;
+                    double a_t0 = qwen_mono_ms();
+                    double a_st0 = stage_trace ? a_t0 : 0;
+                    int a_rc = qwen_tts_generate(ctx, a_req.text, NULL, NULL);
+                    ctx->prefill_only = 0; ctx->prefill_defer = 0;
+                    ctx->speaker_id = sv_spk; ctx->language_id = sv_lang;
+                    int a_len = ctx->prefill_seq_len;
+                    if (a_rc != 0 || a_len <= 0 || a_len > MAXPROMPT || !ctx->prefill_embeds) {
+                        const char *why = (a_len > MAXPROMPT) ? "prompt too long for a batch slot"
+                                                              : "prefill failed";
+                        adm.tag = a_tag;
+                        ADM_DROP(why);
+                        continue;
+                    }
+                    int a_pos0 = 0;
+                    int a_plan = qwen_talker_prefill_plan(ctx, a_len, &a_pos0);
+                    if (a_plan < 0) {
+                        adm.tag = a_tag;
+                        ADM_DROP("prefill failed");
+                        continue;
+                    }
+                    if (a_plan == 1) {
+                        /* This prompt would POPULATE the prefix cache, which the sliced
+                         * path cannot do (it would have to keep the f32 K/V of every
+                         * layer alive across slices).  Run it monolithically, once:
+                         * the prompt is already built, so this is the inline path with
+                         * the same computation and the same result. */
+                        double a_pf0 = stage_trace ? qwen_mono_ms() : 0;
+                        ctx->kv_len = 0;
+                        int a_prc = qwen_talker_prefill(ctx, ctx->prefill_embeds, a_len);
+                        if (stage_trace) st_prefill_ms += qwen_mono_ms() - a_pf0;
+                        int a_pl = ctx->kv_len;
+                        if (a_prc != 0 || a_pl <= 0) {
+                            adm.tag = a_tag;
+                            ADM_DROP("prefill failed");
+                            continue;
+                        }
+                        if (ttfa_trace) {
+                            double a_t1 = qwen_mono_ms();
+                            t2_helper[b] = 0;          t2_seed[b]      = a_req.seed;
+                            t2_admitted[b] = a_t0;     t2_pf_start[b]  = a_t0;
+                            t2_pf_done[b]  = a_t1;     t2_state_rdy[b] = a_t1;
+                            t2_pfq_push[b] = 0;        t2_pfq_pop[b]   = 0;
+                            t2_step1[b] = 0; t2_talker1[b] = 0; t2_decode1[b] = 0;
+                            t2_frame1[b] = 0; t2_audio1[b] = 0; t2_emitted[b] = 0;
+                            t2_batch_at_inst[b] = n_active; t2_qdepth_at_pop[b] = -1;
+                            t2_adm_seq[b] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
+                        }
+                        ADMIT_INSTALL(b, a_req, a_tag, a_pl);
+                        free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
+                        ctx->prefill_seq_len = 0;
+                        adm_inline_reqs++;
+                        if (prof_on) occ_admits++;
+                        break;
+                    }
+                    if (adm_sliced_reqs == 0 && adm_slices_total == 0)
+                        fprintf(stderr, "[ADMSLICE] v=1 pid=%d first_sliced_admission=1 "
+                                        "slice=%d idle_slicing=%d seq_len=%d prefix=%d\n",
+                                (int)getpid(), adm_slice, adm_slice_idle, a_len, a_pos0);
+                    adm.active = 1;
+                    adm.req = a_req; adm.req.text = NULL;  /* scalars only from here on */
+                    adm.tag = a_tag; adm.seq_len = a_len; adm.pos0 = a_pos0;
+                    adm.done = 0; adm.slices = 0; adm.t_admit = a_t0;
+                    if (stage_trace) st_prefill_ms += qwen_mono_ms() - a_st0;
+                }
+
+                {
+                    int a_new = adm.seq_len - adm.pos0;
+                    int a_rem = a_new - adm.done;
+                    int a_S = (n_active == 0 && !adm_slice_idle)
+                                  ? a_rem
+                                  : qwen_prefill_slice_next(a_rem, adm_slice);
+                    double a_s0 = stage_trace ? qwen_mono_ms() : 0;
+                    int a_rc = qwen_talker_prefill_range(ctx, ctx->prefill_embeds, adm.seq_len,
+                                                         adm.pos0, adm.done, adm.done + a_S);
+                    if (stage_trace) st_prefill_ms += qwen_mono_ms() - a_s0;
+                    if (a_rc != 0) { ADM_DROP("prefill failed"); break; }
+                    adm.done += a_S; adm.slices++; adm_slices_total++;
+                    if (adm.done >= a_new) {
+                        int a_pl = ctx->kv_len;
+                        if (ttfa_trace) {
+                            double a_t1 = qwen_mono_ms();
+                            t2_helper[b] = 0;             t2_seed[b]      = adm.req.seed;
+                            t2_admitted[b] = adm.t_admit; t2_pf_start[b]  = adm.t_admit;
+                            t2_pf_done[b]  = a_t1;        t2_state_rdy[b] = a_t1;
+                            t2_pfq_push[b] = 0;           t2_pfq_pop[b]   = 0;
+                            t2_step1[b] = 0; t2_talker1[b] = 0; t2_decode1[b] = 0;
+                            t2_frame1[b] = 0; t2_audio1[b] = 0; t2_emitted[b] = 0;
+                            t2_batch_at_inst[b] = n_active; t2_qdepth_at_pop[b] = -1;
+                            t2_adm_seq[b] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
+                        }
+                        void *a_tag2 = adm.tag;
+                        qwen_batch_req_t a_req2 = adm.req;
+                        ADMIT_INSTALL(b, a_req2, a_tag2, a_pl);
+                        free(ctx->prefill_embeds); ctx->prefill_embeds = NULL;
+                        ctx->prefill_seq_len = 0;
+                        memset(&adm, 0, sizeof(adm));
+                        adm_sliced_reqs++;
+                        if (prof_on) occ_admits++;
+                    }
+                }
+                break;
+            }
+
             if (use_helper) {
                 if (!sink->running(sink->ud) && n_active > 0) break;
                 int block = (n_active == 0);
@@ -2912,6 +3803,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 memcpy(last_hidden + (size_t)b * h, p->last_hidden, (size_t)h * sizeof(float));
                 tcl[b] = p->tcl; pos[b] = p->pl;
+                stream_tail[b] = p->stream_trailing_text;
+                stream_tail_len[b] = p->stream_trailing_len;
+                stream_tail_pos[b] = 0;
+                p->stream_trailing_text = NULL; p->stream_trailing_len = 0;
 #ifdef QWEN_HAVE_CUDA
                 if (cuda_batch) qwen_cuda_talker_batch_upload_slot(g_cuda_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
 #endif
@@ -2920,7 +3815,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
 #endif
                 p_temp[b] = p->req.temperature; p_topk[b] = p->req.top_k; p_topp[b] = p->req.top_p;
                 p_rep[b] = p->req.rep_penalty; p_gw[b] = p->req.greedy_warmup; rng[b] = p->req.seed;
-                nprev[b] = 0; chframes[b] = 0; sframe[b] = 0; decpos[b] = 0;
+                nprev[b] = 0; chframes[b] = 0; sframe[b] = 0; decpos[b] = 0; rq_capped[b] = 0;
                 if (rq_trace) { rq_seed[b] = p->req.seed; rq_tok[b] = p->pl; rq_t0[b] = time_ms(); }
                 if (ttfa_trace) {
                     t2_helper[b]   = 1;
@@ -2928,6 +3823,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     t2_admitted[b] = p->ts_admitted;    t2_pf_start[b]  = p->ts_prefill_start;
                     t2_pf_done[b]  = p->ts_prefill_done; t2_state_rdy[b] = p->ts_state_ready;
                     t2_pfq_push[b] = p->ts_pfq_push;    t2_pfq_pop[b]   = _t_pop;
+                    t2_step1[b] = 0; t2_talker1[b] = 0; t2_decode1[b] = 0;
                     t2_frame1[b] = 0; t2_audio1[b] = 0; t2_emitted[b] = 0;
                     t2_batch_at_inst[b] = n_active;     t2_qdepth_at_pop[b] = pfq.count;
                     t2_adm_seq[b] = atomic_load_explicit(&g_admit_seq, memory_order_relaxed);
@@ -2948,6 +3844,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             int pf_got = sink->next_job(sink->ud, &req, &t, block);
             if (prof_on) { double d = time_ms() - pf_w1; pf_wait += d; pf_mark += d; }
             if (!pf_got) {
+                if (prof_on) occ_free_empty++;
                 if (block) break;
                 continue;
             }
@@ -2958,9 +3855,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                                                    : "prefill failed";
                 if (sink->on_reject) sink->on_reject(sink->ud, t, why);
                 else sink->on_done(sink->ud, t, NULL, 0);
+                qwen_stream_trailing_clear(ctx);
                 continue;
             }
             ADMIT_INSTALL(b, req, t, pl);
+            if (prof_on) occ_admits++;
         }
 
         if (n_active == 0) {
@@ -2977,10 +3876,30 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         }
 
         uint8_t *step_active = active;
-        if (ttfa_prio && n_active > 1) {
-            int newest = -1, starving = 0, established = 0;
+        int n_eligible = n_active;
+        if (lead_gate) {
+            memset(lead_mask, 0, (size_t)B);
+            n_eligible = 0;
             for (int b = 0; b < B; b++) {
                 if (!active[b]) continue;
+                if (sink->step_allowed(sink->ud, tag[b], sframe[b] == 0)) {
+                    lead_mask[b] = 1;
+                    n_eligible++;
+                }
+            }
+            if (n_eligible == 0) {
+                /* A policy may intentionally park every stream while its queued
+                 * audio lead drains.  Do not turn that state into a hot spin. */
+                struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+                nanosleep(&pause, NULL);
+                continue;
+            }
+            step_active = lead_mask;
+        }
+        if (ttfa_prio && n_eligible > 1) {
+            int newest = -1, starving = 0, established = 0;
+            for (int b = 0; b < B; b++) {
+                if (!step_active[b]) continue;
                 if (frozen[b] >= freeze_cap) starving = 1;
                 if (sframe[b] >= ttfa_prio) established = 1;
                 if (sframe[b] < ttfa_prio && (newest < 0 || sframe[b] < sframe[newest])) newest = b;
@@ -2991,23 +3910,130 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 step_active = prio_mask;
             }
         }
-        if (st_bt && step_active == active && n_active > st_bt) {
+        int n_step = 0;
+        for (int b = 0; b < B; b++) if (step_active[b]) n_step++;
+        if (st_bt && step_active != prio_mask && n_step > st_bt) {
             memset(width_mask, 0, (size_t)B);
             int picked = 0;
             for (int k = 0; k < B && picked < st_bt; k++) {
                 int b = (rr_cursor + k) % B;
-                if (!active[b]) continue;
+                if (!step_active[b]) continue;
                 width_mask[b] = 1; picked++;
                 rr_cursor = (b + 1) % B;
             }
             step_active = width_mask;
         }
+        if (dpool.nonblock >= 2) {
+            /* Keep at most one decoder quantum ready behind an in-flight unit.  This
+             * is the bounded form of the nonblocking mailbox experiment: a busy slot
+             * is paused before it accumulates an unbounded code backlog, while other
+             * runnable slots still advance. */
+            memset(dec_mask, 0, (size_t)B);
+            n_step = 0;
+            for (int b = 0; b < B; b++) {
+                if (!active[b]) { dec_paused[b] = 0; continue; }
+                if (!step_active[b]) continue;
+                int pending = chframes[b] - decpos[b];
+                int target = dec_stream_target_frames(decpos[b], n_active,
+                                                      g_stream_dec_chunk, g_dec_chunk_busy);
+                if (dpool.lane && atomic_load(&dpool.busy[b]) != 0 && pending >= target - 1) {
+                    if (!dec_paused[b] && stage_trace)
+                        fprintf(stderr, "[DECQOS] v=1 pid=%d event=PAUSE slot=%d pending=%d target=%d busy=%d active=%d\n",
+                                (int)getpid(), b, pending, target,
+                                atomic_load(&dpool.busy[b]), n_active);
+                    dec_paused[b] = 1;
+                    dec_pause_count[b]++;
+                    dec_pause_run[b]++;
+                    if (dec_pause_run[b] > dec_pause_run_max[b])
+                        dec_pause_run_max[b] = dec_pause_run[b];
+                    if ((int)dec_pause_run[b] > st_dec_pause_run_max)
+                        st_dec_pause_run_max = (int)dec_pause_run[b];
+                    st_dec_pause_busy++;
+                    continue;
+                }
+                if (dec_paused[b] && stage_trace)
+                    fprintf(stderr, "[DECQOS] v=1 pid=%d event=RESUME slot=%d pending=%d target=%d busy=%d active=%d\n",
+                            (int)getpid(), b, pending, target,
+                            atomic_load(&dpool.busy[b]), n_active);
+                if (dec_paused[b] && dpool.lifecycle_trace && dpool.life) {
+                    dec_life_t *life = &dpool.life[b];
+                    const unsigned long long now = dec_life_now_us();
+                    const unsigned long long done = atomic_load(&life->done_us);
+                    fprintf(stderr, "[DECLIFE] v=1 pid=%d event=COMPLETE_SEEN slot=%d done_us=%llu seen_us=%llu "
+                                    "done_to_seen_us=%llu active=%d pending=%d target=%d\n",
+                            (int)getpid(), b, done, now, done ? now - done : 0ULL,
+                            n_active, pending, target);
+                    if (dec_resume_us) {
+                        dec_resume_us[b] = now;
+                        fprintf(stderr, "[DECLIFE] v=1 pid=%d event=RESUME slot=%d resume_us=%llu "
+                                        "seen_to_resume_us=0 pause_run=%u\n",
+                                (int)getpid(), b, now, dec_pause_run[b]);
+                    }
+                }
+                dec_paused[b] = 0;
+                dec_last_pause_run[b] = dec_pause_run[b];
+                dec_pause_run[b] = 0;
+                dec_mask[b] = 1;
+                n_step++;
+            }
+            step_active = dec_mask;
+            if (n_step == 0) {
+                struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+                nanosleep(&pause, NULL);
+                continue;
+            }
+        }
+        if (sd_sched_urgency) {
+            /* First urgency A/B: preserve every runnable slot and the existing batch
+             * width/decoder target.  Only the enqueue order changes.  A slot which
+             * was mailbox-paused accrues age; on resume it is placed ahead of an
+             * equally runnable peer. */
+            int sched_n = 0;
+            for (int b = 0; b < B; b++) {
+                if (!active[b]) { sched_age[b] = 0; continue; }
+                if (!step_active[b]) {
+                    if (dec_paused && dec_paused[b]) {
+                        sched_age[b]++;
+                        sched_skip_count[b]++;
+                        st_sched_skipped++;
+                        if ((int)sched_age[b] > st_sched_age_max)
+                            st_sched_age_max = (int)sched_age[b];
+                    }
+                    continue;
+                }
+                unsigned long long score = (unsigned long long)sched_age[b] * 16u;
+                if (chframes[b] > decpos[b]) score += 4u; /* decoder backlog proxy */
+                if (sframe[b] == 0) score += 2u;          /* preserve first-audio progress */
+                int at = sched_n++;
+                while (at > 0) {
+                    int prev = sched_order[at - 1];
+                    unsigned long long prev_score = (unsigned long long)sched_age[prev] * 16u;
+                    if (chframes[prev] > decpos[prev]) prev_score += 4u;
+                    if (sframe[prev] == 0) prev_score += 2u;
+                    if (prev_score >= score) break;
+                    sched_order[at] = prev;
+                    at--;
+                }
+                sched_order[at] = b;
+            }
+            sched_turn++;
+            st_sched_selected = sched_n;
+            if (stage_trace && (sched_turn & 255u) == 1u)
+                fprintf(stderr, "[DECQOS] v=1 pid=%d event=SCHED turn=%llu active=%d runnable=%d selected=%d "
+                                "proxy=age+pending+first_audio mode=enqueue-order-only\n",
+                        (int)getpid(), sched_turn, n_active, n_step, sched_n);
+        }
         if (ttfa_prio) {
             for (int b = 0; b < B; b++)
-                frozen[b] = (active[b] && !step_active[b]) ? frozen[b] + 1 : 0;
+                frozen[b] = (active[b] && (!lead_gate || lead_mask[b]) && !step_active[b])
+                           ? frozen[b] + 1 : 0;
         }
         if (st_tt) qwen_set_threads_soft(st_tt);
 
+        if (ttfa_trace) {
+            for (int b = 0; b < B; b++)
+                if (step_active[b] && t2_step1[b] == 0.0) t2_step1[b] = qwen_mono_ms();
+        }
         qwen_batch_pack_active(bb, step_active);
         PF_START();
         qwen_batch_proj(logits, ctx->codec_head_bf16, last_hidden, vocab, h, h,
@@ -3030,26 +4056,33 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         qwen_census_frame_at(1);
         if (prof_on) {
             pf_frames++; pf_slotframes += n_active;
+            occ_hist[n_active < 8 ? n_active : 8]++;
             for (int b = 0; b < B; b++) if (step_active[b]) pf_stepframes++;
         }
 
         PF_START();
         if (st_td) qwen_set_threads_soft(st_td);
-        for (int b = 0; b < B; b++) {
-            if (!step_active[b]) {
+        int cohort_n = 0;
+        /* one decision per frame turn: n_active is fixed for the turn, so a cohort is never
+         * left half-built across the cap boundary */
+        const int cohort_allowed = dpool.cohort_max_b <= 0 || n_active <= dpool.cohort_max_b;
+        int cohort_slots[3] = { 0, 0, 0 }, cohort_frames[3] = { 0, 0, 0 };
+        int *cohort_codes[3] = { NULL, NULL, NULL };
+        void *cohort_tags[3] = { NULL, NULL, NULL };
+        int cohort_first[3] = { 0, 0, 0 };
+        for (int b = 0; b < B; b++)
+            if (!step_active[b])
                 memset(step_embed + (size_t)b * h, 0, (size_t)h * sizeof(float));
-                continue;
-            }
+        int decode_order_n = sd_sched_urgency ? st_sched_selected : B;
+        for (int oi = 0; oi < decode_order_n; oi++) {
+            int b = sd_sched_urgency ? sched_order[oi] : oi;
+            if (!step_active[b]) continue;
             RECORD_FRAME_AND_EMBED(b);
 
             if (want_stream[b] || amort) {
                 int pending = chframes[b] - decpos[b];
-                int target;
-                if      (decpos[b] == 0) target = 1;
-                else if (decpos[b] < 4)  target = 2;
-                else if (decpos[b] < 12) target = 4;
-                else if (g_dec_chunk_busy && n_active > 1) target = g_dec_chunk_busy;
-                else                     target = g_stream_dec_chunk;
+                int target = dec_stream_target_frames(decpos[b], n_active,
+                                                      g_stream_dec_chunk, g_dec_chunk_busy);
                 if (ttfa_trace && t2_frame1[b] == 0.0 && pending > 0) t2_frame1[b] = qwen_mono_ms();
                 if (dec_batch) {
                     db_pending[b] = pending;
@@ -3058,18 +4091,98 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 if (pending < target) continue;
                 if (dec_on && want_stream[b]) {
+                    dec_life_ready(&dpool, b, n_active, pending, target,
+                                   dec_last_pause_run ? dec_last_pause_run[b] : 0);
+                    if (dec_last_pause_run) dec_last_pause_run[b] = 0;
+                    if (stage_trace && !(dpool.lane && dpool.multislot >= 2)) {
+                        st_dec_calls++; st_dec_group_max = 1;
+                        st_dec_frames += pending; st_dec_external = 1;
+                    }
+                    if (ttfa_trace && t2_decode1[b] == 0.0) t2_decode1[b] = qwen_mono_ms();
+                    if (dpool.lane) {
+                        /* one unit in flight per slot: a second quantum is ready, so this
+                         * slot's producer waits for its decoder, and only this slot's */
+                        if (dpool.nonblock && atomic_load(&dpool.busy[b]) != 0) {
+                            /* QoS experiment: never let one full mailbox stall the entire
+                             * frame turn.  The pending codes stay in this slot and are
+                             * considered again on the next turn after the lane signals idle. */
+                            st_dec_defer_busy++;
+                            continue;
+                        }
+                        double _dw = dec_wait_idle(&dpool, b);
+                        st_dec_wait += _dw; pf_decwait += _dw;
+                    }
+                    if (dpool.lane && dpool.multislot >= 2 && cohort_allowed) {
+                        /* Keep one candidate until a same-length peer is ready.  A
+                         * different pending length is flushed as an ordinary unit;
+                         * it must never enter a scalar-length multi kernel. */
+                        if (cohort_n > 0 && pending != cohort_frames[0]) {
+                            int queued_prev = 0;
+                            if (cohort_n >= 2)
+                                queued_prev = dec_enqueue_cohort(
+                                    &dpool, cohort_slots, cohort_frames, cohort_n,
+                                    cohort_codes, cohort_tags, cohort_first);
+                            if (!queued_prev) {
+                                for (int ci = 0; ci < cohort_n; ci++)
+                                    dec_enqueue(&dpool, cohort_slots[ci], cohort_codes[ci], cohort_frames[ci],
+                                                cohort_tags[ci], 0, 1, cohort_first[ci]);
+                            }
+                            if (stage_trace) {
+                                st_dec_calls += queued_prev ? 1 : cohort_n;
+                                if (st_dec_group_max < (queued_prev ? cohort_n : 1))
+                                    st_dec_group_max = queued_prev ? cohort_n : 1;
+                                for (int ci = 0; ci < cohort_n; ci++) st_dec_frames += cohort_frames[ci];
+                                st_dec_external = 1;
+                            }
+                            cohort_n = 0;
+                        }
+                        cohort_slots[cohort_n] = b;
+                        cohort_frames[cohort_n] = pending;
+                        cohort_codes[cohort_n] = chcodes[b] + (size_t)decpos[b] * 16;
+                        cohort_tags[cohort_n] = tag[b];
+                        cohort_first[cohort_n] = decpos[b] == 0;
+                        cohort_n++;
+                        decpos[b] = chframes[b];
+                        if (cohort_n < dpool.multislot) continue;
+                        const int queued_cohort = dec_enqueue_cohort(
+                            &dpool, cohort_slots, cohort_frames, cohort_n,
+                            cohort_codes, cohort_tags, cohort_first);
+                        if (!queued_cohort) {
+                            for (int ci = 0; ci < cohort_n; ci++)
+                                dec_enqueue(&dpool, cohort_slots[ci], cohort_codes[ci], cohort_frames[ci],
+                                            cohort_tags[ci], 0, 1, cohort_first[ci]);
+                        }
+                        if (stage_trace) {
+                            st_dec_calls += queued_cohort ? 1 : cohort_n;
+                            if (st_dec_group_max < (queued_cohort ? cohort_n : 1))
+                                st_dec_group_max = queued_cohort ? cohort_n : 1;
+                            for (int ci = 0; ci < cohort_n; ci++) st_dec_frames += cohort_frames[ci];
+                            st_dec_external = 1;
+                        }
+                        cohort_n = 0;
+                        continue;
+                    }
                     dec_enqueue(&dpool, b, chcodes[b] + (size_t)decpos[b] * 16, pending,
                                 tag[b], 0, 1, decpos[b] == 0);
                     decpos[b] = chframes[b];
                     continue;
                 }
                 float *aud = NULL; int an = 0;
+                if (stage_trace) {
+                    st_dec_calls++; st_dec_group_max = 1;
+                    st_dec_frames += pending; st_dec_per_item = 1;
+                }
+                if (ttfa_trace && t2_decode1[b] == 0.0) t2_decode1[b] = qwen_mono_ms();
                 if (qwen_speech_decoder_decode_streaming_st(ctx, &sstate[b],
                         chcodes[b] + (size_t)decpos[b] * 16, pending, &aud, &an) == 0
                     && aud && an > 0) {
                     decpos[b] = chframes[b];
                     T2_FIRST_AUDIO(b);
-                    if (want_stream[b]) sink->on_chunk(sink->ud, tag[b], aud, an);
+                    if (want_stream[b]) {
+                        double _st_w0 = stage_trace ? qwen_mono_ms() : 0;
+                        sink->on_chunk(sink->ud, tag[b], aud, an);
+                        if (stage_trace) st_write_ms += qwen_mono_ms() - _st_w0;
+                    }
                     else {
                         if (acc_n[b] + an > acc_cap[b]) {
                             acc_cap[b] = (acc_n[b] + an) * 2;
@@ -3081,9 +4194,31 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 free(aud);
             }
         }
+        if (cohort_n > 0) {
+            if (cohort_n >= 2 && dec_enqueue_cohort(&dpool, cohort_slots, cohort_frames, cohort_n,
+                                                    cohort_codes, cohort_tags, cohort_first)) {
+                if (stage_trace) {
+                    st_dec_calls++;
+                    if (st_dec_group_max < cohort_n) st_dec_group_max = cohort_n;
+                    for (int ci = 0; ci < cohort_n; ci++) st_dec_frames += cohort_frames[ci];
+                    st_dec_external = 1;
+                }
+            } else {
+                for (int ci = 0; ci < cohort_n; ci++) {
+                    dec_enqueue(&dpool, cohort_slots[ci], cohort_codes[ci], cohort_frames[ci],
+                                cohort_tags[ci], 0, 1, cohort_first[ci]);
+                    if (stage_trace) {
+                        st_dec_calls++; st_dec_group_max = st_dec_group_max < 1 ? 1 : st_dec_group_max;
+                        st_dec_frames += cohort_frames[ci]; st_dec_external = 1;
+                    }
+                }
+            }
+        }
 
         int m1_slot_i = -1; unsigned int m1_seed_i = 0; double m1_ts_i = 0;
-        if (admit_m1 && sink->running(sink->ud)) {
+        /* A pending sliced admission owns ctx->kv_cache and the prompt state; the M1
+         * late admission is monolithic and would overwrite both. */
+        if (admit_m1 && !adm.active && sink->running(sink->ud)) {
             m1_scan++;
             int m1_free_slot = 0;
             for (int b = 0; b < B; b++) {
@@ -3104,6 +4239,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                                                        : "prefill failed";
                     if (sink->on_reject) sink->on_reject(sink->ud, jt, why);
                     else sink->on_done(sink->ud, jt, NULL, 0);
+                    qwen_stream_trailing_clear(ctx);
                     m1_rejected++;
                     if (prof_on) { double _d = time_ms() - _mf0; pf_m1 += _d; pf_mark += _d; }
                     break;
@@ -3181,8 +4317,18 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 nit++;
             }
             if (nit > 0) {
+                if (stage_trace) {
+                    st_dec_calls++; st_dec_group_max = nit;
+                    st_dec_ragged = nit > 1;
+                    for (int _i = 0; _i < nit; _i++)
+                        st_dec_frames += db_items[_i].nframes;
+                }
                 int _di_first = 0;
                 for (int _i = 0; _i < nit; _i++) if (decpos[db_slot[_i]] == 0) { _di_first = 1; break; }
+                if (ttfa_trace)
+                    for (int _i = 0; _i < nit; _i++)
+                        if (t2_decode1[db_slot[_i]] == 0.0)
+                            t2_decode1[db_slot[_i]] = qwen_mono_ms();
                 double _di_t0 = ttfa_trace ? qwen_mono_ms() : 0.0;
                 qwen_speech_decoder_decode_streaming_batch(ctx, db_items, nit);
                 if (ttfa_trace)
@@ -3198,7 +4344,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     if (db_items[i].rc == 0 && aud && an > 0) {
                         T2_FIRST_AUDIO(b);
                         decpos[b] += db_items[i].nframes;
-                        if (want_stream[b]) sink->on_chunk(sink->ud, tag[b], aud, an);
+                        if (want_stream[b]) {
+                            double _st_w0 = stage_trace ? qwen_mono_ms() : 0;
+                            sink->on_chunk(sink->ud, tag[b], aud, an);
+                            if (stage_trace) st_write_ms += qwen_mono_ms() - _st_w0;
+                        }
                         else {
                             if (acc_n[b] + an > acc_cap[b]) {
                                 acc_cap[b] = (acc_n[b] + an) * 2;
@@ -3230,24 +4380,101 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         PF_END(pf_decode);
 
         PF_START();
+        if (ttfa_trace) {
+            for (int b = 0; b < B; b++) {
+                if (step_active[b] && t2_talker1[b] == 0.0) {
+                    t2_talker1[b] = qwen_mono_ms();
+                    fprintf(stderr, "[F2STAGE] v=1 stage=first_talker seed=%u slot=%d "
+                                    "ts=%.3f clock=CLOCK_MONOTONIC domain=S\n",
+                            t2_seed[b], b, t2_talker1[b]);
+                }
+            }
+        }
         int pf_rc = qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, step_active, last_hidden);
         PF_END(pf_talker);
         if (pf_rc != 0) {
             for (int b = 0; b < B; b++) if (active[b]) {
                 if (want_stream[b]) { qwen_sd_stream_free(&sstate[b]); want_stream[b] = 0; }
+                free(stream_tail[b]); stream_tail[b] = NULL;
                 sink->on_done(sink->ud, tag[b], NULL, 0); active[b] = 0; tag[b] = NULL; n_active--;
             }
             break;
         }
-        for (int b = 0; b < B; b++) if (step_active[b]) { pos[b]++; sframe[b]++; }
+        for (int b = 0; b < B; b++) if (step_active[b]) {
+            pos[b]++; sframe[b]++;
+            if (dpool.lifecycle_trace && dec_resume_us && dec_resume_us[b]) {
+                const unsigned long long now = dec_life_now_us();
+                fprintf(stderr, "[DECLIFE] v=1 pid=%d event=NEXT_PROGRESS slot=%d resume_us=%llu progress_us=%llu "
+                                "resume_to_progress_us=%llu active=%d decpos=%d produced=%d\n",
+                        (int)getpid(), b, dec_resume_us[b], now, now - dec_resume_us[b],
+                        n_active, decpos[b], chframes[b]);
+                dec_resume_us[b] = 0;
+            }
+            if (sd_sched_urgency) sched_age[b] = 0;
+        }
+        if (stage_trace) {
+            st_n_step = n_step;
+            double st_end = qwen_mono_ms();
+            double st_admit = pf_admit - st_admit0;
+            double st_head = pf_head - st_head0;
+            double st_samp = pf_samp - st_samp0;
+            double st_cp = pf_cp - st_cp0;
+            double st_decode = pf_decode - st_decode0;
+            double st_talker = pf_talker - st_talker0;
+            double st_wait = pf_wait - st_wait0;
+            double st_wall = st_end - st_iter_start;
+            double st_serial = st_wall - st_admit - st_head - st_samp - st_cp - st_decode - st_talker;
+            if (st_serial < 0) st_serial = 0;
+            fprintf(stderr,
+                    "[STAGE] v=1 pid=%d seq=%llu clock=CLOCK_MONOTONIC domain=S "
+                    "start_ms=%.3f end_ms=%.3f active=%d step=%d admit_ms=%.3f prefill_ms=%.3f head_ms=%.3f "
+                    "sample_ms=%.3f cp_ms=%.3f decode_ms=%.3f talker_ms=%.3f "
+                    "output_ms=%.3f queue_wait_ms=%.3f serial_ms=%.3f wall_ms=%.3f "
+                    "dec_calls=%d dec_group_max=%d dec_frames=%d dec_ragged=%d "
+                    "dec_per_item=%d dec_external=%d dec_wait_ms=%.3f dec_defer_busy=%d dec_pause_busy=%d "
+                    "dec_pause_run_max=%d sched_selected=%d sched_skipped=%d sched_age_max=%d overlap=%d "
+                    "prefill_slice=%d prefill_pending=%d prefill_done=%d\n",
+                    (int)getpid(),
+                    (unsigned long long)atomic_load_explicit(&g_admit_seq, memory_order_relaxed),
+                    st_iter_start, st_end, st_n_active, st_n_step, st_admit, st_prefill_ms, st_head, st_samp,
+                    st_cp, st_decode, st_talker, st_write_ms, st_wait, st_serial, st_wall,
+                    st_dec_calls, st_dec_group_max, st_dec_frames, st_dec_ragged,
+                    st_dec_per_item, st_dec_external, st_dec_wait, st_dec_defer_busy, st_dec_pause_busy,
+                    st_dec_pause_run_max, st_sched_selected, st_sched_skipped, st_sched_age_max, st_overlap,
+                    adm_slice, adm.active, adm.active ? adm.done : 0);
+        }
     }
 
     if (prof_on && pf_frames > 0) {
-        double wall = time_ms() - pf_t0_loop;
+        double wall = (stage_trace ? qwen_mono_ms() : time_ms()) - pf_t0_loop;
         double acc = pf_admit + pf_talker + pf_head + pf_samp + pf_cp + pf_decode + pf_final;
         fprintf(stderr,
             "\n[serve-profile] %lld frames, %lld slot-frames (mean %.2f active slots), loop %.1f s\n",
             pf_frames, pf_slotframes, (double)pf_slotframes / (double)pf_frames, wall / 1000.0);
+        if (dec_on && dpool.lane) {
+            double step_s = 0, dec_s = 0; int nstep = 0, ndec = 0;
+            lane_cpu_by_team(&step_s, &dec_s, &nstep, &ndec);
+            fprintf(stderr, "  [lane-cpu] step team %d threads %.1f cpu-s (%.2f core-eq) · decoder team %d threads "
+                            "%.1f cpu-s (%.2f core-eq) over %.1f s · mailbox wait %.1f ms total (%.2f ms/frame)\n",
+                    nstep, step_s, wall > 0 ? step_s * 1000.0 / wall : 0.0,
+                    ndec, dec_s, wall > 0 ? dec_s * 1000.0 / wall : 0.0, wall / 1000.0,
+                    pf_decwait, pf_decwait / (double)pf_frames);
+            fprintf(stderr, "  [lane-contract] mailbox overruns %lld (must be 0) · max in flight per slot 1 · lead <= 1 quantum\n",
+                    (long long)atomic_load(&g_lane_overrun));
+            if (dpool.elastic)
+                fprintf(stderr, "  [lane-elastic] engine narrowed to %d threads for %.1f s = %.1f %% of the loop (decoder in flight); full team otherwise\n",
+                        dpool.step_width, dpool.overlap_ms / 1000.0, wall > 0 ? 100.0 * dpool.overlap_ms / wall : 0.0);
+        }
+        {
+            fprintf(stderr, "  decode occupancy:");
+            for (int i = 0; i <= 8; i++)
+                if (occ_hist[i])
+                    fprintf(stderr, " B%d=%lld(%.1f%%)", i, occ_hist[i],
+                            100.0 * (double)occ_hist[i] / (double)pf_frames);
+            fprintf(stderr, "  · admits=%lld free-slot scans: queue-empty=%lld "
+                            "decoder-busy=%lld\n",
+                    occ_admits, occ_free_empty, occ_free_decbusy);
+        }
         if (pf_stepframes != pf_slotframes)
             fprintf(stderr, "  stepped slots/frame %.2f (of %.2f admitted): a narrowing policy is ON "
                             "(D2 priority and/or QWEN_BATCH_TALKER)\n",
@@ -3306,19 +4533,46 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         pthread_mutex_unlock(&dpool.m);
         pthread_join(dec_thr, NULL);
         pthread_mutex_destroy(&dpool.m); pthread_cond_destroy(&dpool.cv);
+        pthread_cond_destroy(&dpool.done_cv);
         if (dpool.ctx) qwen_tts_free_clone(dpool.ctx);
+        if (dpool.lane) { qwen_pool_set_width(0); qwen_lane_team_stop(); free(dpool.slot_job); free(dpool.slot_codes); }
         dec_on = 0;
     }
-    free(dec_busy);
     free(db_pending); free(db_target); free(db_slot); free(db_items);
     free(t2_admitted); free(t2_pf_start); free(t2_pf_done); free(t2_state_rdy);
+    free(t2_step1); free(t2_talker1); free(t2_decode1);
     free(t2_pfq_push); free(t2_pfq_pop); free(t2_installed); free(t2_frame1);
     free(t2_audio1); free(t2_seed); free(t2_helper); free(t2_batch_at_inst);
     free(t2_qdepth_at_pop); free(t2_emitted); free(t2_adm_seq);
     free(width_mask);
+    free(dec_mask);
+    if (stage_trace && dpool.nonblock >= 2)
+        for (int b = 0; b < B; b++)
+            fprintf(stderr, "[DECQOS] v=1 pid=%d event=SUMMARY slot=%d pauses=%llu pause_run_max=%u "
+                            "sched_skips=%llu progress_age=%u busy=%d pending=%d decpos=%d produced=%d\n",
+                    (int)getpid(), b, dec_pause_count[b], dec_pause_run_max[b],
+                    sd_sched_urgency ? sched_skip_count[b] : 0ULL,
+                    sd_sched_urgency ? sched_age[b] : 0u,
+                    atomic_load(&dec_busy[b]), chframes[b] - decpos[b], decpos[b], chframes[b]);
+    free(dec_paused); free(dec_pause_count); free(dec_pause_run); free(dec_pause_run_max); free(dec_last_pause_run);
+    free(sched_order); free(sched_age); free(sched_skip_count);
+    free(dec_resume_us);
+    free(dec_life);
+    free(dec_busy);
     free(m1_mask);
+    free(lead_mask);
     free(prio_mask); free(frozen);
 
+    if (adm.active) ADM_DROP(NULL);
+    free(ctx->prefill_embeds); ctx->prefill_embeds = NULL; ctx->prefill_seq_len = 0;
+    if (adm_slice > 0)
+        fprintf(stderr, "[ADMSLICE] v=1 pid=%d slice=%d idle_slicing=%d sliced_requests=%lld "
+                        "slices=%lld mean_slices=%.2f inline_requests=%lld\n",
+                (int)getpid(), adm_slice, adm_slice_idle, adm_sliced_reqs, adm_slices_total,
+                adm_sliced_reqs ? (double)adm_slices_total / (double)adm_sliced_reqs : 0.0,
+                adm_inline_reqs);
+
+    #undef ADM_DROP
     #undef PF_START
     #undef PF_END
     #undef FINALIZE_SLOT
@@ -3337,9 +4591,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         qwen_tts_free_clone(pf_ctx);
     }
 
-    for (int b = 0; b < B; b++) { if (active[b] && (want_stream[b] || amort)) qwen_sd_stream_free(&sstate[b]); free(prev_tok[b]); free(chcodes[b]); free(acc_aud[b]); }
+    for (int b = 0; b < B; b++) { if (active[b] && (want_stream[b] || amort)) qwen_sd_stream_free(&sstate[b]); free(stream_tail[b]); free(prev_tok[b]); free(chcodes[b]); free(acc_aud[b]); }
     free(want_stream); free(sstate); free(acc_aud); free(acc_n); free(acc_cap);
-    free(active); free(tag); free(pos); free(tcl);
+    free(active); free(tag); free(pos); free(tcl); free(stream_tail); free(stream_tail_len); free(stream_tail_pos);
     free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
     free(nprev); free(chframes); free(sframe); free(decpos); free(prev_tok); free(chcodes);
     free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);

@@ -40,6 +40,7 @@ The reference 16-core Arm deployment (`configs/perf/axion-16c-ttfa.json`) pins e
 | `OPENBLAS_THREAD_TIMEOUT` | `1` | without it OpenBLAS idles by **spinning** and contends with the engine's own pool: first audio at C=1 measured 108 ms without against 66 ms with, and the bare arm was *bimodal* — 42,500 context switches per second against 12,000. That was measured when it was worth nothing at C=4; the re-measurement below found the scope reversed, so read both |
 | `OPENBLAS_NUM_THREADS` | **absent** | the engine sizes BLAS per worker at startup and backs off entirely when this is already set, so a stray `export` silently replaces a qualified thread split |
 | `QWEN_PREFIX_CACHE` | `1` | reuses the request-independent prompt head; on production prompts that is 9 of 13–79 prompt positions never computed again |
+| `QWEN_TTS_STREAM_LAYOUT` | `0` | experimental known-text dual-track prompt: prefill only the first/aligned text+codec prefix and consume trailing text embeddings during codec generation; no live network text input |
 | `QWEN_PREFILL_MATMAT` | `1` | routes prefill projections through the native bf16 matmat instead of BLAS: −29% prefill at `-j1` and −46% at `-j16` on that host. It is already the default where a matrix unit exists; pinning it means a change of default elsewhere cannot move this deployment quietly |
 | `QWEN_KAI_NCHUNK` | `384` | sub-tiles the GEMM's n dimension so the microkernel's second pass finds the packed RHS in cache: prefill p50 45.0 → 42.9 ms, first audio 72.2 → 70.2 ms, output bitwise identical. 192 and 96 both measured worse — smaller is not better |
 | `QWEN_POOL_SPIN` | `65536` | generations a pool worker re-reads before parking. The 4096 default tuned elsewhere cost 40% of the Code Predictor here: 16.0 → 9.6 ms/frame, 491,320 → 35,132 context switches |
@@ -108,7 +109,7 @@ QWEN_STREAM_DECODE_CHUNK_BUSY=0 \
 | `--prefork 2` | two worker processes, each pinned to 8 contiguous CPUs, weights shared copy-on-write | one process shares one pool across every request; measured worse for first audio here, and the sweep is what said so |
 | `--prefork-threads 8` | pool size inside each slice | the pool is sized from the machine, not from the slice, and threads cross the pinning |
 | `--batch-size 8` | per-worker in-flight cap **and** the continuous-batching scheduler | at `1` each worker serves one request at a time and never reaches the GEMM path, so concurrency turns into queueing |
-| `--max-queue 1` | one request may wait beyond the slots | unbounded waiting: a caller sees latency instead of a refusal, which is the worse failure |
+| `--max-queue 1` | one request may wait beyond the slots; with prefork, `--max-queue 0` keeps the parent accepting a full listener and returns immediate `503` instead of hiding the wait in the kernel backlog | unbounded waiting: a caller sees latency instead of a refusal, which is the worse failure |
 | `--queue-timeout-ms 0` | no deadline on that wait | — (0 is the deliberate choice here, recorded so a later change is visible) |
 | `--max-request-seconds 60` | generation cap per request, from which a text-length limit is derived | one pathological text can hold a slot for minutes |
 | `OPENBLAS_THREAD_TIMEOUT=1` | OpenBLAS parks instead of spinning | the two pools fight for the same cores: 108 ms against 66 ms for first audio at C=1, bimodally |
@@ -170,10 +171,45 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_APPLE_MMLA` | Apple | unset (off) | MMLA is opt-in on Apple silicon; `=1` enables it |
 | `QWEN_NO_VNNI` | x86 | unset | `=1` drops the VNNI int8 path (matvec and matmat) |
 | `QWEN_NO_BF16DOT` | x86 | unset | `=1` drops the AVX-512 bf16 dot path |
-| `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once |
+| `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once. Use it to answer "is AMX doing anything", never to attribute a result — it removes two unrelated consumers |
+| `QWEN_NO_AMX_BF16` · `QWEN_NO_AMX_INT8` · `QWEN_NO_AMX_Q4` | x86 | unset | one AMX consumer each, which is what a measurement needs. On an 8-core Emerald Rapids the two do disjoint jobs: dropping **bf16** costs C=1 TTFA +39% and C=4 p95 +72% while stream RTF barely moves (it is the *prefill*), and dropping **int8** leaves TTFA alone while costing 9% of RTF and 10% of throughput (it is the *decode*) |
 | `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
+| `QWEN_INT8_SDOT_MM` | ARM dotprod | unset (off) | enables the in-house SDOT B>1 INT8 matmat candidate; compare it against the fixed-B twin and B×SDOT GEMV, and report kernel B separately from server concurrency C |
+| `QWEN_NO_BF16_MATMUL` | x86 | unset | `=1` drops the AVX-512 bf16 matmat, leaving the per-row twin. Only reachable where AMX is absent or declined |
+| `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
+| `QWEN_VNNI_TILE_M4N2` | x86 | unset (off) | `=1` tries the fixed `M4xN2` VNNI tile for observed `B=2` calls. It is an opt-in candidate inspired by the ARM small-B cross-product path; qualify it on the complete server path before enabling it |
+| `QWEN_VNNI_GEMV_MR` | x86 | 2 | output rows handled by the VNNI GEMV microkernel; `4` is an experimental alternative and must be qualified per workload |
+| `QWEN_NO_VNNI_QKV` | x86 | unset | `=1` drops the fused Q/K/V **GEMV** (one activation quantisation shared by the three projections) back to three separate matvecs |
+| `QWEN_NO_X86_QKV` | x86 | unset | `=1` drops the fused Q/K/V **matmat** (int8 and bf16, VNNI and AMX) back to three separate matmats. This is the gate the persistent regions ask about, not the one above |
+| `QWEN_VNNI_TILE_N8` | x86 | unset (off) | `=1` tries the 8-column VNNI tile. Opt-in candidate; qualify on the server path |
+| `QWEN_Q4_VNNI_V3` · `QWEN_Q4_VNNI_V4` | x86 | v3 on | which q4 VNNI microkernel variant runs; `QWEN_Q4_VNNI_V4=1` selects the v4 experiment |
+| `QWEN_AVX2_INT8_GEMV` · `QWEN_AVX2_Q4_GEMV` | x86 AVX2 | off | experimental legacy B=1 integer candidates; each is independently selectable and falls back when its input shape is outside the bounded packed-activation contract |
+| `QWEN_AMX_PREPACK` | x86 AMX | **off** | `=1` pre-tiles weights once into the AMX tile layout and caches them by source pointer. When off the kernel simply reads the source with stride `cols`: there is NO per-call re-tiling anywhere, and the earlier claim that `=0` re-tiles per call was wrong |
+| `QWEN_AMX_PREPACK_KINDS` | x86 AMX | all | limits the prepack cache to some weight kinds. Recognised values are `int8`, `bf16`, `both`, `all` ONLY - `q4` is not one of them and silently disables ALL prepacking |
+| `QWEN_AMX_PERSIST_CFG` | x86 AMX | on | keeps the AMX tile configuration loaded across calls instead of `ldtilecfg`/`tilerelease` per call |
+| `QWEN_AMX_B32` | x86 AMX | unset (off) | prototype 32-wide AMX int8 matmat. No production caller; reachable only from `make x86-amx-b32-bench` |
+| `QWEN_VNNI_PREPACK` | x86 | unset | `=1`/`all` prepack eligible INT8 matrices in the parent; `=cp` or `=talker` limits the parent prepack to one component. It changes the batched VNNI matmat layout, not GEMV. Keep unset unless the target host shows a stable end-to-end win |
+| `QWEN_NO_VNNI_ROWSUM` | x86 | unset | `=1` disables the cached INT8 weight row sums used by VNNI GEMV; keep unset for the native path |
+| `QWEN_NO_VNNI_ACT_QUANT` | x86 | unset | `=1` disables AVX-512 activation quantization used before VNNI; keep unset for the native path |
 | `QWEN_AMX_MIN_B` · `QWEN_VNNI_MIN_B` · `QWEN_AVX2MM_MIN_B` | x86 | 4 · 2 · 2 | smallest batch width that may take that matmat |
+| `QWEN_AMX_BF16_MIN_B` · `QWEN_AMX_INT8_MIN_B` | x86 | fall back to `QWEN_AMX_MIN_B` | split the AMX gate when one threshold does not suit both datatypes; each overrides the shared one for its type only |
+| `QWEN_AMX_INT8_QKV_MIN_B` | x86 | inherits `QWEN_AMX_INT8_MIN_B` | additional lower bound for the fused INT8 QKV path only; other INT8 projections keep the normal AMX gate |
+| `QWEN_AMX_INT8_MIN_ROWS_PER_THREAD` | x86 | 256 | AMX INT8 also needs enough output rows PER WORKER (`rows >= N * threads`; the fused QKV counts `q+2kv`). Measured: below ~256 the tile setup and activation pack are not amortised and VNNI wins, and the same projection flips sign with the thread count. 0 disables the rule |
 | `QWEN_BFMMLA_MIN_B` · `QWEN_SMMLA_MIN_B` · `QWEN_KLEIDI_MIN_B` | ARM | 2 · 2 · 1 | the same thresholds on the ARM kernels |
+
+The batch gates say *when* a kernel is allowed; these say *how it tiles the output rows* once it is:
+
+| flag | ISA | default | effect |
+|---|---|---|---|
+| `QWEN_X86_NCHUNK` | x86 | 0 (off) | output-row chunk for every x86 matmat that has no family value set |
+| `QWEN_AMX_NCHUNK` · `QWEN_VNNI_NCHUNK` · `QWEN_AVX512_NCHUNK` | x86 | 0 (off) | the same, per family: AMX int8/bf16, VNNI int8, AVX-512 bf16. A family value overrides `QWEN_X86_NCHUNK` |
+| `QWEN_KAI_NCHUNK` | ARM | 384 | the KleidiAI equivalent, on by default because it was measured to win there |
+
+Zero, unset or a value below one row tile means "one call per thread slice", which is the shape
+the kernels had before the knob existed — so leaving these alone reproduces the old numbers
+exactly. Values are rounded **down** to the kernel's row tile (16 for AMX, 4 or 2 for the
+AVX-512 families depending on batch width), and a value that rounds to less than one tile is
+ignored rather than honoured as "no chunking at all".
 
 A gate for a kernel the build does not contain is simply inert, so an invocation can carry
 both families — but only the ones for this ISA will appear in the `[FLAGS]` line, and only if
@@ -187,8 +223,8 @@ both belong before any number.
 
 | flag | default | effect |
 |---|---|---|
-| `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit (AMX or ARM BF16), else BLAS | `=0` routes prefill projections back through BLAS, `=1` forces the native matmat |
-| `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably costs the accent on a finetune** — measured language identification 96% → 38%. Base models only, and the server says so when you turn it on |
+| `QWEN_PREFILL_MATMAT` | on where the build has a bf16 matrix unit: AMX, ARM BF16 (not Apple), or **AVX-512 BF16**; else BLAS | `=0` routes prefill projections back through BLAS, `=1` requests the native matmat but cannot create a missing capability. If the request is `1` and no compiled/runtime-enabled native BF16 unit exists, the engine resolves to the auditable BLAS fallback and the profile/dispatch gate refuses the run. The AVX-512-BF16 arm was added 2026-09-03: before it, an AVX-512-BF16 host **without AMX** fell back to BLAS, which converts every weight matrix to f32 first — and that conversion (`bf16_to_f32_matrix`) is single-threaded, so it became a serial stage in front of a parallel GEMM. Measured on AWS c8a.4xlarge (EPYC 9R45, 16c, no AMX) in server mode, four sequential arms: TTFA p50 416 → 124 ms at C=1, p95 939 → 507 ms at C=4, TOTAL_RTF −13% at C=4, with the delta localised in the server-side `admission + prefill` stage (2844 → 1126 ms) while Talker and CP absolute times and `STREAM_RTF` were unchanged. **It changes the sampled trajectory** (mel-corr ~0.4–0.8 against the BLAS path on the same prompt), so it is a different generation, not a rounding difference |
+| `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably degrades output quality on some models.** Base models only, and the server says so when you turn it on |
 | `QWEN_KAI_NCHUNK` **(ARM only)** | 384 | sub-tiles the KleidiAI GEMM's n dimension so the second height pass finds the packed RHS in cache. `=0` restores one kernel call per slice |
 | `QWEN_KAI_OPS` **(ARM only)** | all families on | comma list restricting which KleidiAI families may be used; empty means every one |
 | `QWEN_KAI_REPEAT` **(ARM only)** | off | `=1` times a second identical call — a microbenchmark, not a serving flag |
@@ -198,12 +234,16 @@ both belong before any number.
 | flag | default | effect |
 |---|---|---|
 | `QWEN_PREFIX_CACHE` | **on** | reuses the request-independent prompt head across requests; `=0` disables it |
-| `QWEN_POOL_SPIN` | 65536 on Linux/arm64, 4096 elsewhere | generations a pool worker re-reads before parking on the condvar. On a 16-core Arm host 4096 cost 40% of the Code Predictor: 65536 measured CP 16.0 → 9.6 ms/frame and 491,320 → 35,132 context switches. `=0` parks immediately |
+| `QWEN_POOL_SPIN` | 65536 on Linux/arm64, 4096 elsewhere | generations a pool worker re-reads before parking on the condvar. On a 16-core Arm host 4096 cost 40% of the Code Predictor: 65536 measured CP 16.0 → 9.6 ms/frame and 491,320 → 35,132 context switches. `=0` parks immediately. **The two defaults are both right.** On an 8-core x86 host the Arm value is worse (C=4 p95 358 vs 339 ms) and so is 0 (+13% stream RTF at C=1, 31k vs 2k context switches): a spinning worker needs a core to spin on, and on 8 cores it is stealing from the worker that has work. Pin the measured value per box; do not port this one |
 | `QWEN_SERVE_BLAS` | 0 (the engine's own thread budget) | BLAS threads while a single slot is busy |
 | `QWEN_SERVE_BLAS_BUSY` | 0 (same) | BLAS threads from two busy slots up |
 | `QWEN_TTFA_PRIORITY` | 0 (off) | N > 0 lets N prefilling requests take priority over decoding ones, clamped to 8 |
 | `QWEN_ADMIT_M1` | off | admits a new request one step earlier in the scheduler; opt-in, measured per box |
+| `QWEN_ADMIT_UTIL` | off | Linux prefork diagnostic only: keeps the parent admission cap at 2, but may dispatch one transient third request when a worker's recent service-loop interval is below `QWEN_ADMIT_UTIL_LIMIT_MS`; otherwise it uses the immediate overload response. It provisions child B=3 only while enabled; it is not a permanent cap-3 policy |
+| `QWEN_ADMIT_UTIL_LIMIT_MS` | 60 | recent service-loop interval limit in milliseconds for the transient third-slot predicate; benchmark thresholds must be fixed before an A/B run |
+| `QWEN_ADMIT_UTIL_TRACE` | off | diagnostic `[ADMITUTIL]` decisions: worker, active slots, sample age, recent interval, threshold and admit/reject reason |
 | `QWEN_THP` | off | `=1` advises transparent huge pages over the mapped weights (Linux) |
+| `QWEN_BATCH_MAX_FRAMES` | server: `--max-request-seconds × 12.5` (750 at the default 60 s); CLI `--batch`: 600 (48 s) | per-request generation ceiling of the batched/server paths in codec frames. Reaching it is **not** an EOS: the request is truncated, a `WARNING: request TRUNCATED after N frames` line goes to stderr and `[REQ]` traces carry `truncated=1`. Before 2026-09-08 the server stopped silently at 600 frames (48 s) while `--max-request-seconds 60` admitted 60 s of text. An explicit value here wins over the derived one; it is clamped to the RoPE cache |
 
 Note that `OPENBLAS_NUM_THREADS` is not in this table because it must be **absent**: the engine
 sizes OpenBLAS itself at startup and backs off entirely when that variable is already set, so
@@ -215,20 +255,62 @@ not be present, and the benchmark suite refuses to run when one is.
 
 | flag | default | effect |
 |---|---|---|
-| `QWEN_DECODER_BATCH` | **on in the server** (`[serve]` says so), off in the CLI | one pass over the decoder weights for every active slot. `=0` opts out |
+| `QWEN_DECODER_BATCH` | **on in the server** (`[serve]` says so), off in the CLI | one pass over the decoder weights for every active slot. `=0` opts out. It pays only where a worker actually holds several slots: on an 8-core host split `2x4`, C=4 gives each worker ~1.4 active slots, the gang never exceeds 2, and turning it **off** measured 12% better at C=4 TTFA p95 with identical RTF. Read `decoder batch: calls / mean` before believing either direction |
 | `QWEN_SERVER_NO_DECODER_BATCH` | unset | present = the server does not turn the above on for you |
-| `QWEN_DECODER_THREAD` | off | runs the decoder on its own thread beside the Talker |
+| `QWEN_DECODER_THREAD` | off | experimental decoder consumer beside Talker; with `QWEN_SD_POOL=engine` it submits decoder tiles to the shared engine pool, but the current path disables inline decoder batching and is **not a serving default** (C4 Tier-A test regressed STREAM_RTF p95 0.847→1.296 and TTFA p95 174→1126 ms; detail `.work/p4-same-pool-decoder-20260907.md`) |
+| `QWEN_SD_POOL` | server: `engine` | `engine` runs decoder tiles on the engine pool (inline when already inside a region); `private` keeps the decoder's own worker team. Legacy aliases `qwen`, `q`, `1` (engine) and `0` (private) remain accepted; unknown values fail fast |
+| `QWEN_BLAS_OWN` | server: `1` | `1` holds OpenBLAS at one thread and partitions the decoder SGEMMs across the engine pool (exact sub-problems, output bit-identical); `0` lets OpenBLAS run its own team |
+| `QWEN_CP_REGION` | on (x86 VNNI **and AMX**, int8 CP; Arm i8mm via KleidiAI prepared state) | runs each batched code-predictor transformer step as ONE persistent parallel region with spin barriers between phases instead of 20 pool dispatches; per-slot sections run one slot per thread; outputs bit-identical; `0` restores the dispatched path. The in-region runner follows the same gate table the dispatcher uses, so an AMX host runs AMX tiles in-region at `B>=4`, VNNI row blocks below that, and an Arm host packs the KleidiAI LHS once per projection group and runs the same `kai_i8_task` the dispatched path runs |
+| `QWEN_TK_REGION` | on (x86 VNNI, int8 Talker; Arm i8mm via KleidiAI prepared state) | same design for the batched Talker step: one pool entry per step (28 layers, projections as VNNI row blocks, per-slot sections one slot per thread) instead of 112 dispatches; outputs bit-identical; `0` restores the dispatched path. Off automatically with int4/bf16 weights and on the GCD pool |
+| `QWEN_CP_FRAME_REGION` | on (same build/shape conditions as `QWEN_CP_REGION`) | runs the WHOLE 16-step code-predictor frame — every MTP projection, every transformer step and every lm_head argmax — inside ONE pool entry instead of 47. The embedding row of each step is either `code0` or an argmax this frame produced, so the sequence is decidable before entering; kernels, quantiser and argmax order are unchanged and the codes are bit-identical. `0` restores the per-call path |
+| `QWEN_CP_BATCH_HEAD` | on (x86 VNNI **and AMX**, int8 CP heads) | at concurrency >= 2 runs the MTP projection and each lm_head once for all active slots as one int8 matmat (same quantiser, exact int32 dots, codes bit-identical) instead of one GEMV per slot; `0` restores the per-slot path; int4/bf16 heads and other ISAs keep the per-slot path automatically |
+| `QWEN_SD_SCRATCH_STATS` | off | diagnostic: when a stream ends, prints its decoder scratch arena (blocks, bytes, peak per chunk, spills) |
+| `QWEN_SD_THREADS` | = `-j` | thread count of the decoder's tile jobs (int8 conv, int8 GEMM, snake), whichever pool runs them |
+| `QWEN_PREFILL_LOW_MS` | 0 | with `QWEN_PREFILL_HELPER=1`: for this many ms each prefill submits to the pool at LOW priority, taking only the windows the frame loop leaves free (trade-off knob: STREAM −3%, TTFA +100/+250 ms on c8a C4) |
+| `QWEN_POOL_HI_WINDOW_US` | 200 | a LOW submitter waits while an ordinary one dispatched within this window |
+| `QWEN_SD_SGEMM_CENSUS` | off | diagnostic: prints every decoder SGEMM shape with its wall time (every 100 calls and at exit) |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |
+| `QWEN_SD_RES1_V2` | off | direct dilated int8 conv (DL-4) for the residual convs: per-position activation scale, per-(channel,tap) weight scale, no im2col panel. Leaves for AVX-512 VNNI and Arm dot-product. The DL-4 leaf takes any shape (rectangular and wide included: the activation/weight padding is per `in_ch`), so it serves **res2, the initial/pre convs and every square conv**, not only res1; the flag name understates it. The `in_ch <= 768` square-only bound now applies to the v1 panel and Design-D paths, not to DL-4 |
+| `QWEN_SD_GLUE` | off | fused residual unit on top of `QWEN_SD_RES1_V2`: snake out of place, res1 with its left context passed to the kernel, res2 with the residual in the kernel epilogue (exact, one pass) |
+| `QWEN_SD_CONVT_STACK` | off | ConvT as one un-expanded GEMM per layer with a two-tap/carry/bias epilogue (exact); measured neutral on the x86 product quantum, never qualified on Arm |
+| `QWEN_SD_CONVT_I8` | off | the one-GEMM ConvT stack (needs `QWEN_SD_CONVT_STACK=1`) on KleidiAI int8 with per-row weight scales; the exact carry/two-tap/bias epilogue is unchanged and only the GEMM output is transposed back. Numeric change: default off, Arm i8mm only today |
+| `QWEN_SD_CNEXT_I8` | off | the ConvNeXt pointwise pair (4096-wide, the largest f32 weights left in the decoder unit) on KleidiAI int8 with per-row weight scales, built at first use and driven through the prepared-state pair because the unit runs on the lane team. Numeric change: off until a paired audio gate; Arm i8mm only today |
+| `QWEN_SD_BF16_PREUP` | off | diagnostic persistent bf16 pre-transformer weights; failed its x86 audio gate and stays off |
+| `QWEN_SD_MULTISLOT` | **0 on every Arm profile (retired 2026-09-15); 2 on the Turin x86 product profile** | shared-weight decoder cohort: 2-3 slots whose next decoder unit has the same frame count are decoded as one ragged batched call, sweeping the decoder weights once for the group (DL-4 multi leaf). **Measured a net loss on Arm and retired there**: isolated `decode_quantum_bench` at the product quantum gives one singleton 40.6 ms, two sequential singletons 81.0 ms and one cohort 132.1 ms on Graviton4 (**1.63x** the sequential cost), and 34.6 / 70.1 / 84.3 ms on GCP Axion (**1.20x**); the ratio holds at chunk 1-8 and at S=3. 100% of the excess is in `conv_stack`, and `QWEN_SD_PHASE` puts it in res1/res2, the two `qwen_conv1d_int8_v2_multi` call sites: `sd_dconv_multi_worker` indexes its accumulators with runtime bounds and spills them (40 q-stores / 33 q-loads around 30 `sdot`) where the single-slot kernel keeps them in registers. Numerics are unaffected &mdash; the multi kernel is exact against the single-slot oracle in `--self-test` and paired audio gates measured `mel_corr 1.00000`. x86 VNNI keeps `2`: its twin has the same array structure but has never been measured in isolation |
+| `QWEN_SD_COHORT_MAX_B` | off (0) | diagnostic: allow cohort formation only while the worker has at most N active streams, decided once per frame turn from `n_active`. Written to test dynamic cohort admission on Arm before the cohort was retired outright; kept default-off and in no profile. Use `QWEN_SD_MULTISLOT=0` to disable cohorts in production, not this |
+| `QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC` | off | reserve the last N cpus of the worker mask for a private decoder team, and narrow the engine pool only while a decoder unit is in flight. Linux-only, **not ISA-specific** |
+| `QWEN_SERVER_ASYNC_OUTPUT` | off | experimental stream transport isolation: a bounded per-stream PCM queue and detached writer keep inference callbacks off the socket; queue overflow/disconnect fails and closes the stream rather than dropping PCM silently |
+| `QWEN_STREAM_OUTPUT_MAX_BYTES` | 1048576 | byte cap for the experimental per-stream output queue; invalid values fall back to the 1 MiB default |
+| `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS` | 5000 | socket send timeout used by the experimental stream writer; a stalled reader is terminated after the timeout |
+| `QWEN_STREAM_LEAD_GATE` | off | experimental server policy gate: after first audio, suppresses a stream's next complete Talker/CP frame while estimated delivered-audio lead exceeds the target; this is not decoder preemption |
+| `QWEN_STREAM_LEAD_TARGET_MS` | 250 (range 50–2000) | estimated audio lead target used by `QWEN_STREAM_LEAD_GATE` |
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
-| `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32 |
+| `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |
+| `QWEN_SD_AMX` | off | decoder INT8 AMX control path (V1); requires the AMX INT8 build/capability and `QWEN_SD_INT8=1`, otherwise the decoder falls back to its selected INT8/FP32 path |
+| `QWEN_SD_AMX_D` | off | experimental decoder INT8 Design D; prebuilds immutable AMX B weight tiles at model load and loads the quantised im2col panel directly as AMX A. It supports the real M=96/192/384/768 decoder shapes, reports persistent pack bytes and falls back to V1/INT8 if a shape is unsupported. FAST GCP tests now prove the path under prefork and actual continuous ragged batching; full streaming qualification and production-default selection remain pending |
+| `QWEN_SD_AMX_BF16` | off | experimental decoder AMX BF16 arm; uses real `TDPBF16PS` with activation-as-A and immutable BF16 B packs on the same decoder shapes. It can run with `QWEN_SD_INT8=0`, reports conversion/persistent-pack/tile counters, and is wired into the continuous ragged-batch path. FAST GCP evidence proves execution and parity, but its current C4 STREAM_RTF is behind Design D, so it is not a production default |
+| `QWEN_SD_STREAM_STRIP` | off | experimental SQ-1 decoder slice; on warm streaming causal convolutions with Design D, evaluates only the newly produced output columns from the existing causal tail instead of computing and discarding the left-context columns. Requires `QWEN_SD_AMX_D=1`; falls back to the unchanged full-window path otherwise |
+| `QWEN_SD_DIRECT_CONVT` | off | experimental SQ-2 decoder preparation path; streaming and ragged transposed convolutions accumulate each existing per-tap GEMM directly into the useful output range and request-local carry instead of materializing/copying a full overlap buffer. It preserves the control path and is independently disable-able; allocation failure falls back to the existing implementation |
+| `QWEN_SD_DIRECT_DWCONV` | off | experimental SQ-2b ragged decoder path; keeps depthwise ConvNeXt input/output in the global ragged workset and removes the per-item temporary copy-in/copy-out. It preserves the existing arithmetic and tail update order, is independently disable-able, and falls back to the existing implementation if the direct helper rejects the shape |
+| `QWEN_SD_DIRECT_INPUT` | off | experimental SQ-2c warm streaming path; prepares Design-D INT8 panels directly from the request-local causal tail plus new input instead of materializing a concatenated fp32 `[tail | input]` buffer. It preserves the existing range path/fallback and updates the tail with the established helper after successful execution |
+| `QWEN_SD_FUSED_RESIDUAL` | off | experimental SQ-2d decoder path; for same-width 1x1 residual projections, adds the residual in the Design-D AMX epilogue while storing the projection result, avoiding the separate full-size residual-add pass in both per-slot and ragged worksets. The output buffer remains separate so unsupported paths retain the existing fallback. CLI byte/audio parity, server path proof, short 2x6 C3/C4 A/B and pooled five-minute mixed-bank C4 SOAK pass; pooled STREAM_RTF p95 0.8933. C5/C6 remain non-streamable because admission TTFA/safe-start tails explode; keep default-off (`.work/p4-fused-residual-20260907.md`) |
+| `QWEN_SD_INT8_BLK` | compiled default | block size of the int8 decoder convolution tiles |
+| `QWEN_SD_CONV_NC` | all | auto | output columns per work item in the INT8 decoder conv. Auto sizes the panel from the layer length and the pool so a short layer still fills it; `=128` restores the old fixed panel (the A/B arm). Each column is im2col'd, quantised and scaled independently, so the panel size changes only WHO computes a column, never its value |
+| `QWEN_SD_RAG_MIN_PANELS` | 8 | minimum ragged decoder panel count that submits to the engine pool; experimental A/B control only, with worker/kernel/fallback behavior unchanged |
+| `QWEN_SD_WINDOWED` | off | windowed decoder evaluation; diagnostic for the streaming boundary |
+| `QWEN_DEC_FIRSTCHUNK_GROUP` | 0 (off) | `=1` groups the first streaming chunk of several slots into one decoder pass |
+| `QWEN_THREADS_TALKER` · `QWEN_THREADS_DECODER` | unset (both = `-j`) | split the thread budget between the Talker/CP phase and the decoder phase inside one worker |
+| `QWEN_NO_SIN_POLY` | unset | `=1` drops the polynomial sine used by the snake activation back to `sinf`; the polynomial is only used where the argument is in range |
 
 ## 6. Precision and voice
 
 | flag | default | effect |
 |---|---|---|
 | `QWEN_CP_PREC` | follows `--int8` / `--int4` | `int8` or `int4` for the Code Predictor alone — the lever behind the mixed-precision configurations |
+| `QWEN_CP_LAYER_PREC` · `QWEN_CP_LMHEAD_PREC` | follow `QWEN_CP_PREC` | the same choice for the CP's layers and its lm_heads separately |
+| `QWEN_CP_PREFILL2` | **on** for an AVX-512-VNNI build, off elsewhere | runs the CP's first pass two positions at a time so it reaches a batched kernel. `=0` opts out, and the kernel audit then shows the CP's batched rows disappearing entirely |
 | `QWEN_TALKER_PREC` | follows `--int8` / `--int4` | the same for the Talker |
 | `QWEN_CP_Q2_FFN` | off | `gateup`, `down` or `both` push those Code Predictor projections to 2 bits. Quality gate first |
 | `QWEN_ICL_FRAMES` | the context's own cap | caps the reference frames an in-context voice keeps (anchor dilution) |
@@ -237,11 +319,96 @@ not be present, and the benchmark suite refuses to run when one is.
 ## 7. Diagnostics — never in a run that produces a number
 
 `QWEN_TTFA_TRACE`, `QWEN_SD_PHASE`, `QWEN_LIFE_TRACE`, `QWEN_REQ_TRACE`, `QWEN_BATCH_STATS`,
-`QWEN_SERVE_PROFILE`, `QWEN_TF_CODES`, `QWEN_TF_PREFIX`.
+`QWEN_SERVE_PROFILE`, `QWEN_STAGE_TRACE`, `QWEN_TF_CODES`, `QWEN_TF_PREFIX`.
 
 They print phase tables, per-request lifecycles and kernel censuses, and every one of them
 costs time inside the region being timed. A deployment profile declares them `null` for that
 reason: counters and timing do not share a binary in a run that produces a published figure.
+
+Used for **attribution** rather than timing, two of them answer questions the wall clock cannot:
+
+- `QWEN_BATCH_STATS=1` prints `[batch-audit]`, which names the kernel that did each batched
+  projection and splits it by Talker / Code Predictor / speech decoder. This is how you prove a
+  flag did what it claims: with `QWEN_PREFILL_MATMAT=1` on an AMX host the Talker's 39.5 GMAC
+  sit on `bf16 AMX tiles`, and adding `QWEN_NO_AMX=1` moves the *same* GMAC to
+  `bf16 AVX-512 dpbf16`. A number that does not move under its own control was not measuring
+  what you thought.
+- `QWEN_SERVE_PROFILE=1` prints `[serve-profile]`: per-stage milliseconds, the mean number of
+  active slots, and — the line to read before trusting anything about batching —
+  `decoder batch: calls / mean` with `max slots`. A mean of 1.00 means the batch never formed,
+  whatever the flag says.
+- `QWEN_STAGE_TRACE=1` prints one `[STAGE]` line per completed active engine iteration with
+  monotonic absolute start/end and phase times, active/stepped slots, decoder group
+  information, whether the decoder ran per-item or ragged, and synchronous output time.
+  `tools/stage_pressure.py --client-jsonl ...` can perform a receive-gap overlap join when
+  both sides carry the same host monotonic clock; the result remains diagnostic-only and
+  does not prove client-gap causality by itself.
+
+### Which kernel actually ran, and whether a fix can reach it
+
+`[batch-audit]` names the kernel per component, and one line under it answers a question the MAC
+table cannot:
+
+```
+fallback twin dispatch: bf16 222 fixed-width / 0 generic  ·  int8 96 fixed-width / 0 generic
+fallback twin dispatch: never reached (a wider matmat took every batched call on this build)
+```
+
+The twins are what run when no VNNI, AMX, SDOT, SMMLA or KleidiAI matmat takes the call, and
+the counters record which arm of their fixed-width switch was used — including "never reached",
+which is the honest answer on a build whose dispatcher sends everything to a matrix unit. It
+exists because a kernel improvement is worth exactly what the dispatcher lets it be worth: the
+fixed-width kernels added for bf16 B=9..15 and int8 B=1/5/7/9..15 are a 5-10x improvement on
+builds that reach them, and **zero** on an AMX or AVX-512 host, where these counters stay at
+zero on real prefill shapes, while at `SIMD=portable`, where `--caps` shows
+`bf16 -> fixed-B twin`, the same widths move 11.87 -> 2.25 ms (B=9) and 10.03 -> 1.32 ms (int8
+B=1). Measure the dispatch before claiming the speedup.
+
+### What the flags RESOLVED to, not what was typed
+
+`[FLAGS]` is the raw environment: a variable nobody set is absent, a compiled default is
+invisible, and a predicate that decides a whole path can live outside the gate table. That is
+how an AVX-512-BF16 host ran the Talker prefill on the f32/SGEMM fallback for weeks (~400 ms of
+TTFA at C=1) while every `[FLAGS]` line looked right. `./qwen_tts --dispatch-map` prints the
+other side, per logical feature: **compiled · supported on this CPU · env · resolved · reason**,
+where *resolved* is obtained by calling the runtime predicate itself, and a second table with
+every `g_mm_gate[]` row as `qwen_mm_use()` answers it now. When `tools/cpu_check.sh` receives a
+profile, it runs this map under the profile's actual environment; an explicit
+`QWEN_PREFILL_MATMAT=1` with no native BF16 unit is a hard dispatch-gate finding instead of a
+warning that can survive into a long suite:
+
+```
+[DISPATCH] v=1 pid=… isa_class=x86_avx512bf16 build=1496938 simd=avx512bf16
+  feature                      compiled supported env                       resolved reason
+  talker.prefill.matmat_bf16   yes      yes       QWEN_PREFILL_MATMAT=unset ON       avx512_bf16_matmat_available (VDPBF16PS)
+  talker.prefill.f32_blas_fallback yes  yes       -                         OFF      not taken: bf16 matmat selected
+  prepack.vnni                 yes      yes       QWEN_VNNI_PREPACK=unset   OFF      opt-in; int8 only; REJECTED …
+[DISPATCH-GATE] v=1 rows=13 …
+  gate.int8.vnni   int8 VNNI vpdpbusd   yes  yes  ON   2(2) …  QWEN_NO_VNNI   default ON
+```
+
+The Arm rows are there too — `talker.prefill.matmat_bf16` via `arm_bf16_matmat_available`
+(BFMMLA), `matvec.int8.sdot`, the opt-in `matvec.bf16.bfdot` (`QWEN_ARM_BFDOT`), `q8repack.neon`,
+every `kleidi.*` knob (`QWEN_NO_KLEIDI`, `QWEN_NO_KAI_I8`, `QWEN_NO_KAI_BF16`, `QWEN_KAI_OPS`,
+`QWEN_KAI_QKV_FUSED`, `QWEN_KAI_LHS`, `QWEN_KAI_NCHUNK`), the Apple `apple_off` gate rows with
+`QWEN_APPLE_MMLA`, and `QWEN_POOL_SPIN` with its Linux/aarch64 default of 65536 — so the §9
+"what does not port" list can be read off the machine instead of remembered.
+
+`QWEN_DISPATCH_JSON=path` writes the same rows as JSON; `tools/dispatch_gate.py` compares them
+with `tools/dispatch_expect.json` for the host's `isa_class` and prints `SUSPICIOUS` for a
+feature that is expected ON, compiled, supported and still OFF — the automatic detector for
+that class of bug. `make cpu-check` runs all of it (see [cpu-profiling.md](cpu-profiling.md)).
+`QWEN_DISPATCH_MAP=1` (or any of `QWEN_SERVE_PROFILE` / `QWEN_SHAPE_CENSUS`) makes the server
+print the table in its own banner, so the engagement proof sits inside the timed run's log.
+Every SIGUSR1 counter dump is now bracketed by `[DUMP] v=1 pid=… seq=N … begin` / `end`, so a
+harness that signals before and after a cell can separate the two.
+
+### Is a flag even declarable?
+
+`[FLAGS]` can only report what `g_qwen_reported_flags[]` lists, so a flag the engine reads but
+never declares is one a deployment cannot audit — `check-flags` will happily pass while the
+process runs a configuration nobody asked for. `make check-flag-registry` compares the two sets
+in both directions and fails if they differ; it runs inside `make test-all`.
 
 ## 8. Levers outside the register
 
@@ -258,9 +425,22 @@ for A/B only), `QWEN_SERVER_STRICT`, `QWEN_CANCEL_ON_DISCONNECT`, `QWEN_TTFA_FRE
 Where a CLI flag exists for the same thing, the CLI flag is the one to use: it lands in the
 process arguments, which a `ps` can read months later.
 
+### VNNI parent prepack — candidate, not a default
+
+`QWEN_VNNI_PREPACK=1` (also `all`) builds the eligible INT8 weight layout before prefork;
+`cp` and `talker` restrict that work to one component. The packed layout is reused by the
+batched VNNI matmat path for `B=2..8`; GEMV is unchanged. This is deliberately different from
+the ARM `QWEN_KAI_NCHUNK` knob: it changes the weight representation, not the GEMM's n tile.
+
+On the 16-core VNNI reference host, the corrected `cp` experiment prepacked 41 CP matrices
+(about 102 MB) and produced byte-identical audio. It did not improve the measured server
+objective: C=4 TTFA p95 was 318 ms without it and 319 ms with it, while total RTF moved from
+1.10 to 1.13. The profile therefore leaves the variable null. Use the flag to qualify a new
+host or workload, and record the parent prepack count before interpreting the result.
+
 ---
 
-## 9. What applies on which ISA, and what x86 does not have yet
+## 9. What applies on which ISA, and what does not port
 
 A profile written on one architecture does not port by copying. Three groups:
 
@@ -277,18 +457,25 @@ when the toolchain reports `__ARM_FEATURE_MATMUL_INT8` or `__ARM_FEATURE_BF16`; 
 their `*_MIN_B` thresholds. `QWEN_PREFILL_MATMAT` exists on both, but what it selects differs:
 the KleidiAI bf16 matmat on ARM, the AMX one on x86.
 
-**x86 only** — `QWEN_NO_VNNI`, `QWEN_NO_AMX`, `QWEN_NO_AVX2MM`, `QWEN_NO_BF16DOT`,
-`QWEN_SD_INT8` (on by default only where AVX-512 VNNI exists), and the AMX/VNNI/AVX2
-thresholds.
+**x86 only** — `QWEN_NO_VNNI`, `QWEN_NO_VNNI_TILE`, `QWEN_NO_AMX`, `QWEN_NO_AVX2MM`,
+`QWEN_NO_BF16DOT`, `QWEN_NO_BF16_MATMUL`, the AMX/VNNI/AVX2 batch thresholds, and the
+`*_NCHUNK` row-chunk family.
 
-**The gap worth naming:** there is no x86 counterpart to `QWEN_KAI_NCHUNK` today. On ARM that
-lever exists because the GEMM's n dimension is sub-tiled so the microkernel's second pass finds
-the packed right-hand side still in cache; on x86 the AMX and VNNI matmats are entered through
-the gate table's batch/rows/cols thresholds and have no cache sub-tiling knob at all. So an
-x86 deployment profile can pin *when* those kernels are used, but not how they tile — if a
-future x86 host shows the same second-pass cache miss, the knob has to be written, not
-configured. Say so in the profile's `qualification.notes` rather than silently copying the ARM
-value into a file where it does nothing.
+**Both, but opt-in outside VNNI** — `QWEN_SD_INT8` has an int8 decoder conv on Arm
+dot-product too; it is default-on only where AVX-512 VNNI is. `QWEN_SD_RES1_V2` and
+`QWEN_SD_GLUE` have both a VNNI and an Arm dot-product leaf. `QWEN_SD_LANE_SPLIT` /
+`QWEN_SD_LANE_ELASTIC` and `QWEN_SD_CONVT_STACK` carry no ISA guard at all. AVX2 and
+AVX-512F have **no** int8 decoder conv, so there the whole family falls back to f32
+im2col + SGEMM.
+
+**The two sides are not symmetric, and the asymmetry is the point.** `QWEN_KAI_NCHUNK` is on by
+default at 384 because sub-tiling the KleidiAI GEMM was measured to win on ARM. The x86
+`*_NCHUNK` knobs exist but default to **off**: the kernels they tile are entered through the gate
+table's batch/rows/cols thresholds, and no x86 host has yet shown the second-pass cache miss that
+makes chunking pay. Treat them as instrumentation for a new box — measure, and only then pin a
+value in that box's profile. A value copied across architectures means nothing: the ARM number is
+an n-dimension tile inside a packed GEMM, the x86 ones are output-row chunks in a different
+kernel, and neither reads the other's units.
 
 ---
 

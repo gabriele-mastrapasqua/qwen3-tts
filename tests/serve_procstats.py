@@ -15,9 +15,16 @@ def worker_pids_from_log(log_path):
     that is what ties a dispatcher worker INDEX to a pid, which /proc alone cannot do.
     Returns [] for a single-process topology, where the caller uses the pid it spawned.
     """
-    out = []
-    for m in re.finditer(r"prefork: worker (\d+) pid (\d+) cpus ([\d\-]+) threads (\d+)",
-                         _read(log_path)):
+    text = _read(log_path)
+    # The engine now states its own execution domain on BOTH serving paths, so a
+    # single-process topology is no longer invisible here.  The legacy prefork line stays
+    # as the fallback for logs written before that.
+    out = [(int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4)))
+           for m in re.finditer(r"\[TOPOLOGY\] v=1 worker=(\d+) pid=(\d+) "
+                                r"configured_mask=\S+ actual_mask=(\S+) threads=(\d+)", text)]
+    if out:
+        return out
+    for m in re.finditer(r"prefork: worker (\d+) pid (\d+) cpus ([\d\-]+) threads (\d+)", text):
         out.append((int(m.group(1)), int(m.group(2)), m.group(3), int(m.group(4))))
     return out
 

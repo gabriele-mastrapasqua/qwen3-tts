@@ -47,15 +47,23 @@ x86, all with a scalar fallback and a runtime ISA guard. On x86 the `make blas` 
 portable **AVX2 + FMA** baseline (Haswell 2013+). Pick a higher level explicitly with `SIMD=`:
 
 ```bash
-make blas                    # x86 default: portable -mavx2 -mfma (works on any Haswell+ CPU)
+make blas                    # Linux/x86: SIMD=auto — reads /proc/cpuinfo, probes the compiler, picks
+                             # the highest level both support and prints "[simd] auto -> …"
+make blas SIMD=portable      # -mavx2 -mfma baseline (any Haswell+ CPU); the binary travels
 make blas SIMD=scalar        # no AVX2 — pre-2013 CPUs / portable fallback
-make blas SIMD=avx512         # AVX-512 (adds the __m512 16-wide bf16 matvec)
-make blas SIMD=avx512vnni    # AVX-512 + VNNI native int8 dot (_mm512_dpbusd_epi32) — Zen4+/Intel
+make blas SIMD=avx512        # AVX-512 (adds the __m512 16-wide bf16 matvec)
+make blas SIMD=avx512vnni    # + VNNI native int8 dot (_mm512_dpbusd_epi32) — Ice Lake, Zen4+
+make blas SIMD=avx512bf16    # + AVX-512 BF16 (VDPBF16PS bf16 matvec/matmat) — Zen4/Zen5, SPR+
+make blas SIMD=amx           # + AMX int8/bf16 tiles — Sapphire/Emerald/Granite Rapids
 
 # verify what the binary actually compiled + the CPU it's running on:
 ./qwen_tts --caps            # e.g. "int8 dot: VNNI _mm512_dpbusd_epi32 (native)"
 ./qwen_tts --self-test       # kernel numeric correctness vs an f32 reference (no model needed)
+./qwen_tts --dispatch-map    # every dispatch decision RESOLVED for this host+env (make cpu-check)
 ```
+
+`SIMD=auto` builds a binary that is **not portable to an older CPU**; pin the level in the
+deployment profile so the box that reproduces your numbers compiles the same kernels.
 
 `SIMD=avx512vnni` needs `avx512f avx512bw avx512vl avx512_vnni` in `/proc/cpuinfo` (note the
 kernel flag is `avx512_vnni`, with an underscore). If you build for an ISA your CPU lacks, the

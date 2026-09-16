@@ -361,13 +361,18 @@ int qwen_q8r_matmul(float *Y, const void *key, const float *X, int rows, int col
     if (B == 1) {
         q8r_quant_act(g_q8r_act, X, cols);
     } else {
-        float *tmp = (float *)malloc((size_t)cols * sizeof(float));
-        if (!tmp) return 0;
+        /* grow-once per thread: this ran once per matmat call on every B>1 shape */
+        static __thread float *tmp = NULL;
+        static __thread size_t tmp_cap = 0;
+        if ((size_t)cols * sizeof(float) > tmp_cap) {
+            void *np = NULL;
+            if (posix_memalign(&np, 64, (size_t)cols * sizeof(float)) != 0) return 0;
+            free(tmp); tmp = (float *)np; tmp_cap = (size_t)cols * sizeof(float);
+        }
         for (int b = 0; b < B; b++) {
             for (int c = 0; c < cols; c++) tmp[c] = X[(size_t)c * B + b];
             q8r_quant_act(g_q8r_act + (size_t)b * nb, tmp, cols);
         }
-        free(tmp);
     }
 
     q8r_job_t job = { e->packed, g_q8r_act, Y, rows, cols, B, nb };

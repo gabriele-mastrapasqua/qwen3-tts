@@ -1,0 +1,330 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "axion-c4a-highcpu32-0p6b-all-on",
+    "description": "Host-scoped all-on Arm v2 policy for GCP c4a-highcpu-32 / Neoverse-V2 with the 0.6B model. C16 is preferred; C20 is the measured soft edge. This is not a generic Arm or 1.7B profile.",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [
+        1,
+        20
+      ],
+      "preferred_concurrency": 16,
+      "quality_changes_allowed": false
+    }
+  },
+  "parity": {
+    "lane": "arm-product",
+    "isa_classes": [
+      "arm_i8mm_bf16",
+      "arm_dotprod"
+    ],
+    "decoder": {
+      "requested_batch": 1,
+      "expected_modes": [
+        "per-item-int8-dotprod"
+      ],
+      "precision": "int8",
+      "fallback_status": "VALID FALLBACK"
+    },
+    "backends": {
+      "talker_cp": "kai",
+      "prefill": "kai",
+      "q4": "kai"
+    },
+    "features": {
+      "design_d": "UNSUPPORTED",
+      "fused_residual": "UNSUPPORTED",
+      "kleidi": "ACTIVE",
+      "res1_v2": "ACTIVE",
+      "decoder_lane": [
+        "ACTIVE",
+        "VALID FALLBACK"
+      ],
+      "multislot": [
+        "ACTIVE",
+        "VALID FALLBACK"
+      ]
+    },
+    "quality_gate": {
+      "required": true,
+      "command": "strict profile preflight + same-model serving-generation structural/audio gate",
+      "audio_gate": "same 0.6B model, voice, language, seed/settings and bank; valid non-empty PCM/WAV plus playback checks",
+      "reject_on": [
+        "host/topology mismatch",
+        "KleidiAI bypass",
+        "wrong decoder precision",
+        "wrong Q4/I8 policy",
+        "quality regression"
+      ]
+    },
+    "tunable_flags": [
+      "QWEN_KAI_NCHUNK",
+      "QWEN_POOL_SPIN"
+    ],
+    "notes": "Host-scoped c4a-highcpu-32 policy. KAI, RES1_V2, BF16 pre-up, elastic lane split and the 2-slot multislot cohort are pinned active for the measured 0.6B setup; C16 is preferred and C20 is the soft edge."
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_family": "Google Axion / Arm Neoverse-V2",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 80,
+    "ram_gib": 62,
+    "isa_features_used": [
+      "asimd",
+      "asimddp",
+      "i8mm",
+      "bf16"
+    ],
+    "smt_policy": "OFF; one thread per physical core",
+    "canonical_topology": "4 workers x 8 threads, contiguous masks 0-7, 8-15, 16-23, 24-31",
+    "notes": "GCP c4a-highcpu-32, no SMT. SVE/SVE2 are present but the engine uses the measured KAI/ASIMD paths here."
+  },
+  "build": {
+    "target": "SIMD=arm-i8mm-bf16 with KleidiAI",
+    "requirements": {
+      "isa": "ASIMDDP + I8MM + BF16 HWCAP/compile support",
+      "decoder": "explicit Arm DOTPROD INT8 policy"
+    }
+  },
+  "server": {
+    "prefork_workers": 4,
+    "threads_per_worker": 8,
+    "batch_size": 8,
+    "max_queue": 0,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
+    "worker_affinity": "contiguous core slices, worker 0 -> CPU 0-7, worker 1 -> CPU 8-15, worker 2 -> CPU 16-23, worker 3 -> CPU 24-31"
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 4,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8",
+      "code_predictor_weights": "int8",
+      "speech_decoder_weights": "int8 per-item DOTPROD with RES1_V2",
+      "activations": "KAI native preparation; INT8 RES1_V2 decoder panels",
+      "gemm_backend": "KleidiAI INT8/Q4/BF16"
+    },
+    "environment": {
+      "QWEN_ARM_BFDOT": {
+        "value": "0",
+        "why": "keep the measured/default KAI BF16 policy explicit; BFDOT is a separate opt-in"
+      },
+      "QWEN_BLAS_OWN": {
+        "value": "1",
+        "why": "same engine-owned compute-budget request"
+      },
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "keep the external BLAS pool from spinning against the engine pool"
+      },
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "must be absent so engine-owned BLAS sizing is effective"
+      },
+      "OMP_NUM_THREADS": {
+        "value": null,
+        "why": "must be absent; the engine profile owns the CPU budget"
+      },
+      "QWEN_CP_PREC": {
+        "value": "int8",
+        "why": "pin CP precision"
+      },
+      "QWEN_CP_PREFILL2": {
+        "value": "1",
+        "why": "pin the explicit Arm CP prefill policy"
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "1",
+        "why": "keep server batching semantics; preflight verifies per-item decoder leaf"
+      },
+      "QWEN_SD_BF16_PREUP": {
+        "value": "1",
+        "why": "host-scoped all-on 0.6B policy; KAI BF16 prepared-state path is enabled"
+      },
+      "QWEN_INT8_SDOT_MM": {
+        "value": "0",
+        "why": "do not opt into the separate generic SDOT matmat gate"
+      },
+      "QWEN_INT8_SDOT_MIN_B": {
+        "value": "2",
+        "why": "pin the Arm SDOT matmat gate even though the product decoder is per-item"
+      },
+      "QWEN_SMMLA_MIN_B": {
+        "value": "2",
+        "why": "pin the Arm i8mm gate"
+      },
+      "QWEN_BFMMLA_MIN_B": {
+        "value": "2",
+        "why": "pin the Arm BF16 matrix gate"
+      },
+      "QWEN_KLEIDI_MIN_B": {
+        "value": "1",
+        "why": "pin the KAI Q4/int8 gate"
+      },
+      "QWEN_KAI_LHS": {
+        "value": "asym",
+        "why": "pin the existing asymmetric KAI LHS quantisation mode"
+      },
+      "QWEN_KAI_QKV_FUSED": {
+        "value": "1",
+        "why": "pin KAI fused QKV policy"
+      },
+      "QWEN_KAI_NCHUNK": {
+        "value": "384",
+        "why": "pin the measured KAI GEMM n-subtiling policy"
+      },
+      "QWEN_NO_BFMMLA": {
+        "value": "0",
+        "why": "allow native Arm BF16 matrix path"
+      },
+      "QWEN_NO_KAI_BF16": {
+        "value": "0",
+        "why": "require KAI BF16 where supported"
+      },
+      "QWEN_NO_KAI_I8": {
+        "value": "0",
+        "why": "require KAI INT8 where supported"
+      },
+      "QWEN_NO_KLEIDI": {
+        "value": "0",
+        "why": "KleidiAI is the Arm product backend"
+      },
+      "QWEN_NO_Q8REPACK": {
+        "value": "0",
+        "why": "retain the native Arm Q8 repack path"
+      },
+      "QWEN_NO_SDOT": {
+        "value": "0",
+        "why": "require the Arm DOTPROD decoder leaf"
+      },
+      "QWEN_NO_SMMLA": {
+        "value": "0",
+        "why": "allow the KAI/i8mm matrix path"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "65536",
+        "why": "Arm-specific starting policy; must be requalified on the target host"
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "same server semantics as the AMX lane"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "require native KAI BF16 prefill"
+      },
+      "QWEN_Q4_NAIVE": {
+        "value": "0",
+        "why": "do not select scalar Q4"
+      },
+      "QWEN_SD_AMX": {
+        "value": null,
+        "why": "x86-only legacy switch; must be absent on Arm"
+      },
+      "QWEN_SD_AMX_BF16": {
+        "value": "0",
+        "why": "no Arm AMX decoder path"
+      },
+      "QWEN_SD_AMX_D": {
+        "value": "0",
+        "why": "no Arm Design-D decoder path"
+      },
+      "QWEN_SD_DIRECT_CONVT": {
+        "value": "0",
+        "why": "AMX-only experiment"
+      },
+      "QWEN_SD_DIRECT_DWCONV": {
+        "value": "0",
+        "why": "AMX-only experiment"
+      },
+      "QWEN_SD_DIRECT_INPUT": {
+        "value": "0",
+        "why": "AMX-only experiment"
+      },
+      "QWEN_SD_FUSED_RESIDUAL": {
+        "value": "0",
+        "why": "no Arm fused residual implementation"
+      },
+      "QWEN_SD_INT8": {
+        "value": "1",
+        "why": "select the measured Arm INT8 RES1_V2 decoder"
+      },
+      "QWEN_SD_INT8_BLK": {
+        "value": "64",
+        "why": "pin the existing non-VNNI decoder block policy"
+      },
+      "QWEN_SD_LANE_ELASTIC": {
+        "value": "1",
+        "why": "measured 4x8 Neoverse-V2 lane policy"
+      },
+      "QWEN_SD_LANE_SPLIT": {
+        "value": "4",
+        "why": "reserve the measured Arm decoder lane split"
+      },
+      "QWEN_SD_MULTISLOT": {
+        "value": "0",
+        "why": "RETIRED on this host 2026-09-15. Three independent measurements agree. (1) Isolated decode_quantum_bench, chunk 4, taskset 0-7: one singleton 34.6 ms, two sequential singletons 70.1 ms, one ragged cohort 84.3 ms = 1.20x the sequential cost (the same shape as Graviton4, where it is 1.63x; the penalty is the shared Arm dotprod multi-slot leaf, whose runtime-indexed accumulators spill where the single-slot kernel keeps them in registers). (2) Paired serving screen at the previously recommended 1.7B C12, cohort ON vs OFF: STREAM p95 0.653 -> 0.621, TTFA p95 164 -> 149 ms, safe-play-start p95 229 -> 189 ms, completions 582 -> 609. (3) Paired serving screen at 0.6B C16: STREAM p95 0.884 -> 0.833, TTFA 221 -> 196 ms, safe-start 424 -> 366 ms, completions 603 -> 653. Per-item int8 DOTPROD is the qualified decoder leaf here. The audio is unaffected: the multi-slot kernel is exact against the single-slot oracle in --self-test, and a paired concurrency-4 audio gate on the sibling Arm host measured mel_corr 1.00000 on every pair.",
+        "revert": "QWEN_SD_MULTISLOT=2 only after an exact S==2 named-accumulator kernel lands and beats sequential singleton decode in decode_quantum_bench on this host"
+      },
+      "QWEN_SD_RES1_V2": {
+        "value": "1",
+        "why": "select the verified rectangular/wide Arm DOTPROD decoder leaf"
+      },
+      "QWEN_SD_POOL": {
+        "value": "engine",
+        "why": "same engine-owned decoder pool semantics"
+      },
+      "QWEN_SD_RAG_MIN_PANELS": {
+        "value": "2",
+        "why": "same logical threshold; no Arm ragged decoder implementation is implied"
+      },
+      "QWEN_SD_STREAM_STRIP": {
+        "value": "0",
+        "why": "Design-D warm strip unavailable on Arm"
+      },
+      "QWEN_SD_WINDOWED": {
+        "value": "0",
+        "why": "explicitly disable the legacy windowed fallback so the exact streaming decoder semantics are resolved"
+      },
+      "QWEN_SERVER_ASYNC_OUTPUT": {
+        "value": "0",
+        "why": "same synchronous output contract"
+      },
+      "QWEN_SERVER_NO_DECODER_BATCH": {
+        "value": null,
+        "why": "presence flag must remain absent; decoder request is explicit"
+      },
+      "QWEN_TTS_STREAM_LAYOUT": {
+        "value": "1",
+        "why": "same official known-text serving layout as AMX; ICL/clone and live incremental text remain outside this lane"
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "unqualified",
+    "workload": "Host-scoped 0.6B all-on deployment candidate on GCP c4a-highcpu-32, 4x8. C16 preferred; C20 is the soft realtime edge; C32 is admission-only.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-0.6b",
+    "speaker": "ryan",
+    "notes": "This profile deliberately scopes the all-on deployment candidate to this 32-core c4a host and the 0.6B model. It makes no 1.7B claim and does not change arm-product defaults. Final confirmation: C16 had zero errors/rejects/timeouts and STREAM_RTF p95 0.881 but missed per-class drift; C20 is an edge with STREAM_RTF p50/p95 1.02/1.09 and playback degradation; paired audio mel correlation was 0.94558-0.96306 vs 0.98. C32 must remain admission-only. Status stays unqualified until the numerical/audio delta is fixed or explicitly accepted."
+  }
+}

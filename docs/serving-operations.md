@@ -9,6 +9,13 @@ The short version: **a serving configuration is discovered on the box, not chose
 datasheet.** The engine ships a break-in procedure and a benchmark suite for exactly that, and
 a profile format so the answer survives the session that found it.
 
+> **Scope: this document is about the CPU backend.** Its topology work, its `W x K` search, its
+> pool and pinning discussion and every number in it are sized by cores, cache and memory
+> channels. The CUDA server is sized by GPU memory bandwidth instead, has its own flags and its
+> own traps, and is not performance-qualified — see
+> [`cuda-performance.md` § CUDA streaming server](cuda-performance.md). Nothing here transfers to
+> it, and a number from one must never be quoted for the other.
+
 ---
 
 ## 1. Three ways to run it, and the one you probably want
@@ -114,6 +121,15 @@ so beside the numbers; what you must not do is let a `2x8` slice quietly mean fo
 ### The procedure
 
 ```bash
+# 0. the preflight, and the artifact directory every later number refers to
+make doctor                       # first command on a new box; <1 min, no model: identity,
+                                  # bandwidth, and on 32-core Arm Linux a simultaneous 1x8/2x8/4x8
+                                  # roof_matvec_int8 scaling preflight; then the engine's own GEMV
+                                  # roof, resolved dispatch, shape probe -> a PREDICTED W x K /
+                                  # cap / quantum / env set and a draft profile
+make cpu-check                    # provenance + hardware + self-test + RESOLVED dispatch map vs
+                                  # what this ISA class should select; fails on a silent fallback
+
 # 1. what does this machine actually have?
 make bench-fingerprint            # cpu, cores, SMT, cache, NUMA, measured memory bandwidth
 ./qwen_tts --caps                 # which kernels the binary would pick, per batch width
@@ -127,6 +143,13 @@ $EDITOR configs/perf/<your-host>.json
 ```
 
 Steps 1 and 2 are cheap. Step 3 is what makes the result last: see §3.
+
+`make doctor` is the topology screen, not a serving qualification. Its Arm
+multi-worker GEMV block is visible near the top and archives
+`arm_gemv_scaling.json`; a poor 4×8 verdict means test `2x16`, then `1x32`,
+before paying for a wave or soak. The verdict concerns the tested 4×8 shape,
+not the whole instance. Details and interpretation are in
+[Arm topology preflight](arm-topology-preflight.md).
 
 `bench-topo` starts one server per topology, fires true simultaneous waves at each concurrency
 and prints one row per cell. Measured on the 16-core Axion reference host, 1.7B open weights at
@@ -313,22 +336,96 @@ Never call any of them simply "concurrency N".
 A threshold from one does not transfer to another. The wave is the hardest and the one
 comparable to firing N streams at an accelerator.
 
+### Closed-loop soak: stability over time
+
+The soak is a separate, deliberately longer test. It keeps `C` streaming conversations open
+in a closed loop: each conversation sends its next request only after the previous response
+finishes. The default schedule is seeded and stratified across the text-bank classes, so a
+length-heavy class cannot silently take over the end of the run. Every five minutes it also
+saves a fixed probe response for listening; probe requests are excluded from latency KPIs.
+
+Run it after the qualification suite, with the same open model and deployment profile:
+
+```bash
+make bench-soak SOAK_MODEL=qwen3-tts-1.7b-base \
+                 SOAK_PROFILE=<measured-profile> \
+                 SOAK_CONCURRENCY=2 SOAK_MINUTES=30 \
+                 SOAK_OUT=/tmp/qwen_tts_soak
+
+# Run both the qualification suite and the soak as two identifiable artifacts.
+# The Make target passes the BENCH_* model/profile/bank defaults to the soak and
+# starts it only after the qualification suite completes.
+make bench-suite-full BENCH_MODEL=qwen3-tts-1.7b-base \
+                      BENCH_PROFILE=<measured-profile> \
+                      SOAK_MINUTES=30
+```
+
+The runner refuses an unknown model name: public examples are limited to
+`qwen3-tts-0.6b`, `qwen3-tts-0.6b-base`, `qwen3-tts-1.7b` and `qwen3-tts-1.7b-base`.
+Use `--no-profile "reason"` only for an explicitly exploratory run. The output directory
+contains `manifest.json`, `server.log`, `requests.csv`, `resources.csv`, `soak_summary.json`
+and a small set of probe WAVs.
+
+The analyzer reports three separate decisions:
+
+| result | meaning |
+|---|---|
+| `LATENCY KPI: PASS` | comparable rolling windows stayed within the declared TTFA/RTF limits |
+| `LATENCY KPI: NOT_ASSESSED` | the run completed, but there were too few windows or the completed-text mix changed too much; use the per-class rows, not a pooled drift claim |
+| `RESOURCE STABILITY: PASS` / `FAIL` | the server process tree did or did not show memory, thread or descriptor growth |
+
+`SOAK RESULT: PARTIAL` is intentional: it means the run is useful for stability, but latency
+drift was not scientifically assessable. The default command does not fail for that case;
+add `--strict-kpi` through `SOAK_ARGS` when a pipeline must reject an unassessed latency KPI.
+Intentional fail-fast `503` responses are recorded separately as admission outcomes and do
+not fail the run; queue timeouts and server-side request timeouts still do. The analyzer
+fails only on request errors, resource growth, those timeout counters, or a measured KPI
+regression.
+
+Per-class p50 and p95 have separate evidence thresholds (`--min-per-class-p50`, default 5;
+`--min-per-class-p95`, default 20) because with four or five observations the percentile is
+effectively the maximum and one scheduling or text outlier can look like a regression. A short soak may therefore show
+`PER-CLASS KPI: <class>=PARTIAL` while pooled latency and resource checks pass. That is not a
+model failure. To assess per-class tails, use larger comparison windows and a longer run, for
+example `--window-s 300 --min-per-class 5 --min-per-class-p95 15` for a 15–30 minute soak.
+`--strict-kpi` makes an unassessed per-class result fail the command; normal mode keeps it
+diagnostic while still failing on an assessed regression.
+The full table remains in `soak_summary.json`, while the console output is short enough to
+scan during a long run.
+
+When the binary was transferred without its `.git` directory, pass the revision that produced
+it explicitly so the manifest remains attributable:
+
+```bash
+QWEN_SOURCE_COMMIT=<revision-or-build-id> make bench-soak \
+  SOAK_MODEL=qwen3-tts-1.7b-base SOAK_PROFILE=<measured-profile>
+```
+
 ---
 
 ## 5. The three numbers, and the many that are not
 
 | | what it is | why it is the one |
 |---|---|---|
+| **TTFB** | send → status line + headers parsed by the client | the number every TTS server benchmark quotes; printed by every harness (wave, poisson, soak) next to TTFA and stamped independently of it. The batched path now sends the `200` header at admission, before synthesis; the non-batched path already did so. The harness reports `header_to_audio_ms` for the remaining header-to-audio interval |
 | **TTFA** | send → first audio chunk | what a caller hears as responsiveness |
-| **STREAM_RTF** | `(t_done − t_first_chunk) / (audio after the first chunk)`, **per request** | below 1.0 a player starting at the first chunk never stalls |
+| **STREAM_RTF** | `(t_done − t_first_chunk) / (audio after the first chunk)`, **per request** | the steady-state capacity metric: below 1.0 the server produces audio faster than it is played, on average over the stream. **Superseded reading (2026-09-07): it does NOT prove that a player starting at the first chunk never stalls** — it is a mean rate and hides delivery in large quanta; use the playback metrics below for continuity |
+| **required_prebuffer** | per request, `max(0, max_i[(t_i − t_first) − audio held before chunk i])` | the smallest delay after first audio at which a 1x player that then never pauses finishes without underrun |
+| **safe_play_start** | per request, `max_i (t_i − audio held before chunk i)`, then p50/p95 over requests | the earliest time after the request at which playback can begin and finish without underrun; computed from each request's own timeline, never as TTFA plus a prebuffer percentile |
+| **stall_rate@B** | share of requests with at least one stall under a B ms audio jitter buffer (100/250/500/1000), with re-buffering after an underrun | the production question: what fraction of streams play continuously with a realistic buffer |
 | **rejects / errors** | refused or failed requests | a fast server that drops requests is not fast |
 
 `STREAM_RTF` is computed per request and then aggregated. Percentiles are taken over requests,
 **never as a ratio of percentiles** — that is how a "part" once came out larger than the "whole"
 in a table nobody could explain for a day.
 
-Everything else the harnesses print — total RTF, engine service time, queue decomposition,
-prebuffer and underrun simulation — is **diagnostic**. It explains a KPI; it does not become one.
+All playback quantities are **client-observed**: a mark is the return of the client's chunked
+read, which does not wait for the chunk's trailing CRLF but can return already-queued data
+when the reader is late (several chunks then carry near-identical timestamps). The harness
+counts those `coalesced reads`; when the share is small the cadence numbers are tight upper
+bounds on server lateness, when it is large the run is a diagnostic. Detail and the transport
+audit: `.work/professional-streaming-architecture.md` (MT-1). Total RTF, engine service time
+and queue decomposition remain diagnostics that explain a KPI.
 
 ---
 
@@ -347,6 +444,31 @@ a 16-core Arm host at concurrency 1, the same three texts truncated to word pref
 `STREAM_RTF` barely moves across the same range, because it measures what happens *after* the
 first chunk. That is the expected shape and it is worth knowing before promising a latency
 figure for a workload whose text length you have not seen.
+
+### What the server refuses, and where that limit comes from
+
+The same fact has a serving side: a request whose text cannot be finished inside the per-request
+cap is refused at admission rather than started. The input limit is not a constant, it is derived
+from two things the profile already fixes — a batch slot's prompt budget
+(`QWEN_BATCH_MAX_PROMPT x 3.5` characters, 1792 at the default) and the generation cap
+(`--max-request-seconds x 30` characters per second, 1800 at the default 60 s) — and the smaller
+one wins, floored at 200. On a stock server that is 1792 characters, and the startup line says so:
+
+```
+[serve] per-request generation cap: 60 s -> text limit 1792 characters, frame cap 750 = 60.0 s of audio (from --max-request-seconds); a request that reaches the frame cap is TRUNCATED and logged (--max-request-seconds N / --max-text-chars N; 0 disables the text cap)
+```
+
+Two consequences worth having in mind before a deployment quotes anything. Lowering
+`max_request_seconds` **tightens the accepted input length** with it, silently, because one is
+computed from the other: a 10 s cap accepts 300 characters. And a profile that leaves
+`max_text_chars` unspecified is not an unlimited server — it is a server that derives its limit,
+reports it in `GET /v1/health` as `max_text_chars`, and refuses anything longer with a `400` that
+names which of the two bounds it hit. Fix a number in the profile only to go *tighter* than the
+derived one.
+
+The rest of the envelope — `405`, `413`, `415`, unknown-field rejection, the `503` at queue full
+or queue timeout, the parameter clamps — is one table in [`server.md`](server.md#limits-validation-and-errors),
+and it is identical on all three POST endpoints and in both server modes.
 
 ---
 
@@ -392,6 +514,50 @@ Two rules that have each cost a day:
 
 ---
 
+## 8b. Recommended decoder setup, split by ISA
+
+The decoder is the one place where the right answer genuinely differs between x86 and Arm,
+so keep the two lanes separate rather than carrying one "all-on" set across both.
+
+### Arm (Neoverse-V2 / Graviton4 / Axion, KleidiAI)
+
+| Knob | Setting | Why |
+|---|---|---|
+| decoder precision | `QWEN_SD_INT8=1` | per-item int8 DOTPROD is the qualified leaf; `--dispatch-map` must resolve `per-item-int8-dotprod` |
+| residual convs | `QWEN_SD_RES1_V2=1` | DL-4 direct dilated int8; serves res1, res2 and the initial/pre convs |
+| decoder lane | `QWEN_SD_LANE_SPLIT=4`, `QWEN_SD_LANE_ELASTIC=1` | private decoder team; engine narrows only while a unit is in flight. Linux-only, not ISA-specific |
+| **stream cohort** | **`QWEN_SD_MULTISLOT=0`** | **retired on Arm.** Pairing two streams into one batched call costs 1.63x the sequential decode on Graviton4 and 1.20x on Axion. Numerically free to disable (`mel_corr 1.00000`) |
+| Design D / fused residual | unsupported | x86 AMX only; the gates read `UNSUPPORTED`, which is correct, not a fallback |
+| ConvT stack / ConvNeXt int8 | off unless separately qualified | `QWEN_SD_CONVT_STACK`, `QWEN_SD_CONVT_I8`, `QWEN_SD_CNEXT_I8` change numerics and need their own paired audio gate |
+
+Reference profiles: `arm-product`, `aws-c8g-8xlarge-32c-arm-v2-all-on`,
+`axion-c4a-highcpu32-0p6b-all-on`, `axion-16c-ttfa` &mdash; all four now ship
+`QWEN_SD_MULTISLOT=0`.
+
+### x86 (AVX-512 VNNI / AMX)
+
+| Knob | Setting | Why |
+|---|---|---|
+| decoder precision | `QWEN_SD_INT8=1` (default on VNNI) | the VNNI leaf is the qualified default; AMX hosts add Design D |
+| Design D | `QWEN_SD_AMX_D=1` on AMX hosts | persistent int8 packs, the AMX decoder path |
+| residual convs | `QWEN_SD_RES1_V2=1` | same DL-4 leaf, VNNI twin |
+| **stream cohort** | **`QWEN_SD_MULTISLOT=2` on the Turin product profile** | **kept, but on weaker evidence than the Arm retirement.** It was promoted from a combined lane+V2+cohort smoke, never from an isolated arm, and the VNNI multi kernel has the same runtime-indexed accumulator structure that spills on Arm. Treat as provisional until the three-cell microbench runs on x86 |
+| control arm | `turin-c8a-32c-vnni-control` | the committed A/B arm: `QWEN_SD_RES1_V2=0`, `QWEN_SD_MULTISLOT=0` |
+
+### The one-command check that the ISA lane is what you think
+
+```bash
+./qwen_tts --dispatch-map | grep -iE "decoder|multislot|res1"
+python3 tools/serving_profile.py preflight <profile> --binary ./qwen_tts
+```
+
+The preflight records `multislot_active`, `feature_status.multislot` and
+`resolved_decoder_mode`; a profile whose parity block lists `["ACTIVE", "VALID FALLBACK"]`
+stays valid with the cohort either way, so the preflight passing is **not** on its own
+evidence that the cohort is on or off. Read the recorded value.
+
+---
+
 ## 9. A worked example: a 16-core Arm host
 
 ```bash
@@ -426,11 +592,56 @@ eval "$(tools/perf_profile.py command my-host --model MODEL_DIR --port 8080)"
 
 ---
 
+## The same procedure on x86
+
+Nothing above is Arm-specific: `bench-fingerprint`, `bench-topo` and `bench-suite` read the
+machine and take the topology names from it. Three things differ in practice.
+
+**SMT is usually on, and you have to turn it off** (see the section above) — the Arm instance
+families report `Thread(s) per core: 1` on their own, the x86 ones do not.
+
+**Build level is a decision.** `make blas` on Linux/x86 runs `SIMD=auto`, which reads
+`/proc/cpuinfo`, probes the compiler and picks the highest level both support — `amx` on
+Sapphire/Emerald Rapids, `avx512bf16` on Zen4/5, down to `portable`. It announces itself as
+`[simd] auto -> …`, and the resulting binary is **not portable to an older CPU**. Pin the level
+in the profile so the box that reproduces your numbers compiles the same kernels.
+
+**The flags are not the same flags.** `QWEN_KAI_*` exists only where KleidiAI compiled in, so
+it is inert on x86; the x86 side has the AMX and VNNI gates instead. Two values in particular
+do not travel: `QWEN_POOL_SPIN`, where the Arm profile's 65536 is measurably wrong on 8 cores,
+and `QWEN_DECODER_BATCH`, which pays only when a worker really holds several slots. Both are
+covered in [`feature-flags.md`](feature-flags.md) with the measurement on each side.
+
+An x86 run of the same inner loop, with the profile that ships for an 8-core AMX host:
+
+```bash
+make blas SIMD=amx GIT_REV=$(git rev-parse --short HEAD)
+make bench-topo  BENCH_MODEL=qwen3-tts-1.7b-base BENCH_PROFILE=x86-8c-amx-recommended \
+                 BENCH_TOPO=1x8,2x4,4x2 BENCH_CONC=1,4
+make bench-suite BENCH_MODEL=qwen3-tts-1.7b-base BENCH_PROFILE=x86-8c-amx-recommended \
+                 BENCH_RUNG=fast BENCH_TOPO=2x4 BENCH_OUT=/tmp/bench_x86
+```
+
+Note the topology names: on an 8-core box the cells are `1x8`, `2x4` and `4x2`, not the 16-core
+`2x8`/`4x4`. Pick them from `make bench-fingerprint`, never by copying another host's profile.
+
+**What that box can and cannot do**, measured and written up in
+[`reference-x86-8c-amx.md`](reference-x86-8c-amx.md): on the 1.7B, first audio is competitive —
+C=4 TTFA p95 252 ms — while **sustained stream RTF at C=4 is 1.43**, so it serves four concurrent
+requests with a good time to first audio and keeps one of them realtime. That is a bandwidth
+result, not a kernel one: 82 GB/s against the Arm host's 336. The 0.6B, measured separately on
+the same box, holds two concurrent realtime streams.
+
+---
+
 ## See also
 
 - [`reference-arm-16c.md`](reference-arm-16c.md) — every rung of this suite, measured on one
   16-core Arm box: topology sweep, qualification curve for both models, input-length effect,
   the three arrival models, the profile A/B
+- [`reference-x86-8c-amx.md`](reference-x86-8c-amx.md) — the same procedure on an 8-core Intel
+  AMX box: what AMX buys per stage, and where this class of machine stops
+- [`x86-optimization.md`](x86-optimization.md) — the x86 kernel work behind those numbers
 - [`server.md`](server.md) — the HTTP API
 - [`feature-flags.md`](feature-flags.md) — every runtime flag and its default
 - [`configs/perf/README.md`](../configs/perf/README.md) — the profile format

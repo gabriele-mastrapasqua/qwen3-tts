@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "x86-8c-amx-single-stream-ttfa",
+    "description": "Low-TTFA profile for one AMX worker on an 8-core Intel host with SMT disabled; measured for one and two concurrent requests.",
+    "objective": {
+      "primary": "ttfa",
+      "secondary": "realtime_factor",
+      "concurrency_range": [
+        1,
+        2
+      ],
+      "preferred_concurrency": 1,
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "cpu_family": "Intel Xeon Platinum 8581C",
+    "logical_cpus": 16,
+    "physical_cores": 8,
+    "threads_per_core": 2,
+    "numa_nodes": 1,
+    "l3_mib": 260,
+    "isa_features_used": [
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512vnni",
+      "avx512bf16",
+      "amx_tile",
+      "amx_int8",
+      "amx_bf16"
+    ],
+    "notes": "The host exposes 16 hardware threads and 8 physical cores. Disable SMT before launch; the qualified process uses online CPUs 0-7, one thread per physical core. Do not apply this profile with SMT enabled without requalification."
+  },
+  "build": {
+    "target": "blas",
+    "make": {
+      "command": "make blas SIMD=amx -j8",
+      "variables": {
+        "SIMD": "amx"
+      }
+    },
+    "requirements": {
+      "blas": "OpenBLAS pthread build",
+      "isa": "AVX-512 VNNI, AVX-512 BF16, AMX tile, AMX INT8 and AMX BF16"
+    }
+  },
+  "server": {
+    "prefork_workers": 1,
+    "threads_per_worker": 8,
+    "batch_size": 16,
+    "max_queue": 1,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
+    "worker_affinity": "one worker pinned to online CPUs 0-7 after SMT is disabled"
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 8,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8 per output row",
+      "code_predictor_weights": "int8 per output row",
+      "speech_decoder_weights": "fp32",
+      "activations": "fp32 at the API boundary; int8 packing is internal to matmat",
+      "gemm_backend": "AMX INT8/BF16 GEMM where the shape gate is met; AVX-512 VNNI and AVX-512 BF16 fallbacks otherwise"
+    },
+    "environment": {
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "Must be ABSENT so the engine sizes OpenBLAS from each worker's phase thread budget. The profile lists it under forbidden env and tests/bench_suite.sh refuses to start if it is set.",
+        "revert": "set it explicitly only for a measured override"
+      },
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "Prevents idle OpenBLAS workers from spinning against the engine pool.",
+        "revert": "unset"
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "Reuses the request-independent prompt head across requests. Verified hitting on this host, not merely enabled: the server log shows 'Prefix cache HIT: 9/20 positions reused'.",
+        "revert": "QWEN_PREFIX_CACHE=0"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "Pinned for deterministic dispatch, not for speed. The engine already picks the native bf16 matmat when it detects AMX, and the kernel audit confirms that is what runs here (Talker, 39.5 GMAC on 'bf16 AMX tiles'; with QWEN_NO_AMX=1 the identical GMAC moves to AVX-512 dpbf16). On an x86 host WITHOUT AMX the same autodetect falls back to BLAS silently, so a profile that intends to use the matmat has to say so rather than inherit it.",
+        "revert": "QWEN_PREFILL_MATMAT=0 routes the prefill projections through BLAS"
+      },
+      "QWEN_PREFILL_QUANT": {
+        "value": null,
+        "why": "Deliberately absent. It frees the bf16 copy but measurably degrades output quality on some models. The server prints 'quantized prefill OFF' so a log can be audited after the fact.",
+        "revert": "QWEN_PREFILL_QUANT=1, on base models only"
+      },
+      "QWEN_CP_PREFILL2": {
+        "value": "1",
+        "why": "Two-position first pass in the Code Predictor. It is already ON by default for any AVX-512-VNNI build, so pinning it changes no behaviour and makes it VISIBLE in [FLAGS]: before this branch it was read but never declared, which is the one combination a deployment cannot audit. With QWEN_CP_PREFILL2=0 the CP's batched rows leave the kernel audit entirely.",
+        "revert": "QWEN_CP_PREFILL2=0"
+      },
+      "QWEN_AMX_MIN_B": {
+        "value": "2",
+        "why": "Lets the AMX int8 matmat take the call from the first batched width instead of the compiled default of 4. Measured on this host: C=4 stream RTF 1.47 vs 1.63 and 1.43 vs 1.32 req/s.",
+        "revert": "use the compiled default of 4"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "4096",
+        "why": "Generations a pool worker re-reads before parking on the condvar. This is the x86 COMPILED DEFAULT, pinned so the value is recorded rather than inherited; it is not the off value. Measured on this host: 0 costs +13% stream RTF at C=1 (1.12 vs 0.99) and 16x the context switches, 1024 is in between, and the ARM profile's 65536 is worse on the other side (C=4 p95 358 vs 339 ms). 4096 is a real optimum here, not an inherited number.",
+        "revert": "unset to take the same value implicitly"
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "0",
+        "why": "OFF on this host, against the engine's own server default. The server sets it to 1 itself with setenv(..., overwrite=0), so a profile that stays silent gets batching; this pin is what turns it off. Measured, interleaved, three repeats: off is 12% better at C=4 TTFA p95 (290 vs 331 ms mean) with identical RTF and throughput. The attribution explains it - the batch never forms: 'decoder batch: calls / mean 60 1.00, max slots 1' at C=1 and '42 1.40, max slots 2' at C=4, because 8 cores split into narrow workers mean each worker sees about 1.4 active slots. The gang wait costs tail latency and has nothing to amortise. EXPECT THIS TO FLIP on a box wide enough to give one worker several slots.",
+        "revert": "QWEN_DECODER_BATCH=1, or QWEN_SERVER_NO_DECODER_BATCH to stop the server setting it at all"
+      },
+      "QWEN_NO_VNNI_TILE": {
+        "value": null,
+        "why": "Must remain ABSENT so the shape-aware AVX-512 VNNI matmat keeps its tiled form. It is the path that matters on an x86 host without AMX: with AMX disabled, turning the tile off as well cost a further 10% of throughput here (1.12 vs 1.23 req/s) and 7% of stream RTF.",
+        "revert": "set to 1 only for a control run"
+      },
+      "QWEN_X86_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for every x86 matmat that has no family value is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
+      },
+      "QWEN_AMX_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for the AMX int8 and bf16 kernels is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
+      },
+      "QWEN_VNNI_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for the VNNI int8 kernel is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
+      },
+      "QWEN_AVX512_NCHUNK": {
+        "value": null,
+        "why": "Deliberately absent. Output-row chunking for the AVX-512 bf16 kernel is EXPERIMENTAL: measured neutral on this host (C=4 TTFA 249 vs 251 ms, stream RTF identical at 1.47), so there is nothing to pin. It is instrumentation for a box that shows a cache miss the default call shape does not. It is NOT the ARM QWEN_KAI_NCHUNK in x86 clothing: different kernel, different units, and that one is on by default because it was measured to win.",
+        "revert": "set a row count to experiment; 0 or unset keeps the original call shape"
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "qualified",
+    "workload": "Three synchronized waves at client concurrency 1 and 2 on the short class of the mixed bank; one worker pinned to all eight physical cores.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-1.7b base checkpoint, open weights",
+    "notes": "C=1 TTFA 93.4 ms p50 / 94.7 ms p95 with stream RTF 0.65; C=2 TTFA 137.6/178.6 ms with RTF 1.07. THIS IS THE ONLY CONFIGURATION ON THIS HOST THAT IS FASTER THAN REALTIME, and only at C=1: giving all eight cores to one request is what buys both the sub-100 ms first audio and the 0.65 RTF. It degrades fastest under load (C=4 already 304/354 ms at RTF 1.75), so use it when single-stream latency is the objective and concurrency is someone else's problem. Numbers in `measured` come from the final qualifying run, identified by the `source_commit` and `binary_sha256` fields below; earlier revisions of this file quoted a pre-fix binary and are replaced, not kept alongside. Measured with the environment block above, verified in each server's [FLAGS] line, on an 8-core Intel Emerald Rapids with SMT disabled, one NUMA node, 260 MiB shared L3 and a measured Triad of 82 GB/s. 1.7B open weights at int8, three synchronized waves per level, short class of the mixed bank, zero errors and zero rejections at every level. QWEN_DECODER_BATCH is pinned to 0 and the reason is measured at BOTH ends of this profile's range, because the C=4 result does not license a C=8 conclusion. At C=4 the gang barely forms - 'decoder batch: calls / mean 42 1.40, max slots 2' - and off is 12% better at TTFA p95. At C=8 it DOES form, 'calls / mean 42 2.24, max slots 4' with 2.16 and 3.56 mean active slots across the two workers, and off is STILL better: TTFA p50 443 vs 498 ms and p95 546 vs 580 ms over three interleaved repeats, for about 1% of throughput and RTF, which is inside this box's noise. So the finding is not 'the batch never forms' - at C=8 it does. It is that a gang 2.24 slots deep buys nothing measurable here and costs first audio.",
+    "source_commit": "266f706",
+    "binary_sha256": "f1105dcd395765f101e62b76efd89942ac06a73411b2f59596e7e298d0bac6bd",
+    "measured": {
+      "c1": {
+        "ttfa_p50_ms": 93.373,
+        "ttfa_p95_ms": 94.698,
+        "stream_rtf_p50": 0.6531,
+        "req_per_s": 0.8157,
+        "errors": 0,
+        "rejections": 0
+      },
+      "c2": {
+        "ttfa_p50_ms": 137.632,
+        "ttfa_p95_ms": 178.612,
+        "stream_rtf_p50": 1.0685,
+        "req_per_s": 1.0175,
+        "errors": 0,
+        "rejections": 0
+      }
+    }
+  }
+}

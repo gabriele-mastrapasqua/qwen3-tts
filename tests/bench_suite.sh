@@ -71,9 +71,24 @@ if [ "$SKIP_IDLE" = "0" ] && [ -r /proc/loadavg ]; then
   gate "loadavg           = $L1"
 fi
 
-COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo UNKNOWN)
-DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo yes || echo no)
-gate "source_commit     = $COMMIT   dirty= $DIRTY"
+# A run off a shipped tree has no .git, and "UNKNOWN" in a manifest makes the whole result
+# unattributable. QWEN_SOURCE_COMMIT lets the caller state it, exactly as serve_parallel_wave.py
+# already accepts; git stays the source of truth when it is there.
+# The binary's embedded fingerprint (commit[-dirty]:tree-hash) is the record; git and the
+# declared QWEN_SOURCE_COMMIT are fallbacks for binaries built before it existed.
+SRC_FP=$("$BIN" --caps 2>/dev/null | sed -n 's/.*src=\([^ ]*\).*/\1/p' | head -1)
+if [ -n "$SRC_FP" ]; then
+  COMMIT="$SRC_FP"; case "$SRC_FP" in *-dirty:*) DIRTY=yes;; *:clean) DIRTY=no;; *) DIRTY=unknown;; esac
+  gate "source_fp         = $SRC_FP   (embedded in the binary)   dirty= $DIRTY"
+else
+  COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "${QWEN_SOURCE_COMMIT:-UNKNOWN} (declared, unverified)")
+  if git rev-parse HEAD >/dev/null 2>&1; then
+    DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo yes || echo no)
+  else
+    DIRTY="${QWEN_SOURCE_DIRTY:-unknown (no git in this tree)}"
+  fi
+  gate "source_commit     = $COMMIT   dirty= $DIRTY   (binary carries no fingerprint: rebuild)"
+fi
 [ "$DIRTY" = "no" ] || echo "  WARNING: dirty tree. Final numbers require dirty=no (commit first)."
 
 mkdir -p "$OUT"
@@ -108,7 +123,9 @@ rung () {   # name bank conc waves [extra...]
     echo "          full log: $OUT/$NAME.log"
     FAILED=1; return
   fi
-  grep -E '^topo|^2x8|^4x4|^8x2|^1x16' "$OUT/$NAME.log" | head -20
+  # one row per topology cell: the label is WxK, so match the shape, not a fixed list of
+  # 16-core names. On an 8-core box the cells are 1x8/2x4/4x2 and the old list printed nothing.
+  grep -E '^(topo|[0-9]+x[0-9]+e?)[[:space:]]' "$OUT/$NAME.log" | head -20
   if [ "$IDENTITY" = "1" ] && [ -f tests/serve_identity_gate.py ]; then
     PORT=$((PORT + 1))
     QWEN_LIFE_TRACE=1 QWEN_REQ_TRACE=1 python3 tests/serve_parallel_wave.py \

@@ -25,7 +25,10 @@ start_server() { # $1=workers  $2..=extra flags
 }
 
 req() { # $1=outfile  -> echoes http_code
+    # -d without an explicit header sends application/x-www-form-urlencoded, which the
+    # endpoint rejects with 415 on purpose (JSON only, no form data).
     timeout 120 curl -s -o "$1" -w "%{http_code}" "http://localhost:$PORT/v1/tts" \
+        -H "Content-Type: application/json" \
         -d "{\"text\":\"$TEXT\",\"speaker\":\"ryan\",\"language\":\"English\",\"seed\":$SEED,\"temperature\":0}"
 }
 

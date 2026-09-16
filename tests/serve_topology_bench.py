@@ -192,7 +192,8 @@ def main():
                     "workers": wrows,
                 })
                 rows.append(row)
-                print(f"  {tag}: TTFA p50 {row['ttfa_p50']:.0f} p95 {row['ttfa_p95']:.0f} ms · "
+                print(f"  {tag}: TTFB p50 {row.get('ttfb_p50', float('nan')):.0f} p95 {row.get('ttfb_p95', float('nan')):.0f} ms · "
+                      f"TTFA p50 {row['ttfa_p50']:.0f} p95 {row['ttfa_p95']:.0f} ms · "
                       f"RTF {row['rtf_p50']:.2f} · Q {row['throughput_Q']:.2f} · "
                       f"B {row.get('mean_inflight', 0):.2f} · cores {row['cores']:.1f} · "
                       f"err {row['errors']}", flush=True)
@@ -206,12 +207,13 @@ def main():
             f.close()
             port += W + 2
 
-    hdr = (f"{'topo':<6}{'c':>3}{'req/s':>7}{'Q':>6}{'TTFA50':>8}{'TTFA95':>8}"
+    hdr = (f"{'topo':<6}{'c':>3}{'req/s':>7}{'Q':>6}{'TTFB50':>8}{'TTFB95':>8}{'TTFA50':>8}{'TTFA95':>8}"
            f"{'RTF50':>7}{'RTF95':>7}{'tot50':>8}{'tot95':>8}{'B':>6}"
            f"{'cores':>7}{'csw/s':>8}{'PSS GB':>8}{'err':>5}")
     print("\n" + hdr); print("-" * len(hdr))
     for r in rows:
         print(f"{r['topo']:<6}{r['conc']:>3}{r['ok']/r['wall_s']:>7.2f}{r['throughput_Q']:>6.2f}"
+              f"{r.get('ttfb_p50', float('nan')):>8.0f}{r.get('ttfb_p95', float('nan')):>8.0f}"
               f"{r['ttfa_p50']:>8.0f}{r['ttfa_p95']:>8.0f}{r['rtf_p50']:>7.2f}{r['rtf_p95']:>7.2f}"
               f"{r.get('total_p50', float('nan')):>8.0f}{r.get('total_p95', float('nan')):>8.0f}"
               f"{r.get('mean_inflight', 0):>6.2f}{r['cores']:>7.1f}{r['csw_s']:>8.0f}"

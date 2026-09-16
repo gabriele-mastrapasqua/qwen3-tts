@@ -5,6 +5,7 @@ import json, os, subprocess, sys, tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import perf_profile as P  # noqa: E402
+import serving_profile as S  # noqa: E402
 
 FAILURES = []
 
@@ -71,6 +72,20 @@ check("resolved precision carries --int8", "--int8" in argv)
 check("server-env is comma separated",
       "," in P.server_env(prof) and " " not in P.server_env(prof), P.server_env(prof))
 
+for lane in ("amx-product", "vnni-product", "vnni-bf16-product", "turin-c8a-32c-vnni-product", "turin-c8a-32c-vnni-control", "arm-product", "common-control"):
+    lane_prof, _ = P.load(lane)
+    lane_env = P.environ(lane_prof)
+    check(f"{lane} pins the known-text streaming layout",
+          lane_env.get("QWEN_TTS_STREAM_LAYOUT") == "1",
+          f"got {lane_env.get('QWEN_TTS_STREAM_LAYOUT')!r}")
+
+turin, _ = P.load("turin-c8a-32c-vnni-product")
+effective, tunable_errors = S.merge_profile_env(turin, {"QWEN_POOL_SPIN": "4096"})
+check("declared tunable serving override is accepted",
+      not tunable_errors and effective["QWEN_POOL_SPIN"] == "4096", tunable_errors)
+_, fixed_errors = S.merge_profile_env(turin, {"QWEN_STREAM_DECODE_CHUNK": "8"})
+check("pinned serving override remains rejected", bool(fixed_errors), fixed_errors)
+
 readme = open(os.path.join(P.PERF, "README.md")).read()
 for token, why in ("2 workers x 8 threads", "the topology"), ("--int8", "the precision"), \
                   ("OPENBLAS_THREAD_TIMEOUT", "the OpenBLAS idle policy"):
@@ -96,3 +111,13 @@ os.unlink(silent)
 
 print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'all checks passed'}")
 sys.exit(1 if FAILURES else 0)
+
+# vnni-bf16-product: the VNNI lane for a CPU with native AVX-512 BF16 must claim the bf16 prefill
+# (the f32 pin of vnni-product cost ~600 ms per admission on Zen5, 2026-09-09) and the measured spin.
+bf16_prof, _ = P.load("vnni-bf16-product")
+bf16_env = P.environ(bf16_prof)
+check("vnni-bf16-product enables the native bf16 prefill",
+      bf16_env.get("QWEN_PREFILL_MATMAT") == "1" and bf16_env.get("QWEN_NO_BF16_MATMUL") == "0" and bf16_env.get("QWEN_NO_BF16DOT") == "0", bf16_env)
+check("vnni-bf16-product declares the bf16-native prefill backend", bf16_prof["parity"]["backends"]["prefill"] == "bf16-native")
+check("VNNI product lanes carry the measured Turin spin budget",
+      bf16_env.get("QWEN_POOL_SPIN") == "65536" and P.environ(P.load("vnni-product")[0]).get("QWEN_POOL_SPIN") == "65536")

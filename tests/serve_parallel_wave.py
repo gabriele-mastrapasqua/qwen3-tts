@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """serve_parallel_wave.py — SYNCHRONIZED PARALLEL CAPACITY."""
-import argparse, datetime, json, os, re, signal, socket, subprocess, sys, threading, time
+import argparse, datetime, json, os, platform, re, signal, socket, subprocess, sys, threading, time
 
 RUN_DATE = datetime.date.today().isoformat()
 import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import serve_procstats as PS
+import playback_sim as PB
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+try:
+    import topology as TOPO                       # execution-domain identity for each cell
+except Exception:
+    TOPO = None
 
 TEXTS = []
 
@@ -121,37 +127,19 @@ def _write_wav(path, pcm):
         f.write(hdr); f.write(pcm)
 
 def stream_kpis(marks, total_s):
-    """marks = [(t_rel_s, nbytes)] in arrival order, t_rel measured from request send.
+    """marks = [(t_rel_s, nbytes[, blocked_s])] in arrival order, t_rel from request send.
 
-    underrun_s simulates a zero-jitter-buffer player that starts the instant the first
-    chunk lands and never pauses on purpose: between two chunk arrivals it plays what
-    it holds, and any wall time it spends with an empty buffer is counted. Reported
-    both as a total and as the worst single stall.
+    All definitions live in tests/playback_sim.py (single source).  The legacy keys are
+    kept for the JSON consumers (tools/envelope_report.py, profile_cpu.sh, costmap_ab.sh);
+    the ``playback`` sub-dict carries the full client-observed set: required prebuffer,
+    per-request safe_play_start, zero-buffer and fixed-buffer (100/250/500/1000 ms)
+    stalls, raw cadence and the coalesced-read count that bounds receive fidelity.
     """
-    if len(marks) < 2:
-        return {"stream_rtf": float("nan"), "underrun_s": float("nan"),
-                "stall_max_s": float("nan"), "chunks": len(marks), "ratios": []}
-    t_first = marks[0][0]
-    rest_bytes = sum(nb for _, nb in marks[1:])
-    rest_s = rest_bytes / 2.0 / 24000.0
-    stream_rtf = (total_s - t_first) / rest_s if rest_s > 0 else float("nan")
-
-    ratios, avail, play, prev_t, stall, stall_max = [], marks[0][1] / 48000.0, 0.0, t_first, 0.0, 0.0
-    prebuf = 0.0
-    for t, nb in marks[1:]:
-        dur = nb / 2.0 / 24000.0
-        gap = t - prev_t
-        if dur > 0: ratios.append(gap / dur)
-        prebuf = max(prebuf, (t - t_first) - avail)
-        want = play + gap
-        if want > avail:
-            d = want - avail
-            stall += d; stall_max = max(stall_max, d); play = avail
-        else:
-            play = want
-        avail += dur; prev_t = t
-    return {"stream_rtf": stream_rtf, "underrun_s": stall, "stall_max_s": stall_max,
-            "prebuffer_s": max(0.0, prebuf), "chunks": len(marks), "ratios": ratios}
+    k = PB.timeline_kpis(marks, total_s)
+    return {"stream_rtf": k["stream_rtf"], "underrun_s": k["underrun_total_s"],
+            "stall_max_s": k["stall_max_s"], "prebuffer_s": k["required_prebuffer_s"],
+            "chunks": k["chunks"], "ratios": k.get("gap_ratios", []),
+            "playback": {kk: vv for kk, vv in k.items() if kk != "gap_ratios"}}
 
 def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed=42):
     if not TEXTS:
@@ -159,17 +147,28 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
     cls, txt = TEXTS[idx % len(TEXTS)]
     body = json.dumps({"text": txt, "speaker": speaker, "language": language,
                        "temperature": 0.0, "seed": seed + idx}).encode()
+    t0 = time.time(); t0_mono_ms = time.monotonic() * 1000.0
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("QWEN_TTFA_TRACE"):
+        # F2 aligns the client request origin with the server's CLOCK_MONOTONIC domain.
+        # Ordinary runs send no diagnostic header.
+        headers["X-Qwen-F2-Client-Start-Monotonic-Ms"] = f"{t0_mono_ms:.3f}"
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/tts/stream", data=body,
-                                 headers={"Content-Type": "application/json"})
-    t0 = time.time(); ttfa = None; n = 0; chunks = []; marks = []
+                                 headers=headers)
+    ttfa = None; ttfb = None; n = 0; chunks = []; marks = []
     try:
         with urllib.request.urlopen(req, timeout=1200) as r:
+            ttfb = time.time() - t0          # urlopen returns once the status line + headers are in
             while True:
+                # One read1 = at most one HTTP chunk; the third mark field is the time
+                # spent blocked in the call (near zero = data was already queued, so the
+                # mark overstates that chunk's lateness; counted as a coalesced read).
+                t_call = time.time()
                 ch = r.read1(65536)
                 if not ch: break
                 tnow = time.time() - t0
                 if ttfa is None: ttfa = tnow
-                marks.append((tnow, len(ch)))
+                marks.append((tnow, len(ch), tnow + t0 - t_call))
                 n += len(ch)
                 if SAVE_AUDIO_DIR is not None: chunks.append(ch)
     except Exception as e:
@@ -182,9 +181,10 @@ def one_request(port, out, lock, idx=0, speaker="ryan", language="English", seed
         _write_wav(os.path.join(SAVE_AUDIO_DIR,
                    f"{speaker}_r{idx:03d}_{cls}.wav"), b"".join(chunks))
     with lock:
-        rec = {"cls": cls, "ttfa_ms": (ttfa or 0) * 1000.0, "total_s": total,
+        rec = {"cls": cls, "ttfa_ms": (ttfa or 0) * 1000.0, "ttfb_ms": (ttfb or 0) * 1000.0,
+               "total_s": total,
                "audio_s": secs, "seed": seed + idx, "idx": idx,
-               "t_send": t0, "marks": marks,
+               "t_send": t0, "t_send_mono_ms": t0_mono_ms, "marks": marks,
                "rtf": total / secs if secs > 0 else float("nan")}
         rec.update(stream_kpis(marks, total))
         out.append(rec)
@@ -253,9 +253,13 @@ def result_slug(workload, arrival, topo, conc, model_label, precision):
     return f"{w}_{a}_{model_label}-{precision}_{topo}_c{conc}"
 
 def result_header(a, model_path, extra_env):
-    def sh(cmd, default="UNKNOWN"):
+    env = dict(os.environ)
+    env.update(extra_env)
+
+    def sh(cmd, default="UNKNOWN", command_env=None):
         try:
-            out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10,
+                                 env=command_env)
             v = out.stdout.strip()
             return v if v else default
         except Exception:
@@ -268,13 +272,26 @@ def result_header(a, model_path, extra_env):
     kern = sh("uname -sr")
     bsha = sh(f"sha256sum {a.bin} 2>/dev/null | cut -c1-16")
     brev = sh(f"{a.bin} --caps 2>/dev/null | awk '/build:/{{print $2}}'")
-    commit = os.environ.get("QWEN_SOURCE_COMMIT") or sh("git rev-parse --short HEAD 2>/dev/null")
+    src_fp = sh(f"{a.bin} --caps 2>/dev/null | sed -n 's/.*src=\\([^ ]*\\).*/\\1/p' | head -1", "")
+    # the fingerprint the BINARY carries is the record; a declared commit is only a fallback
+    commit = src_fp or sh("git rev-parse --short HEAD 2>/dev/null") or \
+             (os.environ.get("QWEN_SOURCE_COMMIT", "") + " (declared, unverified)" if os.environ.get("QWEN_SOURCE_COMMIT") else "UNKNOWN")
     dirty = os.environ.get("QWEN_SOURCE_DIRTY") or \
         sh("git diff --quiet HEAD 2>/dev/null && echo no || echo yes", "UNKNOWN")
+    # The levers worth recording differ by ISA: an x86 run that reports QWEN_NO_BFMMLA and stays
+    # silent about AMX has recorded nothing about the kernel that actually ran.
     watched = ["OPENBLAS_THREAD_TIMEOUT", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
-               "QWEN_KAI_QKV_FUSED", "QWEN_POOL_NARROW", "QWEN_POOL_SPIN",
-               "QWEN_PREFIX_CACHE", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA"]
-    env = dict(os.environ); env.update(extra_env)
+               "QWEN_POOL_NARROW", "QWEN_POOL_SPIN", "QWEN_PREFIX_CACHE"]
+    if platform.machine() in ("x86_64", "amd64"):
+        watched += ["QWEN_NO_AMX", "QWEN_NO_AMX_BF16", "QWEN_NO_AMX_INT8",
+                    "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B",
+                    "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_AMX_NCHUNK",
+                    "QWEN_NO_VNNI", "QWEN_NO_VNNI_TILE", "QWEN_VNNI_TILE_N8",
+                    "QWEN_VNNI_TILE_M4N2", "QWEN_VNNI_PREPACK", "QWEN_NO_VNNI_ROWSUM",
+                    "QWEN_NO_VNNI_ACT_QUANT", "QWEN_VNNI_GEMV_MR", "QWEN_VNNI_NCHUNK",
+                    "QWEN_NO_BF16_MATMUL", "QWEN_X86_NCHUNK"]
+    else:
+        watched += ["QWEN_KAI_QKV_FUSED", "QWEN_KAI_NCHUNK", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA"]
     flags = " ".join(f"{k}={env.get(k, '(default)')}" for k in watched)
     print("### ─────────── RESULT IDENTITY ───────────")
     print(f"### machine_type=   {mt}    cpu_model= {cpu}  vcpu= {ncpu}")
@@ -289,10 +306,12 @@ def result_header(a, model_path, extra_env):
     print(f"### arrival_model=     {ARRIVAL_TRUE_WAVE}  (C requests at t=0, wait for ALL,"
           f" then the next wave)")
     print(f"### topology=          {a.topo}   concurrency= {a.conc}   waves= {a.waves}")
-    backend = sh(a.bin + " --caps 2>/dev/null | sed -n 's/^  int8 dot: *//p'")
+    backend = sh(a.bin + " --caps 2>/dev/null | sed -n 's/^  int8 dot: *//p'",
+                 command_env=env)
     print(f"### backend=           {backend}")
     print(f"### precision=         {a.precision}")
     print(f"### runtime_profile=   {a.server_env or '(compiled defaults)'}")
+    print(f"### server_args=       {' '.join(a.server_args) if a.server_args else '(none)'}")
     print(f"### text_bank=         {os.path.basename(a.text_file)}"
           f"{'   classes= ' + a.classes if a.classes else ''}")
     print(f"### runtime_flags=  {flags}")
@@ -307,8 +326,11 @@ def result_header(a, model_path, extra_env):
         "benchmark_family": ARRIVAL_TRUE_WAVE, "workload_class": wl,
         "arrival_model": ARRIVAL_TRUE_WAVE, "topology": a.topo, "concurrency": a.conc,
         "waves": a.waves, "backend": backend, "precision": a.precision,
+        "profile_name": a.profile or None,
         "runtime_profile": a.server_env or "(compiled defaults)",
+        "server_args": list(a.server_args),
         "runtime_flags": {k: env.get(k, "(default)") for k in watched},
+        "profile_preflight": getattr(a, "profile_preflight", None),
         "text_bank": os.path.basename(a.text_file), "classes": a.classes,
         "harness": os.path.basename(__file__), "run_date": RUN_DATE,
     }
@@ -317,6 +339,8 @@ PROFILE_DIR  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
                             "configs", "perf")
 PROFILE_TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "tools", "perf_profile.py")
+PROFILE_GATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "tools", "serving_profile.py")
 
 def resolve_profile(a):
     """Compose the server environment from the named profile, then apply explicit overrides.
@@ -361,7 +385,7 @@ def resolve_profile(a):
         print("### profile_args=      " + " ".join(a.profile_argv))
     return ",".join("%s=%s" % (k, v) for k, v in sorted(merged.items()))
 
-HARNESS_OWNED = {"--serve", "--batch-size", "--prefork", "--prefork-threads",
+HARNESS_OWNED = {"--serve", "--batch-size", "--prefork", "--prefork-threads", "-j",
                  "--prefork-elastic", "-d", "--int8"}
 
 def profile_server_argv(a):
@@ -399,6 +423,9 @@ def main():
     ap.add_argument("--topo", default="2x8,4x4,8x2")
     ap.add_argument("--conc", default="1,2,3,4,5,6,8")
     ap.add_argument("--waves", type=int, default=3)
+    ap.add_argument("--batch-cap", type=int, default=0, metavar="N",
+                    help="in-flight requests per worker (default: 16 split across the "
+                         "workers of the topology)")
     ap.add_argument("--precision", default="int8")
     ap.add_argument("--bin", default="./qwen_tts")
     ap.add_argument("--port", type=int, default=9300)
@@ -415,6 +442,9 @@ def main():
     ap.add_argument("--server-env", default="", metavar="K=V,K=V",
                     help="env applied to the SERVER process only (A/B arms). Merged ON TOP "
                          "of --profile, and every override is announced.")
+    ap.add_argument("--server-arg", action="append", default=[], dest="server_args", metavar="ARG",
+                    help="one extra server argv token; repeat for a diagnostic arm such as "
+                         "--server-arg=--max-queue --server-arg=0")
     ap.add_argument("--profile", default="", metavar="NAME",
                     help="deployment profile from configs/perf; supplies the server env")
     ap.add_argument("--no-profile", default="", metavar="REASON",
@@ -423,10 +453,42 @@ def main():
                     help="write one WAV per request into DIR (quality gate; perturbs timing)")
     a = ap.parse_args()
     a.server_env = resolve_profile(a)
+    os.makedirs(a.out, exist_ok=True)
+    profile_has_parity = False
+    if a.profile:
+        profile_doc = subprocess.run(
+            [sys.executable, PROFILE_TOOL, "show", a.profile],
+            capture_output=True, text=True,
+        )
+        if profile_doc.returncode != 0:
+            raise SystemExit("REFUSING TO RUN: profile show failed for %r" % a.profile)
+        try:
+            profile_has_parity = bool(json.loads(profile_doc.stdout).get("parity"))
+        except json.JSONDecodeError:
+            raise SystemExit("REFUSING TO RUN: profile show returned invalid JSON")
+    if profile_has_parity:
+        # A parity profile is a gate, not a label.  Run the engine's own caps/dispatch
+        # probes with the exact merged environment before starting any server process.
+        preflight_path = os.path.join(a.out, "profile-preflight.json")
+        pf = subprocess.run(
+            [sys.executable, PROFILE_GATE, "preflight", a.profile,
+             "--binary", a.bin, "--server-env", a.server_env,
+             "--out", preflight_path], capture_output=True, text=True)
+        if pf.stdout:
+            print(pf.stdout.rstrip())
+        if pf.stderr:
+            print(pf.stderr.rstrip(), file=sys.stderr)
+        try:
+            a.profile_preflight = json.load(open(preflight_path))
+        except (OSError, json.JSONDecodeError):
+            a.profile_preflight = {"profile": a.profile, "profile_valid": False,
+                                   "errors": ["profile preflight produced no JSON"]}
+        if pf.returncode != 0 or not a.profile_preflight.get("profile_valid"):
+            raise SystemExit("REFUSING TO RUN: resolved serving profile is invalid; see "
+                             + preflight_path)
     global TEXTS
     TEXTS = load_texts(a.text_file,
                        set(x.strip() for x in a.classes.split(",") if x.strip()) or None)
-    os.makedirs(a.out, exist_ok=True)
     label = a.label or os.path.basename(a.model.rstrip("/"))
     concs = [int(x) for x in a.conc.split(",")]
     hz = os.sysconf("SC_CLK_TCK")
@@ -449,15 +511,35 @@ def main():
         print(f"### ⚠️ --save-audio {a.save_audio}: this is a QUALITY run, not a timing run")
     for topo in a.topo.split(","):
         elastic = topo.endswith("e")
-        W, K = (int(x) for x in topo.rstrip("e").split("x"))
-        cap = max(1, 16 // W)
+        # `WxK` or `WxK@MASK`.  The mask is what makes a single-worker cell a defined
+        # experiment: "1x8" alone does not say whether those 8 threads were confined to
+        # one bandwidth domain or free to roam the socket, and on a multi-CCX host those
+        # are different machines.  Use `+` inside a mask (0+2+4) since `--topo` is
+        # comma-separated.  W>1 keeps the prefork split, which owns its own affinity.
+        spec, _, maskspec = topo.rstrip("e").partition("@")
+        cpu_mask = maskspec.replace("+", ",") if maskspec else ""
+        W, K = (int(x) for x in spec.split("x"))
+        # In-flight requests a worker may hold. The default splits a box-wide budget of 16
+        # across the workers; it is NOT the core count, and --batch-cap overrides it when a
+        # deployment pins a different admission width.
+        cap = a.batch_cap if a.batch_cap > 0 else max(1, 16 // W)
         cmd = [a.bin, "-d", a.model, "--serve", str(port), "--batch-size", str(cap)]
         if a.precision == "int8":
             cmd.insert(3, "--int8")
-        cmd += ["--prefork", str(W), "--prefork-threads", str(8 if elastic else K)]
+        if W > 1:
+            if cpu_mask:
+                sys.exit(f"--topo {topo}: an explicit @mask applies to a single-worker "
+                         f"cell; with {W} prefork workers the per-worker split already "
+                         f"sets affinity")
+            cmd += ["--prefork", str(W), "--prefork-threads", str(8 if elastic else K)]
+        else:
+            cmd += ["-j", str(K)]
+            if cpu_mask:
+                cmd += ["--cpu-mask", cpu_mask]
         if elastic:
             cmd += ["--prefork-elastic"]
         cmd += getattr(a, "profile_argv", [])
+        cmd += a.server_args
         log = os.path.join(a.out, f"{label}_{topo}.log")
         f = open(log, "wb")
         senv = dict(os.environ)
@@ -512,11 +594,26 @@ def main():
             for wi in range(min(4, W * 2)):
                 one_request(port, res, lock, wi, a.speaker, a.language, a.seed + 900000)
             res.clear()
-            wmap = {i: pid for i, pid, _cpus, _thr in PS.worker_pids_from_log(log)}
+            wmap = {i: pid for i, pid, _cpus, _thr in PS.worker_pids_from_log(log)} \
+                   or {0: p.pid}
+            dump_signal_supported = W > 1
 
+            # The execution domain this cell actually got, from the engine's own
+            # [TOPOLOGY] line joined with /proc: recorded in every result row so a later
+            # comparison cannot mistake one mask for another.
+            topo_doc = None
+            if TOPO is not None:
+                try:
+                    topo_doc = TOPO.build(log, None, None, K)
+                    json.dump(topo_doc, open(os.path.join(a.out, f"topology_{label}_{topo}.json"), "w"), indent=1)
+                    print(f"###   execution domain: {topo_doc['topology_id']}  masks="
+                          f"{[w.get('actual_mask') for w in topo_doc['workers']]}", flush=True)
+                except Exception as e:
+                    print(f"###   topology identity unavailable: {e}", flush=True)
             for C in concs:
-                try: p.send_signal(signal.SIGUSR1)
-                except Exception: pass
+                if dump_signal_supported:
+                    try: p.send_signal(signal.SIGUSR1)
+                    except Exception: pass
                 time.sleep(1.2)
                 mark = os.path.getsize(log)
                 c0 = counters(pids); t0 = time.time()
@@ -536,8 +633,9 @@ def main():
                     wave_s.append(time.time() - w0)
                 wall = time.time() - t0; c1 = counters(pids)
                 pw1 = {i: PS.proc_sample(pid) for i, pid in wmap.items()}
-                try: p.send_signal(signal.SIGUSR1)
-                except Exception: pass
+                if dump_signal_supported:
+                    try: p.send_signal(signal.SIGUSR1)
+                    except Exception: pass
                 time.sleep(1.2)
                 stats = ""
                 try:
@@ -557,7 +655,15 @@ def main():
                 rej = re.search(r"rejected (\d+)", stats)
                 row = {
                     "model": label, "topo": topo, "W": W, "K": K, "cap": cap, "conc": C,
+                    "cpu_mask_requested": cpu_mask or None,
+                    "topology_id": topo_doc.get("topology_id") if topo_doc else None,
+                    "worker_masks": ([w.get("actual_mask") for w in topo_doc["workers"]]
+                                     if topo_doc else None),
+                    "mask_confidence": ([w.get("mask_confidence") for w in topo_doc["workers"]]
+                                        if topo_doc else None),
                     "waves": a.waves, "ok": len(ok), "errors": nerr,
+                    "ttfb_p50": pct([r.get("ttfb_ms", float("nan")) for r in ok], 50),
+                    "ttfb_p95": pct([r.get("ttfb_ms", float("nan")) for r in ok], 95),
                     "ttfa_p50": pct([r["ttfa_ms"] for r in ok], 50),
                     "ttfa_p95": pct([r["ttfa_ms"] for r in ok], 95),
                     "ttfa_max": max((r["ttfa_ms"] for r in ok), default=float("nan")),
@@ -573,6 +679,7 @@ def main():
                     "prebuf_p50": pct([r["prebuffer_s"] for r in ok], 50),
                     "prebuf_p95": pct([r["prebuffer_s"] for r in ok], 95),
                     "prebuf_max": max((r["prebuffer_s"] for r in ok), default=float("nan")),
+                    "playback": PB.summarize([r["playback"] for r in ok if "playback" in r]),
                     "gap_ratio_p50": pct([x for r in ok for x in r.get("ratios", [])], 50),
                     "gap_ratio_p95": pct([x for r in ok for x in r.get("ratios", [])], 95),
                     "gap_ratio_max": max((x for r in ok for x in r.get("ratios", [])),
@@ -615,7 +722,8 @@ def main():
                                   "INVALID — fix the client, do not report these numbers.",
                                   flush=True)
                             bad_crosscheck = True
-                print(f"  C={C:<2} TTFA p50 {row['ttfa_p50']:6.0f} p95 {row['ttfa_p95']:6.0f} "
+                print(f"  C={C:<2} TTFB p50 {row['ttfb_p50']:6.0f} p95 {row['ttfb_p95']:6.0f} · "
+                      f"TTFA p50 {row['ttfa_p50']:6.0f} p95 {row['ttfa_p95']:6.0f} "
                       f"max {row['ttfa_max']:6.0f} · RTF {row['rtf_p50']:.2f} · "
                       f"ttc {row['ttc_p50']:5.1f}s · {row['req_s']:.2f} req/s · "
                       f"B {row['batch_eff']:.2f} · asg {row['assign']} · "
@@ -631,11 +739,9 @@ def main():
                       f" p95 {row['gap_ratio_p95']:.2f} max {row['gap_ratio_max']:.2f}"
                       f"  |  {row['chunks_p50']:.0f} chunks, {row['audio_p50']:.2f} s audio",
                       flush=True)
-                print(f"     PREBUFFER needed for zero stall: p50 {row['prebuf_p50']*1000:.0f} ms"
-                      f" p95 {row['prebuf_p95']*1000:.0f} ms max {row['prebuf_max']*1000:.0f} ms"
-                      f"  ->  playback can start at TTFA+prebuf ="
-                      f" {row['ttfa_p50'] + row['prebuf_p50']*1000:.0f} ms (p50),"
-                      f" {row['ttfa_p95'] + row['prebuf_p95']*1000:.0f} ms (p95)", flush=True)
+                # safe_play_start is computed PER REQUEST from its own timeline and then
+                # aggregated; it is never TTFA plus a prebuffer percentile.
+                print(PB.format_summary(row["playback"], indent="     "), flush=True)
                 with open(os.path.join(a.out,
                           f"{RUN_DATE}_{result_slug(workload_class(a.text_file, a.classes), ARRIVAL_TRUE_WAVE, topo, C, label, a.precision)}_requests.jsonl"), "w") as rf:
                     for r in ok: rf.write(json.dumps(r) + "\n")
@@ -653,13 +759,17 @@ def main():
             except subprocess.TimeoutExpired: p.kill(); p.wait()
             f.close(); port += W + 2
 
-    hdr = (f"{'topo':<6}{'C':>3}{'TTFA50':>8}{'TTFA95':>8}{'TTFAmax':>9}{'RTF50':>7}{'RTF95':>7}"
+    hdr = (f"{'topo':<6}{'C':>3}{'TTFB50':>8}{'TTFB95':>8}{'TTFA50':>8}{'TTFA95':>8}{'TTFAmax':>9}"
+           f"{'STRM50':>7}{'STRM95':>7}{'TOT50':>7}{'TOT95':>7}"
            f"{'ttc50':>7}{'ttc95':>7}{'req/s':>7}{'B':>6}{'assign':>12}{'cores':>7}"
            f"{'csw/s':>8}{'PSS GB':>8}{'rej':>5}{'err':>5}")
     print("\n" + hdr); print("-" * len(hdr))
+    print("# STRM = STREAM_RTF per request (after the first chunk); TOT = TOTAL_RTF (send -> last byte / audio); "
+          "TTFB = first HTTP byte, TTFA = first audio chunk; B = measured batch, not C")
     for r in rows:
-        print(f"{r['topo']:<6}{r['conc']:>3}{r['ttfa_p50']:>8.0f}{r['ttfa_p95']:>8.0f}"
-              f"{r['ttfa_max']:>9.0f}{r['rtf_p50']:>7.2f}{r['rtf_p95']:>7.2f}"
+        print(f"{r['topo']:<6}{r['conc']:>3}{r['ttfb_p50']:>8.0f}{r['ttfb_p95']:>8.0f}"
+              f"{r['ttfa_p50']:>8.0f}{r['ttfa_p95']:>8.0f}{r['ttfa_max']:>9.0f}"
+              f"{r['stream_p50']:>7.3f}{r['stream_p95']:>7.3f}{r['rtf_p50']:>7.3f}{r['rtf_p95']:>7.3f}"
               f"{r['ttc_p50']:>7.1f}{r['ttc_p95']:>7.1f}{r['req_s']:>7.2f}"
               f"{r['batch_eff']:>6.2f}{r['assign']:>12}{r['cores']:>7.1f}"
               f"{r['csw_s']:>8.0f}{r['pss_mb']/1024:>8.1f}{r['rejects']:>5}{r['errors']:>5}")

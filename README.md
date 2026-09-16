@@ -435,8 +435,10 @@ curl -s http://localhost:8080/v1/audio/speech \
 > Full guide: all endpoints, request body, performance → [docs/server.md](docs/server.md)
 > · running it in production — pre-forked pinned workers, finding `W x K` on your box,
 > deployment profiles and the benchmark suite → [docs/serving-operations.md](docs/serving-operations.md)
+> · Arm topology/bandwidth preflight before serving or soak → [docs/arm-topology-preflight.md](docs/arm-topology-preflight.md)
 > · every runtime flag, its default and why they travel together → [docs/feature-flags.md](docs/feature-flags.md)
 > · a 16-core Arm box measured across every rung → [docs/reference-arm-16c.md](docs/reference-arm-16c.md)
+> · an 8-core Intel AMX box, and what AMX buys per stage → [docs/reference-x86-8c-amx.md](docs/reference-x86-8c-amx.md)
 
 ### Streaming
 
@@ -561,6 +563,13 @@ still gets their own progressive audio stream. This trades a little per-request 
 total throughput on bandwidth-bound boxes. Measure it on your CPU with `make bench-server`; details in
 [docs/server-batching.md](docs/server-batching.md).
 
+**Before serving on a new Arm box:** run `make doctor` first. On a 32-core Arm
+Linux host it now includes a short simultaneous `1x8` / `2x8` / `4x8` INT8 GEMV
+scaling preflight. Read its 4×8 verdict before renting time for a wave or soak:
+the check detects shared-cache/fabric contention that a single-worker roof can
+hide, and may recommend `2x16` or `1x32`. It classifies the tested topology,
+not the whole machine. See [the Arm preflight note](docs/arm-topology-preflight.md).
+
 **vs other implementations:**
 
 | Hardware | 0.6B RTF | Notes |
@@ -580,6 +589,14 @@ total throughput on bandwidth-bound boxes. Measure it on your CPU with `make ben
 Optional `--backend metal|cuda` runs the **whole fused pipeline resident on the GPU** (weights + KV +
 activations on device, one command buffer / step). The CPU path stays the default — GPU is purely additive.
 Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDIA](docs/cuda-performance.md).
+
+> **Streaming server on CUDA — implemented and runtime-verified, not performance-qualified.**
+> `--backend cuda --serve` works, batches, streams, and produces the same codes as a single stream,
+> and it has been listened to under concurrent load. It has **not** met a serving KPI target: every
+> soak so far is a 3-minute screen and each reports per-class KPI drift, and no 30-minute
+> qualification has been run. It is opt-in and there are two settings that silently disable most of
+> it — see [docs/cuda-performance.md § CUDA streaming server](docs/cuda-performance.md). The CPU
+> server remains the qualified path.
 
 **Apple Metal** — `make metal CC=clang`, then `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`.
 **Single-stream latency** (one request — CLI, or a warm `--serve` server; the two match):

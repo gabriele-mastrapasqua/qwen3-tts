@@ -71,6 +71,45 @@ jobs:
           name: qwen_tts-${{ matrix.os }}-${{ matrix.arch }}
           path: qwen_tts-${{ matrix.os }}-${{ matrix.arch }}
 
+  # The ISA guard in qwen_tts_kernels.c can hide a LINK break on targets nobody
+  # develops on: AVX2-only x86 (SIMD=portable) and a no-dotprod Arm baseline both
+  # failed to link seven V2/ConvT symbols while every developer host had VNNI or
+  # dotprod.  Link-only on purpose: this job guards the guard.
+  link-only:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            flags: SIMD=portable
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            flags: SIMD=scalar
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            flags: ARCH_FLAGS=-march=armv8-a
+    name: "link-only ${{ matrix.arch }} ${{ matrix.flags }}"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
+      - name: Link check
+        run: |
+          make clean
+          make blas -j2 ${{ matrix.flags }}
+          test -x ./qwen_tts
+          ./qwen_tts --help >/dev/null
+
   release:
     needs: build
     runs-on: ubuntu-latest

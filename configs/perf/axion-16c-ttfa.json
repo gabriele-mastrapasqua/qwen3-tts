@@ -2,7 +2,7 @@
   "schema_version": 1,
   "profile": {
     "id": "axion-16c-ttfa",
-    "description": "Recommended low-TTFA server configuration for a 16-core Google Axion host. Every value was read from the qualification harness and the engine source, not from memory.",
+    "description": "Qualified low-TTFA control configuration for a 16-core Google Axion host. New Arm RES1_V2/lane/multi-slot controls are recorded explicitly but remain outside this qualified control; use arm-product for requalification.",
     "objective": {
       "primary": "ttfa",
       "secondary": "realtime_factor",
@@ -53,6 +53,7 @@
     "max_queue": 1,
     "queue_timeout_ms": 0,
     "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
     "worker_affinity": "contiguous core slices, worker 0 -> CPU 0-7, worker 1 -> CPU 8-15"
   },
   "streaming": {
@@ -117,6 +118,34 @@
         "value": "1",
         "why": "batch the speech decoder across slots. Measured +8.1 % throughput with first-audio p50 -8.9 % and p95 -6.1 % at concurrency 4, and the audio moves by one LSB in 32768 on 81 samples of 161,280. The server enables it by default; pinned so the profile records what ran.",
         "revert": "QWEN_DECODER_BATCH=0"
+      },
+      "QWEN_SD_BF16_PREUP": {
+        "value": "0",
+        "why": "retain the qualified fp32 pre-transformer control; the new KAI prepared-state path is wired but its Arm quality screen is not promotable",
+        "revert": "QWEN_SD_BF16_PREUP=1 only for a new quality-gated A/B"
+      },
+      "QWEN_SD_INT8": {
+        "value": "0",
+        "why": "retain the qualified fp32 speech-decoder control; RES1_V2 and multi-slot are inert when the Arm INT8 decoder is off",
+        "revert": "QWEN_SD_INT8=1 only for the arm-product qualification"
+      },
+      "QWEN_SD_LANE_ELASTIC": {
+        "value": null,
+        "why": "the qualified Axion control does not claim a decoder lane topology; set only in a new arm-product qualification"
+      },
+      "QWEN_SD_LANE_SPLIT": {
+        "value": null,
+        "why": "the qualified Axion control does not reserve decoder cores; set only after a 16-core lane A/B"
+      },
+      "QWEN_SD_MULTISLOT": {
+        "value": "0",
+        "why": "keep the new shared-weight cohort disabled in the qualified control; its short Neoverse-V2 smoke was slower and not a 16-core qualification",
+        "revert": "QWEN_SD_MULTISLOT=2 or 3 only after a paired wave"
+      },
+      "QWEN_SD_RES1_V2": {
+        "value": "0",
+        "why": "keep the new direct DL-4 residual leaf out of this qualified fp32 control; arm-product records the opt-in policy",
+        "revert": "QWEN_SD_RES1_V2=1 only with QWEN_SD_INT8=1 and a new quality gate"
       }
     }
   },
@@ -131,6 +160,6 @@
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b",
     "speaker": "ryan",
-    "notes": "preferred_concurrency is 4 because at C=6 the realtime factor measured ~1.1: first audio still good, sustained realtime not. The band claims nothing above C=8. Topology and thread split were qualified on this host; the model named here is the base checkpoint the profile is exercised against, and a profile makes no claim about any particular checkpoint's audio."
+    "notes": "preferred_concurrency is 4 because at C=6 the realtime factor measured ~1.1: first audio still good, sustained realtime not. The band claims nothing above C=8. Topology and thread split were qualified on this host; the model named here is the base checkpoint the profile is exercised against, and a profile makes no claim about any particular checkpoint's audio. This file intentionally remains the fp32 control; the new Arm v2/lane/multi-slot policy is in arm-product and requires a fresh 16-core qualification."
   }
 }

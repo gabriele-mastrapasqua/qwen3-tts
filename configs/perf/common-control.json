@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "common-control",
+    "description": "ISA-neutral serving control: same server semantics and per-item INT8 decoder shape, with no AMX Design-D/ragged decoder request.",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [1, 4],
+      "preferred_concurrency": "unspecified",
+      "quality_changes_allowed": false
+    }
+  },
+  "parity": {
+    "lane": "common-control",
+    "isa_classes": ["x86_amx", "x86_avx512vnni", "x86_avx512bf16", "arm_i8mm_bf16", "arm_dotprod"],
+    "decoder": {
+      "requested_batch": 0,
+      "expected_modes": ["per-item-int8-vnni", "per-item-int8-dotprod"],
+      "precision": "int8",
+      "fallback_status": "ACTIVE"
+    },
+    "backends": {
+      "talker_cp": "native-per-isa",
+      "prefill": "f32",
+      "q4": "native-per-isa"
+    },
+    "features": {
+      "design_d": ["VALID FALLBACK", "UNSUPPORTED"],
+      "fused_residual": ["VALID FALLBACK", "UNSUPPORTED"],
+      "kleidi": ["VALID FALLBACK", "UNSUPPORTED"]
+    },
+    "quality_gate": {
+      "required": true,
+      "command": "strict profile preflight + current serving-generation structural/audio gate",
+      "audio_gate": "same model, voice, language, seed/settings and bank; valid non-empty PCM/WAV plus applicable same-generation parity checks",
+      "reject_on": ["decoder batch enabled", "AMX/KAI-only decoder leaf", "wrong precision", "quality regression"]
+    },
+    "tunable_flags": ["QWEN_POOL_SPIN", "QWEN_VNNI_MIN_B", "QWEN_INT8_SDOT_MIN_B", "QWEN_SMMLA_MIN_B", "QWEN_BFMMLA_MIN_B", "QWEN_KAI_NCHUNK"],
+    "notes": "This lane answers same serving architecture versus hardware/ISA. It intentionally gives up AMX ragged decoder and fused residual so the product lanes are not confused with the common control."
+  },
+  "hardware": {
+    "architecture": "any",
+    "cpu_family": "x86 AMX/VNNI or Arm Neoverse-V2/KleidiAI campaign host",
+    "logical_cpus": "unspecified",
+    "physical_cores": "unspecified",
+    "threads_per_core": "unspecified",
+    "numa_nodes": "unspecified",
+    "notes": "Topology and ISA backend remain host facts; only the serving/decoder contract is held constant."
+  },
+  "build": {
+    "target": "host-specific SIMD build; no AMX-only decoder request",
+    "requirements": {
+      "isa": "one of the declared x86/Arm CPU classes",
+      "decoder": "per-item INT8 decoder leaf"
+    }
+  },
+  "server": {
+    "prefork_workers": "unspecified",
+    "threads_per_worker": "unspecified",
+    "batch_size": 2,
+    "max_queue": 0,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": "unspecified",
+    "max_text_chars": "unspecified"
+  },
+  "streaming": {
+    "first_chunk_ramp": [1, 2, 4],
+    "decode_chunk": 4,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8",
+      "code_predictor_weights": "int8",
+      "speech_decoder_weights": "int8 per-item",
+      "activations": "backend-native INT8 preparation",
+      "gemm_backend": "native per ISA; no AMX/KAI-only decoder path"
+    },
+    "environment": {
+      "QWEN_BLAS_OWN": {"value": "1", "why": "same engine-owned compute-budget request"},
+      "OPENBLAS_THREAD_TIMEOUT": {"value": "1", "why": "keep the external BLAS pool from spinning against the engine pool"},
+      "OPENBLAS_NUM_THREADS": {"value": null, "why": "must be absent so engine-owned BLAS sizing is effective"},
+      "OMP_NUM_THREADS": {"value": null, "why": "must be absent; the engine profile owns the CPU budget"},
+      "QWEN_CP_PREC": {"value": "int8", "why": "same CP precision request"},
+      "QWEN_CP_PREFILL2": {"value": "0", "why": "remove the VNNI/Arm-specific CP prefill2 policy from the common control"},
+      "QWEN_DECODER_BATCH": {"value": "0", "why": "the only current decoder shape common to all three backend families is per-item decoding"},
+      "QWEN_KAI_LHS": {"value": null, "why": "no ISA-specific KAI LHS policy in the common control"},
+      "QWEN_KAI_QKV_FUSED": {"value": null, "why": "no ISA-specific KAI QKV policy in the common control"},
+      "QWEN_NO_AMX": {"value": "1", "why": "disable AMX-only generic and decoder paths"},
+      "QWEN_NO_AMX_BF16": {"value": "1", "why": "disable AMX-only BF16 path"},
+      "QWEN_NO_AMX_INT8": {"value": "1", "why": "disable AMX-only INT8 path"},
+      "QWEN_NO_AMX_Q4": {"value": "1", "why": "disable AMX-only Q4 path"},
+      "QWEN_NO_KLEIDI": {"value": "1", "why": "disable KAI-only generic path in the common control"},
+      "QWEN_NO_VNNI": {"value": "0", "why": "leave the ordinary x86 VNNI fallback available; AMX is disabled explicitly"},
+      "QWEN_NO_VNNI_TILE": {"value": "0", "why": "retain the native x86 VNNI tile where the common build has it"},
+      "QWEN_VNNI_MIN_B": {"value": "2", "why": "pin the x86 common-control gate"},
+      "QWEN_INT8_SDOT_MIN_B": {"value": "2", "why": "pin the Arm common-control gate"},
+      "QWEN_SMMLA_MIN_B": {"value": "2", "why": "pin the Arm common-control gate"},
+      "QWEN_BFMMLA_MIN_B": {"value": "2", "why": "pin the Arm common-control gate"},
+      "QWEN_KLEIDI_MIN_B": {"value": "1", "why": "pin the KAI common-control gate even though KAI is disabled"},
+      "QWEN_KAI_NCHUNK": {"value": null, "why": "not a common-control setting; record only in the Arm product lane"},
+      "QWEN_NO_BFMMLA": {"value": "1", "why": "disable Arm-specific BF16 matrix path"},
+      "QWEN_NO_SDOT": {"value": "0", "why": "Arm per-item INT8 decoder remains the native common decoder leaf"},
+      "QWEN_POOL_SPIN": {"value": "4096", "why": "common-control reference value; host-specific tuning is not claimed"},
+      "QWEN_PREFIX_CACHE": {"value": "1", "why": "same server semantics"},
+      "QWEN_PREFILL_MATMAT": {"value": "0", "why": "force the common FP32 prefill policy"},
+      "QWEN_Q4_NAIVE": {"value": "0", "why": "do not select scalar Q4"},
+      "QWEN_SD_AMX": {"value": null, "why": "legacy decoder switch; Design-D is disabled explicitly"},
+      "QWEN_SD_AMX_BF16": {"value": "0", "why": "disable AMX BF16 decoder path"},
+      "QWEN_SD_AMX_D": {"value": "0", "why": "disable AMX Design-D decoder path"},
+      "QWEN_SD_DIRECT_CONVT": {"value": "0", "why": "disable AMX-only direct preparation"},
+      "QWEN_SD_DIRECT_DWCONV": {"value": "0", "why": "disable AMX-only direct preparation"},
+      "QWEN_SD_DIRECT_INPUT": {"value": "0", "why": "disable AMX-only direct preparation"},
+      "QWEN_SD_FUSED_RESIDUAL": {"value": "0", "why": "disable AMX-only fused residual"},
+      "QWEN_SD_INT8": {"value": "1", "why": "same logical per-item INT8 decoder algorithm"},
+      "QWEN_SD_INT8_BLK": {"value": "256", "why": "pin the common decoder quantization block"},
+      "QWEN_SD_POOL": {"value": "engine", "why": "same engine-owned decoder pool semantics"},
+      "QWEN_SD_RAG_MIN_PANELS": {"value": "2", "why": "retained as explicit but inactive for decoder batch=0"},
+      "QWEN_SD_STREAM_STRIP": {"value": "0", "why": "disable AMX-only warm strip"},
+      "QWEN_SD_WINDOWED": {"value": "0", "why": "explicitly disable the legacy windowed fallback so the exact streaming decoder semantics are resolved"},
+      "QWEN_SERVER_ASYNC_OUTPUT": {"value": "0", "why": "same synchronous output contract"},
+      "QWEN_SERVER_NO_DECODER_BATCH": {"value": null, "why": "absence is explicit; decoder batch is disabled by QWEN_DECODER_BATCH=0"},
+      "QWEN_TTS_STREAM_LAYOUT": {"value": "1", "why": "same known-text serving layout across ISA lanes; ICL/clone and live incremental text remain outside this control"},
+      "QWEN_NO_BF16_MATMUL": {"value": "1", "why": "force the common FP32 prefill policy"}
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "unqualified",
+    "workload": "Operational common-control contract; no new hardware result is claimed by this file.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "notes": "The common control removes current accelerated decoder asymmetries; it is not the best product configuration for any ISA."
+  }
+}

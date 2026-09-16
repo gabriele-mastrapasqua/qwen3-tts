@@ -1,95 +1,273 @@
 #!/usr/bin/env python3
-"""soak_client.py — ONE closed-loop conversation of the soak, in one process."""
-import argparse, json, os, sys, time, urllib.request
+"""Run one closed-loop streaming conversation for a soak run."""
+import argparse
+import csv
+import json
+import os
+import random
+import sys
+import time
+import urllib.error
+import urllib.request
 
-def load_texts(path):
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import playback_sim  # noqa: E402
+
+
+def load_texts(path, wanted=None):
     rows = []
-    for ln in open(path, encoding="utf-8"):
-        ln = ln.rstrip("\n")
-        if not ln.strip() or ln.lstrip().startswith("#"):
-            continue
-        parts = [x.strip() for x in ln.split("\t")]
-        if len(parts) >= 8:   rows.append((parts[1], parts[-1]))
-        elif len(parts) > 1:  rows.append((parts[0], parts[-1]))
-        else:                 rows.append(("medium", ln.strip()))
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = [item.strip() for item in line.split("\t")]
+            if len(parts) >= 8:
+                item = (parts[1], parts[-1])
+            elif len(parts) > 1:
+                item = (parts[0], parts[-1])
+            else:
+                item = ("medium", parts[0])
+            if wanted is None or item[0] in wanted:
+                rows.append(item)
     return rows
 
-def one(port, text, speaker, language, seed, temperature, out_path):
-    body = json.dumps({"text": text, "speaker": speaker, "language": language,
-                       "seed": seed, "temperature": temperature}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/tts/stream", data=body,
-                                 headers={"Content-Type": "application/json"})
-    t0 = time.time()
-    n = first = 0
-    ttfa = None
-    fh = open(out_path, "wb") if out_path else None
+
+def make_picker(rows, worker, seed, schedule):
+    if schedule == "ordered":
+        return lambda index: rows[(worker * 7 + index) % len(rows)]
+
+    groups = {}
+    for cls, text in rows:
+        groups.setdefault(cls, []).append(text)
+    classes = sorted(groups)
+    rng = random.Random(seed + worker)
+    for values in groups.values():
+        rng.shuffle(values)
+
+    def pick(index):
+        cls = classes[(worker + index) % len(classes)]
+        values = groups[cls]
+        text = values[((worker + index) // len(classes)) % len(values)]
+        return cls, text
+
+    return pick
+
+
+PLAYBACK_COLUMNS = (
+    "safe_play_start_ms", "header_to_audio_ms", "max_gap_s", "coalesced_reads",
+    "stall_ms_at_100", "stalls_at_100", "stall_ms_at_250", "stalls_at_250",
+    "stall_ms_at_500", "stalls_at_500", "stall_ms_at_1000", "stalls_at_1000",
+)
+
+
+def stream_kpis(marks, total_s):
+    """Return streaming and CLIENT-OBSERVED playback metrics for one response.
+
+    ``marks`` contains ``(seconds_since_send, bytes_received[, seconds_blocked_in_read])``.
+    Every definition lives in ``tests/playback_sim.py`` (single source): the legacy keys
+    are kept for the CSV consumers, ``prebuffer_s`` is the required prebuffer, and the
+    fixed-buffer fields simulate a real jitter buffer.  A mark is the return of the
+    client's chunked read, so a late reader can coalesce arrivals; ``coalesced_reads``
+    counts reads that returned already-queued data and bounds that effect.
+    """
+    k = playback_sim.timeline_kpis(marks, total_s)
+    out = {
+        "stream_rtf": k["stream_rtf"],
+        "underrun_s": k["underrun_total_s"],
+        "stall_max_s": k["stall_max_s"],
+        "prebuffer_s": k["required_prebuffer_s"],
+        "gap_ratio_max": k["gap_ratio_max"],
+        "chunks": k["chunks"],
+        "safe_play_start_ms": k["safe_play_start_s"] * 1000.0,
+        "max_gap_s": k["max_gap_s"],
+        "coalesced_reads": k["coalesced_chunks"],
+    }
+    for b in playback_sim.BUFFERS_MS:
+        out[f"stall_ms_at_{b}"] = k[f"stall_ms@{b}"]
+        out[f"stalls_at_{b}"] = k[f"stalls@{b}"]
+    return out
+
+
+CSV_COLUMNS = (
+    "t_end_s", "worker", "i", "ttfb_ms", "ttfa_ms", "total_ms", "bytes",
+    "first_chunk_bytes", "audio_s", "stream_rtf", "underrun_s",
+    "stall_max_s", "prebuffer_s", "gap_ratio_max", "chunks",
+    *PLAYBACK_COLUMNS,
+    "status", "outcome",
+    "is_probe", "class", "text_chars", "seed", "schedule", "error",
+)
+
+
+def one(port, text, speaker, language, seed, temperature, out_path, timeout):
+    body = json.dumps({
+        "text": text,
+        "speaker": speaker,
+        "language": language,
+        "seed": seed,
+        "temperature": temperature,
+    }).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/tts/stream",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    started = time.time()
+    received = first = 0
+    first_at = None
+    header_at = None
+    marks = []
+    handle = open(out_path, "wb") if out_path else None
     try:
-        with urllib.request.urlopen(req, timeout=600) as r:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            # TTFB: urlopen returns once the status line + headers are parsed.  On the
+            # batched server the header is written together with the first audio chunk,
+            # so TTFB and TTFA are the same event today; they are stamped independently.
+            header_at = time.time() - started
             while True:
-                ch = r.read1(1 << 16)
-                if not ch:
+                # read1 returns at most ONE HTTP chunk (or part of one) and does not wait
+                # for that chunk's trailing CRLF.  ``blocked`` is the time spent inside the
+                # call: a near-zero value means the data was already queued (coalesced
+                # arrival or split chunk), so the mark overstates that chunk's lateness.
+                t_call = time.time()
+                chunk = response.read1(1 << 16)
+                t_ret = time.time()
+                if not chunk:
                     break
-                if ttfa is None:
-                    ttfa = time.time() - t0
-                    first = len(ch)
-                n += len(ch)
-                if fh:
-                    fh.write(ch)
-    except Exception as e:
-        return None, str(e)
+                if first_at is None:
+                    first_at = t_ret - started
+                    first = len(chunk)
+                marks.append((t_ret - started, len(chunk), t_ret - t_call))
+                received += len(chunk)
+                if handle:
+                    handle.write(chunk)
+    except urllib.error.HTTPError as error:
+        # --max-queue 0 deliberately turns overload into an immediate 503.  That is
+        # an admission outcome, not an inference/client error; the caller records it
+        # separately and backs off before retrying the closed-loop worker.
+        if error.code == 503:
+            try:
+                error.read()
+            except Exception:
+                pass
+            return {"status": 503, "outcome": "intentional_reject"}, None
+        return None, f"HTTP {error.code}: {error.reason}"
+    except Exception as error:
+        return None, str(error)
     finally:
-        if fh:
-            fh.close()
-    total = time.time() - t0
-    audio = n / 2.0 / 24000.0
-    rest = (n - first) / 2.0 / 24000.0
-    stream = (total - ttfa) / rest if (ttfa is not None and rest > 0) else float("nan")
-    return dict(ttfa_ms=(ttfa or 0) * 1000.0, total_ms=total * 1000.0, bytes=n,
-                first=first, audio_s=audio, stream_rtf=stream), None
+        if handle:
+            handle.close()
+
+    total = time.time() - started
+    audio_s = received / 2.0 / 24000.0
+    kpis = stream_kpis(marks, total)
+    kpis["header_to_audio_ms"] = ((first_at or 0.0) - (header_at or 0.0)) * 1000.0
+    return {
+        "ttfb_ms": (header_at or 0.0) * 1000.0,
+        "ttfa_ms": (first_at or 0.0) * 1000.0,
+        "total_ms": total * 1000.0,
+        "bytes": received,
+        "status": 200,
+        "outcome": "completed",
+        "first_chunk_bytes": first,
+        "audio_s": audio_s,
+        **kpis,
+    }, None
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--worker", type=int, required=True)
-    ap.add_argument("--t0", type=float, required=True)
-    ap.add_argument("--deadline", type=float, required=True)
-    ap.add_argument("--bank", required=True)
-    ap.add_argument("--speaker", required=True)
-    ap.add_argument("--language", default="English")
-    ap.add_argument("--temperature", type=float, default=0.9)
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--audio-dir", default="")
-    ap.add_argument("--probe-every-min", type=int, default=5)
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--worker", type=int, required=True)
+    parser.add_argument("--t0", type=float, required=True)
+    parser.add_argument("--deadline", type=float, required=True)
+    parser.add_argument("--bank", required=True)
+    parser.add_argument("--classes", default="")
+    parser.add_argument("--speaker", required=True)
+    parser.add_argument("--language", default="English")
+    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--request-timeout", type=float, default=180.0)
+    parser.add_argument("--schedule", choices=("stratified", "ordered"), default="stratified")
+    parser.add_argument("--schedule-seed", type=int, default=42)
+    parser.add_argument("--csv", required=True)
+    parser.add_argument("--audio-dir", default="")
+    parser.add_argument("--probe-every-min", type=int, default=5)
+    args = parser.parse_args()
 
-    texts = load_texts(a.bank)
-    if not texts:
-        sys.exit("empty bank")
-    w, i, ticked = a.worker, 0, set()
-    with open(a.csv, "a", buffering=1) as csv:
-        while time.time() < a.deadline:
-            el = time.time() - a.t0
-            minute = int(el // 60)
-            probe = (a.audio_dir and minute % a.probe_every_min == 0
-                     and minute not in ticked)
+    wanted = {item.strip() for item in args.classes.split(",") if item.strip()} or None
+    rows = load_texts(args.bank, wanted)
+    if not rows:
+        sys.exit("empty text bank")
+    if args.probe_every_min < 1:
+        sys.exit("--probe-every-min must be positive")
+    if args.audio_dir:
+        os.makedirs(args.audio_dir, exist_ok=True)
+
+    pick = make_picker(rows, args.worker, args.schedule_seed, args.schedule)
+    probe_cls, probe_text = rows[(args.worker + args.schedule_seed) % len(rows)]
+    ticked = set()
+    index = 0
+    reject_streak = 0
+    with open(args.csv, "w", newline="", buffering=1, encoding="utf-8") as handle:
+        output = csv.writer(handle)
+        output.writerow(CSV_COLUMNS)
+        while time.time() < args.deadline:
+            elapsed = time.time() - args.t0
+            minute = int(elapsed // 60)
+            probe = bool(args.audio_dir and minute % args.probe_every_min == 0
+                         and minute not in ticked)
             if probe:
                 ticked.add(minute)
-                cls, text = texts[w % len(texts)]
-                seed = 900 + w
-                out = os.path.join(a.audio_dir, f"min{minute:03d}_w{w}.pcm")
+                cls, text = probe_cls, probe_text
+                seed = 900000 + args.worker
+                output_path = os.path.join(
+                    args.audio_dir, f"min{minute:03d}_w{args.worker}.pcm"
+                )
             else:
-                cls, text = texts[(w * 7 + i) % len(texts)]
-                seed = 1000 + w * 100 + i
-                out = ""
-            rec, err = one(a.port, text, a.speaker, a.language, seed, a.temperature, out)
-            t_end = time.time() - a.t0
-            if err:
-                csv.write(f"{t_end:.3f},{w},{i},,,,,,,{1 if probe else 0},{cls},ERROR:{err}\n")
+                cls, text = pick(index)
+                seed = args.schedule_seed + 1000 + args.worker * 100000 + index
+                output_path = ""
+
+            result, error = one(
+                args.port, text, args.speaker, args.language, seed,
+                args.temperature, output_path, args.request_timeout,
+            )
+            end = time.time() - args.t0
+            tail = (int(probe), cls, len(text), seed, args.schedule)
+            # These two fields sit before the five request-identifying tail fields so
+            # older consumers that rely on the final `error` column remain compatible.
+            blanks = len(CSV_COLUMNS) - 3 - len(tail) - 1 - 2
+            if error:
+                output.writerow((f"{end:.3f}", args.worker, index,
+                                 *([""] * blanks), "", "error", *tail, error))
+                reject_streak = 0
+            elif result.get("status") == 503:
+                output.writerow((f"{end:.3f}", args.worker, index,
+                                 *([""] * blanks), "503", "intentional_reject", *tail, ""))
+                reject_streak += 1
+                # A fail-fast server must not be hammered by a closed-loop client.  The
+                # cap is deliberately short so admission remains responsive while the
+                # trace reflects the offered workload rather than a retry storm.
+                time.sleep(min(0.5, 0.05 * (2 ** min(reject_streak - 1, 3))))
             else:
-                csv.write(f"{t_end:.3f},{w},{i},{rec['ttfa_ms']:.1f},{rec['total_ms']:.1f},"
-                          f"{rec['bytes']},{rec['first']},{rec['audio_s']:.3f},"
-                          f"{rec['stream_rtf']:.4f},{1 if probe else 0},{cls},\n")
-            i += 1
+                output.writerow((
+                    f"{end:.3f}", args.worker, index,
+                    f"{result['ttfb_ms']:.1f}", f"{result['ttfa_ms']:.1f}", f"{result['total_ms']:.1f}",
+                    result["bytes"], result["first_chunk_bytes"],
+                    f"{result['audio_s']:.3f}", f"{result['stream_rtf']:.4f}",
+                    f"{result['underrun_s']:.4f}", f"{result['stall_max_s']:.4f}",
+                    f"{result['prebuffer_s']:.4f}", f"{result['gap_ratio_max']:.4f}",
+                    result["chunks"],
+                    f"{result['safe_play_start_ms']:.1f}", f"{result['header_to_audio_ms']:.1f}",
+                    f"{result['max_gap_s']:.4f}", result["coalesced_reads"],
+                    *(f"{result[f'stall_ms_at_{b}']:.1f}" if i == 0 else result[f"stalls_at_{b}"]
+                      for b in playback_sim.BUFFERS_MS for i in (0, 1)),
+                    result["status"], result["outcome"],
+                    *tail, "",
+                ))
+                reject_streak = 0
+            index += 1
+
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_voice_clone.h"
@@ -207,11 +208,18 @@ typedef struct {
     const float *attn_k;
     const float *attn_v;
     const float *attn_o;
+    uint16_t *attn_q_bf16;
+    uint16_t *attn_k_bf16;
+    uint16_t *attn_v_bf16;
+    uint16_t *attn_o_bf16;
     const float *attn_layer_scale;
     const float *ffn_norm;
     const float *ffn_gate;
     const float *ffn_up;
     const float *ffn_down;
+    uint16_t *ffn_gate_bf16;
+    uint16_t *ffn_up_bf16;
+    uint16_t *ffn_down_bf16;
     const float *ffn_layer_scale;
 } qwen_sd_pre_layer_t;
 
@@ -227,6 +235,10 @@ typedef struct {
     const float *norm_weight;
     const float *norm_bias;
     const float *gamma;
+    /* QWEN_SD_CNEXT_I8: per-output-row int8 copies of the two pointwise weights, built
+     * once at first use, registered with KleidiAI under the f32 pointer as the key. */
+    int8_t *pwconv1_i8; float *pwconv1_scale; int pw1_rows, pw1_cols;
+    int8_t *pwconv2_i8; float *pwconv2_scale; int pw2_rows, pw2_cols;
 } qwen_sd_convnext_t;
 
 typedef struct {
@@ -261,10 +273,14 @@ typedef struct {
 
     qwen_sd_pre_layer_t *pre_layers;
     const float *input_proj_weight;
+    uint16_t *input_proj_weight_bf16;
     const float *input_proj_bias;
     const float *final_norm_weight;
     const float *output_proj_weight;
+    uint16_t *output_proj_weight_bf16;
     const float *output_proj_bias;
+    int bf16_preup_ready;
+    size_t bf16_preup_bytes;
 
     float *rope_cos;
     float *rope_sin;
@@ -277,6 +293,7 @@ typedef struct {
     qwen_sd_upsample_block_t upsample_blocks[4];
 
     float *convt_packed[6];
+    float *convt_stack[6];      /* C12-WIN-11: [k*out_ch][in_ch] stacked ConvT weights (NULL unless QWEN_SD_CONVT_STACK) */
 
     const float *final_conv_weight;
     const float *final_conv_bias;
@@ -316,6 +333,7 @@ typedef struct {
     int frames_decoded;
     int samples_produced;
     int initialized;
+    void *scratch;            /* per-stream decoder scratch arena (qwen_tts_speech_decoder.c) */
 } qwen_sd_stream_state_t;
 
 typedef struct {
@@ -447,7 +465,24 @@ typedef struct qwen_tts_ctx {
     int kv_len;
 
     int prefill_only;
+    /* C12-WIN-10 sliced admission: with prefill_defer set, a prefill_only generate
+     * builds the prompt and hands the embeddings back here instead of running the
+     * Talker, so the caller can drive qwen_talker_prefill_range() slice by slice.
+     * prefill_embeds is owned by the caller once the call returns 0. */
+    int prefill_defer;
+    float *prefill_embeds;
+    int prefill_seq_len;
     int bg_text_content_len;
+
+    /* Known-text streaming layout (SL-1).  The prefill contains only the
+     * aligned prefix; the remaining text projections are consumed once per
+     * generated codec frame.  Ownership is the context unless a caller
+     * explicitly transfers the pointer into its request slot. */
+    int   stream_layout_active;
+    int   stream_layout_prefill_len;
+    float *stream_trailing_text;
+    int   stream_trailing_len;
+    int   stream_trailing_pos;
 
     uint16_t *cp_kv_k;
     uint16_t *cp_kv_v;
@@ -557,6 +592,9 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir);
 qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8, int use_int4);
 
 void qwen_kleidi_prepack(qwen_tts_ctx_t *ctx);
+void qwen_amx_prepack_model(qwen_tts_ctx_t *ctx);
+void qwen_amx_prepack_model_nt(qwen_tts_ctx_t *ctx, int serving_threads);
+void qwen_vnni_prepack_model(qwen_tts_ctx_t *ctx);
 
 int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
                            int threads_per, int max_batch);
@@ -613,12 +651,54 @@ typedef struct {
     int (*running)(void *ud);
     int (*cancelled)(void *ud, void *tag);
     void (*on_reject)(void *ud, void *tag, const char *reason);
+    /* Optional serving policy hook.  Return non-zero when this slot may perform
+     * one more Talker/CP frame.  first_step is true for a newly admitted slot;
+     * callers must use it to preserve first-audio progress.  This is a policy
+     * gate at an existing complete-frame boundary, not decoder preemption. */
+    int (*step_allowed)(void *ud, void *tag, int first_step);
 } qwen_batch_sink_t;
 
 int qwen_tts_batch_max_prompt(void);
+
+/* Resolve and VALIDATE QWEN_PREFILL_SLICE (C12-WIN-10).  Exits with a message on an
+ * unusable value, so call it once in the parent before any fork: a worker that dies on a
+ * bad flag would otherwise be respawned while the parent keeps serving the control. */
+int qwen_prefill_slice_tokens(void);
+
+/* Tokens the next prefill slice takes, given what is left and the configured bound.
+ * Shared by the serving loop and by --prefill-slice-check so the tested rule is the
+ * shipped rule. */
+int qwen_prefill_slice_next(int remaining, int slice);
 int qwen_tts_batch_max_frames(void);
+void qwen_tts_set_batch_max_frames(int frames);   /* server: derived from --max-request-seconds; env wins */
+int qwen_tts_batch_max_frames_source(void);       /* 0 compiled default, 1 server-derived, 2 QWEN_BATCH_MAX_FRAMES */
 
 void qwen_admit_probe_read(unsigned long long *seq, double *ts_ms, double *last_iter_ms);
+
+/* Prefork admission health exported through a MAP_SHARED page.  The parent only
+ * reads this small signal; the child updates it at the existing iteration
+ * boundary.  A NULL binding leaves the normal/default path unchanged. */
+#ifdef __cplusplus
+/* nvcc compiles the .cu translation units as C++, where _Atomic is not a keyword, so the
+ * C11 spelling below fails to parse and the whole CUDA build breaks on a struct those units
+ * never touch.  They only need this header to parse and the layout to agree: on every target
+ * we build, _Atomic unsigned long long and _Atomic double have the same size and alignment
+ * as their plain counterparts, so the plain form is layout-compatible.  Atomic access stays
+ * in the C side, which sees the _Atomic version. */
+typedef struct {
+    unsigned long long seq;
+    double ts_ms;
+    double last_iter_ms;
+} qwen_admission_health_t;
+#else
+typedef struct {
+    _Atomic unsigned long long seq;
+    _Atomic double ts_ms;
+    _Atomic double last_iter_ms;
+} qwen_admission_health_t;
+#endif
+
+void qwen_admission_health_bind(qwen_admission_health_t *health, int worker_id);
 
 int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int max_batch, qwen_batch_sink_t *sink);
 
@@ -627,6 +707,9 @@ int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, in
 int qwen_speech_encoder_load(qwen_tts_ctx_t *ctx);
 int qwen_speech_encoder_encode(qwen_tts_ctx_t *ctx, const float *audio, int n_samples,
                                 int **codes_out, int *n_frames_out);
+
+int qwen_sd_bf16_preup_active(void);
+void qwen_sd_bf16_preup_free(qwen_speech_decoder_t *sd, int n_layers);
 
 #ifdef __cplusplus
 }

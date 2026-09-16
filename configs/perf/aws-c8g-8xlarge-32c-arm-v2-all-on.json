@@ -1,0 +1,331 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "aws-c8g-8xlarge-32c-arm-v2-all-on",
+    "description": "Host-scoped all-on Arm v2 policy for AWS c8g.8xlarge / Graviton4 32-vCPU Neoverse-V2. It covers the OSS 0.6B and 1.7B models; preferred concurrency remains unqualified until this host's quality and soak gates are recorded.",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [
+        1,
+        12
+      ],
+      "preferred_concurrency": "0.6B C12; 1.7B C10 (per checkpoint size)",
+      "quality_changes_allowed": false,
+      "preferred_concurrency_evidence": "30-minute closed-loop soaks, strict KPI, this profile as committed, 2026-09-15. 0.6B C12: 3962 completed, 0 errors/rejects/timeouts, STREAM RTF p95 0.836, TTFA p95 198 ms, safe-play-start p95 356 ms, stall@250/@500 0%/0%. 1.7B C10: 3665 completed, 0/0/0, STREAM RTF p95 0.831, TTFA p95 207 ms, safe-play-start p95 364 ms, stall@250/@500 0%/0%. Latency, per-class (5 classes) and resource-stability KPI PASS on both; threads flat at 92. Knee screens put the breakdown at 0.6B C13 and the end of stall-free operation at 1.7B C11. These points assume a client prebuffer of at least 250 ms: stall@100 is 22-23% at these densities."
+    }
+  },
+  "parity": {
+    "lane": "arm-product",
+    "isa_classes": [
+      "arm_i8mm_bf16",
+      "arm_dotprod"
+    ],
+    "decoder": {
+      "requested_batch": 1,
+      "expected_modes": [
+        "per-item-int8-dotprod"
+      ],
+      "precision": "int8",
+      "fallback_status": "VALID FALLBACK"
+    },
+    "backends": {
+      "talker_cp": "kai",
+      "prefill": "kai",
+      "q4": "kai"
+    },
+    "features": {
+      "design_d": "UNSUPPORTED",
+      "fused_residual": "UNSUPPORTED",
+      "kleidi": "ACTIVE",
+      "res1_v2": "ACTIVE",
+      "decoder_lane": [
+        "ACTIVE",
+        "VALID FALLBACK"
+      ],
+      "multislot": [
+        "ACTIVE",
+        "VALID FALLBACK"
+      ]
+    },
+    "quality_gate": {
+      "required": true,
+      "command": "strict profile preflight + same-model serving-generation structural/audio gate",
+      "audio_gate": "same OSS model, voice, language, seed/settings and bank; valid non-empty PCM/WAV plus playback checks",
+      "reject_on": [
+        "host/topology mismatch",
+        "KleidiAI bypass",
+        "wrong decoder precision",
+        "wrong Q4/I8 policy",
+        "quality regression"
+      ]
+    },
+    "tunable_flags": [
+      "QWEN_KAI_NCHUNK",
+      "QWEN_POOL_SPIN"
+    ],
+    "notes": "Host-scoped AWS c8g.8xlarge/Graviton4 32-vCPU policy. KAI, RES1_V2, BF16 pre-up and the elastic lane split are explicitly active for the OSS qualification campaign; the 2-slot multislot cohort is RETIRED on this host (VALID FALLBACK, see QWEN_SD_MULTISLOT) after it measured 1.63x the cost of sequential singleton decode; the host-specific audio and soak gates have now passed and this file promotes 0.6B C12 / 1.7B C10 (see objective.preferred_concurrency_evidence); those points assume a client prebuffer of at least 250 ms."
+  },
+  "hardware": {
+    "architecture": "arm64",
+    "cpu_family": "AWS Graviton4 / Arm Neoverse-V2 (c8g.8xlarge)",
+    "logical_cpus": 32,
+    "physical_cores": 32,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "l3_mib": 36,
+    "ram_gib": 62,
+    "isa_features_used": [
+      "asimd",
+      "asimddp",
+      "i8mm",
+      "bf16"
+    ],
+    "smt_policy": "OFF; one thread per physical core",
+    "canonical_topology": "4 workers x 8 threads, contiguous masks 0-7, 8-15, 16-23, 24-31",
+    "notes": "AWS c8g.8xlarge/Graviton4 32-vCPU host, no SMT and one NUMA node. The GEMV shape discriminator retained 4x8 scaling on this Neoverse-V2 control; server quality/capacity remain unqualified until the host-specific gates pass."
+  },
+  "build": {
+    "target": "SIMD=arm-i8mm-bf16 with KleidiAI",
+    "requirements": {
+      "isa": "ASIMDDP + I8MM + BF16 HWCAP/compile support",
+      "decoder": "explicit Arm DOTPROD INT8 policy"
+    }
+  },
+  "server": {
+    "prefork_workers": 4,
+    "threads_per_worker": 8,
+    "batch_size": 8,
+    "max_queue": 0,
+    "queue_timeout_ms": 0,
+    "max_request_seconds": 60,
+    "max_text_chars": "unspecified",
+    "worker_affinity": "contiguous core slices, worker 0 -> CPU 0-7, worker 1 -> CPU 8-15, worker 2 -> CPU 16-23, worker 3 -> CPU 24-31"
+  },
+  "streaming": {
+    "first_chunk_ramp": [
+      1,
+      2,
+      4
+    ],
+    "decode_chunk": 4,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8",
+      "code_predictor_weights": "int8",
+      "speech_decoder_weights": "int8 per-item DOTPROD with RES1_V2",
+      "activations": "KAI native preparation; INT8 RES1_V2 decoder panels",
+      "gemm_backend": "KleidiAI INT8/Q4/BF16"
+    },
+    "environment": {
+      "QWEN_ARM_BFDOT": {
+        "value": "0",
+        "why": "keep the measured/default KAI BF16 policy explicit; BFDOT is a separate opt-in"
+      },
+      "QWEN_BLAS_OWN": {
+        "value": "1",
+        "why": "same engine-owned compute-budget request"
+      },
+      "OPENBLAS_THREAD_TIMEOUT": {
+        "value": "1",
+        "why": "keep the external BLAS pool from spinning against the engine pool"
+      },
+      "OPENBLAS_NUM_THREADS": {
+        "value": null,
+        "why": "must be absent so engine-owned BLAS sizing is effective"
+      },
+      "OMP_NUM_THREADS": {
+        "value": null,
+        "why": "must be absent; the engine profile owns the CPU budget"
+      },
+      "QWEN_CP_PREC": {
+        "value": "int8",
+        "why": "pin CP precision"
+      },
+      "QWEN_CP_PREFILL2": {
+        "value": "1",
+        "why": "pin the explicit Arm CP prefill policy"
+      },
+      "QWEN_DECODER_BATCH": {
+        "value": "1",
+        "why": "keep server batching semantics; preflight verifies per-item decoder leaf"
+      },
+      "QWEN_SD_BF16_PREUP": {
+        "value": "1",
+        "why": "host-scoped all-on 0.6B policy; KAI BF16 prepared-state path is enabled"
+      },
+      "QWEN_INT8_SDOT_MM": {
+        "value": "0",
+        "why": "do not opt into the separate generic SDOT matmat gate"
+      },
+      "QWEN_INT8_SDOT_MIN_B": {
+        "value": "2",
+        "why": "pin the Arm SDOT matmat gate even though the product decoder is per-item"
+      },
+      "QWEN_SMMLA_MIN_B": {
+        "value": "2",
+        "why": "pin the Arm i8mm gate"
+      },
+      "QWEN_BFMMLA_MIN_B": {
+        "value": "2",
+        "why": "pin the Arm BF16 matrix gate"
+      },
+      "QWEN_KLEIDI_MIN_B": {
+        "value": "1",
+        "why": "pin the KAI Q4/int8 gate"
+      },
+      "QWEN_KAI_LHS": {
+        "value": "asym",
+        "why": "pin the existing asymmetric KAI LHS quantisation mode"
+      },
+      "QWEN_KAI_QKV_FUSED": {
+        "value": "1",
+        "why": "pin KAI fused QKV policy"
+      },
+      "QWEN_KAI_NCHUNK": {
+        "value": "384",
+        "why": "pin the measured KAI GEMM n-subtiling policy"
+      },
+      "QWEN_NO_BFMMLA": {
+        "value": "0",
+        "why": "allow native Arm BF16 matrix path"
+      },
+      "QWEN_NO_KAI_BF16": {
+        "value": "0",
+        "why": "require KAI BF16 where supported"
+      },
+      "QWEN_NO_KAI_I8": {
+        "value": "0",
+        "why": "require KAI INT8 where supported"
+      },
+      "QWEN_NO_KLEIDI": {
+        "value": "0",
+        "why": "KleidiAI is the Arm product backend"
+      },
+      "QWEN_NO_Q8REPACK": {
+        "value": "0",
+        "why": "retain the native Arm Q8 repack path"
+      },
+      "QWEN_NO_SDOT": {
+        "value": "0",
+        "why": "require the Arm DOTPROD decoder leaf"
+      },
+      "QWEN_NO_SMMLA": {
+        "value": "0",
+        "why": "allow the KAI/i8mm matrix path"
+      },
+      "QWEN_POOL_SPIN": {
+        "value": "65536",
+        "why": "Arm-specific starting policy; must be requalified on the target host"
+      },
+      "QWEN_PREFIX_CACHE": {
+        "value": "1",
+        "why": "same server semantics as the AMX lane"
+      },
+      "QWEN_PREFILL_MATMAT": {
+        "value": "1",
+        "why": "require native KAI BF16 prefill"
+      },
+      "QWEN_Q4_NAIVE": {
+        "value": "0",
+        "why": "do not select scalar Q4"
+      },
+      "QWEN_SD_AMX": {
+        "value": null,
+        "why": "x86-only legacy switch; must be absent on Arm"
+      },
+      "QWEN_SD_AMX_BF16": {
+        "value": "0",
+        "why": "no Arm AMX decoder path"
+      },
+      "QWEN_SD_AMX_D": {
+        "value": "0",
+        "why": "no Arm Design-D decoder path"
+      },
+      "QWEN_SD_DIRECT_CONVT": {
+        "value": "0",
+        "why": "AMX-only experiment"
+      },
+      "QWEN_SD_DIRECT_DWCONV": {
+        "value": "0",
+        "why": "AMX-only experiment"
+      },
+      "QWEN_SD_DIRECT_INPUT": {
+        "value": "0",
+        "why": "AMX-only experiment"
+      },
+      "QWEN_SD_FUSED_RESIDUAL": {
+        "value": "0",
+        "why": "no Arm fused residual implementation"
+      },
+      "QWEN_SD_INT8": {
+        "value": "1",
+        "why": "select the measured Arm INT8 RES1_V2 decoder"
+      },
+      "QWEN_SD_INT8_BLK": {
+        "value": "64",
+        "why": "pin the existing non-VNNI decoder block policy"
+      },
+      "QWEN_SD_LANE_ELASTIC": {
+        "value": "1",
+        "why": "host-scoped 4x8 Neoverse-V2 lane policy; must be confirmed by the serving check"
+      },
+      "QWEN_SD_LANE_SPLIT": {
+        "value": "4",
+        "why": "host-scoped Arm decoder lane split for the 4x8 candidate; must be confirmed by the serving check"
+      },
+      "QWEN_SD_MULTISLOT": {
+        "value": "0",
+        "why": "RETIRED on this host 2026-09-14: the ragged cohort is a measured per-call loss on the Arm int8 path. Isolated decode_quantum_bench on this box (chunk 4, taskset 0-7, 8 threads): 1 singleton 40.6 ms, 2 sequential singletons 81.0 ms, 1 ragged pair 132.1 ms (1.63x), and the same ~1.6x at chunk 1/2/8 and at S=3. Cost map puts 100% of the excess in conv_stack; QWEN_SD_PHASE puts +42.5 ms in res1 and +7.1 ms in res2 (the two multi-kernel call sites) while the shared f32 ConvT is 0.7 ms cheaper; objdump shows sd_dconv_multi_worker spilling its runtime-indexed accumulators (40 q-stores / 33 q-loads around 30 sdot) where the single-slot kernel has none. Weight sizes and measured bandwidth bound the sharing upside at a few ms per pair. The pre-registered COHORT_MAX_B=2 vs =1 A/B at C8 and C10 did not meet its keep rule. Per-item int8 DOTPROD is the qualified decoder leaf here.",
+        "revert": "QWEN_SD_MULTISLOT=2 only after an exact S==2 named-accumulator kernel lands and beats sequential singleton decode in decode_quantum_bench; the flag, kernel and multi-slot self-test cases stay in the tree"
+      },
+      "QWEN_SD_RES1_V2": {
+        "value": "1",
+        "why": "select the verified rectangular/wide Arm DOTPROD decoder leaf"
+      },
+      "QWEN_SD_POOL": {
+        "value": "engine",
+        "why": "same engine-owned decoder pool semantics"
+      },
+      "QWEN_SD_RAG_MIN_PANELS": {
+        "value": "2",
+        "why": "same logical threshold; no Arm ragged decoder implementation is implied"
+      },
+      "QWEN_SD_STREAM_STRIP": {
+        "value": "0",
+        "why": "Design-D warm strip unavailable on Arm"
+      },
+      "QWEN_SD_WINDOWED": {
+        "value": "0",
+        "why": "explicitly disable the legacy windowed fallback so the exact streaming decoder semantics are resolved"
+      },
+      "QWEN_SERVER_ASYNC_OUTPUT": {
+        "value": "0",
+        "why": "same synchronous output contract"
+      },
+      "QWEN_SERVER_NO_DECODER_BATCH": {
+        "value": null,
+        "why": "presence flag must remain absent; decoder request is explicit"
+      },
+      "QWEN_TTS_STREAM_LAYOUT": {
+        "value": "1",
+        "why": "same official known-text serving layout as AMX; ICL/clone and live incremental text remain outside this lane"
+      }
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "extra_arguments": [],
+    "server_env_serialization": "comma"
+  },
+  "qualification": {
+    "status": "unqualified",
+    "workload": "Host-scoped OSS 0.6B and 1.7B all-on qualification on AWS c8g.8xlarge/Graviton4 32-vCPU, with 4x8 as the post-discriminator candidate baseline. Capacity recommendations are produced only from this host's WAVE, Poisson, playback and soak evidence.",
+    "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
+    "model": "qwen3-tts-0.6b and qwen3-tts-1.7b",
+    "speaker": "ryan",
+    "notes": "Host-scoped Graviton4 profile only. It does not change arm-product defaults and must remain unqualified until all-on structural/audio quality, playback, and sustained-load gates are recorded. The run manifest, not this static profile, is the source of measured commit and binary provenance."
+  }
+}
