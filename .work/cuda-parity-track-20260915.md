@@ -740,3 +740,35 @@ thread count -- now confirmed on the GPU serving path.
 Two consequences. The 17% RTF win in §14.8 from sizing the pool correctly is **not
 output-neutral**. And every bit-exactness claim in this campaign holds only with the thread
 count fixed, which every comparison here did.
+
+### 14.14 The speech-decoder CUDA graph: root-caused, and worth nothing
+
+The GPU-resident conv decoder is ~150 kernel launches per call and was the last stage with no
+CUDA graph, at 11-15% of serving time. vLLM-Omni captures its Code2Wav stage for this reason, so
+it looked like the best remaining candidate of the "absent, not broken" kind that paid every time
+today.
+
+**What the decoder is actually called with** (one 6.16 s request, traced): lengths 1, 3, 5, 9, 13,
+21, then 28 for every remaining call — a short ramp for time-to-first-audio, then a fixed window.
+Thirteen calls, seven at 28. A graph per length would cover nearly everything on a long request.
+
+**Why capture failed, and it was one line.** `cudaStreamBeginCapture` succeeded and
+`cudaStreamEndCapture` then reported only "operation failed due to a previous error during
+capture", which names no operation. Asking the stream its capture status after each operation
+turned that into a location in one run: status Active after the conv-transpose, Invalidated
+immediately after the residual **`cudaMemcpy` device-to-device**. A synchronous copy cannot be
+recorded and kills the capture where it stands. cuBLAS, the obvious suspect and the thing this
+body has that the Talker's does not, captures without complaint.
+
+With both residual copies made async the capture survives the whole body and EndCapture returns
+clean.
+
+**And it buys nothing.** Five fixed-seed requests: 11.93 s with the graph, 11.94 s without. Same
+reason the batched-body graphs were worth 5-8% rather than the 30% the launch count suggests --
+launches are asynchronous and already overlap execution. The work was reverted rather than kept:
+it also produced a different waveform, so keeping it would have meant chasing a correctness bug
+for a measured zero.
+
+Recorded because the root cause is the useful part. If the decoder is ever restructured, the
+synchronous residual copy is the thing that blocks capture, and the capture-status probe is how to
+find that class of bug in one run instead of by reading.
