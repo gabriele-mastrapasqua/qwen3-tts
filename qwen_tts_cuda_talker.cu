@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <cuda_fp16.h>   /* __half q4blk scale (matches q4_0_block_t fp16 layout) */
 #include <stdio.h>
 #include <stdlib.h>
@@ -289,12 +290,14 @@ static inline void mv(int prec, const void *W, const float *scale, const float *
     else if (w8) { (dst)=up_int8((w8),(size_t)(rows)*(cols)); (dsts)=up_f32((w8s),(rows)); *(pprec)=1; } \
     else         { (dst)=up_bf16((wbf),(size_t)(rows)*(cols)); (dsts)=NULL; *(pprec)=0; } } while(0)
 
+static int cublas_mm_enabled(void);   /* defined with the batched matmat, below */
 extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c=&ctx->config;
     /* The dp4a scratch MUST be allocated here, before any CUDA-graph capture: cudaMalloc
      * inside a capturing stream fails, and a lazy allocation inside mv() both fails and
      * perturbs the capture. qdp_enabled() is idempotent. */
     (void)qdp_enabled();
+    (void)cublas_mm_enabled();   /* same hazard: creating the handle inside a capture fails */
     cuda_talker_t *s=(cuda_talker_t*)calloc(1,sizeof(*s));
     s->hidden=c->hidden_size; s->n_heads=c->num_heads; s->n_kv=c->num_kv_heads;
     s->head_dim=c->head_dim; s->inter=c->intermediate_size; s->n_layers=c->num_layers;
@@ -448,33 +451,44 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
  *
  * The accumulator stays unrolled over QB_MAX for the reason recorded above: indexed by a
  * runtime lane it spills to local memory and costs 33x. */
-__global__ void k_matmat_bf16(const __nv_bfloat16 *__restrict__ W,const float *__restrict__ X,
-                              float *__restrict__ Y,int rows,int cols,int B){
+template<int U>
+__global__ void k_matmat_bf16_u(const __nv_bfloat16 *__restrict__ W,const float *__restrict__ X,
+                                float *__restrict__ Y,int rows,int cols,int B){
     int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
     const __nv_bfloat16 *wr=W+(size_t)row*cols; float s[QB_MAX];
     #pragma unroll
     for(int b=0;b<QB_MAX;++b) s[b]=0.f;
-    int i=lane;
-    for(;i+96<cols;i+=128){
-        float w0=__bfloat162float(wr[i]),    w1=__bfloat162float(wr[i+32]),
-              w2=__bfloat162float(wr[i+64]), w3=__bfloat162float(wr[i+96]);
-        /* Accumulated one at a time, in the same order the scalar loop used, so the result is
-         * bit-identical to it.  Summing the four products as one expression lets the compiler
-         * build a different tree, which on the 28-layer Talker showed up as 1.6e-01 against the
-         * single-stream reference.  The four loads are independent of these adds and still
-         * issue together, which is the entire point of the unroll. */
+    int i=lane; const int span=32*U;
+    for(;i+span-32<cols;i+=span){
+        float w[U];
+        #pragma unroll
+        for(int u=0;u<U;++u) w[u]=__bfloat162float(wr[i+32*u]);   /* U misses in flight */
         #pragma unroll
         for(int b=0;b<QB_MAX;++b) if(b<B){ const float *xb=X+(size_t)b*cols;
-            s[b]+=w0*xb[i]; s[b]+=w1*xb[i+32]; s[b]+=w2*xb[i+64]; s[b]+=w3*xb[i+96]; }
+            /* One at a time, in the scalar loop's order, so the result is bit-identical to it.
+             * Summed as a single expression the compiler builds a different reduction tree and
+             * the 28-layer Talker drifts 1.6e-01 from the single-stream reference -- reordering
+             * rather than error, but indistinguishable from a bad index in a maximum. */
+            #pragma unroll
+            for(int u=0;u<U;++u) s[b]+=w[u]*xb[i+32*u]; }
     }
-    for(;i<cols;i+=32){ float w=__bfloat162float(wr[i]);
+    for(;i<cols;i+=32){ float wv=__bfloat162float(wr[i]);
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+i]; }
+        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=wv*X[(size_t)b*cols+i]; }
     #pragma unroll
     for(int b=0;b<QB_MAX;++b){ if(b>=B) break; float v=s[b];
         #pragma unroll
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=v; }
+}
+/* Unroll depth, i.e. how many weight loads a lane keeps in flight. The kernel is latency-bound,
+ * not bandwidth-bound -- its cost barely moves between two and eight lanes -- so this is the
+ * knob that matters. Swept on the hardware rather than picked. */
+static int mm_unroll(void){
+    static int u=-1;
+    if(u<0){ const char *e=getenv("QWEN_CUDA_MM_UNROLL"); u=e&&*e?atoi(e):4;
+             if(u!=4&&u!=8&&u!=16) u=4; }
+    return u;
 }
 __global__ void k_matmat_int8(const int8_t *W,const float *scale,const float *X,float *Y,int rows,int cols,int B){
     int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
@@ -507,11 +521,89 @@ __global__ void k_matmat_q4_0(const q4blk *W,const float *X,float *Y,int rows,in
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=v; }
 }
+/* cuBLAS for the shapes where it actually wins.
+ *
+ * The hand kernel gives one warp to each output row, so the block count is set by `rows` alone.
+ * At rows=1024 that is 128 blocks on 84 SMs -- one and a half blocks per SM, far too few warps
+ * to hide memory latency -- while at rows=6144 it is 768 blocks and the kernel runs 2x faster
+ * per byte. Measured on an A6000 at B=8, GB/s on the weights, hand vs cublasGemmEx:
+ *
+ *   q/o     1024x1024   225  vs  198   0.88x   hand wins, keep it
+ *   cp q    2048x1024   299  vs  508   1.70x
+ *   gate+up 6144x1024   365  vs  501   1.37x
+ *   down    1024x3072   191  vs  573   3.01x
+ *
+ * So the rule is shape-based and comes from that table: anything wider than 1024x1024 goes to
+ * cuBLAS, the square case stays on the hand kernel, and nothing is chosen by intuition.
+ *
+ * The cost is precision, not correctness: cublasGemmEx requires A and B to share a type, so the
+ * activations are narrowed to bf16 while the hand kernel keeps them in f32 against bf16 weights.
+ * The accumulator stays f32 either way. This is a different generation, not a wrong one, and it
+ * is why the flag ships off until the audio has been listened to. */
+#define CUBLAS_WS_BYTES (32u<<20)
+#define CUBLAS_XB_MAX ((size_t)QB_MAX*8192)   /* B x cols staging, allocated once at init */
+static cublasHandle_t g_cublas = NULL;
+static __nv_bfloat16 *g_xb = NULL; static size_t g_xb_cap = 0;
+static int cublas_mm_enabled(void){
+    static int on=-1;
+    if(on<0){ const char *e=getenv("QWEN_CUDA_CUBLAS"); on=(e&&*e&&*e!='0')?1:0;
+        if(on){
+            if(cublasCreate(&g_cublas)!=CUBLAS_STATUS_SUCCESS){
+                fprintf(stderr,"[cuda] cublasCreate failed — keeping the hand matmat\n"); on=0;
+            }else{
+                cublasSetStream(g_cublas,cudaStreamPerThread);
+                /* A user-provided workspace is what makes cuBLAS safe to capture in a CUDA
+                 * graph: without it the library may allocate on first use of a shape, and an
+                 * allocation inside a capturing stream fails the capture.  The body must NOT be
+                 * pre-executed to dodge that -- capture records without executing, so running
+                 * the body first would apply the step twice to the KV cache and the residual. */
+                void *ws=NULL;
+                if(cudaMalloc(&ws,CUBLAS_WS_BYTES)==cudaSuccess)
+                    cublasSetWorkspace(g_cublas,ws,CUBLAS_WS_BYTES);
+                else
+                    fprintf(stderr,"[cuda] cuBLAS workspace alloc failed — graph capture may fall back\n");
+                if(cudaMalloc(&g_xb,CUBLAS_XB_MAX*sizeof(__nv_bfloat16))==cudaSuccess) g_xb_cap=CUBLAS_XB_MAX;
+                else { g_xb=NULL; g_xb_cap=0; on=0;
+                       fprintf(stderr,"[cuda] cuBLAS activation staging alloc failed — keeping the hand matmat\n"); }
+                fprintf(stderr,"[cuda] batched matmat: cuBLAS for shapes wider than 1024x1024 "
+                               "(activations narrowed to bf16); QWEN_CUDA_CUBLAS=0 disables\n");
+            }
+        }
+    }
+    return on;
+}
+__global__ void k_f32_to_bf16(const float *__restrict__ src,__nv_bfloat16 *__restrict__ dst,int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) dst[i]=__float2bfloat16(src[i]);
+}
+/* True when cuBLAS measured faster for this shape. The square 1024x1024 case is the exception
+ * the table above records, not an oversight. */
+static inline int cublas_wins(int rows,int cols){ return !(rows<=1024 && cols<=1024); }
 static inline void mvB(int prec,const void*W,const float*scale,const float*X,float*Y,int rows,int cols,int B){
+    if(prec==0 && cublas_mm_enabled() && cublas_wins(rows,cols)){
+        size_t need=(size_t)B*cols;
+        /* No allocation here on purpose: mvB runs inside the graph capture, and cudaMalloc in a
+         * capturing stream fails.  The staging buffer is sized once at init; an unexpectedly
+         * wide shape falls through to the hand kernel instead of allocating. */
+        if(g_xb && need<=g_xb_cap){
+            k_f32_to_bf16<<<CEIL((int)need,TPB),TPB>>>(X,g_xb,(int)need);
+            float alpha=1.f,beta=0.f;
+            /* W is row-major [rows][cols], i.e. column-major [cols][rows]; the gemm is
+             * Y_cm[rows x B] = W_cm^T * X_cm, with X row-major [B][cols] = column-major [cols][B]. */
+            if(cublasGemmEx(g_cublas,CUBLAS_OP_T,CUBLAS_OP_N,rows,B,cols,&alpha,
+                            W,CUDA_R_16BF,cols, g_xb,CUDA_R_16BF,cols, &beta,
+                            Y,CUDA_R_32F,rows, CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT)==CUBLAS_STATUS_SUCCESS)
+                return;
+        }
+        /* anything unsupported falls through to the hand kernel rather than failing the step */
+    }
+
     int grid=CEIL(rows*32,TPB);
     if(prec==2) k_matmat_q4_0<<<grid,TPB>>>((const q4blk*)W,X,Y,rows,cols,B);
     else if(prec==1) k_matmat_int8<<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B);
-    else k_matmat_bf16<<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
+    else { int u=mm_unroll();
+           if(u==16)     k_matmat_bf16_u<16><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
+           else if(u==8) k_matmat_bf16_u< 8><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
+           else          k_matmat_bf16_u< 4><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); }
 }
 /* one block per sequence */
 __global__ void k_rmsnorm_full_b(const float *X,const float *w,float *Y,int dim,float eps){
@@ -575,6 +667,77 @@ __global__ void k_attn_b(const float *Q,const float *K,const float *V,float *O,
         float mn=fmaxf(m,score), corr=expf(m-mn), p=expf(score-mn);
         denom=denom*corr+p; acc=acc*corr+p*Vb[((size_t)j*n_kv+kvh)*hd+t]; m=mn; }
     O[(size_t)b*qd+(size_t)h*hd+t]=acc/denom;
+}
+/* Same attention, one warp per (b,head), no barriers.
+ *
+ * nsys put this kernel at 24.9% of all GPU time, second only to the matmats, running at about
+ * 78 GB/s.  The reason is in the loop above: for EVERY key position it does a shared-memory
+ * tree reduction with a __syncthreads() at each level, so roughly eight block-wide barriers per
+ * position -- ten thousand of them per (lane, head) per layer at a realistic kv_len -- across a
+ * block of only two warps that spends most of its life waiting at them.
+ *
+ * This is bit-identical to it, not merely equivalent.  Give lane t the elements t, t+32, t+64...
+ * and reduce those privately first: for hd=64 that single local add IS the tree's s=32 step, and
+ * the five __shfl_down steps that follow ARE its s=16..1 steps, in that order.  The online
+ * softmax recurrence is untouched and still walks positions in sequence, so every rounding in
+ * the kernel happens exactly where it happened before.
+ *
+ * E = hd/32 is a template parameter so the private reduction is fully unrolled; anything that is
+ * not 32, 64 or 128 wide keeps the original kernel. */
+template<int E>
+__global__ void k_attn_bw(const float *Q,const float *K,const float *V,float *O,
+                          int n_heads,int n_kv,int hd,float scale,const int *d_pos,int kv_max,int qd,int kvd,
+                          const unsigned char *d_act,const int *d_slot){
+    int blk=blockIdx.x, b=blk/n_heads, h=blk%n_heads, t=threadIdx.x;
+    if(d_act && !d_act[b]) return;
+    int sb = d_slot ? d_slot[b] : b;
+    int kvh=h/(n_heads/n_kv), valid=d_pos[b]+1;
+    const float *Kb=K+(size_t)sb*kv_max*kvd, *Vb=V+(size_t)sb*kv_max*kvd;
+    const float *Qh=Q+(size_t)b*qd+(size_t)h*hd;
+    float qv[E];
+    #pragma unroll
+    for(int e=0;e<E;++e) qv[e]=Qh[t+32*e];
+    float m=-1e30f, denom=0.f, acc[E];
+    #pragma unroll
+    for(int e=0;e<E;++e) acc[e]=0.f;
+    for(int j=0;j<valid;++j){
+        const float *k=Kb+((size_t)j*n_kv+kvh)*hd;
+        float p[E];
+        /* __fmul_rn, not `*`: the original wrote each product to shared memory before adding,
+         * which the compiler cannot fuse.  Written as a plain multiply here it contracts
+         * `p[0]+=p[1]` into an FMA -- one rounding instead of two -- and the batched Talker then
+         * drifts 3.98e-01 from the single-stream reference over 28 layers.  Arguably more
+         * accurate, but not the same generation, and the point of this rewrite is speed at
+         * identical output. */
+        #pragma unroll
+        for(int e=0;e<E;++e) p[e]=__fmul_rn(qv[e],k[t+32*e]);
+        /* the tree's wide strides, in its order */
+        #pragma unroll
+        for(int st=E/2;st>0;st>>=1)
+            #pragma unroll
+            for(int e=0;e<st;++e) p[e]+=p[e+st];
+        float v=p[0];
+        #pragma unroll
+        for(int sft=16;sft>0;sft>>=1) v+=__shfl_down_sync(0xffffffffu,v,sft);
+        float score=__shfl_sync(0xffffffffu,v,0)*scale;
+        float mn=fmaxf(m,score), corr=expf(m-mn), pr=expf(score-mn);
+        denom=denom*corr+pr;
+        const float *vrow=Vb+((size_t)j*n_kv+kvh)*hd;
+        #pragma unroll
+        for(int e=0;e<E;++e) acc[e]=acc[e]*corr+pr*vrow[t+32*e];
+        m=mn;
+    }
+    float *Oh=O+(size_t)b*qd+(size_t)h*hd;
+    #pragma unroll
+    for(int e=0;e<E;++e) Oh[t+32*e]=acc[e]/denom;
+}
+static inline void attn_b_launch(int blocks,int hd,const float *Q,const float *K,const float *V,float *O,
+                                 int n_heads,int n_kv,float scale,const int *d_pos,int kv_max,int qd,int kvd,
+                                 const unsigned char *d_act,const int *d_slot){
+    if(hd==32)       k_attn_bw<1><<<blocks,32>>>(Q,K,V,O,n_heads,n_kv,hd,scale,d_pos,kv_max,qd,kvd,d_act,d_slot);
+    else if(hd==64)  k_attn_bw<2><<<blocks,32>>>(Q,K,V,O,n_heads,n_kv,hd,scale,d_pos,kv_max,qd,kvd,d_act,d_slot);
+    else if(hd==128) k_attn_bw<4><<<blocks,32>>>(Q,K,V,O,n_heads,n_kv,hd,scale,d_pos,kv_max,qd,kvd,d_act,d_slot);
+    else             k_attn_b<<<blocks,hd,hd*sizeof(float)>>>(Q,K,V,O,n_heads,n_kv,hd,scale,d_pos,kv_max,qd,kvd,d_act,d_slot);
 }
 /* in=[B][2inter], out=[B][inter] */
 __global__ void k_swiglu_il_b(const float *in,float *out,int inter,int B){
@@ -667,7 +830,7 @@ static void talker_body_batch(cuda_talker_batch_t *s){
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
         float *Kl=s->kcache+(size_t)l*Bmax*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*Bmax*s->kv_max*kvd;
         k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act,s->d_slot);
-        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act,s->d_slot);
+        attn_b_launch(B*nh,hd,s->q,Kl,Vl,s->attn,nh,nkv,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act,s->d_slot);
         mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -883,6 +1046,70 @@ static int batch_mask_selftest(void *S, int B, int H, int steps){
     return bad;
 }
 
+/* Is the hand-written batched matvec leaving anything on the table against cuBLAS?
+ *
+ * The kernel is latency-bound at roughly 180 GB/s on a 768 GB/s card, and a PyTorch/vLLM
+ * implementation of this model would route every linear through cuBLAS and its tensor cores.
+ * So measure it rather than argue about it, on the shapes this engine actually issues.
+ *
+ * The comparison is not like for like and the printout says so: cublasGemmEx requires A and B
+ * to carry the SAME type, so the activations have to be narrowed to bf16, while the hand kernel
+ * keeps them in f32 against bf16 weights. If cuBLAS wins by a wide margin the narrowing is
+ * worth pricing; if it does not, the question is closed and the activations stay f32. */
+extern "C" void qwen_cuda_gemm_probe(int B){
+    cublasHandle_t h; if(cublasCreate(&h)!=CUBLAS_STATUS_SUCCESS){ fprintf(stderr,"gemm probe: cublasCreate failed\n"); return; }
+    cublasSetStream(h,cudaStreamPerThread);
+    struct { int rows, cols; const char *what; } shp[] = {
+        {1024,1024,"talker q/o      "},{6144,1024,"talker gate+up  "},
+        {1024,3072,"talker down     "},{2048,1024,"cp q            "},
+        {6144,1024,"cp gate+up      "},{1024,3072,"cp down         "},
+    };
+    fprintf(stderr,"\n  GEMM probe at B=%d (weights bf16; hand kernel keeps activations f32, cuBLAS narrows them to bf16)\n",B);
+    fprintf(stderr,"  %-16s %10s %10s %10s %10s %8s\n","shape","hand ms","hand GB/s","cublas ms","cublas GB/s","ratio");
+    const int IT=200;
+    for(size_t k=0;k<sizeof(shp)/sizeof(shp[0]);++k){
+        int rows=shp[k].rows, cols=shp[k].cols;
+        size_t nw=(size_t)rows*cols;
+        __nv_bfloat16 *W; float *X,*Y; __nv_bfloat16 *Xb;
+        if(cudaMalloc(&W,nw*sizeof(__nv_bfloat16))!=cudaSuccess) break;
+        CK(cudaMalloc(&X,(size_t)B*cols*sizeof(float)));
+        CK(cudaMalloc(&Xb,(size_t)B*cols*sizeof(__nv_bfloat16)));
+        CK(cudaMalloc(&Y,(size_t)B*rows*sizeof(float)));
+        CK(cudaMemset(W,0,nw*sizeof(__nv_bfloat16)));
+        CK(cudaMemset(X,0,(size_t)B*cols*sizeof(float)));
+        CK(cudaMemset(Xb,0,(size_t)B*cols*sizeof(__nv_bfloat16)));
+        double bytes=(double)nw*2.0;            /* the weights: what both kernels must read */
+        int grid=CEIL(rows*32,TPB);
+        k_matmat_bf16_u<4><<<grid,TPB>>>(W,X,Y,rows,cols,B);
+        CK(cudaStreamSynchronize(cudaStreamPerThread));
+        double t0=now_ms();
+        for(int i=0;i<IT;++i) k_matmat_bf16_u<4><<<grid,TPB>>>(W,X,Y,rows,cols,B);
+        CK(cudaStreamSynchronize(cudaStreamPerThread));
+        double th=(now_ms()-t0)/IT;
+        /* Y_cm[rows x B] = Wc^T * Xc, with W row-major [rows][cols] = col-major [cols][rows] */
+        float alpha=1.f,beta=0.f;
+        cublasStatus_t st=cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,rows,B,cols,&alpha,
+                                       W,CUDA_R_16BF,cols, Xb,CUDA_R_16BF,cols, &beta,
+                                       Y,CUDA_R_32F,rows, CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+        if(st!=CUBLAS_STATUS_SUCCESS){
+            fprintf(stderr,"  %-16s %10.3f %10.0f   cublasGemmEx unsupported (status %d)\n",
+                    shp[k].what,th,bytes/th/1e6,(int)st);
+        }else{
+            CK(cudaStreamSynchronize(cudaStreamPerThread));
+            t0=now_ms();
+            for(int i=0;i<IT;++i) cublasGemmEx(h,CUBLAS_OP_T,CUBLAS_OP_N,rows,B,cols,&alpha,
+                                               W,CUDA_R_16BF,cols, Xb,CUDA_R_16BF,cols, &beta,
+                                               Y,CUDA_R_32F,rows, CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+            CK(cudaStreamSynchronize(cudaStreamPerThread));
+            double tc=(now_ms()-t0)/IT;
+            fprintf(stderr,"  %-16s %10.3f %10.0f %10.3f %10.0f %7.2fx\n",
+                    shp[k].what,th,bytes/th/1e6,tc,bytes/tc/1e6,th/tc);
+        }
+        cudaFree(W);cudaFree(X);cudaFree(Xb);cudaFree(Y);
+    }
+    cublasDestroy(h);
+}
+
 extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
     int H=ctx->config.hidden_size, kvm=ctx->kv_max;
     if(frames>kvm-2) frames=kvm-2; if(frames<8) frames=8;
@@ -965,6 +1192,7 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
         if(cdiff>=1e-3) maxdiff=cdiff;
     }
     if(CB) qwen_cuda_cp_batch_free(CB); if(CS) qwen_cuda_cp_free(CS);
+    { extern void qwen_cuda_gemm_probe(int); qwen_cuda_gemm_probe(B); }
     /* Partial occupancy last: it needs B+1 live states, so run it after the others free theirs. */
     S=qwen_cuda_talker_init(ctx);
     int mbad = S ? batch_mask_selftest(S,B,H,24) : 1;
@@ -1125,7 +1353,7 @@ static void cp_body_batch(cuda_cp_batch_t *s){
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
         float *Kl=s->kcache+(size_t)l*Bmax*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*Bmax*s->kv_max*kvd;
         k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act,s->d_slot);
-        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act,s->d_slot);
+        attn_b_launch(B*nh,hd,s->q,Kl,Vl,s->attn,nh,nkv,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act,s->d_slot);
         mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -1169,6 +1397,47 @@ extern "C" void *qwen_cuda_cp_batch_init(void *single, int B){
  * x updated in place with the B residual streams (caller norms + argmaxes each). */
 extern "C" void qwen_cuda_cp_batch_step(void *st,float *x,const int *pos_arr,const unsigned char *active){
     cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; int B=s->B,H=s->hidden;
+
+    /* Compacting idle lanes matters more here than in the Talker.  The code predictor runs
+     * fifteen passes per frame against the Talker's one, so a server sized for eight lanes and
+     * serving four spent half of the dominant component on empty lanes: the C4 ladder measured
+     * 12.31 ms/frame of step at --batch-size 8 against 8.86 at --batch-size 4, for the same
+     * four requests.  The kernels already take a lane->slot map, so the KV stays addressed by
+     * slot and a compacted lane still reads the history of the request it stands for.
+     *
+     * B_eff and h_slot are deliberately left set on return: qwen_cuda_cp_batch_head reads the
+     * residual this leaves on the device, so it has to know the rows are dense and which slot
+     * each one belongs to. */
+    if(batch_compact_enabled() && active){
+        int n=0;
+        for(int b=0;b<B;++b) if(active[b]){
+            s->h_slot[n]=b; s->h_pos[n]=pos_arr[b];
+            memcpy(s->h_emb+(size_t)n*H, x+(size_t)b*H, (size_t)H*sizeof(float));
+            ++n;
+        }
+        if(n==0){ s->B_eff=0; return; }
+        if(n<B){
+            CK(cudaMemcpy(s->x,s->h_emb,(size_t)n*H*sizeof(float),cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(s->d_pos,s->h_pos,(size_t)n*sizeof(int),cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(s->d_slot,s->h_slot,(size_t)n*sizeof(int),cudaMemcpyHostToDevice));
+            { unsigned char ones[QB_MAX]; for(int i=0;i<n;++i) ones[i]=1;
+              CK(cudaMemcpy(s->d_act,ones,(size_t)n,cudaMemcpyHostToDevice)); }
+            s->B_eff=n; s->slot_identity=0;
+            batch_graph_run<cuda_cp_batch_t,cp_body_batch>(s,n);
+            CK(cudaStreamSynchronize(cudaStreamPerThread));
+            CK(cudaMemcpy(s->h_hid,s->x,(size_t)n*H*sizeof(float),cudaMemcpyDeviceToHost));
+            for(int i=0;i<n;++i)
+                memcpy(x+(size_t)s->h_slot[i]*H, s->h_hid+(size_t)i*H, (size_t)H*sizeof(float));
+            return;
+        }
+        /* n==B: every lane steps, so the dense form is the ordinary full-width path */
+    }
+    if(!s->slot_identity){
+        int ids[QB_MAX]; for(int i=0;i<B;++i) ids[i]=i;
+        CK(cudaMemcpy(s->d_slot,ids,(size_t)B*sizeof(int),cudaMemcpyHostToDevice));
+        s->slot_identity=1;
+    }
+    s->B_eff=0;
     CK(cudaMemcpy(s->x,x,(size_t)B*H*sizeof(float),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(s->d_pos,pos_arr,B*sizeof(int),cudaMemcpyHostToDevice));
     /* Same stale-position hazard as the talker, and worse here: cp_kv_max is 64, so any
@@ -1290,17 +1559,24 @@ extern "C" int qwen_cuda_cp_batch_head(void *st,int g,const unsigned char *activ
                                        int *out_codes,int stride){
     cuda_cp_batch_t *s=(cuda_cp_batch_t*)st;
     if(!s||g<0||g>=15||!cp_head_enabled()||!cp_head_ready(s)) return 0;
-    int B=s->B,ch=s->hidden;
-    unsigned char all[QB_MAX];
-    if(!active){ for(int i=0;i<B;++i) all[i]=1; }
-    CK(cudaMemcpy(s->d_act,active?active:all,(size_t)B,cudaMemcpyHostToDevice));
-    k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->d_cpnorm,s->xn,ch,s->eps);
-    size_t shm=(size_t)B*ch*sizeof(float);
-    k_cp_head_part<<<CPH_NCHUNK,TPB,shm>>>(s->d_lm[g],s->xn,ch,s->vocab,B,s->d_act,s->d_partv,s->d_parti);
-    k_cp_head_final<<<B,32>>>(s->d_partv,s->d_parti,B,s->d_act,s->d_code);
+    int ch=s->hidden;
+    /* The step may have left the residual compacted into dense rows 0..B_eff-1. Follow it:
+     * the head then also skips the idle lanes, and the codes are scattered back by slot. */
+    const int dense=(s->B_eff>0&&s->B_eff<=s->B);
+    const int n=dense?s->B_eff:s->B;
+    if(!dense){
+        unsigned char all[QB_MAX];
+        if(!active){ for(int i=0;i<n;++i) all[i]=1; }
+        CK(cudaMemcpy(s->d_act,active?active:all,(size_t)n,cudaMemcpyHostToDevice));
+    }   /* the compacted path already uploaded an all-ones mask of length n */
+    k_rmsnorm_full_b<<<n,TPB,TPB*sizeof(float)>>>(s->x,s->d_cpnorm,s->xn,ch,s->eps);
+    size_t shm=(size_t)n*ch*sizeof(float);
+    k_cp_head_part<<<CPH_NCHUNK,TPB,shm>>>(s->d_lm[g],s->xn,ch,s->vocab,n,s->d_act,s->d_partv,s->d_parti);
+    k_cp_head_final<<<n,32>>>(s->d_partv,s->d_parti,n,s->d_act,s->d_code);
     CK(cudaStreamSynchronize(cudaStreamPerThread));
-    CK(cudaMemcpy(s->h_code,s->d_code,(size_t)B*sizeof(int),cudaMemcpyDeviceToHost));
-    for(int b=0;b<B;++b) if(!active||active[b]) out_codes[(size_t)b*stride+g]=s->h_code[b];
+    CK(cudaMemcpy(s->h_code,s->d_code,(size_t)n*sizeof(int),cudaMemcpyDeviceToHost));
+    if(dense) for(int i=0;i<n;++i) out_codes[(size_t)s->h_slot[i]*stride+g]=s->h_code[i];
+    else      for(int b=0;b<n;++b) if(!active||active[b]) out_codes[(size_t)b*stride+g]=s->h_code[b];
     return 1;
 }
 

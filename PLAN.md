@@ -1135,14 +1135,31 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       plain seam. Owner confirmed by ear that the audio captured **under load** at C4 is good.
       Not yet a qualification: these are 3-minute screens, and `--precision default` is
       mandatory (see CUDA-11).
-- [ ] CUDA-10 **Next target is the code predictor, not the talker scheduler.** Per-stage
-      profile at C4 (`QWEN_SERVE_PROFILE=1`): code predictor **49.7%**, talker step 34.9%,
-      speech decode 11.4% (it was 37.8% before CONVDEC). So continuous batching of the talker —
-      which was about to be written — has a **measured ceiling of ~35%**, and the bulk is in the
-      CP. Our own stage note calls it "15 sequential passes per frame; re-reads its weights
-      16x"; vLLM-Omni independently aims both of its headline optimisations at the same
-      component (re-prefill instead of a KV cache, since its sequences reach only ~16 tokens,
-      and fusing ~60 kernels). Size any talker-scheduler work against the 35% ceiling.
+- [x] CUDA-10 **The code predictor, opened up (A6000, 2026-09-16).** `QWEN_CP_PROFILE` split
+      it almost evenly: GPU transformer passes 54.7%, head 45.1%, seed 0.1%. Three changes,
+      all bit-identical (`0.00e+00` on batched-vs-single, CP, and partial occupancy):
+      **(a)** CUDA graphs for the **batched** bodies — the ones the server runs had none, only
+      the single-stream ones did, so a frame issued ~1950 launches (-5.0% talker, -8.2% CP);
+      **(b)** the head — final norm, lm_head, argmax — moved to the GPU, where a weight row is
+      read once for all lanes instead of once per lane: **11.61 -> 1.35 ms/frame**, stall@250
+      84% -> 57%, 82 -> 96 requests in the same four minutes;
+      **(c)** four weight loads in flight in `k_matmat_bf16`, which was latency-bound at
+      180 GB/s on a 768 GB/s card (talker -14.4%, CP -22.4% overall for the session).
+- [ ] CUDA-12 **Retired: fusing the CP loop onto the device buys nothing.** The plan behind
+      CUDA-10 was that the fifteen per-frame host round trips — upload, launch, full sync,
+      download — were the cost, and that the cure was a device-resident loop (vLLM-Omni's
+      "fuse ~60 kernels"). `qwen_cuda_cp_batch_bench_fused` replays the same fifteen bodies
+      with **one** sync and no copies: 11.62 vs 11.53 ms/f at B=4, 13.21 vs 13.17 at B=8.
+      **Zero.** The GPU is busy for the whole pass; the host is never the critical path. Do
+      not re-open without a measurement that contradicts this one.
+- [ ] CUDA-13 **Remaining: `k_matmat_bf16` is still ~2.5x off the memory roof** after the
+      unroll, and the talker is now the largest consumer. This is kernel efficiency, not
+      structure. The int8/q4 batched matmats share the shape but the CUDA seam is bf16-only,
+      so nothing served reaches them.
+- [ ] CUDA-14 **Concurrency ladder on the A6000** (0.6B, all three paths, batch=C): RTF p50
+      0.44 / 0.77 / 1.05 / 1.37 and stall@250 9% / 53% / 90% / 100% at C2 / C4 / C6 / C8.
+      Knee between C4 and C6. Not a qualification — an A6000 behind a 10-core EPYC 7402 is a
+      weaker box than the A100 arm, and every run still fails per-class KPI drift.
 - [ ] CUDA-11 **Measurement trap, cost us a whole wrong conclusion once already.**
       `tests/serve_soak.py` defaults `--precision` to int8 (`:561`), and the backend seam is
       bf16-only, so a CUDA soak without `--precision default` runs with the GPU at 0% while
