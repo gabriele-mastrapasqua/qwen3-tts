@@ -436,6 +436,12 @@ dispatch row reports compiled/runtime-supported/policy-enabled state independent
 The existing Q4 dequant/FMA path and B>1 AVX2 matmat path are unchanged. Do not infer
 anything about server concurrency from this kernel-B=1 candidate.
 
+The repository's `check-matmat-parity-x86` target also ran under Rosetta 2 during this
+session, but that translated process reported runtime CPU `sse2` and explicitly warned that
+AVX2 was unavailable. Its existing B>1 parity result is useful cross-build coverage; it is
+not AVX2 candidate execution or performance evidence. A native AVX2 host remains required
+for the candidate's adversarial runtime parity.
+
 ## 15. Implementation status — in-house ARM SDOT B>1 matmat
 
 The existing `QWEN_INT8_SDOT_MM=1` implementation is now explicitly observable as
