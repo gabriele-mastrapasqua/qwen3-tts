@@ -544,6 +544,9 @@ and memory behavior can reverse an inner-loop win.
 The safe current behavior is therefore:
 
 - build and report `avx512-no-vnni` distinctly;
+- preserve raw host flags in the qualification manifest, including `avx_vnni`; this
+  repository has no AVX-VNNI-specific kernel family and must not label AVX-VNNI as
+  AVX512-VNNI;
 - select the AVX2 FMA reference or the explicitly forced AVX2 integer/Q4 candidates;
 - record the actual leaf, not merely `AVX512`;
 - defer a dedicated AVX-512 implementation until a real no-VNNI host shows a complete-call
