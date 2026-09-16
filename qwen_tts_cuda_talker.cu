@@ -291,6 +291,7 @@ static inline void mv(int prec, const void *W, const float *scale, const float *
     else         { (dst)=up_bf16((wbf),(size_t)(rows)*(cols)); (dsts)=NULL; *(pprec)=0; } } while(0)
 
 static int cublas_mm_enabled(void);   /* defined with the batched matmat, below */
+static int tc_enabled(void);          /* same: its scratch must exist before any capture */
 extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c=&ctx->config;
     /* The dp4a scratch MUST be allocated here, before any CUDA-graph capture: cudaMalloc
@@ -298,6 +299,7 @@ extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
      * perturbs the capture. qdp_enabled() is idempotent. */
     (void)qdp_enabled();
     (void)cublas_mm_enabled();   /* same hazard: creating the handle inside a capture fails */
+    (void)tc_enabled();
     cuda_talker_t *s=(cuda_talker_t*)calloc(1,sizeof(*s));
     s->hidden=c->hidden_size; s->n_heads=c->num_heads; s->n_kv=c->num_kv_heads;
     s->head_dim=c->head_dim; s->inter=c->intermediate_size; s->n_layers=c->num_layers;
@@ -616,6 +618,147 @@ __global__ void k_f32_to_bf16(const float *__restrict__ src,__nv_bfloat16 *__res
 /* True when cuBLAS measured faster for this shape. The square 1024x1024 case is the exception
  * the table above records, not an oversight. */
 static inline int cublas_wins(int rows,int cols){ return !(rows<=1024 && cols<=1024); }
+
+/* ======================================================================== *
+ *  Tiled tensor-core GEMM for the batched matmats.
+ *
+ *  Why a new kernel at all.  ncu on the existing warp-per-row form reports Waves Per SM 0.25,
+ *  achieved occupancy 25% of theoretical, DRAM throughput 22% and compute throughput 36% on the
+ *  rows=1024 shapes: neither the memory system nor the arithmetic units are close to saturated,
+ *  and the reason is structural.  One warp owning one output row fixes the TOTAL warp count at
+ *  `rows`, so 1024 rows is 1024 warps is 12 per SM against a maximum of 48.  Shrinking blocks
+ *  redistributes those warps but cannot create more, which is why the block-size sweep was worth
+ *  3% and split-K was worth less than nothing.  The ceiling is in the decomposition.
+ *
+ *  A tile decomposition lifts it: each warp owns a 16x16 output tile and walks K, so the work
+ *  per warp rises while the number of warps is set by rows/16 times the K split rather than by
+ *  rows alone.  The measured target is cuBLAS, which reaches 500-616 GB/s on these same shapes
+ *  against this engine's 191-365 -- and which, the nsys trace shows, gets there with exactly
+ *  this shape of kernel (cutlass_80_wmma_tensorop_s161616gemm_bf16_16x16_128x2_tn_align8) and
+ *  its own splitKreduce pass.
+ *
+ *  Portability.  nvcuda::wmma from <mma.h> is the tensor-core interface NVIDIA maintains across
+ *  architectures, and the bf16 16x16x16 shape used here is available from sm_80 onward, which
+ *  covers every modern datacentre and consumer part: A100, A6000, L4, L40S, RTX 30/40/50,
+ *  H100/H200, B200.  The device body is guarded on __CUDA_ARCH__ and the host checks the
+ *  runtime compute capability once, so a binary built for an older gencode still compiles and
+ *  simply never selects this path.  No PTX, no architecture-specific intrinsics, no cutlass
+ *  dependency.
+ *
+ *  The cost is precision and it is NOT hidden.  Tensor cores require BOTH operands in bf16, so
+ *  the activations are narrowed from f32; the accumulator stays f32.  That is a real change to
+ *  what the model generates, not a rounding difference -- narrowing them through cuBLAS moved
+ *  the end of speech and produced an 18% longer utterance at a fixed seed.  So this is opt-in,
+ *  and it is selectable PER STAGE, which is the whole reason for writing it instead of simply
+ *  calling cuBLAS: vLLM-Omni keeps this model's code predictor in fp32 for the same reason and
+ *  runs the talker reduced, and a per-stage flag lets that trade be measured rather than
+ *  assumed.
+ * ======================================================================== */
+#if defined(__CUDACC__)
+#include <mma.h>
+#endif
+
+#define TC_M 16          /* wmma tile: 16x16x16 bf16 -> f32, the shape every sm_80+ part has */
+#define TC_WARPS 4       /* warps per block; 4 x 16 = 64 output rows per block */
+
+/* P is [ksplit][16][rows] f32 partials: 16 and not B, because a wmma tile always writes 16
+ * columns.  The reduce pass reads only the first B of them. */
+__global__ void k_gemm_tc(const __nv_bfloat16 *__restrict__ W,const __nv_bfloat16 *__restrict__ Xb,
+                          float *__restrict__ P,int rows,int cols,int kchunk){
+#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 800)
+    using namespace nvcuda;
+    const int warp=threadIdx.x>>5;
+    const int mtile=blockIdx.x*TC_WARPS+warp;
+    const int m0=mtile*TC_M;
+    if(m0>=rows) return;
+    const int ks=blockIdx.y;
+    int k0=ks*kchunk, k1=k0+kchunk; if(k1>cols) k1=cols;
+    wmma::fragment<wmma::accumulator,TC_M,TC_M,16,float> acc;
+    wmma::fill_fragment(acc,0.0f);
+    for(int k=k0;k+16<=k1;k+=16){
+        wmma::fragment<wmma::matrix_a,TC_M,TC_M,16,__nv_bfloat16,wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b,TC_M,TC_M,16,__nv_bfloat16,wmma::col_major> b;
+        /* W is row-major [rows][cols], so the A tile is a straight row-major load at ld=cols.
+         * The B tile wants B[k][n] = X[n][k]; X is row-major [16][cols], so reading it
+         * column-major at ld=cols gives element (k,n) at n*cols+k, which is exactly that. */
+        wmma::load_matrix_sync(a,W+(size_t)m0*cols+k,cols);
+        wmma::load_matrix_sync(b,Xb+k,cols);
+        wmma::mma_sync(acc,a,b,acc);
+    }
+    /* Partials land as P[ks][n][m], i.e. column-major with ld=rows, matching Y's [b][row]. */
+    wmma::store_matrix_sync(P+(size_t)ks*TC_M*rows+m0,acc,rows,wmma::mem_col_major);
+#else
+    (void)W;(void)Xb;(void)P;(void)rows;(void)cols;(void)kchunk;
+#endif
+}
+/* Sum the K-split partials in chunk order -- deterministic, unlike an atomicAdd, which would
+ * reduce in whatever order the blocks happened to retire. */
+__global__ void k_gemm_tc_reduce(const float *__restrict__ P,float *__restrict__ Y,
+                                 int rows,int B,int S){
+    int idx=blockIdx.x*blockDim.x+threadIdx.x; if(idx>=rows*B) return;
+    int b=idx/rows, row=idx-b*rows;
+    float v=0.f;
+    for(int c=0;c<S;++c) v+=P[((size_t)c*TC_M+b)*rows+row];
+    Y[(size_t)b*rows+row]=v;
+}
+__global__ void k_f32_to_bf16_rows(const float *__restrict__ src,__nv_bfloat16 *__restrict__ dst,
+                                   int B,int cols){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=B*cols) return;
+    dst[i]=__float2bfloat16(src[i]);
+}
+
+static __nv_bfloat16 *g_tc_xb=NULL; static float *g_tc_part=NULL;
+static int g_tc_ok=-1;
+#define TC_XB_FLOATS   ((size_t)TC_M*8192)                 /* 16 padded rows x widest cols */
+#define TC_PART_FLOATS ((size_t)16*TC_M*6144)              /* ksplit x 16 x widest rows */
+/* Allocated at init: mvB runs under CUDA graph capture and cudaMalloc fails in a capturing
+ * stream -- the same hazard the dp4a scratch comment records. */
+static int tc_enabled(void){
+    static int on=-1;
+    if(on<0){
+        const char *e=getenv("QWEN_CUDA_TC");
+        on=(e&&*e&&*e!='0')?1:0;
+        if(on){
+            int dev=0,major=0,minor=0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,dev);
+            cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,dev);
+            if(major*10+minor<80){
+                fprintf(stderr,"[cuda] tensor-core GEMM needs compute capability 8.0+ (device is %d.%d) "
+                               "— keeping the warp-per-row matmat\n",major,minor);
+                on=0;
+            } else if(cudaMalloc(&g_tc_xb,TC_XB_FLOATS*sizeof(__nv_bfloat16))!=cudaSuccess ||
+                      cudaMalloc(&g_tc_part,TC_PART_FLOATS*sizeof(float))!=cudaSuccess){
+                fprintf(stderr,"[cuda] tensor-core GEMM scratch alloc failed — keeping the warp-per-row matmat\n");
+                on=0;
+            } else {
+                /* Rows B..15 of the staging buffer are never written and must read as zero:
+                 * a wmma tile always computes 16 columns and the padding must not contribute. */
+                cudaMemset(g_tc_xb,0,TC_XB_FLOATS*sizeof(__nv_bfloat16));
+                fprintf(stderr,"[cuda] tensor-core GEMM ENABLED (sm_%d%d, bf16 tiles, f32 accumulate, "
+                               "activations narrowed to bf16); QWEN_CUDA_TC=0 disables\n",major,minor);
+            }
+        }
+        g_tc_ok=on;
+    }
+    return on;
+}
+/* How many K chunks this shape wants. Warps without a split are rows/16, which at rows=1024 is
+ * 64 -- well under one wave -- so the split is what fills the device. Aim for a few hundred
+ * blocks while keeping each warp at least four mma steps of work. */
+static inline int tc_ksplit(int rows,int cols){
+    int blocks1=(rows+TC_M*TC_WARPS-1)/(TC_M*TC_WARPS);
+    if(blocks1<=0) blocks1=1;
+    int S=384/blocks1; if(S<1) S=1; if(S>16) S=16;
+    while(S>1 && cols/S<64) S>>=1;
+    return S;
+}
+static inline int tc_usable(int rows,int cols,int B){
+    return tc_enabled() && B>=1 && B<=TC_M && (rows%TC_M)==0 && (cols%16)==0
+           && (size_t)B*cols<=TC_XB_FLOATS
+           && (size_t)tc_ksplit(rows,cols)*TC_M*rows<=TC_PART_FLOATS;
+}
+
 /* Block size for the batched matmats, swept on hardware.
  *
  * ncu on the rows=1024 shapes reported Waves Per SM 0.25 and achieved occupancy 25% against a
@@ -634,8 +777,24 @@ static int mm_tpb(void){
              if(t!=32&&t!=64&&t!=128&&t!=256) t=64; }
     return t;
 }
-static inline void mvB(int prec,const void*W,const float*scale,const float*X,float*Y,int rows,int cols,int B){
-    if(prec==0 && cublas_mm_enabled() && cublas_wins(rows,cols)){
+/* allow_reduced lets the CALLER decide whether this matmat may drop the activations below f32,
+ * because the answer differs by stage: the code predictor picks the codes through an argmax and
+ * is the precision-sensitive one, while the talker only feeds it. vLLM-Omni draws the line in
+ * exactly the same place, keeping this model's code predictor in fp32 while the talker runs
+ * reduced. It gates both reduced-precision paths, the tensor-core tiles and cuBLAS. */
+static inline void mvB(int prec,const void*W,const float*scale,const float*X,float*Y,
+                       int rows,int cols,int B,int allow_reduced=1){
+    if(prec==0 && allow_reduced && tc_usable(rows,cols,B)){
+        int S=tc_ksplit(rows,cols);
+        int kchunk=((cols+S-1)/S+15)&~15;            /* multiples of 16: one whole wmma step */
+        k_f32_to_bf16_rows<<<CEIL(B*cols,TPB),TPB>>>(X,g_tc_xb,B,cols);
+        dim3 g(( rows+TC_M*TC_WARPS-1)/(TC_M*TC_WARPS), S);
+        k_gemm_tc<<<g,TC_WARPS*32>>>((const __nv_bfloat16*)W,g_tc_xb,g_tc_part,rows,cols,kchunk);
+        k_gemm_tc_reduce<<<CEIL(rows*B,TPB),TPB>>>(g_tc_part,Y,rows,B,S);
+        return;
+    }
+
+    if(prec==0 && allow_reduced && cublas_mm_enabled() && cublas_wins(rows,cols)){
         size_t need=(size_t)B*cols;
         /* No allocation here on purpose: mvB runs inside the graph capture, and cudaMalloc in a
          * capturing stream fails.  The staging buffer is sized once at init; an unexpectedly
@@ -1423,9 +1582,9 @@ static void cp_body_batch(cuda_cp_batch_t *s){
     int nh=s->n_heads,nkv=s->n_kv,inter=s->inter; float scale=1.f/sqrtf((float)hd);
     for(int l=0;l<s->n_layers;++l){
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
-        mvB(s->prec,s->wq[l],s->wqs[l],s->xn,s->q,qd,H,B);
-        mvB(s->prec,s->wk[l],s->wks[l],s->xn,s->k,kvd,H,B);
-        mvB(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H,B);
+        mvB(s->prec,s->wq[l],s->wqs[l],s->xn,s->q,qd,H,B,/*allow_reduced=*/0);
+        mvB(s->prec,s->wk[l],s->wks[l],s->xn,s->k,kvd,H,B,/*allow_reduced=*/0);
+        mvB(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H,B,/*allow_reduced=*/0);
         k_rmsnorm_ph_b<<<B*nh,TPB,TPB*sizeof(float)>>>(s->q,s->qn[l],hd,nh,qd,s->eps);
         k_rmsnorm_ph_b<<<B*nkv,TPB,TPB*sizeof(float)>>>(s->k,s->kn[l],hd,nkv,kvd,s->eps);
         k_rope_neox_b<<<CEIL(B*nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos,qd,B,s->d_act);
@@ -1435,12 +1594,12 @@ static void cp_body_batch(cuda_cp_batch_t *s){
         float *Kl=s->kcache+(size_t)l*Bmax*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*Bmax*s->kv_max*kvd;
         k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act,s->d_slot);
         attn_b_launch(B*nh,hd,s->q,Kl,Vl,s->attn,nh,nkv,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act,s->d_slot);
-        mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
+        mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B,/*allow_reduced=*/0);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
-        mvB(s->prec,s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H,B);
+        mvB(s->prec,s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H,B,/*allow_reduced=*/0);
         k_swiglu_il_b<<<CEIL(B*inter,TPB),TPB>>>(s->gu,s->gate,inter,B);
-        mvB(s->prec,s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter,B);
+        mvB(s->prec,s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter,B,/*allow_reduced=*/0);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
     }
 }
