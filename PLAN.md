@@ -85,6 +85,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       measured AVX2/AVX512-no-VNNI and dotprod/NEON baselines, one kernel family per A/B,
       then backend-aware v2 policy. Do not infer legacy capacity from VNNI/AMX/KleidiAI
       results.
+- [ ] LEGACY-X86-1 AVX2 INT8 GEMV candidate: the opt-in
+      `QWEN_AVX2_INT8_GEMV=1` signed-widening dot path is IMPLEMENTED and the existing
+      AVX2 FMA GEMV remains the default. Dispatch/census names the candidate precisely and
+      self-test coverage includes signed extremes and a non-multiple-of-32 tail. Structural
+      x86_64/AVX2 compilation passed; runtime PARITY VERIFIED, PERFORMANCE VERIFIED and
+      DEFAULT/PROMOTED remain NO until a real AVX2 host executes the adversarial self-test
+      and complete-call A/B. Detail: `.work/legacy-cpu-v2-audit-20260916.md`.
 
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 

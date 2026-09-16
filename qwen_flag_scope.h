@@ -36,6 +36,7 @@ static const qwen_flag_scope_t g_qwen_flag_scope[] = {
     { "QWEN_APPLE_MMLA", 32u },
     { "QWEN_ARM_BFDOT", 33u },
     { "QWEN_AVX2MM_MIN_B", 127u },
+    { "QWEN_AVX2_INT8_GEMV", 127u },
     { "QWEN_AVX512_NCHUNK", 30u },
     { "QWEN_BATCH_B", 127u },
     { "QWEN_BATCH_DECODER", 127u },

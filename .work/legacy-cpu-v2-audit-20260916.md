@@ -375,3 +375,39 @@ Do not make the profile an ISA-name switch. `arm_dotprod` and `x86_avx2` are cap
 The current v2 architecture is portable functionally and has useful optimized families beyond the newest targets, but it is not yet performance-portable. The highest-confidence gaps are AVX2/AVX512-no-VNNI INT8/Q4 GEMV, decoder INT8 availability on non-VNNI x86, dotprod-only ARM matmat/KAI reachability, and the absence of a backend performance profile feeding v2 policy. The highest-risk mistake would be to “fix” all of these with one global GEMM or scheduler rule.
 
 The safe order is: make dispatch truth measurable, benchmark complete calls on the named ISA classes, add one legacy GEMV family with parity, then add backend-aware crossover/profile policy. Until those runs exist, no AVX2, AVX512-no-VNNI, M1 or plain-NEON concurrency claim should be inferred from VNNI/AMX/KleidiAI results.
+
+## 13. Implementation status — first legacy candidate
+
+### LEGACY-X86-1 — AVX2 INT8 GEMV
+
+The first implementation is now isolated in the dedicated legacy worktree. It adds an
+experimental B=1 path that reuses the existing activation quantization contract and computes
+the signed INT8 dot by widening both operands to signed 16-bit lanes before `PMADDWD`.
+It intentionally does not reuse the existing AVX2 B>1 `PMADDUBSW` sequence: that instruction
+has saturating 16-bit pairwise intermediates, so the candidate avoids making an unproved
+range assumption. The implementation is bounded to the existing 8192-element activation
+scratch contract and returns to the FMA GEMV outside that bound.
+
+The path is selected only with `QWEN_AVX2_INT8_GEMV=1`; the FMA widen/dequant GEMV remains the
+default. `--caps`/`--dispatch-map` expose compiled, runtime-supported and policy-enabled
+state, and shape census gets the leaf name `avx2-int8-emulated-dot-gemv`.
+
+Status:
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | candidate, opt-in dispatch, precise report row and appended census leaf |
+| PARITY VERIFIED | PENDING AVX2 HOST | adversarial signed-extreme, saturation-sensitive and tail tests are compiled into `--self-test`; the current M1 host correctly skips them; x86 cross-compilation passed |
+| PERFORMANCE VERIFIED | NO | no Ryzen/AVX2 execution host available in this session |
+| DEFAULT/PROMOTED | NO | explicit opt-in only |
+
+The current ARM build was rebuilt with `make blas`; `--caps`, `--dispatch-map`, and
+`--self-test` passed with zero failures. The AVX2 translation units for `qwen_tts_kernels.c`
+and `qwen_tts_dispatch.c` compiled for `x86_64-apple-darwin` with `-mavx2 -mfma`. The existing
+generated flag-scope header had unrelated pre-existing CUDA flag omissions; only the new
+candidate flag was added, and the full generated header was not imported to avoid unrelated
+CUDA scope churn.
+
+Next action: on a real AVX2 host run the self-test with the candidate enabled and disabled,
+then run the complete-call B1 Talker/CP GEMV benchmark before deciding whether to keep the
+candidate. Only after that parity/performance decision should LEGACY-X86-2 Q4 GEMV start.

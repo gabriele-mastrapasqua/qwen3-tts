@@ -138,10 +138,17 @@ enum {
     QWEN_LEAF_AVX2, QWEN_LEAF_NEON, QWEN_LEAF_SCALAR, QWEN_LEAF_BLAS, QWEN_LEAF_F32_FUSED,
     QWEN_LEAF_KLEIDI, QWEN_LEAF_AMX,
     QWEN_LEAF_DELEGATED,   /* the entry delegated to per-matrix calls: their rows carry the work */
+    QWEN_LEAF_AVX2_INT8_GEMV, /* experimental exact signed widening dot product */
     QWEN_LEAF_COUNT
 };
 const char *qwen_leaf_name(int leaf);
 void qwen_census_leaf(int leaf);
+
+/* Experimental legacy-x86 GEMV candidate. It is opt-in until a real AVX2
+ * hardware run proves that it beats the FMA reference. */
+int qwen_avx2_int8_gemv_compiled(void);
+int qwen_avx2_int8_gemv_supported(void);
+int qwen_avx2_int8_gemv_enabled(void);
 /* Same as qwen_census_op, but with an explicit MAC count and a bucketed B for the key:
  * the speech decoder's conv/GEMM "B" is the time length and differs on nearly every call,
  * which would fill the 256-row table with one row per length. */

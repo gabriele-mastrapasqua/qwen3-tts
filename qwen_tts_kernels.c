@@ -1973,7 +1973,7 @@ int qwen_path_kind(int path) {
 }
 static const char *const g_leaf_name[QWEN_LEAF_COUNT] = {
     "none", "vnni", "dpbf16", "sdot", "avx512f", "avx2", "neon", "scalar", "blas",
-    "f32_fused", "kleidi", "amx", "delegated"
+    "f32_fused", "kleidi", "amx", "delegated", "avx2-int8-emulated-dot-gemv"
 };
 const char *qwen_leaf_name(int leaf) {
     return (leaf > 0 && leaf < QWEN_LEAF_COUNT) ? g_leaf_name[leaf] : "none";
@@ -2651,8 +2651,13 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
             getenv("QWEN_NO_SDOT") ? "f32-accum (SDOT off)" : "SDOT vdotq_s32",
             getenv("QWEN_NO_SDOT") ? "f32 dequant"          : "SDOT vdotq_s32"
 #elif defined(__AVX512VNNI__)
-            getenv("QWEN_NO_VNNI") ? "f32-accum (VNNI off)" : "VNNI vpdpbusd",
+            getenv("QWEN_AVX2_INT8_GEMV") ? "AVX2 signed-widening dot (experimental)" :
+                (getenv("QWEN_NO_VNNI") ? "f32-accum (VNNI off)" : "VNNI vpdpbusd"),
             getenv("QWEN_NO_VNNI") ? "f32 dequant"          : "VNNI vpdpbusd"
+#elif defined(__AVX2__)
+            getenv("QWEN_AVX2_INT8_GEMV") ? "AVX2 signed-widening dot (experimental)" :
+                "AVX2 FMA widen/dequant",
+            "AVX2 unpack/dequant FMA"
 #else
             "f32-accum fused", "f32 dequant"
 #endif
@@ -6022,6 +6027,84 @@ static void int8_matvec_fused(float *y, const float *x, const int8_t *W,
 #endif
 }
 
+/*
+ * Legacy x86 candidate: quantise the activation exactly as the other INT8
+ * paths, then compute a signed INT8 dot without PMADDUBSW. PMADDUBSW is a
+ * saturating unsigned-byte*signed-byte pairwise multiply-add; it is useful for
+ * the existing B>1 packing, but its intermediate int16 saturation is not a
+ * safe assumption for arbitrary legal INT8 operands. Widening both operands
+ * to signed int16 and using PMADDWD gives the exact pair sum in int32.
+ *
+ * This is intentionally a GEMV-only candidate. It is opt-in through
+ * QWEN_AVX2_INT8_GEMV=1 and falls back to the existing FMA GEMV for dimensions
+ * outside the bounded activation scratch contract.
+ */
+#if defined(__AVX2__)
+enum { QWEN_AVX2_INT8_GEMV_MAX_COLS = 8192 };
+
+static int32_t avx2_int8_dot_exact(const int8_t *w, const int8_t *qx, int cols) {
+    __m256i acc = _mm256_setzero_si256();
+    int k = 0;
+    for (; k + 32 <= cols; k += 32) {
+        __m128i w0 = _mm_loadu_si128((const __m128i *)(w + k));
+        __m128i x0 = _mm_loadu_si128((const __m128i *)(qx + k));
+        __m128i w1 = _mm_loadu_si128((const __m128i *)(w + k + 16));
+        __m128i x1 = _mm_loadu_si128((const __m128i *)(qx + k + 16));
+        __m256i w0s = _mm256_cvtepi8_epi16(w0);
+        __m256i x0s = _mm256_cvtepi8_epi16(x0);
+        __m256i w1s = _mm256_cvtepi8_epi16(w1);
+        __m256i x1s = _mm256_cvtepi8_epi16(x1);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(w0s, x0s));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(w1s, x1s));
+    }
+    int32_t sum = (int32_t)avx2_hsum_epi32(acc);
+    for (; k < cols; k++) sum += (int32_t)w[k] * (int32_t)qx[k];
+    return sum;
+}
+
+static int int8_matvec_avx2_emulated_dot(float *y, const float *x,
+                                          const int8_t *W, const float *scale,
+                                          int in_dim, int out_dim) {
+    if (in_dim <= 0 || in_dim > QWEN_AVX2_INT8_GEMV_MAX_COLS) return 0;
+    int8_t qx[QWEN_AVX2_INT8_GEMV_MAX_COLS];
+    float sx = quantize_act_int8_col(qx, x, in_dim, 1, 0);
+    qwen_ftz_on();
+    for (int r = 0; r < out_dim; r++) {
+        const int8_t *row = W + (size_t)r * in_dim;
+        int32_t dot = avx2_int8_dot_exact(row, qx, in_dim);
+        y[r] = (float)dot * scale[r] * sx;
+    }
+    return 1;
+}
+#endif
+
+int qwen_avx2_int8_gemv_compiled(void) {
+#if defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_int8_gemv_supported(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_int8_gemv_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AVX2_INT8_GEMV");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v && qwen_avx2_int8_gemv_compiled() && qwen_avx2_int8_gemv_supported();
+}
+
 #if defined(__ARM_FEATURE_DOTPROD)
 static float quantize_act_int8(int8_t *qx, const float *x, int n) {
     float amax = 0.0f;
@@ -6810,6 +6893,14 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
         goto qwen_matvec_int8_timed_done;
     }
     MMSTAT(QWEN_MMK_INT8_GEMV, rows, cols, 1);
+
+#if defined(__AVX2__)
+    if (qwen_avx2_int8_gemv_enabled() &&
+        int8_matvec_avx2_emulated_dot(y, x, W, scale, cols, rows)) {
+        qwen_census_leaf(QWEN_LEAF_AVX2_INT8_GEMV);
+        goto qwen_matvec_int8_timed_done;
+    }
+#endif
 
 #if defined(__AVX512VNNI__)
     enum { QXV_MAX = 8192 };
@@ -11712,6 +11803,58 @@ int qwen_kernel_selftest(void *out) {
     fprintf(f, "qwen-tts kernel self-test (matvec correctness vs f32 reference)\n");
     qwen_caps_report(f);
     fprintf(f, "  (run with QWEN_NO_VNNI=1 / QWEN_NO_SDOT=1 / QWEN_NO_AMX=1 to test the fallback path)\n\n");
+
+#if defined(__AVX2__)
+    /* Exercise the candidate's exact signed dot directly with the values that
+     * make PMADDUBSW most dangerous. This is intentionally independent of the
+     * runtime opt-in, so --self-test proves the candidate before any A/B run. */
+    {
+        enum { test_rows = 5, test_cols = 67 };
+        static const int8_t extreme[] = { -128, -127, -1, 0, 1, 127 };
+        int8_t w[test_rows * test_cols], qx[test_cols];
+        int64_t expected = 0;
+        for (int k = 0; k < test_cols; k++)
+            qx[k] = extreme[(k * 5 + 1) % (int)(sizeof extreme / sizeof extreme[0])];
+        for (int k = 0; k < test_cols; k++) {
+            w[k] = (int8_t)-128;
+            expected += (int32_t)w[k] * (int32_t)qx[k];
+        }
+        int32_t got = avx2_int8_dot_exact(w, qx, test_cols);
+        int dot_ok = (int64_t)got == expected;
+        fprintf(f, "  [avx2-int8-emulated-dot] signed/widening extreme dot: %s (got=%d ref=%lld)\n",
+                dot_ok ? "PASS" : "FAIL", got, (long long)expected);
+        if (!dot_ok) failures++;
+
+        float x[test_cols], scale[test_rows], y[test_rows];
+        int8_t weights[test_rows * test_cols], qref[test_cols];
+        for (int k = 0; k < test_cols; k++) {
+            x[k] = (float)((k % 9) - 4) * 0.375f;
+            if (k == 3) x[k] = -3.25f;
+            for (int r = 0; r < test_rows; r++)
+                weights[r * test_cols + k] = extreme[(r * 3 + k * 5) %
+                    (int)(sizeof extreme / sizeof extreme[0])];
+        }
+        for (int r = 0; r < test_rows; r++) scale[r] = 0.003f * (float)(r + 1);
+        float sx = quantize_act_int8_col(qref, x, test_cols, 1, 0);
+        int candidate_ok = int8_matvec_avx2_emulated_dot(y, x, weights, scale,
+                                                          test_cols, test_rows);
+        float worst = 0.0f;
+        for (int r = 0; candidate_ok && r < test_rows; r++) {
+            int64_t ref_dot = 0;
+            for (int k = 0; k < test_cols; k++)
+                ref_dot += (int32_t)weights[r * test_cols + k] * (int32_t)qref[k];
+            float ref_y = (float)ref_dot * scale[r] * sx;
+            float err = fabsf(y[r] - ref_y);
+            if (err > worst) worst = err;
+        }
+        candidate_ok = candidate_ok && worst <= 1e-6f;
+        fprintf(f, "  [avx2-int8-emulated-dot] quantized adversarial GEMV: max_abs=%.2e %s\n",
+                worst, candidate_ok ? "PASS" : "FAIL");
+        if (!candidate_ok) failures++;
+    }
+#else
+    fprintf(f, "  [avx2-int8-emulated-dot] not compiled on this host (skipped)\n");
+#endif
 
     for (int ci = 0; ci < ncases; ci++) {
         int rows = cases[ci][0], cols = cases[ci][1];
