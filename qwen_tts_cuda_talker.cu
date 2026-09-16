@@ -947,11 +947,13 @@ typedef struct {
     float *kcache,*vcache;
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;
     int prec; int *d_pos; cudaGraphExec_t exec; int cap_ready;   /* CUDA graph of the 5-layer CP step */
+    qwen_tts_ctx_t *ctx;         /* kept so the batched state can reach cp_norm and the lm_heads */
 } cuda_cp_t;
 
 extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c=&ctx->config;
     cuda_cp_t *s=(cuda_cp_t*)calloc(1,sizeof(*s));
+    s->ctx=ctx;
     s->hidden=c->cp_hidden_size; s->n_heads=c->cp_num_heads; s->n_kv=c->cp_num_kv_heads;
     s->head_dim=c->cp_head_dim; s->inter=c->cp_intermediate_size; s->n_layers=c->cp_num_layers;
     s->q_dim=c->cp_num_heads*c->cp_head_dim; s->kv_dim=c->cp_num_kv_heads*c->cp_head_dim;
@@ -1055,6 +1057,10 @@ typedef struct {
     int slot_identity;                                /* 1 when d_slot is the identity map */
     float *h_emb; int *h_pos; int *h_slot; float *h_hid;   /* host staging for compaction */
     cudaGraphExec_t gexec[QB_MAX+1]; unsigned char gmode[QB_MAX+1];   /* see cuda_talker_batch_t */
+    /* GPU code-predictor head (final norm + lm_head + argmax) */
+    qwen_tts_ctx_t *ctx; int head_state;      /* 0 untried, 1 resident, -1 unavailable */
+    __nv_bfloat16 *d_lm[15]; float *d_cpnorm; int vocab;
+    float *d_partv; int *d_parti; int *d_code; int *h_code;
 } cuda_cp_batch_t;
 
 static void cp_body_batch(cuda_cp_batch_t *s){
@@ -1091,6 +1097,7 @@ static void cp_body_batch(cuda_cp_batch_t *s){
 extern "C" void *qwen_cuda_cp_batch_init(void *single, int B){
     cuda_cp_t *ss=(cuda_cp_t*)single; if(!ss||B<1||B>QB_MAX) return NULL;
     cuda_cp_batch_t *s=(cuda_cp_batch_t*)calloc(1,sizeof(*s));
+    s->ctx=ss->ctx;
     s->B=B; s->hidden=ss->hidden; s->q_dim=ss->q_dim; s->kv_dim=ss->kv_dim; s->inter=ss->inter;
     s->n_heads=ss->n_heads; s->n_kv=ss->n_kv; s->head_dim=ss->head_dim; s->n_layers=ss->n_layers;
     s->kv_max=ss->kv_max; s->eps=ss->eps; s->prec=ss->prec;
@@ -1131,12 +1138,139 @@ extern "C" void qwen_cuda_cp_batch_step(void *st,float *x,const int *pos_arr,con
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(x,s->x,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
 }
+
+/* ---- GPU code-predictor head: final norm + lm_head + argmax -----------------------------
+ *
+ * QWEN_CP_PROFILE measured this at 11.0 ms of every 24.4 ms frame on an A6000 (45% of the
+ * code predictor, which is itself half of all serving work).  The cost is not arithmetic, it
+ * is re-reading: one lm_head is [2048 x 1024] bf16 = 4 MB, the frame walks fifteen of them,
+ * and the CPU fallback walks each one once PER LANE because qwen_argmax_matvec_bf16 takes a
+ * single activation vector.  At four lanes that is 240 MB pulled from DRAM per frame.
+ *
+ * Batching over lanes is what removes it.  One block owns a slice of the vocabulary and holds
+ * every lane's activation in shared memory, so a weight row is read once and dotted against
+ * all B lanes while it is still in registers -- the whole frame then reads 60 MB once instead
+ * of 240 MB, on a bus that is fifteen times wider.
+ *
+ * The accumulator is unrolled over QB_MAX rather than indexed by a runtime b.  This is not
+ * style: a runtime-indexed local array cannot live in registers, spills to local memory, and
+ * the same mistake in the batched matmats cost a measured 33x before it was found.
+ *
+ * Ties follow the CPU rule exactly -- strictly greater wins, so the lowest index survives a
+ * tie -- but the dot products themselves are summed in a different order than the AVX2 path,
+ * so a near-tie can still resolve the other way.  That is a different generation, not a wrong
+ * one, and it is why this is measured against audio and not asserted to be bit-identical. */
+#define CPH_NCHUNK 32
+__global__ void k_cp_head_part(const __nv_bfloat16 *W,const float *X,int ch,int vocab,int B,
+                               const unsigned char *act,float *partv,int *parti){
+    const int chunk=blockIdx.x, lane=threadIdx.x&31, warp=threadIdx.x>>5, nwarp=blockDim.x>>5;
+    const int rows=CEIL(vocab,CPH_NCHUNK), r0=chunk*rows, r1=min(r0+rows,vocab);
+    extern __shared__ float xs[];                       /* B x ch activations, loaded once */
+    for(int i=threadIdx.x;i<B*ch;i+=blockDim.x) xs[i]=X[i];
+    __syncthreads();
+    float bestv[QB_MAX]; int besti[QB_MAX];
+    #pragma unroll
+    for(int b=0;b<QB_MAX;++b){ bestv[b]=-1e30f; besti[b]=0; }
+    for(int row=r0+warp;row<r1;row+=nwarp){
+        const __nv_bfloat16 *wr=W+(size_t)row*ch;
+        float acc[QB_MAX];
+        #pragma unroll
+        for(int b=0;b<QB_MAX;++b) acc[b]=0.f;
+        for(int i=lane;i<ch;i+=32){ float w=__bfloat162float(wr[i]);
+            #pragma unroll
+            for(int b=0;b<QB_MAX;++b) if(b<B) acc[b]+=w*xs[(size_t)b*ch+i]; }
+        #pragma unroll
+        for(int b=0;b<QB_MAX;++b){
+            if(b>=B) break;
+            float v=acc[b];
+            for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
+            if(lane==0 && v>bestv[b]){ bestv[b]=v; besti[b]=row; }
+        }
+    }
+    __shared__ float sv[32*QB_MAX]; __shared__ int si[32*QB_MAX];
+    if(lane==0){
+        #pragma unroll
+        for(int b=0;b<QB_MAX;++b){ if(b>=B) break; sv[b*32+warp]=bestv[b]; si[b*32+warp]=besti[b]; }
+    }
+    __syncthreads();
+    if(threadIdx.x<B){
+        int b=threadIdx.x;
+        if(act && !act[b]){ partv[(size_t)b*CPH_NCHUNK+chunk]=-1e30f; parti[(size_t)b*CPH_NCHUNK+chunk]=0; return; }
+        float bv=sv[b*32]; int bi=si[b*32];
+        for(int w=1;w<nwarp;++w){ float v=sv[b*32+w]; int i=si[b*32+w];
+            if(v>bv||(v==bv&&i<bi)){ bv=v; bi=i; } }
+        partv[(size_t)b*CPH_NCHUNK+chunk]=bv; parti[(size_t)b*CPH_NCHUNK+chunk]=bi;
+    }
+}
+__global__ void k_cp_head_final(const float *partv,const int *parti,int B,
+                                const unsigned char *act,int *out){
+    int b=blockIdx.x; if(b>=B) return;
+    if(act && !act[b]){ if(threadIdx.x==0) out[b]=-1; return; }
+    if(threadIdx.x!=0) return;
+    float bv=partv[(size_t)b*CPH_NCHUNK]; int bi=parti[(size_t)b*CPH_NCHUNK];
+    for(int c=1;c<CPH_NCHUNK;++c){ float v=partv[(size_t)b*CPH_NCHUNK+c]; int i=parti[(size_t)b*CPH_NCHUNK+c];
+        if(v>bv||(v==bv&&i<bi)){ bv=v; bi=i; } }
+    out[b]=bi;
+}
+static int cp_head_enabled(void){
+    static int t=-1;
+    if(t<0){ const char *e=getenv("QWEN_CUDA_CP_HEAD"); t=(!e||!e[0])?1:(e[0]!='0'); }
+    return t;
+}
+/* Upload cp_norm and the fifteen bf16 lm_heads once (about 60 MB). Returns 0 if the model
+ * does not carry bf16 heads, in which case the caller keeps the CPU path. */
+static int cp_head_ready(cuda_cp_batch_t *s){
+    if(s->head_state) return s->head_state>0;
+    qwen_tts_ctx_t *ctx=s->ctx;
+    if(!ctx||!ctx->cp_norm){ s->head_state=-1; return 0; }
+    for(int g=0;g<15;++g) if(!ctx->cp_lm_head_bf16[g]){ s->head_state=-1; return 0; }
+    int ch=s->hidden, vocab=ctx->config.codebook_size;
+    if(vocab<=0||ch<=0){ s->head_state=-1; return 0; }
+    s->vocab=vocab;
+    if(cudaMalloc(&s->d_cpnorm,(size_t)ch*sizeof(float))!=cudaSuccess){ s->head_state=-1; return 0; }
+    CK(cudaMemcpy(s->d_cpnorm,ctx->cp_norm,(size_t)ch*sizeof(float),cudaMemcpyHostToDevice));
+    for(int g=0;g<15;++g){
+        if(cudaMalloc(&s->d_lm[g],(size_t)vocab*ch*sizeof(uint16_t))!=cudaSuccess){ s->head_state=-1; return 0; }
+        CK(cudaMemcpy(s->d_lm[g],ctx->cp_lm_head_bf16[g],(size_t)vocab*ch*sizeof(uint16_t),cudaMemcpyHostToDevice));
+    }
+    CK(cudaMalloc(&s->d_partv,(size_t)s->B*CPH_NCHUNK*sizeof(float)));
+    CK(cudaMalloc(&s->d_parti,(size_t)s->B*CPH_NCHUNK*sizeof(int)));
+    CK(cudaMalloc(&s->d_code,(size_t)s->B*sizeof(int)));
+    s->h_code=(int*)malloc((size_t)s->B*sizeof(int));
+    fprintf(stderr,"CUDA CP head: 15 lm_heads resident (%d x %d bf16, %.0f MB) — QWEN_CUDA_CP_HEAD=0 disables\n",
+            vocab,ch,15.0*vocab*ch*2/1e6);
+    s->head_state=1;
+    return 1;
+}
+/* Norm + head + argmax for codebook g, for every active lane, entirely on the device.
+ * Reads the residual the step left in s->x, so it must be called straight after the step.
+ * Returns 0 when it declines, and then the caller's CPU path must run. */
+extern "C" int qwen_cuda_cp_batch_head(void *st,int g,const unsigned char *active,
+                                       int *out_codes,int stride){
+    cuda_cp_batch_t *s=(cuda_cp_batch_t*)st;
+    if(!s||g<0||g>=15||!cp_head_enabled()||!cp_head_ready(s)) return 0;
+    int B=s->B,ch=s->hidden;
+    unsigned char all[QB_MAX];
+    if(!active){ for(int i=0;i<B;++i) all[i]=1; }
+    CK(cudaMemcpy(s->d_act,active?active:all,(size_t)B,cudaMemcpyHostToDevice));
+    k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->d_cpnorm,s->xn,ch,s->eps);
+    size_t shm=(size_t)B*ch*sizeof(float);
+    k_cp_head_part<<<CPH_NCHUNK,TPB,shm>>>(s->d_lm[g],s->xn,ch,s->vocab,B,s->d_act,s->d_partv,s->d_parti);
+    k_cp_head_final<<<B,32>>>(s->d_partv,s->d_parti,B,s->d_act,s->d_code);
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+    CK(cudaMemcpy(s->h_code,s->d_code,(size_t)B*sizeof(int),cudaMemcpyDeviceToHost));
+    for(int b=0;b<B;++b) if(!active||active[b]) out_codes[(size_t)b*stride+g]=s->h_code[b];
+    return 1;
+}
+
 extern "C" void qwen_cuda_cp_batch_free(void *st){
     cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; if(!s) return;
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
     cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
     cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act);cudaFree(s->d_slot);
     for(int i=0;i<=QB_MAX;++i) if(s->gmode[i]==1) cudaGraphExecDestroy(s->gexec[i]);
+    if(s->head_state>0){ for(int g=0;g<15;++g) cudaFree(s->d_lm[g]);
+        cudaFree(s->d_cpnorm);cudaFree(s->d_partv);cudaFree(s->d_parti);cudaFree(s->d_code);free(s->h_code); }
     free(s->h_emb);free(s->h_hid);free(s->h_pos);free(s->h_slot); free(s);
 }
 

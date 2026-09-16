@@ -1362,6 +1362,45 @@ static int cp_batch_lm(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const float *norme
     return 1;
 }
 
+/* Final norm + lm_head + argmax for one codebook, for every active lane.
+ *
+ * The CUDA path reads the residual the batched step left on the device, so it must follow
+ * the step immediately and only applies when that step actually ran on the GPU.  It replaces
+ * a per-lane walk over a 4 MB bf16 matrix -- measured at 45% of the whole code predictor at
+ * four lanes, because the CPU kernel takes one activation vector and so re-reads the weights
+ * once per lane.  Codes may differ from the CPU path on a near-tie: the dot products are
+ * summed in a different order, which is the same reason CPU and CUDA already diverge. */
+static void cp_batch_head(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, float *cx, float *cxn,
+                          int g, int *out_codes, const uint8_t *active) {
+    qwen_tts_config_t *c = &ctx->config;
+    int B = bb->B, ch = bb->cp_h;
+    qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
+#ifdef QWEN_HAVE_CUDA
+    {
+        extern void *g_cuda_cp_batch_state;
+        extern int qwen_cuda_cp_batch_head(void *, int, const unsigned char *, int *, int);
+        if (g_cuda_cp_batch_state && B <= 16 &&
+            qwen_cuda_cp_batch_head(g_cuda_cp_batch_state, g, active, out_codes, 15)) {
+            for (int b = 0; b < B; b++)
+                if (active && !active[b]) out_codes[(size_t)b * 15 + g] = 0;
+            qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
+            return;
+        }
+    }
+#endif
+    for (int b = 0; b < B; b++) {
+        if (active && !active[b]) { out_codes[(size_t)b * 15 + g] = 0; continue; }
+        qwen_rms_norm(cxn + (size_t)b * ch, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
+    }
+    if (!cp_batch_lm(ctx, bb, cxn, g, out_codes, active))
+        for (int b = 0; b < B; b++) {
+            if (active && !active[b]) continue;
+            out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, cxn + (size_t)b * ch, g, ch, c->codebook_size);
+        }
+    qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
+}
+
+
 /* ---- the whole CP frame as ONE parallel region ----------------------------------------
  * Even with the step region and the batched heads on, a 16-step frame still leaves and
  * re-enters the pool 47 times: 16 steps, 16 MTP projections and 15 lm_heads, each one a
@@ -1622,19 +1661,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     }
     batch_cp_transformer_step(ctx, bb, cx, cxn, 1, active);
 
-    {
-        qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
-        for (int b = 0; b < B; b++) {
-            if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + 0] = 0; continue; }
-            qwen_rms_norm(cxn + (size_t)b * ch, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
-        }
-        if (!cp_batch_lm(ctx, bb, cxn, 0, out_codes, active))
-            for (int b = 0; b < B; b++) {
-                if (CPB_SKIP(b)) continue;
-                out_codes[(size_t)b * 15 + 0] = cp_lm_argmax(ctx, cxn + (size_t)b * ch, 0, ch, c->codebook_size);
-            }
-        qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
-    }
+    cp_batch_head(ctx, bb, cx, cxn, 0, out_codes, active);
 
     double _cpb_g0 = cpb_on() ? cpb_now() : 0.0;   /* start of pass g's seed section */
     for (int g = 1; g < 15; g++) {
@@ -1667,19 +1694,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         if (_cpb) { cpb_seed += _cpb_m - _cpb_g0; }
         batch_cp_transformer_step(ctx, bb, cx, cxn, pos, active);
         if (_cpb) { double _t = cpb_now(); cpb_step += _t - _cpb_m; _cpb_m = _t; }
-        {
-            qwen_region_begin(QWEN_RGN_CP_D_LMHEAD);
-            for (int b = 0; b < B; b++) {
-                if (CPB_SKIP(b)) { out_codes[(size_t)b * 15 + g] = 0; continue; }
-                qwen_rms_norm(cxn + (size_t)b * ch, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
-            }
-            if (!cp_batch_lm(ctx, bb, cxn, g, out_codes, active))
-                for (int b = 0; b < B; b++) {
-                    if (CPB_SKIP(b)) continue;
-                    out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, cxn + (size_t)b * ch, g, ch, c->codebook_size);
-                }
-            qwen_region_end(QWEN_RGN_CP_D_LMHEAD);
-        }
+        cp_batch_head(ctx, bb, cx, cxn, g, out_codes, active);
         if (_cpb) { cpb_head += cpb_now() - _cpb_m; _cpb_g0 = cpb_now(); }
     }
     if (cpb_on()) { cpb_frames++; if ((cpb_frames % 500) == 0) cpb_report(); }

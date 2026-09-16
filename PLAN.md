@@ -72,6 +72,20 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ## Immediate priorities
 
+### Legacy CPU / v2 portability audit — detail: `.work/legacy-cpu-v2-audit-20260916.md`
+
+- [x] LEGACY-CPU-0 Read-only architecture audit at `15a5850`: reconstructed model load,
+      quantization/packing, ISA dispatch, Talker/CP/decoder, GEMV/GEMM crossover and v2
+      serving. Current evidence: AVX2 has batched INT8/Q4 emulation but no native INT8/Q4
+      GEMV; AVX-512 without VNNI has no dedicated integer matrix family; dotprod-only ARM
+      has native GEMV but SDOT matmat is opt-in and KAI currently requires i8mm. M1
+      `--caps`, `--dispatch-map` and `--self-test` were rerun on a clean rebuilt HEAD.
+      No execution code was changed.
+- [ ] LEGACY-CPU-1..VALID-1 Execute the linked plan in order: dispatch/profile truth,
+      measured AVX2/AVX512-no-VNNI and dotprod/NEON baselines, one kernel family per A/B,
+      then backend-aware v2 policy. Do not infer legacy capacity from VNNI/AMX/KleidiAI
+      results.
+
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 
 This is the current serving blocker before any new headline concurrency claim. Keep the
