@@ -772,3 +772,60 @@ for a measured zero.
 Recorded because the root cause is the useful part. If the decoder is ever restructured, the
 synchronous residual copy is the thing that blocks capture, and the capture-status probe is how to
 find that class of bug in one run instead of by reading.
+
+### 14.15 The 2-second admission is 99.5% host work, and the GPU has nothing to do with it
+
+`QWEN_STAGE_TRACE` put 43% of server wall time in admission: 2.9% of iterations hold 45% of all
+wall time and 95% of THAT is the prefill of a newly admitted request, which stalls the whole
+batch for up to 1977 ms — precisely the 2.0 s max_gap that forces a 1.9 s safe_play_start.
+
+The prefill's matmats route through the CUDA **seam**, not the resident batched path: the hook is
+process-wide, so `qwen_matmat_bf16` lands in `qwen_cuda_matmat_bf16`. That seam keeps weights as
+f32, uses `cublasSgemm`, and does a synchronous H2D and D2H on every call, which made "move the
+prefill onto the resident bf16 path" look like the obvious next project.
+
+`QWEN_CUDA_SEAM_STATS=1` priced it instead of assuming:
+
+```
+[SEAM] calls=3116  total 278 ms | H2D 23 ms (43 MB)  GEMM 186 ms  D2H 52 ms (119 MB)
+admit = 53.3 s     prefill = 53.2 s     of wall = 126.3 s
+```
+
+**The seam costs 278 ms. The prefill costs 53,200 ms.** About nineteen admissions in the run, so
+each prefill spends roughly 15 ms on the GPU out of 2.8 seconds: **0.5%**. The synchronous
+transfers total 75 ms across the entire run.
+
+So all three seam defects are real as descriptions and irrelevant as causes, and there is nothing
+to move: the prefill's matmats are already on the GPU and already free. The 99.5% is host work —
+norms, RoPE, SwiGLU and the causal O(N^2) attention over the prompt, all of which stay on the CPU.
+
+**Consequence: safe_play_start cannot be reduced by GPU optimisation.** The two real levers are
+optimising the CPU prefill, which is outside the CUDA scope and invalidates CPU baselines, or
+writing a genuine GPU prefill — causal attention over N positions, plus norms and SwiGLU — exposed
+as a CUDA entry point and called from `qwen_tts_talker.c` inside `#ifdef QWEN_HAVE_CUDA` with the
+CPU body untouched. The second respects the scope rule but is a new kernel of a different shape
+from the decode step (one sequence at N positions, not B lanes at one position each), so it is a
+project, not a refinement.
+
+### 14.16 Prefill slicing is a CPU mechanism that does not transfer to CUDA
+
+`QWEN_PREFILL_SLICE=N` runs an admission's prefill in resumable slices, one per frame iteration,
+so streaming slots are not stalled. It is the obvious answer to §14.15 and it is wrong here.
+
+C4, three minutes each, everything else fixed:
+
+| | slice=0 | slice=8 | slice=16 |
+| --- | --- | --- | --- |
+| requests completed | **91** | 56 | 70 |
+| safe_play_start p50/p95 | **0.95 / 1.93 s** | 4.11 / 13.20 s | 1.24 / 6.76 s |
+| stall rate @1000 ms | **4%** | 46% | 17% |
+| admit_ms max | 1976 ms | **569** | 679 |
+| iterations >200 ms, share of wall | 44% | 69% | 58% |
+
+It does exactly what it was designed to do — the admission peak collapses from 1976 ms to 569 —
+and everything that matters gets worse: throughput falls 38% and safe_play_start quadruples.
+
+On the CPU the prefill competes with decode for one thread pool, and slicing lets the other slots
+through. On CUDA the cost is per-CALL, so slicing into ten multiplies the fixed cost by ten
+instead of spreading it. A mechanism designed for one backend can be actively harmful on another,
+and the flag would have shipped on by default if it had been trusted rather than measured.

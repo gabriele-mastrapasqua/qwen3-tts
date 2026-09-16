@@ -1152,6 +1152,17 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       with **one** sync and no copies: 11.62 vs 11.53 ms/f at B=4, 13.21 vs 13.17 at B=8.
       **Zero.** The GPU is busy for the whole pass; the host is never the critical path. Do
       not re-open without a measurement that contradicts this one.
+- [x] CUDA-15 **safe_play_start is not a GPU problem (A6000, 2026-09-16).** 43% of server wall
+      time is admission; 2.9% of iterations hold 45% of it and 95% of that is the prefill, which
+      stalls the batch up to 1977 ms — exactly the 2.0 s max_gap behind a 1.9 s safe_play_start.
+      `QWEN_CUDA_SEAM_STATS=1` priced the GPU share: **seam 278 ms against a prefill of 53,200 ms,
+      i.e. 0.5%**. Nothing to move to the resident path. The levers are the CPU prefill (out of
+      scope, invalidates CPU baselines) or a real GPU prefill behind `#ifdef` — a new kernel of a
+      different shape, a project not a refinement.
+- [ ] CUDA-16 **Do not enable `QWEN_PREFILL_SLICE` on CUDA.** It is a CPU mechanism. It cuts the
+      admission peak 1976 -> 569 ms exactly as designed, and costs 38% of throughput while
+      quadrupling safe_play_start, because the CUDA prefill's cost is per-call, not pool
+      contention. Detail: `.work/cuda-parity-track-20260915.md` §14.16.
 - [ ] CUDA-13 **Remaining: `k_matmat_bf16` is still ~2.5x off the memory roof** after the
       unroll, and the talker is now the largest consumer. This is kernel efficiency, not
       structure. The int8/q4 batched matmats share the shape but the CUDA seam is bf16-only,

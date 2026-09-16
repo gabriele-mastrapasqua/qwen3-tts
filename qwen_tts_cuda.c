@@ -26,6 +26,7 @@ int qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,float alpha,const
 #include <cublas_v2.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 typedef struct { const void *key; float *dbuf; } wc_ent;
