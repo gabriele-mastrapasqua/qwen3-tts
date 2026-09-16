@@ -44,6 +44,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libopenblas-dev clang-tidy
 
+      # qwen_tts_kernels.c includes qwen_build_id.h, which the Makefile GENERATES and .gitignore
+      # excludes, so it is absent in a fresh checkout.  The CodeQL job happens to create it by
+      # running `make blas`; this job analyses the sources without building, so without this step
+      # clang-tidy stops at "'qwen_build_id.h' file not found" and exits 1 -- one error among
+      # fifteen thousand tolerated warnings.  The target is standalone and needs no toolchain.
+      - name: Generate the build-id header
+        run: make qwen_build_id.h
+
       - name: Run clang-tidy
         run: |
           clang-tidy \
