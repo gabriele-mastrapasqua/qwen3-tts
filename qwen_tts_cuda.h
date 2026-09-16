@@ -34,6 +34,7 @@ void  qwen_cuda_conv1d(float *out, const float *in, const float *weight, const f
                        int in_ch, int out_ch, int length, int ksz, int dilation);
 void  qwen_cuda_conv_transpose1d(float *out, const float *in, const float *weight, const float *bias,
                                  int in_ch, int out_ch, int in_len, int out_len, int ksz, int stride);
+int   qwen_cuda_decoder_convt_selftest(void *out);
 
 extern int g_cuda_decoder_on;
 int qwen_cuda_sd_sgemm(int transA, int transB, int M, int N, int K,

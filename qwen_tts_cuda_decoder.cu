@@ -37,13 +37,13 @@ __global__ void kd_depthwise7(const float *in,const float *w,const float *bias,f
     for(int k=0;k<7;++k){ int ip=t-6+k; if(ip>=0&&ip<length) s+=w[(size_t)c*7+k]*in[(size_t)c*length+ip]; }
     out[(size_t)c*length+t]=s;
 }
-/* causal conv_transpose1d (matches causal_conv_transpose1d_naive). w[in_ch,out_ch,ksz]. */
+/* causal conv_transpose1d (matches causal_conv_transpose1d_naive). w[ksz,in_ch,out_ch]. */
 __global__ void kd_convT(const float *in,const float *w,const float *bias,float *out,
                          int in_ch,int out_ch,int in_len,int out_len,int ksz,int stride){
     int p=blockIdx.x*blockDim.x+threadIdx.x, oc=blockIdx.y; if(p>=out_len||oc>=out_ch) return;
     int full=(in_len-1)*stride+ksz, trim=ksz-stride; float s=bias?bias[oc]:0.f;
     if(p<full-trim) for(int k=0;k<ksz;++k){ int sh=p-k; if(sh<0||sh%stride) continue; int tt=sh/stride;
-        if(tt<0||tt>=in_len) continue; for(int ic=0;ic<in_ch;++ic) s+=in[(size_t)ic*in_len+tt]*w[((size_t)ic*out_ch+oc)*ksz+k]; }
+        if(tt<0||tt>=in_len) continue; for(int ic=0;ic<in_ch;++ic) s+=in[(size_t)ic*in_len+tt]*w[((size_t)k*in_ch+ic)*out_ch+oc]; }
     out[(size_t)oc*out_len+p]=s;
 }
 /* per-timestep LayerNorm over channels: for each t, normalize over c, then *w[c]+b[c]. one block per t. */
@@ -97,14 +97,14 @@ __global__ void kd_im2col(const float *in,float *col,int in_ch,int length,int ks
     col[(size_t)row*length+t] = (ip>=0&&ip<length) ? in[(size_t)ic*length+ip] : 0.f;
 }
 /* --- conv_transpose1d via gemm+gather (kd_convT was 74% of decoder GPU time, naive) --------
- * Repack weight w[in_ch,out_ch,ksz] -> WM[out_ch*ksz, in_ch]; P2[out_ch*ksz, in_len]=WM@in (cuBLAS);
+ * Repack weight w[ksz,in_ch,out_ch] -> WM[out_ch*ksz, in_ch]; P2[out_ch*ksz, in_len]=WM@in (cuBLAS);
  * then gather out[oc,p]=bias[oc]+Σ_{k: (p-k)%stride==0, tt=(p-k)/stride<in_len} P2[oc*ksz+k, tt].
  * Same terms as kd_convT (out_len==in_len*stride so the causal trim is implicit), gemm-reassociated. */
 __global__ void kd_wpack_convT(const float *w,float *wm,int in_ch,int out_ch,int ksz){
     int ic=blockIdx.x*blockDim.x+threadIdx.x, row=blockIdx.y;   /* row = oc*ksz + k */
     if(ic>=in_ch||row>=out_ch*ksz) return;
     int oc=row/ksz, k=row%ksz;
-    wm[(size_t)row*in_ch+ic] = w[((size_t)ic*out_ch+oc)*ksz+k];
+    wm[(size_t)row*in_ch+ic] = w[((size_t)k*in_ch+ic)*out_ch+oc];
 }
 __global__ void kd_convT_gather(const float *P2,const float *bias,float *out,
                                 int out_ch,int out_len,int in_len,int ksz,int stride){
@@ -165,16 +165,88 @@ static void conv1d_gemm(const float *cur,const float *W,const float *bias,float 
 }
 
 /* causal conv_transpose1d via gemm+gather, all resident. Bit-equivalent to kd_convT up to gemm
- * fp-accumulation order. QWEN_DEC_NAIVET=1 keeps the old kernel for A/B. */
+ * fp-accumulation order. QWEN_DEC_NAIVET=1 keeps the old kernel for A/B.
+ * Returns 1 for GEMM, 0 for the naive fallback (checked by the self-test). */
 static int g_naivet=-1;
-static void convT_gemm(const float *in,const float *w_host,const float *bias,float *out,
-                       int in_ch,int out_ch,int in_len,int out_len,int ksz,int stride){
+static int convT_gemm(const float *in,const float *w_host,const float *bias,float *out,
+                      int in_ch,int out_ch,int in_len,int out_len,int ksz,int stride){
     if(g_naivet<0) g_naivet = getenv("QWEN_DEC_NAIVET") ? 1 : 0;
     float *WM = g_naivet ? NULL : dev_wT_convT(w_host,in_ch,out_ch,ksz);
-    if(!WM){ kd_convT<<<GRID2(out_len,out_ch),TPB>>>(in,dev_w(w_host,(size_t)in_ch*out_ch*ksz),bias,out,in_ch,out_ch,in_len,out_len,ksz,stride); return; }
-    float *P2=dbg(&T,(size_t)out_ch*ksz*in_len); if(!P2){ kd_convT<<<GRID2(out_len,out_ch),TPB>>>(in,dev_w(w_host,(size_t)in_ch*out_ch*ksz),bias,out,in_ch,out_ch,in_len,out_len,ksz,stride); return; }
+    if(!WM){ kd_convT<<<GRID2(out_len,out_ch),TPB>>>(in,dev_w(w_host,(size_t)in_ch*out_ch*ksz),bias,out,in_ch,out_ch,in_len,out_len,ksz,stride); return 0; }
+    float *P2=dbg(&T,(size_t)out_ch*ksz*in_len); if(!P2){ kd_convT<<<GRID2(out_len,out_ch),TPB>>>(in,dev_w(w_host,(size_t)in_ch*out_ch*ksz),bias,out,in_ch,out_ch,in_len,out_len,ksz,stride); return 0; }
     dmatmul(P2,WM,in,out_ch*ksz,in_ch,in_len);            /* P2[out_ch*ksz,in_len]=WM[out_ch*ksz,in_ch]@in[in_ch,in_len] */
     kd_convT_gather<<<GRID2(out_len,out_ch),TPB>>>(P2,bias,out,out_ch,out_len,in_len,ksz,stride);
+    return 1;
+}
+
+extern "C" int qwen_cuda_decoder_convt_selftest(void *outv){
+    FILE *f=outv?(FILE*)outv:stdout;
+    const int in_ch=2,out_ch=3,in_len=4,ksz=4,stride=2,out_len=in_len*stride;
+    float in[in_ch*in_len],bias[out_ch];
+    static float w[ksz*in_ch*out_ch];   /* stable address: convT_gemm caches by host pointer */
+    float ref[out_ch*out_len],got_naive[out_ch*out_len],got_gemm[out_ch*out_len];
+    float *di=NULL,*db=NULL,*dout=NULL;
+    cudaError_t err=cudaSuccess;
+    int saved_naivet=g_naivet,fails=0;
+
+    for(int i=0;i<in_ch*in_len;++i) in[i]=(float)((i%5)-2)*0.25f+(float)i*0.03f;
+    for(int i=0;i<ksz*in_ch*out_ch;++i) w[i]=(float)((i%7)-3)*0.07f+(float)i*0.001f;
+    for(int oc=0;oc<out_ch;++oc) bias[oc]=(float)(oc-1)*0.05f;
+    /* Scatter reference with sd_pack_convt's [kernel][in_ch][out_ch] layout.
+     * Unequal dimensions and nonuniform weights expose a layout permutation. */
+    for(int oc=0;oc<out_ch;++oc) for(int p=0;p<out_len;++p) ref[oc*out_len+p]=bias[oc];
+    for(int t=0;t<in_len;++t) for(int k=0;k<ksz;++k){
+        int p=t*stride+k; if(p>=out_len) continue;   /* causal right trim */
+        for(int ic=0;ic<in_ch;++ic) for(int oc=0;oc<out_ch;++oc)
+            ref[oc*out_len+p]+=in[ic*in_len+t]*w[(k*in_ch+ic)*out_ch+oc];
+    }
+
+    if((err=cudaMalloc(&di,sizeof(in)))!=cudaSuccess ||
+       (err=cudaMalloc(&db,sizeof(bias)))!=cudaSuccess ||
+       (err=cudaMalloc(&dout,sizeof(ref)))!=cudaSuccess ||
+       (err=cudaMemcpy(di,in,sizeof(in),cudaMemcpyHostToDevice))!=cudaSuccess ||
+       (err=cudaMemcpy(db,bias,sizeof(bias),cudaMemcpyHostToDevice))!=cudaSuccess){
+        fprintf(f,"  decoder_convT_packed: CUDA setup failed: %s\n",cudaGetErrorString(err)); fails=1; goto done;
+    }
+
+    g_naivet=1;
+    convT_gemm(di,w,db,dout,in_ch,out_ch,in_len,out_len,ksz,stride);
+    if((err=cudaStreamSynchronize(cudaStreamPerThread))!=cudaSuccess ||
+       (err=cudaMemcpy(got_naive,dout,sizeof(got_naive),cudaMemcpyDeviceToHost))!=cudaSuccess){
+        fprintf(f,"  decoder_convT_packed (naive): CUDA failed: %s\n",cudaGetErrorString(err)); fails++; goto gemm;
+    }
+    {
+        double max_abs=0,max_ref=0;
+        for(int i=0;i<out_ch*out_len;++i){ double d=fabs((double)got_naive[i]-ref[i]),r=fabs((double)ref[i]); if(!isfinite(d))d=INFINITY; if(d>max_abs)max_abs=d; if(r>max_ref)max_ref=r; }
+        double rel=max_ref>0?max_abs/max_ref:max_abs; int ok=rel<1e-5;
+        fprintf(f,"  decoder_convT_packed (naive): max|abs|=%.3e  rel=%.3e  %s\n",max_abs,rel,ok?"PASS":"FAIL"); if(!ok)fails++;
+    }
+
+gemm:
+    g_naivet=0;
+    /* Poison GEMM scratch so a failed cuBLAS call cannot reuse a valid result. */
+    if(!dbg(&T,(size_t)out_ch*ksz*in_len) ||
+       (err=cudaMemsetAsync(T.p,0xff,(size_t)out_ch*ksz*in_len*sizeof(float),cudaStreamPerThread))!=cudaSuccess){
+        fprintf(f,"  decoder_convT_packed (gemm): scratch setup failed\n"); fails++; goto done;
+    }
+    if(!convT_gemm(di,w,db,dout,in_ch,out_ch,in_len,out_len,ksz,stride)){
+        fprintf(f,"  decoder_convT_packed (gemm): optimized path unavailable\n"); fails++; goto done;
+    }
+    if((err=cudaStreamSynchronize(cudaStreamPerThread))!=cudaSuccess ||
+       (err=cudaMemcpy(got_gemm,dout,sizeof(got_gemm),cudaMemcpyDeviceToHost))!=cudaSuccess){
+        fprintf(f,"  decoder_convT_packed (gemm): CUDA failed: %s\n",cudaGetErrorString(err)); fails++; goto done;
+    }
+    {
+        double max_abs=0,max_ref=0;
+        for(int i=0;i<out_ch*out_len;++i){ double d=fabs((double)got_gemm[i]-ref[i]),r=fabs((double)ref[i]); if(!isfinite(d))d=INFINITY; if(d>max_abs)max_abs=d; if(r>max_ref)max_ref=r; }
+        double rel=max_ref>0?max_abs/max_ref:max_abs; int ok=rel<1e-5;
+        fprintf(f,"  decoder_convT_packed (gemm):  max|abs|=%.3e  rel=%.3e  %s\n",max_abs,rel,ok?"PASS":"FAIL"); if(!ok)fails++;
+    }
+
+done:
+    g_naivet=saved_naivet;
+    if(di)cudaFree(di); if(db)cudaFree(db); if(dout)cudaFree(dout);
+    return fails;
 }
 
 extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cur_ch, int cur_len,
