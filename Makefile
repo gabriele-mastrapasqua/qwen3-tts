@@ -203,7 +203,7 @@ help:
 	@echo "  make para-demo       - Shipped inline [tag]s ([wow]/[yawn]/[scoff]/[giggle]/[laugh]/[sigh]) on natural sentences (1.7B)"
 	@echo "  make test-emotion-ft - Emotion fine-tune (.expr graft) smoke: CSP Italian on 1.7B (preset+clone, seed 42)"
 	@echo "  make test-lora-it    - Emotion×voice×temp listening matrix (L16-26 LoRA; afplay links + full cmds)"
-	@echo "  make emotion-seeds   - Seed-finder palette → docs/emotion-seeds.md (recommended seeds/lang/voice/emo; SLOW)"
+	@echo "  make emotion-seeds   - Seed-finder palette → samples/emotion_seeds.md (local artifact; OUT_MD=path to override; SLOW)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
@@ -618,8 +618,13 @@ EXPR ?= presets/expr/italian_l1626_r64.expr
 test-lora-it: $(TARGET)
 	@bash tests/lora_matrix.sh Italian $(EXPR)
 
+# The palette is a GENERATED artifact, and the doc it used to overwrite was archived as
+# superseded (docs/archive/emotion-seeds.md: k4-era, contradicts the shipped k6/T1.1/steer
+# recipe).  Writing the regenerated palette back into docs/ would resurrect a superseded
+# document in the canonical tree, so it lands beside the audio palette it describes, under
+# samples/ where the rest of that output is already gitignored.  OUT_MD overrides.
 emotion-seeds: $(TARGET)
-	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),docs/emotion-seeds.md) $(if $(N),$(N),5)
+	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),samples/emotion_seeds.md) $(if $(N),$(N),5)
 
 test-batch-invariance: $(TARGET)
 	@echo "=== 1/2 cablaggio: percorsi pinnati, identita' bit a bit dovuta ==="

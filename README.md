@@ -590,6 +590,14 @@ Optional `--backend metal|cuda` runs the **whole fused pipeline resident on the 
 activations on device, one command buffer / step). The CPU path stays the default — GPU is purely additive.
 Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDIA](docs/cuda-performance.md).
 
+> **Streaming server on CUDA — implemented and runtime-verified, not performance-qualified.**
+> `--backend cuda --serve` works, batches, streams, and produces the same codes as a single stream,
+> and it has been listened to under concurrent load. It has **not** met a serving KPI target: every
+> soak so far is a 3-minute screen and each reports per-class KPI drift, and no 30-minute
+> qualification has been run. It is opt-in and there are two settings that silently disable most of
+> it — see [docs/cuda-performance.md § CUDA streaming server](docs/cuda-performance.md). The CPU
+> server remains the qualified path.
+
 **Apple Metal** — `make metal CC=clang`, then `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`.
 **Single-stream latency** (one request — CLI, or a warm `--serve` server; the two match):
 

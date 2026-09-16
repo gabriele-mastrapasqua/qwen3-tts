@@ -9,6 +9,13 @@ The short version: **a serving configuration is discovered on the box, not chose
 datasheet.** The engine ships a break-in procedure and a benchmark suite for exactly that, and
 a profile format so the answer survives the session that found it.
 
+> **Scope: this document is about the CPU backend.** Its topology work, its `W x K` search, its
+> pool and pinning discussion and every number in it are sized by cores, cache and memory
+> channels. The CUDA server is sized by GPU memory bandwidth instead, has its own flags and its
+> own traps, and is not performance-qualified — see
+> [`cuda-performance.md` § CUDA streaming server](cuda-performance.md). Nothing here transfers to
+> it, and a number from one must never be quoted for the other.
+
 ---
 
 ## 1. Three ways to run it, and the one you probably want

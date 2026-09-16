@@ -1730,6 +1730,22 @@ int main(int argc, char **argv) {
 #endif
         }
     }
+#else
+    /* No GPU backend is compiled into this binary, so the whole block above is gone and
+     * --backend would be parsed and then silently ignored: the run would produce CPU audio
+     * while the caller believed it asked for a GPU.  That is the same failure the quantized
+     * offload NOTE above exists to prevent, and it is worth refusing rather than warning --
+     * a benchmark arm that thinks it enabled the treatment and did not is worse than one that
+     * stops.  A COMPILE-time absence, distinct from a GPU that is compiled in but unusable at
+     * runtime, which qwen_backend_init() reports separately. */
+    /* String compare, not qwen_backend_kind_from_str(): qwen_tts_backend.h is itself included
+     * only in GPU builds, so its enum is not declared here. */
+    if (gpu_backend_str && strcmp(gpu_backend_str, "cpu") != 0) {
+        fprintf(stderr, "--backend %s: this binary has no GPU backend compiled in.\n"
+                        "Rebuild with `make cuda` (NVIDIA) or `make metal CC=clang` (Apple), "
+                        "or drop --backend to run on the CPU.\n", gpu_backend_str);
+        return 2;
+    }
 #endif
 
     if (ml_steer_path) {

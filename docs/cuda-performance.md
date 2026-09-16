@@ -93,6 +93,20 @@ each gets its own incremental PCM chunks. WAV requests use the same incremental 
 
 ## CUDA streaming server — 2026-09-16 (RTX A6000, 0.6B)
 
+**Maturity: implemented and runtime-verified, NOT performance-qualified. Opt-in, not a default.**
+
+What that means precisely, so nobody has to infer it:
+
+| claim | status |
+| --- | --- |
+| compiles and runs (`--backend cuda --serve`) | **runtime verified** — A100 2026-09-15, A6000 2026-09-16 |
+| batched steps produce the same codes as single-stream | **verified** — `--gpu-batch-bench` reads `0.00e+00` on three checks |
+| audio is correct under concurrent load | **ear-validated** at C4 |
+| meets a serving KPI target | **NOT established.** Every soak run to date is a 3-minute screen and every one reports `SOAK RESULT: FAIL — per-class KPI drift`. No 30-minute qualification has been run on any GPU. |
+| is a default | **no.** It requires `--backend cuda` plus the resident-path env flags below. |
+
+Treat the concurrency table below as a measured screen on one box, not as a supported envelope.
+
 **Scope: this section is CUDA-only.** Everything below was measured with `--backend cuda` and the
 resident GPU paths on. None of it describes or changes the CPU serving path, whose behaviour,
 tuning and numbers live in `docs/server-batching.md` and `docs/serving-operations.md`. The two

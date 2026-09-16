@@ -4,6 +4,13 @@
 > finding the `W x K` topology for a given box before quoting anything from it, the deployment
 > profile, the benchmark suite and what its numbers mean — see
 > [`serving-operations.md`](serving-operations.md).
+>
+> **The endpoints and the streaming contract on this page are backend-independent.** Everything
+> operational below assumes the CPU backend, which is the qualified one. The same server also runs
+> on `--backend cuda`, with different sizing, different flags and a different maturity level
+> (implemented and runtime-verified, not performance-qualified) — see
+> [`cuda-performance.md` § CUDA streaming server](cuda-performance.md). Do not carry a number
+> between the two.
 
 
 The built-in HTTP server loads the model once at startup and keeps weights in memory

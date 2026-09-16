@@ -2,6 +2,11 @@
 
 Three states, all reported by the engine: **IMPLEMENTED** compiled in · **SELECTABLE** this host can run it · **EFFECTIVE** it is what resolves now. `—` means not compiled into that build. Regenerate with `tools/backend_matrix.py`.
 
+**Scope: CPU dispatch only.** The columns are CPU build profiles and the rows are the features
+`--dispatch-map` resolves on them. The GPU backends are selected with `--backend metal|cuda`
+rather than resolved by ISA dispatch, so they are not rows here; see
+[`cuda-performance.md`](cuda-performance.md) and [`hardware-testing.md`](hardware-testing.md).
+
 | feature | apple_m1 (native) | x86_avx2 (portable) | x86_avx512vnni (avx512vnni) | x86_amx (amx) |
 |---|---|---|---|---|
 | `cp.precision` | follows | follows | follows | follows |
