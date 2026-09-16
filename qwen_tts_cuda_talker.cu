@@ -515,22 +515,25 @@ __global__ void k_rope_neox_b(float *X,const float *cos_base,const float *sin_ba
 }
 /* KV per sequence: kc/vc layer base = [B][kv_max][kvd]; K/V = [B][kvd] */
 __global__ void k_kv_store_b(float *kc,float *vc,const float *K,const float *V,int kvd,const int *d_pos,int kv_max,int B,
-                             const unsigned char *d_act){
+                             const unsigned char *d_act,const int *d_slot){
     int gid=blockIdx.x*blockDim.x+threadIdx.x; if(gid>=B*kvd) return; int b=gid/kvd, i=gid%kvd;
     if(d_act && !d_act[b]) return;   /* never write a paused slot's KV: it owns that position */
-    size_t off=(size_t)b*kv_max*kvd+(size_t)d_pos[b]*kvd+i;
+    /* activations are dense in b; the KV belongs to the slot this lane stands for */
+    int sb = d_slot ? d_slot[b] : b;
+    size_t off=(size_t)sb*kv_max*kvd+(size_t)d_pos[b]*kvd+i;
     kc[off]=K[(size_t)b*kvd+i]; vc[off]=V[(size_t)b*kvd+i];
 }
 /* one block per (b,head): blk=b*n_heads+h, blockDim=hd. KV base per seq = [kv_max][kvd] */
 __global__ void k_attn_b(const float *Q,const float *K,const float *V,float *O,
                          int n_heads,int n_kv,int hd,float scale,const int *d_pos,int kv_max,int qd,int kvd,
-                         const unsigned char *d_act){
+                         const unsigned char *d_act,const int *d_slot){
     int blk=blockIdx.x, b=blk/n_heads, h=blk%n_heads, t=threadIdx.x; if(t>=hd) return;
     /* whole block shares b (blk = b*n_heads + h), so this return is uniform and the
      * __syncthreads() below stay collective */
     if(d_act && !d_act[b]) return;
+    int sb = d_slot ? d_slot[b] : b;   /* dense lane -> owning KV slot */
     int kvh=h/(n_heads/n_kv), valid=d_pos[b]+1;
-    const float *Kb=K+(size_t)b*kv_max*kvd, *Vb=V+(size_t)b*kv_max*kvd;
+    const float *Kb=K+(size_t)sb*kv_max*kvd, *Vb=V+(size_t)sb*kv_max*kvd;
     float qt=Q[(size_t)b*qd+(size_t)h*hd+t];
     extern __shared__ float sh[];
     float m=-1e30f, denom=0.f, acc=0.f;
@@ -557,10 +560,19 @@ typedef struct {
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;      /* [B][dim] */
     int prec; int *d_pos;                             /* device int[B] */
     unsigned char *d_act;                             /* device uint8[B]: which lanes step */
+    int *d_slot;                                      /* device int[B]: dense lane -> owning KV slot */
+    int B_eff;                                        /* lanes actually computed this step (<= B) */
+    int slot_identity;                                /* 1 when d_slot is the identity map */
+    float *h_emb; int *h_pos; int *h_slot; float *h_hid;   /* host staging for compaction */
 } cuda_talker_batch_t;
 
 static void talker_body_batch(cuda_talker_batch_t *s){
-    int B=s->B,H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,hd=s->head_dim,half=hd/2;
+    /* Bmax is the ALLOCATED lane count and fixes the KV layer stride; B is how many
+     * lanes we actually compute this step.  They differ when the caller compacts idle
+     * lanes away, and confusing them silently reindexes every layer's cache. */
+    const int Bmax=s->B;
+    int B=(s->B_eff>0&&s->B_eff<=s->B)?s->B_eff:s->B;
+    int H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,hd=s->head_dim,half=hd/2;
     int nh=s->n_heads,nkv=s->n_kv,inter=s->inter; float scale=1.f/sqrtf((float)hd);
     for(int l=0;l<s->n_layers;++l){
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
@@ -573,9 +585,9 @@ static void talker_body_batch(cuda_talker_batch_t *s){
         k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B,s->d_act);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->k,B*kvd);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
-        float *Kl=s->kcache+(size_t)l*B*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*B*s->kv_max*kvd;
-        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act);
-        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act);
+        float *Kl=s->kcache+(size_t)l*Bmax*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*Bmax*s->kv_max*kvd;
+        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act,s->d_slot);
+        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act,s->d_slot);
         mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -610,6 +622,13 @@ extern "C" void *qwen_cuda_talker_batch_init(void *single, int B){
     CK(cudaMalloc(&s->gu,(size_t)B*2*inter*sizeof(float)));
     CK(cudaMalloc(&s->d_pos,B*sizeof(int)));
     CK(cudaMalloc(&s->d_act,(size_t)B));
+    CK(cudaMalloc(&s->d_slot,B*sizeof(int)));
+    { int *ids=(int*)malloc(B*sizeof(int)); for(int i=0;i<B;++i) ids[i]=i;
+      CK(cudaMemcpy(s->d_slot,ids,B*sizeof(int),cudaMemcpyHostToDevice)); free(ids); }
+    s->B_eff=0; s->slot_identity=1;
+    s->h_emb=(float*)malloc((size_t)B*s->hidden*sizeof(float));
+    s->h_hid=(float*)malloc((size_t)B*s->hidden*sizeof(float));
+    s->h_pos=(int*)malloc(B*sizeof(int)); s->h_slot=(int*)malloc(B*sizeof(int));
     if(getenv("QWEN_CUDA_VERBOSE")){
         fprintf(stderr,"[cuda batch] B=%d L=%d H=%d qd=%d kvd=%d inter=%d kv_max=%d prec=%d\n",
                 B,L,H,qd,kvd,inter,s->kv_max,s->prec);
@@ -622,9 +641,54 @@ extern "C" void *qwen_cuda_talker_batch_init(void *single, int B){
     return s;
 }
 /* embeds=[B][H] host, pos_arr=[B] host; hidden_out=[B][H] host (final-normed). */
+/* QWEN_CUDA_BATCH_COMPACT=1: compute only the lanes that are actually stepping.
+ * The kernels otherwise run every configured lane, so a server with --batch-size 8 and four
+ * requests in flight spends half its GPU work on empty lanes -- and a partly loaded server is
+ * the normal case, not the exception.  Default OFF until measured on hardware. */
+static int batch_compact_enabled(void){
+    static int v=-1;
+    if(v<0){ const char *e=getenv("QWEN_CUDA_BATCH_COMPACT"); v=(e&&*e&&*e!='0')?1:0; }
+    return v;
+}
 extern "C" void qwen_cuda_talker_batch_step(void *st,const float *embeds,const int *pos_arr,float *hidden_out,
                                            const unsigned char *active){
     cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; int B=s->B,H=s->hidden;
+
+    if(batch_compact_enabled() && active){
+        int n=0;
+        for(int b=0;b<B;++b) if(active[b]){
+            s->h_slot[n]=b; s->h_pos[n]=pos_arr[b];
+            memcpy(s->h_emb+(size_t)n*H, embeds+(size_t)b*H, (size_t)H*sizeof(float));
+            ++n;
+        }
+        if(n==0) return;                      /* no lane is stepping: nothing to launch */
+        if(n<B){
+            /* dense lanes 0..n-1 stand for slots h_slot[0..n-1]; the KV stays addressed by slot */
+            CK(cudaMemcpy(s->x,s->h_emb,(size_t)n*H*sizeof(float),cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(s->d_pos,s->h_pos,(size_t)n*sizeof(int),cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(s->d_slot,s->h_slot,(size_t)n*sizeof(int),cudaMemcpyHostToDevice));
+            { unsigned char ones[QB_MAX]; for(int i=0;i<n;++i) ones[i]=1;
+              CK(cudaMemcpy(s->d_act,ones,(size_t)n,cudaMemcpyHostToDevice)); }
+            s->B_eff=n;
+            talker_body_batch(s);
+            CK(cudaStreamSynchronize(cudaStreamPerThread));
+            if(hidden_out){
+                CK(cudaMemcpy(s->h_hid,s->xn,(size_t)n*H*sizeof(float),cudaMemcpyDeviceToHost));
+                for(int i=0;i<n;++i)
+                    memcpy(hidden_out+(size_t)s->h_slot[i]*H, s->h_hid+(size_t)i*H, (size_t)H*sizeof(float));
+            }
+            s->B_eff=0; s->slot_identity=0;
+            return;
+        }
+        /* n==B: every lane steps, so the dense form is the ordinary full-width path */
+    }
+
+    if(!s->slot_identity){   /* a previous compacted step left a permuted map behind */
+        int ids[QB_MAX]; for(int i=0;i<B;++i) ids[i]=i;
+        CK(cudaMemcpy(s->d_slot,ids,(size_t)B*sizeof(int),cudaMemcpyHostToDevice));
+        s->slot_identity=1;
+    }
+    s->B_eff=0;
     CK(cudaMemcpy(s->x,embeds,(size_t)B*H*sizeof(float),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(s->d_pos,pos_arr,B*sizeof(int),cudaMemcpyHostToDevice));
     /* Lanes the caller is not stepping keep a stale pos_arr[b] from whatever request last
@@ -658,7 +722,8 @@ extern "C" void qwen_cuda_talker_batch_free(void *st){
     cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; if(!s) return;
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
     cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
-    cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act); free(s);   /* weights are shared — not freed here */
+    cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act);cudaFree(s->d_slot);
+    free(s->h_emb);free(s->h_hid);free(s->h_pos);free(s->h_slot); free(s);   /* weights are shared — not freed here */
 }
 
 /* Correctness (batched row b MUST equal a single-stream run with the same embeds/pos) +
@@ -862,10 +927,19 @@ typedef struct {
     float *kcache,*vcache; float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;
     int prec; int *d_pos;
     unsigned char *d_act;                             /* device uint8[B]: which lanes step */
+    int *d_slot;                                      /* device int[B]: dense lane -> owning KV slot */
+    int B_eff;                                        /* lanes actually computed this step (<= B) */
+    int slot_identity;                                /* 1 when d_slot is the identity map */
+    float *h_emb; int *h_pos; int *h_slot; float *h_hid;   /* host staging for compaction */
 } cuda_cp_batch_t;
 
 static void cp_body_batch(cuda_cp_batch_t *s){
-    int B=s->B,H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,hd=s->head_dim,half=hd/2;
+    /* Bmax is the ALLOCATED lane count and fixes the KV layer stride; B is how many
+     * lanes we actually compute this step.  They differ when the caller compacts idle
+     * lanes away, and confusing them silently reindexes every layer's cache. */
+    const int Bmax=s->B;
+    int B=(s->B_eff>0&&s->B_eff<=s->B)?s->B_eff:s->B;
+    int H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,hd=s->head_dim,half=hd/2;
     int nh=s->n_heads,nkv=s->n_kv,inter=s->inter; float scale=1.f/sqrtf((float)hd);
     for(int l=0;l<s->n_layers;++l){
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
@@ -878,9 +952,9 @@ static void cp_body_batch(cuda_cp_batch_t *s){
         k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B,s->d_act);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->k,B*kvd);
         k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
-        float *Kl=s->kcache+(size_t)l*B*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*B*s->kv_max*kvd;
-        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act);
-        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act);
+        float *Kl=s->kcache+(size_t)l*Bmax*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*Bmax*s->kv_max*kvd;
+        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B,s->d_act,s->d_slot);
+        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd,s->d_act,s->d_slot);
         mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
         k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
         k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -910,6 +984,13 @@ extern "C" void *qwen_cuda_cp_batch_init(void *single, int B){
     CK(cudaMalloc(&s->gu,(size_t)B*2*inter*sizeof(float)));
     CK(cudaMalloc(&s->d_pos,B*sizeof(int)));
     CK(cudaMalloc(&s->d_act,(size_t)B));
+    CK(cudaMalloc(&s->d_slot,B*sizeof(int)));
+    { int *ids=(int*)malloc(B*sizeof(int)); for(int i=0;i<B;++i) ids[i]=i;
+      CK(cudaMemcpy(s->d_slot,ids,B*sizeof(int),cudaMemcpyHostToDevice)); free(ids); }
+    s->B_eff=0; s->slot_identity=1;
+    s->h_emb=(float*)malloc((size_t)B*s->hidden*sizeof(float));
+    s->h_hid=(float*)malloc((size_t)B*s->hidden*sizeof(float));
+    s->h_pos=(int*)malloc(B*sizeof(int)); s->h_slot=(int*)malloc(B*sizeof(int));
     return s;
 }
 /* x=[B][cp_h] host (each row = the caller's per-seq embed/residual seed), pos_arr=[B] host;
@@ -930,7 +1011,8 @@ extern "C" void qwen_cuda_cp_batch_free(void *st){
     cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; if(!s) return;
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
     cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
-    cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act); free(s);
+    cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act);cudaFree(s->d_slot);
+    free(s->h_emb);free(s->h_hid);free(s->h_pos);free(s->h_slot); free(s);
 }
 
 extern "C" void qwen_cuda_cp_free(void *st) {
