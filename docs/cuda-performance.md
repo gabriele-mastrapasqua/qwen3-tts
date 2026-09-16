@@ -184,6 +184,18 @@ kernel is weight-bound: Talker 5.23 → 4.64 ms/frame, code predictor 7.70 → 6
 path the gain is small — about 5% of RTF at C4 — because halving the bytes does not halve the time
 of a kernel that is latency-bound rather than bandwidth-bound.
 
+### The exact configuration behind the numbers above
+
+```bash
+QWEN_CUDA_FUSED_TALKER=1 QWEN_CUDA_DECODER=1 QWEN_CUDA_CONVDEC=1 \
+QWEN_CUDA_BATCH=1 QWEN_CUDA_BATCH_COMPACT=1 \
+  ./qwen_tts -d qwen3-tts-0.6b --backend cuda --serve 8000 \
+  --batch-size 8 --prefork 1 --prefork-threads 8
+```
+
+All five resident-path flags are on, `--precision` is left at its default (never `--int8` on the
+seam), and the engine pool is sized explicitly. Omitting any of them does not reproduce the table.
+
 ### Verifying a GPU build
 
 ```bash
@@ -234,7 +246,9 @@ Flags / env:
 - `--backend cuda` — select the CUDA backend.
 - `--int8` — int8 weights (Talker + CP). `--quant-mixed` — int4 Talker + int8 CP (fastest, same quality).
 - `QWEN_CUDA_FUSED_TALKER=1` — GPU-resident fused Talker + Code Predictor.
-- `QWEN_CUDA_CONVDEC=1` — GPU-resident ConvNet speech decoder.
+- `QWEN_CUDA_DECODER=1` — speech-decoder pointwise convolutions through cuBLAS on the device.
+- `QWEN_CUDA_CONVDEC=1` — GPU-resident ConvNet speech decoder (the whole conv stack, not just the
+  pointwise convs above; the two are independent and the measurements in this document have both on).
 - `QWEN_CUDA_BATCH=1` — GPU-batched fused steps for the server (`--batch-size N`, N ≤ 16; 8 is the
   measured optimum).
 - `QWEN_CUDA_BATCH_COMPACT=1` — pack the stepping lanes together so idle slots cost nothing.
