@@ -733,6 +733,75 @@ extern "C" void qwen_cuda_talker_free(void *);   /* defined below (after the CP 
 extern "C" void *qwen_cuda_cp_batch_init(void *, int);   /* defined below (CP section) */
 extern "C" void  qwen_cuda_cp_batch_step(void *, float *, const int *, const unsigned char *);
 extern "C" void  qwen_cuda_cp_batch_free(void *);
+/* Partial-occupancy correctness: a lane that is NOT stepping this step must keep its KV
+ * intact, and a lane that IS stepping must read and write the cache of its own slot.
+ *
+ * The lockstep test above passes active=NULL, so every lane steps and QWEN_CUDA_BATCH_COMPACT
+ * never reorders anything -- it proves the flag is inert, not that it is correct.  The
+ * dangerous failure mode of compaction is silent: a lane compacted to a different dense index
+ * reads another request's history and produces plausible audio, which no crash and no
+ * throughput number would reveal.  So compare against the only reference that cannot be wrong,
+ * B independent one-wide states, each stepped exactly on the steps where its lane was active.
+ *
+ * Idle lanes are handed a wrong position and a wrong embedding on purpose: if the mask is
+ * honoured they are never read, and if it is not the reference disagrees immediately. */
+static int batch_mask_selftest(void *S, int B, int H, int steps){
+    if(B<2) return 0;
+    void *tst=qwen_cuda_talker_batch_init(S,B);
+    if(!tst){ fprintf(stderr,"batch mask selftest: batch init failed (B=%d)\n",B); return 1; }
+    void **ref=(void**)calloc(B,sizeof(void*));
+    for(int b=0;b<B;++b){
+        ref[b]=qwen_cuda_talker_batch_init(S,1);
+        if(!ref[b]){ fprintf(stderr,"batch mask selftest: reference init failed\n");
+                     for(int j=0;j<b;++j) qwen_cuda_talker_batch_free(ref[j]);
+                     free(ref); qwen_cuda_talker_batch_free(tst); return 1; }
+    }
+    float *eB=(float*)malloc((size_t)B*H*sizeof(float));
+    float *hB=(float*)malloc((size_t)B*H*sizeof(float));
+    float *e1=(float*)malloc((size_t)H*sizeof(float));
+    float *h1=(float*)malloc((size_t)H*sizeof(float));
+    int *posB=(int*)malloc((size_t)B*sizeof(int));
+    int *posc=(int*)calloc(B,sizeof(int));      /* each lane's own position counter */
+    unsigned char act[QB_MAX];
+    double maxdiff=0; long compared=0, idled=0;
+    for(int p=0;p<steps;++p){
+        int any=0;
+        for(int b=0;b<B;++b){
+            act[b]=(unsigned char)(((p+b)%3)!=0);   /* each lane idles on a different step */
+            if(act[b]){
+                any=1;
+                for(int i=0;i<H;++i)
+                    eB[(size_t)b*H+i]=0.02f*sinf(0.11f*(i+1)+0.3f*posc[b]+1.7f*b);
+                posB[b]=posc[b];
+            }else{
+                ++idled;
+                for(int i=0;i<H;++i) eB[(size_t)b*H+i]=7.0f;   /* must never be read */
+                posB[b]=0;                                     /* wrong on purpose */
+            }
+        }
+        if(!any) continue;
+        qwen_cuda_talker_batch_step(tst,eB,posB,hB,act);
+        for(int b=0;b<B;++b){
+            if(!act[b]) continue;
+            memcpy(e1,eB+(size_t)b*H,(size_t)H*sizeof(float));
+            int one=posc[b];
+            unsigned char on=1;
+            qwen_cuda_talker_batch_step(ref[b],e1,&one,h1,&on);
+            for(int i=0;i<H;++i){ double d=fabs((double)hB[(size_t)b*H+i]-(double)h1[i]);
+                                  if(d>maxdiff) maxdiff=d; }
+            ++compared; ++posc[b];
+        }
+    }
+    int bad=!(maxdiff<1e-3);
+    fprintf(stderr,"batch mask selftest (B=%d, %d steps, %ld lane-steps compared, %ld idled): "
+                   "max|masked-reference|=%.2e (%s)\n",
+            B,steps,compared,idled,maxdiff, bad?"FAIL":"PASS");
+    free(eB);free(hB);free(e1);free(h1);free(posB);free(posc);
+    for(int b=0;b<B;++b) qwen_cuda_talker_batch_free(ref[b]);
+    free(ref); qwen_cuda_talker_batch_free(tst);
+    return bad;
+}
+
 extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
     int H=ctx->config.hidden_size, kvm=ctx->kv_max;
     if(frames>kvm-2) frames=kvm-2; if(frames<8) frames=8;
@@ -805,7 +874,11 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
         if(cdiff>=1e-3) maxdiff=cdiff;
     }
     if(CB) qwen_cuda_cp_batch_free(CB); if(CS) qwen_cuda_cp_free(CS);
-    return maxdiff<1e-3?0:1;
+    /* Partial occupancy last: it needs B+1 live states, so run it after the others free theirs. */
+    S=qwen_cuda_talker_init(ctx);
+    int mbad = S ? batch_mask_selftest(S,B,H,24) : 1;
+    if(S) qwen_cuda_talker_free(S);
+    return (maxdiff<1e-3 && !mbad)?0:1;
 }
 
 /* ======================================================================== *
