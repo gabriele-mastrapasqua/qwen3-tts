@@ -659,3 +659,84 @@ hold.
 
 Do NOT re-open: fusing the CP loop onto the device (§14.5, measured at zero) or raising the lane
 cap (§14.9).
+
+### 14.11 Six restructurings of the batched matmat, and what survived
+
+After the head, the attention and the graphs, the batched matmat is the whole remaining cost:
+the Talker step reads 706 MB of bf16 weights (353M parameters over 28 layers) in 4.75 ms, which
+is 149 GB/s on a 768 GB/s card. ncu: DRAM throughput 22%, compute throughput 36%, Waves Per SM
+0.25, achieved occupancy 25% of theoretical. Nothing is saturated; it is latency-bound.
+
+Six restructurings were written and measured. One helped.
+
+| change | result at B=8 | verdict |
+| --- | --- | --- |
+| four weight loads in flight | 7.56 -> 6.47 ms/f | **kept**, bit-identical |
+| block size 256 -> 64 | 4.86 -> 4.72 | **kept**, bit-identical |
+| split-K over the reduction dim | 4.82 -> 4.98 | removed |
+| wmma tensor-core tiles | 4.73 -> 5.13 | kept default-off (see below) |
+| 16-byte vector loads | 4.73 -> 5.01 | removed |
+| activations staged in shared memory | 4.72 -> 6.80 | removed |
+| residual add fused into the epilogue | 4.72 -> 4.79 | removed |
+
+Each failure says something specific, and together they say the same thing.
+
+**Split-K** quadruples the grid but leaves each block about two unrolled iterations; the
+per-block fixed cost eats the gain. Slower with CUDA graphs on AND off, so not an overlap
+effect.
+
+**Tensor cores** accelerate arithmetic that was never the constraint. The kernel is correct and
+portable (wmma bf16 16x16x16, sm_80 through sm_120, guarded on `__CUDA_ARCH__` with a runtime
+capability check) and is kept default-off because it carries the per-stage precision gate; it is
+not kept because it is fast here.
+
+**Wide loads** raise bytes-in-flight from 256 KB to 2 MB, past the ~460 KB a 768 GB/s card needs
+to saturate, and were still slower. At eight lanes each weight load needs eight activation
+loads, so 32 of every 36 load instructions are activations and every warp issues its own against
+L1.
+
+**Shared-memory staging** is the textbook fix for that and was slower by 44%, because the
+arithmetic does not work at this shape: eight warps per block cover eight rows, so the staged
+activation tile (B x TC floats = 16 KB) is larger than the weight tile the block consumes
+(8 rows x TC bf16 = 8 KB). A real GEMM amortises by giving a block 128 rows, which needs each
+warp to hold several rows in registers -- register blocking, and a different kernel.
+
+**Fusing the residual add** removes 56 launches per Talker step and was 1.5% slower, repeatably:
+the read-modify-write epilogue costs more than the launch it saves.
+
+The reading that matters for whoever picks this up: every win today came from fixing something
+identifiably absent or broken -- a head that was not on the GPU, an attention kernel with eight
+barriers per key position, batched bodies with no CUDA graph, an accumulator sized at QB_MAX.
+Every attempt to squeeze the already-reasonable matmat further has failed. The remaining 5x
+needs either a register-blocked GEMM, which is days of work, or reduced precision, which is
+measured and costly (below).
+
+### 14.12 Per-stage precision: built, measured, and not enough
+
+`mvB` takes `allow_reduced`, and every call in `cp_body_batch` passes 0, so the code predictor
+-- the stage that picks the codes through an argmax -- stays f32 while the talker may run
+reduced. vLLM-Omni draws the line in exactly the same place.
+
+It works as designed: cuBLAS on the talker alone is worth 8% (4.73 -> 4.35 ms/frame) with the CP
+still bit-identical at 0.00e+00. It is still not enough to enable. Same text, seed 42,
+temperature 0, code predictor protected:
+
+```
+duration            7.44 s -> 5.60 s   (-24.7%)
+log-spectrum corr   0.860
+```
+
+Protecting the code predictor does not contain the divergence, because the talker's hidden state
+is what the code predictor consumes. Reduced activations anywhere in that chain are a different
+generation, not a rounding difference.
+
+### 14.13 Determinism follows the engine thread count
+
+The server is deterministic for a FIXED thread count and not across thread counts. Same request,
+`--prefork-threads 1` gives md5 7ca2fc9a618e8b47, `--prefork-threads 8` gives 2e26bd462b23d77b,
+each reproducible. That is the documented CPU-path behaviour -- reduction order follows the
+thread count -- now confirmed on the GPU serving path.
+
+Two consequences. The 17% RTF win in §14.8 from sizing the pool correctly is **not
+output-neutral**. And every bit-exactness claim in this campaign holds only with the thread
+count fixed, which every comparison here did.
