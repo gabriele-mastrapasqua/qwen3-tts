@@ -564,7 +564,56 @@ typedef struct {
     int B_eff;                                        /* lanes actually computed this step (<= B) */
     int slot_identity;                                /* 1 when d_slot is the identity map */
     float *h_emb; int *h_pos; int *h_slot; float *h_hid;   /* host staging for compaction */
+    /* One CUDA graph per effective lane count: the grid dimensions and the by-value B
+     * argument of every kernel are baked in at capture, so a graph taken at four lanes
+     * cannot be replayed at three. */
+    cudaGraphExec_t gexec[QB_MAX+1]; unsigned char gmode[QB_MAX+1];   /* 0 untried, 1 graph, 2 disabled */
 } cuda_talker_batch_t;
+
+/* Replay a batched body from a CUDA graph instead of relaunching its kernels.
+ *
+ * The batched bodies are the ones the server actually runs, and neither had a graph: only
+ * the single-stream talker and CP did.  One batched Talker step is 28 layers x 19 launches
+ * and one batched CP frame is 15 passes x 5 layers x 19, so a frame issues on the order of
+ * two thousand launches whose arguments never change from frame to frame.
+ *
+ * Nothing about the computation changes.  The same kernels run in the same order on the same
+ * pointers; positions, the active mask and the lane->slot map all live in device buffers the
+ * graph reads at replay, so they stay free to vary.  What is baked in at capture is the grid
+ * geometry and the by-value lane count, which is why the cache is keyed on the effective lane
+ * count rather than holding a single graph.
+ *
+ * Capture is skipped entirely for n==0 and falls back to plain launches for good if it fails,
+ * so a driver that refuses capture costs one wasted attempt per lane count and nothing else. */
+static int batch_graph_enabled(void){
+    static int t=-1;
+    if(t<0){ const char *e=getenv("QWEN_CUDA_BATCH_GRAPH"); t=(!e||!e[0])?1:(e[0]!='0'); }
+    return t;
+}
+template<typename T, void (*BODY)(T*)>
+static void batch_graph_run(T *s,int n){
+    if(n<1||n>QB_MAX||!batch_graph_enabled()){ BODY(s); return; }
+    if(s->gmode[n]==2){ BODY(s); return; }
+    if(s->gmode[n]==0){
+        cudaGraph_t g=NULL;
+        if(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)!=cudaSuccess){
+            s->gmode[n]=2; BODY(s); return;
+        }
+        BODY(s);
+        if(cudaStreamEndCapture(cudaStreamPerThread,&g)!=cudaSuccess||!g){
+            s->gmode[n]=2; cudaGetLastError(); BODY(s); return;
+        }
+        cudaError_t rc=cudaGraphInstantiate(&s->gexec[n],g,0);
+        cudaGraphDestroy(g);
+        if(rc!=cudaSuccess){
+            fprintf(stderr,"batched graph instantiate failed at %d lanes (%s); using plain launches\n",
+                    n,cudaGetErrorString(rc));
+            s->gmode[n]=2; BODY(s); return;   /* capture consumed the work: re-issue it */
+        }
+        s->gmode[n]=1;
+    }
+    CK(cudaGraphLaunch(s->gexec[n],cudaStreamPerThread));
+}
 
 static void talker_body_batch(cuda_talker_batch_t *s){
     /* Bmax is the ALLOCATED lane count and fixes the KV layer stride; B is how many
@@ -670,7 +719,7 @@ extern "C" void qwen_cuda_talker_batch_step(void *st,const float *embeds,const i
             { unsigned char ones[QB_MAX]; for(int i=0;i<n;++i) ones[i]=1;
               CK(cudaMemcpy(s->d_act,ones,(size_t)n,cudaMemcpyHostToDevice)); }
             s->B_eff=n;
-            talker_body_batch(s);
+            batch_graph_run<cuda_talker_batch_t,talker_body_batch>(s,n);
             CK(cudaStreamSynchronize(cudaStreamPerThread));
             if(hidden_out){
                 CK(cudaMemcpy(s->h_hid,s->xn,(size_t)n*H*sizeof(float),cudaMemcpyDeviceToHost));
@@ -697,7 +746,7 @@ extern "C" void qwen_cuda_talker_batch_step(void *st,const float *embeds,const i
      * "an illegal memory access was encountered".  NULL means every lane steps. */
     { unsigned char all[QB_MAX]; if(!active){ for(int i=0;i<B;++i) all[i]=1; }
       CK(cudaMemcpy(s->d_act, active?active:all, (size_t)B, cudaMemcpyHostToDevice)); }
-    talker_body_batch(s);
+    batch_graph_run<cuda_talker_batch_t,talker_body_batch>(s,B);
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     if(hidden_out) CK(cudaMemcpy(hidden_out,s->xn,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
 }
@@ -723,6 +772,7 @@ extern "C" void qwen_cuda_talker_batch_free(void *st){
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
     cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
     cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act);cudaFree(s->d_slot);
+    for(int i=0;i<=QB_MAX;++i) if(s->gmode[i]==1) cudaGraphExecDestroy(s->gexec[i]);
     free(s->h_emb);free(s->h_hid);free(s->h_pos);free(s->h_slot); free(s);   /* weights are shared — not freed here */
 }
 
@@ -1004,6 +1054,7 @@ typedef struct {
     int B_eff;                                        /* lanes actually computed this step (<= B) */
     int slot_identity;                                /* 1 when d_slot is the identity map */
     float *h_emb; int *h_pos; int *h_slot; float *h_hid;   /* host staging for compaction */
+    cudaGraphExec_t gexec[QB_MAX+1]; unsigned char gmode[QB_MAX+1];   /* see cuda_talker_batch_t */
 } cuda_cp_batch_t;
 
 static void cp_body_batch(cuda_cp_batch_t *s){
@@ -1076,7 +1127,7 @@ extern "C" void qwen_cuda_cp_batch_step(void *st,float *x,const int *pos_arr,con
      * leftover position >= 64 indexes outside the cache immediately. */
     { unsigned char all[QB_MAX]; if(!active){ for(int i=0;i<B;++i) all[i]=1; }
       CK(cudaMemcpy(s->d_act, active?active:all, (size_t)B, cudaMemcpyHostToDevice)); }
-    cp_body_batch(s);
+    batch_graph_run<cuda_cp_batch_t,cp_body_batch>(s,B);
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(x,s->x,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
 }
@@ -1085,6 +1136,7 @@ extern "C" void qwen_cuda_cp_batch_free(void *st){
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
     cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
     cudaFree(s->gu);cudaFree(s->d_pos);cudaFree(s->d_act);cudaFree(s->d_slot);
+    for(int i=0;i<=QB_MAX;++i) if(s->gmode[i]==1) cudaGraphExecDestroy(s->gexec[i]);
     free(s->h_emb);free(s->h_hid);free(s->h_pos);free(s->h_slot); free(s);
 }
 
