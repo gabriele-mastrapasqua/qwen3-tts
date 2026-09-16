@@ -616,6 +616,24 @@ __global__ void k_f32_to_bf16(const float *__restrict__ src,__nv_bfloat16 *__res
 /* True when cuBLAS measured faster for this shape. The square 1024x1024 case is the exception
  * the table above records, not an oversight. */
 static inline int cublas_wins(int rows,int cols){ return !(rows<=1024 && cols<=1024); }
+/* Block size for the batched matmats, swept on hardware.
+ *
+ * ncu on the rows=1024 shapes reported Waves Per SM 0.25 and achieved occupancy 25% against a
+ * theoretical 100%: the kernel launches 128 blocks where the device holds 504, so three
+ * quarters of the GPU is idle, and DRAM throughput sits at 22%.
+ *
+ * One warp owns one output row, so the block count is rows*32/blockDim. Shrinking the block
+ * multiplies the blocks WITHOUT changing what any warp does -- same elements, same order, same
+ * reduction -- so unlike split-K, which chops the reduction dimension and reassociates the sum,
+ * this is bit-identical. Split-K was tried first and was slower at every setting: quartering
+ * each block's work left roughly two unrolled iterations per block, and the per-block fixed cost
+ * ate the gain. */
+static int mm_tpb(void){
+    static int t=-1;
+    if(t<0){ const char *e=getenv("QWEN_CUDA_MM_TPB"); t=e&&*e?atoi(e):64;
+             if(t!=32&&t!=64&&t!=128&&t!=256) t=64; }
+    return t;
+}
 static inline void mvB(int prec,const void*W,const float*scale,const float*X,float*Y,int rows,int cols,int B){
     if(prec==0 && cublas_mm_enabled() && cublas_wins(rows,cols)){
         size_t need=(size_t)B*cols;
@@ -635,13 +653,14 @@ static inline void mvB(int prec,const void*W,const float*scale,const float*X,flo
         /* anything unsupported falls through to the hand kernel rather than failing the step */
     }
 
-    int grid=CEIL(rows*32,TPB);
+    const int tpb=mm_tpb();
+    int grid=CEIL(rows*32,tpb);
     if(prec!=0){
-#define MMQ(NB) do{ if(prec==2) k_matmat_q4_0_u<NB><<<grid,TPB>>>((const q4blk*)W,X,Y,rows,cols,B); \
+#define MMQ(NB) do{ if(prec==2) k_matmat_q4_0_u<NB><<<grid,tpb>>>((const q4blk*)W,X,Y,rows,cols,B); \
                     else { int u=mm_unroll(); \
-                           if(u==16)     k_matmat_int8_u<16,NB><<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
-                           else if(u==8) k_matmat_int8_u< 8,NB><<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
-                           else          k_matmat_int8_u< 4,NB><<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B); } }while(0)
+                           if(u==16)     k_matmat_int8_u<16,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
+                           else if(u==8) k_matmat_int8_u< 8,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
+                           else          k_matmat_int8_u< 4,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); } }while(0)
       switch(B){
         case  1: MMQ( 1); break;  case  2: MMQ( 2); break;  case  3: MMQ( 3); break;
         case  4: MMQ( 4); break;  case  5: MMQ( 5); break;  case  6: MMQ( 6); break;
@@ -653,9 +672,9 @@ static inline void mvB(int prec,const void*W,const float*scale,const float*X,flo
 #undef MMQ
     }
     else { int u=mm_unroll();
-#define MM_U(NB) do{ if(u==16)     k_matmat_bf16_u<16,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
-                     else if(u==8) k_matmat_bf16_u< 8,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
-                     else          k_matmat_bf16_u< 4,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); }while(0)
+#define MM_U(NB) do{ if(u==16)     k_matmat_bf16_u<16,NB><<<grid,tpb>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
+                     else if(u==8) k_matmat_bf16_u< 8,NB><<<grid,tpb>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
+                     else          k_matmat_bf16_u< 4,NB><<<grid,tpb>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); }while(0)
            switch(B){
              case  1: MM_U( 1); break;  case  2: MM_U( 2); break;  case  3: MM_U( 3); break;
              case  4: MM_U( 4); break;  case  5: MM_U( 5); break;  case  6: MM_U( 6); break;
