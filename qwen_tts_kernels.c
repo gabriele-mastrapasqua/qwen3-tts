@@ -2642,26 +2642,29 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
 
     fprintf(f, "  kernel selection (shape %dx%d, asked to the dispatcher):\n", rows, cols);
 
+    const char *int8_b1 = "f32-accum fused";
+    const char *q4_b1 = "f32 dequant";
+#if defined(__ARM_FEATURE_DOTPROD)
+    int8_b1 = getenv("QWEN_NO_SDOT") ? "f32-accum (SDOT off)" : "SDOT vdotq_s32";
+    q4_b1 = getenv("QWEN_NO_SDOT") ? "f32 dequant" : "SDOT vdotq_s32";
+#elif defined(__AVX512VNNI__)
+    int8_b1 = qwen_avx2_int8_gemv_enabled() ? "AVX2 signed-widening dot (experimental)" :
+              (getenv("QWEN_NO_VNNI") ? "f32-accum (VNNI off)" : "VNNI vpdpbusd");
+    q4_b1 = qwen_avx2_q4_gemv_enabled() ? "AVX2 signed-widening Q4 dot (experimental)" :
+            (getenv("QWEN_NO_VNNI") ? "f32 dequant" : "VNNI vpdpbusd");
+#elif defined(__AVX2__)
+    int8_b1 = qwen_avx2_int8_gemv_enabled() ? "AVX2 signed-widening dot (experimental)" :
+              "AVX2 FMA widen/dequant";
+    q4_b1 = qwen_avx2_q4_gemv_enabled() ? "AVX2 signed-widening Q4 dot (experimental)" :
+            "AVX2 unpack/dequant FMA";
+#endif
     fprintf(f, "    B=1  (CLI, server c=1) matvec: bf16 -> %s | int8 -> %s | q4_0 -> %s\n",
 #if defined(__ARM_FEATURE_BF16) && !defined(__APPLE__)
             getenv("QWEN_ARM_BFDOT") ? "BFDOT" : "NEON 2-row fused",
 #else
             "NEON/scalar 2-row fused",
 #endif
-#if defined(__ARM_FEATURE_DOTPROD)
-            getenv("QWEN_NO_SDOT") ? "f32-accum (SDOT off)" : "SDOT vdotq_s32",
-            getenv("QWEN_NO_SDOT") ? "f32 dequant"          : "SDOT vdotq_s32"
-#elif defined(__AVX512VNNI__)
-            getenv("QWEN_AVX2_INT8_GEMV") ? "AVX2 signed-widening dot (experimental)" :
-                (getenv("QWEN_NO_VNNI") ? "f32-accum (VNNI off)" : "VNNI vpdpbusd"),
-            getenv("QWEN_NO_VNNI") ? "f32 dequant"          : "VNNI vpdpbusd"
-#elif defined(__AVX2__)
-            getenv("QWEN_AVX2_INT8_GEMV") ? "AVX2 signed-widening dot (experimental)" :
-                "AVX2 FMA widen/dequant",
-            "AVX2 unpack/dequant FMA"
-#else
-            "f32-accum fused", "f32 dequant"
-#endif
+            int8_b1, q4_b1
             );
 
     const struct { const char *what; const int *c; int n; const char *fallback; } rows_[] = {
