@@ -830,29 +830,6 @@ static inline void mvB(int prec,const void*W,const float*scale,const float*X,flo
       }
 #undef MMQ
     }
-    else { int u=mm_unroll(); \
-                           if(u==16)     k_matmat_int8_u<16,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
-                           else if(u==8) k_matmat_int8_u< 8,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
-                           else          k_matmat_int8_u< 4,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); } }while(0)
-      switch(B){
-        case  1: MMQ( 1); break;  case  2: MMQ( 2); break;  case  3: MMQ( 3); break;
-        case  4: MMQ( 4); break;  case  5: MMQ( 5); break;  case  6: MMQ( 6); break;
-        case  7: MMQ( 7); break;  case  8: MMQ( 8); break;  case  9: MMQ( 9); break;
-        case 10: MMQ(10); break;  case 11: MMQ(11); break;  case 12: MMQ(12); break;
-        case 13: MMQ(13); break;  case 14: MMQ(14); break;  case 15: MMQ(15); break;
-        default: MMQ(QB_MAX); break;
-      }
-#undef MMQ
-    }
-    else if(mm_rb()>1){
-        /* Two instantiations only. Expanding R over all fifteen lane counts the way the other
-         * paths do adds 45 kernels and takes nvcc past 25 minutes; NB is rounded up to 8 or 16
-         * instead, which the `b<B` guards already tolerate at the cost of a few idle registers. */
-        const int tpbr=mm_tpb();
-        int gridr=CEIL(CEIL(rows,mm_rb())*32,tpbr);
-        if(B<=8) k_matmat_bf16_rb< 8,4><<<gridr,tpbr>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
-        else     k_matmat_bf16_rb<16,4><<<gridr,tpbr>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
-    }
     else { int u=mm_unroll();
 #define MM_U(NB) do{ if(u==16)     k_matmat_bf16_u<16,NB><<<grid,tpb>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
                      else if(u==8) k_matmat_bf16_u< 8,NB><<<grid,tpb>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
