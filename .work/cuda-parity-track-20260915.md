@@ -896,3 +896,36 @@ measurement is cheap.
 It attacks the admission spike, and therefore `max_gap` and `safe_play_start` — the metrics that
 did not move all session however much the decode kernels improved. It does nothing for steady-state
 RTF, which is already bounded by the batched matmat and its memory roof (§14.11).
+
+
+### 14.17 Concurrency ladder on a strong GPU, and what it confirms (WIP)
+
+RTX PRO 6000 Blackwell (97 GB), 30 cores, CUDA 12.8, 0.6B, all resident paths, `--prefork-threads
+8`, length-varied corpus. Four two-minute screens. Full table and the exact command in
+`docs/cuda-performance.md`.
+
+| | C2 | C4 | **C8** | C12 | C16 |
+| --- | --- | --- | --- | --- | --- |
+| RTF p50 | 0.19 | 0.25 | **0.36** | 0.69 | 0.85 |
+| safe_play_start p50/p95 | 49/110 ms | 59/125 ms | **94/189 ms** | 183/564 ms | 408/749 ms |
+| max_gap p95 | 0.21 s | 0.29 s | **0.38 s** | 0.61 s | 0.75 s |
+| stall @100 / @250 ms | 0 / 0% | 0 / 0% | **0 / 0%** | 22 / 12% | 94 / 41% |
+| requests / 2 min | 119 | 158 | **220** | 178 | 192 |
+
+Three things worth keeping.
+
+**The knee is C8, judged on the envelope.** Stalls are zero at every threshold there, and
+safe_play_start is an order of magnitude under the one-second line. C12 would pass an RTF test
+and a safe_play_start test and is stalling 22% of the time at 100 ms, which is the same ordering
+seen on the A6000 at C6 (RTF 0.90 with stall@1000 at 35%): the listening metrics go first.
+
+**Throughput peaks at C8 and falls at C12**, 220 requests to 178. Past that, concurrency buys
+queueing rather than work — and it is the same width at which the batched kernel's per-stream
+cost bottoms out (§14.9: 1.34 ms at B=8, 1.43 at B=12, 1.47 at B=16, measured on an A6000 with
+`--gpu-batch-bench`). Two independent routes to the same number.
+
+**The admission stall of §14.15 does not appear here.** max_gap p95 is 0.21-0.38 s through C8
+against ~2.0 s on the A6000, and the prefill is host work: this box has 30 cores against 10. That
+supports the diagnosis rather than contradicting it, and it means the GPU-prefill project of §15
+is worth most on boxes whose CPU is small relative to their GPU — which is the usual shape of a
+rented inference box.

@@ -130,6 +130,59 @@ quality rather than capacity. The knee scales with GPU memory bandwidth, not wit
 code predictor reads ~2.24 GB of weights per audio frame regardless of how many requests share
 them, so the concurrency a card holds tracks its bandwidth almost linearly.
 
+### RTX PRO 6000 Blackwell — 2026-09-16 (WIP screen, not a qualification)
+
+**Status: WORK IN PROGRESS.** Four two-minute screens on one box. It is enough to locate the
+knee and to show the shape of the failure; it is not a qualification, and the per-class drift
+gate reports FAIL on every rung for the reason given at the end of this section.
+
+RTX PRO 6000 Blackwell Server Edition (97 GB), 30 cores, CUDA 12.8, 0.6B, `--precision default`:
+
+| | C2 | C4 | **C8** | C12 | C16 |
+| --- | --- | --- | --- | --- | --- |
+| RTF p50 | 0.19 | 0.25 | **0.36** | 0.69 | 0.85 |
+| TTFB p50 | 14 ms | 15 ms | **20 ms** | 22 ms | 42 ms |
+| TTFA p50 | 48 ms | 56 ms | **90 ms** | 120 ms | 162 ms |
+| safe_play_start p50/p95 | 49 / 110 ms | 59 / 125 ms | **94 / 189 ms** | 183 / 564 ms | 408 / 749 ms |
+| max_gap p95 | 0.21 s | 0.29 s | **0.38 s** | 0.61 s | 0.75 s |
+| stall @100 ms | 0% | 0% | **0%** | 22% | 94% |
+| stall @250 ms | 0% | 0% | **0%** | 12% | 41% |
+| stall @500 ms | 0% | 0% | **0%** | 1% | 3% |
+| stall @1000 ms | 0% | 0% | **0%** | 0% | 0% |
+| requests / 2 min | 119 | 158 | **220** | 178 | 192 |
+
+**C8 is the last clean rung**, and the judgement is on the whole envelope rather than on RTF:
+stalls are zero at every threshold, safe_play_start is an order of magnitude under one second,
+TTFB is 20 ms and TTFA 90 ms. C12 still has RTF 0.69 and safe_play_start under a second, and is
+already stalling 22% of the time at 100 ms — the listening metrics fail FIRST, which is why a
+concurrency is never declared on RTF alone.
+
+**Throughput peaks at C8 and falls at C12** (220 requests, then 178). Past that point extra
+concurrency buys queueing rather than work, and it lands on the same number the kernel does from
+a completely different direction: per-stream code-predictor cost measured 2.05 ms at B=4,
+**1.34 at B=8**, 1.43 at B=12 and 1.47 at B=16 on an A6000. The kernel optimum and the server's
+throughput peak are the same batch width.
+
+### The exact configuration behind that table
+
+```bash
+QWEN_CUDA_FUSED_TALKER=1 QWEN_CUDA_DECODER=1 QWEN_CUDA_CONVDEC=1 \
+QWEN_CUDA_BATCH=1 QWEN_CUDA_BATCH_COMPACT=1 \
+  ./qwen_tts -d qwen3-tts-0.6b --backend cuda --serve PORT \
+  --batch-size C --prefork 1 --prefork-threads 8          # batch-size capped at 16 (QB_MAX)
+```
+
+Closed-loop clients from `tests/soak_client.py`, two minutes per rung, `--speaker ryan
+--language English --temperature 0.9 --schedule stratified --schedule-seed 42`, text bank
+`tests/load_texts_en.txt`: 21 items over five classes from 4 words (short) to 59 (long), so the
+load is length-varied rather than one repeated sentence. Analysed with `tests/soak_drift.py`
+at `--warmup-s 20 --window-s 45`.
+
+`SOAK RESULT: FAIL — per-class KPI drift` on every rung, including those with 0% stalls. That
+gate measures drift BETWEEN text classes across 45-second windows, and with mixed lengths and a
+few dozen samples per class it does not settle on a screen this short. It is not a serving
+defect and it is not evidence of one; it is also not something to weaken in order to see green.
+
 ### Two configuration traps that silently cost most of the server
 
 1. **`--precision default` is mandatory.** The backend seam is bf16-only, so `--int8` sends the

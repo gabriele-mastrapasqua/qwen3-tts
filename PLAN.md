@@ -1214,6 +1214,18 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       i.e. 0.5%**. Nothing to move to the resident path. The levers are the CPU prefill (out of
       scope, invalidates CPU baselines) or a real GPU prefill behind `#ifdef` — a new kernel of a
       different shape, a project not a refinement.
+- [x] CUDA-18 **Serving evidence on a strong GPU (RTX PRO 6000 Blackwell, 2026-09-16) — WIP.**
+      Four 2-minute screens, 0.6B, all resident paths, length-varied corpus (21 texts, 5 classes,
+      4 to 59 words). **C8 is the last clean rung**: stalls 0% at every threshold,
+      safe_play_start 94/189 ms, TTFB 20 ms, TTFA 90 ms, RTF p50 0.36, 220 requests in two
+      minutes. C12 still has RTF 0.69 and safe_play_start under a second while already stalling
+      22% at 100 ms — the listening metrics fail first, so a concurrency is never declared on RTF
+      alone. Throughput PEAKS at C8 and falls at C12 (220 -> 178), the same batch width at which
+      per-stream code-predictor cost bottoms out on an A6000 (1.34 ms at B=8 against 1.43 at B=12)
+      — the kernel optimum and the server's throughput peak found independently. Screens, not a
+      qualification: the per-class drift gate reports FAIL on every rung, which is a long-soak
+      gate applied to 45-second windows, not a serving defect. Detail and the exact command:
+      `docs/cuda-performance.md`, "RTX PRO 6000 Blackwell".
 - [ ] CUDA-17 **NEXT PHASE: a native GPU prefill, separate from decode.** `qwen_cuda_talker_prefill()`
       — RMSNorm/RoPE, causal N x N attention, SwiGLU/MLP, KV written straight into the slot's
       device cache, then hand back to the batched decode. This is the only thing that can move
