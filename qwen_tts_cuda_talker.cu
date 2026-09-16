@@ -431,12 +431,43 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
  * "Invalid __global__ write of size 4 bytes" inside this kernel, and throughput collapsed from
  * 0.89x to 0.06x of single-stream. Unrolled, s[] stays in registers and every index is a
  * compile-time constant. */
-__global__ void k_matmat_bf16(const __nv_bfloat16 *W,const float *X,float *Y,int rows,int cols,int B){
+/* Four weight loads in flight per lane.
+ *
+ * At B=2, 4 and 8 this kernel took 0.77, 0.72 and 0.82 ms per code-predictor pass: nearly
+ * flat, although eight lanes do four times the arithmetic and four times the activation
+ * traffic of two.  A kernel whose cost does not move with the work it does is not limited by
+ * bandwidth or by FLOPs, and 139 MB in 0.82 ms is 180 GB/s on a card that does 768.  What it
+ * was limited by is latency: one warp, one row, one 2-byte load per iteration, and the very
+ * next instruction needs the value it just loaded.
+ *
+ * The fix is four independent loads before any of them is consumed, which is four misses in
+ * flight per lane instead of one.  The stride stays 32, so each of the four loads is still a
+ * fully coalesced warp-wide read of consecutive elements, on the weights and on the
+ * activations alike -- this is the reason not to switch to a vector type, which would have a
+ * lane read four ADJACENT elements and scatter the activation reads across four sectors.
+ *
+ * The accumulator stays unrolled over QB_MAX for the reason recorded above: indexed by a
+ * runtime lane it spills to local memory and costs 33x. */
+__global__ void k_matmat_bf16(const __nv_bfloat16 *__restrict__ W,const float *__restrict__ X,
+                              float *__restrict__ Y,int rows,int cols,int B){
     int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
     const __nv_bfloat16 *wr=W+(size_t)row*cols; float s[QB_MAX];
     #pragma unroll
     for(int b=0;b<QB_MAX;++b) s[b]=0.f;
-    for(int i=lane;i<cols;i+=32){ float w=__bfloat162float(wr[i]);
+    int i=lane;
+    for(;i+96<cols;i+=128){
+        float w0=__bfloat162float(wr[i]),    w1=__bfloat162float(wr[i+32]),
+              w2=__bfloat162float(wr[i+64]), w3=__bfloat162float(wr[i+96]);
+        /* Accumulated one at a time, in the same order the scalar loop used, so the result is
+         * bit-identical to it.  Summing the four products as one expression lets the compiler
+         * build a different tree, which on the 28-layer Talker showed up as 1.6e-01 against the
+         * single-stream reference.  The four loads are independent of these adds and still
+         * issue together, which is the entire point of the unroll. */
+        #pragma unroll
+        for(int b=0;b<QB_MAX;++b) if(b<B){ const float *xb=X+(size_t)b*cols;
+            s[b]+=w0*xb[i]; s[b]+=w1*xb[i+32]; s[b]+=w2*xb[i+64]; s[b]+=w3*xb[i+96]; }
+    }
+    for(;i<cols;i+=32){ float w=__bfloat162float(wr[i]);
         #pragma unroll
         for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=w*X[(size_t)b*cols+i]; }
     #pragma unroll
@@ -867,7 +898,12 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
         for(int b=0;b<B;++b){ memcpy(eB+(size_t)b*H,e1,H*sizeof(float)); posB[b]=p; }
         qwen_cuda_talker_step(S,e1,h1,p);
         qwen_cuda_talker_batch_step(Bs,eB,posB,hB,NULL);
-        for(int b=0;b<B;++b) for(int i=0;i<H;++i){ double d=fabs(hB[(size_t)b*H+i]-h1[i]); if(d>maxdiff)maxdiff=d; }
+        double sd=0;
+        for(int b=0;b<B;++b) for(int i=0;i<H;++i){ double d=fabs(hB[(size_t)b*H+i]-h1[i]);
+            if(d>maxdiff)maxdiff=d; if(d>sd)sd=d; }
+        /* Print the first steps: a reordering drift starts near zero and compounds through the
+         * residual stream, a wrong index is large on step 0.  The two look identical in a max. */
+        if(p<6) fprintf(stderr,"  step %d: max|batched-single|=%.3e\n",p,sd);
     }
     fprintf(stderr,"batch selftest: correctness max|batched-single|=%.2e over %d steps (%s)\n",
             maxdiff,chk, maxdiff<1e-3?"PASS":"FAIL");
@@ -920,6 +956,11 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
         fprintf(stderr,"batch CP throughput (B=%d, %d passes/frame): single %.2f ms/f (1 seq) | batched %.2f ms/f (%d seq) | GAIN %.2fx\n",
                 B,passes,cs,cb,B, B*cs/cb);
         fprintf(stderr,"batch GEN (Talker+CP) aggregate throughput GAIN (B=%d): %.2fx\n", B, B*(ts+cs)/(tb+cb));
+        { extern double qwen_cuda_cp_batch_bench_fused(void *,int,int);
+          double cf=qwen_cuda_cp_batch_bench_fused(CB,passes,NF);
+          if(cf>0) fprintf(stderr,"batch CP FUSED CEILING (B=%d, %d passes, 1 sync/frame): %.2f ms/f "
+                                  "vs %.2f ms/f served — %.0f%% of the loop is sync+copies\n",
+                           B,passes,cf,cb,100.0*(cb-cf)/cb); }
         free(cx1);free(cxB);free(cpos);
         if(cdiff>=1e-3) maxdiff=cdiff;
     }
@@ -1261,6 +1302,42 @@ extern "C" int qwen_cuda_cp_batch_head(void *st,int g,const unsigned char *activ
     CK(cudaMemcpy(s->h_code,s->d_code,(size_t)B*sizeof(int),cudaMemcpyDeviceToHost));
     for(int b=0;b<B;++b) if(!active||active[b]) out_codes[(size_t)b*stride+g]=s->h_code[b];
     return 1;
+}
+
+/* Upper bound on what fusing the code-predictor loop could buy.
+ *
+ * The served loop alternates: upload x, replay the body, synchronise, download x, and then
+ * the host does the embedding gather and the MTP projection before the next pass. Fifteen
+ * times a frame. The host work between passes measures 40 microseconds for the WHOLE frame,
+ * so if the alternation is expensive it is the synchronising and the copies, not the work
+ * they are there to serialise.
+ *
+ * This times the same fifteen body replays back to back with a single synchronise at the
+ * end and no copies. The result is nonsense as audio -- each pass reads whatever the last
+ * one left -- but it is the exact ceiling of a fused loop, and the gap against the real CP
+ * throughput is the budget available for fusing. Measuring it costs ten seconds; building
+ * the fused loop to find out costs a day. */
+extern "C" double qwen_cuda_cp_batch_bench_fused(void *st,int passes,int frames){
+    cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; if(!s||passes<1||frames<1) return -1.0;
+    int B=s->B;
+    { unsigned char all[QB_MAX]; for(int i=0;i<B;++i) all[i]=1;
+      CK(cudaMemcpy(s->d_act,all,(size_t)B,cudaMemcpyHostToDevice)); }
+    int *ph=(int*)malloc((size_t)B*sizeof(int));
+    for(int p=0;p<passes;++p){ for(int b=0;b<B;++b) ph[b]=p;
+        CK(cudaMemcpy(s->d_pos,ph,(size_t)B*sizeof(int),cudaMemcpyHostToDevice));
+        batch_graph_run<cuda_cp_batch_t,cp_body_batch>(s,B); }      /* warm + capture */
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+    double t0=now_ms();
+    for(int f=0;f<frames;++f){
+        for(int p=0;p<passes;++p){
+            CK(cudaMemcpyAsync(s->d_pos,ph,(size_t)B*sizeof(int),cudaMemcpyHostToDevice,cudaStreamPerThread));
+            batch_graph_run<cuda_cp_batch_t,cp_body_batch>(s,B);
+        }
+        CK(cudaStreamSynchronize(cudaStreamPerThread));             /* one sync per frame */
+    }
+    double ms=(now_ms()-t0)/frames;
+    free(ph);
+    return ms;
 }
 
 extern "C" void qwen_cuda_cp_batch_free(void *st){
