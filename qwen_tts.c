@@ -2962,7 +2962,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int want_cuda_batch = 0;
 #ifdef QWEN_HAVE_CUDA
     { extern void *g_cuda_talker_state, *g_cuda_cp_state;
-      want_cuda_batch = (getenv("QWEN_CUDA_BATCH") && g_cuda_talker_state && g_cuda_cp_state && B <= 8); }
+      extern int qwen_cuda_batch_max(void);
+      want_cuda_batch = (getenv("QWEN_CUDA_BATCH") && g_cuda_talker_state && g_cuda_cp_state && B <= qwen_cuda_batch_max()); }
 #endif
     int want_metal_batch = 0;
 #ifdef QWEN_HAVE_METAL
@@ -2996,6 +2997,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int cuda_batch = 0;
 #ifdef QWEN_HAVE_CUDA
     extern void *g_cuda_talker_state, *g_cuda_cp_state, *g_cuda_talker_batch_state, *g_cuda_cp_batch_state;
+    extern int  qwen_cuda_batch_max(void);
     extern void *qwen_cuda_talker_batch_init(void *, int);
     extern void *qwen_cuda_cp_batch_init(void *, int);
     extern void  qwen_cuda_talker_batch_upload_slot(void *, int, const uint16_t *, const uint16_t *, int, int);
@@ -3007,8 +3009,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         cuda_batch = (g_cuda_talker_batch_state && g_cuda_cp_batch_state);
         if (cuda_batch) fprintf(stderr, "[serve] GPU batched Talker+CP ENABLED (B=%d, matvec->matmat)\n", B);
         else fprintf(stderr, "[serve] GPU batched init failed — falling back to CPU batch path\n");
-    } else if (getenv("QWEN_CUDA_BATCH") && B > 8) {
-        fprintf(stderr, "[serve] QWEN_CUDA_BATCH: batch-size %d > 8 (QB_MAX) — using CPU batch path\n", B);
+    } else if (getenv("QWEN_CUDA_BATCH") && B > qwen_cuda_batch_max()) {
+        fprintf(stderr, "[serve] QWEN_CUDA_BATCH: batch-size %d > %d (QB_MAX) — using CPU batch path\n",
+                B, qwen_cuda_batch_max());
     }
 #endif
 

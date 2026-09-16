@@ -422,7 +422,11 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
  * [B][dim], KV is [B][kv_max][kvd]. The matmat kernels read each weight row once and apply it
  * to all B columns (accumulator s[B]), amortizing weight DRAM traffic over B. Lockstep, but
  * d_pos[B] is per-sequence so it generalizes to ragged batching. B capped at QB_MAX. */
-#define QB_MAX 8
+#define QB_MAX 16
+/* The batched CUDA path's lane cap, stated once. The C side used to hardcode 8 next to the
+ * Metal cap, which meant raising one silently required remembering the other. */
+extern "C" int qwen_cuda_batch_max(void){ return QB_MAX; }
+
 
 /* batched matmat: X[B][cols], Y[B][rows]; warp per output row reads W[row,:] once → B dots.
  *
@@ -451,20 +455,27 @@ extern "C" void qwen_cuda_talker_upload_kv(void *state, qwen_tts_ctx_t *ctx, int
  *
  * The accumulator stays unrolled over QB_MAX for the reason recorded above: indexed by a
  * runtime lane it spills to local memory and costs 33x. */
-template<int U>
+/* NB, the lane count, is a template parameter and not an argument.
+ *
+ * s[] is an array of registers sized at compile time. Sized at QB_MAX with a runtime `b<B`
+ * guard it burns QB_MAX registers whatever B actually is, so raising the cap from 8 to 16 made
+ * EVERY batch size slower -- measured 4.81 -> 7.38 ms/frame on the Talker at B=8, and 10.62 ->
+ * 18.06 on the CP -- because occupancy fell. That is the quiet sibling of the spill that cost
+ * 33x in the batched matmats, and it is why the cap could not simply be raised. */
+template<int U,int NB>
 __global__ void k_matmat_bf16_u(const __nv_bfloat16 *__restrict__ W,const float *__restrict__ X,
                                 float *__restrict__ Y,int rows,int cols,int B){
     int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31; if(row>=rows) return;
-    const __nv_bfloat16 *wr=W+(size_t)row*cols; float s[QB_MAX];
+    const __nv_bfloat16 *wr=W+(size_t)row*cols; float s[NB];
     #pragma unroll
-    for(int b=0;b<QB_MAX;++b) s[b]=0.f;
+    for(int b=0;b<NB;++b) s[b]=0.f;
     int i=lane; const int span=32*U;
     for(;i+span-32<cols;i+=span){
         float w[U];
         #pragma unroll
         for(int u=0;u<U;++u) w[u]=__bfloat162float(wr[i+32*u]);   /* U misses in flight */
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b) if(b<B){ const float *xb=X+(size_t)b*cols;
+        for(int b=0;b<NB;++b) if(b<B){ const float *xb=X+(size_t)b*cols;
             /* One at a time, in the scalar loop's order, so the result is bit-identical to it.
              * Summed as a single expression the compiler builds a different reduction tree and
              * the 28-layer Talker drifts 1.6e-01 from the single-stream reference -- reordering
@@ -474,9 +485,9 @@ __global__ void k_matmat_bf16_u(const __nv_bfloat16 *__restrict__ W,const float 
     }
     for(;i<cols;i+=32){ float wv=__bfloat162float(wr[i]);
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b) if(b<B) s[b]+=wv*X[(size_t)b*cols+i]; }
+        for(int b=0;b<NB;++b) if(b<B) s[b]+=wv*X[(size_t)b*cols+i]; }
     #pragma unroll
-    for(int b=0;b<QB_MAX;++b){ if(b>=B) break; float v=s[b];
+    for(int b=0;b<NB;++b){ if(b>=B) break; float v=s[b];
         #pragma unroll
         for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
         if(lane==0) Y[(size_t)b*rows+row]=v; }
@@ -601,9 +612,19 @@ static inline void mvB(int prec,const void*W,const float*scale,const float*X,flo
     if(prec==2) k_matmat_q4_0<<<grid,TPB>>>((const q4blk*)W,X,Y,rows,cols,B);
     else if(prec==1) k_matmat_int8<<<grid,TPB>>>((const int8_t*)W,scale,X,Y,rows,cols,B);
     else { int u=mm_unroll();
-           if(u==16)     k_matmat_bf16_u<16><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
-           else if(u==8) k_matmat_bf16_u< 8><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
-           else          k_matmat_bf16_u< 4><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); }
+#define MM_U(NB) do{ if(u==16)     k_matmat_bf16_u<16,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
+                     else if(u==8) k_matmat_bf16_u< 8,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
+                     else          k_matmat_bf16_u< 4,NB><<<grid,TPB>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); }while(0)
+           switch(B){
+             case  1: MM_U( 1); break;  case  2: MM_U( 2); break;  case  3: MM_U( 3); break;
+             case  4: MM_U( 4); break;  case  5: MM_U( 5); break;  case  6: MM_U( 6); break;
+             case  7: MM_U( 7); break;  case  8: MM_U( 8); break;  case  9: MM_U( 9); break;
+             case 10: MM_U(10); break;  case 11: MM_U(11); break;  case 12: MM_U(12); break;
+             case 13: MM_U(13); break;  case 14: MM_U(14); break;  case 15: MM_U(15); break;
+             default: MM_U(QB_MAX); break;
+           }
+#undef MM_U
+         }
 }
 /* one block per sequence */
 __global__ void k_rmsnorm_full_b(const float *X,const float *w,float *Y,int dim,float eps){
@@ -1080,10 +1101,10 @@ extern "C" void qwen_cuda_gemm_probe(int B){
         CK(cudaMemset(Xb,0,(size_t)B*cols*sizeof(__nv_bfloat16)));
         double bytes=(double)nw*2.0;            /* the weights: what both kernels must read */
         int grid=CEIL(rows*32,TPB);
-        k_matmat_bf16_u<4><<<grid,TPB>>>(W,X,Y,rows,cols,B);
+        k_matmat_bf16_u<4,QB_MAX><<<grid,TPB>>>(W,X,Y,rows,cols,B);
         CK(cudaStreamSynchronize(cudaStreamPerThread));
         double t0=now_ms();
-        for(int i=0;i<IT;++i) k_matmat_bf16_u<4><<<grid,TPB>>>(W,X,Y,rows,cols,B);
+        for(int i=0;i<IT;++i) k_matmat_bf16_u<4,QB_MAX><<<grid,TPB>>>(W,X,Y,rows,cols,B);
         CK(cudaStreamSynchronize(cudaStreamPerThread));
         double th=(now_ms()-t0)/IT;
         /* Y_cm[rows x B] = Wc^T * Xc, with W row-major [rows][cols] = col-major [cols][rows] */
@@ -1471,6 +1492,7 @@ extern "C" void qwen_cuda_cp_batch_step(void *st,float *x,const int *pos_arr,con
  * so a near-tie can still resolve the other way.  That is a different generation, not a wrong
  * one, and it is why this is measured against audio and not asserted to be bit-identical. */
 #define CPH_NCHUNK 32
+template<int NB>
 __global__ void k_cp_head_part(const __nv_bfloat16 *W,const float *X,int ch,int vocab,int B,
                                const unsigned char *act,float *partv,int *parti){
     const int chunk=blockIdx.x, lane=threadIdx.x&31, warp=threadIdx.x>>5, nwarp=blockDim.x>>5;
@@ -1478,29 +1500,29 @@ __global__ void k_cp_head_part(const __nv_bfloat16 *W,const float *X,int ch,int 
     extern __shared__ float xs[];                       /* B x ch activations, loaded once */
     for(int i=threadIdx.x;i<B*ch;i+=blockDim.x) xs[i]=X[i];
     __syncthreads();
-    float bestv[QB_MAX]; int besti[QB_MAX];
+    float bestv[NB]; int besti[NB];
     #pragma unroll
-    for(int b=0;b<QB_MAX;++b){ bestv[b]=-1e30f; besti[b]=0; }
+    for(int b=0;b<NB;++b){ bestv[b]=-1e30f; besti[b]=0; }
     for(int row=r0+warp;row<r1;row+=nwarp){
         const __nv_bfloat16 *wr=W+(size_t)row*ch;
-        float acc[QB_MAX];
+        float acc[NB];
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b) acc[b]=0.f;
+        for(int b=0;b<NB;++b) acc[b]=0.f;
         for(int i=lane;i<ch;i+=32){ float w=__bfloat162float(wr[i]);
             #pragma unroll
-            for(int b=0;b<QB_MAX;++b) if(b<B) acc[b]+=w*xs[(size_t)b*ch+i]; }
+            for(int b=0;b<NB;++b) if(b<B) acc[b]+=w*xs[(size_t)b*ch+i]; }
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b){
+        for(int b=0;b<NB;++b){
             if(b>=B) break;
             float v=acc[b];
             for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
             if(lane==0 && v>bestv[b]){ bestv[b]=v; besti[b]=row; }
         }
     }
-    __shared__ float sv[32*QB_MAX]; __shared__ int si[32*QB_MAX];
+    __shared__ float sv[32*NB]; __shared__ int si[32*NB];
     if(lane==0){
         #pragma unroll
-        for(int b=0;b<QB_MAX;++b){ if(b>=B) break; sv[b*32+warp]=bestv[b]; si[b*32+warp]=besti[b]; }
+        for(int b=0;b<NB;++b){ if(b>=B) break; sv[b*32+warp]=bestv[b]; si[b*32+warp]=besti[b]; }
     }
     __syncthreads();
     if(threadIdx.x<B){
@@ -1564,6 +1586,10 @@ extern "C" int qwen_cuda_cp_batch_head(void *st,int g,const unsigned char *activ
      * the head then also skips the idle lanes, and the codes are scattered back by slot. */
     const int dense=(s->B_eff>0&&s->B_eff<=s->B);
     const int n=dense?s->B_eff:s->B;
+    /* One block holds every lane's activation in shared memory. Past twelve lanes at ch=1024
+     * that exceeds the 48 KB a block gets without an opt-in, and the launch would fail silently
+     * and leave the codes unwritten; hand those widths back to the CPU head instead. */
+    if((size_t)n*ch*sizeof(float) > 48000u) return 0;
     if(!dense){
         unsigned char all[QB_MAX];
         if(!active){ for(int i=0;i<n;++i) all[i]=1; }
@@ -1571,7 +1597,16 @@ extern "C" int qwen_cuda_cp_batch_head(void *st,int g,const unsigned char *activ
     }   /* the compacted path already uploaded an all-ones mask of length n */
     k_rmsnorm_full_b<<<n,TPB,TPB*sizeof(float)>>>(s->x,s->d_cpnorm,s->xn,ch,s->eps);
     size_t shm=(size_t)n*ch*sizeof(float);
-    k_cp_head_part<<<CPH_NCHUNK,TPB,shm>>>(s->d_lm[g],s->xn,ch,s->vocab,n,s->d_act,s->d_partv,s->d_parti);
+#define CPH_N(NB) k_cp_head_part<NB><<<CPH_NCHUNK,TPB,shm>>>(s->d_lm[g],s->xn,ch,s->vocab,n,s->d_act,s->d_partv,s->d_parti)
+    switch(n){
+      case  1: CPH_N( 1); break;  case  2: CPH_N( 2); break;  case  3: CPH_N( 3); break;
+      case  4: CPH_N( 4); break;  case  5: CPH_N( 5); break;  case  6: CPH_N( 6); break;
+      case  7: CPH_N( 7); break;  case  8: CPH_N( 8); break;  case  9: CPH_N( 9); break;
+      case 10: CPH_N(10); break;  case 11: CPH_N(11); break;  case 12: CPH_N(12); break;
+      case 13: CPH_N(13); break;  case 14: CPH_N(14); break;  case 15: CPH_N(15); break;
+      default: CPH_N(QB_MAX); break;
+    }
+#undef CPH_N
     k_cp_head_final<<<n,32>>>(s->d_partv,s->d_parti,n,s->d_act,s->d_code);
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(s->h_code,s->d_code,(size_t)n*sizeof(int),cudaMemcpyDeviceToHost));
