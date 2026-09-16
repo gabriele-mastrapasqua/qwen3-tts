@@ -455,3 +455,156 @@ The B2/B4/B8 labels above are kernel batch widths. They are not server concurren
 This result is a useful warning against enabling a global dotprod matmat rule on M1-class
 hosts: the current implementation rereads/loops enough work that the native single-vector
 SDOT path remains faster for the tested shapes.
+
+## 16. KAI dotprod-only split — implementation blocker, not forced
+
+The source audit confirms that this is an integration/packing problem, not evidence that
+KleidiAI requires i8mm for every useful operation:
+
+- `third_party/kleidiai` contains separate dotprod GEMV ukernels for Q4 and Q8, and a
+  dotprod Q8 4x4 GEMM, alongside the i8mm 4x8 GEMM families.
+- `qwen_tts_kleidi.c:23-47` currently defines `QWEN_KLEIDI_BUILD` only when both
+  `__ARM_FEATURE_DOTPROD` and `__ARM_FEATURE_MATMUL_INT8` are present. `Makefile:91-120`
+  likewise omits all KAI sources unless the compiler advertises i8mm.
+- `kleidi_cpu_ok():65-90` requires both Linux `HWCAP_ASIMDDP` and `HWCAP2_I8MM` (or the
+  corresponding Apple sysctls). Relaxing that boolean alone would be unsafe.
+- The application registration path currently packs persistent Q4 and Q8 RHS data using
+  the i8mm GEMM metadata (`qwen_kleidi_register_q4()` / `qwen_kleidi_register_i8()`). The
+  dotprod runners have distinct `nr/kr/sr`/workspace contracts. The runtime B>1 path also
+  directly names the i8mm runner, while B=1 names the dotprod runner.
+
+Therefore a safe dotprod-only KAI split needs a second prepared-pack family (or a proven
+identical-layout proof for each exact ukernel), separate registration metadata and a
+capability/selection path that cannot reach i8mm code. No such proof exists in this audit.
+The minimum safe result is to keep the in-house `arm-sdot-gemv` and opt-in
+`arm-sdot-matmat` paths as the dotprod-only candidates, while reporting KAI as unavailable
+on dotprod-only builds. No KAI code was weakened or made reachable by a partial macro edit.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | NO | The requested split is not a safe reporting-only change because current pack/runner contracts are i8mm-centric. |
+| PARITY VERIFIED | N/A | No new KAI dispatch was exposed. Existing dotprod in-house paths remain covered. |
+| PERFORMANCE VERIFIED | N/A | KAI dotprod-only was not executed. |
+| DEFAULT/PROMOTED | NO | A dotprod-only CPU cannot enter the current KAI path. |
+
+The next KAI work item is a dedicated pack-contract implementation with per-family census
+and parity tests, not a scheduler or threshold change. This preserves the hard safety rule:
+a dotprod-only CPU must never execute an i8mm instruction.
+
+## 17. Legacy x86 decoder INT8 feasibility
+
+The decoder cliff is a capability gate, not a missing dispatch flag. `qwen_sd_int8_available()`
+(`qwen_tts_kernels.c:8827-8835`) returns true only for `__ARM_FEATURE_DOTPROD` or
+`__AVX512VNNI__`; AVX2 and AVX-512F/BW without VNNI therefore remain on the f32/im2col/BLAS
+control path. The decoder call site (`qwen_tts_speech_decoder.c:955-985`) additionally
+requires `qwen_sd_int8_usable(in_ch,out_ch)`, currently equal-channel shapes up to 768.
+
+The existing INT8 decoder implementation is not a single GEMV reuse opportunity. It needs:
+
+1. activation-panel construction (`sd_im2col_task`, `:926-943`) for `[N][K]` columns;
+2. per-panel activation quantization and row sums;
+3. packed decoder weights and correction terms (`qwen_conv1d_int8_*`);
+4. the convolution output/bias epilogue and streaming/ragged continuation contracts; and
+5. a backend that handles the small, changing `N`/kernel/dilation shapes without changing
+   the existing f32 numerical contract.
+
+The new AVX2 signed-widening GEMV is not directly sufficient: decoder INT8 needs a panel
+matmul/conv primitive, not one vector against one row, and the existing AVX2 B>1 matrix
+path has its own activation layout and `PMADDUBSW` saturation proof obligation. Reusing it
+would require a decoder-specific packed-weight format plus tensor and streaming parity
+coverage. That is a separate project, not a clean extension of LEGACY-X86-1/2.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | NO | No decoder AVX2 backend was added. |
+| PARITY VERIFIED | N/A | Existing f32/BLAS decoder remains the reference/default. |
+| PERFORMANCE VERIFIED | NO | No AVX2 decoder runtime was available. |
+| DEFAULT/PROMOTED | NO | `QWEN_SD_INT8` cannot enable an unavailable backend. |
+
+Recommended follow-up is `LEGACY-X86-DECODER-1`: first capture representative decoder
+shapes and complete-call `im2col`, quantize, dot, epilogue timings; then design one panel
+kernel and compare it against the existing BLAS path. Do not gate it on the Talker GEMV
+candidate or alter v2 scheduling.
+
+## 18. AVX-512 without VNNI — no speculative second implementation
+
+The focused design check found no currently justified complete-call kernel distinct from
+the AVX2 candidate. `SIMD=avx512` supplies AVX-512F/BW/VL plus AVX2/FMA, but the integer
+matrix gate still resolves through the AVX2 implementation; there is no VPDPBUSD-equivalent
+instruction without AVX512-VNNI. Wider staging/quantization and Q4 unpack are possible,
+but the remaining dot/reduction would still be emulated, and 512-bit frequency/downclock
+and memory behavior can reverse an inner-loop win.
+
+The safe current behavior is therefore:
+
+- build and report `avx512-no-vnni` distinctly;
+- select the AVX2 FMA reference or the explicitly forced AVX2 integer/Q4 candidates;
+- record the actual leaf, not merely `AVX512`;
+- defer a dedicated AVX-512 implementation until a real no-VNNI host shows a complete-call
+  advantage after frequency and bandwidth are measured.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | NO dedicated path | Existing AVX2 candidate is usable as the controlled fallback. |
+| PARITY VERIFIED | STRUCTURAL | AVX512 source compiles through the AVX2-compatible branches; no hardware execution here. |
+| PERFORMANCE VERIFIED | NO | Requires AVX512-no-VNNI hardware and frequency telemetry. |
+| DEFAULT/PROMOTED | NO | No wider path is enabled by ISA name alone. |
+
+## 19. Fast legacy CPU qualification screen
+
+`tools/legacy_cpu_screen.py` and the `legacy-cpu-screen` Make target now provide one
+repeatable, model-free first pass for a newly supplied x86 host. It archives raw output
+and a JSON manifest containing:
+
+- CPU identity, flags, cache/NUMA topology, compiler and git/source state;
+- `--caps`, baseline and forced-candidate `--dispatch-map`, and self-tests;
+- existing `membw` output;
+- existing `roof_matvec_int8` at a CP-sized and Talker-sized layer count, comparing the
+  current FMA GEMV with the opt-in AVX2 integer candidate;
+- existing `--matmat-bench` at the current reference and each independent AVX2 INT8/Q4
+  candidate, with shape census enabled.
+
+The command keeps `mode=physical`, `mode=smt` and `mode=unspecified` explicit, accepts an
+optional `taskset` mask, and never treats kernel batch B as server concurrency C. It is a
+screen only: a zero exit code means the commands ran and the candidate was observable, not
+that it should be promoted.
+
+Cloud first command after a clean build:
+
+```sh
+make legacy-cpu-screen LEGACY_SCREEN_MODE=physical LEGACY_SCREEN_THREADS=8 \
+  LEGACY_SCREEN_CPUS=0-7 LEGACY_SCREEN_OUT=/tmp/qwen-legacy-screen-physical
+```
+
+Repeat with a separate output directory and `LEGACY_SCREEN_MODE=smt` for SMT. On a Ryzen
+6800H, use the physical-core mask first, then the full logical mask; compare the raw
+`roof_int8_*`, `matmat_*` and `dispatch_*` logs before any v2 serving run. Set
+`LEGACY_SCREEN_THREADS` to the actual mask width rather than silently allowing the helper
+to choose a different topology.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | `tools/legacy_cpu_screen.py`, Make target and raw JSON/log archive |
+| PARITY VERIFIED | STRUCTURAL | script syntax and Make integration checked locally; candidate runtime parity remains per-ISA |
+| PERFORMANCE VERIFIED | NO | no AVX2/AVX512-no-VNNI target in this session |
+| DEFAULT/PROMOTED | NO | screen never changes serving defaults |
+
+## 20. Plain NEON fallback truth
+
+The plain-AArch64 case does not currently show a scalar cliff in the common matvec path.
+When dotprod is absent, `int8_matvec_fused()` and the Q4/BF16 conversion helpers still
+use the existing NEON widen/FMA and conversion branches where `__ARM_NEON` is available;
+the scalar loops are tails or the non-NEON portability build. `qwen_sd_int8_available()`
+correctly stays false without dotprod, so the decoder retains its f32/BLAS control path.
+
+This is a truthful functional fallback, not a performance claim: there is no native INT8
+dot product and no i8mm/KAI matrix path. The next useful action is an armv8-a no-dotprod
+screen using §19 plus CP/Talker/decoder timings; no broad plain-NEON backend was added
+without that evidence.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | EXISTING FALLBACK | NEON widen/FMA and conversion branches are already selected without dotprod |
+| PARITY VERIFIED | EXISTING GATES | local M1 fallback self-test available with `QWEN_NO_SDOT=1`; no plain-NEON host here |
+| PERFORMANCE VERIFIED | NO | requires armv8-a no-dotprod runtime |
+| DEFAULT/PROMOTED | EXISTING | functional fallback is the default when native dotprod is unavailable |

@@ -103,6 +103,28 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       the first M1 microbench is negative (B2/B4/B8 SDOT matmat loses to B×SDOT GEMV),
       so it is not promoted. Keep the path for other shapes/hosts and do not conflate
       kernel B with server concurrency C. KAI dotprod/i8mm separation remains separate.
+- [ ] LEGACY-ARM-1b KAI dotprod/i8mm split: **BLOCKED BY PACK CONTRACT**. The vendored
+      KAI source has dotprod GEMV (and some dotprod GEMM) separately from i8mm, but the
+      Makefile/build guard and `qwen_kleidi_register_q4/i8()` currently require the
+      i8mm pack metadata. Relaxing the CPU boolean would risk executing a dotprod runner
+      on an i8mm-packed RHS, so no unsafe partial split was made. Detail and exact source
+      evidence: `.work/legacy-cpu-v2-audit-20260916.md` §16.
+- [ ] LEGACY-X86-DECODER-1 decoder INT8 feasibility: **DESIGN/AUDIT COMPLETE, CODE NOT
+      STARTED**. AVX2 and AVX-512-no-VNNI are excluded by `qwen_sd_int8_available()`;
+      the required panel quantization/conv/streaming backend is materially larger than
+      the new GEMV primitive. Keep f32/BLAS default and measure decoder shapes before
+      implementing. Detail: addendum §17.
+- [ ] LEGACY-X86-3 AVX-512-no-VNNI: **DESIGN SCREEN COMPLETE, NO NEW KERNEL**. The build
+      can use/report the AVX2 legacy candidates; no dedicated 512-bit emulation is added
+      until hardware shows a complete-call win after frequency/downclock measurement.
+      Detail: addendum §18.
+- [x] LEGACY-CPU-SCREEN fast qualification harness: add one model-free command that saves
+      topology, flags, source/build identity, caps, dispatch, self-test, bandwidth and
+      legacy candidate A/B output without mixing physical-core and SMT modes. Keep all
+      candidates opt-in and performance status UNVERIFIED until a target host runs it.
+      **IMPLEMENTED** as `make legacy-cpu-screen`; use separate `LEGACY_SCREEN_MODE=physical`
+      and `LEGACY_SCREEN_MODE=smt` output directories. First cloud command and manifest
+      contract: `.work/legacy-cpu-v2-audit-20260916.md` §19.
 
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 
