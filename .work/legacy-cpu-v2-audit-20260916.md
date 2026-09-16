@@ -410,4 +410,28 @@ CUDA scope churn.
 
 Next action: on a real AVX2 host run the self-test with the candidate enabled and disabled,
 then run the complete-call B1 Talker/CP GEMV benchmark before deciding whether to keep the
-candidate. Only after that parity/performance decision should LEGACY-X86-2 Q4 GEMV start.
+candidate.
+
+## 14. Implementation status — AVX2 Q4 GEMV candidate
+
+`QWEN_AVX2_Q4_GEMV=1` now selects an independent B=1 Q4_0 path before the existing
+native/f32 Q4 branches. It quantizes the activation with the existing column contract,
+unpacks the two unsigned nibbles, uses `_mm256_maddubs_epi16` only in its proven-safe
+Q4(0..15) × signed-activation range, reduces with `_mm256_madd_epi16`, then applies the
+per-block `-8 * sum(qx)` correction and fp16 block scale. This is deliberately not the
+AVX2 B>1 gate: B=1 has a separate complete-call A/B and remains default-off.
+
+The candidate rejects non-block-aligned input rather than inventing a partial Q4 block;
+the self-test covers two blocks, extreme nibble values, five output rows (tail), and the
+invalid partial-block case. The precise leaf is `avx2-q4-emulated-dot-gemv`, and the
+dispatch row reports compiled/runtime-supported/policy-enabled state independently.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | opt-in wrapper, Q4 integer dot/correction, census leaf, dispatch row and flag docs |
+| PARITY VERIFIED | STRUCTURAL ONLY | adversarial integer oracle is in `--self-test`; current M1 skips AVX2 execution; x86 AVX2 syntax compilation passes |
+| PERFORMANCE VERIFIED | NO | no AVX2 runtime host available |
+| DEFAULT/PROMOTED | NO | `QWEN_AVX2_Q4_GEMV=1` is required |
+
+The existing Q4 dequant/FMA path and B>1 AVX2 matmat path are unchanged. Do not infer
+anything about server concurrency from this kernel-B=1 candidate.

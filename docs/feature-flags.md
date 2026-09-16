@@ -182,6 +182,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_X86_QKV` | x86 | unset | `=1` drops the fused Q/K/V **matmat** (int8 and bf16, VNNI and AMX) back to three separate matmats. This is the gate the persistent regions ask about, not the one above |
 | `QWEN_VNNI_TILE_N8` | x86 | unset (off) | `=1` tries the 8-column VNNI tile. Opt-in candidate; qualify on the server path |
 | `QWEN_Q4_VNNI_V3` · `QWEN_Q4_VNNI_V4` | x86 | v3 on | which q4 VNNI microkernel variant runs; `QWEN_Q4_VNNI_V4=1` selects the v4 experiment |
+| `QWEN_AVX2_INT8_GEMV` · `QWEN_AVX2_Q4_GEMV` | x86 AVX2 | off | experimental legacy B=1 integer candidates; each is independently selectable and falls back when its input shape is outside the bounded packed-activation contract |
 | `QWEN_AMX_PREPACK` | x86 AMX | **off** | `=1` pre-tiles weights once into the AMX tile layout and caches them by source pointer. When off the kernel simply reads the source with stride `cols`: there is NO per-call re-tiling anywhere, and the earlier claim that `=0` re-tiles per call was wrong |
 | `QWEN_AMX_PREPACK_KINDS` | x86 AMX | all | limits the prepack cache to some weight kinds. Recognised values are `int8`, `bf16`, `both`, `all` ONLY - `q4` is not one of them and silently disables ALL prepacking |
 | `QWEN_AMX_PERSIST_CFG` | x86 AMX | on | keeps the AMX tile configuration loaded across calls instead of `ldtilecfg`/`tilerelease` per call |

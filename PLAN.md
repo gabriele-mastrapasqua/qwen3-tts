@@ -92,6 +92,16 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       x86_64/AVX2 compilation passed; runtime PARITY VERIFIED, PERFORMANCE VERIFIED and
       DEFAULT/PROMOTED remain NO until a real AVX2 host executes the adversarial self-test
       and complete-call A/B. Detail: `.work/legacy-cpu-v2-audit-20260916.md`.
+- [ ] LEGACY-X86-2 AVX2 Q4 B1 GEMV candidate: the opt-in
+      `QWEN_AVX2_Q4_GEMV=1` path uses the Q4_0 nibble/correction contract with a
+      non-saturating-safe Q4×signed-activation dot and keeps the existing FMA path
+      as default. Dispatch/census and adversarial two-block/output-tail tests are
+      present; runtime PARITY/PERFORMANCE VERIFIED and DEFAULT/PROMOTED remain NO
+      until a real AVX2 host runs the candidate and complete-call A/B.
+- [ ] LEGACY-ARM-1 SDOT B>1 candidate: keep `QWEN_INT8_SDOT_MM=1` opt-in and add
+      an explicit SDOT-matmat census leaf/fast-screen before any policy change;
+      compare kernel B (not server concurrency C) against B×SDOT GEMV and the twin
+      on the local M1. KAI dotprod/i8mm separation remains a separate design gate.
 
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 

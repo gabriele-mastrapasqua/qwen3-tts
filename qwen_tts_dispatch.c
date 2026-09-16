@@ -304,6 +304,21 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             "QWEN_AVX2_INT8_GEMV", (compiled && supported && enabled) ? "ON" : "OFF", reason);
     }
 
+    /* Q4 B=1 is a separate complete-call candidate.  It intentionally does not
+     * reuse the B>1 QWEN_AVX2MM gate: that gate's batch threshold is irrelevant
+     * to a single streaming projection. */
+    {
+        const int compiled = qwen_avx2_q4_gemv_compiled();
+        const int supported = qwen_avx2_q4_gemv_supported();
+        const int enabled = qwen_avx2_q4_gemv_enabled();
+        const char *reason = !compiled ? "candidate not compiled into this build"
+                           : !supported ? "compiled, but this CPU lacks AVX2"
+                           : enabled ? "experimental Q4 integer GEMV selected before native/f32 Q4 paths"
+                                     : "default OFF; set QWEN_AVX2_Q4_GEMV=1 for A/B";
+        row(&feats[n++], "matvec.q4.avx2-emulated-dot-gemv", yn(compiled), yn(supported),
+            "QWEN_AVX2_Q4_GEMV", (compiled && supported && enabled) ? "ON" : "OFF", reason);
+    }
+
     /* ---- Talker prefill: the predicate that was invisible ------------------------ */
     {
         int on = qwen_prefill_matmat_resolved(&why);

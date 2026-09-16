@@ -1973,7 +1973,8 @@ int qwen_path_kind(int path) {
 }
 static const char *const g_leaf_name[QWEN_LEAF_COUNT] = {
     "none", "vnni", "dpbf16", "sdot", "avx512f", "avx2", "neon", "scalar", "blas",
-    "f32_fused", "kleidi", "amx", "delegated", "avx2-int8-emulated-dot-gemv"
+    "f32_fused", "kleidi", "amx", "delegated", "avx2-int8-emulated-dot-gemv",
+    "avx2-q4-emulated-dot-gemv"
 };
 const char *qwen_leaf_name(int leaf) {
     return (leaf > 0 && leaf < QWEN_LEAF_COUNT) ? g_leaf_name[leaf] : "none";
@@ -7221,6 +7222,90 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
     }
 }
 
+/* Legacy x86 Q4 GEMV candidate.  Q4_0 stores two unsigned nibbles per byte;
+ * the mathematical weight is (nibble - 8) * block_scale.  The AVX2 B>1
+ * implementation already uses the safe range of PMADDUBSW here: nibble (0..15)
+ * times signed activation (-128..127), summed in pairs, cannot approach int16
+ * saturation.  Keep the B=1 path separate so its complete-call quantisation,
+ * correction and output-row tail are measurable independently. */
+#if defined(__AVX2__)
+enum { QWEN_AVX2_Q4_GEMV_MAX_COLS = 8192 };
+
+static int32_t avx2_q4_dot_block(const uint8_t *qs, const int8_t *qx) {
+    const __m128i raw = _mm_loadu_si128((const __m128i *)qs);
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    const __m128i lo = _mm_and_si128(raw, lomask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
+    const __m256i weights = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                                              _mm_unpacklo_epi8(lo, hi));
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i products = _mm256_maddubs_epi16(
+        weights, _mm256_loadu_si256((const __m256i *)qx));
+    const __m256i pair_sums = _mm256_madd_epi16(products, ones);
+    int32_t dot = avx2_hsum_epi32(pair_sums);
+
+    /* Correction for the stored nibble representation: (q - 8) * x. */
+    const __m128i xlo = _mm_loadu_si128((const __m128i *)qx);
+    const __m128i xhi = _mm_loadu_si128((const __m128i *)(qx + 16));
+    const __m256i xlo16 = _mm256_cvtepi8_epi16(xlo);
+    const __m256i xhi16 = _mm256_cvtepi8_epi16(xhi);
+    const int32_t qsum = avx2_hsum_epi32(_mm256_add_epi32(
+        _mm256_madd_epi16(xlo16, ones), _mm256_madd_epi16(xhi16, ones)));
+    return dot - 8 * qsum;
+}
+
+static void avx2_q4_matvec_integer_qx(float *y, const int8_t *qx, float sx,
+                                      const q4_0_block_t *W, int cols, int rows) {
+    const int nb = cols / Q4_0_BLOCK_SIZE;
+    for (int o = 0; o < rows; o++) {
+        const q4_0_block_t *row = W + (size_t)o * nb;
+        float sum = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            sum += qwen_f16_to_f32(row[b].scale_f16) *
+                   (float)avx2_q4_dot_block(row[b].qs, qx + b * Q4_0_BLOCK_SIZE);
+        }
+        y[o] = sum * sx;
+    }
+}
+
+static int avx2_q4_matvec_integer(float *y, const float *x,
+                                  const q4_0_block_t *W, int cols, int rows) {
+    if (cols <= 0 || cols > QWEN_AVX2_Q4_GEMV_MAX_COLS ||
+        cols % Q4_0_BLOCK_SIZE != 0) return 0;
+    int8_t qx[QWEN_AVX2_Q4_GEMV_MAX_COLS];
+    const float sx = quantize_act_int8_col(qx, x, cols, 1, 0);
+    avx2_q4_matvec_integer_qx(y, qx, sx, W, cols, rows);
+    return 1;
+}
+#endif
+
+int qwen_avx2_q4_gemv_compiled(void) {
+#if defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_q4_gemv_supported(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx2_q4_gemv_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AVX2_Q4_GEMV");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v && qwen_avx2_q4_gemv_compiled() && qwen_avx2_q4_gemv_supported();
+}
+
 #if defined(__ARM_FEATURE_DOTPROD)
 static void q4_0_matvec_sdot(float *y, const int8_t *qx, float sx,
                              const q4_0_block_t *W, int cols, int out_dim) {
@@ -7514,6 +7599,13 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
         return;
     }
     MMSTAT(QWEN_MMK_Q4_GEMV, rows, cols, 1);
+#if defined(__AVX2__)
+    if (qwen_avx2_q4_gemv_enabled() &&
+        avx2_q4_matvec_integer(y, x, W, cols, rows)) {
+        qwen_census_leaf(QWEN_LEAF_AVX2_Q4_GEMV);
+        return;
+    }
+#endif
 #if defined(__AVX512VNNI__)
     if (!q4_sdot_disabled() && cols <= Q4_QX_MAX && cols % Q4_0_BLOCK_SIZE == 0) {
         int8_t qx_buf[Q4_QX_MAX];
@@ -11852,8 +11944,57 @@ int qwen_kernel_selftest(void *out) {
                 worst, candidate_ok ? "PASS" : "FAIL");
         if (!candidate_ok) failures++;
     }
+
+    /* Q4 candidate coverage: exercise both nibble extremes, two blocks and an
+     * odd output-row tail.  A non-block-aligned input is intentionally rejected
+     * because Q4_0 has no representation for a partial final block. */
+    {
+        enum { q4_rows = 5, q4_cols = 64, q4_nb = q4_cols / Q4_0_BLOCK_SIZE };
+        float x[q4_cols], y[q4_rows], ref[q4_rows];
+        int8_t qx[q4_cols];
+        q4_0_block_t wq[q4_rows * q4_nb];
+        for (int k = 0; k < q4_cols; k++) x[k] = (float)((k % 11) - 5) * 0.27f;
+        for (int r = 0; r < q4_rows; r++) {
+            for (int b = 0; b < q4_nb; b++) {
+                q4_0_block_t *blk = &wq[r * q4_nb + b];
+                blk->scale_f16 = qwen_f32_to_f16(0.03125f * (float)(r + b + 1));
+                for (int i = 0; i < 16; i++) {
+                    const int lo = (i + r + b) & 15;
+                    const int hi = (15 - i + 2 * r + b) & 15;
+                    blk->qs[i] = (uint8_t)(lo | (hi << 4));
+                }
+            }
+        }
+        const float sx = quantize_act_int8_col(qx, x, q4_cols, 1, 0);
+        avx2_q4_matvec_integer_qx(y, qx, sx, wq, q4_cols, q4_rows);
+        float worst = 0.0f;
+        for (int r = 0; r < q4_rows; r++) {
+            /* The candidate applies the per-block scale while accumulating, so
+             * mirror that order rather than compare against a dequant FMA path. */
+            float s = 0.0f;
+            for (int b = 0; b < q4_nb; b++) {
+                int32_t bd = 0;
+                const q4_0_block_t *blk = &wq[r * q4_nb + b];
+                for (int i = 0; i < 16; i++) {
+                    bd += ((int)(blk->qs[i] & 0x0F) - 8) * qx[b * 32 + 2 * i];
+                    bd += ((int)(blk->qs[i] >> 4) - 8) * qx[b * 32 + 2 * i + 1];
+                }
+                s += qwen_f16_to_f32(blk->scale_f16) * (float)bd;
+            }
+            ref[r] = s * sx;
+            float err = fabsf(y[r] - ref[r]);
+            if (err > worst) worst = err;
+        }
+        float invalid_y[q4_rows];
+        int invalid_rejected = !avx2_q4_matvec_integer(invalid_y, x, wq, 65, q4_rows);
+        int q4_ok = worst <= 1e-6f && invalid_rejected;
+        fprintf(f, "  [avx2-q4-emulated-dot] nibble/extreme/tail parity: max_abs=%.2e invalid-tail=%s %s\n",
+                worst, invalid_rejected ? "rejected" : "accepted", q4_ok ? "PASS" : "FAIL");
+        if (!q4_ok) failures++;
+    }
 #else
     fprintf(f, "  [avx2-int8-emulated-dot] not compiled on this host (skipped)\n");
+    fprintf(f, "  [avx2-q4-emulated-dot] not compiled on this host (skipped)\n");
 #endif
 
     for (int ci = 0; ci < ncases; ci++) {
