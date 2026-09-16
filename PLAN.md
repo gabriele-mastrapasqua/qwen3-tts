@@ -125,6 +125,13 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       **IMPLEMENTED** as `make legacy-cpu-screen`; use separate `LEGACY_SCREEN_MODE=physical`
       and `LEGACY_SCREEN_MODE=smt` output directories. First cloud command and manifest
       contract: `.work/legacy-cpu-v2-audit-20260916.md` §19.
+- [x] LEGACY-CPU-AMD-MILAN GCP AVX2 screen: EPYC 7B13, 8 physical cores, SMT off, no
+      AVX-512/VNNI. Doctor measured 61.55 GB/s host read and 47.1 GB/s 8T engine GEMV;
+      simultaneous 2x4 and 4x2 retained near-linear aggregate scaling with only 1.08x/
+      1.10x per-worker slowdown, unlike Graviton5. AVX2 INT8 candidate dispatch and parity
+      passed but complete 28-layer performance was negative (82.52 ms vs 25.89 ms FMA),
+      so it remains opt-in/default-off. Q4 candidate dispatch/parity passed; performance
+      remains unverified. Detail: addendum §21.
 
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 

@@ -617,3 +617,51 @@ without that evidence.
 | PARITY VERIFIED | EXISTING GATES | local M1 fallback self-test available with `QWEN_NO_SDOT=1`; no plain-NEON host here |
 | PERFORMANCE VERIFIED | NO | requires armv8-a no-dotprod runtime |
 | DEFAULT/PROMOTED | EXISTING | functional fallback is the default when native dotprod is unavailable |
+
+## 21. GCP AMD Milan / EPYC 7B13 AVX2 screen (2026-09-16)
+
+The new GCP host was tested from the local `feature/legacy-cpu-simd-v2` archive at
+`453756e9a047e973ebc40ea39ac9790d822a70c2`; no push or remote commit was made. The public
+OSS clone is kept separately on the host. SMT was disabled reversibly before measurement:
+8 physical CPUs online (`0-7`), one socket, one NUMA node, `AVX2+FMA`, no AVX-512 and no
+VNNI.
+
+The doctor completed with the hardware gates passing and reported:
+
+| measurement | result |
+|---|---:|
+| host read / copy / triad bandwidth @8T | 61.55 / 57.33 / 50.32 GB/s |
+| `membw` sweep | 1T 8, 2T 17, 4T 33, 8T 62 GB/s read |
+| engine GEMV roof @2T / @4T / @8T | 18.2 / 32.5 / 47.1 GB/s |
+| 1.7B INT8 frame at the 8T GEMV roof | 29.9 ms |
+
+The direct simultaneous GEMV discriminator used the same 28-layer Talker workload and
+disjoint masks. The isolated baselines were measured with the same binary and repetitions
+so the per-worker comparison is not confused with an 8T-vs-4T comparison:
+
+| shape | worker result | aggregate | comparison |
+|---|---:|---:|---|
+| 1x8 | 24.44 ms / 57.67 GB/s | 57.67 GB/s | reference shape |
+| 1x4 isolated | 42.38 ms / 33.25 GB/s | 33.25 GB/s | reference for 2x4 |
+| 2x4 simultaneous | 45.93 ms / 30.69 GB/s each | 61.38 GB/s | 1.08x worker slowdown; 1.85x aggregate vs 1x4 |
+| 1x2 isolated | 76.46 ms / 18.43 GB/s | 18.43 GB/s | reference for 4x2 |
+| 4x2 simultaneous | 83.77 ms / 16.82 GB/s each | 67.29 GB/s | 1.10x worker slowdown; 3.65x aggregate vs 1x2 |
+
+Verdict: **cross-worker bandwidth/cache contention is not Graviton5-like on this host**.
+At equal worker width, 2x4 and 4x2 retain near-linear aggregate scaling with only about
+8-10% per-worker latency loss. The host is simply small and core/bandwidth limited; the
+doctor's model predicts no useful 1.7B streaming point and only C1/C2 as a 0.6B screen
+starting point. Those model values include the existing uncalibrated decoder factor and
+are not serving qualification.
+
+The model-free legacy screen ran every engine-relevant command successfully: caps,
+dispatch, baseline/candidate self-tests, bandwidth, INT8 FMA-vs-candidate roofs and
+matmat census. Its final `21/23` result is `INCOMPLETE` only because the transferred
+source archive has no `.git`, so `git_head` and `git_status` could not run; this is not a
+kernel failure.
+
+On this actual AVX2 host, the INT8 GEMV candidate was selected and parity-clean but slower
+for the complete 28-layer roof: FMA reference `25.89 ms / 54.4 GB/s` versus candidate
+`82.52 ms / 17.1 GB/s` at 8T. It remains default-off and is not promoted. The Q4 candidate
+was selected by its dispatch A/B and passed self-test/adversarial coverage, but no complete
+Q4 B1 performance verdict was claimed here.
