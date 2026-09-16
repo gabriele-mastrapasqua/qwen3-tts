@@ -465,3 +465,122 @@ directions is the strongest signal available here.
 Continuous batching of the talker remains a legitimate piece of work, but it is third in line
 behind the code predictor and behind simply shipping the three-path configuration, and it
 should be sized against a measured 35% ceiling rather than an assumed one.
+
+---
+
+## 14. The code predictor, opened up — 2026-09-16 (RTX A6000, EPYC 7402)
+
+A second box, weaker than the A100 on both sides: an A6000 (768 GB/s) behind a 10-core EPYC
+7402. Build note worth keeping: the Makefile's default `NVCC_ARCH` includes `sm_120`, which
+CUDA 12.6 does not know, so a 12.6 toolkit needs `make cuda NVCC_ARCH="-gencode
+arch=compute_86,code=sm_86"`.
+
+### 14.1 The compaction commit was verified, and the existing test could not have done it
+
+`b7b916b` (QWEN_CUDA_BATCH_COMPACT) reported PASS with the flag on and off, identical to the
+last digit. The reason was not that it worked: `--gpu-batch-bench` calls the batched step with
+`active=NULL`, so every lane steps and the compaction path never runs. The test proved the
+flag inert, not correct.
+
+A compaction fault is silent by construction — a lane packed to the wrong dense index reads
+another request's KV and returns plausible audio — so it needs a reference that cannot itself
+be wrong. `batch_mask_selftest` (884eebd) runs B independent one-wide states, each stepped
+exactly on the steps where its lane was active, and hands idle lanes a wrong position and a
+wrong embedding on purpose. B=8, 24 steps, 128 lane-steps compared, 64 idled, compaction on:
+**0.00e+00**.
+
+### 14.2 The measurement the previous session set up, and what it said
+
+`QWEN_CP_PROFILE=1`, C4 soak, all three CUDA paths, 2500 frames:
+
+```
+seed 0.036 ms (0.1%)   step 13.35 ms (54.7%)   head 11.00 ms (45.1%)
+```
+
+Neither of the two hypotheses on the table was right alone; both halves mattered. The
+`head` — final norm, lm_head, argmax — was not on the GPU at all.
+
+### 14.3 Correction: the CUDA graphs were missing where it counts
+
+§6.1 of this note recorded that CUDA graphs are not missing. That is true only of the
+**single-stream** bodies. The server runs the **batched** ones, and those had no graph:
+
+| per served frame | launches |
+| --- | --- |
+| `talker_body_batch` | 28 layers x 19 = 532 |
+| `cp_body_batch` | 15 passes x 5 layers x 19 = 1425 |
+
+`61d989d` caches one graph per effective lane count — the grid geometry and the by-value lane
+count are fixed at capture, positions and masks stay in device buffers read at replay. Worth
+**-5.0% on the Talker and -8.2% on the CP**, not the ~30% the launch arithmetic suggests:
+launches are asynchronous, so most of the issue cost was already overlapping with execution.
+The estimate that motivated the change was too optimistic by about 4x.
+
+### 14.4 The head: 8.6x, and bit-identical
+
+One lm_head is [2048 x 1024] bf16 = 4 MB; a frame walks fifteen of them; and
+`qwen_argmax_matvec_bf16` takes one activation vector, so the CPU walked each matrix **once
+per lane** — 240 MB per frame from DRAM at four lanes. `k_cp_head_part` (50a5735) gives one
+block a slice of the vocabulary and holds every lane's activation in shared memory, so a
+weight row is read once and dotted against all lanes from registers: 60 MB, on the GPU's bus.
+
+C4 soak, four minutes each arm:
+
+| | head off | head on |
+| --- | --- | --- |
+| CP step | 12.38 ms/f | 12.31 ms/f |
+| CP head | 11.61 ms/f | **1.35 ms/f** |
+| CP total | 24.03 ms/f | **13.70 ms/f** |
+| safe_play_start p50/p95 | 1731 / 4352 ms | **1373 / 2633 ms** |
+| stall@250 | 84% | **57%** |
+| stall@1000 | 41% | **19%** |
+| requests completed | 82 | **96** |
+
+Codes are bit-identical: a fixed-seed temperature-0 streaming request gave the same md5 with
+the head on and off, `max|diff| 0` over 6.16 s. Not assumed — the summation order differs, so
+a near-tie could have resolved the other way, and it was measured because of that.
+
+### 14.5 Refuted: the seventeen host round trips are not the cost
+
+This note's §6.2, and the plan that followed from it, held that the CP's per-pass host
+alternation — upload, launch, full sync, download, fifteen times a frame — was the thing to
+fuse away. `qwen_cuda_cp_batch_bench_fused` times the same fifteen body replays back to back
+with **one** sync and no copies. The answer, at B=4 and B=8:
+
+```
+fused ceiling 11.62 ms/f vs 11.53 ms/f served   (B=4)
+fused ceiling 13.21 ms/f vs 13.17 ms/f served   (B=8)
+```
+
+**Zero.** The GPU is genuinely busy for the whole pass; the host is never the critical path.
+Fusing the loop onto the device — the obvious big project, and the one vLLM-Omni's "fuse ~60
+kernels" pointed at — would have bought nothing. Ten seconds of measurement instead of a day
+of work.
+
+### 14.6 Where the step time actually went: latency, not bandwidth
+
+CP batched cost 0.77 / 0.72 / 0.82 ms per pass at B=2 / 4 / 8. A kernel whose cost barely
+moves while arithmetic and activation traffic quadruple is limited by neither, and 139 MB in
+0.82 ms is 180 GB/s on a 768 GB/s card. `k_matmat_bf16` had one warp per row issuing one
+2-byte load per iteration with the next instruction consuming it. Four independent loads per
+lane (f43a354), stride unchanged at 32 so both weights and activations stay fully coalesced:
+
+| B=8 | start | + graphs | + unroll |
+| --- | --- | --- | --- |
+| Talker | 7.56 ms/f | 7.18 | **6.47** (-14.4%) |
+| CP | 14.35 ms/f | 13.17 | **11.14** (-22.4%) |
+| aggregate GAIN | 4.73x | 5.10x | **5.90x** |
+
+One trap on the way. Summing the four products as a single expression lets the compiler build
+a different reduction tree, and the batched Talker then disagreed with the single-stream
+reference by 1.61e-01 — reordering, not error, but indistinguishable from a bad index in a
+maximum. Accumulating in the original order is bit-identical **and faster**. The selftest now
+prints the first six steps' divergence, which is what settled it: a wrong index is wrong on
+step 0, a drift climbs through the residual stream.
+
+### 14.7 What is now known about the remaining time
+
+The head is no longer a target at 1.35 ms/f. The step is, and it is a kernel-efficiency
+problem inside `k_matmat_bf16` rather than a structural one — still roughly 2.5x off the
+memory roof after the unroll. The int8 and q4 batched matmats have the same shape, but the
+CUDA seam is bf16-only so nothing served reaches them.
