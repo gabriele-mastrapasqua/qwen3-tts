@@ -956,6 +956,19 @@ doctor: $(TARGET) $(MEMBW_BIN) $(ROOF_MATVEC_BIN)
 	  --store $(PROFILES_DIR)/roofs $(DOCTOR_ARGS)
 test-doctor:
 	@python3 tests/test_doctor.py
+
+# Fast legacy CPU candidate screen. This is model-free and does not replace cpu-check,
+# doctor or qualification. Keep physical-core and SMT runs in separate manifests.
+LEGACY_SCREEN_OUT ?= /tmp/qwen-legacy-cpu-screen-$(shell date +%Y%m%d-%H%M%S)
+LEGACY_SCREEN_MODE ?= unspecified
+LEGACY_SCREEN_THREADS ?= 1
+LEGACY_SCREEN_CPUS ?=
+LEGACY_SCREEN_ARGS ?=
+legacy-cpu-screen: $(TARGET) $(MEMBW_BIN) $(ROOF_MATVEC_BIN)
+	@python3 tools/legacy_cpu_screen.py --bin ./$(TARGET) --membw $(MEMBW_BIN) \
+	  --roof $(ROOF_MATVEC_BIN) --out "$(LEGACY_SCREEN_OUT)" \
+	  --mode "$(LEGACY_SCREEN_MODE)" --threads "$(LEGACY_SCREEN_THREADS)" \
+	  $(if $(LEGACY_SCREEN_CPUS),--cpus "$(LEGACY_SCREEN_CPUS)",) $(LEGACY_SCREEN_ARGS)
 # doctor-wave: run the grid the doctor recommended (profiles/doctor/LATEST/wave-plan.json)
 # sequentially from ONE python file: no shell chain, no pgrep, one log per run, a summary
 # table at the end.  WAVE_ARGS="--dry-run" prints the commands; --only <label,...> a subset.
@@ -1400,7 +1413,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench \
-	cpu-check doctor test-doctor roof-matvec dispatch-map profile-cpu-check profile-cpu tune-archive
+	cpu-check doctor test-doctor legacy-cpu-screen roof-matvec dispatch-map profile-cpu-check profile-cpu tune-archive
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench

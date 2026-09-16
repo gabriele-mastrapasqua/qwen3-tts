@@ -174,6 +174,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once. Use it to answer "is AMX doing anything", never to attribute a result — it removes two unrelated consumers |
 | `QWEN_NO_AMX_BF16` · `QWEN_NO_AMX_INT8` · `QWEN_NO_AMX_Q4` | x86 | unset | one AMX consumer each, which is what a measurement needs. On an 8-core Emerald Rapids the two do disjoint jobs: dropping **bf16** costs C=1 TTFA +39% and C=4 p95 +72% while stream RTF barely moves (it is the *prefill*), and dropping **int8** leaves TTFA alone while costing 9% of RTF and 10% of throughput (it is the *decode*) |
 | `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
+| `QWEN_INT8_SDOT_MM` | ARM dotprod | unset (off) | enables the in-house SDOT B>1 INT8 matmat candidate; compare it against the fixed-B twin and B×SDOT GEMV, and report kernel B separately from server concurrency C |
 | `QWEN_NO_BF16_MATMUL` | x86 | unset | `=1` drops the AVX-512 bf16 matmat, leaving the per-row twin. Only reachable where AMX is absent or declined |
 | `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
 | `QWEN_VNNI_TILE_M4N2` | x86 | unset (off) | `=1` tries the fixed `M4xN2` VNNI tile for observed `B=2` calls. It is an opt-in candidate inspired by the ARM small-B cross-product path; qualify it on the complete server path before enabling it |
@@ -182,6 +183,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_X86_QKV` | x86 | unset | `=1` drops the fused Q/K/V **matmat** (int8 and bf16, VNNI and AMX) back to three separate matmats. This is the gate the persistent regions ask about, not the one above |
 | `QWEN_VNNI_TILE_N8` | x86 | unset (off) | `=1` tries the 8-column VNNI tile. Opt-in candidate; qualify on the server path |
 | `QWEN_Q4_VNNI_V3` · `QWEN_Q4_VNNI_V4` | x86 | v3 on | which q4 VNNI microkernel variant runs; `QWEN_Q4_VNNI_V4=1` selects the v4 experiment |
+| `QWEN_AVX2_INT8_GEMV` · `QWEN_AVX2_Q4_GEMV` | x86 AVX2 | off | experimental legacy B=1 integer candidates; each is independently selectable and falls back when its input shape is outside the bounded packed-activation contract |
 | `QWEN_AMX_PREPACK` | x86 AMX | **off** | `=1` pre-tiles weights once into the AMX tile layout and caches them by source pointer. When off the kernel simply reads the source with stride `cols`: there is NO per-call re-tiling anywhere, and the earlier claim that `=0` re-tiles per call was wrong |
 | `QWEN_AMX_PREPACK_KINDS` | x86 AMX | all | limits the prepack cache to some weight kinds. Recognised values are `int8`, `bf16`, `both`, `all` ONLY - `q4` is not one of them and silently disables ALL prepacking |
 | `QWEN_AMX_PERSIST_CFG` | x86 AMX | on | keeps the AMX tile configuration loaded across calls instead of `ldtilecfg`/`tilerelease` per call |

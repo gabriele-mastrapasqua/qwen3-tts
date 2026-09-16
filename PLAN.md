@@ -85,6 +85,58 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       measured AVX2/AVX512-no-VNNI and dotprod/NEON baselines, one kernel family per A/B,
       then backend-aware v2 policy. Do not infer legacy capacity from VNNI/AMX/KleidiAI
       results.
+- [ ] LEGACY-X86-1 AVX2 INT8 GEMV candidate: the opt-in
+      `QWEN_AVX2_INT8_GEMV=1` signed-widening dot path is IMPLEMENTED and the existing
+      AVX2 FMA GEMV remains the default. Dispatch/census names the candidate precisely and
+      self-test coverage includes signed extremes and a non-multiple-of-32 tail. Structural
+      x86_64/AVX2 compilation passed; runtime PARITY VERIFIED, PERFORMANCE VERIFIED and
+      DEFAULT/PROMOTED remain NO until a real AVX2 host executes the adversarial self-test
+      and complete-call A/B. Detail: `.work/legacy-cpu-v2-audit-20260916.md`.
+- [ ] LEGACY-X86-2 AVX2 Q4 B1 GEMV candidate: the opt-in
+      `QWEN_AVX2_Q4_GEMV=1` path uses the Q4_0 nibble/correction contract with a
+      non-saturating-safe Q4×signed-activation dot and keeps the existing FMA path
+      as default. Dispatch/census and adversarial two-block/output-tail tests are
+      present; runtime PARITY/PERFORMANCE VERIFIED and DEFAULT/PROMOTED remain NO
+      until a real AVX2 host runs the candidate and complete-call A/B.
+- [ ] LEGACY-ARM-1 SDOT B>1 candidate: `QWEN_INT8_SDOT_MM=1` remains opt-in and now
+      has an explicit `arm-sdot-matmat` census leaf. IMPLEMENTED and M1 parity verified;
+      the first M1 microbench is negative (B2/B4/B8 SDOT matmat loses to B×SDOT GEMV),
+      so it is not promoted. Keep the path for other shapes/hosts and do not conflate
+      kernel B with server concurrency C. KAI dotprod/i8mm separation remains separate.
+- [ ] LEGACY-ARM-1b KAI dotprod/i8mm split: **BLOCKED BY PACK CONTRACT**. The vendored
+      KAI source has dotprod GEMV (and some dotprod GEMM) separately from i8mm, but the
+      Makefile/build guard and `qwen_kleidi_register_q4/i8()` currently require the
+      i8mm pack metadata. Relaxing the CPU boolean would risk executing a dotprod runner
+      on an i8mm-packed RHS, so no unsafe partial split was made. Detail and exact source
+      evidence: `.work/legacy-cpu-v2-audit-20260916.md` §16.
+- [ ] LEGACY-X86-DECODER-1 decoder INT8 feasibility: **DESIGN/AUDIT COMPLETE, CODE NOT
+      STARTED**. AVX2 and AVX-512-no-VNNI are excluded by `qwen_sd_int8_available()`;
+      the required panel quantization/conv/streaming backend is materially larger than
+      the new GEMV primitive. Keep f32/BLAS default and measure decoder shapes before
+      implementing. Detail: addendum §17.
+- [ ] LEGACY-X86-3 AVX-512-no-VNNI: **DESIGN SCREEN COMPLETE, NO NEW KERNEL**. The build
+      can use/report the AVX2 legacy candidates; no dedicated 512-bit emulation is added
+      until hardware shows a complete-call win after frequency/downclock measurement.
+      Detail: addendum §18.
+- [x] LEGACY-CPU-SCREEN fast qualification harness: add one model-free command that saves
+      topology, flags, source/build identity, caps, dispatch, self-test, bandwidth and
+      legacy candidate A/B output without mixing physical-core and SMT modes. Keep all
+      candidates opt-in and performance status UNVERIFIED until a target host runs it.
+      **IMPLEMENTED** as `make legacy-cpu-screen`; use separate `LEGACY_SCREEN_MODE=physical`
+      and `LEGACY_SCREEN_MODE=smt` output directories. First cloud command and manifest
+      contract: `.work/legacy-cpu-v2-audit-20260916.md` §19.
+- [x] LEGACY-CPU-AMD-MILAN GCP AVX2 screen: EPYC 7B13, 8 physical cores, SMT off, no
+      AVX-512/VNNI. Doctor measured 61.55 GB/s host read and 47.1 GB/s 8T engine GEMV;
+      simultaneous 2x4 and 4x2 retained near-linear aggregate scaling with only 1.08x/
+      1.10x per-worker slowdown, unlike Graviton5. AVX2 INT8 candidate dispatch and parity
+      passed but complete 28-layer performance was negative (82.52 ms vs 25.89 ms FMA),
+      so it remains opt-in/default-off. Q4 candidate dispatch/parity passed; performance
+      remains unverified. Detail: addendum §21.
+- [x] LEGACY-CPU-AMD-MILAN-V2-SCREEN: the 0.6B C1 two-minute cross-v2 flag bundle reduced
+      TTFA p95 1667->1034 ms and safe-start p95 2175->1613 ms, but worsened STREAM p95
+      0.888->0.988 and introduced 10% stall@250/@500 versus the same-duration control.
+      Classification: PARTIAL, unqualified and not promoted. Exact environment and raw
+      KPI comparison: `configs/perf/gcp-milan-8c-avx2-v2-cross-screen.json` and audit §22.
 
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 

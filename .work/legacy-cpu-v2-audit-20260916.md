@@ -375,3 +375,328 @@ Do not make the profile an ISA-name switch. `arm_dotprod` and `x86_avx2` are cap
 The current v2 architecture is portable functionally and has useful optimized families beyond the newest targets, but it is not yet performance-portable. The highest-confidence gaps are AVX2/AVX512-no-VNNI INT8/Q4 GEMV, decoder INT8 availability on non-VNNI x86, dotprod-only ARM matmat/KAI reachability, and the absence of a backend performance profile feeding v2 policy. The highest-risk mistake would be to “fix” all of these with one global GEMM or scheduler rule.
 
 The safe order is: make dispatch truth measurable, benchmark complete calls on the named ISA classes, add one legacy GEMV family with parity, then add backend-aware crossover/profile policy. Until those runs exist, no AVX2, AVX512-no-VNNI, M1 or plain-NEON concurrency claim should be inferred from VNNI/AMX/KleidiAI results.
+
+## 13. Implementation status — first legacy candidate
+
+### LEGACY-X86-1 — AVX2 INT8 GEMV
+
+The first implementation is now isolated in the dedicated legacy worktree. It adds an
+experimental B=1 path that reuses the existing activation quantization contract and computes
+the signed INT8 dot by widening both operands to signed 16-bit lanes before `PMADDWD`.
+It intentionally does not reuse the existing AVX2 B>1 `PMADDUBSW` sequence: that instruction
+has saturating 16-bit pairwise intermediates, so the candidate avoids making an unproved
+range assumption. The implementation is bounded to the existing 8192-element activation
+scratch contract and returns to the FMA GEMV outside that bound.
+
+The path is selected only with `QWEN_AVX2_INT8_GEMV=1`; the FMA widen/dequant GEMV remains the
+default. `--caps`/`--dispatch-map` expose compiled, runtime-supported and policy-enabled
+state, and shape census gets the leaf name `avx2-int8-emulated-dot-gemv`.
+
+Status:
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | candidate, opt-in dispatch, precise report row and appended census leaf |
+| PARITY VERIFIED | PENDING AVX2 HOST | adversarial signed-extreme, saturation-sensitive and tail tests are compiled into `--self-test`; the current M1 host correctly skips them; x86 cross-compilation passed |
+| PERFORMANCE VERIFIED | NO | no Ryzen/AVX2 execution host available in this session |
+| DEFAULT/PROMOTED | NO | explicit opt-in only |
+
+The current ARM build was rebuilt with `make blas`; `--caps`, `--dispatch-map`, and
+`--self-test` passed with zero failures. The AVX2 translation units for `qwen_tts_kernels.c`
+and `qwen_tts_dispatch.c` compiled for `x86_64-apple-darwin` with `-mavx2 -mfma`. The existing
+generated flag-scope header had unrelated pre-existing CUDA flag omissions; only the new
+candidate flag was added, and the full generated header was not imported to avoid unrelated
+CUDA scope churn.
+
+Next action: on a real AVX2 host run the self-test with the candidate enabled and disabled,
+then run the complete-call B1 Talker/CP GEMV benchmark before deciding whether to keep the
+candidate.
+
+## 14. Implementation status — AVX2 Q4 GEMV candidate
+
+`QWEN_AVX2_Q4_GEMV=1` now selects an independent B=1 Q4_0 path before the existing
+native/f32 Q4 branches. It quantizes the activation with the existing column contract,
+unpacks the two unsigned nibbles, uses `_mm256_maddubs_epi16` only in its proven-safe
+Q4(0..15) × signed-activation range, reduces with `_mm256_madd_epi16`, then applies the
+per-block `-8 * sum(qx)` correction and fp16 block scale. This is deliberately not the
+AVX2 B>1 gate: B=1 has a separate complete-call A/B and remains default-off.
+
+The candidate rejects non-block-aligned input rather than inventing a partial Q4 block;
+the self-test covers two blocks, extreme nibble values, five output rows (tail), and the
+invalid partial-block case. The precise leaf is `avx2-q4-emulated-dot-gemv`, and the
+dispatch row reports compiled/runtime-supported/policy-enabled state independently.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | opt-in wrapper, Q4 integer dot/correction, census leaf, dispatch row and flag docs |
+| PARITY VERIFIED | STRUCTURAL ONLY | adversarial integer oracle is in `--self-test`; current M1 skips AVX2 execution; x86 AVX2 syntax compilation passes |
+| PERFORMANCE VERIFIED | NO | no AVX2 runtime host available |
+| DEFAULT/PROMOTED | NO | `QWEN_AVX2_Q4_GEMV=1` is required |
+
+The existing Q4 dequant/FMA path and B>1 AVX2 matmat path are unchanged. Do not infer
+anything about server concurrency from this kernel-B=1 candidate.
+
+The repository's `check-matmat-parity-x86` target also ran under Rosetta 2 during this
+session, but that translated process reported runtime CPU `sse2` and explicitly warned that
+AVX2 was unavailable. Its existing B>1 parity result is useful cross-build coverage; it is
+not AVX2 candidate execution or performance evidence. A native AVX2 host remains required
+for the candidate's adversarial runtime parity.
+
+## 15. Implementation status — in-house ARM SDOT B>1 matmat
+
+The existing `QWEN_INT8_SDOT_MM=1` implementation is now explicitly observable as
+`arm-sdot-matmat` in the leaf census whenever it actually runs. The default remains the
+fixed-B f32-accum twin on dotprod-only ARM; the SDOT matmat gate is still opt-in. This
+separates three measurements that must not be conflated: kernel B=1 SDOT GEMV, kernel B>1
+SDOT matmat, and server concurrency C.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | existing SDOT matmat gate plus explicit selected leaf |
+| PARITY VERIFIED | YES | M1 `QWEN_INT8_SDOT_MM=1 ./qwen_tts --self-test` passed; dispatch gate resolved ON and census showed `arm-sdot-matmat` for `matmat_int8` |
+| PERFORMANCE VERIFIED | NO / NEGATIVE M1 SCREEN | `--matmat-bench` measured SDOT matmat slower than B×SDOT GEMV: at `-j1`, B2/B4/B8 speedups 0.30/0.43/0.61x; at the default 4 threads, 0.30–0.61x across the reported shapes |
+| DEFAULT/PROMOTED | NO | opt-in gate remains unchanged; the M1 screen rejects promotion for this workload, but does not delete the candidate for other shapes/hosts |
+
+The B2/B4/B8 labels above are kernel batch widths. They are not server concurrency C.
+This result is a useful warning against enabling a global dotprod matmat rule on M1-class
+hosts: the current implementation rereads/loops enough work that the native single-vector
+SDOT path remains faster for the tested shapes.
+
+## 16. KAI dotprod-only split — implementation blocker, not forced
+
+The source audit confirms that this is an integration/packing problem, not evidence that
+KleidiAI requires i8mm for every useful operation:
+
+- `third_party/kleidiai` contains separate dotprod GEMV ukernels for Q4 and Q8, and a
+  dotprod Q8 4x4 GEMM, alongside the i8mm 4x8 GEMM families.
+- `qwen_tts_kleidi.c:23-47` currently defines `QWEN_KLEIDI_BUILD` only when both
+  `__ARM_FEATURE_DOTPROD` and `__ARM_FEATURE_MATMUL_INT8` are present. `Makefile:91-120`
+  likewise omits all KAI sources unless the compiler advertises i8mm.
+- `kleidi_cpu_ok():65-90` requires both Linux `HWCAP_ASIMDDP` and `HWCAP2_I8MM` (or the
+  corresponding Apple sysctls). Relaxing that boolean alone would be unsafe.
+- The application registration path currently packs persistent Q4 and Q8 RHS data using
+  the i8mm GEMM metadata (`qwen_kleidi_register_q4()` / `qwen_kleidi_register_i8()`). The
+  dotprod runners have distinct `nr/kr/sr`/workspace contracts. The runtime B>1 path also
+  directly names the i8mm runner, while B=1 names the dotprod runner.
+
+Therefore a safe dotprod-only KAI split needs a second prepared-pack family (or a proven
+identical-layout proof for each exact ukernel), separate registration metadata and a
+capability/selection path that cannot reach i8mm code. No such proof exists in this audit.
+The minimum safe result is to keep the in-house `arm-sdot-gemv` and opt-in
+`arm-sdot-matmat` paths as the dotprod-only candidates, while reporting KAI as unavailable
+on dotprod-only builds. No KAI code was weakened or made reachable by a partial macro edit.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | NO | The requested split is not a safe reporting-only change because current pack/runner contracts are i8mm-centric. |
+| PARITY VERIFIED | N/A | No new KAI dispatch was exposed. Existing dotprod in-house paths remain covered. |
+| PERFORMANCE VERIFIED | N/A | KAI dotprod-only was not executed. |
+| DEFAULT/PROMOTED | NO | A dotprod-only CPU cannot enter the current KAI path. |
+
+The next KAI work item is a dedicated pack-contract implementation with per-family census
+and parity tests, not a scheduler or threshold change. This preserves the hard safety rule:
+a dotprod-only CPU must never execute an i8mm instruction.
+
+## 17. Legacy x86 decoder INT8 feasibility
+
+The decoder cliff is a capability gate, not a missing dispatch flag. `qwen_sd_int8_available()`
+(`qwen_tts_kernels.c:8827-8835`) returns true only for `__ARM_FEATURE_DOTPROD` or
+`__AVX512VNNI__`; AVX2 and AVX-512F/BW without VNNI therefore remain on the f32/im2col/BLAS
+control path. The decoder call site (`qwen_tts_speech_decoder.c:955-985`) additionally
+requires `qwen_sd_int8_usable(in_ch,out_ch)`, currently equal-channel shapes up to 768.
+
+The existing INT8 decoder implementation is not a single GEMV reuse opportunity. It needs:
+
+1. activation-panel construction (`sd_im2col_task`, `:926-943`) for `[N][K]` columns;
+2. per-panel activation quantization and row sums;
+3. packed decoder weights and correction terms (`qwen_conv1d_int8_*`);
+4. the convolution output/bias epilogue and streaming/ragged continuation contracts; and
+5. a backend that handles the small, changing `N`/kernel/dilation shapes without changing
+   the existing f32 numerical contract.
+
+The new AVX2 signed-widening GEMV is not directly sufficient: decoder INT8 needs a panel
+matmul/conv primitive, not one vector against one row, and the existing AVX2 B>1 matrix
+path has its own activation layout and `PMADDUBSW` saturation proof obligation. Reusing it
+would require a decoder-specific packed-weight format plus tensor and streaming parity
+coverage. That is a separate project, not a clean extension of LEGACY-X86-1/2.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | NO | No decoder AVX2 backend was added. |
+| PARITY VERIFIED | N/A | Existing f32/BLAS decoder remains the reference/default. |
+| PERFORMANCE VERIFIED | NO | No AVX2 decoder runtime was available. |
+| DEFAULT/PROMOTED | NO | `QWEN_SD_INT8` cannot enable an unavailable backend. |
+
+Recommended follow-up is `LEGACY-X86-DECODER-1`: first capture representative decoder
+shapes and complete-call `im2col`, quantize, dot, epilogue timings; then design one panel
+kernel and compare it against the existing BLAS path. Do not gate it on the Talker GEMV
+candidate or alter v2 scheduling.
+
+## 18. AVX-512 without VNNI — no speculative second implementation
+
+The focused design check found no currently justified complete-call kernel distinct from
+the AVX2 candidate. `SIMD=avx512` supplies AVX-512F/BW/VL plus AVX2/FMA, but the integer
+matrix gate still resolves through the AVX2 implementation; there is no VPDPBUSD-equivalent
+instruction without AVX512-VNNI. Wider staging/quantization and Q4 unpack are possible,
+but the remaining dot/reduction would still be emulated, and 512-bit frequency/downclock
+and memory behavior can reverse an inner-loop win.
+
+The safe current behavior is therefore:
+
+- build and report `avx512-no-vnni` distinctly;
+- preserve raw host flags in the qualification manifest, including `avx_vnni`; this
+  repository has no AVX-VNNI-specific kernel family and must not label AVX-VNNI as
+  AVX512-VNNI;
+- select the AVX2 FMA reference or the explicitly forced AVX2 integer/Q4 candidates;
+- record the actual leaf, not merely `AVX512`;
+- defer a dedicated AVX-512 implementation until a real no-VNNI host shows a complete-call
+  advantage after frequency and bandwidth are measured.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | NO dedicated path | Existing AVX2 candidate is usable as the controlled fallback. |
+| PARITY VERIFIED | STRUCTURAL | AVX512 source compiles through the AVX2-compatible branches; no hardware execution here. |
+| PERFORMANCE VERIFIED | NO | Requires AVX512-no-VNNI hardware and frequency telemetry. |
+| DEFAULT/PROMOTED | NO | No wider path is enabled by ISA name alone. |
+
+## 19. Fast legacy CPU qualification screen
+
+`tools/legacy_cpu_screen.py` and the `legacy-cpu-screen` Make target now provide one
+repeatable, model-free first pass for a newly supplied x86 host. It archives raw output
+and a JSON manifest containing:
+
+- CPU identity, flags, cache/NUMA topology, compiler and git/source state;
+- `--caps`, baseline and forced-candidate `--dispatch-map`, and self-tests;
+- existing `membw` output;
+- existing `roof_matvec_int8` at a CP-sized and Talker-sized layer count, comparing the
+  current FMA GEMV with the opt-in AVX2 integer candidate;
+- existing `--matmat-bench` at the current reference and each independent AVX2 INT8/Q4
+  candidate, with shape census enabled.
+
+The command keeps `mode=physical`, `mode=smt` and `mode=unspecified` explicit, accepts an
+optional `taskset` mask, and never treats kernel batch B as server concurrency C. It is a
+screen only: a zero exit code means the commands ran and the candidate was observable, not
+that it should be promoted.
+
+Cloud first command after a clean build:
+
+```sh
+make legacy-cpu-screen LEGACY_SCREEN_MODE=physical LEGACY_SCREEN_THREADS=8 \
+  LEGACY_SCREEN_CPUS=0-7 LEGACY_SCREEN_OUT=/tmp/qwen-legacy-screen-physical
+```
+
+Repeat with a separate output directory and `LEGACY_SCREEN_MODE=smt` for SMT. On a Ryzen
+6800H, use the physical-core mask first, then the full logical mask; compare the raw
+`roof_int8_*`, `matmat_*` and `dispatch_*` logs before any v2 serving run. Set
+`LEGACY_SCREEN_THREADS` to the actual mask width rather than silently allowing the helper
+to choose a different topology.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | `tools/legacy_cpu_screen.py`, Make target and raw JSON/log archive |
+| PARITY VERIFIED | STRUCTURAL | script syntax and Make integration checked locally; candidate runtime parity remains per-ISA |
+| PERFORMANCE VERIFIED | NO | no AVX2/AVX512-no-VNNI target in this session |
+| DEFAULT/PROMOTED | NO | screen never changes serving defaults |
+
+## 20. Plain NEON fallback truth
+
+The plain-AArch64 case does not currently show a scalar cliff in the common matvec path.
+When dotprod is absent, `int8_matvec_fused()` and the Q4/BF16 conversion helpers still
+use the existing NEON widen/FMA and conversion branches where `__ARM_NEON` is available;
+the scalar loops are tails or the non-NEON portability build. `qwen_sd_int8_available()`
+correctly stays false without dotprod, so the decoder retains its f32/BLAS control path.
+
+This is a truthful functional fallback, not a performance claim: there is no native INT8
+dot product and no i8mm/KAI matrix path. The next useful action is an armv8-a no-dotprod
+screen using §19 plus CP/Talker/decoder timings; no broad plain-NEON backend was added
+without that evidence.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | EXISTING FALLBACK | NEON widen/FMA and conversion branches are already selected without dotprod |
+| PARITY VERIFIED | EXISTING GATES | local M1 fallback self-test available with `QWEN_NO_SDOT=1`; no plain-NEON host here |
+| PERFORMANCE VERIFIED | NO | requires armv8-a no-dotprod runtime |
+| DEFAULT/PROMOTED | EXISTING | functional fallback is the default when native dotprod is unavailable |
+
+## 21. GCP AMD Milan / EPYC 7B13 AVX2 screen (2026-09-16)
+
+The new GCP host was tested from the local `feature/legacy-cpu-simd-v2` archive at
+`453756e9a047e973ebc40ea39ac9790d822a70c2`; no push or remote commit was made. The public
+OSS clone is kept separately on the host. SMT was disabled reversibly before measurement:
+8 physical CPUs online (`0-7`), one socket, one NUMA node, `AVX2+FMA`, no AVX-512 and no
+VNNI.
+
+The doctor completed with the hardware gates passing and reported:
+
+| measurement | result |
+|---|---:|
+| host read / copy / triad bandwidth @8T | 61.55 / 57.33 / 50.32 GB/s |
+| `membw` sweep | 1T 8, 2T 17, 4T 33, 8T 62 GB/s read |
+| engine GEMV roof @2T / @4T / @8T | 18.2 / 32.5 / 47.1 GB/s |
+| 1.7B INT8 frame at the 8T GEMV roof | 29.9 ms |
+
+The direct simultaneous GEMV discriminator used the same 28-layer Talker workload and
+disjoint masks. The isolated baselines were measured with the same binary and repetitions
+so the per-worker comparison is not confused with an 8T-vs-4T comparison:
+
+| shape | worker result | aggregate | comparison |
+|---|---:|---:|---|
+| 1x8 | 24.44 ms / 57.67 GB/s | 57.67 GB/s | reference shape |
+| 1x4 isolated | 42.38 ms / 33.25 GB/s | 33.25 GB/s | reference for 2x4 |
+| 2x4 simultaneous | 45.93 ms / 30.69 GB/s each | 61.38 GB/s | 1.08x worker slowdown; 1.85x aggregate vs 1x4 |
+| 1x2 isolated | 76.46 ms / 18.43 GB/s | 18.43 GB/s | reference for 4x2 |
+| 4x2 simultaneous | 83.77 ms / 16.82 GB/s each | 67.29 GB/s | 1.10x worker slowdown; 3.65x aggregate vs 1x2 |
+
+Verdict: **cross-worker bandwidth/cache contention is not Graviton5-like on this host**.
+At equal worker width, 2x4 and 4x2 retain near-linear aggregate scaling with only about
+8-10% per-worker latency loss. The host is simply small and core/bandwidth limited; the
+doctor's model predicts no useful 1.7B streaming point and only C1/C2 as a 0.6B screen
+starting point. Those model values include the existing uncalibrated decoder factor and
+are not serving qualification.
+
+The model-free legacy screen ran every engine-relevant command successfully: caps,
+dispatch, baseline/candidate self-tests, bandwidth, INT8 FMA-vs-candidate roofs and
+matmat census. Its final `21/23` result is `INCOMPLETE` only because the transferred
+source archive has no `.git`, so `git_head` and `git_status` could not run; this is not a
+kernel failure.
+
+On this actual AVX2 host, the INT8 GEMV candidate was selected and parity-clean but slower
+for the complete 28-layer roof: FMA reference `25.89 ms / 54.4 GB/s` versus candidate
+`82.52 ms / 17.1 GB/s` at 8T. It remains default-off and is not promoted. The Q4 candidate
+was selected by its dispatch A/B and passed self-test/adversarial coverage, but no complete
+Q4 B1 performance verdict was claimed here.
+
+## 22. GCP AMD Milan AVX2 cross-v2 C1 screen (2026-09-16)
+
+After the default AVX2/FMA screen, the same OSS `qwen3-tts-0.6b` C1 workload was run for
+two minutes with the shared v2/server flags that are meaningful on AVX2: engine-owned BLAS,
+parked OpenBLAS, CP INT8 with `QWEN_CP_PREFILL2=1`, per-item decoder, prefix cache,
+`QWEN_STREAM_DECODE_CHUNK=4`, stream layout, and `QWEN_POOL_SPIN=4096`. AVX2 integer/Q4
+candidate kernels stayed off. VNNI/AMX/BF16-native/KAI leaves were not fabricated: the
+runtime dispatch map reported their capability gates as unavailable and selected the
+existing AVX2 FMA plus FP32/BLAS fallbacks.
+
+The first treatment was compared with a new, same-duration two-minute control using the
+same binary, bank, speaker, worker mask, warmup and port-independent launch. Both runs
+completed 11 requests with zero errors, rejects or timeouts:
+
+| C1 0.6B, 2-minute screen | TTFA p95 | safe-start p95 | STREAM RTF p95 | stall@250/@500 |
+|---|---:|---:|---:|---:|
+| AVX2 control | 1667 ms | 2175 ms | 0.888 | 0% / 0% |
+| cross-v2 flags | 1034 ms | 1613 ms | 0.988 | 10% / 10% |
+
+Verdict: **PARTIALLY IMPROVED, NOT A WIN**. The cross-v2 bundle materially improved first-audio
+and safe-start tails, but spent nearly all playback margin and introduced stalls in this
+short run. It is recorded as an unqualified diagnostic profile in
+`configs/perf/gcp-milan-8c-avx2-v2-cross-screen.json`; it is not a default or product
+recommendation. The next useful test on a larger Milan is to keep this bundle as the
+candidate, repeat the same control/treatment at C1/C2, and then isolate CP prefill2,
+decoder-batch policy and stream chunk if the trade-off persists. No v2 scheduler claim is
+made from this screen.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | unqualified Milan cross-v2 config records exact flags and measured screen |
+| PARITY VERIFIED | STRUCTURAL/runtime-safe | zero errors/rejects/timeouts; capability gates selected valid AVX2 fallbacks |
+| PERFORMANCE VERIFIED | NO | two-minute C1 A/B only; playback trade-off is unresolved |
+| DEFAULT/PROMOTED | NO | the bundle is not promoted |
