@@ -1155,15 +1155,18 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       and `matmat_bf16` only, so `--backend cuda --int8` (or `--int4`) offloads NOTHING while
       the startup line claimed it did. `main.c` now prints an explicit NOTE naming the resident
       paths instead. Inside the GPU `#if`; the CPU build does not compile it.
-- [ ] CUDA-2 PR #29 (`Da3dalusCode`, "Fix noise from the CUDA speech decoder with packed
-      ConvTranspose weights"). **Diagnosis confirmed statically**: `sd_pack_convt`
-      (`qwen_tts_speech_decoder.c:229`) writes `[k][ic][oc]`, the CPU oracle
-      `causal_conv_transpose1d_naive:295` reads that same layout, and the packing overwrites the
-      weight pointer **in place** (`:1321`, `:1338`) — so CUDA always received the packed tensor
-      while `kd_convT` read it as `[ic][oc][k]`. Unconditional on the CUDA decoder path, not an
-      edge case. The PR also adds a `decoder_convT_packed` self-test. MERGE IT WITH
-      `gh pr merge 29 --merge` — never a local `git merge --squash` + commit, which reassigns
-      authorship away from the contributor.
+- [x] CUDA-2 PR #29 (`Da3dalusCode`) — **MERGED 2026-09-16**, merge commit `79ca337`, with
+      `gh pr merge 29 --merge` so `f4b0e5e Da3dalusCode` stays in main's history and in the
+      contributor graph. `sd_pack_convt` (`qwen_tts_speech_decoder.c:229`) writes `[k][ic][oc]`
+      and overwrites the weight pointer **in place**, so CUDA always received the packed tensor
+      while `kd_convT` read it as `[ic][oc][k]` — unconditional on the GPU decoder path.
+      Verified before merging on an RTX PRO 6000 Blackwell (CUDA 12.8, 0.6B, ryan/English,
+      seed 42, temperature 0, `QWEN_CUDA_CONVDEC=1`), generating the same text from a clean
+      clone with and without it: the PR's own `decoder_convT_packed` self-test passes at
+      `rel = 6.278e-08` on both the naive and gemm paths; duration is 7.12 s either way, so the
+      codec tokens are identical and only the decoded waveform changes; `pearson -0.005`; and
+      the level goes from **rms 137 to rms 1254** — attenuated noise to ordinary speech on the
+      int16 scale. Confirmed by ear.
 - [x] CUDA-8 **Batched GPU Talker: wrong results, illegal memory accesses and 0.12x
       throughput — FIXED.** `--gpu-batch-bench` bisected it cleanly: exact at B<=2, broken at
       B>=4, with correctness and speed failing at the same threshold. The three batched matmat

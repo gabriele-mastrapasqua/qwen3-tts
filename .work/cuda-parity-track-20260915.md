@@ -133,6 +133,13 @@ whichever box is named; the three code fixes were reproduced on both.
 
 ### 5.2 PR #29 — validated, and it is not sufficient on its own
 
+> **MERGED 2026-09-16** as `79ca337`, after the arena defect below was fixed independently. The
+> "not sufficient on its own" verdict in this section was true at the time and is now historical:
+> both fixes are in main. Re-measured before merging on an RTX PRO 6000 Blackwell from a clean
+> clone — same text, seed and voice with and without the PR — the decoder goes from **rms 137 to
+> rms 1254** at identical duration, which is the white noise turning into speech. See PLAN
+> CUDA-2 for the full evidence.
+
 Merges clean (0 conflicts), `f4b0e5e Da3dalusCode` preserved in history. Its own new self-test
 passes: `decoder_convT_packed (naive)` and `(gemm)` both at `rel = 6.278e-08`. The static
 diagnosis holds — `sd_pack_convt` writes `[k][ic][oc]` and overwrites the weight pointer in
