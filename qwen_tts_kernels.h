@@ -140,6 +140,7 @@ enum {
     QWEN_LEAF_DELEGATED,   /* the entry delegated to per-matrix calls: their rows carry the work */
     QWEN_LEAF_AVX2_INT8_GEMV, /* experimental exact signed widening dot product */
     QWEN_LEAF_AVX2_Q4_GEMV,   /* experimental q4 unsigned-nibble dot product */
+    QWEN_LEAF_SDOT_MATMAT,    /* opt-in B>1 in-house ARM dotprod matmat */
     QWEN_LEAF_COUNT
 };
 const char *qwen_leaf_name(int leaf);

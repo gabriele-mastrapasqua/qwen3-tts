@@ -1974,7 +1974,7 @@ int qwen_path_kind(int path) {
 static const char *const g_leaf_name[QWEN_LEAF_COUNT] = {
     "none", "vnni", "dpbf16", "sdot", "avx512f", "avx2", "neon", "scalar", "blas",
     "f32_fused", "kleidi", "amx", "delegated", "avx2-int8-emulated-dot-gemv",
-    "avx2-q4-emulated-dot-gemv"
+    "avx2-q4-emulated-dot-gemv", "arm-sdot-matmat"
 };
 const char *qwen_leaf_name(int leaf) {
     return (leaf > 0 && leaf < QWEN_LEAF_COUNT) ? g_leaf_name[leaf] : "none";
@@ -4918,9 +4918,11 @@ void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                 }
                 int nt = g_n_threads;
                 if (nt > 1 && rows >= 256) {
+                    qwen_census_leaf(QWEN_LEAF_SDOT_MATMAT);
                     int8_smm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
                     qwen_parallel((size_t)nt, int8_smm_task, &c);
                 } else {
+                    qwen_census_leaf(QWEN_LEAF_SDOT_MATMAT);
                     int8_matmat_sdot_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
                 }
                 goto qwen_matmat_int8_timed_done;

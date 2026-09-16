@@ -98,10 +98,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       as default. Dispatch/census and adversarial two-block/output-tail tests are
       present; runtime PARITY/PERFORMANCE VERIFIED and DEFAULT/PROMOTED remain NO
       until a real AVX2 host runs the candidate and complete-call A/B.
-- [ ] LEGACY-ARM-1 SDOT B>1 candidate: keep `QWEN_INT8_SDOT_MM=1` opt-in and add
-      an explicit SDOT-matmat census leaf/fast-screen before any policy change;
-      compare kernel B (not server concurrency C) against B×SDOT GEMV and the twin
-      on the local M1. KAI dotprod/i8mm separation remains a separate design gate.
+- [ ] LEGACY-ARM-1 SDOT B>1 candidate: `QWEN_INT8_SDOT_MM=1` remains opt-in and now
+      has an explicit `arm-sdot-matmat` census leaf. IMPLEMENTED and M1 parity verified;
+      the first M1 microbench is negative (B2/B4/B8 SDOT matmat loses to B×SDOT GEMV),
+      so it is not promoted. Keep the path for other shapes/hosts and do not conflate
+      kernel B with server concurrency C. KAI dotprod/i8mm separation remains separate.
 
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 

@@ -435,3 +435,23 @@ dispatch row reports compiled/runtime-supported/policy-enabled state independent
 
 The existing Q4 dequant/FMA path and B>1 AVX2 matmat path are unchanged. Do not infer
 anything about server concurrency from this kernel-B=1 candidate.
+
+## 15. Implementation status — in-house ARM SDOT B>1 matmat
+
+The existing `QWEN_INT8_SDOT_MM=1` implementation is now explicitly observable as
+`arm-sdot-matmat` in the leaf census whenever it actually runs. The default remains the
+fixed-B f32-accum twin on dotprod-only ARM; the SDOT matmat gate is still opt-in. This
+separates three measurements that must not be conflated: kernel B=1 SDOT GEMV, kernel B>1
+SDOT matmat, and server concurrency C.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | existing SDOT matmat gate plus explicit selected leaf |
+| PARITY VERIFIED | YES | M1 `QWEN_INT8_SDOT_MM=1 ./qwen_tts --self-test` passed; dispatch gate resolved ON and census showed `arm-sdot-matmat` for `matmat_int8` |
+| PERFORMANCE VERIFIED | NO / NEGATIVE M1 SCREEN | `--matmat-bench` measured SDOT matmat slower than B×SDOT GEMV: at `-j1`, B2/B4/B8 speedups 0.30/0.43/0.61x; at the default 4 threads, 0.30–0.61x across the reported shapes |
+| DEFAULT/PROMOTED | NO | opt-in gate remains unchanged; the M1 screen rejects promotion for this workload, but does not delete the candidate for other shapes/hosts |
+
+The B2/B4/B8 labels above are kernel batch widths. They are not server concurrency C.
+This result is a useful warning against enabling a global dotprod matmat rule on M1-class
+hosts: the current implementation rereads/loops enough work that the native single-vector
+SDOT path remains faster for the tested shapes.

@@ -174,6 +174,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_AMX` | x86 | unset | `=1` disables every AMX matmat kernel at once. Use it to answer "is AMX doing anything", never to attribute a result — it removes two unrelated consumers |
 | `QWEN_NO_AMX_BF16` · `QWEN_NO_AMX_INT8` · `QWEN_NO_AMX_Q4` | x86 | unset | one AMX consumer each, which is what a measurement needs. On an 8-core Emerald Rapids the two do disjoint jobs: dropping **bf16** costs C=1 TTFA +39% and C=4 p95 +72% while stream RTF barely moves (it is the *prefill*), and dropping **int8** leaves TTFA alone while costing 9% of RTF and 10% of throughput (it is the *decode*) |
 | `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
+| `QWEN_INT8_SDOT_MM` | ARM dotprod | unset (off) | enables the in-house SDOT B>1 INT8 matmat candidate; compare it against the fixed-B twin and B×SDOT GEMV, and report kernel B separately from server concurrency C |
 | `QWEN_NO_BF16_MATMUL` | x86 | unset | `=1` drops the AVX-512 bf16 matmat, leaving the per-row twin. Only reachable where AMX is absent or declined |
 | `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
 | `QWEN_VNNI_TILE_M4N2` | x86 | unset (off) | `=1` tries the fixed `M4xN2` VNNI tile for observed `B=2` calls. It is an opt-in candidate inspired by the ARM small-B cross-product path; qualify it on the complete server path before enabling it |
