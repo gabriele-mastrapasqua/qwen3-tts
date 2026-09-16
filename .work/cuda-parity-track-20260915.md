@@ -584,3 +584,78 @@ The head is no longer a target at 1.35 ms/f. The step is, and it is a kernel-eff
 problem inside `k_matmat_bf16` rather than a structural one — still roughly 2.5x off the
 memory roof after the unroll. The int8 and q4 batched matmats have the same shape, but the
 CUDA seam is bf16-only so nothing served reaches them.
+
+### 14.8 The harness was measuring a one-thread server
+
+Four kernel-level wins in a row moved the client-observed metrics less and less, and the last
+one gave it away: the code predictor step fell 15% (8.60 -> 7.32 ms/frame) and RTF p50 at C4
+moved 4% while the stall rate did not move at all. Optimising the right thing and seeing
+nothing means the constraint is elsewhere.
+
+It was `--prefork-threads 1`, which with `--prefork 1` sizes the entire server pool. Our soak
+driver passed it, and `tests/serve_soak.py` defaults it to 1 at `:563`. Every GPU soak in this
+campaign — today's A6000 ladder and yesterday's A100 arm alike — ran the server with **one
+engine thread on a ten-core box**.
+
+C4, everything else held fixed:
+
+| threads | RTF p50 | stall@250 | stall@1000 | completed | safe_play_start p50/p95 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.68 | 44% | 11% | 82 | 1092 / 2311 ms |
+| 4 | 0.58 | 36% | 4% | 91 | 955 / 2172 ms |
+| 8 | 0.56 | 36% | 4% | 91 | 925 / 2047 ms |
+
+The CP step is unchanged across all three (7.37 / 7.34 / 7.31 ms/frame), so this is entirely
+CPU-side work and not a GPU effect. Four threads captures it; eight adds nothing.
+
+The engine's own default is `cpus/n` and has always been correct, so no user was ever affected
+— but every GPU serving number this project has recorded understates the server by roughly this
+much, and the A100 arm had more headroom at C4 than we credited it with.
+
+This is the third harness default of the same shape, after `--precision int8` silencing the GPU
+entirely. The pattern to watch for is a default that disables what is being measured while the
+run still looks healthy.
+
+### 14.9 Refuted: the lane cap was not the constraint
+
+QB_MAX was 8, and at C10 the server queued 453 requests because two of ten could never be
+admitted. Since the code predictor reads 2.24 GB of weights per frame regardless of B — the
+lanes share them — wider batches should amortise it, so raising the cap looked structural.
+
+Raising it alone made everything slower: at QB_MAX=16 the Talker went 4.81 -> 7.38 ms/frame and
+the CP 10.62 -> 18.06 **at B=8**, serving the same eight lanes. `s[]` is an array of registers
+sized at compile time, so sizing it at QB_MAX with a runtime guard burns QB_MAX registers
+whatever B is. Templating the lane count fixes that, and then:
+
+| per stream | Talker | CP |
+| --- | --- | --- |
+| B=4 | 0.99 ms | 2.05 ms |
+| B=8 | 0.61 | **1.34** |
+| B=12 | 0.60 | 1.43 |
+| B=16 | 0.58 | 1.47 |
+
+Eight lanes is already the optimum: past it the kernel stops being weight-bound and becomes
+bound by per-lane registers. The queueing at C10 is admission working correctly against a
+saturated GPU, not a cap worth raising.
+
+The win landed at the narrow end instead, which is where a compacted server actually runs:
+B=4 Talker 6.02 -> 3.97 ms/frame (-34%), CP 9.99 -> 8.18 (-18%).
+
+### 14.10 Where the remaining headroom is, ranked by evidence
+
+The code predictor reads 2.24 GB per audio frame and the batched kernels move it at about
+209 GB/s on a 768 GB/s card. That ratio, not scheduling, is what sets the concurrency a GPU can
+hold.
+
+1. **int8 weights on the resident CUDA path — untested, halves the bytes.** `k_matmat_int8` and
+   `k_matmat_q4_0` already exist here and `mvB` already selects on `s->prec`; the models are
+   simply loaded bf16 for the GPU. Note the confusion that hid this: `--int8` disabling the GPU
+   is a property of the bf16-only *seam*, not of the *resident* path.
+2. **The matmat itself, 209 vs the 500-616 GB/s cuBLAS reaches on the same shapes.** cuBLAS is
+   wired and measured but needs bf16 activations, which moved the end of speech and produced an
+   18% longer utterance, so it stays off. A split-K hand kernel would keep f32: the kernel gives
+   one warp per output row, so at rows=1024 it launches only 128 blocks onto 84 SMs.
+3. **The speech decoder**, 11-15% of stage time and not graph-captured.
+
+Do NOT re-open: fusing the CP loop onto the device (§14.5, measured at zero) or raising the lane
+cap (§14.9).

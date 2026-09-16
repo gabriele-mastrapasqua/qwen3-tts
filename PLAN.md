@@ -1160,10 +1160,20 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       0.44 / 0.77 / 1.05 / 1.37 and stall@250 9% / 53% / 90% / 100% at C2 / C4 / C6 / C8.
       Knee between C4 and C6. Not a qualification — an A6000 behind a 10-core EPYC 7402 is a
       weaker box than the A100 arm, and every run still fails per-class KPI drift.
-- [ ] CUDA-11 **Measurement trap, cost us a whole wrong conclusion once already.**
-      `tests/serve_soak.py` defaults `--precision` to int8 (`:561`), and the backend seam is
-      bf16-only, so a CUDA soak without `--precision default` runs with the GPU at 0% while
-      looking healthy. Also: never compare two arms that differ in more than one flag — the
+- [ ] CUDA-11 **Measurement traps. Three now, all the same shape: a harness default that
+      quietly disables the thing being measured.**
+      **(a)** `tests/serve_soak.py` defaults `--precision` to int8 (`:561`), and the backend
+      seam is bf16-only, so a CUDA soak without `--precision default` runs with the GPU at 0%
+      while looking healthy.
+      **(b)** It also defaults `--prefork-threads` to **1** (`:563`), which with `--prefork 1`
+      sizes the whole server pool. Every GPU soak we have run — today's A6000 ladder AND
+      yesterday's A100 arm — measured the server with ONE engine thread on a ten-core box.
+      Measured at C4: RTF p50 0.68 -> 0.58, stall@1000 11% -> 4%, 82 -> 91 requests, with the CP
+      step unchanged at 7.3 ms/frame, so the cost is entirely CPU-side. The ENGINE default is
+      `cpus/n` and has always been right; only our measurements were wrong, and every GPU number
+      recorded before 2026-09-16 understates the server by about this much. Four threads
+      captures it all, eight adds nothing.
+      **(c)** Never compare two arms that differ in more than one flag — the
       "seam beats resident" conclusion recorded earlier was really CONVDEC on versus off, and
       had to be withdrawn. Detail: `.work/cuda-parity-track-20260915.md` §12.
 - [ ] CUDA-7 **The Metal batched path has the same defect as the CUDA one, unfixed.**
