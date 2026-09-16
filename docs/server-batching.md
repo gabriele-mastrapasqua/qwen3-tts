@@ -118,6 +118,16 @@ already dips ~0.95. Measured on real hardware:
 int8/int4 inherit from the batched matmat twins (batching pays most at low precision — it amortizes
 the unpack); per-box details in `docs/hardware-testing.md`.
 
+## GPU serving is a separate document
+
+This page describes the **CPU** request-batching server: its architecture, its admission, and its
+numbers, which are sized by cores, cache and memory channels.
+
+The CUDA server shares the endpoints and the streaming contract but nothing else that matters for
+tuning. It is stepped by `QWEN_CUDA_BATCH=1`, sized by GPU memory bandwidth rather than by cores,
+and has its own flags, its own optimum batch size and its own configuration traps. Do not carry a
+number from one to the other: see **`docs/cuda-performance.md`, "CUDA streaming server"**.
+
 ## Status / next
 
 - ✅ S1 batch-multi engine + dynamic scheduler · ✅ S2 continuous batching · ✅ S3 per-request streaming

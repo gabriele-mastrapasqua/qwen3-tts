@@ -91,6 +91,99 @@ Streaming (`/v1/tts/stream`) batches too: concurrent streams share the batched f
 each gets its own incremental PCM chunks. WAV requests use the same incremental decoder internally
 (bit-identical to the seam-free full decode, mel-corr 1.0) so they reach the same throughput.
 
+## CUDA streaming server — 2026-09-16 (RTX A6000, 0.6B)
+
+**Scope: this section is CUDA-only.** Everything below was measured with `--backend cuda` and the
+resident GPU paths on. None of it describes or changes the CPU serving path, whose behaviour,
+tuning and numbers live in `docs/server-batching.md` and `docs/serving-operations.md`. The two
+paths are sized by different things — the CPU server by cores and cache, this one by GPU memory
+bandwidth — and their numbers are not comparable.
+
+### Concurrency the streaming server holds
+
+RTX A6000 (768 GB/s) behind a 10-core EPYC 7402, 0.6B, `--precision default`, all resident paths
+on, 3-minute closed-loop soaks:
+
+| | C2 | C4 | C6 | C8 |
+| --- | --- | --- | --- | --- |
+| RTF p50 | 0.43 | **0.56** | 0.90 | 1.11 |
+| stall rate @1000 ms | 0% | **4%** | 35% | 63% |
+| safe_play_start p50/p95 | 0.69 / 1.6 s | 1.02 / 1.95 s | 1.65 / 4.0 s | 2.76 / 7.9 s |
+| requests / 3 min | 57 | 91 | 93 | 101 |
+
+**C4 comfortable, C6 usable.** Throughput keeps climbing to C8, so past C6 the limit is playback
+quality rather than capacity. The knee scales with GPU memory bandwidth, not with core count: the
+code predictor reads ~2.24 GB of weights per audio frame regardless of how many requests share
+them, so the concurrency a card holds tracks its bandwidth almost linearly.
+
+### Two configuration traps that silently cost most of the server
+
+1. **`--precision default` is mandatory.** The backend seam is bf16-only, so `--int8` sends the
+   *seam* back to the CPU. `tests/serve_soak.py` defaults `--precision` to int8, which produces a
+   healthy-looking run with the GPU near 0%.
+2. **Size the engine pool.** `--prefork-threads` defaults to `cpus/n` and that default is correct;
+   passing `1` explicitly — as `tests/serve_soak.py` does — sizes the whole server pool to one
+   thread. Measured at C4: RTF p50 0.68 → 0.58, stall@1000 11% → 4%, 82 → 91 requests, with the
+   GPU-side cost unchanged. Four threads captures it, eight adds nothing.
+
+Note that the server is deterministic for a **fixed** thread count and not across thread counts:
+the reduction order follows the pool size. Hold it fixed for any A/B.
+
+### What the batched path does on the GPU
+
+`QWEN_CUDA_BATCH=1` steps every in-flight request together, so each weight row is read once for
+all lanes. Since 2026-09-16 the batched bodies also:
+
+- **replay from CUDA graphs**, cached per effective lane count. Only the single-stream bodies had
+  graphs before; the server runs the batched ones, which were issuing ~1950 launches per frame.
+- **compact idle lanes** (`QWEN_CUDA_BATCH_COMPACT=1`) so a server sized for 8 lanes serving 2
+  does not pay for the empty ones. Worth 17% of code-predictor time at low occupancy. The KV stays
+  addressed by slot, so a compacted lane still reads its own request's history.
+- **run the code-predictor head on the GPU** — final norm, lm_head and argmax. The CPU fallback
+  re-reads a 4 MB lm_head once *per lane*, fifteen times per frame; the GPU reads each weight row
+  once for all lanes. 11.6 → 1.35 ms/frame, and codes are bit-identical.
+- **size the per-lane accumulators to the actual lane count**, which is worth 34% at 4 lanes.
+
+Measured effect of the 2026-09-16 work, `--gpu-batch-bench 8`:
+
+| | before | after |
+| --- | --- | --- |
+| Talker step | 7.56 ms/frame | **4.75** (−37%) |
+| Code predictor | 14.35 ms/frame | **10.44** (−27%) |
+| aggregate GAIN | 4.73× | **6.82×** |
+
+Every one of those is bit-identical: a fixed-seed temperature-0 streaming request returns the same
+md5 before and after, and the three batched self-tests stay at `0.00e+00`.
+
+### Batch size
+
+`--batch-size 8` is the measured optimum and `QB_MAX` is 16. Wider batches are allowed but do not
+pay: per-stream code-predictor cost is 2.05 ms at B=4, **1.34 at B=8**, 1.43 at B=12 and 1.47 at
+B=16. Past eight lanes the kernel stops being weight-bound — the weights are read once regardless
+— and becomes bound by per-lane registers.
+
+### int8 on the GPU
+
+int8 weights work on the resident path and are selected by `--int8` (the seam caveat above applies
+only to the seam, not to the resident kernels). They help the **single-request** path, where the
+kernel is weight-bound: Talker 5.23 → 4.64 ms/frame, code predictor 7.70 → 6.00. On the batched
+path the gain is small — about 5% of RTF at C4 — because halving the bytes does not halve the time
+of a kernel that is latency-bound rather than bandwidth-bound.
+
+### Verifying a GPU build
+
+```bash
+./qwen_tts -d qwen3-tts-0.6b --backend cuda --gpu-selftest        # seam vs CPU
+./qwen_tts -d qwen3-tts-0.6b --backend cuda --gpu-batch-bench 8   # batched exactness + throughput
+```
+
+`--gpu-batch-bench` prints three exactness checks, all of which must read `0.00e+00`: batched
+Talker against single-stream, batched code predictor against single-stream, and **partial
+occupancy against independent per-lane references** — the last one is the only check that
+exercises lane compaction, since the first two step every lane. With `--int4` the first two read
+non-zero by design: the single-stream q4 path uses the dp4a kernel, which quantises activations to
+int8, so the two sides are deliberately different arithmetic (`QWEN_CUDA_DP4A=0` makes them agree).
+
 ## How to run
 
 Build (pick your arch, or use the default multi-arch):
@@ -128,7 +221,24 @@ Flags / env:
 - `--int8` — int8 weights (Talker + CP). `--quant-mixed` — int4 Talker + int8 CP (fastest, same quality).
 - `QWEN_CUDA_FUSED_TALKER=1` — GPU-resident fused Talker + Code Predictor.
 - `QWEN_CUDA_CONVDEC=1` — GPU-resident ConvNet speech decoder.
-- `QWEN_CUDA_BATCH=1` — GPU-batched fused steps for the server (`--batch-size N`, N ≤ 8).
+- `QWEN_CUDA_BATCH=1` — GPU-batched fused steps for the server (`--batch-size N`, N ≤ 16; 8 is the
+  measured optimum).
+- `QWEN_CUDA_BATCH_COMPACT=1` — pack the stepping lanes together so idle slots cost nothing.
+  Default off; verified exact against independent per-lane references.
+- `QWEN_CUDA_BATCH_GRAPH=0` — replay the batched bodies with plain launches instead of CUDA
+  graphs. Default on, bit-identical.
+- `QWEN_CUDA_CP_HEAD=0` — put the code-predictor head (norm + lm_head + argmax) back on the CPU.
+  Default on; the GPU path produces identical codes.
+- `QWEN_CP_PROFILE=1` — break the batched code-predictor frame into seed / step / head and report
+  every 500 frames.
+- `QWEN_CUDA_MM_UNROLL`, `QWEN_CUDA_MM_TPB` — weight loads in flight (default 4) and block size
+  (default 64) for the batched matmats. Both swept on an A6000; exposed to re-sweep elsewhere.
+- `QWEN_CUDA_CUBLAS=1`, `QWEN_CUDA_TC=1` — route the wide batched matmats through cuBLAS, or
+  through the portable wmma tensor-core GEMM. **Both default off and both change what the model
+  generates**: tensor cores require bf16 activations, and at a fixed seed that moved the end of
+  speech and produced a 25% shorter utterance. The code predictor is excluded from both by
+  construction, since it picks the codes through an argmax.
+- `QWEN_CUDA_TF32`, `QWEN_CUDA_VERBOSE` — TF32 in the seam's GEMMs; batched-state diagnostics.
 - dp4a int4 matvec (integer `__dp4a`, activation quantized to int8 per 32-block, even/odd-
   deinterleaved to match q4_0 packing): **ON by default** since the A100 validation (−33% Talker
   ms/f on 1.7B, ear-validated). `QWEN_CUDA_DP4A=0` reverts to the f32-activation kernel
