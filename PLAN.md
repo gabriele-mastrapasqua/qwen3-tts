@@ -1159,6 +1159,17 @@ discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA
       i.e. 0.5%**. Nothing to move to the resident path. The levers are the CPU prefill (out of
       scope, invalidates CPU baselines) or a real GPU prefill behind `#ifdef` — a new kernel of a
       different shape, a project not a refinement.
+- [ ] CUDA-17 **NEXT PHASE: a native GPU prefill, separate from decode.** `qwen_cuda_talker_prefill()`
+      — RMSNorm/RoPE, causal N x N attention, SwiGLU/MLP, KV written straight into the slot's
+      device cache, then hand back to the batched decode. This is the only thing that can move
+      `safe_play_start`, since admission is 43% of server time and only 0.5% of a prefill is GPU
+      today (CUDA-15). It also deletes the `qwen_cuda_talker_batch_upload_slot()` transfer as a
+      side effect. **A project, not a micro-optimisation**: the decode kernels do not transfer
+      (B lanes at one position vs one sequence at N positions). Rules: everything new in the .cu,
+      the call site an `#ifdef QWEN_HAVE_CUDA` with the CPU body byte-identical, and an estimate
+      + standalone PoC BEFORE implementing — split the host 2.8 s first with `make cost-map` or
+      `perf` (zero code change), and only proceed if the GPU floor is ~100x under, not ~5x.
+      Design note: `.work/cuda-parity-track-20260915.md` §15.
 - [ ] CUDA-16 **Do not enable `QWEN_PREFILL_SLICE` on CUDA.** It is a CPU mechanism. It cuts the
       admission peak 1976 -> 569 ms exactly as designed, and costs 38% of throughput while
       quadrupling safe_play_start, because the CUDA prefill's cost is per-call, not pool

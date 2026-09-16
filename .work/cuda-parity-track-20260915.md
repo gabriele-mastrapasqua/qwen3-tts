@@ -829,3 +829,63 @@ On the CPU the prefill competes with decode for one thread pool, and slicing let
 through. On CUDA the cost is per-CALL, so slicing into ten multiplies the fixed cost by ten
 instead of spreading it. A mechanism designed for one backend can be actively harmful on another,
 and the flag would have shipped on by default if it had been trusted rather than measured.
+
+---
+
+## 15. Next CUDA phase: a native GPU prefill, separate from decode (design note, not started)
+
+§14.15 established that admission is 43% of server wall time, that a single prefill stalls the
+batch for ~2.8 s, and that **15 ms of that is GPU**. The matmats already run on the device and are
+free; the rest is host work. So the next phase is not another kernel tweak — it is giving the
+prefill its own GPU path.
+
+### 15.1 Shape
+
+```
+qwen_cuda_talker_prefill(ctx, embeds, seq_len, slot)
+    RMSNorm / RoPE over N positions
+    causal attention N x N              <- the piece that does not exist today
+    SwiGLU / MLP
+    KV population directly into the slot's device cache
+  -> hand back to the normal continuous batched decode
+```
+
+It is a different kernel shape from everything written on 2026-09-16. The decode step is B lanes
+at ONE position each, attending to history; this is ONE sequence at N positions, attending
+causally among themselves. None of the `_b` kernels transfer unchanged.
+
+### 15.2 Why it is worth more than it looks
+
+The KV lands on the device already. `qwen_cuda_talker_batch_upload_slot()` exists precisely to
+push a newly admitted request's KV from host to device, and a native prefill removes that
+transfer as a side effect rather than as a separate optimisation.
+
+### 15.3 Scope rule, non-negotiable
+
+Everything new goes in `qwen_tts_cuda_talker.cu`. The call site in `qwen_tts_talker.c` is an
+`#ifdef QWEN_HAVE_CUDA` block that tries the device and falls through, with the CPU body left
+character-for-character unchanged — verified by stripping the ifdefs and diffing, not asserted.
+CPU serving baselines cost a month and any structural edit invalidates them.
+
+### 15.4 Estimate and PoC BEFORE implementing
+
+This session spent seven restructurings to win two; the same discipline applies, and here the
+measurement is cheap.
+
+1. **Split the 2.8 s on the host first, with zero code change.** `perf` during a soak, or the
+   regions the engine already carries (`QWEN_RGN_TK_PREFILL`, `QWEN_RGN_TK_PF_WEIGHT_PREP`) via
+   `make cost-map`. If the bulk is NOT the causal attention, a GPU attention kernel is the wrong
+   project and the estimate stops there.
+2. **Price the GPU floor for whatever dominates.** For causal attention at N=400, 28 layers,
+   16 heads, head_dim 64: roughly 18 GFLOP including both QK^T and AV, which is single-digit
+   milliseconds on an A6000 even at poor efficiency. A floor that is 100x under the current cost
+   is what would justify the work; a floor within 5x would not.
+3. **PoC the attention kernel standalone** against the CPU prefill for one prompt, checked for
+   exactness the way `--gpu-batch-bench` checks the decode path, before wiring anything into the
+   server.
+
+### 15.5 What to expect it to fix, and what it will not
+
+It attacks the admission spike, and therefore `max_gap` and `safe_play_start` — the metrics that
+did not move all session however much the decode kernels improved. It does nothing for steady-state
+RTF, which is already bounded by the batched matmat and its memory roof (§14.11).
