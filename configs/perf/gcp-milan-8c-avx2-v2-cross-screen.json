@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "id": "gcp-milan-8c-avx2-v2-cross-screen",
+    "description": "Unqualified diagnostic cross-v2 serving screen for an 8-physical-core AMD EPYC 7B13 Milan host. This records the applicable shared server flags; it is not a production recommendation and does not claim scaling beyond this host.",
+    "objective": {
+      "primary": "realtime_factor",
+      "secondary": "ttfa",
+      "concurrency_range": [1, 1],
+      "preferred_concurrency": "unspecified",
+      "quality_changes_allowed": false
+    }
+  },
+  "hardware": {
+    "architecture": "x86_64",
+    "cpu_family": "AMD EPYC 7B13 Milan",
+    "logical_cpus": 8,
+    "physical_cores": 8,
+    "threads_per_core": 1,
+    "numa_nodes": 1,
+    "isa_features_used": ["avx2", "fma"],
+    "isa_features_absent": ["avx512", "avx512_vnni", "amx"],
+    "smt_policy": "OFF; CPUs 0-7 online",
+    "notes": "GCP host used for an 8-core diagnostic screen. DRAM read was approximately 62 GB/s at 8T and simultaneous GEMV retained near-linear aggregate scaling; these are host observations, not a larger-Milan sizing result."
+  },
+  "build": {
+    "target": "SIMD=portable",
+    "make": {
+      "command": "make blas; make SIMD=portable -j8 qwen_tts",
+      "variables": {
+        "SIMD": "portable",
+        "ARCH_FLAGS": "-mavx2 -mfma"
+      }
+    },
+    "requirements": {
+      "blas": "OpenBLAS pthread build",
+      "source_commit": "453756e9a047e973ebc40ea39ac9790d822a70c2"
+    }
+  },
+  "server": {
+    "prefork_workers": 1,
+    "threads_per_worker": 8,
+    "batch_size": 1,
+    "max_queue": 0,
+    "queue_timeout_ms": 0,
+    "worker_affinity": "CPUs 0-7"
+  },
+  "streaming": {
+    "first_chunk_ramp": [1, 2, 4],
+    "decode_chunk": 4,
+    "decode_chunk_busy": 0
+  },
+  "runtime": {
+    "precision": {
+      "talker_weights": "int8; AVX2 FMA widen/dequant GEMV reference",
+      "code_predictor_weights": "int8; CP precision explicitly int8",
+      "speech_decoder_weights": "fp32/BLAS control; AVX2 INT8 decoder unavailable",
+      "activations": "backend-native preparation with AVX2 FMA reference leaves",
+      "gemm_backend": "OpenBLAS prefill/decoder; AVX2 FMA matvec reference"
+    },
+    "environment": {
+      "OPENBLAS_THREAD_TIMEOUT": {"value": "1", "why": "park idle OpenBLAS workers instead of spinning against the engine pool"},
+      "OPENBLAS_NUM_THREADS": {"value": null, "why": "must remain absent so the engine owns BLAS sizing"},
+      "QWEN_BLAS_OWN": {"value": "1", "why": "engine-owned BLAS budget"},
+      "QWEN_CP_PREC": {"value": "int8", "why": "explicit CP precision"},
+      "QWEN_CP_PREFILL2": {"value": "1", "why": "experimental CP two-position prefill; opt-in on AVX2"},
+      "QWEN_DECODER_BATCH": {"value": "0", "why": "per-item decoder control used by the cross-v2 screen"},
+      "QWEN_POOL_SPIN": {"value": "4096", "why": "x86 reference spin value; not claimed optimal for larger Milan"},
+      "QWEN_PREFIX_CACHE": {"value": "1", "why": "shared v2 request-independent prefix cache"},
+      "QWEN_PREFILL_MATMAT": {"value": "1", "why": "request native prefill policy; AVX2 gate correctly resolves to FP32/SGEMM fallback"},
+      "QWEN_SERVER_ASYNC_OUTPUT": {"value": "0", "why": "retain synchronous output contract"},
+      "QWEN_STREAM_DECODE_CHUNK": {"value": "4", "why": "shared v2 streaming chunk reference"},
+      "QWEN_TTS_STREAM_LAYOUT": {"value": "1", "why": "shared known-text streaming layout"},
+      "QWEN_Q4_NAIVE": {"value": "0", "why": "do not select scalar Q4"},
+      "QWEN_SD_INT8": {"value": "1", "why": "requested but capability gate resolves OFF on AVX2"},
+      "QWEN_SD_INT8_BLK": {"value": "256", "why": "record decoder quantization block request"},
+      "QWEN_SD_POOL": {"value": "engine", "why": "engine-owned decoder/BLAS pool request"},
+      "QWEN_SD_RAG_MIN_PANELS": {"value": "2", "why": "shared decoder threshold; inactive for the per-item AVX2 fallback"},
+      "QWEN_SD_STREAM_STRIP": {"value": "0", "why": "unavailable on AVX2"},
+      "QWEN_SD_WINDOWED": {"value": "0", "why": "disable legacy windowed fallback"},
+      "QWEN_SD_AMX_BF16": {"value": "0", "why": "AMX unavailable"},
+      "QWEN_SD_AMX_D": {"value": "0", "why": "AMX unavailable"}
+    },
+    "selected_leaves": {
+      "talker_int8_b1": "avx2-fma-gemv",
+      "cp_int8_b1": "avx2-fma-gemv",
+      "prefill": "f32-blas-fallback",
+      "decoder": "f32-blas",
+      "avx2_integer_gemv_candidate": "OFF",
+      "avx2_q4_gemv_candidate": "OFF"
+    }
+  },
+  "qualification": {
+    "status": "unqualified",
+    "workload": "OSS qwen3-tts-0.6b, Ryan speaker, C1 closed-loop, 2 minutes measured after 10 seconds warmup, same bank and 4x8-capable single worker on control and treatment.",
+    "benchmark_family": "DIAGNOSTIC_CLOSED_LOOP",
+    "source_commit": "453756e9a047e973ebc40ea39ac9790d822a70c2",
+    "measured": {
+      "control_2m": {
+        "ttfa_p50_ms": 1019.3,
+        "ttfa_p95_ms": 1666.7,
+        "stream_rtf_p50": 0.7957,
+        "stream_rtf_p95": 0.8883,
+        "safe_start_p50_ms": 1490.1,
+        "safe_start_p95_ms": 2174.9,
+        "stall250_pct": 0.0,
+        "stall500_pct": 0.0,
+        "completed": 11,
+        "errors": 0,
+        "rejects": 0,
+        "timeouts": 0
+      },
+      "cross_v2_2m": {
+        "ttfa_p50_ms": 829.0,
+        "ttfa_p95_ms": 1034.4,
+        "stream_rtf_p50": 0.8854,
+        "stream_rtf_p95": 0.9884,
+        "safe_start_p50_ms": 1453.0,
+        "safe_start_p95_ms": 1613.0,
+        "stall250_pct": 10.0,
+        "stall500_pct": 10.0,
+        "completed": 11,
+        "errors": 0,
+        "rejects": 0,
+        "timeouts": 0
+      }
+    },
+    "interpretation": "PARTIAL: cross-v2 flags reduced TTFA p95 by 38% and safe-start p95 by 26%, but worsened STREAM p95 from 0.888 to 0.988 and introduced 10% stall@250/@500 in this short C1 sample. Do not promote; remeasure on a larger Milan before selecting a product profile.",
+    "status_matrix": {
+      "IMPLEMENTED": "YES; configuration records the tested flag set",
+      "PARITY_VERIFIED": "NOT_APPLICABLE_TO_FLAG_BUNDLE; serving run had zero errors and runtime gates selected valid AVX2 fallbacks",
+      "PERFORMANCE_VERIFIED": "NO; diagnostic 2-minute A/B only",
+      "DEFAULT_PROMOTED": "NO"
+    }
+  },
+  "launch": {
+    "executable": "./qwen_tts",
+    "server_env_serialization": "comma"
+  }
+}

@@ -665,3 +665,38 @@ for the complete 28-layer roof: FMA reference `25.89 ms / 54.4 GB/s` versus cand
 `82.52 ms / 17.1 GB/s` at 8T. It remains default-off and is not promoted. The Q4 candidate
 was selected by its dispatch A/B and passed self-test/adversarial coverage, but no complete
 Q4 B1 performance verdict was claimed here.
+
+## 22. GCP AMD Milan AVX2 cross-v2 C1 screen (2026-09-16)
+
+After the default AVX2/FMA screen, the same OSS `qwen3-tts-0.6b` C1 workload was run for
+two minutes with the shared v2/server flags that are meaningful on AVX2: engine-owned BLAS,
+parked OpenBLAS, CP INT8 with `QWEN_CP_PREFILL2=1`, per-item decoder, prefix cache,
+`QWEN_STREAM_DECODE_CHUNK=4`, stream layout, and `QWEN_POOL_SPIN=4096`. AVX2 integer/Q4
+candidate kernels stayed off. VNNI/AMX/BF16-native/KAI leaves were not fabricated: the
+runtime dispatch map reported their capability gates as unavailable and selected the
+existing AVX2 FMA plus FP32/BLAS fallbacks.
+
+The first treatment was compared with a new, same-duration two-minute control using the
+same binary, bank, speaker, worker mask, warmup and port-independent launch. Both runs
+completed 11 requests with zero errors, rejects or timeouts:
+
+| C1 0.6B, 2-minute screen | TTFA p95 | safe-start p95 | STREAM RTF p95 | stall@250/@500 |
+|---|---:|---:|---:|---:|
+| AVX2 control | 1667 ms | 2175 ms | 0.888 | 0% / 0% |
+| cross-v2 flags | 1034 ms | 1613 ms | 0.988 | 10% / 10% |
+
+Verdict: **PARTIALLY IMPROVED, NOT A WIN**. The cross-v2 bundle materially improved first-audio
+and safe-start tails, but spent nearly all playback margin and introduced stalls in this
+short run. It is recorded as an unqualified diagnostic profile in
+`configs/perf/gcp-milan-8c-avx2-v2-cross-screen.json`; it is not a default or product
+recommendation. The next useful test on a larger Milan is to keep this bundle as the
+candidate, repeat the same control/treatment at C1/C2, and then isolate CP prefill2,
+decoder-batch policy and stream chunk if the trade-off persists. No v2 scheduler claim is
+made from this screen.
+
+| property | status | evidence / limitation |
+|---|---|---|
+| IMPLEMENTED | YES | unqualified Milan cross-v2 config records exact flags and measured screen |
+| PARITY VERIFIED | STRUCTURAL/runtime-safe | zero errors/rejects/timeouts; capability gates selected valid AVX2 fallbacks |
+| PERFORMANCE VERIFIED | NO | two-minute C1 A/B only; playback trade-off is unresolved |
+| DEFAULT/PROMOTED | NO | the bundle is not promoted |

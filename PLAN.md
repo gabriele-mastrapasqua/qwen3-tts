@@ -132,6 +132,11 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       passed but complete 28-layer performance was negative (82.52 ms vs 25.89 ms FMA),
       so it remains opt-in/default-off. Q4 candidate dispatch/parity passed; performance
       remains unverified. Detail: addendum §21.
+- [x] LEGACY-CPU-AMD-MILAN-V2-SCREEN: the 0.6B C1 two-minute cross-v2 flag bundle reduced
+      TTFA p95 1667->1034 ms and safe-start p95 2175->1613 ms, but worsened STREAM p95
+      0.888->0.988 and introduced 10% stall@250/@500 versus the same-duration control.
+      Classification: PARTIAL, unqualified and not promoted. Exact environment and raw
+      KPI comparison: `configs/perf/gcp-milan-8c-avx2-v2-cross-screen.json` and audit §22.
 
 ### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
 
