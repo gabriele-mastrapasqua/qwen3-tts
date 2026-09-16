@@ -898,34 +898,35 @@ did not move all session however much the decode kernels improved. It does nothi
 RTF, which is already bounded by the batched matmat and its memory roof (§14.11).
 
 
-### 14.17 Concurrency ladder on a strong GPU, and what it confirms (WIP)
+### 14.17 Concurrency ladder on a strong GPU (WIP), and a sparse-ladder mistake
 
-RTX PRO 6000 Blackwell (97 GB), 30 cores, CUDA 12.8, 0.6B, all resident paths, `--prefork-threads
-8`, length-varied corpus. Four two-minute screens. Full table and the exact command in
-`docs/cuda-performance.md`.
+RTX PRO 6000 Blackwell (97 GB), 30 cores, CUDA 12.8, 0.6B, all resident paths,
+`--prefork-threads 8`, length-varied corpus. Eight two-minute screens. Full table with every
+metric and the exact command in `docs/cuda-performance.md`.
 
-| | C2 | C4 | **C8** | C12 | C16 |
-| --- | --- | --- | --- | --- | --- |
-| RTF p50 | 0.19 | 0.25 | **0.36** | 0.69 | 0.85 |
-| safe_play_start p50/p95 | 49/110 ms | 59/125 ms | **94/189 ms** | 183/564 ms | 408/749 ms |
-| max_gap p95 | 0.21 s | 0.29 s | **0.38 s** | 0.61 s | 0.75 s |
-| stall @100 / @250 ms | 0 / 0% | 0 / 0% | **0 / 0%** | 22 / 12% | 94 / 41% |
-| requests / 2 min | 119 | 158 | **220** | 178 | 192 |
+| | C2 | C4 | C8 | C9 | C10 | **C11** | C12 | C16 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RTF p50 | 0.19 | 0.25 | 0.36 | 0.41 | 0.41 | **0.47** | 0.69 | 0.86 |
+| safe_play_start p50/p95 | 49/110 | 59/125 | 94/189 | 102/251 | 107/226 | **104/237** | 183/564 | 408/749 ms |
+| max_gap p95 | 0.21 | 0.29 | 0.38 | 0.44 | 0.45 | **0.46** | 0.61 | 0.75 s |
+| stall @100 / @250 ms | 0/0% | 0/0% | 0/0% | 2/0% | 2/0% | **2/0%** | 22/12% | 94/41% |
+| requests / 2 min | 119 | 158 | 220 | 213 | 236 | **238** | 178 | 192 |
+| audio-s / wall-s | 10.5 | 16.0 | 22.2 | 21.4 | **24.1** | 23.0 | 17.4 | 18.8 |
 
-Three things worth keeping.
+**C8 to C11 is a plateau and C12 is a cliff.** Across the plateau stalls stay at 0% from 250 ms
+upward, safe_play_start stays near 105/240 ms, and throughput climbs to 238. One rung further
+costs 12% of stalls at 250 ms, doubles safe_play_start p95, and drops throughput by a quarter.
 
-**The knee is C8, judged on the envelope.** Stalls are zero at every threshold there, and
-safe_play_start is an order of magnitude under the one-second line. C12 would pass an RTF test
-and a safe_play_start test and is stalling 22% of the time at 100 ms, which is the same ordering
-seen on the A6000 at C6 (RTF 0.90 with stall@1000 at 35%): the listening metrics go first.
+**The mistake, recorded because it was mine and it was already published.** The first pass ran
+C2/C4/C8/C12/C16 and concluded that C8 was the last clean rung and that throughput peaked there
+— which agreed exactly with the batched kernel's per-stream optimum at B=8 (§14.9). Two
+independent routes to the same number is the strongest kind of evidence, and that is why it went
+into three documents and was pushed. Filling in C9, C10 and C11 dissolved it: the plateau runs to
+C11 and throughput peaks at C10-C11, so the agreement was an artifact of where the ladder
+happened to stop. A doubling ladder establishes "the highest rung MEASURED clean" and never "the
+highest rung that is clean", and the elegance of a coincidence is not evidence for it.
 
-**Throughput peaks at C8 and falls at C12**, 220 requests to 178. Past that, concurrency buys
-queueing rather than work — and it is the same width at which the batched kernel's per-stream
-cost bottoms out (§14.9: 1.34 ms at B=8, 1.43 at B=12, 1.47 at B=16, measured on an A6000 with
-`--gpu-batch-bench`). Two independent routes to the same number.
-
-**The admission stall of §14.15 does not appear here.** max_gap p95 is 0.21-0.38 s through C8
-against ~2.0 s on the A6000, and the prefill is host work: this box has 30 cores against 10. That
-supports the diagnosis rather than contradicting it, and it means the GPU-prefill project of §15
-is worth most on boxes whose CPU is small relative to their GPU — which is the usual shape of a
-rented inference box.
+**The admission stall of §14.15 does not appear here.** max_gap p95 is 0.21-0.46 s across the
+whole plateau against ~2.0 s on the A6000, and the prefill is host work: this box has 30 cores
+against 10. That supports the diagnosis and says where the GPU-prefill project of §15 would pay
+most — boxes whose CPU is small relative to their GPU, the usual shape of a rented inference box.

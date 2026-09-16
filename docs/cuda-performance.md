@@ -130,38 +130,54 @@ quality rather than capacity. The knee scales with GPU memory bandwidth, not wit
 code predictor reads ~2.24 GB of weights per audio frame regardless of how many requests share
 them, so the concurrency a card holds tracks its bandwidth almost linearly.
 
-### RTX PRO 6000 Blackwell — 2026-09-16 (WIP screen, not a qualification)
+### RTX PRO 6000 Blackwell — 2026-09-16 (WIP screens, not a qualification)
 
-**Status: WORK IN PROGRESS.** Four two-minute screens on one box. It is enough to locate the
-knee and to show the shape of the failure; it is not a qualification, and the per-class drift
-gate reports FAIL on every rung for the reason given at the end of this section.
+**Status: WORK IN PROGRESS.** Eight two-minute screens on one box. Enough to locate the knee and
+to show the shape of the degradation; not a qualification, and the per-class drift gate reports
+FAIL on every rung for the reason at the end of this section.
 
-RTX PRO 6000 Blackwell Server Edition (97 GB), 30 cores, CUDA 12.8, 0.6B, `--precision default`:
+RTX PRO 6000 Blackwell Server Edition (97 GB), 30 cores, CUDA 12.8, 0.6B, `--precision default`.
+Steady-state window (65-110 s); p50 unless marked.
 
-| | C2 | C4 | **C8** | C12 | C16 |
-| --- | --- | --- | --- | --- | --- |
-| RTF p50 | 0.19 | 0.25 | **0.36** | 0.69 | 0.85 |
-| TTFB p50 | 14 ms | 15 ms | **20 ms** | 22 ms | 42 ms |
-| TTFA p50 | 48 ms | 56 ms | **90 ms** | 120 ms | 162 ms |
-| safe_play_start p50/p95 | 49 / 110 ms | 59 / 125 ms | **94 / 189 ms** | 183 / 564 ms | 408 / 749 ms |
-| max_gap p95 | 0.21 s | 0.29 s | **0.38 s** | 0.61 s | 0.75 s |
-| stall @100 ms | 0% | 0% | **0%** | 22% | 94% |
-| stall @250 ms | 0% | 0% | **0%** | 12% | 41% |
-| stall @500 ms | 0% | 0% | **0%** | 1% | 3% |
-| stall @1000 ms | 0% | 0% | **0%** | 0% | 0% |
-| requests / 2 min | 119 | 158 | **220** | 178 | 192 |
+| | C2 | C4 | C8 | C9 | C10 | **C11** | C12 | C16 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RTF p50 | 0.19 | 0.25 | 0.36 | 0.41 | 0.41 | **0.47** | 0.69 | 0.86 |
+| RTF p95 | 0.23 | 0.30 | 0.40 | 0.48 | 0.46 | **0.55** | 0.88 | 0.98 |
+| TTFB p50 | 14 | 15 | 20 | 19 | 21 | **20** | 22 | 41 ms |
+| TTFB p95 | 20 | 38 | 72 | 78 | 91 | **93** | 100 | 152 ms |
+| TTFA p50 | 48 | 62 | 90 | 92 | 98 | **93** | 119 | 150 ms |
+| TTFA p95 | 110 | 133 | 189 | 199 | 180 | **179** | 228 | 339 ms |
+| safe_play_start p50 | 49 | 59 | 94 | 102 | 107 | **104** | 183 | 408 ms |
+| safe_play_start p95 | 110 | 125 | 189 | 251 | 226 | **237** | 564 | 749 ms |
+| max_gap p95 | 0.21 | 0.29 | 0.38 | 0.44 | 0.45 | **0.46** | 0.61 | 0.75 s |
+| stall @100 ms | 0% | 0% | 0% | 2% | 2% | **2%** | 22% | 94% |
+| stall @250 ms | 0% | 0% | 0% | 0% | 0% | **0%** | 12% | 41% |
+| stall @500 ms | 0% | 0% | 0% | 0% | 0% | **0%** | 1% | 3% |
+| stall @1000 ms | 0% | 0% | 0% | 0% | 0% | **0%** | 0% | 0% |
+| requests / 2 min | 119 | 158 | 220 | 213 | 236 | **238** | 178 | 192 |
+| audio-s / wall-s | 10.5 | 16.0 | 22.2 | 21.4 | **24.1** | 23.0 | 17.4 | 18.8 |
 
-**C8 is the last clean rung**, and the judgement is on the whole envelope rather than on RTF:
-stalls are zero at every threshold, safe_play_start is an order of magnitude under one second,
-TTFB is 20 ms and TTFA 90 ms. C12 still has RTF 0.69 and safe_play_start under a second, and is
-already stalling 22% of the time at 100 ms — the listening metrics fail FIRST, which is why a
-concurrency is never declared on RTF alone.
+**C11 is the highest clean rung.** Everything from C8 to C11 sits on a plateau: stalls are 0% from
+250 ms upward (2% at the tightest 100 ms threshold from C9), safe_play_start stays near
+105 / 240 ms — an order of magnitude under the one-second line — TTFB is ~20 ms and TTFA ~95 ms,
+and throughput keeps climbing to 238 requests.
 
-**Throughput peaks at C8 and falls at C12** (220 requests, then 178). Past that point extra
-concurrency buys queueing rather than work, and it lands on the same number the kernel does from
-a completely different direction: per-stream code-predictor cost measured 2.05 ms at B=4,
-**1.34 at B=8**, 1.43 at B=12 and 1.47 at B=16 on an A6000. The kernel optimum and the server's
-throughput peak are the same batch width.
+**The break is between C11 and C12, and it is a cliff, not a slope.** One rung costs 12% of
+stalls at 250 ms where there were none, doubles safe_play_start p95 from 237 to 564 ms, and drops
+throughput from 238 requests to 178. Concurrency past that point buys queueing rather than work:
+audio-seconds per wall-second peak at **24.1 around C10** and fall to 17.4 at C12.
+
+The judgement is on the whole envelope, never on RTF. C12 would pass an RTF test at 0.69 and a
+safe_play_start test at 183/564 ms while stalling 22% of the time at 100 ms. The listening
+metrics fail first — the A6000 showed the same ordering at C6, RTF 0.90 with a 35% stall rate at
+1000 ms.
+
+A note on how this table was arrived at, because it matters for reading any ladder. The first
+pass ran C2/C4/C8/C12/C16 and concluded that C8 was the last clean rung and that throughput
+peaked there — which happened to coincide with the batched kernel's own per-stream optimum at
+B=8, an elegant agreement. Filling in C9, C10 and C11 dissolved both claims: the plateau extends
+to C11 and throughput peaks at C10-C11. "The highest rung measured clean" and "the highest rung
+that is clean" are different statements, and a doubling ladder only ever establishes the first.
 
 ### The exact configuration behind that table
 
@@ -175,13 +191,14 @@ QWEN_CUDA_BATCH=1 QWEN_CUDA_BATCH_COMPACT=1 \
 Closed-loop clients from `tests/soak_client.py`, two minutes per rung, `--speaker ryan
 --language English --temperature 0.9 --schedule stratified --schedule-seed 42`, text bank
 `tests/load_texts_en.txt`: 21 items over five classes from 4 words (short) to 59 (long), so the
-load is length-varied rather than one repeated sentence. Analysed with `tests/soak_drift.py`
-at `--warmup-s 20 --window-s 45`.
+load is length-varied rather than one sentence repeated. Analysed with `tests/soak_drift.py` at
+`--warmup-s 20 --window-s 45`. `audio-s / wall-s` is C divided by RTF p50, the unit vLLM-Omni
+reports, so the row is comparable with published figures for other engines.
 
-`SOAK RESULT: FAIL — per-class KPI drift` on every rung, including those with 0% stalls. That
+`SOAK RESULT: FAIL — per-class KPI drift` on every rung, including those with zero stalls. That
 gate measures drift BETWEEN text classes across 45-second windows, and with mixed lengths and a
-few dozen samples per class it does not settle on a screen this short. It is not a serving
-defect and it is not evidence of one; it is also not something to weaken in order to see green.
+few dozen samples per class it does not settle on a screen this short. It is not a serving defect
+and not evidence of one, and it is not something to weaken in order to see green.
 
 ### Two configuration traps that silently cost most of the server
 
