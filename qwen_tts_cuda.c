@@ -102,22 +102,63 @@ static float *cuda_io(float **buf, size_t *cap, size_t need) {
     return *buf;
 }
 
+/* Seam accounting, CUDA-only and default off.
+ *
+ * The serving trace puts 43% of server wall time in admission, and the admission prefill routes
+ * its matmats through THIS function rather than through the resident batched path: the hook is
+ * installed for the whole process, so `qwen_matmat_bf16` lands here. Before rewriting the prefill
+ * onto the resident path it is worth knowing which part of the 2 s is actually here -- the
+ * transfers, the GEMM -- and which part is the norms, RoPE and attention that stay on the host.
+ *
+ * QWEN_CUDA_SEAM_STATS=1 reports on exit. */
+static long long g_seam_calls = 0;
+static double g_seam_ms = 0, g_seam_h2d_ms = 0, g_seam_d2h_ms = 0, g_seam_gemm_ms = 0;
+static double g_seam_h2d_mb = 0, g_seam_d2h_mb = 0;
+void qwen_cuda_seam_stats_report(void);
+static int seam_stats_on(void) {
+    static int t = -1;
+    if (t < 0) { const char *e = getenv("QWEN_CUDA_SEAM_STATS"); t = (e && e[0] && e[0] != '0');
+                 if (t) atexit(qwen_cuda_seam_stats_report); }
+    return t;
+}
+static double seam_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+void qwen_cuda_seam_stats_report(void) {
+    if (!seam_stats_on() || g_seam_calls == 0) return;
+    fprintf(stderr,
+            "[SEAM] calls=%lld  total %.0f ms  |  H2D %.0f ms (%.0f MB)  GEMM %.0f ms  D2H %.0f ms (%.0f MB)\n"
+            "[SEAM] per call: %.3f ms  |  transfers are %.0f%% of seam time\n",
+            g_seam_calls, g_seam_ms, g_seam_h2d_ms, g_seam_h2d_mb, g_seam_gemm_ms,
+            g_seam_d2h_ms, g_seam_d2h_mb, g_seam_ms / (double)g_seam_calls,
+            100.0 * (g_seam_h2d_ms + g_seam_d2h_ms) / (g_seam_ms > 0 ? g_seam_ms : 1));
+}
 void qwen_cuda_matmat_bf16(void *ctx, float *Y, const uint16_t *W,
                            const float *X, int rows, int cols, int B) {
     qwen_cuda_ctx *c = ctx;
+    const int st = seam_stats_on();
+    const double t_in = st ? seam_now_ms() : 0;
     float *dW = cuda_weight(c, W, (size_t)rows * cols);
     float *dX = cuda_io(&c->dX, &c->dX_cap, (size_t)cols * B * sizeof(float));
     float *dY = cuda_io(&c->dY, &c->dY_cap, (size_t)rows * B * sizeof(float));
     if (!dW || !dX || !dY) { fprintf(stderr, "CUDA: alloc failed\n"); return; }
+    double t0 = st ? seam_now_ms() : 0;
     cudaMemcpy(dX, X, (size_t)cols * B * sizeof(float), cudaMemcpyHostToDevice);
+    if (st) { double t1 = seam_now_ms(); g_seam_h2d_ms += t1 - t0;
+              g_seam_h2d_mb += (double)cols * B * sizeof(float) / 1e6; t0 = t1; }
 
     const float alpha = 1.0f, beta = 0.0f;
     cublasSgemm(c->handle, CUBLAS_OP_N, CUBLAS_OP_N,
                  B,  rows,  cols,
                 &alpha, dX,  B, dW,  cols,
                 &beta,  dY,  B);
+    if (st) { cudaStreamSynchronize(0); double t1 = seam_now_ms(); g_seam_gemm_ms += t1 - t0; t0 = t1; }
 
     cudaMemcpy(Y, dY, (size_t)rows * B * sizeof(float), cudaMemcpyDeviceToHost);
+    if (st) { g_seam_d2h_ms += seam_now_ms() - t0;
+              g_seam_d2h_mb += (double)rows * B * sizeof(float) / 1e6;
+              g_seam_ms += seam_now_ms() - t_in; g_seam_calls++; }
 }
 
 void qwen_cuda_matvec_bf16(void *ctx, float *y, const uint16_t *W,

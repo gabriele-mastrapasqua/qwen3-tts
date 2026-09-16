@@ -759,65 +759,6 @@ static inline int tc_usable(int rows,int cols,int B){
            && (size_t)tc_ksplit(rows,cols)*TC_M*rows<=TC_PART_FLOATS;
 }
 
-/* Register blocking: R output rows per warp instead of one.
- *
- * ncu says this kernel is latency-bound -- 22% DRAM, 36% compute, nothing saturated -- and the
- * load mix says why. With one row per warp and B lanes, an iteration issues one weight load and
- * B activation loads for B fused multiply-adds: nine loads for eight FMAs, and eight of those
- * nine are activations every warp fetches for itself even though the warp next door wants the
- * same columns.
- *
- * Giving a warp R rows lets one activation load feed R multiplies. At B=8 the ratio goes from
- * nine loads per eight FMAs to twelve per thirty-two, a threefold cut in issued loads per unit
- * of arithmetic, and it cuts L1 traffic by R as well since the activations are fetched by
- * rows/R warps instead of by rows of them.
- *
- * This is the piece the shared-memory attempt was missing. Staging activations in shared failed
- * because a block of eight warps covers eight rows, so the staged tile was larger than the
- * weight tile the block consumed and there was nothing to reuse. Reuse has to come from a warp
- * owning several rows; shared memory is the optimisation that comes AFTER that, not instead.
- *
- * Bit-identical: a lane still walks columns lane, lane+32, lane+64 ... in order, accumulating
- * into the same per-row accumulator, so every rounding falls where it did. Only the assignment
- * of rows to warps changes, and rows are independent. */
-template<int NB,int R>
-__global__ void k_matmat_bf16_rb(const __nv_bfloat16 *__restrict__ W,const float *__restrict__ X,
-                                 float *__restrict__ Y,int rows,int cols,int B){
-    const int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
-    const int r0=warp*R; if(r0>=rows) return;
-    const int nr=(rows-r0<R)?(rows-r0):R;
-    float acc[R][NB];
-    #pragma unroll
-    for(int r=0;r<R;++r)
-        #pragma unroll
-        for(int b=0;b<NB;++b) acc[r][b]=0.f;
-    for(int i=lane;i<cols;i+=32){
-        float xv[NB];
-        #pragma unroll
-        for(int b=0;b<NB;++b) if(b<B) xv[b]=X[(size_t)b*cols+i];
-        #pragma unroll
-        for(int r=0;r<R;++r){ if(r>=nr) break;
-            const float w=__bfloat162float(W[(size_t)(r0+r)*cols+i]);
-            #pragma unroll
-            for(int b=0;b<NB;++b) if(b<B) acc[r][b]+=w*xv[b]; }
-    }
-    #pragma unroll
-    for(int r=0;r<R;++r){ if(r>=nr) break;
-        #pragma unroll
-        for(int b=0;b<NB;++b){ if(b>=B) break; float v=acc[r][b];
-            #pragma unroll
-            for(int o=16;o>0;o>>=1) v+=__shfl_down_sync(0xffffffffu,v,o);
-            if(lane==0) Y[(size_t)b*rows+(r0+r)]=v; } }
-}
-/* Rows per warp. 1 is the old kernel; swept on hardware because more rows means fewer warps,
- * and the trade between reuse and occupancy is not decidable on paper. */
-static int mm_rb(void){
-    static int r=-1;
-    if(r<0){ const char *e=getenv("QWEN_CUDA_MM_RB"); r=e&&*e?atoi(e):1;
-             if(r!=1&&r!=4) r=1; }   /* only R=4 is instantiated; see the dispatch */
-    return r;
-}
-
 /* Block size for the batched matmats, swept on hardware.
  *
  * ncu on the rows=1024 shapes reported Waves Per SM 0.25 and achieved occupancy 25% against a
@@ -875,15 +816,19 @@ static inline void mvB(int prec,const void*W,const float*scale,const float*X,flo
     int grid=CEIL(rows*32,tpb);
     if(prec!=0){
 #define MMQ(NB) do{ if(prec==2) k_matmat_q4_0_u<NB><<<grid,tpb>>>((const q4blk*)W,X,Y,rows,cols,B); \
-                    else if(prec==0 && mm_rb()>1){
-        /* Two instantiations only. Expanding R over all fifteen lane counts as the other paths do
-         * added 45 kernels and took nvcc past 25 minutes; NB is rounded up to 8 or 16 instead,
-         * which the `b<B` guards already tolerate at the cost of a few idle registers. */
-        const int R=mm_rb(), tpbr=mm_tpb();
-        int gridr=CEIL(CEIL(rows,R)*32,tpbr);
-        if(B<=8) k_matmat_bf16_rb<8,4><<<gridr,tpbr>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
-        else     k_matmat_bf16_rb<16,4><<<gridr,tpbr>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
-        (void)R;
+                    else { int u=mm_unroll(); \
+                           if(u==16)     k_matmat_int8_u<16,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
+                           else if(u==8) k_matmat_int8_u< 8,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
+                           else          k_matmat_int8_u< 4,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); } }while(0)
+      switch(B){
+        case  1: MMQ( 1); break;  case  2: MMQ( 2); break;  case  3: MMQ( 3); break;
+        case  4: MMQ( 4); break;  case  5: MMQ( 5); break;  case  6: MMQ( 6); break;
+        case  7: MMQ( 7); break;  case  8: MMQ( 8); break;  case  9: MMQ( 9); break;
+        case 10: MMQ(10); break;  case 11: MMQ(11); break;  case 12: MMQ(12); break;
+        case 13: MMQ(13); break;  case 14: MMQ(14); break;  case 15: MMQ(15); break;
+        default: MMQ(QB_MAX); break;
+      }
+#undef MMQ
     }
     else { int u=mm_unroll(); \
                            if(u==16)     k_matmat_int8_u<16,NB><<<grid,tpb>>>((const int8_t*)W,scale,X,Y,rows,cols,B); \
@@ -898,6 +843,15 @@ static inline void mvB(int prec,const void*W,const float*scale,const float*X,flo
         default: MMQ(QB_MAX); break;
       }
 #undef MMQ
+    }
+    else if(mm_rb()>1){
+        /* Two instantiations only. Expanding R over all fifteen lane counts the way the other
+         * paths do adds 45 kernels and takes nvcc past 25 minutes; NB is rounded up to 8 or 16
+         * instead, which the `b<B` guards already tolerate at the cost of a few idle registers. */
+        const int tpbr=mm_tpb();
+        int gridr=CEIL(CEIL(rows,mm_rb())*32,tpbr);
+        if(B<=8) k_matmat_bf16_rb< 8,4><<<gridr,tpbr>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
+        else     k_matmat_bf16_rb<16,4><<<gridr,tpbr>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B);
     }
     else { int u=mm_unroll();
 #define MM_U(NB) do{ if(u==16)     k_matmat_bf16_u<16,NB><<<grid,tpb>>>((const __nv_bfloat16*)W,X,Y,rows,cols,B); \
