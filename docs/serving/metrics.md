@@ -13,7 +13,8 @@ a GPU server, which is always single-process because a CUDA or Metal context doe
 curl -s http://127.0.0.1:9109/metrics
 ```
 
-Off by default. Bound to `127.0.0.1` unless you pass `--metrics-bind`.
+Off by default. Bound to `127.0.0.1` unless you pass `--metrics-bind`, and rate limited to
+**5 scrapes per second** unless you pass `--metrics-max-rate` (see below).
 
 ## What this is, and what it is not
 
@@ -78,6 +79,7 @@ failure a summed view hides, and the one the soak campaigns kept finding.
 | `qwen_tts_worker_cpus{worker}` | gauge | *`--prefork-elastic` only* — CPUs currently assigned |
 | `qwen_tts_elastic_replans_total` | counter | *`--prefork-elastic` only* — re-slicings |
 | `qwen_tts_rejected_total{reason}` | counter | refusals, by reason |
+| `qwen_tts_metrics_throttled_total` | counter | scrapes this endpoint refused with `429` |
 | `qwen_tts_timed_out_total{worker}` | counter | *single process only* — over the request budget |
 
 Useful queries:
@@ -88,6 +90,36 @@ qwen_tts_worker_inflight / qwen_tts_worker_slots               # saturation, per
 sum(rate(qwen_tts_rejected_total[5m])) by (reason)             # pressure, and of what kind
 max(qwen_tts_worker_inflight) - min(qwen_tts_worker_inflight)  # imbalance
 ```
+
+## Rate limiting — because the page is rendered in the dispatch loop
+
+The same decision that makes this endpoint free at a sane scrape interval is what makes a
+runaway client dangerous: in `--prefork` the page is rendered **inside the parent's dispatch
+loop**. A `watch -n 0.01 curl` or a scraper misconfigured to 10 ms would buy itself a hundred
+renders a second out of the budget that hands requests to workers.
+
+So the endpoint serves at most `--metrics-max-rate` scrapes per second (**default 5**) and
+refuses the rest with `429 Too Many Requests` and a `Retry-After`. `--metrics-max-rate 0`
+disables the limit.
+
+- **A token bucket, not a minimum interval**, for the same reason DynamoDB uses one: a fixed
+  floor punishes the legitimate case — Prometheus and somebody's `curl` landing in the same
+  millisecond — while doing nothing about a sustained flood. The bucket holds `2 × rate` tokens,
+  so short bursts pass and the average is capped.
+- **A refusal is cheaper than an answer**, or the limit funds the attack: the `429` path does
+  not render the page.
+- **Refusals do not consume tokens.** A client hammering at 100/s gets the configured rate
+  served and the rest refused, rather than locking out everyone including itself.
+- **The refusals are on the page**: `qwen_tts_metrics_throttled_total`. Nonzero means something
+  is polling too fast — not that the server is unhealthy.
+
+Default sizing: a 5 s `scrape_interval` is 0.2 scrapes/s, and even three independent scrapers
+plus `metrics_watch.py` at 1 s stays under 1.5/s. The default of 5/s is generous for anything
+real and still caps an accident at a cost the parent cannot feel.
+
+**Honest scope: this is QoS against accident, not DDoS protection.** A hostile flood is a
+firewall's problem, and the port is loopback-bound by default precisely so that it is not
+reachable to flood in the first place.
 
 ## Two honest limits, stated on the page itself
 
@@ -114,8 +146,10 @@ restart and silently drops the interval), **conserved** (`completed <= dispatche
 
 `tests/serve_metrics.sh` is the regression gate: it proves the flag is refused outside server
 mode and on the service port, that a plain server omits counters it does not maintain, that a
-batched server's counters move with traffic, that nothing listens by default, and — on Linux —
-that the prefork parent emits one distinct series set per worker and every worker moves.
+batched server's counters move with traffic, that nothing listens by default, that fast polling
+is refused with `429` while a served scrape stays a complete page and `--metrics-max-rate 0`
+turns the limit off, and — on Linux — that the prefork parent emits one distinct series set per
+worker and every worker moves.
 
 ## Seeing it in a dashboard
 

@@ -10,6 +10,10 @@
 # enough to see a wave arrive and a worker stall inside one screen. 15s is the usual production
 # value and costs the server nothing either way -- the page is rendered on demand and the
 # server does no work between scrapes.
+#
+# Mind the endpoint's own limit: it serves --metrics-max-rate scrapes per second (default 5)
+# and answers 429 above that. 5s here is 0.2/s, so there is room for several scrapers; an
+# interval below 200ms would start being refused. Watch qwen_tts_metrics_throttled_total.
 global:
   scrape_interval: 5s
   evaluation_interval: 5s

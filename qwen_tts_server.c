@@ -1568,9 +1568,55 @@ static struct {
 static int g_metrics_port = 0;
 static const char *g_metrics_bind = "127.0.0.1";
 
+/* Quality of service for the scrape port.
+ *
+ * Rendering a page is cheap, but in --prefork it happens INSIDE the parent's dispatch loop,
+ * which is the same reason it costs nothing at a sane scrape interval and the reason a runaway
+ * client must not be allowed to set the pace.  A `watch -n 0.01 curl` or a scraper misconfigured
+ * to 10 ms would otherwise buy itself a hundred renders a second out of the budget that hands
+ * requests to workers.
+ *
+ * A token bucket rather than a minimum interval, for the same reason DynamoDB uses one: a fixed
+ * floor punishes the legitimate case where two scrapers -- Prometheus and somebody's curl --
+ * happen to land together, while doing nothing about a sustained flood.  The bucket absorbs the
+ * burst and caps the average.
+ *
+ * Refusal is 429 with Retry-After, which is what the scrapers already understand, and it does
+ * NOT render the page: a refusal must be cheaper than an answer or the limit funds the attack.
+ * Refused requests do not consume tokens, so a client hammering at 100/s gets the configured
+ * rate served and the rest refused, instead of locking everyone out including itself.
+ *
+ * Honest scope: this is QoS against accident -- a runaway loop, a bad scrape_interval -- not
+ * DDoS protection.  A hostile flood is a firewall's problem, and the port is loopback-bound by
+ * default precisely so that it is not reachable to flood. */
+static double srv_now_ms(void);             /* defined with the request-timing helpers below */
+static double g_metrics_rate = 5.0;         /* served scrapes per second; 0 disables the limit */
+static double g_metrics_tokens = 0.0;
+static double g_metrics_bucket_ms = 0.0;
+static unsigned long long g_metrics_throttled = 0;
+
 void qwen_tts_server_set_metrics(int port, const char *bind_addr) {
     g_metrics_port = port;
     if (bind_addr && *bind_addr) g_metrics_bind = bind_addr;
+}
+
+void qwen_tts_server_set_metrics_rate(double per_second) {
+    g_metrics_rate = per_second > 0.0 ? per_second : 0.0;
+}
+
+/* Single-threaded by construction in both modes -- the prefork parent's dispatch loop, or the
+   one metrics thread of a single process -- so no atomics are needed here. */
+static int qwen_metrics_admit(void) {
+    if (g_metrics_rate <= 0.0) return 1;
+    const double burst = g_metrics_rate * 2.0 < 2.0 ? 2.0 : g_metrics_rate * 2.0;
+    const double now = srv_now_ms();
+    if (g_metrics_bucket_ms == 0.0) { g_metrics_bucket_ms = now; g_metrics_tokens = burst; }
+    g_metrics_tokens += (now - g_metrics_bucket_ms) * 0.001 * g_metrics_rate;
+    if (g_metrics_tokens > burst) g_metrics_tokens = burst;
+    g_metrics_bucket_ms = now;
+    if (g_metrics_tokens < 1.0) { g_metrics_throttled++; return 0; }
+    g_metrics_tokens -= 1.0;
+    return 1;
 }
 
 /* Deliberately not setup_listen_socket(): that one sets SO_REUSEPORT, which is right for the
@@ -1620,6 +1666,12 @@ static size_t qwen_metrics_render(char *b, size_t cap) {
          "qwen_tts_build_info{git_rev=\"%s\",source_fp=\"%s\",simd=\"%s\",mode=\"%s\"} 1\n",
          QWEN_BUILD_GIT_REV, QWEN_BUILD_SOURCE_FP, QWEN_BUILD_SIMD,
          prefork ? "prefork" : "single");
+
+    QM_P("# HELP qwen_tts_metrics_throttled_total Scrapes this endpoint refused with 429 "
+         "because they exceeded --metrics-max-rate. Nonzero means something is polling too "
+         "fast, not that the server is unhealthy.\n"
+         "# TYPE qwen_tts_metrics_throttled_total counter\n"
+         "qwen_tts_metrics_throttled_total %llu\n", g_metrics_throttled);
 
     QM_P("# HELP qwen_tts_workers Processes serving requests.\n"
          "# TYPE qwen_tts_workers gauge\n"
@@ -1739,6 +1791,31 @@ static void qwen_metrics_answer(int cfd) {
     }
     for (int i = 0; i < 4; i++) { ssize_t r = recv(cfd, junk, sizeof junk, 0); if (r <= 0) break; }
 
+    if (!qwen_metrics_admit()) {
+        /* Retry-After is integer seconds by the HTTP grammar, so a sub-second budget cannot be
+           expressed there; the body carries the exact figure for a human reading it by hand. */
+        char body[192];
+        int bn = snprintf(body, sizeof body,
+                          "rate limited: this endpoint serves at most %.3g scrape(s) per second "
+                          "(--metrics-max-rate; 0 disables). Slow your scrape_interval down.\n",
+                          g_metrics_rate);
+        char head[224];
+        int retry = (int)(1.0 / g_metrics_rate);
+        if (retry < 1) retry = 1;
+        int hn = snprintf(head, sizeof head,
+                          "HTTP/1.1 429 Too Many Requests\r\n"
+                          "Content-Type: text/plain; charset=utf-8\r\n"
+                          "Retry-After: %d\r\n"
+                          "Content-Length: %d\r\n"
+                          "Connection: close\r\n\r\n", retry, bn > 0 ? bn : 0);
+        if (hn > 0 && write(cfd, head, (size_t)hn) == (ssize_t)hn && bn > 0) {
+            ssize_t w = write(cfd, body, (size_t)bn); (void)w;
+        }
+        for (int i = 0; i < 4; i++) { ssize_t r = recv(cfd, junk, sizeof junk, 0); if (r <= 0) break; }
+        close(cfd);
+        return;
+    }
+
     size_t n = qwen_metrics_render(g_metrics.page, g_metrics.page_cap);
     char head[192];
     int hn = snprintf(head, sizeof head,
@@ -1754,6 +1831,13 @@ static void qwen_metrics_answer(int cfd) {
        sends RST, and a scraper that gets RST discards the response we just wrote. */
     for (int i = 0; i < 4; i++) { ssize_t r = recv(cfd, junk, sizeof junk, 0); if (r <= 0) break; }
     close(cfd);
+}
+
+static const char *qwen_metrics_rate_note(void) {
+    static char note[64];
+    if (g_metrics_rate <= 0.0) return "rate limit OFF";
+    snprintf(note, sizeof note, "max %.3g scrape/s", g_metrics_rate);
+    return note;
 }
 
 static int qwen_metrics_alloc_page(int workers) {
@@ -1804,8 +1888,8 @@ static void qwen_metrics_start_single(int batched) {
         return;
     }
     pthread_detach(t);
-    fprintf(stderr, "[serve] metrics: http://%s:%d/metrics (single process)\n",
-            g_metrics_bind, g_metrics_port);
+    fprintf(stderr, "[serve] metrics: http://%s:%d/metrics (single process, %s)\n",
+            g_metrics_bind, g_metrics_port, qwen_metrics_rate_note());
     if (!batched)
         fprintf(stderr, "[serve] metrics: this server keeps no request counters "
                         "(--batch-size 1, no --prefork), so the page carries build identity "
@@ -1841,8 +1925,8 @@ static int qwen_metrics_start_prefork(int workers, int cap, const int *active,
     g_metrics.rejected_tot   = rejected_tot;
     g_metrics.replans_tot    = replans_tot;
     fprintf(stderr, "[serve] metrics: http://%s:%d/metrics (prefork parent, %d workers, "
-                    "one series set per worker, never summed)\n",
-            g_metrics_bind, g_metrics_port, workers);
+                    "one series set per worker, never summed, %s)\n",
+            g_metrics_bind, g_metrics_port, workers, qwen_metrics_rate_note());
     return fd;
 }
 

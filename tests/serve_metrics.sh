@@ -7,6 +7,8 @@
 #      a page of zeros that look like measurements is worse than an absent series;
 #   3. a batched server publishes counters, and they MOVE with real traffic;
 #   4. without --metrics-port nothing listens at all;
+#   4b. a client polling too fast is refused with 429 and the refusals are counted on the page,
+#      and --metrics-max-rate 0 turns that off;
 #   5. on Linux, the prefork PARENT publishes one series set per worker, the sets are
 #      distinct, and every counter advances under real concurrent traffic.
 #
@@ -104,6 +106,39 @@ if start_server "--batch-size 4"; then
                        || bad "nothing listens without --metrics-port" "the port answered"
 else
     bad "default server starts" "no /v1/health within 90s"
+fi
+
+# 4b. rate limit: spam is refused, cheaply, and says so
+cleanup; sleep 1
+status() { timeout 3 curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$MPORT/metrics" 2>/dev/null; }
+burst()  { local n=$1 code hits=0; for _ in $(seq 1 "$n"); do code=$(status);            [ "$code" = "429" ] && hits=$((hits+1)); done; echo "$hits"; }
+
+if start_server "--batch-size 4 --metrics-port $MPORT --metrics-max-rate 2"; then
+    hits=$(burst 30)
+    [ "$hits" -gt 0 ] && ok "fast polling is refused with 429 ($hits/30)" \
+                      || bad "fast polling is refused with 429" "none refused in 30"
+    # the counter is on the page, so a served scrape can report how many were turned away
+    sleep 2
+    n=$(scrape | awk -F' ' '/^qwen_tts_metrics_throttled_total/ {print $2}')
+    { [ -n "${n:-}" ] && [ "$n" -gt 0 ]; } \
+        && ok "refusals are counted on the page ($n)" \
+        || bad "refusals are counted on the page" "throttled_total is '${n:-absent}'"
+    # and a scrape that IS served is still a complete page
+    sleep 2
+    lines=$(scrape | grep -c '^qwen_tts_')
+    [ "${lines:-0}" -ge 8 ] && ok "a served scrape is still a complete page ($lines series)" \
+                            || bad "a served scrape is still a complete page" "only ${lines:-0} series"
+else
+    bad "rate-limited server starts" "no /v1/health within 90s"
+fi
+cleanup; sleep 1
+
+if start_server "--batch-size 4 --metrics-port $MPORT --metrics-max-rate 0"; then
+    hits=$(burst 30)
+    [ "$hits" -eq 0 ] && ok "--metrics-max-rate 0 disables the limit" \
+                      || bad "--metrics-max-rate 0 disables the limit" "$hits/30 still refused"
+else
+    bad "unlimited server starts" "no /v1/health within 90s"
 fi
 
 # 5. prefork parent: one series set per worker, all of them moving (Linux only)

@@ -270,7 +270,22 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       Full observability example added: `configs/observability/` + `tools/observability_up.sh`,
       verified end to end with Prometheus 3.14 and Grafana 13.2 on the box (target `up`, four
       worker series in the TSDB, dashboard provisioned).
-- [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** Everything above was at 5 s. 1 s is
+- [x] OTEL-9 **QoS on the scrape port** (2026-09-17). The decision that makes the page free at a
+      sane interval — rendering inside the prefork parent's dispatch loop — is what made a
+      runaway client dangerous, so `--metrics-max-rate` (default 5 scrapes/s, `0` disables)
+      serves at most that and answers `429` + `Retry-After` above it. A token bucket holding
+      `2 x rate`, not a minimum interval, for the reason DynamoDB uses one: a fixed floor
+      punishes two scrapers landing together and does nothing about a sustained flood. The
+      refusal path does not render the page (a refusal must be cheaper than an answer, or the
+      limit funds the attack) and refusals do not consume tokens (a hammering client must not
+      lock out everyone including itself). Refusals are published as
+      `qwen_tts_metrics_throttled_total`. Verified on the Axion under C16 load: a 100-request
+      burst at full speed served 12 and refused 88, with the counter reading exactly 88, while
+      the Prometheus 5 s scrape stayed `up` throughout. Scope stated in the docs: QoS against
+      accident, not DDoS protection — a flood is a firewall's problem and the port is
+      loopback-bound by default.
+- [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** Note it is within the shipped default
+      limit (1/s against 5/s), so this is a cost question, not a behaviour one. Everything above was at 5 s. 1 s is
       5x the scrapes and should still be invisible, but it is a claim, not a measurement.
       The parent path is inside `#if defined(__linux__)` and is compiled out on macOS, so every
       line of it shipped unexecuted: the poll-set registration, the per-worker rendering, the

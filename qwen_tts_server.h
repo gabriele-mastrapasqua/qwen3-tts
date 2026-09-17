@@ -23,6 +23,9 @@ void qwen_topology_emit(int worker, int threads, const char *configured_mask,
 /* Enable the read-only metrics page on its own port.  Server mode only, and main.c refuses
  * the flag without --serve: there is nothing to publish about a one-shot CLI run. */
 void qwen_tts_server_set_metrics(int port, const char *bind_addr);
+/* Served scrapes per second, token bucket with a burst of twice the rate. 0 disables the
+ * limit. Refusals are 429 + Retry-After and do not render the page. */
+void qwen_tts_server_set_metrics_rate(double per_second);
 void qwen_tts_server_set_max_request_ms(int ms);
 void qwen_tts_server_set_max_text_chars(int chars);
 

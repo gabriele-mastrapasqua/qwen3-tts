@@ -768,6 +768,7 @@ int main(int argc, char **argv) {
     int serve_prefork_threads = 0;
     int metrics_port = 0;
     const char *metrics_bind = NULL;
+    double metrics_max_rate = -1.0;   /* <0 = leave the server default */
     const char *serve_cpu_mask = NULL;   /* --cpu-mask: benchmark control, see below */
     int serve_max_queue = -1;
     int serve_queue_timeout = 0;
@@ -907,6 +908,7 @@ int main(int argc, char **argv) {
         {"prefork-elastic", no_argument,       0, 1812},
         {"metrics-port",    required_argument, 0, 1814},
         {"metrics-bind",    required_argument, 0, 1815},
+        {"metrics-max-rate", required_argument, 0, 1816},
         {"ml-steer",      required_argument, 0, 1044},
         {"ml-weight",     required_argument, 0, 1045},
         {"ml-range",      required_argument, 0, 1046},
@@ -1051,6 +1053,7 @@ int main(int argc, char **argv) {
             case 1812: setenv("QWEN_PREFORK_ELASTIC", "1", 1); break;
             case 1814: metrics_port = atoi(optarg); break;
             case 1815: metrics_bind = optarg; break;
+            case 1816: metrics_max_rate = atof(optarg); break;
             case 1044: ml_steer_path = optarg; break;
             case 1045: ml_steer_weight = atof(optarg); break;
             case 1046: { int a, b; if (sscanf(optarg, "%d-%d", &a, &b) == 2) { ml_l0 = a; ml_l1 = b; } break; }
@@ -1133,6 +1136,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --prefork-elastic          move cores between workers with the load (1->8, 2->8+8, 3->8+4+4, 4+->4 each)\n");
                 fprintf(stderr, "  --metrics-port <n>         serve Prometheus/OpenMetrics text on port n (requires --serve; CPU and GPU alike)\n");
                 fprintf(stderr, "  --metrics-bind <addr>      address for --metrics-port (default 127.0.0.1; use 0.0.0.0 to expose it)\n");
+                fprintf(stderr, "  --metrics-max-rate <n>     scrapes/second the metrics port will serve, burst 2n (default 5; 0 = no limit)\n");
                 fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
                 fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
@@ -1455,6 +1459,14 @@ int main(int argc, char **argv) {
     if (metrics_port > 0 && serve_port <= 0) {
         fprintf(stderr, "--metrics-port %d requires --serve: there is nothing to publish about "
                         "a one-shot CLI run.\n", metrics_port);
+        return 2;
+    }
+    if (metrics_max_rate >= 0.0 && metrics_port <= 0) {
+        fprintf(stderr, "--metrics-max-rate has no effect without --metrics-port.\n");
+        return 2;
+    }
+    if (metrics_max_rate < 0.0 && metrics_max_rate != -1.0) {
+        fprintf(stderr, "--metrics-max-rate cannot be negative (0 disables the limit).\n");
         return 2;
     }
     if (metrics_bind && metrics_port <= 0) {
@@ -3155,7 +3167,10 @@ int main(int argc, char **argv) {
             return 1;
         }
         qwen_tts_server_set_limits(serve_max_queue, serve_queue_timeout);
-        if (metrics_port > 0) qwen_tts_server_set_metrics(metrics_port, metrics_bind);
+        if (metrics_port > 0) {
+            qwen_tts_server_set_metrics(metrics_port, metrics_bind);
+            if (metrics_max_rate >= 0.0) qwen_tts_server_set_metrics_rate(metrics_max_rate);
+        }
         if (serve_max_request_s >= 0)
             qwen_tts_server_set_max_request_ms(serve_max_request_s * 1000);
         if (serve_max_text_chars > 0)
