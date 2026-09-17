@@ -140,7 +140,15 @@ inventing numbers the server is not entitled to claim, and without complicating 
 **Nothing is implemented until OTEL-1 and OTEL-2 are answered** — the survey found that the wire
 format is the easy half and the honest-metric boundary is the hard half.
 
-**Recommended shape (2026-09-17, pending ratification): two tiers, and tier 1 costs nothing.**
+**DECIDED 2026-09-17 (owner): tier 1 only, and it must publish state that already exists.**
+No new instrumentation, nothing added to any serving path, nothing that can slow a request.
+`/metrics` is a *rendering* of what the process already holds when somebody asks for it, and
+that is the whole feature — collection, retention, alerting and rate computation are the
+scraper's job, not ours. Pull model: the server does nothing between scrapes, keeps no
+telemetry state, runs no background thread and pushes nothing. Tier 2 stays parked unless tier 1
+proves insufficient. Rationale below.
+
+**Recommended shape (two tiers, and tier 1 costs nothing).**
 The prefork parent already holds the per-worker picture over time in its own memory —
 `active[w]` in-flight, `completed[w]` cumulative finished connections (`srv_conn_close()` at
 `qwen_tts_server.c:1458` writes one byte per finished connection, the parent counts them at
@@ -173,6 +181,15 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       tier 2 only. Separately and cheaply: `/v1/health` should report which worker answered
       (`"worker": N`) and the doc should say its counters are that worker's while its limits are
       the server's — two lines, no behaviour change. Check what in `tests/` reads it.
+- [x] OTEL-2b **Do NOT expose `/v1/health` as the metrics source, even via a sidecar**
+      (decided 2026-09-17). The zero-code route exists — `prometheus-community/json_exporter` or
+      a Telegraf `http` input maps a JSON endpoint to Prometheus series with a config file and no
+      C at all — but on a prefork server it inherits the defect in OTEL-2: each scrape lands on
+      whichever worker got the handoff, so `admitted`/`done`/`rejected_*` jump between unrelated
+      per-worker values and every `rate()` over them is noise. A wrong time series is worse than
+      no time series, because it is the one a dashboard will be built on. The parent is the only
+      process with a stable complete view, which is what makes the small C change the *minimum
+      correct* option rather than merely the nicer one.
 - [ ] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** Readable directly by
       Prometheus, Grafana Alloy, VictoriaMetrics and the Datadog OpenMetrics check, and by the
       OpenTelemetry Collector through its `prometheus` receiver, which converts to OTLP for
