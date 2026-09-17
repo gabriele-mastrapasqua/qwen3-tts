@@ -140,6 +140,13 @@ inventing numbers the server is not entitled to claim, and without complicating 
 **Nothing is implemented until OTEL-1 and OTEL-2 are answered** — the survey found that the wire
 format is the easy half and the honest-metric boundary is the hard half.
 
+**IMPLEMENTED 2026-09-17 on `feat/metrics-endpoint`** — `--metrics-port` / `--metrics-bind`,
+`docs/serving/metrics.md`, `tests/serve_metrics.sh`, `tools/metrics_watch.py`. Touches
+`main.c` (flags), `qwen_tts_server.h` (one prototype) and `qwen_tts_server.c` only; no kernel,
+engine or compute file is in the diff, and no worker process changes at all. **Open: the
+prefork parent path is Linux-only and is compiled out on macOS, so it is written but not yet
+executed — OTEL-7 validates it on the 32-core Axion.**
+
 **DECIDED 2026-09-17 (owner): tier 1 only, and it must publish state that already exists.**
 No new instrumentation, nothing added to any serving path, nothing that can slow a request.
 `/metrics` is a *rendering* of what the process already holds when somebody asks for it, and
@@ -160,7 +167,7 @@ on the request path is **structurally zero**: no code is added to any path a req
 and the child does not change at all. Tier 2 (latency, audio seconds, the write-gap proxy) is
 child-side, needs the shared segment, and happens only if tier 1 proves insufficient.
 
-- [ ] OTEL-1 **Decide what the server is entitled to export.** Our envelope is half
+- [x] OTEL-1 **Decide what the server is entitled to export.** (2026-09-17) Our envelope is half
       client-side by construction. Server-observable: TTFB, TTFA, queue/admission time, request
       duration, audio-seconds per wall-second, `STREAM_RTF`, and the **write-gap / cadence debt**
       proxy. Not server-observable: `required_prebuffer`, `safe_play_start`, `stall_rate@N` —
@@ -169,7 +176,9 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       the harness's `stall_rate`, plus the standing rule that a bucketed Grafana p95 is an
       operations signal and **not** a qualification number (the harnesses stay the acceptance
       instrument). Same discipline as the `doctor` provenance labels.
-- [ ] OTEL-2 **Decide the aggregation model, because the server is prefork.**
+- [x] OTEL-2 **Decide the aggregation model, because the server is prefork.** (2026-09-17 —
+      per-worker series, never aggregated in C. The `/v1/health` worker-attribution fix is
+      **still open**, tracked as OTEL-8.)
       `static server_state_t g_srv` (`qwen_tts_server.c:597`) is process-local, so each worker
       counts only itself — which means `GET /v1/health` **already** returns one worker's
       counters on a 12-worker box, a different twelfth each scrape. Verify empirically, then
@@ -190,7 +199,7 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       no time series, because it is the one a dashboard will be built on. The parent is the only
       process with a stable complete view, which is what makes the small C change the *minimum
       correct* option rather than merely the nicer one.
-- [ ] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** Readable directly by
+- [x] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** (2026-09-17) Readable directly by
       Prometheus, Grafana Alloy, VictoriaMetrics and the Datadog OpenMetrics check, and by the
       OpenTelemetry Collector through its `prometheus` receiver, which converts to OTLP for
       anything downstream — so a text page reaches every OTel consumer without linking a
@@ -202,7 +211,9 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       most invasive change available, for no gain. A separate port also makes "answers without
       the synth lock, outside admission" structural rather than a thing to be careful about, and
       it keeps concurrency/capacity/build identity off the public port.
-- [ ] OTEL-4 **Namespace, buckets, and a hard cardinality rule.** Tier 2 note: **prefer no
+- [x] OTEL-4 **Namespace and the cardinality rule — done for tier 1** (2026-09-17: `qwen_tts_`
+      with underscores, labels limited to `worker` and `reason`, no `voice` or `language` label
+      anywhere. The bucket/threshold design below applies to tier 2 and is not yet needed.) Tier 2 note: **prefer no
       histograms.** A Prometheus histogram is a set of "how many exceeded X" counters, and we have
       already declared the only threshold that matters — so `_sum`/`_count` pairs (mean over any
       window via `rate()`) plus exact threshold counters such as
@@ -218,7 +229,8 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       `worker`, `route`, `outcome`, plus static identity on `qwen_tts_build_info`. Copy vLLM's
       deprecation policy verbatim (notice in the HELP string, release-note entry, one-cycle CLI
       escape hatch).
-- [ ] OTEL-5 **Decide on `gen_ai.server.*` aliases — deliberately, not by default.** As of
+- [x] OTEL-5 **`gen_ai.server.*` aliases: NOT emitted** (decided 2026-09-17; revisit only if a
+      reader actually asks for them). As of
       2026-09-17 every `gen_ai.*` metric is still stability **Development**, none Stable, and on
       2026-06-12 (semconv v1.42.0) the whole namespace was deprecated out of the main repository
       into `open-telemetry/semantic-conventions-genai`, which has no tagged release. The
@@ -229,7 +241,7 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       convention that can rename fields without a deprecation window. Open sub-question: whether
       to propose an audio operation upstream — we have an unusually well-specified envelope to
       argue from.
-- [ ] OTEL-6 **Cost gate — tier 2 only.** Tier 1 adds no code to any path a request traverses,
+- [x] OTEL-6 **Cost gate — not applicable to tier 1** (2026-09-17). Tier 1 adds no code to any path a request traverses,
       so there is nothing to gate; do not run a campaign to prove zero. For tier 2:
       instrumentation is not
       free until measured. The per-request instants already exist in `batch_job_t`
@@ -238,6 +250,21 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       not clock reads — but it still has to clear **< 0.2 % of wall** on `make cost-map` plus a
       C12 wave A/B on the frozen Turin profile before the endpoint is documented as safe under
       load.
+- [ ] OTEL-7 **Validate the prefork parent on Linux — 32-core Axion (GCP), the best box.**
+      The parent path is inside `#if defined(__linux__)` and is compiled out on macOS, so every
+      line of it shipped unexecuted: the poll-set registration, the per-worker rendering, the
+      never-reset counter twins and the teardown ordering are all reviewed but unrun. On the box:
+      `bash tests/serve_metrics.sh` (its block 5 runs only on Linux — one series set per worker,
+      distinct, every worker moving, counters monotonic across scrapes), then a **2-minute mini
+      soak** with `tools/metrics_watch.py --duration 120 --interval 10` against real load, which
+      checks monotonic / conserved (`completed <= dispatched`) / balanced (no idle worker).
+      Watch for: a worker that never receives work, a counter that resets, and whether the
+      parent's `all_workers_full` rejects track the harness's own reject count.
+- [ ] OTEL-8 **`/v1/health` should say which worker answered.** Found while surveying, unrelated
+      to the endpoint: `g_srv` is a process-local static, so on a prefork server the health
+      counters are one worker's, a different one per probe, while the limits it reports are the
+      server's. Add `"worker": N` and say so in `docs/serving/api.md`. Two lines, no behaviour
+      change; check what in `tests/` reads it first.
 
 ### Legacy CPU / v2 portability audit — detail: `.work/legacy-cpu-v2-audit-20260916.md`
 

@@ -15,6 +15,7 @@ docs/serving/
 │
 ├── gpu-cuda.md          ⚠ the CUDA streaming server — WORK IN PROGRESS, not qualified
 │
+├── metrics.md           watching a running server: --metrics-port, Prometheus/OTel  (both backends)
 └── boxes.md             every box measured for serving, its profile JSON, and what it holds
 ```
 
@@ -81,6 +82,9 @@ looked best was the one that mattered least.
 
 ## The rest of the map
 
+- [`metrics.md`](metrics.md) — `--metrics-port`: what a running server publishes about itself,
+  read by Prometheus, Grafana Alloy or an OpenTelemetry Collector. An operations signal, never
+  a qualification number
 - [`../feature-flags.md`](../feature-flags.md) — every runtime flag, its default per ISA, the
   measurement that chose it, and how to prove the process actually read it
 - [`../../configs/perf/README.md`](../../configs/perf/README.md) — the deployment profile format
