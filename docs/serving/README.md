@@ -90,4 +90,6 @@ looked best was the one that mattered least.
 - [`../ENGINEERING-METHOD.md`](../ENGINEERING-METHOD.md) — why the measurement rules are shaped
   the way they are
 - [A CPU streaming server that never stalls](../../blog/cpu-streaming-server-that-never-stalls.md)
-  — the narrative version: the v2 design and the measurements that chose each piece of it
+  — the narrative version, with the full envelope tables: the v2 design, Design D and the AMX
+  accounting, the decoder cohort we retired, and what the 30-minute soaks found that the wave
+  benchmarks did not

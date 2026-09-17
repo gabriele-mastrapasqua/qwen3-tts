@@ -696,7 +696,7 @@ concurrent users in roughly the time of one by reading each weight once for all 
 | [Optimization Notes](blog/optimization-notes.md) | RTF 3.5 → 1.3: the full M1 bf16 optimization story |
 | [Emotion on the Small Model](blog/emotion-on-the-small-model.md) | Why steering and fine-tuning both failed on the 0.6B, the cosine≈0 measurement that killed transfer, and the reframe that solved it: emotion as a property of the voice |
 | [Fast on Every CPU](blog/making-qwen3-tts-fast-on-every-cpu.md) | SDOT (sub-1.0 on M1) + AVX2/AVX-512/VNNI on x86; why it's memory-bound |
-| [A CPU streaming server that never stalls](blog/cpu-streaming-server-that-never-stalls.md) | The v2 serving design: why RTF 0.90 can stall 35% of the time, where first audio really goes under load, the decode quantum that sets the prebuffer, and the configuration gate that exists because a benchmark was bimodal |
+| [A CPU streaming server that never stalls](blog/cpu-streaming-server-that-never-stalls.md) | The v2 serving design, with the full KPI tables: why RTF 0.90 can stall 35% of the time, where first audio really goes under load, AMX Design D and the discovery that the kernel was never the problem, a decoder feature we shipped and then retired on measurement, and the 30-minute soaks that failed where every benchmark passed |
 
 ## Credits & Acknowledgments
 
