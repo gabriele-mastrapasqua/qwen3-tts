@@ -1726,6 +1726,17 @@ static void qwen_metrics_answer(int cfd) {
     int fl = fcntl(cfd, F_GETFL, 0);
     if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
     char junk[1024];
+    /* accept() can return before the request bytes land.  Answering and closing right then
+       leaves the request arriving at a closed socket, the kernel replies RST, and the scraper
+       discards the response we had already written -- which showed up as roughly one empty
+       scrape in three hundred under load.  So wait for the request, but only briefly and only
+       once: this runs inside the prefork dispatch loop, where an unbounded wait would be a
+       scraper holding up request dispatch. 2 ms is generous on loopback and invisible next to
+       the loop's own 1000 ms poll. */
+    {
+        struct pollfd pw = { .fd = cfd, .events = POLLIN, .revents = 0 };
+        (void)poll(&pw, 1, 2);
+    }
     for (int i = 0; i < 4; i++) { ssize_t r = recv(cfd, junk, sizeof junk, 0); if (r <= 0) break; }
 
     size_t n = qwen_metrics_render(g_metrics.page, g_metrics.page_cap);

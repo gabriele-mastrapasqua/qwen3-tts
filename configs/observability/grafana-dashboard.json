@@ -1,0 +1,135 @@
+{
+  "uid": "qwen-tts-serving",
+  "title": "Qwen3-TTS serving",
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Completed per second, per worker",
+      "description": "A worker whose line goes flat while the others carry on is wedged. Total throughput can barely move while that happens, which is why these are never summed.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_worker_completed_total[1m])",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "In flight, per worker",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "qwen_tts_worker_inflight",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Saturation (inflight / slots)",
+      "description": "1.0 means that worker will accept nothing more. Sustained 1.0 on every worker is where the parent starts refusing.",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "qwen_tts_worker_inflight / qwen_tts_worker_slots",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejects per second, by reason",
+      "description": "In --prefork these are the PARENT's refusals only; a rejection inside a worker's own queue is not visible from here.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_rejected_total[1m])",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Imbalance (max - min inflight)",
+      "description": "Above zero is normal: request durations vary. What matters is whether it stays there.",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "max(qwen_tts_worker_inflight) - min(qwen_tts_worker_inflight)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Workers up",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum(qwen_tts_worker_up)"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Build",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "qwen_tts_build_info",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}

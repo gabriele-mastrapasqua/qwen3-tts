@@ -250,7 +250,28 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       not clock reads — but it still has to clear **< 0.2 % of wall** on `make cost-map` plus a
       C12 wave A/B on the frozen Turin profile before the endpoint is documented as safe under
       load.
-- [ ] OTEL-7 **Validate the prefork parent on Linux — 32-core Axion (GCP), the best box.**
+- [x] OTEL-7 **Prefork parent validated on Linux — 32-core Neoverse-V2 Axion, 2026-09-17.**
+      Clean build (`rc=0`, zero errors) — the first time the `#if defined(__linux__)` parent block
+      was compiled at all — with `--caps` reporting SMMLA and BFMMLA active and `--self-test`
+      passing. `tests/serve_metrics.sh` 13/13 including block 5: four distinct per-worker series,
+      every worker dispatched, `dispatched_total` summing to the offered load, counters monotonic
+      across scrapes. A 120 s C16 closed-loop soak with `tools/metrics_watch.py` at 5 s returned
+      monotonic / conserved / balanced, and the arithmetic closes: `dispatched - completed = 4`
+      per worker, 16 in total, exactly the offered concurrency still in flight. Per-worker spread
+      43..64 — normal duration variance, and visible only because nothing is summed.
+      **Cost: below the noise floor.** Three arms (off / on / off) of the same soak on the frozen
+      `axion-c4a-highcpu32-0p6b-all-on` profile: the two identical OFF arms already differ 6.6% on
+      TTFA p50 and 12.2% on p99, every on-vs-off delta is inside that, and several ON numbers are
+      better than both OFF arms — which cannot be real. Table in `docs/serving/metrics.md`.
+      **One defect found by measuring:** `accept()` can return before the request lands, so
+      answering and closing raced with the arriving request, the kernel sent `RST` and the scraper
+      discarded an already-written response — one empty scrape in ~300 under load. Fixed with a
+      single bounded 2 ms `poll()`; 1000 scrapes under load afterwards, zero empty.
+      Full observability example added: `configs/observability/` + `tools/observability_up.sh`,
+      verified end to end with Prometheus 3.14 and Grafana 13.2 on the box (target `up`, four
+      worker series in the TSDB, dashboard provisioned).
+- [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** Everything above was at 5 s. 1 s is
+      5x the scrapes and should still be invisible, but it is a claim, not a measurement.
       The parent path is inside `#if defined(__linux__)` and is compiled out on macOS, so every
       line of it shipped unexecuted: the poll-set registration, the per-worker rendering, the
       never-reset counter twins and the teardown ordering are all reviewed but unrun. On the box:

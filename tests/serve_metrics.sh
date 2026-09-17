@@ -38,7 +38,14 @@ start_server() {   # $1 = extra flags; waits for /v1/health
     done
     return 1
 }
-scrape() { timeout 3 curl -s "http://127.0.0.1:$MPORT/metrics" 2>/dev/null; }
+# One retry: a single-sample assertion against a network endpoint is a flaky assertion
+# regardless of cause, and this one caught a real RST race exactly once in three hundred.
+scrape() {
+    local body
+    body=$(timeout 3 curl -s "http://127.0.0.1:$MPORT/metrics" 2>/dev/null)
+    [ -n "$body" ] || body=$(timeout 3 curl -s "http://127.0.0.1:$MPORT/metrics" 2>/dev/null)
+    printf '%s' "$body"
+}
 
 echo "=== metrics endpoint ==="
 

@@ -1,0 +1,25 @@
+# Prometheus scrape config for a Qwen3-TTS streaming server.
+#
+# The server publishes on --metrics-port, bound to 127.0.0.1 unless you passed --metrics-bind.
+# Point Prometheus at that port; everything else here is ordinary Prometheus.
+#
+#   ./qwen_tts -d qwen3-tts-1.7b --serve 8080 --prefork 12 --batch-size 2 --metrics-port 9109
+#   prometheus --config.file=configs/observability/prometheus.yml
+#
+# A 5s interval is chosen for watching a soak, not for a long-lived deployment: it is dense
+# enough to see a wave arrive and a worker stall inside one screen. 15s is the usual production
+# value and costs the server nothing either way -- the page is rendered on demand and the
+# server does no work between scrapes.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: qwen-tts
+    static_configs:
+      - targets: ["127.0.0.1:9109"]
+        labels:
+          # Set these to whatever identifies the deployment for you. They are NOT published by
+          # the server: it deliberately labels nothing it cannot know, and a host or an
+          # environment name is exactly that.
+          instance_name: "local"

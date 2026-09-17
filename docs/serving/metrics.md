@@ -117,10 +117,54 @@ mode and on the service port, that a plain server omits counters it does not mai
 batched server's counters move with traffic, that nothing listens by default, and — on Linux —
 that the prefork parent emits one distinct series set per worker and every worker moves.
 
+## Seeing it in a dashboard
+
+`configs/observability/` is a working example — a Prometheus scrape config and a Grafana
+dashboard built on the per-worker series — with `tools/observability_up.sh` to fetch and start
+both, provisioned, bound to loopback:
+
+```bash
+tools/observability_up.sh                                  # on the box
+ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 user@box # from your laptop
+```
+
+Then `http://127.0.0.1:3000` → **Qwen3-TTS serving**. Read
+[`configs/observability/README.md`](../../configs/observability/README.md) for what each panel
+is built to expose, and why nothing there is a qualification number.
+
 ## Cost
+
+**Measured on a 32-core Neoverse-V2 (GCP Axion), 2026-09-17.** Three arms of a closed-loop C16
+soak, 120 s each, on the frozen `axion-c4a-highcpu32-0p6b-all-on` profile (0.6B int8, 4 workers
+× 8 threads, batch 8). The arms differ **only** by `--metrics-port`; the middle one also had
+`tools/metrics_watch.py` scraping every 5 s, so the cost includes real scrapes. The OFF arm was
+run first and last, because the interesting comparison is not on-versus-off but
+**on-versus-the-box's-own-drift**.
+
+| | off (first) | on | off (last) |
+|---|---|---|---|
+| completed | 217 | 217 | 213 |
+| errors | 0 | 0 | 0 |
+| TTFB p50 / p95 (ms) | 23.0 / 75.1 | 18.4 / 73.1 | 21.3 / 75.2 |
+| TTFA p50 / p95 (ms) | 116.8 / 200.5 | 106.9 / 198.8 | 124.5 / 190.1 |
+| TTFA p99 (ms) | 242.0 | 212.6 | 212.4 |
+| RTF p50 / p95 | 0.76 / 0.82 | 0.75 / 0.80 | 0.77 / 0.85 |
+
+The two OFF arms — identical binary, identical flags, identical seed — already differ by 6.6% on
+TTFA p50 and **12.2% on p99**. Every on-versus-off delta is inside that, and several ON numbers
+are *better* than both OFF arms, which cannot be a real effect. The honest conclusion is that
+any cost is **below the noise floor of a 120 s window on this box**, not that the endpoint is
+free in some stronger sense. Tested at a 5 s scrape interval; 1 s was not measured.
 
 Nothing is added to any path a request travels, and no worker changes at all. In `--prefork` the
 page is rendered from inside the parent's dispatch loop, on the one thread that owns that state,
 so there is no shared memory, no snapshot and no atomic. Reads and writes to the scrape socket
 are non-blocking and one-shot: a scrape that would block is **dropped** rather than retried,
 because losing one sample is cheaper than delaying the server that produced it.
+
+One bounded exception, and it was found by measuring rather than by reading. `accept()` can
+return before the request bytes land; answering and closing right then leaves the request
+arriving at a closed socket, the kernel replies `RST`, and the scraper discards a response that
+was already written. Under load that appeared as roughly **one empty scrape in three hundred**.
+The handler therefore waits up to **2 ms**, once, for the request — generous on loopback, and
+invisible beside the dispatch loop's own 1000 ms `poll()`.
