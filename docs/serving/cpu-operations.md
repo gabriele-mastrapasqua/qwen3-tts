@@ -19,6 +19,19 @@ a profile format so the answer survives the session that found it.
 > [`gpu-cuda.md`](gpu-cuda.md). Nothing here transfers to
 > it, and a number from one must never be quoted for the other.
 
+> **⚠️ Era: most of the worked examples here are PRE-v2.** The 16-core Axion and 8-core Intel AMX
+> tables throughout this document — the topology sweep, the profile A/B, the qualification curve,
+> the input-length scaling — were measured **on or before 2026-09-01**, and mostly with three-wave
+> TTFA sweeps rather than closed-loop soaks. The v2 serving work (decoder lane split, direct
+> dilated residual convolutions, admission and cohort policy) landed between 2026-09-07 and
+> 2026-09-15, and the only hosts qualified on it are the four **32-core** boxes in
+> [`boxes.md`](boxes.md).
+>
+> They are kept because this document teaches a **procedure**, and the procedure is what has to be
+> right: what each rung answers, why the arrival model matters, how a profile earns its keep, what
+> shape the topology trade has. **Do not quote any concurrency in this document as current
+> capacity.**
+
 ---
 
 ## 1. Three ways to run it, and the one you probably want
@@ -170,12 +183,8 @@ before paying for a wave or soak. The verdict concerns the tested 4×8 shape,
 not the whole instance. Details and interpretation are in
 [Arm topology preflight](../arm-topology-preflight.md).
 
-> ⚠️ The 16-core Axion and 8-core AMX numbers in this document were measured **before the v2
-> serving work** (decoder lane split, direct dilated residual convs, admission and cohort
-> policy; 2026-09-07 to 09-15) and mostly with three-wave TTFA sweeps rather than closed-loop
-> soaks. They are kept because the *procedure* and the *shape of the trade* are what this
-> document is teaching, and those still hold. **Do not quote their concurrencies as current
-> capacity** — the v2-qualified points are the 32-core hosts in [`boxes.md`](boxes.md).
+> ⚠️ Pre-v2 example (16-core Axion, 2026-09-01). Read the **shape** of the trade, not the
+> concurrencies — see the era note at the top.
 
 `bench-topo` starts one server per topology, fires true simultaneous waves at each concurrency
 and prints one row per cell. Measured on the 16-core Axion reference host, 1.7B open weights at
@@ -221,7 +230,8 @@ flag is on when the process says so, never when the invocation intended it.**
 
 The benchmark harness will not start without `--profile NAME` or an explicit
 `--no-profile '<reason>'`. That is deliberate, and it comes from a measurement rather than from
-taste. Same binary, same bank, same host, arms interleaved, varying only whether the platform's
+taste. Same binary, same bank, same host (16-core Axion, pre-v2), arms interleaved, varying only
+whether the platform's
 declared runtime environment was applied:
 
 | round | without the profile | with it |
@@ -240,7 +250,8 @@ Its scope was measured too, not assumed: at concurrency 4 on the same host the d
 173 against 169 ms, i.e. nothing — when every worker is busy there is no idle time for a
 spinning thread to waste.
 
-**That scope has since moved, and the re-measurement says so.** Same host, current build,
+**That scope has since moved, and the re-measurement says so.** Same host, the build current on
+2026-09-01 — still pre-v2,
 `2x8`, four waves of the short bank, the two arms differing only in whether the profile
 environment was applied:
 
@@ -311,7 +322,7 @@ SUITE PASSED — artifacts in /tmp/bench_fast, manifest in /tmp/bench_fast/manif
 includes the decay from the run you just finished — wait for the box to settle rather than
 chaining two suites back to back.
 
-The same rung on the same host, both models at int8, profile `axion-16c-ttfa`, topology `2x8`,
+The same rung on the same host (pre-v2), both models at int8, profile `axion-16c-ttfa`, topology `2x8`,
 five waves of a short bank — the shape to expect when a box is set up correctly:
 
 | model | C | TTFA p50 | TTFA p95 | stream RTF p50 | audio p50 | errors |
@@ -459,7 +470,8 @@ and queue decomposition remain diagnostics that explain a KPI.
 
 Prompt positions grow one-for-one with text tokens, and the prompt-prefix cache covers only the
 request-independent head, so the first non-cached position is the first text token. Measured on
-a 16-core Arm host at concurrency 1, the same three texts truncated to word prefixes:
+a 16-core Arm host at concurrency 1 (pre-v2 — the *shape* is the point here, not the
+milliseconds), the same three texts truncated to word prefixes:
 
 | words | prompt positions | TTFA p50 |
 |---:|---:|---:|
@@ -651,7 +663,8 @@ make bench-suite BENCH_MODEL=qwen3-tts-1.7b-base BENCH_PROFILE=x86-8c-amx-recomm
 Note the topology names: on an 8-core box the cells are `1x8`, `2x4` and `4x2`, not the 16-core
 `2x8`/`4x4`. Pick them from `make bench-fingerprint`, never by copying another host's profile.
 
-**What that box can and cannot do**, measured and written up in
+**What that box can and cannot do** — measured pre-v2, and never requalified since —
+written up in
 [`reference-x86-8c-amx.md`](../reference-x86-8c-amx.md): on the 1.7B, first audio is competitive —
 C=4 TTFA p95 252 ms — while **sustained stream RTF at C=4 is 1.43**, so it serves four concurrent
 requests with a good time to first audio and keeps one of them realtime. That is a bandwidth

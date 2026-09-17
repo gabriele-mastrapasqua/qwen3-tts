@@ -17,6 +17,18 @@ process so it performs**, which is a different question and the one that goes wr
 | **what it holds** | 0.6B **C12–C16** and 1.7B **C10–C16** on a 32-core Arm host; 1.7B **C11** on a 32-core Zen5 — measured per box on the v2 architecture, never extrapolated. Smaller hosts have **no current v2 capacity number**: see [`boxes.md`](boxes.md) |
 | **the one hard rule** | the flags are not decoration. A server started without them does not error. It is simply slower, and nothing in the output says so |
 
+> **Which numbers on this page are current.** The v2 serving architecture landed between
+> 2026-09-07 and 2026-09-15, and the hosts qualified on it are the **four 32-core boxes** —
+> Graviton4, Axion, Zen5 Turin and its control arm. That is the whole of the current capacity
+> evidence, and it was deliberate: take the biggest CPUs available and find out what the
+> architecture does.
+>
+> Several *mechanism* measurements below come from a 16-core Arm host or an 8-core Intel AMX host
+> and date from **2026-09-01 or earlier — before v2**. They are marked where they appear. What they
+> establish still holds (which topology wins at which concurrency, what a flag costs on which
+> silicon); **the concurrencies those machines reached do not**, and are listed apart in
+> [`boxes.md`](boxes.md).
+
 ---
 
 ## The short version
@@ -209,6 +221,8 @@ properties of the host and travel badly:
 - **`QWEN_POOL_SPIN`** — 65536 on the 16-core Arm host, where the 4096 default cost 40% of the
   Code Predictor (16.0 → 9.6 ms/frame, 491,320 → 35,132 context switches). On 8 x86 cores 65536
   measured *worse* and 4096 is right. "Explicitly disable it" would have cost 13% of stream RTF.
+  *(Both measured 2026-09-01 on pre-v2 hosts. The direction is the point — a spin count is a
+  property of the machine, not of the engine version — but re-sweep it on a box you care about.)*
 - **`QWEN_DECODER_BATCH`** — pays only when a worker really holds several slots. The Turin
   product profile pins `0`; the Arm profiles pin `1`.
 
@@ -225,7 +239,7 @@ and VNNI gates instead.
 | `--batch-size N` | per-worker **in-flight cap** *and* the scheduler: at `1` a worker serves one request at a time, from `2` up it runs the continuous-batching scheduler | **the default is 1** — concurrency turns into queueing and the engine never reaches the GEMM path |
 | `--max-queue` | who is refused instead of held open. With prefork, `0` keeps the parent accepting and returns an immediate `503` | unbounded waiting: the caller sees latency instead of a refusal, which is the worse failure |
 | `--max-request-seconds` | the generation cap per request, **and the input text limit derived from it** | one pathological text holds a slot for minutes |
-| `OPENBLAS_THREAD_TIMEOUT=1` | OpenBLAS parks instead of spinning | two pools fight for the same cores: first audio 108 ms against 66 ms at C=1, *bimodally* — and 42,500 context switches per second against 12,000 |
+| `OPENBLAS_THREAD_TIMEOUT=1` | OpenBLAS parks instead of spinning | two pools fight for the same cores: first audio 108 ms against 66 ms at C=1, *bimodally* — and 42,500 context switches per second against 12,000 (pre-v2 host; the mechanism is what carries) |
 | `OPENBLAS_NUM_THREADS` | must be **absent**, not merely unset | the engine backs off sizing BLAS entirely when it is already set, so a stray `export` in somebody's shell silently replaces the qualified thread split |
 
 That last row is why a profile can declare a variable `null`, and why
@@ -234,8 +248,9 @@ one of them is present.
 
 ### Why the environment is worth applying — and where it is not
 
-Measured on a 16-core Arm host, current build, `2x8`, four waves, the only difference between the
-arms being whether the profile environment was applied:
+Measured on a **16-core Arm host, 2026-09-01 — a pre-v2 host and a pre-v2 build**, `2x8`, four
+waves, the only difference between the arms being whether the profile environment was applied.
+The reason it is still here is the mechanism in the last column, which has not changed:
 
 | arm | C | TTFA p50 | stream RTF p50 | context switches/s |
 |---|---:|---:|---:|---:|
@@ -311,8 +326,9 @@ needs client concurrency `C ≥ 2W`. More workers means narrower batches per wor
 every worker on the slower kernel at exactly the concurrency you care about.
 
 **More workers is not more throughput past the bandwidth roof.** Talker and Code Predictor are
-DRAM-bound weight streams; W workers read the weights W times. On a 16-core Arm host `1x16` won
-first audio at C=1 and gave it back at C=4, while `2x8` held both — and on a two-socket box the
+DRAM-bound weight streams; W workers read the weights W times. On a 16-core Arm host (2026-09-01,
+pre-v2) `1x16` won first audio at C=1 and gave it back at C=4, while `2x8` held both; the *shape*
+of that trade is what generalises, not the two concurrencies. On a two-socket box the
 weights are loaded *before* the fork and shared copy-on-write, so workers pinned to the second
 socket read them across the interconnect. That is worth one `numactl` arm before accepting a
 topology.

@@ -32,6 +32,23 @@ docs/serving/
 If you are unsure, the answer is the CPU server. The GPU one is genuinely fast and genuinely
 unproven, and [`gpu-cuda.md`](gpu-cuda.md) opens with the list of what is missing.
 
+### How to read a number in this directory
+
+Every number here carries the host it was measured on, and the host tells you which **era** it
+belongs to. The **v2 serving architecture** — decoder lane split, direct dilated residual
+convolutions, admission and cohort policy, stream layout — landed between 2026-09-07 and
+2026-09-15, and **the only hosts qualified on it are the four 32-core boxes**: a Graviton4, an
+Axion, and a Zen5 Turin with its control arm. That was deliberate — brute-force the biggest CPUs
+available and find out what the architecture can actually do — and it is also the entire extent of
+the current capacity evidence.
+
+Numbers attributed to a **16-core or 8-core host date from 2026-09-01 or earlier** and describe the
+previous engine, usually measured with three-wave TTFA sweeps rather than 30-minute closed-loop
+soaks. They are kept, and labelled, wherever they teach something that is still true — which
+topology wins at which concurrency, what a flag costs on which silicon, why a spinning BLAS
+matters. **None of them is a current capacity claim**, and they are listed apart in
+[`boxes.md`](boxes.md).
+
 ## Before anything else, on any box
 
 ```bash

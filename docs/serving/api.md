@@ -269,6 +269,11 @@ with it: see [`configs/perf/README.md`](../../configs/perf/README.md) and
 
 ## Performance
 
+> These are **single-request** figures on the development machine — what one caller experiences,
+> not what a server holds. They say nothing about concurrency, and they predate the current serving
+> architecture. For serving capacity, and which hosts it was qualified on, see
+> [`boxes.md`](boxes.md).
+
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads, same text + seed (`--seed 42`). bf16 below;
 **with `--int8` the 0.6B server is faster than real-time warm — RTF ~0.88** (and ~0.93 with a cloned
 `.qvoice`). See [performance.md](../performance.md) for the full int8 sweet-spot table.

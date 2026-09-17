@@ -114,6 +114,20 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       "Measured before v2 — history, not current capacity" heading, because the topology and flag
       lessons they taught still hold while the concurrency they reached does not. Residue: the
       `v0.22.0` tag annotation still carries the old sentence; the release description is corrected.
+- [x] DOCS-7 **Era labelling swept across every serving document** (2026-09-17). DOCS-6 removed the
+      pre-v2 rows from the capacity tables; this pass went through the rest. Confirmed by
+      `git log -S` that the 16-core Axion topology sweep, the profile-environment A/B (including the
+      arm labelled "current build") and the `QWEN_POOL_SPIN` measurement all date from **2026-09-01**
+      — every one of them pre-v2. Added: an era convention in `docs/serving/README.md` stating that
+      the v2-qualified set is exactly the four 32-core boxes and why (brute-force the largest CPUs
+      available); an era box at the top of `docs/serving/cpu.md` and of
+      `docs/serving/cpu-operations.md`; inline `pre-v2` markers on each affected table; a warning on
+      the 2026-07 batching table in `docs/serving/cpu-batching.md`; a scope note on the Apple M1
+      single-request figures in `docs/serving/api.md`; host attribution in the blog post (the
+      admission decomposition is the 12-core GCP reference host, the bimodal profile measurement is
+      the 16-core Arm host on 2026-09-01). Dates added to the pre-v2 rows in
+      `docs/serving/boxes.md`. Nothing deleted: the lessons those hosts taught are kept, the
+      concurrencies they reached are no longer presented as current.
 - [x] DOCS-5 **Blog: `blog/cpu-streaming-server-that-never-stalls.md`** — the v2 CPU serving design
       as a narrative, for dev.to: the envelope, the admission decomposition, the decode quantum,
       the falsified utilization-aware admission, the bimodal configuration measurement, `doctor`,

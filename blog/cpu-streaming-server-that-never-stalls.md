@@ -76,8 +76,8 @@ The engine's shape is a 28-layer Talker, a 5-layer Code Predictor that re-reads 
 per 80 ms audio frame, and a convolutional speech decoder. Decode is DRAM-bound: we already knew
 that. What we did not know was how little of a *loaded server's* first audio was decode at all.
 
-At the first concurrency that failed the envelope on our reference host, we decomposed the wall
-clock and found:
+At the first concurrency that failed the envelope on the streaming reference host — a 12-physical-core
+GCP `c4-standard-24`, SMT off, 1.7B INT8 — we decomposed the wall clock and found:
 
 - three full-wave requests waited **3.6–4.9 seconds before the parent process even called
   `accept()`**;
@@ -157,10 +157,13 @@ next person to have that idea should get the measurement instead of the enthusia
 
 ## 4. The configuration is part of the product
 
-Here is the measurement that changed how we ship this thing more than any kernel did.
+Here is the measurement that changed how we ship this thing more than any kernel did. It is from
+2026-09-01, on the 16-core Arm host we used before the current architecture existed — which is
+worth saying, because the *number* has moved since and the *mechanism* has not.
 
-Same binary, same text bank, same host, arms interleaved, varying **only** whether the platform's
-declared runtime environment was applied. First audio at concurrency 1:
+Same binary, same text bank, same host — a 16-core Arm box, 2026-09-01 — arms interleaved, varying
+**only** whether the platform's declared runtime environment was applied. First audio at
+concurrency 1:
 
 | round | without the environment | with it |
 |---|---:|---:|
@@ -202,9 +205,9 @@ Two values in that set are worth naming because they are the ones people copy:
   holds several slots, and not otherwise. Pinned per profile, never as a portable default.
 
 And a nuance we kept in the docs because it is more useful than the flattering version: re-measured
-on a current build, that whole environment set is worth **nothing at concurrency 1** — most of it
-became a compiled default in the meantime — and **18% of first audio at concurrency 4**. It earns
-its keep where the machine is loaded. It stays pinned at C=1 anyway, so a change of default
+on the build current that day, that whole environment set is worth **nothing at concurrency 1** —
+most of it became a compiled default in the meantime — and **18% of first audio at concurrency 4**.
+It earns its keep where the machine is loaded. It stays pinned at C=1 anyway, so a change of default
 elsewhere cannot move a qualified deployment quietly.
 
 ## 5. `make doctor`: under a minute, no model

@@ -107,6 +107,11 @@ the rigorous correctness gate. The default matmul path forks the greedy trajecto
 
 ## Performance — measured on rented silicon (2026-07-11)
 
+> **⚠️ These are 2026-07 numbers — two architectures ago.** They establish that request batching
+> *works* and where it pays (bandwidth-bound boxes, low precision), which is what this page is
+> about. They are **not** current capacity: the v2 serving work landed in September 2026, and the
+> hosts qualified on it are the four 32-core boxes in [`boxes.md`](boxes.md).
+
 The throughput win (read each weight once, reuse across B) shows up on **bandwidth-bound** boxes.
 On M1 (bf16, the dev box) it is **correctness-validated** and the aggregate RTF for a small batch
 already dips ~0.95. Measured on real hardware:
