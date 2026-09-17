@@ -1,0 +1,323 @@
+# Text bank v2 for the serving benchmarks — English + Italian, neutral register.
+#
+# bank-version: v2
+# bank-sha256:  55b286369ef8dd44
+#
+# WHY A VERSION. A benchmark number belongs to the corpus that produced it. The v1 bank held
+# 21 texts in total, and 3 of them carried the whole `long` class -- in a 30-minute soak each
+# of those was spoken roughly 216 times. Repetition that heavy does not trip an engine cache
+# (the prefix cache is keyed on speaker and language, not on text), but it does something
+# quietly worse: it removes text variability from the measurement, so the spread is narrower
+# than reality and a regression that only shows on unusual lengths is invisible.
+#
+# So v2 is an ERA BOUNDARY, in the same sense as the v2 serving work: numbers measured on v1
+# and numbers measured on v2 are NOT comparable, and every artifact records which bank it used.
+# v1 is kept at tests/load_texts_en.txt -- nothing was deleted, and the v1 texts are all here
+# too, so the classes are extended rather than redefined.
+#
+# WHY THE CLASS BANDS ARE UNCHANGED. Each class keeps the character band it had in v1, measured
+# rather than asserted:
+#
+#   short            65 texts,  21- 27 ch (~1.5-1.9 s)
+#   medium          126 texts,  62- 72 ch (~4.4-5.1 s)
+#   conversational   49 texts,  43- 78 ch (~3.1-5.6 s)
+#   long             33 texts, 317-361 ch (~22.6-25.8 s)
+#   italian           4 texts,  22-315 ch (~1.6-22.5 s)
+#
+# Redefining a class -- making `short` mean 70 characters instead of 25 -- would silently break
+# comparability with every registered profile. Extending within the band does not.
+#
+# Format:  <class>\t<text>
+# Classes: short | medium | long | conversational | italian
+#
+# WHICH CLASS FOR WHICH RUN. `medium` is the workhorse of the fast screen: at ~4-5 s of audio a
+# request produces enough chunks to exercise the streaming path while still allowing a high
+# request rate, which is what gets the sample count up. `short` at ~1.5 s yields too few chunks
+# for the cadence metrics to see anything. The 30-minute qualification uses the stratified mix.
+
+# ---- short : 65 texts, 21-27 characters (~1.5-1.9 s of speech)
+short	The order is confirmed.
+short	Your balance is up to date.
+short	Please hold for a moment.
+short	The line is now open.
+short	Thank you for waiting.
+short	The order is on its way.
+short	Your session has expired.
+short	Please try that again.
+short	The file was not found.
+short	Two seats are still free.
+short	We received your request.
+short	The meeting starts at ten.
+short	Your card was declined.
+short	No results for that name.
+short	The line is busy today.
+short	Payment has been received.
+short	Your ticket is now open.
+short	The room is ready for you.
+short	Delivery is set for Friday.
+short	That address looks wrong.
+short	We could not reach you.
+short	The report is ready now.
+short	Your plan renews in May.
+short	The call was disconnected.
+short	Please check your inbox.
+short	That code has expired.
+short	The store closes at eight.
+short	Your refund is processing.
+short	We saved your changes.
+short	The train leaves shortly.
+short	Access has been granted.
+short	Nothing is scheduled here.
+short	The update is available.
+short	Your seat is in row four.
+short	This offer ends tonight.
+short	The password was changed.
+short	We are still reviewing it.
+short	Your parcel left the depot.
+short	The office is closed now.
+short	That number is not valid.
+short	Please wait for the tone.
+short	The service is restored.
+short	Your name is on the list.
+short	The battery is very low.
+short	We found three matches.
+short	The gate has been changed.
+short	Your invoice is attached.
+short	The weather looks clear.
+short	That slot is taken now.
+short	Your account is verified.
+short	The signal is quite weak.
+short	Please stay on the line.
+short	The device is now paired.
+short	Your booking is confirmed.
+short	The lift is out of order.
+short	We will call you shortly.
+short	The road ahead is closed.
+short	Your photo was uploaded.
+short	The printer is offline.
+short	That message was deleted.
+short	Your trial ends on Sunday.
+short	The window is now locked.
+short	We updated your details.
+short	The package is damaged.
+short	Your query has an answer.
+
+# ---- medium : 126 texts, 62-72 characters (~4.4-5.1 s of speech)
+medium	Your appointment has been moved to Thursday morning at nine o'clock.
+medium	The payment went through, and the receipt is on its way to your inbox.
+medium	I can see two active plans on this account, and only one of them renews.
+medium	If the code does not arrive in a minute, I can send it again right away.
+medium	The delivery is scheduled for tomorrow between ten and twelve.
+medium	The engineer will arrive before noon and call you from the gate.
+medium	Your package cleared customs and should reach the depot tonight.
+medium	We have moved your appointment to Thursday at half past three.
+medium	The payment failed because the card we hold on file has now expired.
+medium	Please confirm the address so the courier can complete delivery.
+medium	Your subscription renews next month unless you cancel it before.
+medium	The technician found a loose cable and replaced it this morning.
+medium	We are sorry for the delay and have added a credit to your account.
+medium	The store on the high street closes early during public holidays.
+medium	Your refund was approved and should appear within five working days.
+medium	The meeting room is booked, so we moved the call to the small one.
+medium	A new version is available and will install when you next restart.
+medium	The driver is running late because of roadworks near the bridge.
+medium	Your application is complete and a decision will follow by email.
+medium	We could not verify the document, so please upload a clearer copy.
+medium	The line was quiet for a moment because the call was transferred.
+medium	Your booking covers two nights with breakfast included each day.
+medium	The report shows a small drop in traffic over the last two weeks.
+medium	Please keep the reference number in case you need to call again.
+medium	The account was locked after several failed attempts to sign in.
+medium	We have dispatched a replacement and it should arrive on Monday.
+medium	The event begins at seven, though doors open half an hour before.
+medium	Your details were updated and a confirmation has been sent to you.
+medium	The battery should last a full day with moderate use and no video.
+medium	We noticed unusual activity and paused the card as a precaution.
+medium	The class is full, but we can add your name to the waiting list.
+medium	Your parcel is out for delivery and the driver has eight stops left.
+medium	The invoice covers the period from the first to the last of March.
+medium	Please switch the device off and on again before we continue here.
+medium	The flight is boarding at gate twelve and closes in twenty minutes.
+medium	We received your letter and passed it to the relevant department.
+medium	The signal drops in the tunnel, so the call may cut out briefly.
+medium	Your order shipped this morning and tracking is now available.
+medium	The rate applies only to new customers joining before the deadline.
+medium	We can offer an earlier slot on Tuesday if that suits you better.
+medium	The form was submitted twice, so the second one has been removed.
+medium	Your recording is ready and will stay available for thirty days.
+medium	The road is closed at the junction, so take the second exit instead.
+medium	We have logged the fault and an engineer will call within the hour.
+medium	The price shown includes delivery but not the optional insurance.
+medium	Your password was reset and a temporary one is waiting in the inbox.
+medium	The team reviewed the case and agreed the charge was made in error.
+medium	Please read the summary before signing, as the terms have changed.
+medium	The library closes at six but the reading room stays open later.
+medium	We are upgrading the system tonight and the service may be slower.
+medium	Your seat was changed because the aircraft type was swapped today.
+medium	The estimate is valid for thirty days from the date on the letter.
+medium	We tried to call twice this morning but the line was engaged both.
+medium	The kitchen closes at ten, though drinks are served until midnight.
+medium	Your message was delivered but the recipient has not read it yet.
+medium	The heating switches off overnight and comes back on at six sharp.
+medium	We have noted your preference and will not contact you by phone.
+medium	The appointment lasts about forty minutes including the paperwork.
+medium	Your file is large, so the upload may take a couple of minutes.
+medium	The bus runs every twenty minutes until the end of the afternoon.
+medium	We replaced the part under warranty at no cost to you whatsoever.
+medium	The garden is open to visitors from April through to late October.
+medium	Your card ending in four nine was used at a shop this afternoon.
+medium	The lift is under repair, so please use the stairs on the far side.
+medium	We sent a reminder last week and another one earlier this morning.
+medium	The course runs for six weeks with a break in the middle of it.
+medium	Your claim is being assessed and we will write to you next week.
+medium	The window seat was taken, so we placed you on the aisle instead.
+medium	We can hold the item for you until the end of the working day.
+medium	The doctor is running behind, so expect a wait of twenty minutes.
+medium	Your data is stored securely and never shared with third parties.
+medium	The town centre is busy today because of the market on the square.
+medium	We updated the terms and the changes take effect from next month.
+medium	The parcel was signed for by a neighbour at number twenty three.
+medium	Your session will end soon unless you choose to continue working.
+medium	The fault was traced to a faulty switch in the upstairs cupboard.
+medium	We can post the documents or you may collect them from reception.
+medium	The train was cancelled, so the next one leaves in half an hour.
+medium	Your membership card arrives separately and should come this week.
+medium	The building has step free access through the side entrance only.
+medium	We will confirm the time once the engineer has finished the route.
+medium	The recipe serves four and takes about an hour from start to end.
+medium	Your balance is low, so the next payment may not go through today.
+medium	The hall is available on Saturday but not for the whole evening.
+medium	We looked into the matter and found the delay was at our own end.
+medium	The offer applies to a single item and cannot be used with others.
+medium	Your appointment is with a different nurse because of the swap.
+medium	The tap drips slightly and the washer will need replacing soon.
+medium	We have reserved the room and sent the details to your address.
+medium	The path is muddy after the rain so sensible shoes are advised.
+medium	Your call is important and we will answer as soon as we are free.
+medium	The system found no matches, so try a shorter search term instead.
+medium	We can deliver on Saturday morning for a small additional charge.
+medium	The museum is free to enter though donations are always welcome.
+medium	Your ticket allows one journey each way on the day of travel only.
+medium	The alarm will sound briefly while the system runs its daily test.
+medium	We noticed the reading was high and have arranged a second visit.
+medium	The colour may differ slightly from the photograph on the website.
+medium	Your order includes a spare part which is packed in the same box.
+medium	The office moves to the new address at the end of this quarter.
+medium	We are unable to change the booking within twelve hours of travel.
+medium	The printer needs paper and the tray is empty on the lower shelf.
+medium	Your enquiry was forwarded to the team that handles these cases.
+medium	The gate code changed last week and the new one is in the email.
+medium	We tested the line and found no fault at the exchange this time.
+medium	The cover starts today and runs for a year from this same date.
+medium	Your package was returned because nobody was home on both visits.
+medium	The road reopens next Monday once the resurfacing work is done.
+medium	We will call before we arrive so you have time to move the car.
+medium	The photograph must show the whole document including the edges.
+medium	Your renewal quote is lower than last year despite the new cover.
+medium	The bin collection moves to Wednesday during the holiday period.
+medium	We have a slot free at four although it is a longer appointment.
+medium	The link expires in one hour so please open it as soon as you can.
+medium	Your account shows two devices signed in from different places.
+medium	The hedge needs cutting back before it blocks the path entirely.
+medium	We can arrange an interpreter if you let us know a week before.
+medium	The boiler was serviced in spring and the certificate is attached.
+medium	Your seat reservation was lost when the service was rescheduled.
+medium	The forecast suggests rain later so the match may be called off.
+medium	We keep recordings for six months and then delete them securely.
+medium	The shelf holds a fair weight but should be fixed to the studs.
+medium	Your query needs a manager, so I will pass you across in a moment.
+medium	The paint needs two coats with four hours drying time between.
+medium	We have your old address on file and would like to correct it.
+medium	The engineer called twice and left a card through the letterbox.
+
+# ---- conversational : 49 texts, 43-78 characters (~3.1-5.6 s of speech)
+conversational	Sure, I can check that for you. One second.
+conversational	That is a good question, and the honest answer is that it depends on the plan.
+conversational	No problem at all. Let me look it up and I will tell you exactly what I see.
+conversational	I understand. Let us take it one step at a time.
+conversational	Sorry, could you say that again? The line broke up.
+conversational	Right, I see what you mean now. Let me check the file.
+conversational	Hang on, I will put you through to someone who knows.
+conversational	No, that is not quite it. Let me start from the beginning.
+conversational	Yes, exactly. That is what the note on the account says too.
+conversational	Give me a second, the page is still loading on my end.
+conversational	Well, that is odd. It was working perfectly this morning.
+conversational	Okay, so we agree on the date. What about the time?
+conversational	Honestly, I would wait until Monday and see what happens.
+conversational	Hold on, I think I have found it. Was it under the old name?
+conversational	Sure, no problem at all. I will send it across shortly.
+conversational	Hmm, that does not match what I have here on the screen.
+conversational	Fine, let us do it that way then. It is simpler for everyone.
+conversational	Sorry to interrupt, but is this the same account as before?
+conversational	Actually, now that you mention it, there was a letter.
+conversational	Let me stop you there, because I think there is a mix up.
+conversational	Oh dear. That should not have happened, and I am sorry.
+conversational	Good question. I will have to find out and call you back.
+conversational	That is one way to do it, though there is a quicker route.
+conversational	Wait, are we talking about the same booking reference here?
+conversational	Perfect. I have made a note and it is all set for Thursday.
+conversational	I am not sure, to be honest. Let me ask my colleague.
+conversational	So, to be clear, you want both items sent to the new address?
+conversational	Of course. Take your time, I am not going anywhere.
+conversational	Ah, that explains it. The reference was entered incorrectly.
+conversational	Look, I understand, but the rules here are quite strict.
+conversational	Great, that is everything. Is there anything else today?
+conversational	Hmm, let me try a different search. Was it a joint account?
+conversational	Sorry, one moment. Somebody is talking to me on the other side.
+conversational	Yes, I can hear you now. That is much better, thank you.
+conversational	Right then, shall we go through it once more from the top?
+conversational	Well spotted. I would never have caught that on my own.
+conversational	Not at all, it is a very common question and easy to fix.
+conversational	Hang on, that date is a Sunday. Did you mean the Saturday?
+conversational	True, but the same thing happened last year and it resolved.
+conversational	Okay, I have cancelled it. You should get a message shortly.
+conversational	Sorry about the wait. It has been rather busy this afternoon.
+conversational	Let me read that back to you, just so we both have it right.
+conversational	I see. And was anybody at home when the driver called round?
+conversational	That is unusual. Normally it clears within a day or two.
+conversational	Alright, leave it with me and I will sort it out today.
+conversational	Sorry, I missed that last part. Could you repeat the number?
+conversational	Yes, that is right. The second one replaced the first.
+conversational	Oh, I have just seen the note. You spoke to my colleague.
+conversational	Fair enough. In that case we will take the other approach.
+
+# ---- long : 33 texts, 317-361 characters (~22.6-25.8 s of speech)
+long	Thank you for calling. I have looked at the account and the transfer you are asking about was received yesterday evening, but it is still being processed by the receiving bank, which usually takes one working day. If it has not cleared by tomorrow afternoon, call back with the reference number and we will open a trace on it.
+long	Here is what I can do for you today. I can move the appointment to any morning next week, I can add a reminder by text the day before, and I can note on the file that you prefer to be called rather than emailed. None of that changes the price of the plan, and you can undo any of it later by calling this same number.
+long	Before we finish, let me read the details back to you so we are sure nothing is wrong. The address on the file is the one you gave me, the delivery window is tomorrow between ten and twelve, and the payment method is the card ending in the four digits you confirmed. If any of that is not right, tell me now and I will correct it while the record is still open.
+long	Before we go any further I should explain how the assessment works, because it is not quite what most people expect. A surveyor visits the property and spends roughly an hour looking at the structure, the roof and the drainage. They do not move furniture or lift carpets, so anything hidden underneath will not appear in the report.
+long	The route has changed since you last travelled with us, so I will run through it carefully. The service now leaves from the lower platform rather than the main concourse, and the first stop is the retail park instead of the hospital. Journey time is about eight minutes longer in the morning peak but slightly quicker in the evening.
+long	I can see three separate charges from the same shop on the same afternoon, which does look unusual. Two of them are for small amounts and one is considerably larger. In cases like this the most likely explanation is that the first two attempts failed at the terminal and were later reversed, but the reversal can take several days to appear.
+long	The difficulty with the current arrangement is that the two systems were never designed to talk to each other, so every record has to be entered twice. That works well enough when the volume is low, but it falls apart in the busy months, and most of the errors we see are simply somebody typing the same thing differently the second time.
+long	The garden has been left to itself for several seasons, so the first job is simply working out what is still alive underneath. The roses at the back are worth saving and will recover with hard pruning in late winter. The hedge along the boundary has grown well beyond its line and will need cutting in two stages, a year apart, or it may not come back at all.
+long	Reading through the notes, the pattern is clearer than it looked at the time. The symptoms appear in the late afternoon rather than the morning, they are worse after a long day standing, and they ease considerably at the weekend. That points away from the first explanation we considered and towards something much more ordinary.
+long	The course covers the same ground as last year but in a different order, which most people find easier. We start with the practical sessions rather than the theory, so you are handling the equipment in the first week instead of the fourth. The written work is spread across the whole term rather than concentrated at the end.
+long	I should be clear about what the guarantee does and does not cover, because the wording is easy to misread. It covers failure of the mechanism under normal domestic use, and that includes the motor, the gearbox and the electronics. It does not cover the finish, accidental damage, or anything caused by fitting the unit outside the recommended range.
+long	The measurements do not agree, and rather than average them I would like to understand why. The first set was taken in the morning with the doors closed, the second in the afternoon with the extraction running, and the third by a different instrument altogether. Any one of those could account for the difference on its own.
+long	What happens next depends on whether the other party responds within the twenty one days. If they do, we will send you a copy of whatever they say and you will have two weeks to comment before anything is decided. If they do not, the matter proceeds on the papers alone, which is usually quicker but means your account is the only one on the file.
+long	The recording quality is good enough for the purpose, though you will hear the room more than you would like. The microphone was sitting on a hard desk, which reflects sound straight back into it, and the heating came on twice during the session. None of that prevents transcription, and the speech itself is clear throughout.
+long	I have checked the stock across all four branches and the size you want is only in the one furthest from you. They can send it here by the internal van, which runs twice a week, so it would arrive on Thursday at the earliest. Alternatively I can order it new, which takes about ten days but means it comes directly to your address.
+long	We looked carefully at the timings and the delay was not where everyone assumed. The first stage finished on schedule and the last stage took no longer than usual. The whole of the loss happened in the handover between them, where the file sat untouched for most of two days because neither team believed it was theirs.
+long	Your tenancy ends on the last day of the month, so the inventory check is booked for the morning after. Please leave the meters readable and the keys on the kitchen counter. Normal wear is expected and will not be charged for, but anything beyond that will be itemised with photographs and you will have a week to dispute it.
+long	The best time to see the site is early, before the coaches arrive, and the light is better then as well. Allow two hours for the main circuit and another hour if you want the upper terrace, which involves a steep climb and is not accessible by wheelchair. The café closes an hour before the gates, so eat before you walk rather than after.
+long	The soil here is heavier than it looks, which explains most of what has failed so far. Anything that wants free drainage will struggle unless the bed is raised or the ground is opened up with grit over a couple of seasons. The things that have done well, the shrubs along the fence and the fruit at the end, are all happy in clay.
+long	Thank you for holding. The direct debit was returned by the bank on the second, which is why the policy shows as unpaid. Nothing has lapsed, because there is a grace period of fourteen days and we are still inside it. If you confirm the sort code I will set up a new instruction today. I will confirm all of this by email today.
+long	The building work starts on the fifteenth and should take three weeks. During that time the main entrance will be closed and everyone will use the side door by the car park. There will be noise between eight and five, though the noisiest part is expected to last only two days. I have added a note to the file so the next person sees the history.
+long	Let me summarise so there is no confusion later. You will send the two missing documents by Friday, we hold the application open until they arrive, and the case then returns to the queue at its original position. A decision usually follows within ten working days of the file being complete. I appreciate your patience while we sorted this out properly.
+long	The original appointment was missed because the engineer went to the wrong postcode, and the second was cancelled when the part did not arrive. What I can do is book a morning slot with a named engineer, add a note that this is a repeat visit, and waive the standing charge this quarter. Please keep the reference number somewhere safe for later.
+long	When the alarm sounds, leave by the nearest exit and go to the assembly point beyond the cycle racks. Do not use the lift and do not go back inside until a warden says it is safe. If you are helping someone who cannot use the stairs, wait at the refuge point on the landing. We will not take any further action until we hear back from you.
+long	The engine note changes under load, which is the first sign of what we found. There is a slow leak on the coolant hose where it meets the pump, and the warning light has never come on. The part is inexpensive, but the labour takes two hours because the manifold has to come off first. Nothing further is needed from you at this stage.
+long	The report reads worse than the situation is, because everything is listed at the same weight. Of the eleven items, seven are routine for a building of this age and three are worth doing within the year. Only the flashing above the back bedroom needs attention before the winter. You are welcome to call back if any part of that is unclear.
+long	I want to be honest about the timescale. The first phase is quick, perhaps three weeks, because everything needed is in place. The second depends on an approval we do not control, and that has taken from one month to five in comparable cases. So the total could be two months or seven. There is no charge for any of the work described above.
+long	The instrument was calibrated in March and the certificate runs a year, so the readings are sound. What concerns me is the placement. It sits beside a doorway that opens often, and the trace spikes whenever somebody walks through. Moving it three metres along the wall would fix that. If anything changes in the meantime we will telephone you first.
+long	Over the last six months demand is not simply rising. It climbs sharply on Mondays and falls away by Thursday, and the pattern is getting stronger. Staffing to the average leaves us short at the start of the week and idle at the end. Moving two people across would cost nothing. The details are also visible in the account online if you prefer.
+long	The photographs were taken eighteen months apart from the same position, which makes them useful. The crack has widened by about two millimetres at the top and not at all at the bottom, suggesting movement rather than settlement. It is worth monitoring with a gauge rather than by eye. We will write to you once the next step is complete.
+long	You are right that the wording changed and I am sorry it was not flagged. The previous version allowed cancellation with fourteen days notice at any point. The current one keeps that for monthly plans only. Since you joined under the old terms, the old notice period applies to you. A written summary will follow within five working days of today.
+long	There were two problems that night and the second was caused by the response to the first. The initial fault was a failed disk, which the system handled without any loss. The outage came later, when the rebuild saturated the network the service depends on, and lasted most of an hour. I will confirm all of this by email today.
+long	I can take the details now, but the decision is not made here. We record what you tell us, request the file from the original office, and pass both to the panel that meets on alternate Tuesdays. Most cases resolve within six weeks, though a few take longer where records are split. I have added a note to the file so the next person sees the history.
+
+# ---- italian : 4 texts, 22-315 characters (~1.6-22.5 s of speech)
+italian	L'ordine è confermato.
+italian	Il pagamento è andato a buon fine e la ricevuta è già in arrivo.
+italian	Grazie per aver chiamato. Ho controllato il conto e il bonifico di ieri sera risulta ricevuto, ma è ancora in lavorazione presso la banca destinataria, cosa che di solito richiede un giorno lavorativo. Se domani pomeriggio non risulta ancora accreditato, richiami con il numero di riferimento e apriamo una ricerca.
+italian	Posso spostare l'appuntamento a giovedì mattina alle nove, se le va bene.

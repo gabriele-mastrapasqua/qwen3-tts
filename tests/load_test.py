@@ -29,7 +29,29 @@ from urllib.parse import urlparse
 
 SR = 24000
 BYTES_PER_SAMPLE = 2
-DEFAULT_TEXTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "load_texts_en.txt")
+DEFAULT_TEXTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "load_texts_en_v2.txt")
+
+
+def bank_provenance(path):
+    """Which corpus produced this number.
+
+    A benchmark result belongs to the text bank it was measured on, and the banks are
+    versioned precisely because extending one changes the numbers. A run that does not
+    record its corpus cannot be compared to anything later, so this is printed and written
+    into every artifact rather than left to memory.
+    """
+    import hashlib
+    version = "unversioned"
+    try:
+        raw = open(path, "rb").read()
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if line.startswith("# bank-version:"):
+                version = line.split(":", 1)[1].strip()
+                break
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+    except OSError:
+        digest = "unreadable"
+    return {"bank": os.path.basename(path), "bank_version": version, "bank_sha256": digest}
 
 NEIGHBOR_MS = 200.0
 
@@ -436,6 +458,29 @@ def pct(values, p):
     lo, hi = int(k), min(int(k) + 1, len(v) - 1)
     return v[lo] + (v[hi] - v[lo]) * (k - lo)
 
+def pct_ci(values, p, resamples=400, seed=12345):
+    """Bootstrap confidence interval for a percentile, and how many samples support it.
+
+    A percentile is estimated from the samples in its tail, and there are n*(1-p/100) of those:
+    a p99 over 200 requests rests on TWO. Printing 253.8 as if it were a measurement invites
+    exactly the mistake of reading a 10% move between runs as a change in the system. So every
+    percentile carries its own spread, resampled from the data that produced it, and the count
+    of samples behind it. Costs milliseconds here and nothing at all on the server.
+    """
+    if not values:
+        return float("nan"), float("nan"), 0
+    n = len(values)
+    tail = max(1, int(round(n * (1.0 - p / 100.0))))
+    rnd = random.Random(seed)
+    est = []
+    for _ in range(resamples):
+        est.append(pct([values[rnd.randrange(n)] for _ in range(n)], p))
+    est.sort()
+    lo = est[int(0.025 * (len(est) - 1))]
+    hi = est[int(0.975 * (len(est) - 1))]
+    return lo, hi, tail
+
+
 def mean_inflight(records, wall):
     """Requests in flight, time-averaged (integral of the overlaps / wall).
     It says whether the OFFERED load turned into the intended concurrency: with staggered
@@ -471,6 +516,7 @@ def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
         "wall_s": wall, "audio_s": audio, "throughput_Q": (audio / wall) if wall else 0.0,
         "ttfb_p50": pct(ttfb, 50), "ttfb_p95": pct(ttfb, 95), "ttfb_p99": pct(ttfb, 99),
         "ttfb_max": max(ttfb) if ttfb else float("nan"),
+        "_ttfa_samples": list(ttfa),
         "ttfa_p50": p50, "ttfa_p95": p95, "ttfa_p99": pct(ttfa, 99),
         "ttfa_max": max(ttfa) if ttfa else float("nan"),
         "ttfa_mean": statistics.fmean(ttfa) if ttfa else float("nan"),
@@ -510,6 +556,26 @@ def print_table(rows, budget_ms):
               f" | {deg:>7.2f}x{s['ttfa_stability']:>6.2f}{over:>9} | "
               f"{s['mean_inflight']:>9.2f}{s['throughput_Q']:>7.2f}"
               f"{s['rtf_p50']:>9.2f}{s['rtf_p95']:>7.2f}")
+    print()
+    print("=============== HOW MUCH OF THAT IS REAL")
+    print(f"{'conc':>5}{'req':>5} | {'TTFA p50 (95% CI)':>28}{'n':>5} | {'TTFA p95 (95% CI)':>28}{'n':>5}"
+          f" | {'TTFA p99 (95% CI)':>28}{'n':>5}")
+    for s_ in rows:
+        vals = s_.get("_ttfa_samples") or []
+        cells = ""
+        for q in (50, 95, 99):
+            lo, hi, tail = pct_ci(vals, q)
+            mark = " !" if tail < 10 else "  "
+            cells += f"{f'{pct(vals, q):.0f} [{lo:.0f}-{hi:.0f}]':>28}{tail:>3}{mark}"
+        print(f"{s_['concurrency']:>5}{s_['requests']:>5} | {cells}")
+    print("n        = samples in the tail that the percentile rests on. ! means fewer than 10,")
+    print("           at which point the figure cannot support a comparison between runs: the")
+    print("           count above a p99 is Binomial(N, 0.01), so at N=200 it is 2 +/- 1.5.")
+    print("           Note the CI is itself optimistic out there: resampling cannot invent a")
+    print("           value worse than the worst one seen, so at the extreme tail trust n, not")
+    print("           the interval.")
+    print("           Prefer the exact threshold counts (>budget, and the server's")
+    print("           ttfa_over_*_total series) whenever the run is short.")
     print()
     print(f"degrad   = TTFA p95(c) / TTFA p95(c=1). \"serving c users costs the worst one Nx\"")
     print(f"stab     = p95/p50. If it moves away from 1 there is a SPIKE even with a good median")
@@ -665,6 +731,8 @@ def main():
 
     print(f"target   {args.url}{args.path}")
     print(f"speaker  {args.speaker} · language {args.language} · temp {args.temperature}")
+    _bank = bank_provenance(args.text_file)
+    print(f"bank     {_bank['bank']} version={_bank['bank_version']} sha={_bank['bank_sha256']}")
     print(f"texts    {len(texts)} from {os.path.basename(args.text_file)}"
           f"{' (' + ','.join(classes) + ')' if classes else ''}")
     mode = f"soak {args.duration:.0f}s" if args.duration else f"{args.requests} requests"

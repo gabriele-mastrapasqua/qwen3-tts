@@ -727,7 +727,9 @@ BENCH_MODEL   ?= $(MODEL_LARGE)
 BENCH_PROFILE ?= recommended
 BENCH_TOPO    ?= 2x8
 BENCH_SPEAKER ?= ryan
-BENCH_BANK    ?= tests/load_texts_en.txt
+# v2 corpus: 277 texts against v1's 21. Numbers measured on the two banks are NOT comparable,
+# which is why every artifact records the bank version and digest. v1 stays available.
+BENCH_BANK    ?= tests/load_texts_en_v2.txt
 BENCH_CONC    ?= 1,4
 BENCH_WAVES   ?= 3
 BENCH_OUT     ?= /tmp/bench_suite
