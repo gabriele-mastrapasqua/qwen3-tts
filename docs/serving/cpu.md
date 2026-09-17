@@ -76,10 +76,12 @@ preflight near the top of its report. A poor `4x8` verdict means test `2x16`, th
 
 ### Turn SMT off first
 
-The engine pins workers to contiguous **logical** CPU ids, so with SMT on a two-thread slice can
-be one physical core wearing two hats, and a topology sweep then compares configurations that are
-not what their names say. The Arm instance families report `Thread(s) per core: 1` on their own;
-the x86 ones usually do not.
+The engine orders the CPUs **core-major** (each core's threads adjacent) and slices that order, so
+siblings stay inside one worker and two workers never share a physical core. That is correct, and
+it is also why a slice does not mean what its width suggests: with SMT on and `per = 2`, a worker's
+slice is **one physical core with both its threads**, not two cores. A topology sweep then compares
+configurations that are not what their names say. The Arm instance families report
+`Thread(s) per core: 1` on their own; the x86 ones usually do not.
 
 ```bash
 lscpu -e                                       # which id is a sibling of which core
@@ -317,6 +319,22 @@ topology.
 
 **Threads do not add up.** Each worker's pool is K threads and the BLAS inside it has its own.
 Oversubscription turns latency into context switches — the 40 ms in the table above.
+
+A worked example of all three at once, from a dual-socket 12-physical-core host with SMT on
+(24 logical CPUs), serving the 1.7B to 24 concurrent callers:
+
+```bash
+./qwen_tts -d qwen3-tts-1.7b --load-voice v.qvoice --icl-only --serve 8000            --prefork 12 --prefork-threads 2
+```
+
+Core-major slicing gives each of the twelve workers `per = 24/12 = 2` cpus, which on an SMT-2 host
+is **one physical core with both its threads**. So the whole machine is in use — but as twelve
+one-core servers. Then `--batch-size` is absent, so the per-worker in-flight cap is 1 and only
+twelve of the twenty-four requests are running; the rest sit in the backlog. And no worker ever
+sees a batch, because a batch needs two requests in one worker. Three separate ways of leaving
+performance on the table, none of which prints an error. The fix is fewer, wider workers with a
+real cap — `--prefork 2 --prefork-threads 6 --batch-size 8` on the twelve physical cores — plus
+`--int8`, which on a DDR3-class machine is the single biggest lever available.
 
 Ask the parent what actually happened rather than inferring it:
 

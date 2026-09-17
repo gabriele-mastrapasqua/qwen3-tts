@@ -55,12 +55,28 @@ prefork: 12 workers x 2 threads, 24 cpus (2 per worker), cap 1 in flight each, p
 request at a time, from `2` up it runs the continuous-batching scheduler. So `W x cap` is the
 number of requests in flight, and the backlog (16) is what queues behind it.
 
-**Core slices come from `--prefork`, not from `--prefork-threads`.** Worker *w* is pinned to
-the contiguous logical CPUs `[w * (nproc / W), …]`; `--prefork-threads` then sizes the pool
-*inside* that slice. More threads than the slice is oversubscription, fewer leaves cores idle,
-and when *W* does not divide `nproc` the remainder is unused. There is no CLI way to exclude
-SMT siblings: the slices are contiguous *logical* ids, so read `lscpu -e` to see which id is a
-sibling of which core, and which socket each belongs to.
+**Core slices come from `--prefork`, not from `--prefork-threads`.** The parent orders the CPUs
+it is allowed to use **core-major** — each physical core's threads adjacent — and hands worker *w*
+the contiguous range `[w * (ncpu / W), …]` of *that* order. `--prefork-threads` then sizes the pool
+*inside* the slice. More threads than the slice is oversubscription, fewer leaves cores idle, and
+when *W* does not divide `ncpu` the remainder is unused.
+
+Core-major ordering is there because of a measured defect: Linux numbers every core's first thread
+before any sibling, so on a 12-core SMT-2 host (siblings `N` and `N+12`) `--prefork 2` used to give
+worker 0 cpus 0–11 and worker 1 cpus 12–23 — **the same twelve physical cores, one worker per
+hyperthread.** The workers were not isolated at all, and since the AMX tile unit is per physical
+core they serialised on it while the numbers looked like isolation. Each worker now prints the mask
+it actually set, and says which ordering produced it:
+
+```
+prefork topology: 24 logical cpus = 12 physical cores x 2 SMT · 12 workers x 2 threads · 2 cpus per worker (core-major masks)
+prefork: worker 0 pid 4711 cpus 0,12 threads 2 (core-major slice, siblings kept together)
+```
+
+Read that second line carefully on an SMT host: with `per = 2` and SMT 2, a worker's slice is **one
+physical core**, not two. The engine warns about it at startup. It falls back to plain logical order
+when sysfs topology is unavailable and says so, in which case `lscpu -e` is what tells you which id
+is a sibling of which core and which socket each belongs to.
 
 **On more than one socket, the weights are loaded before the fork** and shared copy-on-write,
 so workers pinned to the second socket read them across the interconnect. That is measurable,
