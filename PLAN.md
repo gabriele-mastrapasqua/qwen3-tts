@@ -308,7 +308,28 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       line, TTFA past 1 s, behind-realtime fraction) with server health below; `Build` panel
       fixed to show labels, and a `up{job}` panel added so a gap in the graphs can be told apart
       from a server that was down.
-- [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** Note it is within the shipped default
+- [x] OTEL-11 **Scrape cost measured directly, not inferred** (2026-09-17). A soak A/B can only
+      say "below the noise floor", and this box's floor is several percent, so the parent's own
+      CPU time was read from `/proc/<pid>/stat` over three 120 s windows under C16 load: idle,
+      1 scrape/s, idle again. The parent consumed **less than one clock tick in every arm**, so
+      119 scrapes cost under 10 ms in total: an upper bound of **~84 us per scrape**, and the
+      real figure is below the instrument's resolution. Closes OTEL-7b: a 1 s interval is free.
+- [x] OTEL-12 **Worker-0 asymmetry: my softirq explanation was WRONG, and the error was mine.**
+      (2026-09-17.) Three signals agreed that worker 0 was ~10% slower — TTFA, completions and
+      behind-realtime chunks — and I attributed it to network softirq work concentrated on its
+      cores, citing 58.7% of NET_RX against an even 25%. **That number was cumulative since
+      boot**: it counted every earlier experiment, ssh session and tmux run on the box, not the
+      benchmark window. Measuring the delta *during* each arm shows NET_RX split evenly —
+      24.5 / 27.8 / 23.9 / 23.7 — and the hypothesis is refuted. Hardware interrupts were
+      already even (25.9% vs 25%) and were refuted earlier.
+      What survives is simpler and fits every arm: the **load generator runs unpinned on the
+      same box**, the scheduler favours low-numbered idle CPUs, and it was observed on cpu0 —
+      inside worker 0's slice. Pinning it anywhere (w1 or w3 cores) removed most of worker 0's
+      penalty without transferring it, because eight TTS threads dilute one python process.
+      Consequences: every closed-loop soak run with a co-located generator has carried this,
+      systematically on worker 0, worth ~2.5% aggregate; and the lesson is the method one —
+      **a cumulative counter is not a measurement of a window.**
+- [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** SUPERSEDED by OTEL-11. Note it is within the shipped default
       limit (1/s against 5/s), so this is a cost question, not a behaviour one. Everything above was at 5 s. 1 s is
       5x the scrapes and should still be invisible, but it is a claim, not a measurement.
       The parent path is inside `#if defined(__linux__)` and is compiled out on macOS, so every

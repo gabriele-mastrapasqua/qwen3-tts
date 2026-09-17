@@ -71,8 +71,12 @@ groups:
           description: >-
             Queue-depth balance will look perfect while this is true: a least-loaded dispatcher
             equalises how many requests each worker HOLDS, not how fast it serves them, so a
-            slow worker hides there. Usually the CPUs, not the process -- check which cores are
-            carrying network softirq work.
+            slow worker hides there entirely. Look first for something unpinned sharing that
+            worker's cores -- a co-located load generator, a backup job, an agent -- since the
+            scheduler favours low-numbered idle CPUs and those belong to worker 0. Measured on a
+            32-core Axion: an unpinned generator cost worker 0 about 8% on first-audio latency
+            and half again as many chunks behind realtime, and pinning it anywhere else removed
+            most of that.
 
       - alert: QwenTtsListenersLeaving
         expr: >-
