@@ -232,3 +232,85 @@ frozen Turin profile, before the endpoint is documented as production-safe.
 - vLLM `docs/design/metrics.md` and the v1 metrics design page
 - The tree: `qwen_tts_server.c` (`g_srv` :597, `handle_health` :862, `batch_job_t` :1584,
   `reader_main` :1857, admission-health mmap :2804), `qwen_tts.h:689`, `docs/serving/api.md`
+
+## 10. Recommendation (2026-09-17) — two tiers, and tier 1 costs nothing
+
+Written after reading the prefork parent loop, which changes the answer. The parent
+**already holds the per-worker picture over time, in its own memory, with no IPC to add**:
+
+| parent-side state | where | what it already is |
+|---|---|---|
+| `active[w]` | accept loop | in-flight requests on worker `w` |
+| `completed[w]` | `:3026`, `+= n` bytes | **cumulative finished connections** on worker `w` — `srv_conn_close()` (`:1458`) writes exactly one byte per finished connection |
+| `kids[w]` | fork table | worker alive / dead |
+| `rejected` | `:3113` | parent-side "all workers full" rejections |
+| `replans` | elastic path | elastic re-slicing churn |
+| `cur[w]`, `slice` | elastic path | CPUs currently assigned to worker `w` |
+
+That is the operational picture — balance across workers, a wedged worker, rejection
+pressure, elastic churn — and it is **already being maintained**. Nothing has to be measured;
+something has to be *printed*.
+
+### Tier 1 — print what the parent already knows (recommended first step)
+
+- Register a second listening socket in the parent's **existing `pfd[]` poll set**. No new
+  thread, no shared memory, no atomics: the accept loop is single-threaded and is the sole
+  owner of `active[]` / `completed[]` / `kids[]`, so there is no race to design around.
+- One-shot handler: non-blocking read of the request (discarded — it is a scrape), print the
+  text page, close. Never retry, never buffer: drop on `EAGAIN`.
+- Series, all labelled `worker`:
+
+  ```
+  qwen_tts_worker_up{worker}                    gauge    kids[w] > 0
+  qwen_tts_worker_inflight{worker}              gauge    active[w]
+  qwen_tts_worker_connections_total{worker}     counter  completed[w]
+  qwen_tts_worker_cpus{worker}                  gauge    cur[w] (elastic slice width)
+  qwen_tts_rejected_total                       counter  rejected  (parent, all workers full)
+  qwen_tts_elastic_replans_total                counter  replans
+  qwen_tts_workers_total                        gauge
+  qwen_tts_build_info{version,isa,model_size,profile}  = 1
+  ```
+
+- Throughput per worker over time is the reader's job, not ours:
+  `rate(qwen_tts_worker_connections_total[5m])`. A worker that is wedged shows as `inflight`
+  pinned at `cap` with a flat `connections_total` — visible precisely because we never summed
+  the workers together.
+- **Cost on the request path: structurally zero**, not "measured under 0.2 %". No code is added
+  to any path a request traverses; no child-side code changes at all. OTEL-6's cost gate does
+  not apply to tier 1 — there is nothing to gate.
+- Only risk to note: a slow scraper writing into the accept loop. Bound by non-blocking
+  one-shot writes and by binding the metrics port to loopback by default. If even that is
+  unacceptable, the fallback is a parent thread plus `_Atomic int active[]`, paid for in the
+  parent only — still nothing on the request path.
+- Separate **port** (`--metrics-port`, off by default), not the service port: the parent does
+  not read the service socket at all today — it `accept()`s and hands the fd to a worker with
+  `SCM_RIGHTS` (`srv_send_fd`, `:1468`). Teaching it to peek at HTTP on the data path to route
+  `/metrics` would be the single most invasive thing in this whole document, for no gain.
+
+### Tier 2 — latency and audio seconds, only if tier 1 proves insufficient
+
+TTFB, TTFA, audio-seconds and the write-gap proxy are child-side and need the shared segment of
+§4 (extend the `qwen_admission_health_t` mmap with one counter block per worker; single writer
+per slot, so relaxed atomics and no contention). Recommended form when we get there: **no
+histograms.** A Prometheus histogram is a set of "how many exceeded X" counters, and we have
+already declared the only threshold we care about. So:
+
+- `_sum` / `_count` counter pairs → the mean over any window via `rate()`;
+- plus exact threshold counters for the declared lines, e.g.
+  `qwen_tts_ttfa_over_1s_total{worker}` — one atomic increment, exact rather than an estimated
+  quantile, and it encodes the `safe_play_start` hard line directly.
+
+That is ~12 `uint64` per worker (~100 bytes each), against ~16 buckets × 4 histograms for the
+conventional shape.
+
+### Not recommended
+
+- `gen_ai.server.*` aliases: skip for now (§1) — Development stability, namespace moved to an
+  untagged repository, no audio operation defined. Revisit if a reader actually asks.
+- Any server-side `stall_rate` or `safe_play_start`: §5. Not ours to claim.
+
+### Separate, cheap, unrelated to the tiering
+
+`GET /v1/health` should say which worker answered (`"worker": N`) and the doc should state that
+its counters are that worker's while its limits are the server's. Two lines, no behaviour
+change, and it stops the endpoint from being quietly misread (§4).

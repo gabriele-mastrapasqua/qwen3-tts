@@ -136,9 +136,21 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 ### OTEL — telemetry endpoint for the streaming server (ANALYSIS FIRST) — detail: `.work/otel-metrics-endpoint-20260917.md`
 
 Goal: let a standard observability reader watch a production CPU streaming server, without
-inventing numbers the server is not entitled to claim. **Nothing is implemented until OTEL-1
-and OTEL-2 are answered** — the survey already found that the wire format is the easy half and
-the honest-metric boundary is the hard half.
+inventing numbers the server is not entitled to claim, and without complicating the server.
+**Nothing is implemented until OTEL-1 and OTEL-2 are answered** — the survey found that the wire
+format is the easy half and the honest-metric boundary is the hard half.
+
+**Recommended shape (2026-09-17, pending ratification): two tiers, and tier 1 costs nothing.**
+The prefork parent already holds the per-worker picture over time in its own memory —
+`active[w]` in-flight, `completed[w]` cumulative finished connections (`srv_conn_close()` at
+`qwen_tts_server.c:1458` writes one byte per finished connection, the parent counts them at
+`:3026`), `kids[w]` alive, `rejected`, elastic `replans` and `cur[w]`. Nothing has to be
+measured; something has to be *printed*. Tier 1 registers a second listening socket in the
+parent's **existing `pfd[]` poll set** — no thread, no shared memory, no atomics, since the
+accept loop is the sole owner of that state — and emits it as per-worker labelled series. Cost
+on the request path is **structurally zero**: no code is added to any path a request traverses,
+and the child does not change at all. Tier 2 (latency, audio seconds, the write-gap proxy) is
+child-side, needs the shared segment, and happens only if tier 1 proves insufficient.
 
 - [ ] OTEL-1 **Decide what the server is entitled to export.** Our envelope is half
       client-side by construction. Server-observable: TTFB, TTFA, queue/admission time, request
@@ -153,21 +165,33 @@ the honest-metric boundary is the hard half.
       `static server_state_t g_srv` (`qwen_tts_server.c:597`) is process-local, so each worker
       counts only itself — which means `GET /v1/health` **already** returns one worker's
       counters on a 12-worker box, a different twelfth each scrape. Verify empirically, then
-      choose: shared `mmap` segment aggregated by the parent (the `qwen_admission_health_t`
-      pattern at `:2804` already establishes it, and gauges require it), per-worker `worker=`
-      labels summed by the reader (free and correct for counters and histogram buckets, and it
-      keeps a starving worker *visible* instead of averaged away), or both. Fix or document the
-      `/v1/health` behaviour either way, and check what in `tests/` depends on it.
+      choose. **Recommended: never aggregate in C at all** — emit per-worker labelled series
+      and let the reader do `sum()` / `rate()`. That keeps a wedged worker *visible* (inflight
+      pinned at cap, `connections_total` flat) instead of averaged away, which is the failure the
+      soak work kept finding, and for tier 1 it needs no shared memory: the parent already owns
+      the numbers. The `qwen_admission_health_t` mmap pattern at `:2804` stays the answer for
+      tier 2 only. Separately and cheaply: `/v1/health` should report which worker answered
+      (`"worker": N`) and the doc should say its counters are that worker's while its limits are
+      the server's — two lines, no behaviour change. Check what in `tests/` reads it.
 - [ ] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** Readable directly by
       Prometheus, Grafana Alloy, VictoriaMetrics and the Datadog OpenMetrics check, and by the
       OpenTelemetry Collector through its `prometheus` receiver, which converts to OTLP for
       anything downstream — so a text page reaches every OTel consumer without linking a
       protobuf/gRPC client into a dependency-free C server. Path `/metrics`, not `/v1/metrics`
-      (scraper default; `/v1/metrics` is OTLP-over-HTTP's own push path). Off by default: the
-      page publishes concurrency, capacity, model size and build identity to anyone who can
-      reach the port. Must answer without the synth lock and outside admission — a metrics
-      endpoint that queues behind TTS goes blind exactly when it is needed.
-- [ ] OTEL-4 **Namespace, buckets, and a hard cardinality rule.** Prefix `qwen_tts_` with
+      (scraper default; `/v1/metrics` is OTLP-over-HTTP's own push path). **On a separate port**
+      (`--metrics-port`, off by default, loopback-bound): the parent does not read the service
+      socket at all today — it `accept()`s and passes the fd with `SCM_RIGHTS` (`:1468`) — so
+      teaching it to peek at HTTP on the data path just to route `/metrics` would be the single
+      most invasive change available, for no gain. A separate port also makes "answers without
+      the synth lock, outside admission" structural rather than a thing to be careful about, and
+      it keeps concurrency/capacity/build identity off the public port.
+- [ ] OTEL-4 **Namespace, buckets, and a hard cardinality rule.** Tier 2 note: **prefer no
+      histograms.** A Prometheus histogram is a set of "how many exceeded X" counters, and we have
+      already declared the only threshold that matters — so `_sum`/`_count` pairs (mean over any
+      window via `rate()`) plus exact threshold counters such as
+      `qwen_tts_ttfa_over_1s_total{worker}`, which encodes the `safe_play_start` hard line
+      directly and is exact rather than an estimated quantile. ~12 `uint64` per worker instead of
+      four bucket arrays. Prefix `qwen_tts_` with
       underscores — *not* vLLM's `vllm:` colon, which their own docs concede is contrary to
       Prometheus convention. Adopt the GenAI semantic-convention TTFT bucket set for the latency
       histograms (`0.001 … 1.0 … 10.0 s`; the `1.0` boundary happens to be our `safe_play_start`
@@ -188,7 +212,9 @@ the honest-metric boundary is the hard half.
       convention that can rename fields without a deprecation window. Open sub-question: whether
       to propose an audio operation upstream — we have an unusually well-specified envelope to
       argue from.
-- [ ] OTEL-6 **Cost gate before any of it is called production-safe.** Instrumentation is not
+- [ ] OTEL-6 **Cost gate — tier 2 only.** Tier 1 adds no code to any path a request traverses,
+      so there is nothing to gate; do not run a campaign to prove zero. For tier 2:
+      instrumentation is not
       free until measured. The per-request instants already exist in `batch_job_t`
       (`t_recv`/`t_parsed`/`t_admit`/`t_first`/`t_write_complete`, `first_audio_ready_us`,
       `audio_ready_samples`) and are discarded at job completion, so the addition is aggregation,
