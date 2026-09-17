@@ -62,7 +62,7 @@ make blas
 - **The small 0.6B is expressive too — and stays sub-realtime** 🆕 — for a long time `--emotion` did nothing on the 0.6B: unlike the 1.7B it has no steerable emotion subspace. It does, however, clone voices very well — so on the small model **the emotion rides on the voice**. **All 9 presets ship ready** (240 KB of 4 KB voice assets) and **any cloned voice emotes with zero setup** via six shipped emotion directions — so the small model has the whole expressive stack out of the box: **6 emotions + inline `[tag]` paralinguistics + voice cloning, together, at RTF ≈ 0.8** under `--int8` on an M1. Try it with **`make emo-06b-demo`**. See [docs/emotion-06b-recipe.md](docs/emotion-06b-recipe.md).
 - **Inline markup for audiobooks** — write one text with ElevenLabs/Bark-style tags and get a multi-emotion take in one pass: `--text "I won! [joy] ...amazing! [pause:500ms] [sad] But it's over. [sigh]"`. Mid-text emotion switches, `[pause:400ms]`/`[break:1s]` pauses, and `[sigh]`/`[huff]` paralinguistic fillers — auto-detected in `--text` (no flag) or explicit via `--compose`. Spans are model-generated and concatenated seamlessly. See [docs/markup.md](docs/markup.md).
 - **VoiceDesign** — Create new voices from text descriptions.
-- **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`; JSON body takes `emotion`/`instruct`/`volume`/`rate` (same recipe as the CLI). **Inline `[mood]` markup works over the API too** — one request can switch emotion sentence-by-sentence (`"text":"[joy] Great news! [sad] But I must go."`), auto-detected and streamed span-by-span. See [docs/server.md](docs/server.md).
+- **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`; JSON body takes `emotion`/`instruct`/`volume`/`rate` (same recipe as the CLI). **Inline `[mood]` markup works over the API too** — one request can switch emotion sentence-by-sentence (`"text":"[joy] Great news! [sad] But I must go."`), auto-detected and streamed span-by-span. See [docs/serving/api.md](docs/serving/api.md).
 - **Streaming** — Real-time audio via `--stream` (WAV) or `--stdout` (raw PCM).
 - **INT8 / INT4 quantization** — `--int8` / `--int4` quantize Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86), near-bf16 quality, and work with presets **and** custom `.qvoice` voices. On cache-rich Apple Silicon **both go sub-realtime** (0.6B best **0.52 int4 / 0.69 int8**; 1.7B best **~1.53** quant-mixed); on memory-starved x86, int8+VNNI wins the wall clock. See [Performance](#performance).
 - **Configurable sampling** — Temperature, top-k, top-p, and repetition penalty.
@@ -432,13 +432,39 @@ curl -s http://localhost:8080/v1/audio/speech \
   -d '{"input":"Hello world","voice":"ryan"}' -o output.wav
 ```
 
-> Full guide: all endpoints, request body, performance → [docs/server.md](docs/server.md)
-> · running it in production — pre-forked pinned workers, finding `W x K` on your box,
-> deployment profiles and the benchmark suite → [docs/serving-operations.md](docs/serving-operations.md)
-> · Arm topology/bandwidth preflight before serving or soak → [docs/arm-topology-preflight.md](docs/arm-topology-preflight.md)
-> · every runtime flag, its default and why they travel together → [docs/feature-flags.md](docs/feature-flags.md)
-> · a 16-core Arm box measured across every rung → [docs/reference-arm-16c.md](docs/reference-arm-16c.md)
-> · an 8-core Intel AMX box, and what AMX buys per stage → [docs/reference-x86-8c-amx.md](docs/reference-x86-8c-amx.md)
+#### Serving it for real
+
+The commands above are the API. A server you put in front of users needs two more steps, and
+skipping them does not produce an error — only a slower machine:
+
+```bash
+make doctor                       # ALWAYS FIRST on a new box: <1 min, no model. What is this
+                                  # machine, do the SMT/governor/cgroup gates pass, what is its
+                                  # bandwidth roof, which kernels resolve, what topology to try
+
+# then launch from a deployment profile, which carries the ~40 correct flags for your ISA
+eval "$(tools/perf_profile.py command recommended --model qwen3-tts-0.6b --port 8080)"
+tools/perf_profile.py check-flags recommended --log server.log   # prove the process read them
+```
+
+`--batch-size` **defaults to 1** and is also the per-worker in-flight cap: with `--prefork 12`
+and no `--batch-size`, twelve requests run and the rest wait. A worker only reaches the batched
+GEMM path at batch ≥ 2, which needs client concurrency `C ≥ 2W`.
+
+**Serving is documented in its own directory: [docs/serving/](docs/serving/README.md).**
+
+| | |
+|---|---|
+| [**Serving index**](docs/serving/README.md) | one API, two backends, two maturity levels — pick a lane |
+| [**CPU streaming server**](docs/serving/cpu.md) | **production.** `make doctor` first, then the deployment profile that carries the forty flags you should not be typing by hand |
+| [Operations manual](docs/serving/cpu-operations.md) | the break-in sweep, the benchmark suite rung by rung, arrival models, the 30-minute soak |
+| [Request batching](docs/serving/cpu-batching.md) | vLLM-style `--batch-size N`: continuous batching with per-request streaming |
+| [**CUDA streaming server**](docs/serving/gpu-cuda.md) | ⚠️ **work in progress** — implemented and fast, never qualified |
+| [The HTTP API](docs/serving/api.md) | endpoints, request body, streaming, the error envelope — identical on both backends |
+| [Measured boxes](docs/serving/boxes.md) | every host this has been measured on, its profile JSON, and what it holds |
+
+> Also: every runtime flag and its default per ISA → [docs/feature-flags.md](docs/feature-flags.md)
+> · Arm topology/bandwidth preflight → [docs/arm-topology-preflight.md](docs/arm-topology-preflight.md)
 
 ### Streaming
 
@@ -561,7 +587,7 @@ and reused across all in-flight requests, instead of re-read per user. A continu
 batch full (a finished request's slot is refilled immediately) and **streaming composes** — each user
 still gets their own progressive audio stream. This trades a little per-request latency for much higher
 total throughput on bandwidth-bound boxes. Measure it on your CPU with `make bench-server`; details in
-[docs/server-batching.md](docs/server-batching.md).
+[docs/serving/cpu-batching.md](docs/serving/cpu-batching.md).
 
 **Before serving on a new Arm box:** run `make doctor` first. On a 32-core Arm
 Linux host it now includes a short simultaneous `1x8` / `2x8` / `4x8` INT8 GEMV
@@ -595,7 +621,7 @@ Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDI
 > and it has been listened to under concurrent load. It has **not** met a serving KPI target: every
 > soak so far is a 3-minute screen and each reports per-class KPI drift, and no 30-minute
 > qualification has been run. It is opt-in and there are two settings that silently disable most of
-> it — see [docs/cuda-performance.md § CUDA streaming server](docs/cuda-performance.md). The CPU
+> it — see [docs/serving/gpu-cuda.md](docs/serving/gpu-cuda.md). The CPU
 > server remains the qualified path.
 
 **Apple Metal** — `make metal CC=clang`, then `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`.
@@ -649,8 +675,7 @@ concurrent users in roughly the time of one by reading each weight once for all 
 |-------|----------|
 | [Voice Cloning](docs/voice-cloning.md) | Reference audio tips, ECAPA-TDNN internals, model comparison, samples |
 | [Custom Voices](docs/custom-voices.md) | `.qvoice` format, delta vs standard, managing profiles, troubleshooting |
-| [HTTP Server](docs/server.md) | All endpoints, request body, streaming, server performance |
-| [Server request-batching](docs/server-batching.md) | vLLM-style `--batch-size N`: serve N concurrent users together, continuous batching, per-request streaming |
+| [**Serving**](docs/serving/README.md) | The whole serving directory: the HTTP API, the **production CPU server**, the **WIP CUDA server**, the operations manual and every measured box |
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
 | [Emotion — THE recipe](docs/emotion-THE-recipe.md) | The one-and-only `--emotion` recipe: preset → STEER @ w12, clone → COMBINE; native preset per language. Single source of truth |
 | [Emotion on the small 0.6B](docs/emotion-06b-recipe.md) | 🆕 The small model has no steerable emotion subspace — so the emotion rides on the **voice** (4 KB asset per emotion, `make emovoice`). Emotion + paralinguistics + cloning at RTF ≈ 0.8 |
@@ -671,6 +696,7 @@ concurrent users in roughly the time of one by reading each weight once for all 
 | [Optimization Notes](blog/optimization-notes.md) | RTF 3.5 → 1.3: the full M1 bf16 optimization story |
 | [Emotion on the Small Model](blog/emotion-on-the-small-model.md) | Why steering and fine-tuning both failed on the 0.6B, the cosine≈0 measurement that killed transfer, and the reframe that solved it: emotion as a property of the voice |
 | [Fast on Every CPU](blog/making-qwen3-tts-fast-on-every-cpu.md) | SDOT (sub-1.0 on M1) + AVX2/AVX-512/VNNI on x86; why it's memory-bound |
+| [A CPU streaming server that never stalls](blog/cpu-streaming-server-that-never-stalls.md) | The v2 serving design: why RTF 0.90 can stall 35% of the time, where first audio really goes under load, the decode quantum that sets the prebuffer, and the configuration gate that exists because a benchmark was bimodal |
 
 ## Credits & Acknowledgments
 

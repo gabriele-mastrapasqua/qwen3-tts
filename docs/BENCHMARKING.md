@@ -171,7 +171,7 @@ splitter is never called "batching" in a server report.
 Two tiers (2026-09-07): TIER A, development bench, usually C3 + C4, one architectural
 question per run, never published; TIER B, qualification, the full envelope below on a
 stationary stratified workload. Playback terms: `required_prebuffer`, `safe_play_start`,
-`stall_rate@B`, `max_gap` are defined in `docs/serving-operations.md` §5 and computed by
+`stall_rate@B`, `max_gap` are defined in `docs/serving/cpu-operations.md` §5 and computed by
 `tests/playback_sim.py`; they are client-observed (see the coalesced-read share).
 
 `tests/serve_parallel_wave.py` accepts repeated `--server-arg=ARG` tokens for a bounded

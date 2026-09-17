@@ -351,7 +351,7 @@ so a harness that signals before and after a cell can subtract the two.
 
 - [ENGINEERING-METHOD.md](ENGINEERING-METHOD.md) — the rules these gates encode (§8 harness
   validity, §9 runtime over source, §17 the ledger).
-- [serving-operations.md](serving-operations.md) §2 — the box break-in, now starting with
+- [serving/cpu-operations.md](serving/cpu-operations.md) §2 — the box break-in, now starting with
   `make cpu-check`.
 - [feature-flags.md](feature-flags.md) §7 — the diagnostics, and what `[FLAGS]` cannot show.
 - `make kernel-tune` / `make tune-archive BOX=` — measured dispatcher thresholds, archived

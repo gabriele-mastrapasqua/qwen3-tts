@@ -195,7 +195,7 @@ nobody re-measures, which is the same failure the runtime-environment gate above
 prevent.
 
 The way to add one is the break-in sweep in
-[`../../docs/serving-operations.md`](../../docs/serving-operations.md) §2, then a profile
+[`../../docs/serving/cpu-operations.md`](../../docs/serving/cpu-operations.md) §2, then a profile
 with `status: qualified` and the numbers that earned it.
 
 ### The one rule that generalises, and the one that does not
@@ -226,7 +226,7 @@ filled in, every field looks deliberate, and nothing says which of them anybody 
 A skeleton starts at `unqualified` and makes filling a field a decision.
 
 Then run the break-in sweep in
-[`../../docs/serving-operations.md`](../../docs/serving-operations.md) §2, put what it
+[`../../docs/serving/cpu-operations.md`](../../docs/serving/cpu-operations.md) §2, put what it
 measured into the file, and set `qualification.status` to `qualified` with the numbers that
 earned it.
 

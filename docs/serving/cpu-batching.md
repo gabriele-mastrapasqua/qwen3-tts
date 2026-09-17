@@ -1,4 +1,7 @@
-# Server request-batching (vLLM-style)
+# CPU server request-batching (vLLM-style)
+
+_[Serving index](README.md) · [api](api.md) · [CPU server](cpu.md) · **batching** · [boxes](boxes.md)_
+
 
 > **PRODUCT 2 of the batching arc.** Serve **N different users' different requests** concurrently
 > with maximum efficiency, by stepping them **together** through Talker + Code Predictor
@@ -72,7 +75,7 @@ worker.)
 
 ## Endpoints
 
-Same as the normal server (see `docs/server.md`):
+Same as the normal server (see `docs/serving/api.md`):
 
 | Endpoint | Method | Batched? |
 |---|---|---|
@@ -126,7 +129,7 @@ numbers, which are sized by cores, cache and memory channels.
 The CUDA server shares the endpoints and the streaming contract but nothing else that matters for
 tuning. It is stepped by `QWEN_CUDA_BATCH=1`, sized by GPU memory bandwidth rather than by cores,
 and has its own flags, its own optimum batch size and its own configuration traps. Do not carry a
-number from one to the other: see **`docs/cuda-performance.md`, "CUDA streaming server"**.
+number from one to the other: see **[`gpu-cuda.md`](gpu-cuda.md)**.
 
 ## Status / next
 

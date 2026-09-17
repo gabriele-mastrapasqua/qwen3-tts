@@ -106,6 +106,6 @@
     "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
     "model": "qwen3-tts-1.7b",
     "speaker": "ryan",
-    "notes": "Use this to START, then replace it. Two workers of eight threads is where a 16-core Arm host landed, and it rests on one measured fact that generalises -- a single request saturates at about eight threads and regresses at sixteen -- and one that does not: which topology wins depends on the concurrency you expect, because a worker only sees a batch at C >= 2W and the engine takes a different kernel above batch 2. Run the sweep in docs/serving-operations.md, then write your own profile with status 'qualified' and the numbers that earned it."
+    "notes": "Use this to START, then replace it. Two workers of eight threads is where a 16-core Arm host landed, and it rests on one measured fact that generalises -- a single request saturates at about eight threads and regresses at sixteen -- and one that does not: which topology wins depends on the concurrency you expect, because a worker only sees a batch at C >= 2W and the engine takes a different kernel above batch 2. Run the sweep in docs/serving/cpu-operations.md, then write your own profile with status 'qualified' and the numbers that earned it."
   }
 }

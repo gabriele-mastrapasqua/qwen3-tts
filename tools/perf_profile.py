@@ -291,7 +291,7 @@ def cmd_new(a):
         "workload": "NONE YET — nothing here has been measured on this machine.",
         "benchmark_family": "TRUE_SIMULTANEOUS_WAVE",
         "model": "unspecified", "speaker": "unspecified",
-        "notes": ("Run the break-in sweep in docs/serving-operations.md, then replace the topology, "
+        "notes": ("Run the break-in sweep in docs/serving/cpu-operations.md, then replace the topology, "
                   "the thread split and the environment with what it measured, and set status to "
                   "'qualified' with the numbers that earned it. Until then this file is a starting "
                   "point and says so."),

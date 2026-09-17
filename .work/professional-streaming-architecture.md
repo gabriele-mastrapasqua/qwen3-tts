@@ -85,7 +85,7 @@ before chunk i]` is a max-lateness statistic over the same timeline. They disagr
 exactly when delivery is quantized: a stream can have STREAM_RTF 0.90 and still deliver
 2.56 s of audio every ~2.3 s. **STREAM_RTF < 1 does not prove that a player starting at
 first audio never stalls.** It remains the capacity metric; it is not a streamability
-qualification. `docs/serving-operations.md` section 5 currently states the opposite in
+qualification. `docs/serving/cpu-operations.md` section 5 currently states the opposite in
 its STREAM_RTF row and calls prebuffer/underrun "diagnostic, not a KPI"; that
 interpretation is superseded by this addendum and must be corrected under MT-1.
 
@@ -301,7 +301,7 @@ still analyze (absent columns read as n/a, never NaN).
 
 ### E11. Documentation that needs semantic correction (under MT-1, non-destructive)
 
-- `docs/serving-operations.md` section 5: STREAM_RTF row ("below 1.0 a player starting
+- `docs/serving/cpu-operations.md` section 5: STREAM_RTF row ("below 1.0 a player starting
   at the first chunk never stalls") and the sentence demoting prebuffer/underrun to
   diagnostics.
 - `docs/BENCHMARKING.md` sections 7-8 (terminology and canonical server metrics): add the

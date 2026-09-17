@@ -252,7 +252,7 @@ help:
 	@echo "  make check-isa             - compile-check the ISA paths this machine does not have"
 	@echo "  make test-decoder-tool - Build qwen_tts_decoder_tool (decode a QWEN_DUMP_CODES dump alone)"
 	@echo ""
-	@echo "Serving qualification (docs/serving-operations.md):"
+	@echo "Serving qualification (docs/serving/cpu-operations.md):"
 	@echo "  make bench-fingerprint     - what this machine actually is: cpu, cores, SMT, cache, NUMA, measured bandwidth"
 	@echo "  make bench-topo            - sweep prefork topologies to find W x K (BENCH_TOPO=1x16,2x8,4x4)"
 	@echo "  make bench-suite           - the qualification suite: preflight gates, rungs, audio length, manifest"

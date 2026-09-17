@@ -1,7 +1,7 @@
 # A 16-core Arm serving box, measured end to end
 
 One machine, one build, one profile, every rung of the suite. This page exists so that
-[`serving-operations.md`](serving-operations.md) can describe a *procedure* without carrying a
+[`serving/cpu-operations.md`](serving/cpu-operations.md) can describe a *procedure* without carrying a
 table for every cell, and so that a second box has something to be compared against.
 
 **Nothing here transfers by itself.** It is one hardware configuration at one precision with

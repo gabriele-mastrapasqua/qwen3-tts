@@ -71,7 +71,7 @@
               "description": "The client-concurrency band this configuration was qualified over. Outside it the profile makes no claim."
             },
             "preferred_concurrency": {
-              "description": "Only set when a measurement supports it; otherwise \"unspecified\".",
+              "description": "Only set when a measurement supports it; otherwise \"unspecified\". A string is allowed for the case a single integer cannot express: one qualified point per checkpoint size, e.g. \"0.6B C12; 1.7B C10 (per checkpoint size)\". Whatever form it takes, the evidence belongs in preferred_concurrency_evidence.",
               "oneOf": [
                 {
                   "type": "integer",
@@ -79,8 +79,16 @@
                 },
                 {
                   "const": "unspecified"
+                },
+                {
+                  "type": "string",
+                  "pattern": "^(0\\.6B|1\\.7B) C[0-9]+; (0\\.6B|1\\.7B) C[0-9]+( \\(per checkpoint size\\))?$"
                 }
               ]
+            },
+            "preferred_concurrency_evidence": {
+              "type": "string",
+              "description": "What measurement promoted preferred_concurrency: run shape, date, and the KPI numbers that earned it. A preferred point without this is a preference, not a result."
             },
             "quality_changes_allowed": {
               "type": "boolean",
@@ -295,6 +303,13 @@
             "type": "string"
           }
         },
+        "isa_features_absent": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "ISA features this host does NOT have, when their absence is the point of the profile. A cross-ISA screen exists to measure what happens without VNNI or without a matrix unit, and that has to be readable from the file rather than inferred from the cpu_family."
+        },
         "notes": {
           "type": "string"
         },
@@ -456,6 +471,13 @@
               }
             }
           }
+        },
+        "selected_leaves": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The kernel leaf each stage RESOLVED to on this host, as read from --dispatch-map. Recorded when the point of the profile is which leaves are reachable at all (a cross-ISA screen), so the file states it instead of leaving it to be inferred from the cpu_family."
         }
       }
     },
@@ -504,10 +526,12 @@
           "type": "string"
         },
         "benchmark_family": {
+          "description": "The arrival model, because a threshold from one does not transfer to another. DIAGNOSTIC_CLOSED_LOOP is the deliberately weakest form: a short closed-loop A/B run to answer one question, never a qualification - a profile carrying it must stay unqualified.",
           "enum": [
             "TRUE_SIMULTANEOUS_WAVE",
             "POISSON_OPEN_LOOP",
-            "CLOSED_LOOP_SATURATION"
+            "CLOSED_LOOP_SATURATION",
+            "DIAGNOSTIC_CLOSED_LOOP"
           ]
         },
         "model": {
@@ -557,9 +581,88 @@
               },
               "rejections": {
                 "type": "integer"
+              },
+              "ttfb_p50_ms": {
+                "type": "number",
+                "description": "send -> status line and headers parsed by the client."
+              },
+              "ttfb_p95_ms": {
+                "type": "number",
+                "description": "send -> status line and headers parsed by the client."
+              },
+              "stream_rtf_p95": {
+                "type": "number",
+                "description": "STREAM_RTF over requests. A mean rate: below 1.0 is capacity, not a proof that a player never stalls."
+              },
+              "total_rtf_p50": {
+                "type": "number",
+                "description": "Whole-request RTF including admission and prefill. A diagnostic that explains a KPI, not a KPI."
+              },
+              "total_rtf_p95": {
+                "type": "number",
+                "description": "Whole-request RTF including admission and prefill."
+              },
+              "safe_start_p50_ms": {
+                "type": "number",
+                "description": "safe_play_start: the earliest time after the request at which playback can begin and still finish without an underrun. Computed per request, then percentiled - never as TTFA plus a prebuffer percentile."
+              },
+              "safe_start_p95_ms": {
+                "type": "number",
+                "description": "safe_play_start p95. Under 1 s is the hard line; at or above it the configuration is not acceptable however good the RTF looks."
+              },
+              "prebuffer_p95_ms": {
+                "type": "number",
+                "description": "required_prebuffer: the smallest delay after first audio at which a 1x player then never pauses."
+              },
+              "max_gap_p95_s": {
+                "type": "number",
+                "description": "The largest inter-chunk gap. This is the mechanism behind the stall rates: it is what forces the prebuffer."
+              },
+              "stall100_pct": {
+                "type": "number",
+                "description": "Share of requests with at least one stall under a 100 ms jitter buffer, re-buffering after an underrun. The tightest of the four and the first to break."
+              },
+              "stall250_pct": {
+                "type": "number",
+                "description": "Share of requests stalling under a 250 ms jitter buffer."
+              },
+              "stall500_pct": {
+                "type": "number",
+                "description": "Share of requests stalling under a 500 ms jitter buffer."
+              },
+              "stall1000_pct": {
+                "type": "number",
+                "description": "Share of requests stalling under a 1000 ms jitter buffer. Zero here proves very little on its own."
+              },
+              "audio_s_per_wall_s": {
+                "type": "number",
+                "description": "Audio seconds produced per wall second across all streams: the throughput unit comparable with published figures for other engines."
+              },
+              "completed": {
+                "type": "integer",
+                "description": "Requests that finished in the measured window."
+              },
+              "rejects": {
+                "type": "integer",
+                "description": "Requests refused at admission (503). Intentional fail-fast rejects are an outcome, not an error."
+              },
+              "timeouts": {
+                "type": "integer",
+                "description": "Queue or server-side request timeouts. These fail a run."
               }
             }
           }
+        },
+        "interpretation": {
+          "type": "string",
+          "description": "What the measured block means and what it does NOT license. Required in spirit whenever a screen is partial: it is where 'do not promote this' is written down next to the numbers that might tempt somebody to."
+        },
+        "status_matrix": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The four separable claims, each answered on its own: IMPLEMENTED, PARITY_VERIFIED, PERFORMANCE_VERIFIED, DEFAULT_PROMOTED. They are recorded apart because they are routinely conflated, and 'it runs' is the one most often mistaken for the other three."
         }
       }
     }

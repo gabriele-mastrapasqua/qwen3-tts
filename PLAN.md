@@ -72,6 +72,42 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
 
 ## Immediate priorities
 
+### Serving documentation and release readiness
+
+- [x] DOCS-1 **Serving docs split by backend under `docs/serving/`** (2026-09-17). One index
+      (`docs/serving/README.md`) linking two separate strategies, because the CPU server is
+      qualified and the CUDA one is not, and a shared document is how an unqualified number gets
+      quoted as a supported one. The former top-level `server`, `serving-operations` and
+      `server-batching` pages are now `docs/serving/api.md` (the API is the one thing both backends
+      share), `docs/serving/cpu-operations.md` and `docs/serving/cpu-batching.md`; the CUDA
+      streaming-server sections moved out of `docs/cuda-performance.md` into
+      `docs/serving/gpu-cuda.md`, which keeps the backend page about the backend. Every inbound reference in the repository was rewritten and
+      every relative link verified to resolve.
+- [x] DOCS-2 **New: `docs/serving/cpu.md`** — the production CPU serving strategy, in the order a
+      new box is actually approached: `make doctor` first, build for the ISA, launch from a
+      deployment profile rather than by hand, qualify on the whole envelope. Carries the expanded
+      Arm and x86 invocations verbatim, since ~40 flags per ISA is exactly the thing nobody will
+      remember and the reason `tools/perf_profile.py command` exists.
+- [x] DOCS-3 **New: `docs/serving/boxes.md`** — the index of every measured host, its profile JSON,
+      the status that profile carries and what it was observed to hold, plus the GPU boxes marked
+      as screens. States explicitly that no GPU equivalent of `configs/perf/*.json` exists, which
+      is why a GPU run has no gate that can refuse to start misconfigured.
+- [x] DOCS-4 **`configs/perf/schema.json` widened to accept what profiles already record**
+      (2026-09-17). `tools/perf_profile.py validate` was failing on two committed files:
+      `preferred_concurrency` could not express one qualified point per checkpoint size (the form
+      ARM-SOAK-9 wrote into the Graviton4 profile), and the Milan cross-screen used five fields the
+      schema had never been told about. Added `preferred_concurrency_evidence`,
+      `isa_features_absent`, `selected_leaves`, `interpretation`, `status_matrix`,
+      `DIAGNOSTIC_CLOSED_LOOP`, and the **whole playback envelope** in `qualification.measured`
+      (TTFB, `stream_rtf_p95`, safe-start, prebuffer, `max_gap`, all four stall thresholds,
+      audio-s/wall-s, completed/rejects/timeouts) — the schema could previously record only TTFA,
+      `stream_rtf_p50` and throughput, i.e. everything except the metrics that decide acceptance.
+      20/20 profiles valid, `tests/test_perf_profile.py` green.
+- [x] DOCS-5 **Blog: `blog/cpu-streaming-server-that-never-stalls.md`** — the v2 CPU serving design
+      as a narrative, for dev.to: the envelope, the admission decomposition, the decode quantum,
+      the falsified utilization-aware admission, the bimodal configuration measurement, `doctor`,
+      and the doubling-ladder lesson.
+
 ### Legacy CPU / v2 portability audit — detail: `.work/legacy-cpu-v2-audit-20260916.md`
 
 - [x] LEGACY-CPU-0 Read-only architecture audit at `15a5850`: reconstructed model load,
@@ -518,7 +554,7 @@ sustained qualification.
       `.work/professional-streaming-architecture.md` E12.
 - [x] MT-2 Per-request `safe_play_start`, stall_rate/stall_ms @100/250/500/1000 ms,
       max_gap; summaries in the wave and soak analyzers; `tests/test_playback_sim.py`.
-- [x] MT-3 Superseded readings corrected in `docs/serving-operations.md` section 5,
+- [x] MT-3 Superseded readings corrected in `docs/serving/cpu-operations.md` section 5,
       `docs/BENCHMARKING.md` sections 7-8, `ENGINEERING.md` section 9, AWS reference notes.
 - [x] MT-4 Runtime transport boundary: batched streams send the header before synthesis and
       accepted sockets use `TCP_NODELAY`; server/client event ordering is proven on the

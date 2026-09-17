@@ -1,7 +1,7 @@
 # An 8-core Intel AMX serving box, measured end to end
 
 The x86 counterpart to [`reference-arm-16c.md`](reference-arm-16c.md): one machine, one build,
-one profile, so that [`serving-operations.md`](serving-operations.md) can describe a *procedure*
+one profile, so that [`serving/cpu-operations.md`](serving/cpu-operations.md) can describe a *procedure*
 without carrying a table per cell, and so a second x86 box has something to be compared against.
 
 **Nothing here transfers by itself.** The shapes are the transferable part — which stage AMX

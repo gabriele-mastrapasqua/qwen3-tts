@@ -1,15 +1,18 @@
-# HTTP Server
+# HTTP Server — the API
+
+_[Serving index](README.md) · **api** · [CPU server](cpu.md) · [CUDA server](gpu-cuda.md) · [boxes](boxes.md)_
+
 
 > **This page is the API.** For how to run the process in production — pre-forked workers,
 > finding the `W x K` topology for a given box before quoting anything from it, the deployment
 > profile, the benchmark suite and what its numbers mean — see
-> [`serving-operations.md`](serving-operations.md).
+> [`cpu-operations.md`](cpu-operations.md).
 >
 > **The endpoints and the streaming contract on this page are backend-independent.** Everything
 > operational below assumes the CPU backend, which is the qualified one. The same server also runs
 > on `--backend cuda`, with different sizing, different flags and a different maturity level
 > (implemented and runtime-verified, not performance-qualified) — see
-> [`cuda-performance.md` § CUDA streaming server](cuda-performance.md). Do not carry a number
+> [`gpu-cuda.md`](gpu-cuda.md). Do not carry a number
 > between the two.
 
 
@@ -20,14 +23,14 @@ skip all loading overhead and go straight to inference.
 > **Serving many users at once?** Add `--batch-size N` to step concurrent requests
 > **together** through the model (vLLM-style request batching: weights read once,
 > continuous scheduling, per-request streaming). See
-> [server-batching.md](server-batching.md). This page covers the single-request server.
+> [cpu-batching.md](cpu-batching.md). This page covers the single-request server.
 >
 > **Running it in production?** `--prefork W --prefork-threads K` (Linux) forks *W* workers
 > after the weights are loaded and pins each to its own slice of cores, sharing the weights
 > copy-on-write. Note that `--batch-size` is then also the **per-worker in-flight cap**, and
 > that it defaults to 1: with `--prefork 12` and no `--batch-size`, twelve requests run at
 > once and the rest wait in the listen backlog. How to choose *W x K* on your box, and how to
-> measure it: [serving-operations.md](serving-operations.md).
+> measure it: [cpu-operations.md](cpu-operations.md).
 
 ## Starting the Server
 
@@ -180,7 +183,7 @@ temperature=0.5, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
 | `emotion` | Named mood — same recipe as the CLI `--emotion`: `joy`, `happy`, `excited`, `proud`, `news`, `dramatic`, `calm`, `sad`, `gloomy`, `annoyed`, `stern`, `angry`. Sets the Code-Predictor steering vector for the `(emotion, language)` pair (applied during generation, so it works on **both** `/v1/tts` and `/v1/tts/stream`) and applies the recipe's volume/tempo. Best on 1.7B. |
 | `volume` | Linear output gain (`1.0` = unchanged). Overrides the emotion recipe's volume; applied on both full and streaming paths. |
 | `rate` | Pitch-preserving tempo (`>1` faster). Overrides the emotion recipe's rate. Applied on `/v1/tts`; **not** on `/v1/tts/stream` (needs the full buffer). |
-| inline `[mood]` markup (in `text`) | **Per-sentence dynamic emotion.** If the `text` carries inline tags — `[joy]`/`[sad]`/`[excited]`/… to switch mood mid-text, `[neutral]` to reset, `[pause:400ms]`/`[break:1s]` for gaps, `[laugh]`/`[sigh]` paralinguistics — the server splits the text into spans, synthesizes each with its own emotion, and concatenates them. Auto-detected on **both** endpoints; `/v1/tts/stream` flushes span-by-span (low time-to-first-audio). This is the same composer as the CLI's `--compose` / auto-detected `--text`. The top-level `emotion` field sets a single mood for the whole request; inline tags let one request span several. Same tag set as [docs/markup.md](markup.md). |
+| inline `[mood]` markup (in `text`) | **Per-sentence dynamic emotion.** If the `text` carries inline tags — `[joy]`/`[sad]`/`[excited]`/… to switch mood mid-text, `[neutral]` to reset, `[pause:400ms]`/`[break:1s]` for gaps, `[laugh]`/`[sigh]` paralinguistics — the server splits the text into spans, synthesizes each with its own emotion, and concatenates them. Auto-detected on **both** endpoints; `/v1/tts/stream` flushes span-by-span (low time-to-first-audio). This is the same composer as the CLI's `--compose` / auto-detected `--text`. The top-level `emotion` field sets a single mood for the whole request; inline tags let one request span several. Same tag set as [docs/markup.md](../markup.md). |
 
 Each request resets its **sampling parameters** to defaults (speaker, language, temperature,
 top-k/p, rep-penalty, seed) **and clears any prior emotion steering**, so nothing leaks between requests.
@@ -261,14 +264,14 @@ subject to instead of hard-coding them:
 ```
 
 A deployment profile records the same two knobs, so what a machine was qualified with travels
-with it: see [`configs/perf/README.md`](../configs/perf/README.md) and
-[`serving-operations.md`](serving-operations.md).
+with it: see [`configs/perf/README.md`](../../configs/perf/README.md) and
+[`cpu-operations.md`](cpu-operations.md).
 
 ## Performance
 
 Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads, same text + seed (`--seed 42`). bf16 below;
 **with `--int8` the 0.6B server is faster than real-time warm — RTF ~0.88** (and ~0.93 with a cloned
-`.qvoice`). See [performance.md](performance.md) for the full int8 sweet-spot table.
+`.qvoice`). See [performance.md](../performance.md) for the full int8 sweet-spot table.
 
 | 0.6B, bf16 | Short text (~8s audio) | Long text (~16s audio) |
 |---|---|---|

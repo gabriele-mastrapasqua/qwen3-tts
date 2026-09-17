@@ -1,6 +1,9 @@
-# Running the server in production, and finding the configuration first
+# Running the CPU server in production, and finding the configuration first
 
-[`server.md`](server.md) is the API: endpoints, request bodies, streaming. **This document is
+_[Serving index](README.md) · [api](api.md) · [CPU server](cpu.md) · **operations** · [boxes](boxes.md)_
+
+
+[`api.md`](api.md) is the API: endpoints, request bodies, streaming. **This document is
 the other half** — how to run the process, how to find the configuration for a particular
 machine before quoting any number from it, and how to measure it so the number means
 something a week later.
@@ -13,7 +16,7 @@ a profile format so the answer survives the session that found it.
 > pool and pinning discussion and every number in it are sized by cores, cache and memory
 > channels. The CUDA server is sized by GPU memory bandwidth instead, has its own flags and its
 > own traps, and is not performance-qualified — see
-> [`cuda-performance.md` § CUDA streaming server](cuda-performance.md). Nothing here transfers to
+> [`gpu-cuda.md`](gpu-cuda.md). Nothing here transfers to
 > it, and a number from one must never be quoted for the other.
 
 ---
@@ -149,7 +152,7 @@ multi-worker GEMV block is visible near the top and archives
 `arm_gemv_scaling.json`; a poor 4×8 verdict means test `2x16`, then `1x32`,
 before paying for a wave or soak. The verdict concerns the tested 4×8 shape,
 not the whole instance. Details and interpretation are in
-[Arm topology preflight](arm-topology-preflight.md).
+[Arm topology preflight](../arm-topology-preflight.md).
 
 `bench-topo` starts one server per topology, fires true simultaneous waves at each concurrency
 and prints one row per cell. Measured on the 16-core Axion reference host, 1.7B open weights at
@@ -467,7 +470,7 @@ names which of the two bounds it hit. Fix a number in the profile only to go *ti
 derived one.
 
 The rest of the envelope — `405`, `413`, `415`, unknown-field rejection, the `503` at queue full
-or queue timeout, the parameter clamps — is one table in [`server.md`](server.md#limits-validation-and-errors),
+or queue timeout, the parameter clamps — is one table in [`api.md`](api.md#limits-validation-and-errors),
 and it is identical on all three POST endpoints and in both server modes.
 
 ---
@@ -497,7 +500,7 @@ from a different arithmetic order, not a change of content.
 ## 8. Runtime flags
 
 Every environment flag, its default per ISA, and the one-line incantation that restores the
-previous numerics: [`feature-flags.md`](feature-flags.md). The engine also declares what it
+previous numerics: [`feature-flags.md`](../feature-flags.md). The engine also declares what it
 actually read, in one machine-readable line:
 
 ```
@@ -610,7 +613,7 @@ in the profile so the box that reproduces your numbers compiles the same kernels
 it is inert on x86; the x86 side has the AMX and VNNI gates instead. Two values in particular
 do not travel: `QWEN_POOL_SPIN`, where the Arm profile's 65536 is measurably wrong on 8 cores,
 and `QWEN_DECODER_BATCH`, which pays only when a worker really holds several slots. Both are
-covered in [`feature-flags.md`](feature-flags.md) with the measurement on each side.
+covered in [`feature-flags.md`](../feature-flags.md) with the measurement on each side.
 
 An x86 run of the same inner loop, with the profile that ships for an 8-core AMX host:
 
@@ -626,7 +629,7 @@ Note the topology names: on an 8-core box the cells are `1x8`, `2x4` and `4x2`, 
 `2x8`/`4x4`. Pick them from `make bench-fingerprint`, never by copying another host's profile.
 
 **What that box can and cannot do**, measured and written up in
-[`reference-x86-8c-amx.md`](reference-x86-8c-amx.md): on the 1.7B, first audio is competitive —
+[`reference-x86-8c-amx.md`](../reference-x86-8c-amx.md): on the 1.7B, first audio is competitive —
 C=4 TTFA p95 252 ms — while **sustained stream RTF at C=4 is 1.43**, so it serves four concurrent
 requests with a good time to first audio and keeps one of them realtime. That is a bandwidth
 result, not a kernel one: 82 GB/s against the Arm host's 336. The 0.6B, measured separately on
@@ -636,14 +639,14 @@ the same box, holds two concurrent realtime streams.
 
 ## See also
 
-- [`reference-arm-16c.md`](reference-arm-16c.md) — every rung of this suite, measured on one
+- [`reference-arm-16c.md`](../reference-arm-16c.md) — every rung of this suite, measured on one
   16-core Arm box: topology sweep, qualification curve for both models, input-length effect,
   the three arrival models, the profile A/B
-- [`reference-x86-8c-amx.md`](reference-x86-8c-amx.md) — the same procedure on an 8-core Intel
+- [`reference-x86-8c-amx.md`](../reference-x86-8c-amx.md) — the same procedure on an 8-core Intel
   AMX box: what AMX buys per stage, and where this class of machine stops
-- [`x86-optimization.md`](x86-optimization.md) — the x86 kernel work behind those numbers
-- [`server.md`](server.md) — the HTTP API
-- [`feature-flags.md`](feature-flags.md) — every runtime flag and its default
-- [`configs/perf/README.md`](../configs/perf/README.md) — the profile format
-- [`ENGINEERING-METHOD.md`](ENGINEERING-METHOD.md) — why the measurement rules above are shaped
+- [`x86-optimization.md`](../x86-optimization.md) — the x86 kernel work behind those numbers
+- [`api.md`](api.md) — the HTTP API
+- [`feature-flags.md`](../feature-flags.md) — every runtime flag and its default
+- [`configs/perf/README.md`](../../configs/perf/README.md) — the profile format
+- [`ENGINEERING-METHOD.md`](../ENGINEERING-METHOD.md) — why the measurement rules above are shaped
   the way they are

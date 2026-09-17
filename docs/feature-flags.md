@@ -85,7 +85,7 @@ eval "$(tools/perf_profile.py command axion-16c-ttfa --model MODEL_DIR --port 80
 ```
 
 which emits the argv **and** the environment, and `check-flags` afterwards proves the process
-read them. See [`serving-operations.md`](serving-operations.md) §3.
+read them. See [`serving/cpu-operations.md`](serving/cpu-operations.md) §3.
 
 ### One deployment, explained piece by piece
 
@@ -481,7 +481,7 @@ kernel, and neither reads the other's units.
 
 ## See also
 
-- [`serving-operations.md`](serving-operations.md) — how to run and measure the server
+- [`serving/cpu-operations.md`](serving/cpu-operations.md) — how to run and measure the server
 - [`reference-arm-16c.md`](reference-arm-16c.md) — one box with all of this applied, measured
 - [`configs/perf/README.md`](../configs/perf/README.md) — the profile format that pins these values
 - [`performance.md`](performance.md) — what the numbers mean once they are taken
