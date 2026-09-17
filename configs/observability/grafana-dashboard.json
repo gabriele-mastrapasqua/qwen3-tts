@@ -1,0 +1,527 @@
+{
+  "uid": "qwen-tts-serving",
+  "title": "Qwen3-TTS serving",
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "type": "row",
+      "title": "What the listener gets",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": [],
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Realtime streams sustained",
+      "description": "Seconds of audio produced per second of wall clock -- how many realtime listeners this box is actually carrying. THE throughput unit for TTS: requests per second is meaningless when one request is two seconds of speech and the next is sixty.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(qwen_tts_worker_audio_seconds_total[1m]))",
+          "legendFormat": "all workers"
+        },
+        {
+          "expr": "rate(qwen_tts_worker_audio_seconds_total[1m])",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Time to first audio, mean",
+      "description": "Windowed mean, not a percentile: percentiles for acceptance come from the client-side harnesses over raw samples. The line at 1s is the safe_play_start budget. The 1s threshold line only appears as the data approaches it: on a healthy server this sits an order of magnitude below, and the panel below counts the crossings.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_worker_ttfa_seconds_sum[5m]) / rate(qwen_tts_worker_ttfa_seconds_count[5m])",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Where first audio time goes",
+      "description": "TTFA split into the two things that can make it late: waiting for admission, and everything after. A rising queue share means offer more capacity; a rising engine share means the request itself got slower. Without the split those are the same graph.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 25,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_worker_queue_seconds_sum[5m]) / rate(qwen_tts_worker_queue_seconds_count[5m])",
+          "legendFormat": "queue w{{worker}}"
+        },
+        {
+          "expr": "(rate(qwen_tts_worker_ttfa_seconds_sum[5m]) / rate(qwen_tts_worker_ttfa_seconds_count[5m])) - (rate(qwen_tts_worker_queue_seconds_sum[5m]) / rate(qwen_tts_worker_queue_seconds_count[5m]))",
+          "legendFormat": "engine w{{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "First audio past 1s, per second",
+      "description": "Requests whose first audio arrived later than the 1s safe_play_start line. An exact count, not a quantile estimated from buckets. Anything sustained above zero is a listener-visible problem even while every queue metric stays green. Flat at zero with a sane axis is the healthy picture; the axis is pinned so an all-zero panel does not autoscale into something that looks broken.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          },
+          "min": 0,
+          "softMax": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_worker_ttfa_over_1s_total[5m])",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Chunks arriving behind realtime",
+      "description": "Fraction of chunk-to-chunk gaps where wall time exceeded the audio delivered, so the listener's buffer was draining. A PROXY for choppiness -- a real stall happens in a player, against a buffer this server cannot see. Sustained near 1.0 means the engine is generating slower than realtime.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2
+          },
+          "max": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_worker_stream_gap_behind_realtime_total[1m]) / rate(qwen_tts_worker_stream_gaps_total[1m])",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "How requests end",
+      "description": "A listener closing the tab mid-stream is ordinary and informative, and it is invisible everywhere else on this board: the queue stays shallow, nothing is refused, throughput just sags. A step change here is the signal.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "softMax": 1,
+          "custom": {
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_ok_total[5m]))",
+          "legendFormat": "delivered"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_client_gone_total[5m]))",
+          "legendFormat": "client gone"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_timeout_total[5m]))",
+          "legendFormat": "timed out"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_rejected_total[5m]))",
+          "legendFormat": "rejected"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "First-audio tail shape, per worker",
+      "description": "Exact counts past 250ms / 500ms / 1s rather than a percentile. Over a short window a p99 rests on two requests; these are precise at any sample size, and per worker they answer which worker owns the tail.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "softMax": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(qwen_tts_worker_ttfa_over_250ms_total[5m])) by (worker)",
+          "legendFormat": "w{{worker}} >250ms"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_ttfa_over_500ms_total[5m])) by (worker)",
+          "legendFormat": "w{{worker}} >500ms"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_ttfa_over_1s_total[5m])) by (worker)",
+          "legendFormat": "w{{worker}} >1s"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Server health",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 33
+      },
+      "collapsed": false,
+      "panels": [],
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Completed per second, per worker",
+      "description": "A worker whose line goes flat while the others carry on is wedged, and total throughput may barely move. Never summed, for that reason. Note this counts REQUESTS, which vary wildly in length -- the audio-seconds panel above is the honest throughput.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 34
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_worker_completed_total[1m])",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "In flight, per worker",
+      "description": "Averaged over a minute on purpose: the raw gauge is sampled once per scrape, so plotting it directly shows a sawtooth that is aliasing, not events. Drop the avg_over_time if you want the raw samples.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "avg_over_time(qwen_tts_worker_inflight[1m])",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Saturation (inflight / slots)",
+      "description": "1.0 means that worker accepts nothing more. Sustained 1.0 everywhere is where the parent starts refusing.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "#EAB839",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "qwen_tts_worker_inflight / qwen_tts_worker_slots",
+          "legendFormat": "worker {{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Refusals per second",
+      "description": "In --prefork the request reasons are the PARENT's refusals only; a rejection inside a worker's own queue is invisible from there. The scrape line is the metrics port's own limiter -- nonzero means something is polling too fast, not that the server is unwell.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          },
+          "min": 0,
+          "softMax": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_rejected_total[1m])",
+          "legendFormat": "requests: {{reason}}"
+        },
+        {
+          "expr": "rate(qwen_tts_metrics_throttled_total[1m])",
+          "legendFormat": "scrapes: rate limited"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Identity",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "collapsed": false,
+      "panels": [],
+      "fieldConfig": {
+        "defaults": {}
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Imbalance (max - min inflight)",
+      "description": "Above zero is normal -- request durations vary. What matters is whether it stays there.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "max(qwen_tts_worker_inflight) - min(qwen_tts_worker_inflight)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Workers up",
+      "description": "Worker processes the parent still has.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(qwen_tts_worker_up)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Scrape up",
+      "description": "Prometheus's own view of the target. Without this a gap in the graphs cannot be told apart from a server that was down.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 12,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"qwen-tts\"}"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Build",
+      "description": "Which binary is answering. git_rev reads 'unknown' when the tree was built without its .git directory -- a tarball or an archive export -- which is honest rather than a bug: that build genuinely cannot name its revision.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 18,
+        "y": 51
+      },
+      "targets": [
+        {
+          "expr": "qwen_tts_build_info",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "instance": true,
+              "job": true
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {}
+      }
+    }
+  ]
+}

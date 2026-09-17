@@ -1,0 +1,103 @@
+# Prometheus alerting rules for a Qwen3-TTS streaming server.
+#
+#   rule_files: ["configs/observability/alerts.yml"]   # in prometheus.yml
+#
+# Two principles behind the choices below.
+#
+# Every rule fires on something a LISTENER would notice, or on something that will shortly
+# make a listener notice. Queue depth and CPU are not on this list: they are how you explain an
+# alert, not what you wake up for.
+#
+# And every threshold here is an EXACT count, never an estimated quantile. A p99 over a short
+# window rests on a couple of requests, so an alert on one is an alert on noise. The server
+# publishes exact counters past the budget precisely so the rules can use them.
+groups:
+  - name: qwen-tts-serving
+    rules:
+
+      - alert: QwenTtsFirstAudioPastBudget
+        expr: sum(rate(qwen_tts_worker_ttfa_over_1s_total[5m])) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "First audio is arriving later than 1s"
+          description: >-
+            safe_play_start is a hard line, not a target: past it a player either stalls at the
+            start or has to buffer visibly. Any sustained rate above zero means some listeners
+            are getting that. Check the queue-versus-engine split first -- if the queue share is
+            rising the box needs capacity, if it is not the request itself got slower.
+
+      - alert: QwenTtsBehindRealtime
+        expr: >-
+          sum(rate(qwen_tts_worker_stream_gap_behind_realtime_total[5m]))
+          / sum(rate(qwen_tts_worker_stream_gaps_total[5m])) > 0.25
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "A quarter of audio chunks arrive with the buffer draining"
+          description: >-
+            A PROXY, not a stall rate -- a stall happens in a player this server cannot see. But
+            sustained above a quarter it means the engine is generating close to or slower than
+            realtime, and a listener's buffer only has to run out once.
+
+      - alert: QwenTtsRefusingRequests
+        expr: sum(rate(qwen_tts_rejected_total[5m])) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "The server is turning requests away"
+          description: >-
+            In --prefork this counts the parent's refusals only; a worker's own queue rejections
+            are not visible from there, so treat this as a floor rather than a total.
+
+      - alert: QwenTtsWorkerLost
+        expr: sum(qwen_tts_worker_up) < max_over_time(sum(qwen_tts_worker_up)[1h:1m])
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Fewer workers than this server had an hour ago"
+          description: >-
+            Compared against its own recent maximum rather than a hard-coded count, so the rule
+            does not need editing per deployment. Capacity has dropped by a whole worker.
+
+      - alert: QwenTtsWorkerImbalance
+        expr: >-
+          (max(rate(qwen_tts_worker_ttfa_seconds_sum[15m]) / rate(qwen_tts_worker_ttfa_seconds_count[15m]))
+           / min(rate(qwen_tts_worker_ttfa_seconds_sum[15m]) / rate(qwen_tts_worker_ttfa_seconds_count[15m]))) > 1.25
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "One worker is materially slower than the others"
+          description: >-
+            Queue-depth balance will look perfect while this is true: a least-loaded dispatcher
+            equalises how many requests each worker HOLDS, not how fast it serves them, so a
+            slow worker hides there entirely. Look first for something unpinned sharing that
+            worker's cores -- a co-located load generator, a backup job, an agent -- since the
+            scheduler favours low-numbered idle CPUs and those belong to worker 0. Measured on a
+            32-core Axion: an unpinned generator cost worker 0 about 8% on first-audio latency
+            and half again as many chunks behind realtime, and pinning it anywhere else removed
+            most of that.
+
+      - alert: QwenTtsListenersLeaving
+        expr: >-
+          sum(rate(qwen_tts_worker_terminated_client_gone_total[15m]))
+          / sum(rate(qwen_tts_worker_terminated_ok_total[15m])
+                + rate(qwen_tts_worker_terminated_client_gone_total[15m])) > 0.25
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "A quarter of streams are abandoned before the audio ends"
+          description: >-
+            Some abandonment is normal -- people stop listening. A step change is not, and it is
+            invisible on every other series: the queue stays shallow, nothing is refused,
+            throughput simply sags. Compare against first-audio latency before blaming clients.
+
+      - alert: QwenTtsMetricsPolledTooFast
+        expr: rate(qwen_tts_metrics_throttled_total[5m]) > 0
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: "Something is scraping the metrics port faster than it will serve"
+          description: >-
+            The endpoint is refusing scrapes with 429. Nothing is wrong with the server; a
+            scrape_interval is too short, or more collectors are pointed at it than expected.

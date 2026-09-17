@@ -344,6 +344,23 @@ def status_value(pid, key):
     return 0
 
 
+def _bank_version(path):
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            if line.startswith("# bank-version:"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unversioned"
+
+
+def _bank_sha(path):
+    import hashlib
+    try:
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()[:16]
+    except OSError:
+        return "unreadable"
+
 def linux_sample(pids):
     result = {key: 0 for key in (
         "rss_kb", "pss_kb", "anon_kb", "swap_kb", "threads", "fds", "cpu_ticks",
@@ -553,7 +570,7 @@ def main():
     parser.add_argument("--no-profile", default="")
     parser.add_argument("--server-env", default="", metavar="KEY=VALUE,...")
     parser.add_argument("--port", type=int, default=9700)
-    parser.add_argument("--bank", default=os.path.join(ROOT, "tests", "load_texts_en.txt"))
+    parser.add_argument("--bank", default=os.path.join(ROOT, "tests", "load_texts_en_v2.txt"))
     parser.add_argument("--classes", default="")
     parser.add_argument("--speaker", default="ryan")
     parser.add_argument("--language", default="English")
@@ -663,6 +680,11 @@ def main():
         "language": args.language,
         "temperature": args.temperature,
         "text_bank": os.path.basename(args.bank),
+        # A soak number belongs to the corpus that produced it, and the banks are versioned
+        # because extending one changes the numbers. Without this a manifest cannot be
+        # compared with a later one.
+        "text_bank_version": _bank_version(args.bank),
+        "text_bank_sha256": _bank_sha(args.bank),
         "classes": args.classes,
         "schedule": args.schedule,
         "schedule_seed": args.schedule_seed,

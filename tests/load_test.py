@@ -29,7 +29,29 @@ from urllib.parse import urlparse
 
 SR = 24000
 BYTES_PER_SAMPLE = 2
-DEFAULT_TEXTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "load_texts_en.txt")
+DEFAULT_TEXTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "load_texts_en_v2.txt")
+
+
+def bank_provenance(path):
+    """Which corpus produced this number.
+
+    A benchmark result belongs to the text bank it was measured on, and the banks are
+    versioned precisely because extending one changes the numbers. A run that does not
+    record its corpus cannot be compared to anything later, so this is printed and written
+    into every artifact rather than left to memory.
+    """
+    import hashlib
+    version = "unversioned"
+    try:
+        raw = open(path, "rb").read()
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if line.startswith("# bank-version:"):
+                version = line.split(":", 1)[1].strip()
+                break
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+    except OSError:
+        digest = "unreadable"
+    return {"bank": os.path.basename(path), "bank_version": version, "bank_sha256": digest}
 
 NEIGHBOR_MS = 200.0
 
@@ -281,8 +303,24 @@ async def run_level(args, host, port, texts, conc, service_s):
             print(f"  ⚠️  --server-log {args.server_log}: cannot open, client-side attribution only")
             tail = None
 
+    # Stratify by CLASS, not by list position.
+    #
+    # Cycling the bank directly makes the workload mix proportional to how many texts each
+    # class happens to hold, and the bank is grouped by class, so it also arrives in phases:
+    # sixty short requests, then a hundred medium ones. That was harmless when the bank held
+    # twenty-one texts in near-equal groups and stopped being harmless the moment it held two
+    # hundred and seventy-seven in unequal ones. Round-robin over the classes keeps the mix
+    # fixed and independent of the bank's composition, so adding variety to one class cannot
+    # silently reweight the benchmark.
+    _by_class = {}
+    for _c, _t in texts:
+        _by_class.setdefault(_c, []).append(_t)
+    _class_order = sorted(_by_class)
+
     def payload_for(idx):
-        cls, txt = texts[idx % len(texts)]
+        cls = _class_order[idx % len(_class_order)]
+        pool = _by_class[cls]
+        txt = pool[(idx // len(_class_order)) % len(pool)]
         return cls, {"text": txt, "speaker": args.speaker, "language": args.language,
                      "temperature": args.temperature, "seed": args.seed + idx}
 
@@ -292,8 +330,12 @@ async def run_level(args, host, port, texts, conc, service_s):
     t0 = time.perf_counter()
     tail_task = asyncio.create_task(tail.run(t0)) if tail else None
 
-    if args.arrival == "all-at-once" and args.duration:
-        stop_at = t0 + args.duration
+    if args.arrival == "all-at-once" and (args.duration or args.min_samples):
+        # --min-samples is what a SCREEN should be defined by. The sample count is what
+        # controls the precision of a percentile; the duration is only a proxy for it, and a
+        # proxy that changes with the box, the model size and the text mix. Given both, the
+        # run stops at whichever comes first, so the duration acts as a cap and not a target.
+        stop_at = t0 + (args.duration if args.duration else 1e9)
         sem = asyncio.Semaphore(conc)
 
         async def worker(idx):
@@ -304,13 +346,20 @@ async def run_level(args, host, port, texts, conc, service_s):
                 return await one_request(host, port, args.path, pl, idx, cls, out_dir,
                                          args.save_audio, args.timeout, t0, 0.0, inflight, None)
 
+        def enough():
+            return args.min_samples > 0 and len(records) >= args.min_samples
+
         pending, idx = set(), 0
-        while time.perf_counter() < stop_at or pending:
-            while len(pending) < conc and time.perf_counter() < stop_at:
+        while (time.perf_counter() < stop_at and not enough()) or pending:
+            while len(pending) < conc and time.perf_counter() < stop_at and not enough():
                 pending.add(asyncio.create_task(worker(idx))); idx += 1
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             records.extend(r for r in (d.result() for d in done) if r)
         lam = None
+        if args.min_samples > 0:
+            why = "sample target" if len(records) >= args.min_samples else "duration cap"
+            print(f"stopped  on the {why}: {len(records)} completed in "
+                  f"{time.perf_counter() - t0:.0f}s")
 
     elif args.arrival == "all-at-once":
         sem = asyncio.Semaphore(conc)
@@ -436,6 +485,29 @@ def pct(values, p):
     lo, hi = int(k), min(int(k) + 1, len(v) - 1)
     return v[lo] + (v[hi] - v[lo]) * (k - lo)
 
+def pct_ci(values, p, resamples=400, seed=12345):
+    """Bootstrap confidence interval for a percentile, and how many samples support it.
+
+    A percentile is estimated from the samples in its tail, and there are n*(1-p/100) of those:
+    a p99 over 200 requests rests on TWO. Printing 253.8 as if it were a measurement invites
+    exactly the mistake of reading a 10% move between runs as a change in the system. So every
+    percentile carries its own spread, resampled from the data that produced it, and the count
+    of samples behind it. Costs milliseconds here and nothing at all on the server.
+    """
+    if not values:
+        return float("nan"), float("nan"), 0
+    n = len(values)
+    tail = max(1, int(round(n * (1.0 - p / 100.0))))
+    rnd = random.Random(seed)
+    est = []
+    for _ in range(resamples):
+        est.append(pct([values[rnd.randrange(n)] for _ in range(n)], p))
+    est.sort()
+    lo = est[int(0.025 * (len(est) - 1))]
+    hi = est[int(0.975 * (len(est) - 1))]
+    return lo, hi, tail
+
+
 def mean_inflight(records, wall):
     """Requests in flight, time-averaged (integral of the overlaps / wall).
     It says whether the OFFERED load turned into the intended concurrency: with staggered
@@ -471,6 +543,7 @@ def summarize(records, wall, conc, budget_ms, arrival, lam, seed, service_s):
         "wall_s": wall, "audio_s": audio, "throughput_Q": (audio / wall) if wall else 0.0,
         "ttfb_p50": pct(ttfb, 50), "ttfb_p95": pct(ttfb, 95), "ttfb_p99": pct(ttfb, 99),
         "ttfb_max": max(ttfb) if ttfb else float("nan"),
+        "_ttfa_samples": list(ttfa),
         "ttfa_p50": p50, "ttfa_p95": p95, "ttfa_p99": pct(ttfa, 99),
         "ttfa_max": max(ttfa) if ttfa else float("nan"),
         "ttfa_mean": statistics.fmean(ttfa) if ttfa else float("nan"),
@@ -510,6 +583,26 @@ def print_table(rows, budget_ms):
               f" | {deg:>7.2f}x{s['ttfa_stability']:>6.2f}{over:>9} | "
               f"{s['mean_inflight']:>9.2f}{s['throughput_Q']:>7.2f}"
               f"{s['rtf_p50']:>9.2f}{s['rtf_p95']:>7.2f}")
+    print()
+    print("=============== HOW MUCH OF THAT IS REAL")
+    print(f"{'conc':>5}{'req':>5} | {'TTFA p50 (95% CI)':>28}{'n':>5} | {'TTFA p95 (95% CI)':>28}{'n':>5}"
+          f" | {'TTFA p99 (95% CI)':>28}{'n':>5}")
+    for s_ in rows:
+        vals = s_.get("_ttfa_samples") or []
+        cells = ""
+        for q in (50, 95, 99):
+            lo, hi, tail = pct_ci(vals, q)
+            mark = " !" if tail < 10 else "  "
+            cells += f"{f'{pct(vals, q):.0f} [{lo:.0f}-{hi:.0f}]':>28}{tail:>3}{mark}"
+        print(f"{s_['concurrency']:>5}{s_['requests']:>5} | {cells}")
+    print("n        = samples in the tail that the percentile rests on. ! means fewer than 10,")
+    print("           at which point the figure cannot support a comparison between runs: the")
+    print("           count above a p99 is Binomial(N, 0.01), so at N=200 it is 2 +/- 1.5.")
+    print("           Note the CI is itself optimistic out there: resampling cannot invent a")
+    print("           value worse than the worst one seen, so at the extreme tail trust n, not")
+    print("           the interval.")
+    print("           Prefer the exact threshold counts (>budget, and the server's")
+    print("           ttfa_over_*_total series) whenever the run is short.")
     print()
     print(f"degrad   = TTFA p95(c) / TTFA p95(c=1). \"serving c users costs the worst one Nx\"")
     print(f"stab     = p95/p50. If it moves away from 1 there is a SPIKE even with a good median")
@@ -622,6 +715,10 @@ def main():
     ap.add_argument("--concurrency", default="1,2,4,8", help="comma-separated sweep, e.g. 1,2,4,8")
     ap.add_argument("--requests", type=int, default=16, help="requests per concurrency level")
     ap.add_argument("--duration", type=float, default=0.0, help="seconds; overrides --requests (soak)")
+    ap.add_argument("--min-samples", type=int, default=0,
+                    help="closed loop: run until this many requests complete, with --duration "
+                         "as a cap. Sample count is what sets a percentile's precision, so a "
+                         "screen defined this way keeps the same precision on any box.")
     ap.add_argument("--text-file", default=DEFAULT_TEXTS)
     ap.add_argument("--classes", default="", help="filter on the text classes, e.g. short,long")
     ap.add_argument("--speaker", default="ryan")
@@ -665,6 +762,8 @@ def main():
 
     print(f"target   {args.url}{args.path}")
     print(f"speaker  {args.speaker} · language {args.language} · temp {args.temperature}")
+    _bank = bank_provenance(args.text_file)
+    print(f"bank     {_bank['bank']} version={_bank['bank_version']} sha={_bank['bank_sha256']}")
     print(f"texts    {len(texts)} from {os.path.basename(args.text_file)}"
           f"{' (' + ','.join(classes) + ')' if classes else ''}")
     mode = f"soak {args.duration:.0f}s" if args.duration else f"{args.requests} requests"

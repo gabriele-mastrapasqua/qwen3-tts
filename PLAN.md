@@ -140,6 +140,13 @@ inventing numbers the server is not entitled to claim, and without complicating 
 **Nothing is implemented until OTEL-1 and OTEL-2 are answered** — the survey found that the wire
 format is the easy half and the honest-metric boundary is the hard half.
 
+**IMPLEMENTED 2026-09-17 on `feat/metrics-endpoint`** — `--metrics-port` / `--metrics-bind`,
+`docs/serving/metrics.md`, `tests/serve_metrics.sh`, `tools/metrics_watch.py`. Touches
+`main.c` (flags), `qwen_tts_server.h` (one prototype) and `qwen_tts_server.c` only; no kernel,
+engine or compute file is in the diff, and no worker process changes at all. **Open: the
+prefork parent path is Linux-only and is compiled out on macOS, so it is written but not yet
+executed — OTEL-7 validates it on the 32-core Axion.**
+
 **DECIDED 2026-09-17 (owner): tier 1 only, and it must publish state that already exists.**
 No new instrumentation, nothing added to any serving path, nothing that can slow a request.
 `/metrics` is a *rendering* of what the process already holds when somebody asks for it, and
@@ -160,7 +167,7 @@ on the request path is **structurally zero**: no code is added to any path a req
 and the child does not change at all. Tier 2 (latency, audio seconds, the write-gap proxy) is
 child-side, needs the shared segment, and happens only if tier 1 proves insufficient.
 
-- [ ] OTEL-1 **Decide what the server is entitled to export.** Our envelope is half
+- [x] OTEL-1 **Decide what the server is entitled to export.** (2026-09-17) Our envelope is half
       client-side by construction. Server-observable: TTFB, TTFA, queue/admission time, request
       duration, audio-seconds per wall-second, `STREAM_RTF`, and the **write-gap / cadence debt**
       proxy. Not server-observable: `required_prebuffer`, `safe_play_start`, `stall_rate@N` —
@@ -169,7 +176,9 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       the harness's `stall_rate`, plus the standing rule that a bucketed Grafana p95 is an
       operations signal and **not** a qualification number (the harnesses stay the acceptance
       instrument). Same discipline as the `doctor` provenance labels.
-- [ ] OTEL-2 **Decide the aggregation model, because the server is prefork.**
+- [x] OTEL-2 **Decide the aggregation model, because the server is prefork.** (2026-09-17 —
+      per-worker series, never aggregated in C. The `/v1/health` worker-attribution fix is
+      **still open**, tracked as OTEL-8.)
       `static server_state_t g_srv` (`qwen_tts_server.c:597`) is process-local, so each worker
       counts only itself — which means `GET /v1/health` **already** returns one worker's
       counters on a 12-worker box, a different twelfth each scrape. Verify empirically, then
@@ -190,7 +199,7 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       no time series, because it is the one a dashboard will be built on. The parent is the only
       process with a stable complete view, which is what makes the small C change the *minimum
       correct* option rather than merely the nicer one.
-- [ ] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** Readable directly by
+- [x] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** (2026-09-17) Readable directly by
       Prometheus, Grafana Alloy, VictoriaMetrics and the Datadog OpenMetrics check, and by the
       OpenTelemetry Collector through its `prometheus` receiver, which converts to OTLP for
       anything downstream — so a text page reaches every OTel consumer without linking a
@@ -202,7 +211,9 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       most invasive change available, for no gain. A separate port also makes "answers without
       the synth lock, outside admission" structural rather than a thing to be careful about, and
       it keeps concurrency/capacity/build identity off the public port.
-- [ ] OTEL-4 **Namespace, buckets, and a hard cardinality rule.** Tier 2 note: **prefer no
+- [x] OTEL-4 **Namespace and the cardinality rule — done for tier 1** (2026-09-17: `qwen_tts_`
+      with underscores, labels limited to `worker` and `reason`, no `voice` or `language` label
+      anywhere. The bucket/threshold design below applies to tier 2 and is not yet needed.) Tier 2 note: **prefer no
       histograms.** A Prometheus histogram is a set of "how many exceeded X" counters, and we have
       already declared the only threshold that matters — so `_sum`/`_count` pairs (mean over any
       window via `rate()`) plus exact threshold counters such as
@@ -218,7 +229,8 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       `worker`, `route`, `outcome`, plus static identity on `qwen_tts_build_info`. Copy vLLM's
       deprecation policy verbatim (notice in the HELP string, release-note entry, one-cycle CLI
       escape hatch).
-- [ ] OTEL-5 **Decide on `gen_ai.server.*` aliases — deliberately, not by default.** As of
+- [x] OTEL-5 **`gen_ai.server.*` aliases: NOT emitted** (decided 2026-09-17; revisit only if a
+      reader actually asks for them). As of
       2026-09-17 every `gen_ai.*` metric is still stability **Development**, none Stable, and on
       2026-06-12 (semconv v1.42.0) the whole namespace was deprecated out of the main repository
       into `open-telemetry/semantic-conventions-genai`, which has no tagged release. The
@@ -229,7 +241,7 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       convention that can rename fields without a deprecation window. Open sub-question: whether
       to propose an audio operation upstream — we have an unusually well-specified envelope to
       argue from.
-- [ ] OTEL-6 **Cost gate — tier 2 only.** Tier 1 adds no code to any path a request traverses,
+- [x] OTEL-6 **Cost gate — not applicable to tier 1** (2026-09-17). Tier 1 adds no code to any path a request traverses,
       so there is nothing to gate; do not run a campaign to prove zero. For tier 2:
       instrumentation is not
       free until measured. The per-request instants already exist in `batch_job_t`
@@ -238,6 +250,102 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       not clock reads — but it still has to clear **< 0.2 % of wall** on `make cost-map` plus a
       C12 wave A/B on the frozen Turin profile before the endpoint is documented as safe under
       load.
+- [x] OTEL-7 **Prefork parent validated on Linux — 32-core Neoverse-V2 Axion, 2026-09-17.**
+      Clean build (`rc=0`, zero errors) — the first time the `#if defined(__linux__)` parent block
+      was compiled at all — with `--caps` reporting SMMLA and BFMMLA active and `--self-test`
+      passing. `tests/serve_metrics.sh` 13/13 including block 5: four distinct per-worker series,
+      every worker dispatched, `dispatched_total` summing to the offered load, counters monotonic
+      across scrapes. A 120 s C16 closed-loop soak with `tools/metrics_watch.py` at 5 s returned
+      monotonic / conserved / balanced, and the arithmetic closes: `dispatched - completed = 4`
+      per worker, 16 in total, exactly the offered concurrency still in flight. Per-worker spread
+      43..64 — normal duration variance, and visible only because nothing is summed.
+      **Cost: below the noise floor.** Three arms (off / on / off) of the same soak on the frozen
+      `axion-c4a-highcpu32-0p6b-all-on` profile: the two identical OFF arms already differ 6.6% on
+      TTFA p50 and 12.2% on p99, every on-vs-off delta is inside that, and several ON numbers are
+      better than both OFF arms — which cannot be real. Table in `docs/serving/metrics.md`.
+      **One defect found by measuring:** `accept()` can return before the request lands, so
+      answering and closing raced with the arriving request, the kernel sent `RST` and the scraper
+      discarded an already-written response — one empty scrape in ~300 under load. Fixed with a
+      single bounded 2 ms `poll()`; 1000 scrapes under load afterwards, zero empty.
+      Full observability example added: `configs/observability/` + `tools/observability_up.sh`,
+      verified end to end with Prometheus 3.14 and Grafana 13.2 on the box (target `up`, four
+      worker series in the TSDB, dashboard provisioned).
+- [x] OTEL-9 **QoS on the scrape port** (2026-09-17). The decision that makes the page free at a
+      sane interval — rendering inside the prefork parent's dispatch loop — is what made a
+      runaway client dangerous, so `--metrics-max-rate` (default 5 scrapes/s, `0` disables)
+      serves at most that and answers `429` + `Retry-After` above it. A token bucket holding
+      `2 x rate`, not a minimum interval, for the reason DynamoDB uses one: a fixed floor
+      punishes two scrapers landing together and does nothing about a sustained flood. The
+      refusal path does not render the page (a refusal must be cheaper than an answer, or the
+      limit funds the attack) and refusals do not consume tokens (a hammering client must not
+      lock out everyone including itself). Refusals are published as
+      `qwen_tts_metrics_throttled_total`. Verified on the Axion under C16 load: a 100-request
+      burst at full speed served 12 and refused 88, with the counter reading exactly 88, while
+      the Prometheus 5 s scrape stayed `up` throughout. Scope stated in the docs: QoS against
+      accident, not DDoS protection — a flood is a firewall's problem and the port is
+      loopback-bound by default.
+- [x] OTEL-10 **Tier 2 shipped: the measurements only a worker can see** (2026-09-17). One
+      `MAP_SHARED` page, one slot per worker, single writer, read by the parent at scrape time.
+      Adds audio seconds produced, TTFA and TTFB as `_sum`/`_count`, an exact
+      `ttfa_over_1s_total` for the `safe_play_start` line, and a behind-realtime chunk-gap proxy.
+      Hooked into `qwen_life_emit()` and `sink_on_chunk()`, which already ran once per request
+      and once per chunk with every timing in hand, so nothing new is computed: with metrics off
+      it is one never-taken branch, with them on a few relaxed atomic adds per request.
+      **Two defects found while building it, both by measuring rather than reading.** The gap
+      counter first used a 250 ms threshold and fired on 15 of 17 chunks of a *healthy* stream —
+      a chunk carrying 500 ms of audio arriving 400 ms later is filling the buffer, not draining
+      it. Re-defined as gap-versus-audio-delivered and validated by discrimination: same text,
+      same box, bf16 (RTF~1.3) 13/13 behind realtime, `--int8` (RTF~0.85) **0/12**. And the new
+      series overflowed the page buffer, which truncated mid-sample while `Content-Length` agreed
+      with the truncation — a corrupt page that parses. Buffer resized and the renderer now grows
+      and re-renders; the test asserts the last line is a whole sample.
+      **Cost: still below the noise floor.** Same three-arm C16 soak: the two identical OFF arms
+      differ 23.5% on TTFA p99 (265.0 vs 202.6) while every on-vs-off delta is at most 7.5% and
+      mostly under 1%. Live at C16 on the Axion: 14.0 realtime streams sustained, zero requests
+      past the 1 s line, and ~2.9% of chunks arriving behind realtime — which is the kind of
+      thing the proxy exists to make visible.
+      Dashboard reorganised around the listener (realtime streams, TTFA mean against the 1 s
+      line, TTFA past 1 s, behind-realtime fraction) with server health below; `Build` panel
+      fixed to show labels, and a `up{job}` panel added so a gap in the graphs can be told apart
+      from a server that was down.
+- [x] OTEL-11 **Scrape cost measured directly, not inferred** (2026-09-17). A soak A/B can only
+      say "below the noise floor", and this box's floor is several percent, so the parent's own
+      CPU time was read from `/proc/<pid>/stat` over three 120 s windows under C16 load: idle,
+      1 scrape/s, idle again. The parent consumed **less than one clock tick in every arm**, so
+      119 scrapes cost under 10 ms in total: an upper bound of **~84 us per scrape**, and the
+      real figure is below the instrument's resolution. Closes OTEL-7b: a 1 s interval is free.
+- [x] OTEL-12 **Worker-0 asymmetry: my softirq explanation was WRONG, and the error was mine.**
+      (2026-09-17.) Three signals agreed that worker 0 was ~10% slower — TTFA, completions and
+      behind-realtime chunks — and I attributed it to network softirq work concentrated on its
+      cores, citing 58.7% of NET_RX against an even 25%. **That number was cumulative since
+      boot**: it counted every earlier experiment, ssh session and tmux run on the box, not the
+      benchmark window. Measuring the delta *during* each arm shows NET_RX split evenly —
+      24.5 / 27.8 / 23.9 / 23.7 — and the hypothesis is refuted. Hardware interrupts were
+      already even (25.9% vs 25%) and were refuted earlier.
+      What survives is simpler and fits every arm: the **load generator runs unpinned on the
+      same box**, the scheduler favours low-numbered idle CPUs, and it was observed on cpu0 —
+      inside worker 0's slice. Pinning it anywhere (w1 or w3 cores) removed most of worker 0's
+      penalty without transferring it, because eight TTS threads dilute one python process.
+      Consequences: every closed-loop soak run with a co-located generator has carried this,
+      systematically on worker 0, worth ~2.5% aggregate; and the lesson is the method one —
+      **a cumulative counter is not a measurement of a window.**
+- [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** SUPERSEDED by OTEL-11. Note it is within the shipped default
+      limit (1/s against 5/s), so this is a cost question, not a behaviour one. Everything above was at 5 s. 1 s is
+      5x the scrapes and should still be invisible, but it is a claim, not a measurement.
+      The parent path is inside `#if defined(__linux__)` and is compiled out on macOS, so every
+      line of it shipped unexecuted: the poll-set registration, the per-worker rendering, the
+      never-reset counter twins and the teardown ordering are all reviewed but unrun. On the box:
+      `bash tests/serve_metrics.sh` (its block 5 runs only on Linux — one series set per worker,
+      distinct, every worker moving, counters monotonic across scrapes), then a **2-minute mini
+      soak** with `tools/metrics_watch.py --duration 120 --interval 10` against real load, which
+      checks monotonic / conserved (`completed <= dispatched`) / balanced (no idle worker).
+      Watch for: a worker that never receives work, a counter that resets, and whether the
+      parent's `all_workers_full` rejects track the harness's own reject count.
+- [ ] OTEL-8 **`/v1/health` should say which worker answered.** Found while surveying, unrelated
+      to the endpoint: `g_srv` is a process-local static, so on a prefork server the health
+      counters are one worker's, a different one per probe, while the limits it reports are the
+      server's. Add `"worker": N` and say so in `docs/serving/api.md`. Two lines, no behaviour
+      change; check what in `tests/` reads it first.
 
 ### Legacy CPU / v2 portability audit — detail: `.work/legacy-cpu-v2-audit-20260916.md`
 

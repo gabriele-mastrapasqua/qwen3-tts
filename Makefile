@@ -727,7 +727,9 @@ BENCH_MODEL   ?= $(MODEL_LARGE)
 BENCH_PROFILE ?= recommended
 BENCH_TOPO    ?= 2x8
 BENCH_SPEAKER ?= ryan
-BENCH_BANK    ?= tests/load_texts_en.txt
+# v2 corpus: 277 texts against v1's 21. Numbers measured on the two banks are NOT comparable,
+# which is why every artifact records the bank version and digest. v1 stays available.
+BENCH_BANK    ?= tests/load_texts_en_v2.txt
 BENCH_CONC    ?= 1,4
 BENCH_WAVES   ?= 3
 BENCH_OUT     ?= /tmp/bench_suite
@@ -793,6 +795,25 @@ soak-fast: $(TARGET)
 	  --min-windows "$(SOAKFAST_WINDOWS)" --out "$(SOAKFAST_OUT)" \
 	  $(if $(SOAK_PROFILE),--profile "$(SOAK_PROFILE)",--no-profile "$(SOAK_NO_PROFILE)") \
 	  $(SOAKFAST_ARGS)
+
+# SOAK-SCREEN: the dev A/B instrument. Fixed concurrency, `medium`-class texts (~4-5 s of
+# audio, enough chunks to exercise streaming while keeping the request rate high) and a stop
+# condition in SAMPLES rather than minutes -- the sample count is what sets a percentile's
+# precision, and minutes are only a proxy for it that moves with the box and the model.
+# A SCREEN IS NEVER A QUALIFICATION: its numbers never go into a profile or a report. See
+# docs/serving/benchmarks.md.
+SCREEN_MODEL    ?= $(BENCH_MODEL)
+SCREEN_PROFILE  ?= $(BENCH_PROFILE)
+SCREEN_PORT     ?= 8080
+SCREEN_CONC     ?= 16
+SCREEN_SAMPLES  ?= 1500
+SCREEN_CAP_S    ?= 600
+SCREEN_CLASSES  ?= medium
+SCREEN_SPEAKER  ?= ryan
+SCREEN_ARGS     ?=
+
+soak-screen: $(TARGET)
+	@python3 tests/load_test.py --url http://127.0.0.1:$(SCREEN_PORT) 	  --concurrency $(SCREEN_CONC) --min-samples $(SCREEN_SAMPLES) --duration $(SCREEN_CAP_S) 	  --arrival all-at-once --classes $(SCREEN_CLASSES) --speaker $(SCREEN_SPEAKER) 	  --language English --seed 42 --temperature 0 --no-save-audio $(SCREEN_ARGS)
 
 bench-suite-full: bench-suite
 	@$(MAKE) bench-soak
