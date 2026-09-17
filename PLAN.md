@@ -133,6 +133,69 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       the falsified utilization-aware admission, the bimodal configuration measurement, `doctor`,
       and the doubling-ladder lesson.
 
+### OTEL — telemetry endpoint for the streaming server (ANALYSIS FIRST) — detail: `.work/otel-metrics-endpoint-20260917.md`
+
+Goal: let a standard observability reader watch a production CPU streaming server, without
+inventing numbers the server is not entitled to claim. **Nothing is implemented until OTEL-1
+and OTEL-2 are answered** — the survey already found that the wire format is the easy half and
+the honest-metric boundary is the hard half.
+
+- [ ] OTEL-1 **Decide what the server is entitled to export.** Our envelope is half
+      client-side by construction. Server-observable: TTFB, TTFA, queue/admission time, request
+      duration, audio-seconds per wall-second, `STREAM_RTF`, and the **write-gap / cadence debt**
+      proxy. Not server-observable: `required_prebuffer`, `safe_play_start`, `stall_rate@N` —
+      a stall is an event in a *player*, and the server does not hold the playback clock.
+      Deliverable: the exported set, each metric named so that the proxy can never be quoted as
+      the harness's `stall_rate`, plus the standing rule that a bucketed Grafana p95 is an
+      operations signal and **not** a qualification number (the harnesses stay the acceptance
+      instrument). Same discipline as the `doctor` provenance labels.
+- [ ] OTEL-2 **Decide the aggregation model, because the server is prefork.**
+      `static server_state_t g_srv` (`qwen_tts_server.c:597`) is process-local, so each worker
+      counts only itself — which means `GET /v1/health` **already** returns one worker's
+      counters on a 12-worker box, a different twelfth each scrape. Verify empirically, then
+      choose: shared `mmap` segment aggregated by the parent (the `qwen_admission_health_t`
+      pattern at `:2804` already establishes it, and gauges require it), per-worker `worker=`
+      labels summed by the reader (free and correct for counters and histogram buckets, and it
+      keeps a starving worker *visible* instead of averaged away), or both. Fix or document the
+      `/v1/health` behaviour either way, and check what in `tests/` depends on it.
+- [ ] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** Readable directly by
+      Prometheus, Grafana Alloy, VictoriaMetrics and the Datadog OpenMetrics check, and by the
+      OpenTelemetry Collector through its `prometheus` receiver, which converts to OTLP for
+      anything downstream — so a text page reaches every OTel consumer without linking a
+      protobuf/gRPC client into a dependency-free C server. Path `/metrics`, not `/v1/metrics`
+      (scraper default; `/v1/metrics` is OTLP-over-HTTP's own push path). Off by default: the
+      page publishes concurrency, capacity, model size and build identity to anyone who can
+      reach the port. Must answer without the synth lock and outside admission — a metrics
+      endpoint that queues behind TTS goes blind exactly when it is needed.
+- [ ] OTEL-4 **Namespace, buckets, and a hard cardinality rule.** Prefix `qwen_tts_` with
+      underscores — *not* vLLM's `vllm:` colon, which their own docs concede is contrary to
+      Prometheus convention. Adopt the GenAI semantic-convention TTFT bucket set for the latency
+      histograms (`0.001 … 1.0 … 10.0 s`; the `1.0` boundary happens to be our `safe_play_start`
+      line); pick our own for `stream_rtf` and `write_gap`. **`voice` must never be a label** —
+      presets are bounded at 9 but the clone path takes arbitrary names, so a voice label is an
+      unbounded series generator driven by user input; same for `language`. Allowed labels:
+      `worker`, `route`, `outcome`, plus static identity on `qwen_tts_build_info`. Copy vLLM's
+      deprecation policy verbatim (notice in the HELP string, release-note entry, one-cycle CLI
+      escape hatch).
+- [ ] OTEL-5 **Decide on `gen_ai.server.*` aliases — deliberately, not by default.** As of
+      2026-09-17 every `gen_ai.*` metric is still stability **Development**, none Stable, and on
+      2026-06-12 (semconv v1.42.0) the whole namespace was deprecated out of the main repository
+      into `open-telemetry/semantic-conventions-genai`, which has no tagged release. The
+      conventions are token-centric and define **no audio or text-to-speech operation at all**:
+      `gen_ai.operation.name` has `chat`, `text_completion`, `embeddings`, … and nothing for
+      speech. So `gen_ai.server.time_to_first_token` / `.request.duration` /
+      `.time_per_output_token` are at best an alias set for three of our metrics, for a
+      convention that can rename fields without a deprecation window. Open sub-question: whether
+      to propose an audio operation upstream — we have an unusually well-specified envelope to
+      argue from.
+- [ ] OTEL-6 **Cost gate before any of it is called production-safe.** Instrumentation is not
+      free until measured. The per-request instants already exist in `batch_job_t`
+      (`t_recv`/`t_parsed`/`t_admit`/`t_first`/`t_write_complete`, `first_audio_ready_us`,
+      `audio_ready_samples`) and are discarded at job completion, so the addition is aggregation,
+      not clock reads — but it still has to clear **< 0.2 % of wall** on `make cost-map` plus a
+      C12 wave A/B on the frozen Turin profile before the endpoint is documented as safe under
+      load.
+
 ### Legacy CPU / v2 portability audit — detail: `.work/legacy-cpu-v2-audit-20260916.md`
 
 - [x] LEGACY-CPU-0 Read-only architecture audit at `15a5850`: reconstructed model load,
