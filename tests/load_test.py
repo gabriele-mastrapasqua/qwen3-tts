@@ -303,8 +303,24 @@ async def run_level(args, host, port, texts, conc, service_s):
             print(f"  ⚠️  --server-log {args.server_log}: cannot open, client-side attribution only")
             tail = None
 
+    # Stratify by CLASS, not by list position.
+    #
+    # Cycling the bank directly makes the workload mix proportional to how many texts each
+    # class happens to hold, and the bank is grouped by class, so it also arrives in phases:
+    # sixty short requests, then a hundred medium ones. That was harmless when the bank held
+    # twenty-one texts in near-equal groups and stopped being harmless the moment it held two
+    # hundred and seventy-seven in unequal ones. Round-robin over the classes keeps the mix
+    # fixed and independent of the bank's composition, so adding variety to one class cannot
+    # silently reweight the benchmark.
+    _by_class = {}
+    for _c, _t in texts:
+        _by_class.setdefault(_c, []).append(_t)
+    _class_order = sorted(_by_class)
+
     def payload_for(idx):
-        cls, txt = texts[idx % len(texts)]
+        cls = _class_order[idx % len(_class_order)]
+        pool = _by_class[cls]
+        txt = pool[(idx // len(_class_order)) % len(pool)]
         return cls, {"text": txt, "speaker": args.speaker, "language": args.language,
                      "temperature": args.temperature, "seed": args.seed + idx}
 
@@ -314,8 +330,12 @@ async def run_level(args, host, port, texts, conc, service_s):
     t0 = time.perf_counter()
     tail_task = asyncio.create_task(tail.run(t0)) if tail else None
 
-    if args.arrival == "all-at-once" and args.duration:
-        stop_at = t0 + args.duration
+    if args.arrival == "all-at-once" and (args.duration or args.min_samples):
+        # --min-samples is what a SCREEN should be defined by. The sample count is what
+        # controls the precision of a percentile; the duration is only a proxy for it, and a
+        # proxy that changes with the box, the model size and the text mix. Given both, the
+        # run stops at whichever comes first, so the duration acts as a cap and not a target.
+        stop_at = t0 + (args.duration if args.duration else 1e9)
         sem = asyncio.Semaphore(conc)
 
         async def worker(idx):
@@ -326,13 +346,20 @@ async def run_level(args, host, port, texts, conc, service_s):
                 return await one_request(host, port, args.path, pl, idx, cls, out_dir,
                                          args.save_audio, args.timeout, t0, 0.0, inflight, None)
 
+        def enough():
+            return args.min_samples > 0 and len(records) >= args.min_samples
+
         pending, idx = set(), 0
-        while time.perf_counter() < stop_at or pending:
-            while len(pending) < conc and time.perf_counter() < stop_at:
+        while (time.perf_counter() < stop_at and not enough()) or pending:
+            while len(pending) < conc and time.perf_counter() < stop_at and not enough():
                 pending.add(asyncio.create_task(worker(idx))); idx += 1
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             records.extend(r for r in (d.result() for d in done) if r)
         lam = None
+        if args.min_samples > 0:
+            why = "sample target" if len(records) >= args.min_samples else "duration cap"
+            print(f"stopped  on the {why}: {len(records)} completed in "
+                  f"{time.perf_counter() - t0:.0f}s")
 
     elif args.arrival == "all-at-once":
         sem = asyncio.Semaphore(conc)
@@ -688,6 +715,10 @@ def main():
     ap.add_argument("--concurrency", default="1,2,4,8", help="comma-separated sweep, e.g. 1,2,4,8")
     ap.add_argument("--requests", type=int, default=16, help="requests per concurrency level")
     ap.add_argument("--duration", type=float, default=0.0, help="seconds; overrides --requests (soak)")
+    ap.add_argument("--min-samples", type=int, default=0,
+                    help="closed loop: run until this many requests complete, with --duration "
+                         "as a cap. Sample count is what sets a percentile's precision, so a "
+                         "screen defined this way keeps the same precision on any box.")
     ap.add_argument("--text-file", default=DEFAULT_TEXTS)
     ap.add_argument("--classes", default="", help="filter on the text classes, e.g. short,long")
     ap.add_argument("--speaker", default="ryan")

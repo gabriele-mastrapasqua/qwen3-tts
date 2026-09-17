@@ -106,6 +106,40 @@ exactly the sense that pre-v2 serving numbers are not comparable with v2 ones. S
 - classes were **extended inside their bands, never redefined** — making `short` mean 70
   characters instead of 25 would have broken comparability silently.
 
+## The screen, calibrated
+
+A screen nobody has calibrated is a screen nobody should trust. So: a production flag was
+turned off to inject a known regression (`QWEN_KAI_QKV_FUSED`, on the prefill path that sets
+TTFA), and both instruments measured the same defect on a 32-core Axion at C16. The question
+is not the size of the change but whether the instrument's own uncertainty excludes zero,
+so the **difference between the arms** was bootstrapped directly.
+
+| instrument | N per arm | TTFA p50 | 95% CI of the delta | verdict |
+|---|---|---|---|---|
+| mini-soak, 2 min | ~296 | 90.2 → 95.4 ms | `[-5.8, +17.5]` | **cannot separate the arms** |
+| screen, 1500 samples | 1515 | 90.1 → 96.2 ms | `[+4.4, +9.6]` | **sees it** |
+
+Both instruments agree on the point estimate (+5.1 ms against +6.1 ms). The two-minute run is
+not *wrong*; it is *imprecise*, which is worse, because an imprecise number looks exactly like
+a precise one. The screen reached its sample target in 463 s, short of its ten-minute cap.
+
+The same run showed something a coarser instrument would have hidden: the flag **improves the
+median and widens the tail** — p50 worsens by ~6 ms with it off while p95 improves by ~17 ms,
+and both instruments agree on both signs.
+
+## Stratify by class, not by list position
+
+A related trap, found while calibrating. The harness used to cycle the bank with
+`texts[idx % len(texts)]`, which makes the workload mix proportional to how many texts each
+class happens to contain — and since the bank is grouped by class, it also arrives in phases:
+sixty short requests, then a hundred medium ones. Harmless with v1's twenty-one texts in
+near-equal groups; not harmless with v2's two hundred and seventy-seven in unequal ones, where
+it silently reweighted the benchmark toward `medium`.
+
+The harness now round-robins over the classes and indexes within them, so the mix is fixed and
+independent of the bank's composition. **Adding variety to one class can no longer change what
+the benchmark measures** — which is the whole point of extending a corpus.
+
 ## What never goes into a profile
 
 - A screen result, at any length.
