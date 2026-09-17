@@ -1,0 +1,85 @@
+name: CUDA Compile
+
+# Compiling CUDA needs no GPU. nvcc turns .cu into PTX and cubin entirely on the host, and a
+# device is required only to RUN the result -- so this gate fits on a standard free runner.
+#
+# It exists because 2,400 lines of device code had no compile coverage at all: a syntax or type
+# error in a .cu surfaced only when somebody built on a GPU box, which is an expensive place to
+# discover a typo.
+#
+# What it catches: syntax and type errors, wrong __global__/__device__ qualifiers, missing
+# headers, intrinsics that do not exist for a target architecture, and -- because the link step
+# runs too -- missing symbols. The toolkit ships stubs for libcuda, so linking works without a
+# driver.
+#
+# What it does NOT catch: anything at runtime. No kernel correctness, no memory behaviour, no
+# occupancy. And it does not verify the rule that matters most here -- that the CPU paths are
+# untouched -- which still needs the ifdef-strip-and-diff check.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  nvcc:
+    name: nvcc (${{ matrix.cuda }})
+    runs-on: ubuntu-latest
+    container:
+      # >= 12.8 is NOT optional: the Makefile targets sm_120 (Blackwell), which older nvcc
+      # does not know. 12.6 and Ubuntu's own nvidia-cuda-toolkit both fail on that gencode.
+      # Keep this in step with the toolkit the GPU boxes actually build with.
+      image: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12.8.1"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the host toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential libopenblas-dev git ca-certificates
+          nvcc --version
+
+      - name: Compile the device code for every target architecture
+        run: |
+          set -eux
+          # The same flags the Makefile uses, so this gate tests what ships rather than a
+          # convenient subset. Five architectures, so an intrinsic that exists on Blackwell and
+          # not on Ampere is caught here instead of on a rented box.
+          ARCH="-gencode arch=compute_80,code=sm_80 \
+                -gencode arch=compute_86,code=sm_86 \
+                -gencode arch=compute_89,code=sm_89 \
+                -gencode arch=compute_120,code=sm_120 \
+                -gencode arch=compute_120,code=compute_120"
+          for f in qwen_tts_cuda_kernels.cu qwen_tts_cuda_talker.cu qwen_tts_cuda_decoder.cu; do
+            echo "=== $f ==="
+            nvcc $ARCH -O3 --default-stream per-thread -I. -I/usr/local/cuda/include \
+                 -c -o "${f%.cu}.o" "$f"
+          done
+
+      - name: Link the full CUDA build
+        run: |
+          set -eux
+          # Compilation alone misses missing symbols, and the toolkit's libcuda stub makes the
+          # link possible without a driver, so it costs little to do it properly.
+          make cuda CUDA_HOME=/usr/local/cuda -j"$(nproc)"
+          ls -la qwen_tts
+
+      - name: Prove the CUDA backend was actually compiled in
+        run: |
+          set -eu
+          # There is no device on this runner, so the claim under test is compile-time only.
+          # A build WITHOUT CUDA answers --gpu-selftest with "requires a GPU build"; a build
+          # with it gets past that line and then fails for lack of a device, which is the
+          # expected outcome here. So the assertion is on the message, not the exit code --
+          # otherwise this step would be testing for a GPU we deliberately do not have.
+          ./qwen_tts --gpu-selftest --backend cuda > selftest.txt 2>&1 || true
+          cat selftest.txt
+          if grep -q "requires a GPU build" selftest.txt; then
+            echo "ERROR: the binary was linked without the CUDA backend"; exit 1
+          fi
+          echo "OK: CUDA is compiled in (it then failed for want of a device, as expected)"
