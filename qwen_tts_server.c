@@ -47,6 +47,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include "qwen_build_id.h"
 
@@ -99,7 +100,13 @@ typedef struct {
     _Atomic unsigned long long audio_ms;
     _Atomic unsigned long long ttfa_ms_sum;
     _Atomic unsigned long long ttfa_n;
+    _Atomic unsigned long long ttfa_over_250ms;
+    _Atomic unsigned long long ttfa_over_500ms;
     _Atomic unsigned long long ttfa_over_1s;
+    _Atomic unsigned long long term_ok;
+    _Atomic unsigned long long term_client_gone;
+    _Atomic unsigned long long term_timeout;
+    _Atomic unsigned long long term_rejected;
     _Atomic unsigned long long ttfb_ms_sum;
     _Atomic unsigned long long ttfb_n;
     _Atomic unsigned long long queue_ms_sum;
@@ -112,6 +119,11 @@ typedef struct {
 static qwen_metrics_slot_t *g_metrics_slots = NULL;   /* MAP_SHARED, [0..workers) */
 static int                  g_metrics_slot_n = 0;
 static qwen_metrics_slot_t *g_metrics_mine = NULL;    /* this process's slot, or NULL */
+/* Which prefork worker this process is, or -1 for a single server. g_srv counters are
+   process-local, so a health probe against a prefork server reports ONE worker's totals -- a
+   different one per probe, since the parent hands the connection to whoever is free. Saying
+   which one turns a misleading number into a scoped one. */
+static int g_srv_worker_id = -1;
 
 #define QM_ADD(field, v) do { \
         if (g_metrics_mine) \
@@ -953,12 +965,13 @@ static void handle_health(int fd) {
     int ready = g_srv.batched ? alive : 1;
     const char *sched = g_srv.batched ? (alive ? "running" : "down") : "none";
     const char *mode  = g_srv.batched ? "batched" : "single";
-    char json[640];
+    char json[800];
     snprintf(json, sizeof(json),
              "{\"status\":\"%s\",\"mode\":\"%s\",\"scheduler\":\"%s\","
              "\"num_requests_running\":%d,\"num_requests_waiting\":%d,"
              "\"queue_max\":%d,\"queue_timeout_ms\":%d,\"max_request_ms\":%d,"
              "\"max_text_chars\":%d,"
+             "\"worker\":%d,\"counters_scope\":\"%s\","
              "\"admitted\":%d,\"done\":%d,"
              "\"rejected_queue_full\":%d,\"rejected_queue_timeout\":%d,"
              "\"timed_out\":%d}",
@@ -966,6 +979,9 @@ static void handle_health(int fd) {
              atomic_load(&g_srv.running), waiting,
              g_srv.queue_max, g_srv.queue_timeout_ms, g_srv.max_request_ms,
              srv_max_text_chars(),
+             g_srv_worker_id,
+             g_srv_worker_id >= 0 ? "this worker only; the limits above are the server's"
+                                  : "this server",
              atomic_load(&g_srv.admitted), atomic_load(&g_srv.done),
              atomic_load(&g_srv.rejected_full), atomic_load(&g_srv.rejected_stale),
              atomic_load(&g_srv.timed_out));
@@ -1816,65 +1832,97 @@ static size_t qwen_metrics_render(char *b, size_t cap) {
        published as zeros. */
     if (g_metrics_slots) {
         const int nw = prefork ? g_metrics.workers : 1;
-        const struct { const char *name, *type, *help; } defs[] = {
+        /* Name, help and struct member in one row. The previous shape carried the member in a
+           positional switch parallel to this table, which is a bug waiting for the next series
+           to be inserted in the middle -- and six were. */
+        const struct {
+            const char *name, *type, *help;
+            size_t off;
+            int as_seconds;
+        } defs[] = {
             {"qwen_tts_worker_audio_seconds_total", "counter",
              "Seconds of audio this worker produced. rate() of this is the realtime streams it "
              "is sustaining, which is the throughput unit that means something for TTS: a "
-             "request is not a unit of work when one is two seconds and the next is sixty."},
+             "request is not a unit of work when one is two seconds and the next is sixty.",
+             offsetof(qwen_metrics_slot_t, audio_ms), 1},
             {"qwen_tts_worker_requests_finished_total", "counter",
-             "Requests this worker finished, counted where the timings are taken."},
+             "Requests this worker finished, counted where the timings are taken.",
+             offsetof(qwen_metrics_slot_t, requests), 0},
             {"qwen_tts_worker_ttfa_seconds_sum", "counter",
              "Sum of time-to-first-audio. With _count, rate(sum)/rate(count) is the mean over "
              "any window. This is an operations signal; acceptance percentiles come from the "
-             "client-side harnesses."},
-            {"qwen_tts_worker_ttfa_seconds_count", "counter", "Requests contributing to the TTFA sum."},
+             "client-side harnesses.",
+             offsetof(qwen_metrics_slot_t, ttfa_ms_sum), 1},
+            {"qwen_tts_worker_ttfa_seconds_count", "counter",
+             "Requests contributing to the TTFA sum.",
+             offsetof(qwen_metrics_slot_t, ttfa_n), 0},
+            {"qwen_tts_worker_ttfa_over_250ms_total", "counter",
+             "Requests whose first audio took longer than 250 ms. With the 500 ms and 1 s "
+             "counters this is the shape of the tail, per worker, exact at any sample size -- "
+             "unlike a percentile, which over a short run rests on a handful of requests.",
+             offsetof(qwen_metrics_slot_t, ttfa_over_250ms), 0},
+            {"qwen_tts_worker_ttfa_over_500ms_total", "counter",
+             "Requests whose first audio took longer than 500 ms.",
+             offsetof(qwen_metrics_slot_t, ttfa_over_500ms), 0},
             {"qwen_tts_worker_ttfa_over_1s_total", "counter",
              "Requests whose first audio took longer than 1 second. Exact, not a bucket "
              "estimate: 1 s is the safe_play_start line, so the useful question is how many "
-             "crossed it."},
-            {"qwen_tts_worker_ttfb_seconds_sum", "counter", "Sum of time-to-first-byte."},
-            {"qwen_tts_worker_ttfb_seconds_count", "counter", "Requests contributing to the TTFB sum."},
+             "crossed it.",
+             offsetof(qwen_metrics_slot_t, ttfa_over_1s), 0},
+            {"qwen_tts_worker_terminated_ok_total", "counter",
+             "Requests that ran to completion and were fully delivered.",
+             offsetof(qwen_metrics_slot_t, term_ok), 0},
+            {"qwen_tts_worker_terminated_client_gone_total", "counter",
+             "Requests where the client disconnected before the audio finished. Ordinary for a "
+             "TTS server -- somebody stopped listening -- and invisible on every other series "
+             "here: the queue stays shallow, nothing is refused, throughput just sags.",
+             offsetof(qwen_metrics_slot_t, term_client_gone), 0},
+            {"qwen_tts_worker_terminated_timeout_total", "counter",
+             "Requests stopped by the per-request budget.",
+             offsetof(qwen_metrics_slot_t, term_timeout), 0},
+            {"qwen_tts_worker_terminated_rejected_total", "counter",
+             "Requests the worker refused after admission, such as a prompt over the token cap.",
+             offsetof(qwen_metrics_slot_t, term_rejected), 0},
+            {"qwen_tts_worker_ttfb_seconds_sum", "counter",
+             "Sum of time-to-first-byte.",
+             offsetof(qwen_metrics_slot_t, ttfb_ms_sum), 1},
+            {"qwen_tts_worker_ttfb_seconds_count", "counter",
+             "Requests contributing to the TTFB sum.",
+             offsetof(qwen_metrics_slot_t, ttfb_n), 0},
             {"qwen_tts_worker_queue_seconds_sum", "counter",
              "Sum of time spent waiting for admission, from enqueue to the scheduler taking the "
              "request. Subtract it from TTFA to separate the two reasons first audio can be "
-             "late: queued behind other work, or slow once it started."},
-            {"qwen_tts_worker_queue_seconds_count", "counter", "Requests contributing to the queue sum."},
+             "late: queued behind other work, or slow once it started.",
+             offsetof(qwen_metrics_slot_t, queue_ms_sum), 1},
+            {"qwen_tts_worker_queue_seconds_count", "counter",
+             "Requests contributing to the queue sum.",
+             offsetof(qwen_metrics_slot_t, queue_n), 0},
             {"qwen_tts_worker_stream_gaps_total", "counter",
-             "Gaps measured between consecutive streamed chunks reaching the socket."},
+             "Gaps measured between consecutive streamed chunks reaching the socket.",
+             offsetof(qwen_metrics_slot_t, gaps), 0},
             {"qwen_tts_worker_stream_gap_behind_realtime_total", "counter",
              "Chunk-to-chunk gaps where the wall time exceeded the audio delivered in the "
              "chunk, so the listener's buffer was draining across it. A PROXY for choppiness, "
              "not a stall rate: a stall happens in a player, against a buffer this server "
              "cannot see. A raw millisecond threshold would flag healthy streams, since a chunk "
-             "carrying more audio than the gap is filling the buffer, not draining it."},
+             "carrying more audio than the gap is filling the buffer, not draining it.",
+             offsetof(qwen_metrics_slot_t, gap_behind), 0},
             {"qwen_tts_worker_stream_gap_over_1s_total", "counter",
-             "Chunk-to-chunk write gaps longer than 1 s. Same proxy, same caveat."},
+             "Chunk-to-chunk write gaps longer than 1 s. Same proxy, same caveat.",
+             offsetof(qwen_metrics_slot_t, gap_over_1s), 0},
         };
         for (size_t k = 0; k < sizeof defs / sizeof defs[0]; k++) {
             QM_P("# HELP %s %s\n# TYPE %s %s\n", defs[k].name, defs[k].help,
                  defs[k].name, defs[k].type);
             for (int w = 0; w < nw && w < g_metrics_slot_n; w++) {
-                const qwen_metrics_slot_t *sl = &g_metrics_slots[w];
-                unsigned long long v = 0;
-                double as_seconds = 0.0;
-                switch (k) {
-                    case 0: as_seconds = atomic_load_explicit(&sl->audio_ms, memory_order_relaxed) / 1000.0; break;
-                    case 1: v = atomic_load_explicit(&sl->requests, memory_order_relaxed); break;
-                    case 2: as_seconds = atomic_load_explicit(&sl->ttfa_ms_sum, memory_order_relaxed) / 1000.0; break;
-                    case 3: v = atomic_load_explicit(&sl->ttfa_n, memory_order_relaxed); break;
-                    case 4: v = atomic_load_explicit(&sl->ttfa_over_1s, memory_order_relaxed); break;
-                    case 5: as_seconds = atomic_load_explicit(&sl->ttfb_ms_sum, memory_order_relaxed) / 1000.0; break;
-                    case 6: v = atomic_load_explicit(&sl->ttfb_n, memory_order_relaxed); break;
-                    case 7: as_seconds = atomic_load_explicit(&sl->queue_ms_sum, memory_order_relaxed) / 1000.0; break;
-                    case 8: v = atomic_load_explicit(&sl->queue_n, memory_order_relaxed); break;
-                    case 9: v = atomic_load_explicit(&sl->gaps, memory_order_relaxed); break;
-                    case 10: v = atomic_load_explicit(&sl->gap_behind, memory_order_relaxed); break;
-                    default: v = atomic_load_explicit(&sl->gap_over_1s, memory_order_relaxed); break;
-                }
-                if (k == 0 || k == 2 || k == 5 || k == 7)
-                    QM_P("%s{worker=\"%d\"} %.3f\n", defs[k].name, w, as_seconds);
+                const char *base = (const char *)&g_metrics_slots[w];
+                const _Atomic unsigned long long *f =
+                    (const _Atomic unsigned long long *)(const void *)(base + defs[k].off);
+                unsigned long long raw = atomic_load_explicit(f, memory_order_relaxed);
+                if (defs[k].as_seconds)
+                    QM_P("%s{worker=\"%d\"} %.3f\n", defs[k].name, w, raw / 1000.0);
                 else
-                    QM_P("%s{worker=\"%d\"} %llu\n", defs[k].name, w, v);
+                    QM_P("%s{worker=\"%d\"} %llu\n", defs[k].name, w, raw);
             }
         }
     }
@@ -2772,7 +2820,13 @@ static void qwen_metrics_request_done(const batch_job_t *j) {
             QM_ADD(ttfa_n, 1);
             /* Exact, not a quantile estimated from buckets: safe_play_start's hard line is
                1 s, so the useful question is how many requests crossed it, not roughly where
-               the 95th percentile sits. */
+               the 95th percentile sits.
+               Three thresholds rather than one because a percentile needs samples a short run
+               does not have -- a p99 over 200 requests IS the second-worst request -- while a
+               threshold count is exact at any N. Together they give the shape of the tail, per
+               worker, without a single histogram bucket. */
+            if (ttfa > 250.0)  QM_ADD(ttfa_over_250ms, 1);
+            if (ttfa > 500.0)  QM_ADD(ttfa_over_500ms, 1);
             if (ttfa > 1000.0) QM_ADD(ttfa_over_1s, 1);
         }
     }
@@ -2787,7 +2841,18 @@ static void qwen_metrics_request_done(const batch_job_t *j) {
         QM_ADD(queue_ms_sum, (unsigned long long)(j->t_admit - j->enq_ms + 0.5));
         QM_ADD(queue_n, 1);
     }
+
+    /* How the request ENDED, which the page could not say before. A listener closing the tab
+       mid-stream is the most ordinary event a TTS server sees, and until now a wave of them
+       looked like nothing at all: the queue stayed shallow, nothing was refused, throughput
+       simply sagged. */
+    if (j->timed_out)        QM_ADD(term_timeout, 1);
+    else if (j->client_gone) QM_ADD(term_client_gone, 1);
+    else                     QM_ADD(term_ok, 1);
 }
+
+/* The reject path does not go through the timing hook, so it is counted on its own. */
+static void qwen_metrics_request_rejected(void) { QM_ADD(term_rejected, 1); }
 
 static void qwen_life_emit(batch_job_t *j) {
     qwen_metrics_request_done(j);
@@ -2865,6 +2930,7 @@ static void sink_on_reject(void *ud, void *tag, const char *reason) {
     if (!async_output) srv_conn_close(j->fd);
     job_free(j);
     sc->done++;
+    qwen_metrics_request_rejected();
     atomic_fetch_add(&g_srv.done, 1);
     atomic_fetch_sub(&g_srv.running, 1);
 }
@@ -3578,7 +3644,8 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             qwen_topology_emit(w, threads_per, cpulist, "prefork");
             if (admit_util)
                 qwen_admission_health_bind(admit_health, w);
-            qwen_metrics_slot_bind(w);
+                    qwen_metrics_slot_bind(w);
+            g_srv_worker_id = w;
             const int child_batch = admit_util ? cap + 1 : max_batch;
             int rc = (child_batch >= 2) ? qwen_tts_serve_batched(ctx, port, child_batch)
                                       : qwen_tts_serve_ex(ctx, port, 1);

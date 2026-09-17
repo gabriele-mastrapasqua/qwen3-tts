@@ -120,6 +120,8 @@ if start_server "--batch-size 4 --int8 --metrics-port $MPORT"; then
     ttfa_n=$(val qwen_tts_worker_ttfa_seconds_count)
     gaps=$(val qwen_tts_worker_stream_gaps_total)
     qn=$(val qwen_tts_worker_queue_seconds_count)
+    tok=$(val qwen_tts_worker_terminated_ok_total)
+    t250=$(val qwen_tts_worker_ttfa_over_250ms_total)
     behind=$(val qwen_tts_worker_stream_gap_behind_realtime_total)
 
     awk -v a="${audio:-0}" 'BEGIN{exit !(a+0 > 0)}' \
@@ -131,6 +133,11 @@ if start_server "--batch-size 4 --int8 --metrics-port $MPORT"; then
                            || bad "chunk gaps are measured" "got '${gaps:-absent}'"
     [ "${qn:-0}" -ge 1 ] && ok "admission wait is counted ($qn request)" \
                          || bad "admission wait is counted" "count is '${qn:-absent}'"
+    [ "${tok:-0}" -ge 1 ] && ok "request outcome is classified ($tok delivered)" \
+                          || bad "request outcome is classified" "terminated_ok is '${tok:-absent}'"
+    { [ -n "${t250:-}" ] && [ -n "${ttfa_n:-}" ] && [ "$t250" -le "$ttfa_n" ]; } \
+        && ok "tail thresholds are a subset of requests ($t250/$ttfa_n past 250ms)" \
+        || bad "tail thresholds are a subset of requests" "$t250 of $ttfa_n"
     # int8 on a dev box streams at or better than realtime, so the buffer should not be
     # draining across most chunks. This is what separates the proxy from a raw ms threshold.
     { [ -n "${behind:-}" ] && [ -n "${gaps:-}" ] && [ "$behind" -le "$gaps" ]; } \

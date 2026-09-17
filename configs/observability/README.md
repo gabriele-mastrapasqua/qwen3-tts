@@ -10,6 +10,7 @@ What it contains:
 |---|---|
 | `prometheus.yml` | a scrape config pointing at `--metrics-port` |
 | `grafana-dashboard.json` | six panels built on the per-worker series |
+| `alerts.yml` | Prometheus rules for the conditions worth waking somebody for |
 | `../../tools/observability_up.sh` | downloads and starts both, provisioned, on loopback |
 
 ## Fastest path
@@ -45,6 +46,14 @@ The panels exist to make one class of failure visible, and it is the one a summe
   it stays there.
 - **Rejects per second by reason** — and mind the scope: in `--prefork` these are the parent's
   refusals only. A rejection inside a worker's own queue is invisible from the parent.
+
+## Alerts
+
+`alerts.yml` follows two rules. Every alert fires on something a **listener** would notice, or
+would shortly notice — queue depth and CPU are how you explain an alert, not what you wake up
+for. And every threshold is an **exact count, never an estimated quantile**: over a short window
+a p99 rests on a couple of requests, so an alert on one is an alert on noise. The server
+publishes exact counts past each budget line so the rules never have to guess.
 
 ## What you must not read off these charts
 

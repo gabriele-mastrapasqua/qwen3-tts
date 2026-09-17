@@ -87,7 +87,11 @@ failure a summed view hides, and the one the soak campaigns kept finding.
 | `qwen_tts_worker_audio_seconds_total{worker}` | counter | **seconds of audio produced** — `rate()` is realtime streams sustained |
 | `qwen_tts_worker_requests_finished_total{worker}` | counter | requests finished, where the timings are taken |
 | `qwen_tts_worker_ttfa_seconds_sum{worker}` / `_count` | counter | time to first audio; `rate(sum)/rate(count)` is the windowed mean |
-| `qwen_tts_worker_ttfa_over_1s_total{worker}` | counter | requests past the 1 s `safe_play_start` line — **exact, not a bucket estimate** |
+| `qwen_tts_worker_ttfa_over_250ms_total{worker}` / `_over_500ms_` / `_over_1s_` | counter | **the shape of the tail** — exact counts past each line, per worker |
+| `qwen_tts_worker_terminated_ok_total{worker}` | counter | ran to completion and was delivered |
+| `qwen_tts_worker_terminated_client_gone_total{worker}` | counter | **client disconnected mid-stream** |
+| `qwen_tts_worker_terminated_timeout_total{worker}` | counter | stopped by the per-request budget |
+| `qwen_tts_worker_terminated_rejected_total{worker}` | counter | refused after admission |
 | `qwen_tts_worker_ttfb_seconds_sum{worker}` / `_count` | counter | time to first byte |
 | `qwen_tts_worker_queue_seconds_sum{worker}` / `_count` | counter | **admission wait** — enqueue to the scheduler taking it |
 | `qwen_tts_worker_stream_gaps_total{worker}` | counter | chunk-to-chunk gaps measured |
@@ -100,6 +104,29 @@ A request is not a unit of work here: one is two seconds of speech, the next is 
 `rate(qwen_tts_worker_audio_seconds_total[1m])` is how many **realtime listeners** the box is
 carrying, and it is the number that means something for a TTS server. Requests per second is
 kept because a worker whose request rate goes flat is wedged, which is a different question.
+
+### Why three thresholds instead of a percentile
+
+A percentile is estimated from the samples in its tail, and there are `N x (1-q)` of those. At
+C16 this server does roughly 1.8 requests/second, so a two-minute run is ~215 requests and a
+**p99 is the second-worst request** — the count above it is `Binomial(N, 0.01)`, mean 2.15,
+standard deviation 1.5. It can legitimately move 50% between identical runs. That is not a
+number a comparison can rest on, and `tests/load_test.py` now prints a bootstrap confidence
+interval and the supporting sample count beside every percentile, marking any that rests on
+fewer than ten samples.
+
+Exact threshold counts do not have this problem: with 215 requests, *"zero crossed 1 s"* is
+precise, while *"p99 = 253 ms"* is not. Three lines — 250 ms, 500 ms, 1 s — give the shape of
+the tail per worker at any sample size, with no histogram buckets. When a percentile really is
+the question, the arithmetic is simple: ~9 minutes per arm for a thousand requests, ~18 for two
+thousand.
+
+### Why counting how requests end matters
+
+A listener closing the tab mid-stream is the most ordinary event a TTS server sees, and before
+these counters it was invisible on every series here: the queue stays shallow, nothing is
+refused, throughput simply sags. `terminated_client_gone` makes a step change in abandonment
+something you can see and alert on, and separates "people are leaving" from "we are failing".
 
 ### Why admission wait is separate from TTFA
 
@@ -179,6 +206,12 @@ Samples the page while load runs elsewhere and checks the three properties a scr
 survive being wrong: **monotonic** (no counter went backwards — Prometheus reads a decrease as a
 restart and silently drops the interval), **conserved** (`completed <= dispatched`, always), and
 **balanced** (every live worker received something).
+
+`configs/observability/alerts.yml` ships Prometheus rules for the conditions worth waking
+somebody for. Every one of them fires on something a **listener** would notice — first audio
+past the budget, chunks arriving with the buffer draining, refusals, a lost worker, a step
+change in abandonment — and every threshold is an **exact count, never an estimated quantile**,
+for the reason above.
 
 `tests/serve_metrics.sh` is the regression gate: it proves the flag is refused outside server
 mode and on the service port, that a plain server omits counters it does not maintain, that a

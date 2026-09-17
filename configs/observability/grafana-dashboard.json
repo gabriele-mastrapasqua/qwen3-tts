@@ -140,7 +140,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 17
+        "y": 25
       },
       "fieldConfig": {
         "defaults": {
@@ -168,7 +168,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 17
+        "y": 25
       },
       "fieldConfig": {
         "defaults": {
@@ -189,13 +189,87 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "How requests end",
+      "description": "A listener closing the tab mid-stream is ordinary and informative, and it is invisible everywhere else on this board: the queue stays shallow, nothing is refused, throughput just sags. A step change here is the signal.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "softMax": 1,
+          "custom": {
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_ok_total[5m]))",
+          "legendFormat": "delivered"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_client_gone_total[5m]))",
+          "legendFormat": "client gone"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_timeout_total[5m]))",
+          "legendFormat": "timed out"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_terminated_rejected_total[5m]))",
+          "legendFormat": "rejected"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "First-audio tail shape, per worker",
+      "description": "Exact counts past 250ms / 500ms / 1s rather than a percentile. Over a short window a p99 rests on two requests; these are precise at any sample size, and per worker they answer which worker owns the tail.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "softMax": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(qwen_tts_worker_ttfa_over_250ms_total[5m])) by (worker)",
+          "legendFormat": "w{{worker}} >250ms"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_ttfa_over_500ms_total[5m])) by (worker)",
+          "legendFormat": "w{{worker}} >500ms"
+        },
+        {
+          "expr": "sum(rate(qwen_tts_worker_ttfa_over_1s_total[5m])) by (worker)",
+          "legendFormat": "w{{worker}} >1s"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Server health",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 33
       },
       "collapsed": false,
       "panels": [],
@@ -211,7 +285,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "fieldConfig": {
         "defaults": {
@@ -237,7 +311,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 26
+        "y": 34
       },
       "fieldConfig": {
         "defaults": {
@@ -263,7 +337,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "fieldConfig": {
         "defaults": {
@@ -311,7 +385,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 34
+        "y": 42
       },
       "fieldConfig": {
         "defaults": {
@@ -342,7 +416,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 50
       },
       "collapsed": false,
       "panels": [],
@@ -358,7 +432,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 43
+        "y": 51
       },
       "fieldConfig": {
         "defaults": {},
@@ -378,7 +452,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 43
+        "y": 51
       },
       "fieldConfig": {
         "defaults": {},
@@ -398,7 +472,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 43
+        "y": 51
       },
       "fieldConfig": {
         "defaults": {},
@@ -418,7 +492,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 43
+        "y": 51
       },
       "targets": [
         {
