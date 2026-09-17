@@ -240,15 +240,20 @@ From 30-minute closed-loop soaks with strict KPI checking, stratified over a fiv
 | 32-core Graviton4 | 1.7B | **C10** | STREAM p95 0.831, TTFA p95 207 ms, safe-start p95 364 ms, stall@250/@500 **0%** |
 | 32-core Axion | both | **C16** | STREAM p95 0.789 / 0.845, zero errors, zero 250/500 ms stalls |
 | 32-core EPYC Zen5 | 1.7B | **C11** | per-class STREAM p95 0.816–0.848, safe-start p95 ~467 ms, stall@250 = stall@500 = 0% |
-| 16-core Axion | 1.7B | **C4** | at C6 the realtime factor is ~1.1: first audio still good, sustained realtime not |
-| 8-core Xeon AMX | 1.7B | **C1** | the only configuration on that host faster than realtime, and only with all eight cores on one request |
 
 Those points assume a client prebuffer of at least 250 ms — at these densities `stall@100` is
 22–23%, and saying so is part of the claim rather than a footnote to it.
 
-The 8-core row is there deliberately. This is a memory-bandwidth problem: eight cores of Xeon with
-AMX serve one realtime stream, and thirty-two Arm cores serve sixteen. Matrix units buy first
-audio; **bandwidth buys concurrency**.
+**Every row is a 32-core host, and that is not a marketing choice — it is the honest extent of the
+evidence.** Smaller hosts were qualified earlier, on the architecture that preceded this one, and
+those numbers are not comparable: different scheduler, different decoder path, different arrival
+model (three-wave TTFA sweeps rather than 30-minute closed-loop soaks). They are kept in the
+repository, labelled as what they are, and they do not appear in this table. Requalifying a 16- and
+an 8-core host on v2 is work that has not been done.
+
+What the 32-core rows do say is that this is a **memory-bandwidth** problem rather than a core-count
+one. The two Arm hosts and the Zen5 have comparable core counts and land at different concurrencies,
+and the ordering follows their bandwidth. Matrix units buy first audio; bandwidth buys concurrency.
 
 ## 7. The last lesson, which is about ladders
 

@@ -103,6 +103,17 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       audio-s/wall-s, completed/rejects/timeouts) — the schema could previously record only TTFA,
       `stream_rtf_p50` and throughput, i.e. everything except the metrics that decide acceptance.
       20/20 profiles valid, `tests/test_perf_profile.py` green.
+- [x] DOCS-6 **Capacity claims split by ERA, not only by status** (2026-09-17). The serving docs,
+      the blog post and the v0.22.0 release description listed the 16-core Axion (C4) and the
+      8-core Xeon AMX (C1) beside the 32-core points as "what it holds today, from those soaks".
+      Both were wrong twice over: those hosts were qualified **before** the v2 serving work
+      (2026-09-07 to 09-15, x86-8c-amx at commit `266f706`, 2026-09-01) and their numbers come from
+      three-wave TTFA sweeps, not 30-minute closed-loop soaks — so they were neither current nor
+      the same kind of evidence. The v2-qualified set is exactly the four 32-core hosts. Removed
+      from every capacity claim; kept in `docs/serving/boxes.md` under an explicit
+      "Measured before v2 — history, not current capacity" heading, because the topology and flag
+      lessons they taught still hold while the concurrency they reached does not. Residue: the
+      `v0.22.0` tag annotation still carries the old sentence; the release description is corrected.
 - [x] DOCS-5 **Blog: `blog/cpu-streaming-server-that-never-stalls.md`** — the v2 CPU serving design
       as a narrative, for dev.to: the envelope, the admission decomposition, the decode quantum,
       the falsified utilization-aware admission, the bimodal configuration measurement, `doctor`,

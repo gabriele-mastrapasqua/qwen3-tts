@@ -170,6 +170,13 @@ before paying for a wave or soak. The verdict concerns the tested 4×8 shape,
 not the whole instance. Details and interpretation are in
 [Arm topology preflight](../arm-topology-preflight.md).
 
+> ⚠️ The 16-core Axion and 8-core AMX numbers in this document were measured **before the v2
+> serving work** (decoder lane split, direct dilated residual convs, admission and cohort
+> policy; 2026-09-07 to 09-15) and mostly with three-wave TTFA sweeps rather than closed-loop
+> soaks. They are kept because the *procedure* and the *shape of the trade* are what this
+> document is teaching, and those still hold. **Do not quote their concurrencies as current
+> capacity** — the v2-qualified points are the 32-core hosts in [`boxes.md`](boxes.md).
+
 `bench-topo` starts one server per topology, fires true simultaneous waves at each concurrency
 and prints one row per cell. Measured on the 16-core Axion reference host, 1.7B open weights at
 int8, profile `axion-16c-ttfa`, short bank, three waves:

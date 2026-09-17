@@ -26,7 +26,7 @@ docs/serving/
 | evidence behind the numbers | 30-minute strict-KPI closed-loop soaks | 2–3 minute screens on two cards |
 | configuration gate | `configs/perf/*.json` — a profile that refuses to be optional | none exists for GPU |
 | sized by | cores, cache, memory channels | GPU memory bandwidth |
-| what it holds | 0.6B C12–C16, 1.7B C10–C16 on 32 cores; C4 on 16; C1–C2 on 8 | C11 on an RTX PRO 6000 Blackwell screen |
+| what it holds | 0.6B C12–C16 and 1.7B C10–C16 on 32 cores (30-minute soaks); 1.7B C11 on 32-core Zen5 | C11 on an RTX PRO 6000 Blackwell screen |
 | deploy it today? | yes | only if you are prepared to qualify it yourself |
 
 If you are unsure, the answer is the CPU server. The GPU one is genuinely fast and genuinely

@@ -14,7 +14,7 @@ process so it performs**, which is a different question and the one that goes wr
 | | |
 |---|---|
 | **status** | production; qualified on named hosts, see [`boxes.md`](boxes.md) |
-| **what it holds** | 0.6B **C12–C16** and 1.7B **C10–C16** on a 32-core Arm host; 1.7B **C11–C12** on a 32-core Zen5; **C4** on a 16-core Arm; **C1–C2** on 8 cores — measured per box, never extrapolated |
+| **what it holds** | 0.6B **C12–C16** and 1.7B **C10–C16** on a 32-core Arm host; 1.7B **C11** on a 32-core Zen5 — measured per box on the v2 architecture, never extrapolated. Smaller hosts have **no current v2 capacity number**: see [`boxes.md`](boxes.md) |
 | **the one hard rule** | the flags are not decoration. A server started without them does not error. It is simply slower, and nothing in the output says so |
 
 ---
