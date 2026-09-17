@@ -127,6 +127,33 @@ The same run showed something a coarser instrument would have hidden: the flag *
 median and widens the tail** — p50 worsens by ~6 ms with it off while p95 improves by ~17 ms,
 and both instruments agree on both signs.
 
+A second point, on a different axis, turned the decoder lane split down (`QWEN_SD_LANE_SPLIT`
+4 → 1). It is **saturated**: a 3.5× regression that both instruments separate with enormous
+margin, so it says nothing about their relative sensitivity. It is kept because it validates
+three other things.
+
+The **stop condition became the signal**. The healthy arm stopped on its sample target, 1515
+requests in 465 s; the damaged arm stopped on the ten-minute cap having completed 652. A
+throughput collapse declared before any percentile was computed.
+
+The **server's own series behaved as designed**, in exact counts rather than estimates:
+
+| | healthy | lane split off |
+|---|---|---|
+| audio seconds produced | 10,159 | 4,361 (−57%) |
+| first audio past 250 ms | 18 | 515 (79% of requests) |
+| first audio past 500 ms | 0 | 297 |
+| chunks behind realtime | **4.91%** | **99.26%** |
+
+And it **corrected a prediction**. A decoder defect was expected to spare time-to-first-audio,
+since the decoder runs after the first chunk. It multiplied TTFA p50 by 4.5×: at C16 the queue
+backs up and the delay propagates all the way to admission, so at that concurrency the decoder
+*is* on the critical path.
+
+What the calibration still lacks is the middle — an effect around 15–30%, where the two-minute
+run is marginal rather than blind or overwhelmed. The natural next probe is the same knob at
+half the dose (`QWEN_SD_LANE_SPLIT` 4 → 2), since the axis is now understood.
+
 ## Stratify by class, not by list position
 
 A related trap, found while calibrating. The harness used to cycle the bank with
