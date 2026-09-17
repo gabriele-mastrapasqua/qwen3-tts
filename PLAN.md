@@ -284,6 +284,30 @@ child-side, needs the shared segment, and happens only if tier 1 proves insuffic
       the Prometheus 5 s scrape stayed `up` throughout. Scope stated in the docs: QoS against
       accident, not DDoS protection — a flood is a firewall's problem and the port is
       loopback-bound by default.
+- [x] OTEL-10 **Tier 2 shipped: the measurements only a worker can see** (2026-09-17). One
+      `MAP_SHARED` page, one slot per worker, single writer, read by the parent at scrape time.
+      Adds audio seconds produced, TTFA and TTFB as `_sum`/`_count`, an exact
+      `ttfa_over_1s_total` for the `safe_play_start` line, and a behind-realtime chunk-gap proxy.
+      Hooked into `qwen_life_emit()` and `sink_on_chunk()`, which already ran once per request
+      and once per chunk with every timing in hand, so nothing new is computed: with metrics off
+      it is one never-taken branch, with them on a few relaxed atomic adds per request.
+      **Two defects found while building it, both by measuring rather than reading.** The gap
+      counter first used a 250 ms threshold and fired on 15 of 17 chunks of a *healthy* stream —
+      a chunk carrying 500 ms of audio arriving 400 ms later is filling the buffer, not draining
+      it. Re-defined as gap-versus-audio-delivered and validated by discrimination: same text,
+      same box, bf16 (RTF~1.3) 13/13 behind realtime, `--int8` (RTF~0.85) **0/12**. And the new
+      series overflowed the page buffer, which truncated mid-sample while `Content-Length` agreed
+      with the truncation — a corrupt page that parses. Buffer resized and the renderer now grows
+      and re-renders; the test asserts the last line is a whole sample.
+      **Cost: still below the noise floor.** Same three-arm C16 soak: the two identical OFF arms
+      differ 23.5% on TTFA p99 (265.0 vs 202.6) while every on-vs-off delta is at most 7.5% and
+      mostly under 1%. Live at C16 on the Axion: 14.0 realtime streams sustained, zero requests
+      past the 1 s line, and ~2.9% of chunks arriving behind realtime — which is the kind of
+      thing the proxy exists to make visible.
+      Dashboard reorganised around the listener (realtime streams, TTFA mean against the 1 s
+      line, TTFA past 1 s, behind-realtime fraction) with server health below; `Build` panel
+      fixed to show labels, and a `up{job}` panel added so a gap in the graphs can be told apart
+      from a server that was down.
 - [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** Note it is within the shipped default
       limit (1/s against 5/s), so this is a cost question, not a behaviour one. Everything above was at 5 s. 1 s is
       5x the scrapes and should still be invisible, but it is a claim, not a measurement.

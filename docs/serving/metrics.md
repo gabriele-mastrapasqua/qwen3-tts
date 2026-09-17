@@ -35,9 +35,13 @@ measurement by construction:
 | KPI | on this page? | why |
 |---|---|---|
 | in-flight, queued, dispatched, completed, rejects | **yes** | server-side state, already maintained |
+| audio seconds produced, TTFA, TTFB | **yes** | measured in the worker, from instants the request already carries |
+| chunks arriving behind realtime | **yes, as a named proxy** | the server sees its own writes, not the listener's buffer |
 | `required_prebuffer`, `safe_play_start`, `stall_rate@N` | **no** | a stall is an event in a *player*; the server does not hold the playback clock |
 
-A server-side "stall rate" would be an invented number. It is not exported, deliberately.
+A server-side "stall rate" would be an invented number. It is not exported, deliberately. The
+nearest honest thing is the behind-realtime gap count, and it is named so it cannot be mistaken
+for one.
 
 ## Reading it with standard tools
 
@@ -80,6 +84,30 @@ failure a summed view hides, and the one the soak campaigns kept finding.
 | `qwen_tts_elastic_replans_total` | counter | *`--prefork-elastic` only* — re-slicings |
 | `qwen_tts_rejected_total{reason}` | counter | refusals, by reason |
 | `qwen_tts_metrics_throttled_total` | counter | scrapes this endpoint refused with `429` |
+| `qwen_tts_worker_audio_seconds_total{worker}` | counter | **seconds of audio produced** — `rate()` is realtime streams sustained |
+| `qwen_tts_worker_requests_finished_total{worker}` | counter | requests finished, where the timings are taken |
+| `qwen_tts_worker_ttfa_seconds_sum{worker}` / `_count` | counter | time to first audio; `rate(sum)/rate(count)` is the windowed mean |
+| `qwen_tts_worker_ttfa_over_1s_total{worker}` | counter | requests past the 1 s `safe_play_start` line — **exact, not a bucket estimate** |
+| `qwen_tts_worker_ttfb_seconds_sum{worker}` / `_count` | counter | time to first byte |
+| `qwen_tts_worker_stream_gaps_total{worker}` | counter | chunk-to-chunk gaps measured |
+| `qwen_tts_worker_stream_gap_behind_realtime_total{worker}` | counter | gaps where wall time exceeded the audio delivered |
+| `qwen_tts_worker_stream_gap_over_1s_total{worker}` | counter | gaps over 1 s outright |
+
+### Why audio seconds and not requests per second
+
+A request is not a unit of work here: one is two seconds of speech, the next is sixty.
+`rate(qwen_tts_worker_audio_seconds_total[1m])` is how many **realtime listeners** the box is
+carrying, and it is the number that means something for a TTS server. Requests per second is
+kept because a worker whose request rate goes flat is wedged, which is a different question.
+
+### Why "behind realtime" and not a millisecond threshold
+
+The first version of this counted chunk gaps longer than 250 ms, and on a healthy stream it
+fired on almost every chunk — because a chunk carrying 500 ms of audio that arrives 400 ms after
+the previous one is **filling** the listener's buffer, not draining it. The gap only matters
+against the audio delivered in it. Measured on an M1 with the same text and chunking: bf16
+(RTF ≈ 1.3) reported 13 behind-realtime gaps out of 13, `--int8` (RTF ≈ 0.85) reported **0 out
+of 12**. The metric discriminates the thing it claims to.
 | `qwen_tts_timed_out_total{worker}` | counter | *single process only* — over the request budget |
 
 Useful queries:

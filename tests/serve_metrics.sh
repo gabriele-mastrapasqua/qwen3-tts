@@ -108,6 +108,42 @@ else
     bad "default server starts" "no /v1/health within 90s"
 fi
 
+# 3b. the per-worker measurements the parent cannot see: audio seconds, TTFA, gap proxy
+cleanup; sleep 1
+if start_server "--batch-size 4 --int8 --metrics-port $MPORT"; then
+    timeout 180 curl -s -o /dev/null -X POST "http://127.0.0.1:$PORT/v1/tts/stream" \
+        -H 'Content-Type: application/json' \
+        -d '{"text":"A streamed request long enough to produce several audio chunks in a row.","speaker":"ryan","seed":42,"temperature":0}'
+    page=$(scrape)
+    val() { printf '%s\n' "$page" | awk -F' ' -v k="$1" '$1 == k"{worker=\"0\"}" {print $2}'; }
+    audio=$(val qwen_tts_worker_audio_seconds_total)
+    ttfa_n=$(val qwen_tts_worker_ttfa_seconds_count)
+    gaps=$(val qwen_tts_worker_stream_gaps_total)
+    behind=$(val qwen_tts_worker_stream_gap_behind_realtime_total)
+
+    awk -v a="${audio:-0}" 'BEGIN{exit !(a+0 > 0)}' \
+        && ok "audio seconds are reported ($audio s)" \
+        || bad "audio seconds are reported" "got '${audio:-absent}'"
+    [ "${ttfa_n:-0}" -ge 1 ] && ok "TTFA is counted ($ttfa_n request)" \
+                             || bad "TTFA is counted" "count is '${ttfa_n:-absent}'"
+    [ "${gaps:-0}" -ge 1 ] && ok "chunk gaps are measured ($gaps)" \
+                           || bad "chunk gaps are measured" "got '${gaps:-absent}'"
+    # int8 on a dev box streams at or better than realtime, so the buffer should not be
+    # draining across most chunks. This is what separates the proxy from a raw ms threshold.
+    { [ -n "${behind:-}" ] && [ -n "${gaps:-}" ] && [ "$behind" -le "$gaps" ]; } \
+        && ok "behind-realtime gaps are a subset of gaps ($behind/$gaps)" \
+        || bad "behind-realtime gaps are a subset of gaps" "$behind of $gaps"
+    # and the page must never be truncated: the last line has to be a whole sample
+    last=$(printf '%s\n' "$page" | tail -1)
+    case "$last" in
+        *\ [0-9]*) ok "the page ends on a complete sample" ;;
+        *) bad "the page ends on a complete sample" "last line was '$last'" ;;
+    esac
+else
+    bad "measurement server starts" "no /v1/health within 90s"
+fi
+cleanup; sleep 1
+
 # 4b. rate limit: spam is refused, cheaply, and says so
 cleanup; sleep 1
 status() { timeout 3 curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$MPORT/metrics" 2>/dev/null; }

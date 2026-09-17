@@ -7,7 +7,12 @@
 #include "qwen_tts_server.h"
 #if defined(__linux__)
 #include <sys/prctl.h>
+#endif
+/* POSIX, and needed on every platform now: the per-worker metrics slots are a shared mapping
+   even in a single process, so the same code serves both. prctl above stays Linux-only. */
 #include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
 #endif
 #include "qwen_tts_costmap.h"
 #include "qwen_tts_kernels.h"
@@ -75,6 +80,63 @@ static void stream_output_release(stream_output_t *out);
 static int stream_output_failed(stream_output_t *out);
 
 static pthread_mutex_t g_synth_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Per-worker measurements that only the worker can see.
+ *
+ * The gauges and dispatch counters come from the prefork parent, which knows them already.
+ * These do not: how long a request waited for its first audio, how many seconds of audio came
+ * out, how choppy the writes were.  Those live in the child, so they need one shared page --
+ * one slot per worker, single writer, read by the parent when somebody scrapes.
+ *
+ * Integer milliseconds, not doubles: there is no atomic double, and a millisecond is finer
+ * than any decision made from these numbers.
+ *
+ * Cost when metrics are off: `g_metrics_mine` stays NULL and every update is one
+ * never-taken, perfectly-predicted branch.  Cost when on: a handful of relaxed atomic adds
+ * per REQUEST -- no locks, no contention, since no two processes ever write the same slot. */
+typedef struct {
+    _Atomic unsigned long long requests;
+    _Atomic unsigned long long audio_ms;
+    _Atomic unsigned long long ttfa_ms_sum;
+    _Atomic unsigned long long ttfa_n;
+    _Atomic unsigned long long ttfa_over_1s;
+    _Atomic unsigned long long ttfb_ms_sum;
+    _Atomic unsigned long long ttfb_n;
+    _Atomic unsigned long long gaps;
+    _Atomic unsigned long long gap_behind;      /* wall gap exceeded the audio delivered */
+    _Atomic unsigned long long gap_over_1s;
+} qwen_metrics_slot_t;
+
+static qwen_metrics_slot_t *g_metrics_slots = NULL;   /* MAP_SHARED, [0..workers) */
+static int                  g_metrics_slot_n = 0;
+static qwen_metrics_slot_t *g_metrics_mine = NULL;    /* this process's slot, or NULL */
+
+#define QM_ADD(field, v) do { \
+        if (g_metrics_mine) \
+            atomic_fetch_add_explicit(&g_metrics_mine->field, \
+                                      (unsigned long long)(v), memory_order_relaxed); \
+    } while (0)
+
+static int qwen_metrics_shared_alloc(int workers) {
+    if (workers < 1) workers = 1;
+    size_t bytes = (size_t)workers * sizeof(qwen_metrics_slot_t);
+    void *m = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) {
+        fprintf(stderr, "[serve] metrics: per-worker measurements DISABLED (mmap failed)\n");
+        return -1;
+    }
+    memset(m, 0, bytes);
+    g_metrics_slots = (qwen_metrics_slot_t *)m;
+    g_metrics_slot_n = workers;
+    return 0;
+}
+
+/* Called in the child, right after fork, before it serves anything. */
+static void qwen_metrics_slot_bind(int worker) {
+    if (g_metrics_slots && worker >= 0 && worker < g_metrics_slot_n)
+        g_metrics_mine = &g_metrics_slots[worker];
+}
+
 
 static int g_serialize_synth = 0;
 
@@ -305,6 +367,7 @@ struct stream_output {
     double enqueue_first_ms;
     double write_attempt_ms;
     double write_complete_ms;
+    double last_write_ms;       /* previous chunk's completion, for the write-gap proxy */
     _Atomic int refs;       /* producer + detached writer */
 };
 
@@ -414,6 +477,22 @@ static void *stream_output_writer_main(void *arg) {
             out->total_samples += chunk->n_samples;
             if (out->write_complete_ms == 0.0)
                 out->write_complete_ms = stream_output_now_ms();
+            /* The gap between one chunk reaching the socket and the next. It is NOT a stall:
+               a stall happens in a player, against a buffer this process cannot see. It is the
+               server-side shadow of one, and it is named so nobody quotes it as the real thing.
+               Guarded on g_metrics_mine so a server without --metrics-port does not even read
+               the clock here. */
+            if (g_metrics_mine) {
+                double nowms = stream_output_now_ms();
+                if (out->last_write_ms > 0.0) {
+                    const double gap = nowms - out->last_write_ms;
+                    const double audio_ms = (double)chunk->n_samples / 24.0;
+                    QM_ADD(gaps, 1);
+                    if (gap > audio_ms)  QM_ADD(gap_behind, 1);
+                    if (gap > 1000.0)    QM_ADD(gap_over_1s, 1);
+                }
+                out->last_write_ms = nowms;
+            }
             pthread_mutex_unlock(&out->mtx);
             free(chunk->pcm); free(chunk);
         }
@@ -1590,6 +1669,7 @@ static const char *g_metrics_bind = "127.0.0.1";
  * DDoS protection.  A hostile flood is a firewall's problem, and the port is loopback-bound by
  * default precisely so that it is not reachable to flood. */
 static double srv_now_ms(void);             /* defined with the request-timing helpers below */
+
 static double g_metrics_rate = 5.0;         /* served scrapes per second; 0 disables the limit */
 static double g_metrics_tokens = 0.0;
 static double g_metrics_bucket_ms = 0.0;
@@ -1729,6 +1809,67 @@ static size_t qwen_metrics_render(char *b, size_t cap) {
     else
         QM_P("qwen_tts_worker_completed_total{worker=\"0\"} %d\n", atomic_load(&g_srv.done));
 
+    /* Per-worker measurements the parent cannot see: these come from the shared slots the
+       workers write. Absent entirely when the segment could not be allocated, rather than
+       published as zeros. */
+    if (g_metrics_slots) {
+        const int nw = prefork ? g_metrics.workers : 1;
+        const struct { const char *name, *type, *help; } defs[] = {
+            {"qwen_tts_worker_audio_seconds_total", "counter",
+             "Seconds of audio this worker produced. rate() of this is the realtime streams it "
+             "is sustaining, which is the throughput unit that means something for TTS: a "
+             "request is not a unit of work when one is two seconds and the next is sixty."},
+            {"qwen_tts_worker_requests_finished_total", "counter",
+             "Requests this worker finished, counted where the timings are taken."},
+            {"qwen_tts_worker_ttfa_seconds_sum", "counter",
+             "Sum of time-to-first-audio. With _count, rate(sum)/rate(count) is the mean over "
+             "any window. This is an operations signal; acceptance percentiles come from the "
+             "client-side harnesses."},
+            {"qwen_tts_worker_ttfa_seconds_count", "counter", "Requests contributing to the TTFA sum."},
+            {"qwen_tts_worker_ttfa_over_1s_total", "counter",
+             "Requests whose first audio took longer than 1 second. Exact, not a bucket "
+             "estimate: 1 s is the safe_play_start line, so the useful question is how many "
+             "crossed it."},
+            {"qwen_tts_worker_ttfb_seconds_sum", "counter", "Sum of time-to-first-byte."},
+            {"qwen_tts_worker_ttfb_seconds_count", "counter", "Requests contributing to the TTFB sum."},
+            {"qwen_tts_worker_stream_gaps_total", "counter",
+             "Gaps measured between consecutive streamed chunks reaching the socket."},
+            {"qwen_tts_worker_stream_gap_behind_realtime_total", "counter",
+             "Chunk-to-chunk gaps where the wall time exceeded the audio delivered in the "
+             "chunk, so the listener's buffer was draining across it. A PROXY for choppiness, "
+             "not a stall rate: a stall happens in a player, against a buffer this server "
+             "cannot see. A raw millisecond threshold would flag healthy streams, since a chunk "
+             "carrying more audio than the gap is filling the buffer, not draining it."},
+            {"qwen_tts_worker_stream_gap_over_1s_total", "counter",
+             "Chunk-to-chunk write gaps longer than 1 s. Same proxy, same caveat."},
+        };
+        for (size_t k = 0; k < sizeof defs / sizeof defs[0]; k++) {
+            QM_P("# HELP %s %s\n# TYPE %s %s\n", defs[k].name, defs[k].help,
+                 defs[k].name, defs[k].type);
+            for (int w = 0; w < nw && w < g_metrics_slot_n; w++) {
+                const qwen_metrics_slot_t *sl = &g_metrics_slots[w];
+                unsigned long long v = 0;
+                double as_seconds = 0.0;
+                switch (k) {
+                    case 0: as_seconds = atomic_load_explicit(&sl->audio_ms, memory_order_relaxed) / 1000.0; break;
+                    case 1: v = atomic_load_explicit(&sl->requests, memory_order_relaxed); break;
+                    case 2: as_seconds = atomic_load_explicit(&sl->ttfa_ms_sum, memory_order_relaxed) / 1000.0; break;
+                    case 3: v = atomic_load_explicit(&sl->ttfa_n, memory_order_relaxed); break;
+                    case 4: v = atomic_load_explicit(&sl->ttfa_over_1s, memory_order_relaxed); break;
+                    case 5: as_seconds = atomic_load_explicit(&sl->ttfb_ms_sum, memory_order_relaxed) / 1000.0; break;
+                    case 6: v = atomic_load_explicit(&sl->ttfb_n, memory_order_relaxed); break;
+                    case 7: v = atomic_load_explicit(&sl->gaps, memory_order_relaxed); break;
+                    case 8: v = atomic_load_explicit(&sl->gap_behind, memory_order_relaxed); break;
+                    default: v = atomic_load_explicit(&sl->gap_over_1s, memory_order_relaxed); break;
+                }
+                if (k == 0 || k == 2 || k == 5)
+                    QM_P("%s{worker=\"%d\"} %.3f\n", defs[k].name, w, as_seconds);
+                else
+                    QM_P("%s{worker=\"%d\"} %llu\n", defs[k].name, w, v);
+            }
+        }
+    }
+
     if (prefork) {
         /* What the PARENT refused, which is not the whole story and must not be read as
            such: a worker's own queue rejections and timeouts happen inside that worker and
@@ -1817,6 +1958,16 @@ static void qwen_metrics_answer(int cfd) {
     }
 
     size_t n = qwen_metrics_render(g_metrics.page, g_metrics.page_cap);
+    /* A full buffer means the page was cut, possibly mid-sample. Grow once and render again
+       rather than serve something that parses as valid and is not. */
+    for (int grow = 0; n >= g_metrics.page_cap && grow < 4; grow++) {
+        size_t bigger = g_metrics.page_cap * 2;
+        char *p = (char *)realloc(g_metrics.page, bigger);
+        if (!p) break;
+        g_metrics.page = p;
+        g_metrics.page_cap = bigger;
+        n = qwen_metrics_render(g_metrics.page, g_metrics.page_cap);
+    }
     char head[192];
     int hn = snprintf(head, sizeof head,
                       "HTTP/1.1 200 OK\r\n"
@@ -1840,8 +1991,12 @@ static const char *qwen_metrics_rate_note(void) {
     return note;
 }
 
+/* Sized for the HELP text, which is most of the page, plus room per worker. Undersizing this
+   is not a cosmetic bug: the renderer truncates, Content-Length agrees with the truncation, and
+   the scraper is handed a page whose last line is half a sample. The caller grows and re-renders
+   if it ever fills, so this is a starting size and not a limit. */
 static int qwen_metrics_alloc_page(int workers) {
-    size_t cap = 4096 + (size_t)(workers > 0 ? workers : 1) * 512;
+    size_t cap = 16384 + (size_t)(workers > 0 ? workers : 1) * 2048;
     g_metrics.page = (char *)malloc(cap);
     if (!g_metrics.page) return -1;
     g_metrics.page_cap = cap;
@@ -1880,6 +2035,7 @@ static void qwen_metrics_start_single(int batched) {
     }
     g_metrics.mode = QWEN_METRICS_SINGLE;
     g_metrics.single_batched = batched;
+    if (qwen_metrics_shared_alloc(1) == 0) qwen_metrics_slot_bind(0);
     pthread_t t;
     if (pthread_create(&t, NULL, qwen_metrics_thread, (void *)(intptr_t)fd) != 0) {
         g_metrics.mode = QWEN_METRICS_OFF;
@@ -2016,6 +2172,7 @@ typedef struct batch_job {
     int free_slots_before, free_slots_at_accept, parent_cap;
     double t_write_attempt;
     double t_write_complete;
+    double t_last_chunk_ms;     /* previous chunk's write, for the write-gap proxy */
     unsigned long long enq_adm_seq;
     double enq_adm_ts;
     double enq_last_iter_ms;
@@ -2481,6 +2638,23 @@ static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
     int _gone = send_pcm_chunk(j->fd, samples, n_samples);
     if (j->t_write_complete == 0.0 && !_gone) j->t_write_complete = srv_now_ms();
     if (!_gone) sink_mark_audio_ready(j, n_samples);
+    /* The default streaming path: QWEN_SERVER_ASYNC_OUTPUT is opt-in, so this -- not the
+       writer thread -- is where chunks normally reach the socket. Instrumented here as well,
+       or the gap proxy would read zero on exactly the configuration people run. */
+    if (!_gone && g_metrics_mine) {
+        double nowms = srv_now_ms();
+        if (j->t_last_chunk_ms > 0.0) {
+            /* A raw gap threshold would flag healthy streams: a chunk carrying 500 ms of audio
+               that arrives 400 ms after the previous one is FILLING the listener's buffer, not
+               draining it. What matters is the gap against the audio delivered in it. */
+            const double gap = nowms - j->t_last_chunk_ms;
+            const double audio_ms = (double)n_samples / 24.0;
+            QM_ADD(gaps, 1);
+            if (gap > audio_ms)  QM_ADD(gap_behind, 1);
+            if (gap > 1000.0)    QM_ADD(gap_over_1s, 1);
+        }
+        j->t_last_chunk_ms = nowms;
+    }
     if (_gone && !j->client_gone) {
         j->client_gone = 1; j->t_abort_detected = srv_now_ms();
     }
@@ -2573,7 +2747,34 @@ static int qwen_life_trace(void) {
     if (v < 0) v = getenv("QWEN_LIFE_TRACE") ? 1 : 0;
     return v;
 }
+/* One call per finished request, from the point that already holds every timing. */
+static void qwen_metrics_request_done(const batch_job_t *j) {
+    if (!g_metrics_mine || !j) return;
+    QM_ADD(requests, 1);
+
+    long long samples = atomic_load_explicit(&j->audio_ready_samples, memory_order_relaxed);
+    if (samples > 0) QM_ADD(audio_ms, samples / 24);          /* 24 kHz mono */
+
+    long long first_us = atomic_load_explicit(&j->first_audio_ready_us, memory_order_relaxed);
+    if (first_us > 0 && j->t_recv > 0.0) {
+        double ttfa = (double)first_us / 1000.0 - j->t_recv;
+        if (ttfa >= 0.0) {
+            QM_ADD(ttfa_ms_sum, (unsigned long long)(ttfa + 0.5));
+            QM_ADD(ttfa_n, 1);
+            /* Exact, not a quantile estimated from buckets: safe_play_start's hard line is
+               1 s, so the useful question is how many requests crossed it, not roughly where
+               the 95th percentile sits. */
+            if (ttfa > 1000.0) QM_ADD(ttfa_over_1s, 1);
+        }
+    }
+    if (j->t_first > 0.0 && j->t_recv > 0.0 && j->t_first >= j->t_recv) {
+        QM_ADD(ttfb_ms_sum, (unsigned long long)(j->t_first - j->t_recv + 0.5));
+        QM_ADD(ttfb_n, 1);
+    }
+}
+
 static void qwen_life_emit(batch_job_t *j) {
+    qwen_metrics_request_done(j);
     if (qwen_costmap_level()) {
         const double d = srv_now_ms();
         if (j->t_recv > 0.0 && d > j->t_recv)
@@ -3270,6 +3471,8 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
     if (cur) for (int w = 0; w < 2 * workers; w++) cur[w] = -1;
     if (!sp || !kids || !assigned || !completed || !active || !slice || !cur) return -1;
     if (!dispatched_tot || !completed_tot) return -1;
+    /* Before the fork loop on purpose: the children must inherit the mapping. */
+    if (g_metrics_port > 0) (void)qwen_metrics_shared_alloc(workers);
 
     {
         /* Say the host topology out loud before any measurement starts.  A benchmark that does
@@ -3359,6 +3562,7 @@ int qwen_tts_serve_prefork(qwen_tts_ctx_t *ctx, int port, int workers,
             qwen_topology_emit(w, threads_per, cpulist, "prefork");
             if (admit_util)
                 qwen_admission_health_bind(admit_health, w);
+            qwen_metrics_slot_bind(w);
             const int child_batch = admit_util ? cap + 1 : max_batch;
             int rc = (child_batch >= 2) ? qwen_tts_serve_batched(ctx, port, child_batch)
                                       : qwen_tts_serve_ex(ctx, port, 1);
