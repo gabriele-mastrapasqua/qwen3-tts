@@ -68,7 +68,8 @@ an asymptotic RTF approaching ~1.0.
 
 | Hardware | 0.6B RTF (short) | 0.6B RTF (long) | Notes |
 |----------|------------------|-----------------|-------|
-| **This project (C, Apple M1 CPU)** | **1.39** | **1.26** | **Pure C, server warm, no GPU** |
+| **This project (C, Apple M1 CPU, `--int4`)** | **0.52** | — | **Pure C, no GPU — 2× faster than real time** |
+| **This project (C, Apple M1 CPU, bf16)** | 1.39 | 1.26 | Pure C, server warm, no GPU |
 | Python + PyTorch (Ryzen 9 7950X CPU) | 4.5–5.8 | — | Official Python, CPU-only |
 | NVIDIA RTX 3090 | 0.52 | 0.68 | Python + PyTorch + FlashAttention 2 |
 | NVIDIA RTX 4090 | 0.38 | 0.45 | Python + PyTorch + FlashAttention 2 |
@@ -105,11 +106,27 @@ bash tests/x86_bench.sh            # builds scalar/AVX2/AVX-512 binaries, prints
 ./qwen_tts --self-test             # kernel numeric correctness (ISA-independent, no model)
 ```
 
+Numbers refreshed **2026-08-04**, after the AVX-512 parity round (16-wide attention/rms/conversions,
+native-bf16 `VDPBF16PS` matvec, q4-VNNI v3-default + fused-QKV VNNI twin — bf16 mode −21% single-thread
+on Zen5, and **int4 beats int8 single-thread on x86 0.6B** for the first time).
+
 | Device | CPU / cache | RAM | SIMD + threads | Best 0.6B RTF | Best config |
 |---|---|---|---|---|---|
-| **Apple M1** (dev) | M1 8-core, large system-level cache, LPDDR4X | 16 GB | NEON + SDOT int8, GCD 4-thread | **~1.3 bf16 / sub-1.0 int8** | `--int8 -j4` |
+| **Apple M1** (dev) | M1 8-core, large system-level cache, LPDDR4X | 16 GB | NEON + SDOT int8/int4, GCD 4-thread | **0.52 int4 / 0.69 int8** | `--int4 -j4` |
+| **Apple M4** (Mac mini, Scaleway) | M4 10-core, SME | 16 GB | NEON + SDOT + i8mm + bf16 + SME | **0.32** (1.7B quant-mixed **0.57**) | `--int4 -j4` |
+| **Neoverse-N1** (Ampere Altra Max, Scaleway) | N1, modest per-core cache | 16 GB / 4 vCPU | NEON + SDOT, pthread 4-thread | **1.28** stream int4 + conv-int8 (**1.49** default) | `--int4 --stream` |
+| **Graviton3** (Neoverse-V1, AWS c7g.2xlarge) | V1, i8mm-capable | 16 GB / 8 vCPU | NEON + SDOT + **i8mm SMMLA + BFMMLA**, pthread 4-thread | **0.66** (1.7B int8 **0.95**, sub-RT) | `--int8 -j4` |
 | **Ryzen 7 6800H** (bare metal, WSL2) | Zen3+ 8C/16T, 16 MB L3, DDR5-4800 | 32 GB | AVX2 + FMA, pthread 4-thread | **2.02** | `--int4 -j4` |
-| **EPYC 9555P** (Scaleway VM) | Zen5 "Turin" 64-core, 256 MB L3 (**32 MB/CCD**), AVX-512 + VNNI + BF16 | 16 GB / 4 vCPU | AVX-512-VNNI, pthread | **1.64** | `--int8 -j1` |
+| **EPYC 9555P** (Scaleway VM) | Zen5 "Turin" 64-core, 256 MB L3 (**32 MB/CCD**), AVX-512 + VNNI + BF16 | 16 GB / 4 vCPU | AVX-512 attention + VNNI + VDPBF16PS, pthread 4-thread | **0.95** (int4 = int8; at `-j1` int4 **1.05** beats int8 1.21) | `--int4 -j4`, `SIMD=avx512bf16` |
+
+Single-stream RTF is **memory/cache-bound** — the Code Predictor re-reads its weights 16× per frame — so
+SIMD width and thread count matter less than fewer weight bytes (`--int8` / `--int4`) and a cache that
+fits the working set. On cache-rich Apple Silicon **int4 is the fastest lever**; on x86 it depends on the
+model: **0.6B → `--int4`**, **1.7B → `--int8`** (pure `--int8` beats `--quant-mixed` there, which is the
+Apple-silicon config).
+
+**Many-core servers are best for throughput, not single-stream latency.** That is a different question
+with a different metric and its own evidence — see [`serving/`](serving/README.md).
 
 > EPYC 9555P cpuinfo AVX-512 flags: `avx512f avx512bw avx512vl avx512dq avx512cd avx512_vnni
 > avx512_bf16 avx512vbmi avx512_vbmi2 avx512ifma avx512_bitalg avx512_vpopcntdq avx512_vp2intersect`.

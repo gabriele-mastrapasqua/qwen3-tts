@@ -432,39 +432,11 @@ curl -s http://localhost:8080/v1/audio/speech \
   -d '{"input":"Hello world","voice":"ryan"}' -o output.wav
 ```
 
-#### Serving it for real
-
-The commands above are the API. A server you put in front of users needs two more steps, and
-skipping them does not produce an error — only a slower machine:
-
-```bash
-make doctor                       # ALWAYS FIRST on a new box: <1 min, no model. What is this
-                                  # machine, do the SMT/governor/cgroup gates pass, what is its
-                                  # bandwidth roof, which kernels resolve, what topology to try
-
-# then launch from a deployment profile, which carries the ~40 correct flags for your ISA
-eval "$(tools/perf_profile.py command recommended --model qwen3-tts-0.6b --port 8080)"
-tools/perf_profile.py check-flags recommended --log server.log   # prove the process read them
-```
-
-`--batch-size` **defaults to 1** and is also the per-worker in-flight cap: with `--prefork 12`
-and no `--batch-size`, twelve requests run and the rest wait. A worker only reaches the batched
-GEMM path at batch ≥ 2, which needs client concurrency `C ≥ 2W`.
-
-**Serving is documented in its own directory: [docs/serving/](docs/serving/README.md).**
-
-| | |
-|---|---|
-| [**Serving index**](docs/serving/README.md) | one API, two backends, two maturity levels — pick a lane |
-| [**CPU streaming server**](docs/serving/cpu.md) | **production.** `make doctor` first, then the deployment profile that carries the forty flags you should not be typing by hand |
-| [Operations manual](docs/serving/cpu-operations.md) | the break-in sweep, the benchmark suite rung by rung, arrival models, the 30-minute soak |
-| [Request batching](docs/serving/cpu-batching.md) | vLLM-style `--batch-size N`: continuous batching with per-request streaming |
-| [**CUDA streaming server**](docs/serving/gpu-cuda.md) | ⚠️ **work in progress** — implemented and fast, never qualified |
-| [The HTTP API](docs/serving/api.md) | endpoints, request body, streaming, the error envelope — identical on both backends |
-| [Measured boxes](docs/serving/boxes.md) | every host this has been measured on, its profile JSON, and what it holds |
-
-> Also: every runtime flag and its default per ISA → [docs/feature-flags.md](docs/feature-flags.md)
-> · Arm topology/bandwidth preflight → [docs/arm-topology-preflight.md](docs/arm-topology-preflight.md)
+> **These are the API.** Putting a server in front of real users is a different job — `make doctor`
+> first, then launch from a deployment profile rather than by hand, then qualify it on your box.
+> Note `--batch-size` **defaults to 1** and is also the per-worker in-flight cap.
+> → [Performance § Many listeners at once](#many-listeners-at-once--the-streaming-server) and the
+> whole [**docs/serving/**](docs/serving/README.md) directory.
 
 ### Streaming
 
@@ -499,6 +471,24 @@ Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --
 
 ## Performance
 
+**There are two modes, and they answer two different questions.** A number from one does not
+predict the other, and most confusion about TTS performance comes from mixing them:
+
+| | **one request at a time** | **many listeners at once** |
+|---|---|---|
+| how you run it | CLI, `--stream`, or a warm `--serve` with a single client | `--serve` under real concurrent load |
+| the question | how fast is **this** request? | how many streams stay **continuous**? |
+| the metric | **RTF** and time-to-first-audio | the whole playback envelope — `safe_play_start`, stall rate, `max_gap`. RTF alone is not enough |
+| the limit | this machine's bandwidth for one weight stream | the same bandwidth shared across N streams, **plus** admission and scheduling |
+| numbers live in | right below | **[docs/serving/](docs/serving/README.md)** |
+
+Why they do not transfer: a stream can average twice real time and still hiccup for two seconds,
+and it is the hiccup a listener hears. One measured case had **RTF 0.90 while 35% of streams
+stalled** against a one-second buffer. So the section below is about latency, and serving capacity
+is a separate document with a separate kind of evidence behind it.
+
+### One request at a time
+
 > ### ⚡ Faster than real-time on Apple Silicon — both `--int8` and `--int4` go sub-1.0 RTF
 > On a 2020 M1 (CPU, no GPU) the 0.6B model runs **~2× faster than real time** — CLI, streaming **and** server — with **no perceptible quality loss** by ear (cloned `.qvoice` voices included).
 
@@ -511,7 +501,7 @@ cache-rich SLC; int8 is the safest quality/speed pick — **both beat real time*
 | **`--int8`** | **0.69** ⚡ | ~1.4× faster |
 | **`--int4`** | **0.52** ⚡ | ~1.9× faster |
 
-**Every delivery mode stays sub-realtime** — bf16 vs `--int8` across CLI / streaming / server / cloned voice:
+**Every delivery mode stays sub-realtime** — bf16 vs `--int8`, still **one request at a time**:
 
 | Mode | bf16 RTF | **`--int8` RTF** | First audio (TTFA) |
 |---|---|---|---|
@@ -519,8 +509,13 @@ cache-rich SLC; int8 is the safest quality/speed pick — **both beat real time*
 | CLI (long, ~14 s) | ~1.3 | **0.80** ⚡ | — |
 | **Streaming** (`--stream`, short) | 1.5–1.8 | **0.89** ⚡ | **0.46 s** |
 | **Streaming** (long) | ~1.3 | **0.81** ⚡ | **0.50 s** |
-| **HTTP server** (`--serve`, warm) | ~1.3 | **0.88** ⚡ | — |
+| **HTTP server** (`--serve`, warm, **one** client) | ~1.3 | **0.88** ⚡ | — |
 | **Custom voice** `.qvoice` (streamed) | 1.34 | **0.93** ⚡ | 0.47 s |
+
+RTF = processing_time ÷ audio_duration; **< 1.0 = faster than real time.**
+
+<details>
+<summary><b>The expressive stack costs ~0.09 RTF · why quantization is the lever · the cross-device table · vs Python/PyTorch</b></summary>
 
 **Expressive *and* sub-realtime** — the 0.6B's full expressive stack (emotional voice + inline `[tag]`
 paralinguistics + cloning, see [Emotion on the small 0.6B](#emotion--expressivity-on-the-small-06b--)) costs
@@ -533,99 +528,105 @@ only **~0.09 RTF** over the bare model:
 | **emotional voice + `[tag]`** | 1.18 | **0.78** ⚡ | — |
 | bare 0.6B (reference) | 1.17 | 0.69 | — |
 
-RTF = processing_time / audio_duration; **< 1.0 = faster than real-time**. Quantization reads fewer weight bytes
-per frame (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B ~1.5 (bf16) → 0.69 (int8) → 0.52 (int4)**; **1.7B
-~2.0 (bf16) → 1.79 (int8) → ~1.53 (quant-mixed: int4 Talker + int8 CP, the fastest 1.7B config on M1)** — no
-perceptible quality loss, works with `.qvoice` voices ([details](docs/quantization.md)).
+Quantization reads fewer weight bytes per frame (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B ~1.5
+(bf16) → 0.69 (int8) → 0.52 (int4)**; **1.7B ~2.0 (bf16) → 1.79 (int8) → ~1.53 (quant-mixed: int4 Talker +
+int8 CP, the fastest 1.7B config on M1)** — no perceptible quality loss, works with `.qvoice` voices
+([details](docs/quantization.md)).
 
-### 📊 Benchmark *your* CPU
+**Cross-device CPU** — M1, M4, Neoverse-N1, Graviton3, Ryzen 6800H and EPYC 9555P, each with its best
+config and what it teaches → **[docs/performance.md](docs/performance.md)**, which also carries the
+CPU-vs-GPU comparison (5–7× faster than Python on CPU, and faster than real time with `--int8` on a 2020
+laptop with no GPU) and the per-component breakdown.
 
-Want to know how this runs on **your** machine (Apple Silicon, AMD/Intel x86, ARM server)? The repo
-ships a one-command per-box report — no setup beyond the model:
+</details>
+
+> Per-component breakdown and optimization history → [docs/performance.md](docs/performance.md)
+> · x86 AVX2/AVX-512/VNNI findings → [docs/x86-optimization.md](docs/x86-optimization.md)
+> · quantization trade-offs → [docs/quantization.md](docs/quantization.md)
+
+### Many listeners at once — the streaming server
+
+Different question, different evidence, **its own directory**: [docs/serving/](docs/serving/README.md).
+
+The short version: the CPU server is the production path, qualified on named hosts by **30-minute
+closed-loop soaks with strict KPI checking**, and it holds **0.6B C12–C16 and 1.7B C10–C16 on 32-core
+hosts** with zero stalls at a 250 ms jitter buffer. Concurrency is qualified per box, never
+extrapolated — the same architecture lands at C10, C12 and C16 on three 32-core machines, and the
+ordering follows memory bandwidth.
 
 ```bash
-make bench              # quick RTF: short+long, normal+stream (both models)
-make bench-full         # + server, instruct, INT8, .qvoice
-
-# Per-CPU report (copy onto any rented ARM/x86 box):
-./qwen_tts --caps       # what SIMD your CPU actually has (NEON/SDOT/bf16/i8mm/SVE • AVX2/AVX-512/VNNI/AMX)
-./qwen_tts --self-test  # are the kernels numerically correct on this ISA?
-make bench-matrix       # caps + self-test + RTF matrix (single vs batch × bf16/int8/int4)
-make bench-matrix-full  # + streaming + server + request-batching throughput
-make bench-server       # concurrent-request throughput alone (N users vs single-stream, per precision)
+make doctor      # ALWAYS FIRST on a new box: <1 min, no model. What is this machine, do the
+                 # SMT/governor/cgroup gates pass, what is its bandwidth roof, which kernels
+                 # resolve, and what topology to try — every number provenance-labelled
 ```
 
-The full cross-hardware workflow (which boxes have which SIMD, where to rent, what to measure) lives in
-[docs/hardware-testing.md](docs/hardware-testing.md).
+Then launch from a deployment profile rather than by hand, because the ~40 correct environment
+variables differ per ISA and several do not transfer between machines:
 
-**Cross-device CPU (single-stream 0.6B, this repo's best config — reproduce with `bash tests/x86_bench.sh`):**
+```bash
+eval "$(tools/perf_profile.py command recommended --model qwen3-tts-0.6b --port 8080)"
+```
 
-| Device | SIMD + threads | RAM | Best 0.6B RTF | Config |
-|---|---|---|---|---|
-| **Apple M1** 8-core | NEON + SDOT int8/int4, GCD 4-thread | 16 GB | **0.52 int4 / 0.69 int8** | `--int4 -j4` |
-| **Neoverse-N1** (Ampere Altra Max, Scaleway) | NEON + SDOT, pthread 4-thread | 16 GB / 4 vCPU | **1.28** stream int4 + conv-int8 (**1.49** default) | `--int4 --stream` |
-| **Graviton3** (Neoverse-V1, AWS c7g.2xlarge) | NEON + SDOT + **i8mm SMMLA + BFMMLA**, pthread 4-thread | 16 GB / 8 vCPU | **0.66** (1.7B int8: **0.95**, sub-RT!) | `--int8 -j4` |
-| **Apple M4** (Mac mini, Scaleway) | NEON + SDOT + i8mm + bf16 + SME | 16 GB / 10-core | **0.32** (1.7B qm: **0.57**!) | `--int4 -j4` |
-| **Ryzen 7 6800H** (Zen3+, 16 MB L3, bare metal) | AVX2 + FMA, pthread 4-thread | 32 GB | **2.02** | `--int4 -j4` |
-| **EPYC 9555P** (Zen5, AVX-512+VNNI+BF16, Scaleway VM) | AVX-512 attention + VNNI + VDPBF16PS, pthread 4-thread | 16 GB / 4 vCPU | **0.95** (int4 = int8; -j1: int4 **1.05** beats int8 1.21) | `--int4 -j4`, `SIMD=avx512bf16` |
+**Request batching is a throughput lever, not a per-request speedup.** `--serve --batch-size N` steps
+concurrent requests *together* through the model (vLLM-style): each weight row is read from memory once
+and reused across all in-flight sequences, and streaming composes — every user still gets their own
+progressive audio. Note `--batch-size` defaults to **1** and is also the per-worker in-flight cap.
 
-Numbers refreshed 2026-08-04 after the AVX-512 parity round (16-wide attention/rms/conversions,
-native-bf16 `VDPBF16PS` matvec, q4-VNNI v3-default + fused-QKV VNNI twin — bf16 mode −21% single-thread
-on Zen5, and **int4 now beats int8 single-thread on x86 0.6B** for the first time). Single-stream RTF is
-**memory/cache-bound** (the Code Predictor re-reads its weights 16×/frame): SIMD width and thread count
-matter less than fewer weight bytes (`--int8`/`--int4`) and a cache that fits the working set (Apple's
-SLC, an X3D chip's V-cache). On cache-rich Apple Silicon **int4 is the fastest lever**; on x86 it now
-depends on the model: **0.6B → `--int4`**, **1.7B → `--int8`** (still the 1.7B wall-clock king; pure
-`--int8` beats `--quant-mixed`, which is the Apple-silicon config). Many-core servers are best for
-**throughput** (concurrent requests), not single-stream latency. Check yours: `./qwen_tts --caps` (on
-x86, build with `make blas SIMD=avx512bf16` on Zen4/5 / Cooper Lake+, or `SIMD=avx512vnni` if the CPU
-lacks `avx512bf16` — the default build is portable AVX2).
+| | |
+|---|---|
+| [**Serving index**](docs/serving/README.md) | one API, two backends, two maturity levels — pick a lane |
+| [**CPU streaming server**](docs/serving/cpu.md) | **production.** `make doctor`, then the deployment profile that carries the forty flags you should not be typing by hand |
+| [Operations manual](docs/serving/cpu-operations.md) | the break-in sweep, the benchmark suite rung by rung, arrival models, the 30-minute soak |
+| [Request batching](docs/serving/cpu-batching.md) | vLLM-style `--batch-size N`: continuous batching with per-request streaming |
+| [**CUDA streaming server**](docs/serving/gpu-cuda.md) | ⚠️ **work in progress** — implemented and fast, never qualified |
+| [The HTTP API](docs/serving/api.md) | endpoints, request body, streaming, the error envelope — identical on both backends |
+| [Measured boxes](docs/serving/boxes.md) | every host this has been measured on, its profile JSON, and what it holds |
 
-**Concurrent serving — request batching (`--serve --batch-size N`).** For *N users at once*, the server
-can step their requests **together** through the model (vLLM-style): weights are read from memory **once**
-and reused across all in-flight requests, instead of re-read per user. A continuous scheduler keeps the
-batch full (a finished request's slot is refilled immediately) and **streaming composes** — each user
-still gets their own progressive audio stream. This trades a little per-request latency for much higher
-total throughput on bandwidth-bound boxes. Measure it on your CPU with `make bench-server`; details in
-[docs/serving/cpu-batching.md](docs/serving/cpu-batching.md).
+> Also: every runtime flag and its default per ISA → [docs/feature-flags.md](docs/feature-flags.md)
+> · Arm topology/bandwidth preflight → [docs/arm-topology-preflight.md](docs/arm-topology-preflight.md)
 
-**Before serving on a new Arm box:** run `make doctor` first. On a 32-core Arm
-Linux host it now includes a short simultaneous `1x8` / `2x8` / `4x8` INT8 GEMV
-scaling preflight. Read its 4×8 verdict before renting time for a wave or soak:
-the check detects shared-cache/fabric contention that a single-worker roof can
-hide, and may recommend `2x16` or `1x32`. It classifies the tested topology,
-not the whole machine. See [the Arm preflight note](docs/arm-topology-preflight.md).
+### 📊 Benchmark *your* box
 
-**vs other implementations:**
+```bash
+# single-request latency — the CLI question
+make bench              # quick RTF: short+long, normal+stream (both models)
+./qwen_tts --caps       # what SIMD this CPU actually has (NEON/SDOT/bf16/i8mm/SVE • AVX2/AVX-512/VNNI/AMX)
+./qwen_tts --self-test  # are the kernels numerically correct on this ISA?
+make bench-matrix       # caps + self-test + RTF matrix (single vs batch × bf16/int8/int4)
 
-| Hardware | 0.6B RTF | Notes |
-|----------|----------|-------|
-| **This project (C, Apple M1 CPU, `--int4`)** | **0.52** | Pure C, no GPU — **2× faster than real-time** (post-PR#17 decoder work) |
-| This project (C, Apple M1 CPU, bf16) | 1.26–1.39 | Pure C, no GPU |
-| Python + PyTorch (Ryzen 9 7950X CPU) | 4.5–5.8 | Official Python, CPU-only |
-| NVIDIA RTX 3090 | 0.52–0.68 | Python + PyTorch + FlashAttention 2 |
+# serving capacity — the other question entirely
+make doctor                                        # the box preflight, first
+make bench-topo  BENCH_TOPO=1x16,2x8,4x4 BENCH_CONC=1,4    # find W x K on this machine
+make bench-suite BENCH_PROFILE=<name>              # the qualification curve
+make bench-soak  SOAK_MINUTES=30 SOAK_CONCURRENCY=8 # does it hold, sustained
+```
 
-5–7x faster than Python on CPU, and **faster than real-time with `--int8`** — on a 2020 laptop with no GPU.
-
-> Per-component breakdown, full GPU table, optimization history → [docs/performance.md](docs/performance.md)
-> x86 AVX2/AVX-512/VNNI findings + how to benchmark your CPU → [docs/x86-optimization.md](docs/x86-optimization.md)
+Cross-hardware workflow (which boxes have which SIMD, where to rent, what to measure) →
+[docs/hardware-testing.md](docs/hardware-testing.md). The serving procedure →
+[docs/serving/cpu-operations.md](docs/serving/cpu-operations.md).
 
 ### 🖥️ GPU backends — Apple Metal & NVIDIA CUDA (opt-in)
 
 Optional `--backend metal|cuda` runs the **whole fused pipeline resident on the GPU** (weights + KV +
 activations on device, one command buffer / step). The CPU path stays the default — GPU is purely additive.
-Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDIA](docs/cuda-performance.md).
 
-> **Streaming server on CUDA — implemented and runtime-verified, not performance-qualified.**
-> `--backend cuda --serve` works, batches, streams, and produces the same codes as a single stream,
-> and it has been listened to under concurrent load. It has **not** met a serving KPI target: every
-> soak so far is a 3-minute screen and each reports per-class KPI drift, and no 30-minute
-> qualification has been run. It is opt-in and there are two settings that silently disable most of
-> it — see [docs/serving/gpu-cuda.md](docs/serving/gpu-cuda.md). The CPU
-> server remains the qualified path.
+| | build | single-stream RTF |
+|---|---|---|
+| **Apple Metal** | `make metal CC=clang` | M2 Pro 0.36–0.39 (0.6B) / 0.48–0.53 (1.7B) · M4 **0.28** / **0.41** (int4) |
+| **NVIDIA CUDA** | `make cuda` (one multi-arch binary: Ampere/Ada/Blackwell) | RTX 4060-class **0.44** (1.7B quant-mixed) · A100 **0.39** (0.6B) / **0.50** (1.7B) |
 
-**Apple Metal** — `make metal CC=clang`, then `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`.
-**Single-stream latency** (one request — CLI, or a warm `--serve` server; the two match):
+> ⚠️ **The CUDA streaming server is work in progress.** `--backend cuda --serve` works, batches, streams
+> and produces the same codes as a single stream, and it has been listened to under concurrent load. It
+> has **never met a serving KPI target**: every soak so far is a 2–3 minute screen, no 30-minute
+> qualification has been run on any GPU, and there is no deployment-profile gate for GPU — so two
+> settings can silently remove most of it. See [docs/serving/gpu-cuda.md](docs/serving/gpu-cuda.md).
+> **The CPU server remains the qualified path.**
+
+<details>
+<summary><b>Metal and CUDA detail — TTFA, the bandwidth scaling floor, and the batching table</b></summary>
+
+**Apple Metal** — `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`. Single-stream latency (one
+request — CLI, or a warm `--serve` server; the two match):
 
 | Device | 0.6B RTF | 1.7B RTF | Streaming TTFA (single client) |
 |---|---|---|---|
@@ -633,16 +634,14 @@ Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDI
 | **Apple M2 Pro** 16-core GPU | 0.36–0.39 | 0.48–0.53 | **314 ms** / 517 ms |
 | **Apple M4** 10-core GPU | **0.28** (int4) | **0.41** (int4) | — |
 
-RTF = processing_time ÷ audio_duration (**< 1.0 = faster than real time**); TTFA = time to first audio for a
-single `--stream` client, **warm server** (the first request after startup pays a one-time weight→GPU-buffer
-upload — e.g. ~3.6 s cold vs 469 ms warm on M1-0.6B). Metal beats the native M2 CPU path ~1.5–2×; **int8 is the sweet spot** on Apple Silicon
-(bandwidth-rich → int4's nibble-unpack doesn't pay). Resident decode is bit-identical to the CPU path.
-*(Multi-user concurrency → the batching table below.)*
+TTFA is for a single `--stream` client on a **warm server** (the first request after startup pays a
+one-time weight→GPU-buffer upload — e.g. ~3.6 s cold vs 469 ms warm on M1-0.6B). Metal beats the native
+M2 CPU path ~1.5–2×; **int8 is the sweet spot** on Apple Silicon (bandwidth-rich → int4's nibble-unpack
+does not pay). Resident decode is bit-identical to the CPU path.
 
-**NVIDIA CUDA** — `make cuda` (resident fused + cuBLAS pointwise convs + CUDA graphs). One multi-arch
-binary (Ampere/Ada/Blackwell). The CUDA toolkit is auto-detected (`nvcc` on `PATH`, else `/usr/local/cuda`,
-else `/opt/cuda` — Arch Linux); point at a different prefix with `make cuda CUDA_HOME=/path/to/cuda`.
-**Single-stream latency** (one request), measured:
+**NVIDIA CUDA** — resident fused + cuBLAS pointwise convs + CUDA graphs. The toolkit is auto-detected
+(`nvcc` on `PATH`, else `/usr/local/cuda`, else `/opt/cuda` — Arch Linux); point elsewhere with
+`make cuda CUDA_HOME=/path/to/cuda`.
 
 | GPU | Config | RTF (single stream) |
 |---|---|---|
@@ -650,16 +649,14 @@ else `/opt/cuda` — Arch Linux); point at a different prefix with `make cuda CU
 | **A100-SXM4-40GB** (cloud) | 0.6B (bf16 or int4) | **0.39** |
 | **A100-SXM4-40GB** (cloud) | 1.7B `--quant-mixed` + `QWEN_CUDA_DP4A=1` | **0.50** |
 
-`QWEN_CUDA_DP4A=1` (new, opt-in) runs int4 weights against int8-quantized activations with integer
-`__dp4a` dots: **1.7B Talker −33% ms/f on the A100**, ear-validated. Note the honest scaling limit:
-decode is bandwidth-bound only up to a point — past it, single-stream becomes **launch-latency-bound**
-(the A100's 5–6× bandwidth did not translate to 5× RTF), so big cards pay off in **batching**, not
-single-stream. Details → [docs/cuda-performance.md](docs/cuda-performance.md).
+`QWEN_CUDA_DP4A=1` runs int4 weights against int8-quantized activations with integer `__dp4a` dots:
+**1.7B Talker −33% ms/f on the A100**, ear-validated. Note the honest scaling limit: decode is
+bandwidth-bound only up to a point — past it, single-stream becomes **launch-latency-bound** (the A100's
+5–6× bandwidth did not translate to 5× RTF), so big cards pay off in **batching**, not single-stream.
 
-**Throughput — server request-batching** (`--serve --batch-size N`, continuous batching + per-request
-streaming). Batching is a **throughput / parallelism** lever, *not* a per-request speedup — it serves N
-concurrent users in roughly the time of one by reading each weight once for all B sequences (matvec → matmat).
-**CPU, CUDA and Metal all batch:**
+**Throughput — server request-batching** (`--serve --batch-size N`). Batching is a throughput lever, not
+a per-request speedup — it serves N concurrent users in roughly the time of one by reading each weight
+once for all B sequences (matvec → matmat). **CPU, CUDA and Metal all batch:**
 
 | Backend | Batch speedup | Notes |
 |---|---|---|
@@ -668,6 +665,10 @@ concurrent users in roughly the time of one by reading each weight once for all 
 | **Apple Metal** (M2 Pro) | **~2.8× at B=4** | 0.6B 2.81× · 1.7B 2.82× (consistent); batch output bit-identical to single-stream |
 | **CPU x86** | ~N on bandwidth-bound servers | ~1× on cache-rich M1 (single-stream is already fast) |
 | **CPU ARM** (Graviton3+, i8mm) | **int8 batch matmat 2.1×, int4 1.6×** (native SMMLA GEMM) | e2e batched server −19% wall @ B=4 vs the pre-SMMLA twin; bf16 1.5× (BFMMLA) |
+
+</details>
+
+Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDIA](docs/cuda-performance.md)
 
 ## Documentation
 
