@@ -102,6 +102,8 @@ typedef struct {
     _Atomic unsigned long long ttfa_over_1s;
     _Atomic unsigned long long ttfb_ms_sum;
     _Atomic unsigned long long ttfb_n;
+    _Atomic unsigned long long queue_ms_sum;
+    _Atomic unsigned long long queue_n;
     _Atomic unsigned long long gaps;
     _Atomic unsigned long long gap_behind;      /* wall gap exceeded the audio delivered */
     _Atomic unsigned long long gap_over_1s;
@@ -1832,6 +1834,11 @@ static size_t qwen_metrics_render(char *b, size_t cap) {
              "crossed it."},
             {"qwen_tts_worker_ttfb_seconds_sum", "counter", "Sum of time-to-first-byte."},
             {"qwen_tts_worker_ttfb_seconds_count", "counter", "Requests contributing to the TTFB sum."},
+            {"qwen_tts_worker_queue_seconds_sum", "counter",
+             "Sum of time spent waiting for admission, from enqueue to the scheduler taking the "
+             "request. Subtract it from TTFA to separate the two reasons first audio can be "
+             "late: queued behind other work, or slow once it started."},
+            {"qwen_tts_worker_queue_seconds_count", "counter", "Requests contributing to the queue sum."},
             {"qwen_tts_worker_stream_gaps_total", "counter",
              "Gaps measured between consecutive streamed chunks reaching the socket."},
             {"qwen_tts_worker_stream_gap_behind_realtime_total", "counter",
@@ -1858,11 +1865,13 @@ static size_t qwen_metrics_render(char *b, size_t cap) {
                     case 4: v = atomic_load_explicit(&sl->ttfa_over_1s, memory_order_relaxed); break;
                     case 5: as_seconds = atomic_load_explicit(&sl->ttfb_ms_sum, memory_order_relaxed) / 1000.0; break;
                     case 6: v = atomic_load_explicit(&sl->ttfb_n, memory_order_relaxed); break;
-                    case 7: v = atomic_load_explicit(&sl->gaps, memory_order_relaxed); break;
-                    case 8: v = atomic_load_explicit(&sl->gap_behind, memory_order_relaxed); break;
+                    case 7: as_seconds = atomic_load_explicit(&sl->queue_ms_sum, memory_order_relaxed) / 1000.0; break;
+                    case 8: v = atomic_load_explicit(&sl->queue_n, memory_order_relaxed); break;
+                    case 9: v = atomic_load_explicit(&sl->gaps, memory_order_relaxed); break;
+                    case 10: v = atomic_load_explicit(&sl->gap_behind, memory_order_relaxed); break;
                     default: v = atomic_load_explicit(&sl->gap_over_1s, memory_order_relaxed); break;
                 }
-                if (k == 0 || k == 2 || k == 5)
+                if (k == 0 || k == 2 || k == 5 || k == 7)
                     QM_P("%s{worker=\"%d\"} %.3f\n", defs[k].name, w, as_seconds);
                 else
                     QM_P("%s{worker=\"%d\"} %llu\n", defs[k].name, w, v);
@@ -2770,6 +2779,13 @@ static void qwen_metrics_request_done(const batch_job_t *j) {
     if (j->t_first > 0.0 && j->t_recv > 0.0 && j->t_first >= j->t_recv) {
         QM_ADD(ttfb_ms_sum, (unsigned long long)(j->t_first - j->t_recv + 0.5));
         QM_ADD(ttfb_n, 1);
+    }
+    /* Waiting to be admitted, which is the half of TTFA the engine is not responsible for.
+       Without it a slower first audio cannot be told apart: queued behind other work, or a
+       slow prefill? Both instants are already on the job; this is two more adds. */
+    if (j->t_admit > 0.0 && j->enq_ms > 0.0 && j->t_admit >= j->enq_ms) {
+        QM_ADD(queue_ms_sum, (unsigned long long)(j->t_admit - j->enq_ms + 0.5));
+        QM_ADD(queue_n, 1);
     }
 }
 

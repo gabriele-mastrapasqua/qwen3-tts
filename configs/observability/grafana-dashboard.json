@@ -99,13 +99,48 @@
     },
     {
       "type": "timeseries",
+      "title": "Where first audio time goes",
+      "description": "TTFA split into the two things that can make it late: waiting for admission, and everything after. A rising queue share means offer more capacity; a rising engine share means the request itself got slower. Without the split those are the same graph.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 25,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(qwen_tts_worker_queue_seconds_sum[5m]) / rate(qwen_tts_worker_queue_seconds_count[5m])",
+          "legendFormat": "queue w{{worker}}"
+        },
+        {
+          "expr": "(rate(qwen_tts_worker_ttfa_seconds_sum[5m]) / rate(qwen_tts_worker_ttfa_seconds_count[5m])) - (rate(qwen_tts_worker_queue_seconds_sum[5m]) / rate(qwen_tts_worker_queue_seconds_count[5m]))",
+          "legendFormat": "engine w{{worker}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
       "title": "First audio past 1s, per second",
       "description": "Requests whose first audio arrived later than the 1s safe_play_start line. An exact count, not a quantile estimated from buckets. Anything sustained above zero is a listener-visible problem even while every queue metric stays green. Flat at zero with a sane axis is the healthy picture; the axis is pinned so an all-zero panel does not autoscale into something that looks broken.",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 9
+        "y": 17
       },
       "fieldConfig": {
         "defaults": {
@@ -133,7 +168,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 9
+        "y": 17
       },
       "fieldConfig": {
         "defaults": {
@@ -160,7 +195,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 25
       },
       "collapsed": false,
       "panels": [],
@@ -176,7 +211,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 26
       },
       "fieldConfig": {
         "defaults": {
@@ -202,7 +237,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 26
       },
       "fieldConfig": {
         "defaults": {
@@ -228,7 +263,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "fieldConfig": {
         "defaults": {
@@ -276,7 +311,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 26
+        "y": 34
       },
       "fieldConfig": {
         "defaults": {
@@ -307,7 +342,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "collapsed": false,
       "panels": [],
@@ -323,7 +358,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 35
+        "y": 43
       },
       "fieldConfig": {
         "defaults": {},
@@ -343,7 +378,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 35
+        "y": 43
       },
       "fieldConfig": {
         "defaults": {},
@@ -363,7 +398,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 35
+        "y": 43
       },
       "fieldConfig": {
         "defaults": {},
@@ -383,7 +418,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 35
+        "y": 43
       },
       "targets": [
         {

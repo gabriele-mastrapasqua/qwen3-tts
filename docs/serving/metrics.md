@@ -89,6 +89,7 @@ failure a summed view hides, and the one the soak campaigns kept finding.
 | `qwen_tts_worker_ttfa_seconds_sum{worker}` / `_count` | counter | time to first audio; `rate(sum)/rate(count)` is the windowed mean |
 | `qwen_tts_worker_ttfa_over_1s_total{worker}` | counter | requests past the 1 s `safe_play_start` line — **exact, not a bucket estimate** |
 | `qwen_tts_worker_ttfb_seconds_sum{worker}` / `_count` | counter | time to first byte |
+| `qwen_tts_worker_queue_seconds_sum{worker}` / `_count` | counter | **admission wait** — enqueue to the scheduler taking it |
 | `qwen_tts_worker_stream_gaps_total{worker}` | counter | chunk-to-chunk gaps measured |
 | `qwen_tts_worker_stream_gap_behind_realtime_total{worker}` | counter | gaps where wall time exceeded the audio delivered |
 | `qwen_tts_worker_stream_gap_over_1s_total{worker}` | counter | gaps over 1 s outright |
@@ -99,6 +100,13 @@ A request is not a unit of work here: one is two seconds of speech, the next is 
 `rate(qwen_tts_worker_audio_seconds_total[1m])` is how many **realtime listeners** the box is
 carrying, and it is the number that means something for a TTS server. Requests per second is
 kept because a worker whose request rate goes flat is wedged, which is a different question.
+
+### Why admission wait is separate from TTFA
+
+First audio can be late for two unrelated reasons: the request waited behind other work, or it
+was slow once it started. Those want opposite responses — more capacity versus a faster engine —
+and without the split they are the same graph. Subtracting the queue mean from the TTFA mean
+separates them, and both instants were already on the request.
 
 ### Why "behind realtime" and not a millisecond threshold
 

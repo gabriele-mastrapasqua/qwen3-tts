@@ -119,6 +119,7 @@ if start_server "--batch-size 4 --int8 --metrics-port $MPORT"; then
     audio=$(val qwen_tts_worker_audio_seconds_total)
     ttfa_n=$(val qwen_tts_worker_ttfa_seconds_count)
     gaps=$(val qwen_tts_worker_stream_gaps_total)
+    qn=$(val qwen_tts_worker_queue_seconds_count)
     behind=$(val qwen_tts_worker_stream_gap_behind_realtime_total)
 
     awk -v a="${audio:-0}" 'BEGIN{exit !(a+0 > 0)}' \
@@ -128,6 +129,8 @@ if start_server "--batch-size 4 --int8 --metrics-port $MPORT"; then
                              || bad "TTFA is counted" "count is '${ttfa_n:-absent}'"
     [ "${gaps:-0}" -ge 1 ] && ok "chunk gaps are measured ($gaps)" \
                            || bad "chunk gaps are measured" "got '${gaps:-absent}'"
+    [ "${qn:-0}" -ge 1 ] && ok "admission wait is counted ($qn request)" \
+                         || bad "admission wait is counted" "count is '${qn:-absent}'"
     # int8 on a dev box streams at or better than realtime, so the buffer should not be
     # draining across most chunks. This is what separates the proxy from a raw ms threshold.
     { [ -n "${behind:-}" ] && [ -n "${gaps:-}" ] && [ "$behind" -le "$gaps" ]; } \
