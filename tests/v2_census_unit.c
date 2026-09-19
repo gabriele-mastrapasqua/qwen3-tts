@@ -20,6 +20,17 @@ int main(void) {
         for (int i = 0; i < n; i++) { assert(p[i] >= 1 && p[i] <= 16); sum += p[i]; }
         assert(sum == b);
     }
+    {
+        const int want[][3] = {{16, 1, 0}, {16, 4, 0}, {16, 8, 0},
+                               {16, 15, 0}, {16, 16, 0}};
+        const int bs[] = {17, 20, 24, 31, 32};
+        for (size_t i = 0; i < sizeof bs / sizeof bs[0]; i++) {
+            int p[3] = {0};
+            int n = qwen_batch_chunk_plan(bs[i], 16, p, 3);
+            assert(n == 2);
+            assert(p[0] == want[i][0] && p[1] == want[i][1]);
+        }
+    }
     setenv("QWEN_V2_CENSUS", "1", 1);
     qwen_v2_census_batch_begin(QWEN_V2_STAGE_TALKER, 8, 3, 3, 0);
     qwen_v2_census_call_begin(QWEN_V2_STAGE_TALKER, QWEN_V2_WEIGHT_INT8,

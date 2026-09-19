@@ -7,6 +7,20 @@
 
 int qwen_kleidi_supported(void);
 
+/* Dotprod-only B=1 candidates.  These use a separate RHS packing contract and
+ * remain opt-in until native Linux qualification proves complete-call value. */
+int qwen_kleidi_dotprod_compiled(void);
+int qwen_kleidi_dotprod_supported(void);
+int qwen_kleidi_dotprod_enabled(void);
+int qwen_kleidi_dotprod_register_q4(const void *key, const uint8_t *ggml_blocks,
+                                    int rows, int cols);
+int qwen_kleidi_dotprod_matmul_q4(float *Y, const void *key, const float *X,
+                                  int rows, int cols, int B);
+int qwen_kleidi_dotprod_register_i8(const void *key, const int8_t *W, const float *scale,
+                                    int rows, int cols);
+int qwen_kleidi_dotprod_matmul_i8(float *Y, const void *key, const float *X,
+                                  int rows, int cols, int B);
+
 int qwen_kleidi_enabled(void);
 
 int qwen_kleidi_register_q4(const void *key, const uint8_t *ggml_blocks, int rows, int cols);

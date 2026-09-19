@@ -317,7 +317,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_VNNI_NCHUNK", "QWEN_AVX512_NCHUNK", "QWEN_KAI_NCHUNK",
     /* ARM KleidiAI */
     "QWEN_NO_KLEIDI", "QWEN_NO_KAI_BF16", "QWEN_NO_KAI_I8", "QWEN_KAI_OPS", "QWEN_KAI_QKV_FUSED",
-    "QWEN_KAI_LHS", "QWEN_KAI_REPEAT",
+    "QWEN_KAI_LHS", "QWEN_KAI_REPEAT", "QWEN_KAI_DOTPROD_GEMV",
     /* prefill */
     "QWEN_PREFILL_MATMAT", "QWEN_PREFILL_QUANT", "QWEN_PREFILL_HELPER", "QWEN_GGUF_QUANT_PREFILL",
     "QWEN_PREFILL_SLICE",
@@ -1604,10 +1604,20 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
 
 static int kai_i8_try(float *Y, const int8_t *W, const float *scale, const float *X,
                       int rows, int cols, int B) {
-    if (!qwen_kleidi_i8_enabled()) return 0;
-    if (qwen_kleidi_matmul_i8(Y, W, X, rows, cols, B)) return 1;
-    if (!qwen_kleidi_register_i8(W, W, scale, rows, cols)) return 0;
-    return qwen_kleidi_matmul_i8(Y, W, X, rows, cols, B);
+    if (qwen_kleidi_i8_enabled()) {
+        if (qwen_kleidi_matmul_i8(Y, W, X, rows, cols, B)) return 1;
+        if (qwen_kleidi_register_i8(W, W, scale, rows, cols) &&
+            qwen_kleidi_matmul_i8(Y, W, X, rows, cols, B)) return 1;
+    }
+    /* Dotprod-only KAI has a separate packer and intentionally handles B=1
+     * only. It is an opt-in qualification candidate; B>1 stays on the
+     * existing native SDOT/SMMLA/fallback policy. */
+    if (B == 1 && qwen_kleidi_dotprod_enabled()) {
+        if (qwen_kleidi_dotprod_matmul_i8(Y, W, X, rows, cols, B)) return 1;
+        if (qwen_kleidi_dotprod_register_i8(W, W, scale, rows, cols) &&
+            qwen_kleidi_dotprod_matmul_i8(Y, W, X, rows, cols, B)) return 1;
+    }
+    return 0;
 }
 static int kai_bf16_try(float *Y, const uint16_t *W, const float *X,
                         int rows, int cols, int B) {
@@ -5669,6 +5679,12 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
         MMSTAT(QWEN_MMK_KLEIDI_Q4, rows, cols, B);
         return;
     }
+    if (B == 1 && qwen_kleidi_dotprod_enabled() &&
+        qwen_kleidi_dotprod_matmul_q4(Y, (const void *)W, X, rows, cols, B)) {
+        qwen_census_leaf(QWEN_LEAF_KLEIDI);
+        MMSTAT(QWEN_MMK_Q4_GEMV, rows, cols, B);
+        return;
+    }
 #if defined(__AMX_INT8__) && defined(__AMX_TILE__)
     {
         if (qwen_mm_use(QWEN_MMK_Q4_AMX, B, rows, cols) && cols % Q4_0_BLOCK_SIZE == 0 &&
@@ -7872,6 +7888,12 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
         MMSTAT(QWEN_MMK_KLEIDI_Q4, rows, cols, 1);
         return;
     }
+    if (qwen_kleidi_dotprod_enabled() &&
+        qwen_kleidi_dotprod_matmul_q4(y, (const void *)W, x, rows, cols, 1)) {
+        qwen_census_leaf(QWEN_LEAF_KLEIDI);
+        MMSTAT(QWEN_MMK_Q4_GEMV, rows, cols, 1);
+        return;
+    }
     MMSTAT(QWEN_MMK_Q4_GEMV, rows, cols, 1);
 #if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
     if (qwen_avx512bw_q4_gemv_enabled() &&
@@ -8034,6 +8056,14 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
         qwen_kleidi_matmul_q4(k, (const void *)Wk, x, kv_dim, in_dim, 1) &&
         qwen_kleidi_matmul_q4(v, (const void *)Wv, x, kv_dim, in_dim, 1)) {
         MMSTAT(QWEN_MMK_KLEIDI_Q4, q_dim + 2 * kv_dim, in_dim, 1);
+        return;
+    }
+    if (qwen_kleidi_dotprod_enabled() &&
+        qwen_kleidi_dotprod_matmul_q4(q, (const void *)Wq, x, q_dim, in_dim, 1) &&
+        qwen_kleidi_dotprod_matmul_q4(k, (const void *)Wk, x, kv_dim, in_dim, 1) &&
+        qwen_kleidi_dotprod_matmul_q4(v, (const void *)Wv, x, kv_dim, in_dim, 1)) {
+        qwen_census_leaf(QWEN_LEAF_KLEIDI);
+        MMSTAT(QWEN_MMK_Q4_GEMV, q_dim + 2 * kv_dim, in_dim, 1);
         return;
     }
     MMSTAT(QWEN_MMK_Q4_GEMV, q_dim + 2 * kv_dim, in_dim, 1);

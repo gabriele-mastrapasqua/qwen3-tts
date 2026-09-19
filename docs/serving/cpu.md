@@ -144,7 +144,7 @@ explicitly opt-in. The direct AVX2 decoder path uses signed widening and require
 `QWEN_SD_INT8=1` and `QWEN_SD_RES1_V2=1`; it is default-off and has no AVX2 host performance
 qualification yet. On a dotprod-only Arm build (for example, Neoverse N1), B=1 INT8/Q4 uses
 SDOT; INT8 SDOT matmat remains opt-in, and `QWEN_Q4_SDOT_MM=1` selects fused Q4 SDOT matmat
-for B=2..16. KleidiAI stays unavailable because its current build and pack path needs i8mm. Arm lists INT8 matrix multiply support for Neoverse V1 in its
+for B=2..16. Full KleidiAI GEMM/region support stays unavailable because its build and pack path needs i8mm, but `QWEN_KAI_DOTPROD_GEMV=1` exposes the separate opt-in B=1 Q4/INT8 candidate with dotprod-specific packing. Arm lists INT8 matrix multiply support for Neoverse V1 in its
 [V1 technical overview](https://community.arm.com/developer/ip-products/processors/b/processors-ip-blog/posts/neoverse-v1-platform-a-new-performance-tier-for-arm).
 Qualify V1 as a separate feature class; do not infer its gates from N1. None of these mappings
 establishes a current v2 streaming capacity claim. Older N1 single-stream and Graviton3/V1

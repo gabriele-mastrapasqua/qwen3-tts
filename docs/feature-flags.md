@@ -230,6 +230,7 @@ both belong before any number.
 | `QWEN_PREFILL_QUANT` | off | `=1` runs prefill on the quantized weights and frees the bf16 copy (~4 GB on the 1.7B). **It measurably degrades output quality on some models.** Base models only, and the server says so when you turn it on |
 | `QWEN_KAI_NCHUNK` **(ARM only)** | 384 | sub-tiles the KleidiAI GEMM's n dimension so the second height pass finds the packed RHS in cache. `=0` restores one kernel call per slice |
 | `QWEN_KAI_OPS` **(ARM only)** | all families on | comma list restricting which KleidiAI families may be used; empty means every one |
+| `QWEN_KAI_DOTPROD_GEMV` **(ARM dotprod only)** | off | `=1` enables the separate KleidiAI dotprod Q4/INT8 B=1 GEMV candidate and its dotprod-specific RHS packing. It does not enable i8mm GEMM/regions and remains a native-host qualification switch |
 | `QWEN_KAI_REPEAT` **(ARM only)** | off | `=1` times a second identical call — a microbenchmark, not a serving flag |
 
 ## 4. Server, admission and first audio
@@ -454,8 +455,9 @@ every diagnostic, and `OPENBLAS_THREAD_TIMEOUT` / `OPENBLAS_NUM_THREADS` whereve
 the BLAS. `QWEN_THP` is Linux-only in effect, whatever the CPU. These are the ones a profile
 carries across a port unchanged.
 
-**ARM only** — every `QWEN_KAI_*` and `QWEN_NO_KLEIDI`, because KleidiAI is compiled in only
-when the toolchain reports `__ARM_FEATURE_MATMUL_INT8` or `__ARM_FEATURE_BF16`; plus
+**ARM only** — every `QWEN_KAI_*` and `QWEN_NO_KLEIDI`, because the full KleidiAI GEMM/BF16
+families are compiled when the toolchain reports `__ARM_FEATURE_MATMUL_INT8` (the dotprod-only
+candidate is compiled from `__ARM_FEATURE_DOTPROD`); plus
 `QWEN_NO_SDOT`, `QWEN_NO_SMMLA`, `QWEN_NO_BFMMLA`, `QWEN_ARM_BFDOT`, `QWEN_APPLE_MMLA` and
 their `*_MIN_B` thresholds. `QWEN_PREFILL_MATMAT` exists on both, but what it selects differs:
 the KleidiAI bf16 matmat on ARM, the AMX one on x86.

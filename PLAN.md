@@ -14,8 +14,10 @@ streaming evidence. See `docs/serving/boxes.md` for current host qualifications.
 Work is on `feature/old-cpus-simd`, based on main `e391ec5467b0218eeb175f4888ad65b259d1e7c7`.
 AVX2 B>1 INT8/Q4 matmat already exists. AVX2 and AVX-512BW no-VNNI B=1 GEMV candidates plus
 decoder DL-4 are opt-in. AVX-512F without VNNI reuses AVX2-width kernels for B>1 and checks
-F/BW/VL at dispatch and startup. Dotprod Arm uses SDOT; KleidiAI's current packed paths require
-i8mm. New candidates stay off pending native-host streaming and performance qualification. Detail:
+F/BW/VL at dispatch and startup. Dotprod Arm uses SDOT; full KleidiAI GEMM/region paths require
+i8mm, while a separate dotprod-only B=1 GEMV candidate is available behind
+`QWEN_KAI_DOTPROD_GEMV=1`. New candidates stay off pending native-host streaming and performance
+qualification. Detail:
 `.work/legacy-cpu-v2-audit-20260916.md`.
 
 ### Completed and validated outcomes
@@ -31,7 +33,7 @@ i8mm. New candidates stay off pending native-host streaming and performance qual
 
 ### Legacy CPU qualification still open
 
-- [ ] ISA-AUDIT-1 Audit released-main ISA/kernel/v2 reachability before new SIMD work. Detail: `.work/isa-v2-reachability-audit-20260919.md`.
+- [x] ISA-AUDIT-1 Audit released-main ISA/kernel/v2 reachability before new SIMD work; v2 census and qualification harness are implemented, with native Linux qualification still open. Detail: `.work/isa-v2-reachability-audit-20260919.md`.
 - [ ] LEGACY-5 Add/run plain-NEON and dotprod screens on Neoverse N1 and i8mm-capable V1; qualify current v2 streams. Detail: audit §23–24.
 - [ ] OLDCPU-1 Measure AVX2 INT8/Q4 B=1 GEMV candidates and v2 stream behavior on a native Zen3/4 or equivalent host.
 - [ ] OLDCPU-2 Run complete dispatch/server qualification on AVX-512F without VNNI; compare its AVX2-width path and frequency behavior.
@@ -40,7 +42,7 @@ i8mm. New candidates stay off pending native-host streaming and performance qual
 - [ ] OLDCPU-6 Screen a dedicated AVX-512BW no-VNNI B>1 INT8/Q4 matmat against the existing AVX2 fallback; implement only if a physical host shows a server-level gain. Detail: audit §18, §26.
 - [ ] OLDCPU-3 Qualify the direct AVX2 decoder path in complete-call and streaming tests; both `QWEN_SD_INT8=1` and `QWEN_SD_RES1_V2=1` are required.
 - [ ] OLDARM-1 A/B INT8 SDOT matmat and fused Q4 SDOT matmat on target CP/Talker shapes; record kernel B separately from server concurrency C.
-- [ ] OLDARM-2 Keep KleidiAI dotprod/i8mm splitting blocked until build, runner and RHS packing contracts are independently safe.
+- [x] OLDARM-2 Split KleidiAI dotprod B=1 GEMV packing/runner from i8mm GEMM; candidate is default-off and awaits Linux native qualification.
 - [ ] LEGACY-CPU-1 Run measured AVX2/no-VNNI and Arm dotprod/NEON server screens before changing backend policy.
 
 ## Other CPU qualification

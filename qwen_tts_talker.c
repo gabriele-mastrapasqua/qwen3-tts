@@ -1073,7 +1073,8 @@ static void tk_release_bf16(qwen_tts_ctx_t *caller) {
 #define PREFW(L, F) ((uint16_t *)((L)->F##_bf16_pref ? (L)->F##_bf16_pref : (L)->F##_bf16))
 
 void qwen_kleidi_prepack(qwen_tts_ctx_t *ctx) {
-    if (!ctx || (!qwen_kleidi_i8_enabled() && !qwen_kleidi_bf16_enabled())) return;
+    if (!ctx || (!qwen_kleidi_i8_enabled() && !qwen_kleidi_bf16_enabled() &&
+                 !qwen_kleidi_dotprod_enabled())) return;
     qwen_tts_config_t *c = &ctx->config;
     const int h = c->hidden_size;
     const int q_dim = c->num_heads * c->head_dim;

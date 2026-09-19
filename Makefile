@@ -93,27 +93,33 @@ $(ARCH_STAMP): FORCE
 	@printf '%s\n' '$(ARCH_STAMP_VALUE)' > $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; sleep 1; fi
 
+KAI_HAS_DOTPROD := $(shell $(CC) $(ARCH_FLAGS) -dM -E -x c /dev/null 2>/dev/null | grep -c __ARM_FEATURE_DOTPROD)
 KAI_HAS_I8MM := $(shell $(CC) $(ARCH_FLAGS) -dM -E -x c /dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8)
-ifeq ($(KAI_HAS_I8MM),1)
 KAI_DIR  = third_party/kleidiai
-KAI_SRCS = $(KAI_DIR)/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4c32pscalef16_qsu4c32s16s0.c \
-           $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32p_f32.c \
-           $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod.c \
-           $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm.c
-KAI_ASM  = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod_asm.S \
-           $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm_asm.S
-
 KAI_I8_DIR = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp
-KAI_SRCS += $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.c \
-            $(KAI_DIR)/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c \
-            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4x4_1x4_neon_dotprod.c \
-            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod.c \
-            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod.c \
-            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm.c
-KAI_ASM  += $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4x4_1x4_neon_dotprod_asm.S \
-            $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm_asm.S
 
-KAI_HAS_BF16 := $(shell $(CC) $(ARCH_FLAGS) -dM -E -x c /dev/null 2>/dev/null | grep -qE '^#define __ARM_FEATURE_BF16 ' && echo 1 || echo 0)
+# Dotprod GEMV and i8mm GEMM use different nr/kr/sr contracts. Keep the
+# dotprod objects available on dotprod-only hosts and add the i8mm objects only
+# when the compiler can emit SMMLA. This prevents a dotprod-only build from
+# accidentally inheriting the full i8mm packing contract.
+ifeq ($(KAI_HAS_DOTPROD),1)
+KAI_DOTPROD_SRCS = $(KAI_DIR)/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4c32pscalef16_qsu4c32s16s0.c \
+                   $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32p_f32.c \
+                   $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod.c \
+                   $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.c \
+                   $(KAI_DIR)/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c \
+                   $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod.c
+KAI_DOTPROD_ASM = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod_asm.S
+KAI_INC = -I$(KAI_DIR)
+endif
+
+ifeq ($(KAI_HAS_I8MM),1)
+KAI_SRCS = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm.c \
+           $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm.c
+KAI_ASM  = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p4x8_16x4_neon_i8mm_asm.S \
+           $(KAI_I8_DIR)/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm_asm.S
+
+KAI_HAS_BF16 := $(shell $(CC) $(ARCH_FLAGS) -dM -E -x c /dev/null 2>/dev/null | grep -qE '^#define __ARM_FEATURE_BF16_VECTOR_ARITHMETIC ' && echo 1 || echo 0)
 ifeq ($(KAI_HAS_BF16),1)
 KAI_BF_DIR = $(KAI_DIR)/kai/ukernels/matmul/matmul_clamp_f32_bf16p_bf16p
 KAI_SRCS += $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_bf16p1x4_f32_neon.c \
@@ -122,12 +128,14 @@ KAI_SRCS += $(KAI_DIR)/kai/ukernels/matmul/pack/kai_lhs_quant_pack_bf16p1x4_f32_
             $(KAI_BF_DIR)/kai_matmul_clamp_f32_bf16p1x4_bf16p12x4b_1x36_neon_dot.c \
             $(KAI_BF_DIR)/kai_matmul_clamp_f32_bf16p8x4_bf16p12x4b_8x12_neon_mmla.c
 endif
-KAI_AOBJ = $(KAI_ASM:.S=.o)
-KAI_INC  = -I$(KAI_DIR)
+KAI_AOBJ = $(KAI_DOTPROD_ASM:.S=.o) $(KAI_ASM:.S=.o)
+KAI_INC  ?= -I$(KAI_DIR)
 endif
 
+KAI_AOBJ ?= $(KAI_DOTPROD_ASM:.S=.o) $(KAI_ASM:.S=.o)
+
 SRCS = main.c \
-       qwen_tts_kleidi.c qwen_tts_q8repack.c qwen_tts_q4export.c $(KAI_SRCS) \
+       qwen_tts_kleidi.c qwen_tts_kleidi_dotprod.c qwen_tts_q8repack.c qwen_tts_q4export.c $(KAI_DOTPROD_SRCS) $(KAI_SRCS) \
        qwen_tts.c \
        qwen_tts_gguf.c \
        qwen_tts_talker.c \
@@ -178,7 +186,7 @@ update-ingot:
 clean-ingot:
 	@$(MAKE) -C $(INGOT_DIR) clean
 
-.PHONY: update-ingot clean-ingot test-v2-census
+.PHONY: update-ingot clean-ingot test-v2-census test-kai-dotprod
 
 $(TARGET): $(OBJS) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(INGOT_LIB) $(LDLIBS)
@@ -226,6 +234,7 @@ help:
 	@echo "                               expected-vs-observed per ISA class -> profiles/<date>_<host>_<sha8>/"
 	@echo "  make cpu-qualify           - one-command old-CPU/ISA-v2 qualification (hardware, compile/parity,"
 	@echo "                               model-free A/B and optional MODEL+C1/C2/C4/C8 census)"
+	@echo "  make test-kai-dotprod      - dotprod-only KleidiAI Q4/int8 GEMV pack/parity smoke (opt-in candidate)"
 	@echo "  make doctor                - first serving preflight: <1 min, no model; on 32-core Arm also"
 	@echo "                               simultaneous 1x8/2x8/4x8 GEMV scaling, then identity + dispatch + draft profile"
 	@echo "  make dispatch-map          - just the resolved dispatch table (./qwen_tts --dispatch-map)"
@@ -380,6 +389,15 @@ test-v2-census: tests/v2_census_unit
 
 tests/v2_census_unit: tests/v2_census_unit.c qwen_tts_v2_census.c qwen_tts_v2_census.h
 	$(CC) $(CFLAGS_BASE) -I. -std=gnu11 -o $@ tests/v2_census_unit.c qwen_tts_v2_census.c -lpthread
+
+ifeq ($(KAI_HAS_DOTPROD),1)
+test-kai-dotprod: qwen_tts_kleidi_dotprod.o $(KAI_DOTPROD_SRCS) $(KAI_DOTPROD_ASM:.S=.o)
+	@$(CC) $(CFLAGS) -I. -o /tmp/qwen-kai-dotprod-unit tests/kai_dotprod_unit.c qwen_tts_kleidi_dotprod.o $(KAI_DOTPROD_SRCS) $(KAI_DOTPROD_ASM:.S=.o) $(LDLIBS)
+	@QWEN_KAI_DOTPROD_GEMV=1 /tmp/qwen-kai-dotprod-unit
+else
+test-kai-dotprod:
+	@echo "SKIP: compiler has no Arm dotprod target"
+endif
 
 emotion-para-demo: $(TARGET)
 	@bash tests/emotion_para_demo.sh
@@ -836,7 +854,10 @@ bench-suite-full: bench-suite
 # qwen_tts_costmap.c is not optional: qwen_tts_thread.c calls qwen_region_begin_/end_, so
 # leaving it out breaks the link, not the measurement.
 PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_v2_census.c qwen_tts_thread.c \
-             qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
+             qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_kleidi_dotprod.c qwen_tts_q8repack.c \
+             $(KAI_DOTPROD_SRCS) $(KAI_SRCS) $(KAI_DOTPROD_ASM) $(KAI_ASM)
+PARITY_X86_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_v2_census.c qwen_tts_thread.c \
+                 qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_kleidi_dotprod.c qwen_tts_q8repack.c
 PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I. -I$(INGOT_DIR)/include $(KAI_INC)
 check-matmat-parity: $(INGOT_LIB)
 	@echo "=== matmat parity — native ISA ==="
@@ -853,7 +874,7 @@ check-matmat-parity-x86:
 ifeq ($(UNAME_S)-$(UNAME_M),Darwin-arm64)
 	@echo "=== matmat parity — x86-64-v3 (AVX2) under Rosetta 2 ==="
 	@clang -target x86_64-apple-macos13 $(PARITY_CF) -DUSE_BLAS -DACCELERATE_NEW_LAPACK \
-	  -march=x86-64-v3 $(PARITY_SRC) -framework Accelerate -lm -o /tmp/matmat_parity_x86
+	  -march=x86-64-v3 $(PARITY_X86_SRC) -framework Accelerate -lm -o /tmp/matmat_parity_x86
 	@/tmp/matmat_parity_x86
 else
 	@echo "check-matmat-parity-x86: Arm Mac only (needs Rosetta 2). On x86 use check-matmat-parity."

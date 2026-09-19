@@ -220,6 +220,8 @@ def make_checks(binary: Path, out: Path, records: list[dict[str, Any]], timeout:
     run_cmd(records, "matmat_parity_x86_control", ["make", "check-matmat-parity-x86"], out,
             timeout=timeout, required=False,
             label="PARITY VERIFIED where Rosetta control is available")
+    run_cmd(records, "kai_dotprod_parity", ["make", "test-kai-dotprod"], out,
+            timeout=timeout, label="PARITY VERIFIED: dotprod-only vendor pack/kernel ABI where available")
     run_cmd(records, "selftest_native", [str(binary), "--self-test"], out,
             timeout=timeout, label="PARITY VERIFIED: dispatched native self-test")
     run_cmd(records, "selftest_fallback", [str(binary), "--self-test"], out,
@@ -232,6 +234,7 @@ def candidate_envs(dispatch: dict[str, Any]) -> dict[str, dict[str, str]]:
         "QWEN_AVX2_INT8_GEMV": "0", "QWEN_AVX2_Q4_GEMV": "0",
         "QWEN_AVX512_INT8_GEMV": "0", "QWEN_AVX512_Q4_GEMV": "0",
         "QWEN_INT8_SDOT_MM": "0", "QWEN_Q4_SDOT_MM": "0",
+        "QWEN_KAI_DOTPROD_GEMV": "0",
     }
     cls = str(dispatch.get("isa_class", ""))
     if cls.startswith("x86_") or platform.machine().lower() in ("x86_64", "amd64"):
@@ -246,6 +249,7 @@ def candidate_envs(dispatch: dict[str, Any]) -> dict[str, dict[str, str]]:
         "baseline": baseline,
         "sdot_matmat": {**baseline, "QWEN_INT8_SDOT_MM": "1"},
         "q4_sdot_matmat": {**baseline, "QWEN_Q4_SDOT_MM": "1"},
+        "kai_dotprod_gemv": {**baseline, "QWEN_KAI_DOTPROD_GEMV": "1"},
     }
 
 

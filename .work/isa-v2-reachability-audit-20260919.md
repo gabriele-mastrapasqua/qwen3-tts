@@ -12,7 +12,7 @@ Files/functions inspected · `Makefile`; `qwen_tts_kernels.c/.h`; `qwen_tts_klei
 
 Evidence · Source guards, runtime predicates, call sites, and fallback branches were read in the clean archive. The archive was built with `make blas`; `--caps`, `--dispatch-map`, and `--self-test` were run from the resulting binary. The Apple M1-class self-test passed all cases. The exact command output is summarized in §L; raw build output is not tracked.
 
-Conclusion · The released tree is usable across the scalar/NEON/AVX2/AVX-512/AMX families, but support is uneven by operation and batch width. AVX-512 without VNNI is a real wide FP/SIMD build that reuses AVX2 integer matmat; it is not an AVX-512 integer backend. The largest production reachability defects are (1) ragged decoder batching is disabled for ordinary VNNI/SDOT INT8 paths, (2) live B_eff above 16 silently misses most native matmat gates, and (3) KleidiAI is coupled to i8mm even for dotprod-only GEMV-capable CPUs. B=1 INT8/Q4 on AVX2 and AVX-512-no-VNNI remains a fallback/candidate problem, not proof that AVX2 is complete. Existing code should be wired and instrumented before new SIMD is written.
+Conclusion · The released tree is usable across the scalar/NEON/AVX2/AVX-512/AMX families, but support is uneven by operation and batch width. AVX-512 without VNNI is a real wide FP/SIMD build that reuses AVX2 integer matmat; it is not an AVX-512 integer backend. The largest baseline reachability defects are (1) ragged decoder batching is disabled for ordinary VNNI/SDOT INT8 paths and (2) live B_eff above 16 silently misses most native matmat gates. The former remains an intentional control pending an equivalent multislot panel implementation; the latter now has an opt-in chunking control. The dotprod-only KleidiAI gate has since been split for a default-off B=1 candidate, while full KAI GEMM/regions remain i8mm-only. B=1 INT8/Q4 on AVX2 and AVX-512-no-VNNI remains a fallback/candidate problem, not proof that AVX2 is complete.
 
 Next action · Track P0 wiring/observability and P1 gate fixes first; qualify them on native Linux hosts; only then benchmark or implement P2 kernels.
 
@@ -23,7 +23,7 @@ Next action · Track P0 wiring/observability and P1 gate fixes first; qualify th
 3. **AVX2/FMA is active for B>1 matmat, but B=1 integer GEMV is not native by default.** `qwen_matmat_int8()` and `qwen_matmat_q4_0()` can select AVX2 for B>1. `qwen_matvec_int8()` and `qwen_matvec_q4_0()` select the signed-widening AVX2 candidates only when their environment flags are set; otherwise they use the fused FP32/dequant fallback. The known negative candidate must remain opt-in.
 4. **AVX-512 without VNNI is not a separate integer tier.** The `avx512` profile compiles AVX512F/BW/VL plus AVX2/FMA, but no VNNI or BF16. FP32, attention, RMS, conversion, and helper code can use AVX-512; INT8/Q4 B>1 reuses AVX2-width kernels; B=1 uses the same fallback/candidate policy as AVX2.
 5. **VNNI and AMX are shape-gated, not host-wide labels.** VNNI B=1 GEMV and B>1 matmat are available when shapes and environment permit. AMX INT8 begins at B>=3 and rows>=32/cols>=64; AMX BF16 begins at B>=4 and rows/cols>=32. B=1 on an AMX host still uses GEMV/VNNI/FP32 paths.
-6. **KleidiAI has a concrete dotprod-only support gap.** The Makefile and `qwen_tts_kleidi.c` require both `__ARM_FEATURE_DOTPROD` and `__ARM_FEATURE_MATMUL_INT8`, and runtime requires HWCAP dotprod plus i8mm. KAI's dotprod 1x kernels exist, but a Neoverse-v1/dotprod-only CPU cannot compile or select them.
+6. **Baseline KAI support was coupled to i8mm.** The full Makefile/backend still requires `__ARM_FEATURE_MATMUL_INT8` and runtime dotprod+i8mm for GEMM/regions, but the branch now builds a separate dotprod-only B=1 Q4/INT8 candidate from `__ARM_FEATURE_DOTPROD`, with its own packing and `QWEN_KAI_DOTPROD_GEMV=1` opt-in. Linux complete-call qualification remains open.
 7. **Decoder reachability differs from Talker/CP.** Per-item INT8 decoder convolution is compiled only for AVX512VNNI or Arm dotprod. The v2 decoder batch entry returns to per-item decode unless AMX decoder support or the explicit multislot-v2 lane is enabled (`qwen_tts_speech_decoder.c:4512-4547`). A VNNI or SDOT host therefore does not automatically get a B>1 decoder kernel.
 8. **Observability is not yet enough to prove production leaf reachability.** `--caps` and `--dispatch-map` report representative B values and family predicates, but no per-stage `B_eff`, runnable/parked reason, contiguity, or leaf histogram. A small default-off census extension is needed before declaring C4/C8 coverage.
 9. **The released dispatch class hides the AVX-512-no-VNNI tier.** `qwen_tts_dispatch.c:81-113` checks VNNI and then AVX2, so a no-VNNI AVX-512 build is reported as `x86_avx2` even though its FP helpers were compiled at AVX-512 width. The server and qualification reports cannot currently distinguish “AVX2 host” from “AVX-512F/BW/VL host reusing AVX2 integer kernels.”
@@ -78,12 +78,12 @@ The Makefile's Linux auto selection is ordered AMX → AVX512-BF16 → AVX512-VN
 | BF16/BFDOT/BFMMLA | `__ARM_FEATURE_BF16_VECTOR_ARITHMETIC` in kernels; BFMMLA runtime; Apple BFMMLA default off; `QWEN_ARM_BFDOT` opt-in | BF16 matmat BFMMLA; BF16 GEMV usually NEON 2-row; BFDOT is opt-in | ACTIVE/OPT-IN |
 | SVE/SVE2 | No qwen engine SVE/SVE2 guards or dispatch; only vendor helper declarations | No SVE/SVE2 GEMV/GEMM | Not implemented |
 | SME | No qwen engine SME kernels/dispatch; vendor declarations only | No SME path | Not implemented |
-| KleidiAI dotprod | Source contains dotprod 1x kernels | Whole build/runtime gate requires i8mm as well | SUPPORT GAP on dotprod-only CPUs |
-| KleidiAI i8mm | `QWEN_KLEIDI_BUILD` requires AArch64 + DOTPROD + MATMUL_INT8; runtime checks both | Q4/INT8/BF16 GEMV/GEMM, prepared regions, selected Talker/CP | ACTIVE on i8mm hosts; no dotprod-only use |
-| Apple Silicon M1 | Darwin sysctl reports NEON+dotprod; BFMMLA/SMMLA default off; KAI unavailable without i8mm | SDOT B=1; B>1 generic/B×GEMV; BF16 prefill via Accelerate | ACTIVE fallback profile |
+| KleidiAI dotprod | Separate `qwen_tts_kleidi_dotprod.c` and dotprod vendor pack/kernel sources; runtime HWCAP ASIMDDP/sysctl | Opt-in B=1 Q4/INT8 GEMV with dotprod-specific RHS packing; no B>1 KAI region | IMPLEMENTED OPT-IN; local pack/kernel parity, Linux complete-call qualification pending |
+| KleidiAI i8mm | `QWEN_KLEIDI_BUILD` requires AArch64 + DOTPROD + MATMUL_INT8; runtime checks both | Q4/INT8/BF16 GEMV/GEMM, prepared regions, selected Talker/CP | ACTIVE on i8mm hosts; GEMM/regions remain i8mm-only |
+| Apple Silicon M1 | Darwin sysctl reports NEON+dotprod; BFMMLA/SMMLA default off; full KAI unavailable without i8mm; dotprod candidate is opt-in | SDOT B=1; B>1 generic/B×GEMV; optional KAI dotprod B=1; BF16 prefill via Accelerate | ACTIVE fallback profile; candidate locally parity-checked |
 | Apple Silicon M2+ class | Runtime can expose dotprod+i8mm/BF16; Apple MMLA still explicitly opt-in | Potential SMMLA/BFMMLA/KAI paths after env and shape gates | OPT-IN/needs native qualification |
 
-The KAI Makefile source block is conditional on `__ARM_FEATURE_MATMUL_INT8` (`Makefile:91-122`), and `qwen_kleidi_supported()` requires runtime dotprod and i8mm (`qwen_tts_kleidi.c:23-101`). This is stricter than the dotprod GEMV requirement.
+The full KAI Makefile/source block remains conditional on `__ARM_FEATURE_MATMUL_INT8` and `qwen_kleidi_supported()` still requires runtime dotprod+i8mm. The branch additionally builds `qwen_tts_kleidi_dotprod.c` and the vendor dotprod packers/1x kernels when `__ARM_FEATURE_DOTPROD` is present. Its runtime predicate checks HWCAP ASIMDDP/sysctl and its separate registry is only used with `QWEN_KAI_DOTPROD_GEMV=1`; this is a candidate, not a claim that full KAI is available on dotprod-only CPUs.
 
 ## C. Kernel census and caller reachability
 
@@ -93,7 +93,7 @@ This table records the production qwen dispatcher. Vendor Ingot kernels are list
 |---|---|---|---|---|
 | INT8 GEMV, VNNI | `qwen_matvec_int8()`; `__AVX512VNNI__` | VNNI present, `QWEN_NO_VNNI` unset, columns<=8192 | Talker/CP B=1 projections and codec heads on x86 VNNI | ACTIVE |
 | INT8 GEMV, SDOT | `qwen_matvec_int8()`; DOTPROD | `QWEN_NO_SDOT` unset, columns<=8192 | Talker/CP B=1 on Arm dotprod | ACTIVE |
-| INT8 GEMV, KAI | `qwen_tts_kleidi.c`; dotprod+i8mm build | `QWEN_NO_KLEIDI`, KAI runtime | KAI prepared/GEMV paths when model regions and state qualify; unavailable dotprod-only | ACTIVE / gap |
+| INT8 GEMV, KAI | full `qwen_tts_kleidi.c` on dotprod+i8mm; separate `qwen_tts_kleidi_dotprod.c` on dotprod | `QWEN_NO_KLEIDI` for full KAI; `QWEN_KAI_DOTPROD_GEMV=1` for candidate | Full KAI prepared/GEMV paths when model regions and state qualify; dotprod-only candidate reaches B=1 after opt-in/prepack | ACTIVE full KAI; OPT-IN candidate |
 | INT8 GEMV, AVX2 signed widening | `qwen_matvec_int8()`; `__AVX2__` | `QWEN_AVX2_INT8_GEMV=1` and related minimum/shape flags | B=1 only; v2 can reach it if explicitly enabled | OPT-IN; known negative candidate |
 | INT8 GEMV, generic | FP32 fused twin/dequant fallback | Always | All unsupported B=1 cases including AVX2/no-VNNI | FALLBACK |
 | INT8 B>1 matmat, AVX2 | `qwen_matmat_int8()`; `__AVX2__` | `QWEN_NO_AVX2MM`, min B=2, max B=16, shape | Talker/CP batch projections when B_eff>1; AVX512-no-VNNI reuses this | ACTIVE |
@@ -181,12 +181,12 @@ Cells describe what the **released v2 server actually reaches**, with `B=1` mean
 
 | Stage / weight type | B=1 path | B>1 path | AVX2 | AVX-512 no-VNNI | VNNI | AMX | NEON | SDOT / dotprod | i8mm / KAI |
 |---|---|---|---|---|---|---|---|---|---|
-| Talker step INT8 | GEMV | matmat or generic | B1 FP32 fused; B>1 native AVX2 if 2..16 | B1 FP32 fused; B>1 AVX2-width native | native VNNI GEMV/matmat | B1 VNNI/GEMV; B>=3 native AMX when rows/cols pass | generic/f32 | native SDOT GEMV; B>1 SDOT only opt-in, else f32 twin/B×GEMV | KAI GEMV/GEMM or SMMLA when prepared; KAI unavailable dotprod-only |
-| Talker step Q4 | GEMV | matmat/B×GEMV | B1 fused dequant or opt-in candidate; B>1 AVX2 | B1 fused dequant; B>1 AVX2 | native VNNI | B>=4 AMX Q4; B1 VNNI | generic/fused | SDOT GEMV; B>1 explicit B×GEMV | KAI dotprod 1x / i8mm GEMM |
+| Talker step INT8 | GEMV | matmat or generic | B1 FP32 fused; B>1 native AVX2 if 2..16 | B1 FP32 fused; B>1 AVX2-width native | native VNNI GEMV/matmat | B1 VNNI/GEMV; B>=3 native AMX when rows/cols pass | generic/f32 | native SDOT GEMV; B>1 SDOT only opt-in, else f32 twin/B×GEMV | full KAI GEMV/GEMM or SMMLA when prepared; dotprod-only KAI GEMV is opt-in B=1 |
+| Talker step Q4 | GEMV | matmat/B×GEMV | B1 fused dequant or opt-in candidate; B>1 AVX2 | B1 fused dequant; B>1 AVX2 | native VNNI | B>=4 AMX Q4; B1 VNNI | generic/fused | SDOT GEMV; B>1 explicit B×GEMV | dotprod-only KAI 1x GEMV opt-in; i8mm KAI GEMM on full profile |
 | Talker step BF16 | NEON/FP32 or native BF16 | fixed-B/generic or native | generic fixed-B/f32 twin | generic fixed-B/f32 twin; no BF16 instruction | generic fixed-B/f32 unless BF16 profile | B>=4 AMX BF16 with shape | 2-row NEON/f32 | no SDOT BF16 GEMM | KAI BF16 only BF16+i8mm build |
 | Talker prefill INT8 | usually non-INT8/BLAS unless opt-in | chunks <=16 then INT8 dispatcher | opt-in AVX2 matmat; otherwise fallback | same AVX2-width fallback | VNNI only when opt-in and B gate passes | AMX if chunk/shape gate passes | generic/BLAS | SDOT opt-in; otherwise generic | KAI/prepared if model and build qualify |
 | Talker prefill BF16 | convert + SGEMM unless native backend | chunks default 16 (env 16..64) | FP32 conversion + BLAS | FP32 conversion + BLAS | FP32 conversion + BLAS unless BF16 profile | native AMX BF16 if chunk/shape | FP32/Accelerate or generic | not a BF16 GEMM path | KAI BF16 if independently compiled |
-| CP step INT8/QKV | GEMV | matmat or CP region | B1 fused FP32; B>1 AVX2 if gate | AVX2-width B>1; no AVX512 integer | native VNNI; CP region if enabled | AMX/QKV/region for shape | generic/f32 | SDOT B1; B>1 opt-in or generic | KAI region/GEMM if prepared |
+| CP step INT8/QKV | GEMV | matmat or CP region | B1 fused FP32; B>1 AVX2 if gate | AVX2-width B>1; no AVX512 integer | native VNNI; CP region if enabled | AMX/QKV/region for shape | generic/f32 | SDOT B1; B>1 opt-in or generic | full KAI region/GEMM if prepared; dotprod-only candidate is B=1 GEMV |
 | CP prefill/frame heads | GEMV/three projections | QKV/heads or region | no fused QKV; AVX2 projections | no fused QKV; AVX2 projections | fused QKV and CP region when contiguous | fused QKV/region for shape | three generic projections | three SDOT/B×GEMV paths | KAI prepared heads/region |
 | Decoder per item INT8 conv | native conv only on supported ISA | not a batch operation | **missing** integer conv; f32/BLAS | **missing** integer conv; f32/BLAS | native VNNI conv when `QWEN_SD_INT8` and square shape | AMX decoder D/BF16 options, not the ordinary VNNI leaf | NEON/f32 unless dotprod | native SDOT conv only with decoder INT8 opt-in | KAI decoder BF16/MLP only in qualified prepared modes |
 | Decoder ragged batch | per-item fallback for one frame/slot | exact batch only with explicit gates | no AVX2 int8 batch; BLAS/f32 | no VNNI decoder batch; BLAS/f32 | **not reached by default**; batch gate falls back to per item | native/AMX decoder batch if exact+AMX | per-item/generic | **not reached by default**; per item if enabled | KAI/prepare path only where decoder mode explicitly enables it |
@@ -206,7 +206,7 @@ The selection report's B=1/2/4/8/16 probes (`qwen_kernel_selection_report`) are 
 
 | Finding | Evidence | Classification |
 |---|---|---|
-| KAI dotprod 1x implementation cannot be built on dotprod-only CPUs | Makefile KAI block and `kleidi_cpu_ok()` require i8mm; source has dotprod path | P1 support/gating gap |
+| KAI dotprod 1x implementation was gated with the i8mm backend | `qwen_tts_kleidi_dotprod.c` now has a separate dotprod pack/registry; full KAI still owns i8mm GEMM/regions | **FIXED OPT-IN**; native Linux qualification remains |
 | AVX2/no-VNNI INT8 and Q4 B1 candidates are opt-in and not default server coverage | `qwen_matvec_int8/q4_0()` check `QWEN_AVX2_*_GEMV`; default falls to FP32/dequant | P2 candidate, not a wiring bug; preserve negative benchmark |
 | AVX-512 no-VNNI has no AVX512 integer GEMV/GEMM leaf | `qwen_matmat_int8/q4_0()` selects AVX2; no VNNI/AVX512 integer guard | P2 only after complete-call/downclock evidence |
 | SDOT INT8 B>1 matmat is opt-in; Q4 B>1 is B×GEMV | `QWEN_INT8_SDOT_MM`; explicit Q4 B-column loop | P1 policy/observability, P2 new kernel |
@@ -220,8 +220,8 @@ The selection report's B=1/2/4/8/16 probes (`qwen_kernel_selection_report`) are 
 
 ## G. Capability and observability defects
 
-1. **KAI gate is stricter than the GEMV contract (P1).** Split KAI dotprod 1x build/runtime support from i8mm GEMM/region support. Keep i8mm required for packed GEMM, but allow a dotprod-only runner if its ABI and packing are valid.
-2. **BF16 macro names need an explicit compile check (P1).** The Makefile BF16 source block uses `__ARM_FEATURE_BF16`, while kernel bodies use `__ARM_FEATURE_BF16_VECTOR_ARITHMETIC`. They may coincide on the target compiler, but this is not proven by the current guard contract and can silently omit a usable KAI BF16 source.
+1. **KAI gate was stricter than the GEMV contract (P1; fixed opt-in).** Dotprod 1x build/runtime support is now separate from i8mm GEMM/region support. The candidate uses its own packing and remains opt-in pending native complete-call qualification.
+2. **BF16 macro contract (fixed; compile verified).** The Makefile and KAI source guard now use `__ARM_FEATURE_BF16_VECTOR_ARITHMETIC`, matching the vendor BF16 translation units. Native Arm runtime qualification remains pending.
 3. **First-use environment caching is order-sensitive (P1).** `qwen_mm_use`, `qwen_kleidi_enabled`, and decoder flags cache environment decisions atomically. Running `--caps`, `--dispatch-map`, self-test, or a library probe before server initialization can freeze a value before the server applies its environment. The server should initialize flags before any report or explicitly reject late changes.
 4. **The reports are too coarse to prove v2 reachability (P1).** `qwen_tts_dispatch.c` exposes compiled/supported/resolved rows and representative B probes, but not stage, active mask, B_eff, contiguity, region use, or fallback reason per server step. Add a default-off low-cost histogram/event row to the existing census.
 5. **The capability report omits some audited features (P2 observability).** `--caps` reports AVX/AVX2/FMA/AVX512F/BW/VNNI/BF16 and AMX-int8, but not F16C, BMI1/2, AVX512VL/DQ, AVX512-FP16, or an explicit AMX-BF16 runtime line. Their absence is a reporting gap, not evidence of support.
@@ -238,7 +238,7 @@ The selection report's B=1/2/4/8/16 probes (`qwen_kernel_selection_report`) are 
 
 ### P1 — current fallback/gate is clearly narrower than existing code
 
-* Decouple KAI dotprod GEMV from i8mm GEMM and make q8-repack B1/B>1 behavior explicit.
+* Keep the new KAI dotprod GEMV opt-in and make q8-repack B1/B>1 behavior explicit on a native Arm host.
 * Make SDOT B>1 policy shape-aware and visible. Retain the Apple M1 evidence where B×SDOT GEMV beat the SDOT matmat candidate; no global promotion follows from that result.
 * Initialize dispatch flags before caps/dispatch-map/self-test or remove first-use caching for server-controlled flags.
 * Add parity/census coverage for CP and Talker so the same B_eff reaches the same family policy; currently CP regions and QKV have narrower conditions.
@@ -249,7 +249,7 @@ The selection report's B=1/2/4/8/16 probes (`qwen_kernel_selection_report`) are 
 * AVX512-no-VNNI B>1 INT8/Q4 512-bit formulations. First compare complete-call cost against the existing AVX2 path, memory behavior, and AVX-512 frequency/downclock on a Skylake-SP-class host.
 * Fused AVX2/Arm QKV only if the three-projection fallback dominates measured serving traces and packing can be reused.
 * Decoder AVX2/no-VNNI integer convolution only after decoder batch/per-item reachability is measured; the current source has no such production body.
-* Native dotprod-only KAI GEMV if the vendor ABI can safely be split from i8mm.
+* Promote the dotprod-only KAI GEMV candidate only if native complete-call measurements beat the existing SDOT/B×GEMV paths; the implementation and parity hook are now present.
 
 ### P3 — theoretical or low-priority
 
@@ -267,7 +267,7 @@ This is a compatibility/qualification matrix, not a performance claim. Every tar
 | X3 VNNI | Cascade Lake, Ice Lake, Sapphire Rapids | Which Talker/CP/QKV/decoder leaves use VNNI at B1/B>1? | per-stage census and decoder batch test |
 | X4 AMX | Sapphire Rapids/Granite Rapids with AMX permissions | Are AMX gates reached only at B/shape thresholds and permission succeeds? | AMX permission check, B1 vs B3/B4/B8, decoder AMX mode |
 | A1 plain NEON | Neoverse N1 / Ampere Altra / Graviton2 | End-to-end generic/f32 paths, no accidental dotprod assumption | Linux HWCAP and C1/C4 stream |
-| A2 dotprod-only | Neoverse V1 or Apple M1-like dotprod without i8mm | SDOT B1, SDOT opt-in B>1, Q4 B×GEMV, KAI rejection | verify no i8mm and census reason |
+| A2 dotprod-only | Neoverse N1/Graviton2/Altra or Apple M1-like dotprod without i8mm | SDOT B1, SDOT opt-in B>1, Q4 B×GEMV, optional KAI dotprod B1 | verify no i8mm, candidate census leaf/reason and complete-call A/B |
 | A3 dotprod+i8mm | Graviton3/V1-class with i8mm or equivalent | SMMLA/KAI GEMM and q8-repack B>1 | separate native GEMV/GEMM and prepared-region tests |
 | A4 BF16 Arm | Neoverse V1/V2 or Graviton3/4 exposing BF16 | BFMMLA/BFDOT/KAI BF16 guards and defaults | compiler macros, HWCAP, B2/B4 prefill/step |
 | Apple separately | M1, then M2/M3/M4 class | Darwin sysctl, MMLA defaults, Accelerate prefill | no Linux HWCAP assumptions; explicit env/default census |
@@ -351,7 +351,8 @@ milestone is now present in the working branch (preserved work is committed sepa
 | P0 per-stage v2 reachability was not observable | **INSTRUMENTED — NEEDS NATIVE QUALIFICATION** | `qwen_tts_v2_census.c/.h` adds an off-by-default aggregate census with stage, capacity C, runnable count, B_eff, contiguity, weight, operation, path, leaf, reason, count and MACs. Talker, CP, prefill, decoder, and the Talker/CP region runners are wrapped. `QWEN_V2_CENSUS=1` emits deterministic CSV; `QWEN_V2_CENSUS_JSON` writes a machine-readable artifact. Local unit coverage is in `make test-v2-census`. |
 | B_eff > 16 silently misses optimized gates | **FIXED AS AN EXPLICIT CONTROL; DEFAULT POLICY UNCHANGED** | `QWEN_BATCH_CHUNK_MAX_B=2..16` enables ordered `16+tail` chunking in the existing Talker projection helpers. The default remains unset, so native qualification can compare the prior generic B>16 behavior with the chunked control. Partition tests cover B=1..32; numerical serving parity still needs a model-backed run at B=17/20/24/31/32. |
 | Ordinary VNNI/SDOT decoder batch bypass | **INSTRUMENTED — POLICY STILL OPEN** | The batch entry now records the exact decoder policy and actual AMX-BF16/AMX-INT8 path hint before either the ragged body or the per-item fallback. The released semantic gate is unchanged: plain VNNI/SDOT INT8 remains the control until an equivalent multislot implementation is proven. Native VNNI/SDOT parity and performance are still required before wiring it. |
-| KAI dotprod-only support gap | **DEFERRED — ABI/PACKING REFACTOR REQUIRED** | Static source review confirms the current registration and RHS packing use i8mm-family contracts even when B=1. Compiling the whole KAI block under dotprod alone would therefore be unsafe. The existing dotprod 1x vendor sources remain recorded as a P1 target; no gate was broadened speculatively. |
+| KAI dotprod-only support gap | **IMPLEMENTED — OPT-IN; NEEDS LINUX NATIVE QUALIFICATION** | `qwen_tts_kleidi_dotprod.c` adds a separate dotprod-only registry and distinct Q4/int8 RHS packing for B=1 GEMV. `Makefile` now builds the vendor dotprod packers/kernels when `__ARM_FEATURE_DOTPROD` is present and adds i8mm objects only for `__ARM_FEATURE_MATMUL_INT8`. Existing i8mm GEMM/region APIs and gates remain unchanged. `QWEN_KAI_DOTPROD_GEMV=1` is default-off; `make test-kai-dotprod` proves pack/kernel parity on the local Apple dotprod host. Linux HWCAP, model reachability, and performance remain required. |
+| BF16 macro contract | **FIXED — COMPILE VERIFIED; NATIVE QUALIFICATION PENDING** | The Makefile and KAI source guard now use `__ARM_FEATURE_BF16_VECTOR_ARITHMETIC`, matching every vendor BF16 translation unit. `make check-isa` covers the Arm BF16 profile; runtime BF16/KAI behavior still needs a Linux Arm host. |
 | AVX-512 no-VNNI classification | **FIXED IN PRESERVATION COMMIT** | The dispatch/reporting change from the previous work distinguishes `x86_avx512_no_vnni`; the new v2 census keeps the actual AVX2 integer leaf separate from wide FP/helper classification. |
 | First-use environment cache ordering | **OPEN — NEEDS POLICY CONTRACT TEST** | The census does not change cache semantics. Standalone `--caps`/`--dispatch-map` exit before server startup, while server defaults are applied before continuous serving. A dedicated initialization contract test is still needed before changing the existing cached policies. |
 
@@ -377,3 +378,13 @@ milestone is now present in the working branch (preserved work is committed sepa
 * The first smoke run exposed a real integration omission: the standalone matmat parity target
   did not link the new census module. `PARITY_SRC` now includes `qwen_tts_v2_census.c`; native
   and Rosetta parity both pass again.
+* The KAI split was implemented without changing a production default. On a dotprod-only build,
+  model registration delegates B=1 Q4/int8 weights to the separate candidate registry only when
+  `QWEN_KAI_DOTPROD_GEMV=1`; B>1 continues through the existing SDOT/generic policy. Dispatch
+  reports now show `kleidi.dotprod_gemv` independently from `kleidi.enabled` (full i8mm KAI).
+* `make test-kai-dotprod` passed locally for adversarial synthetic Q4/int8 rows. This is vendor
+  ABI/packing and arithmetic parity evidence, not a claim that the candidate wins against native
+  SDOT or that Linux HWCAP exposure is correct.
+* The qualification harness runs the dotprod parity target and includes a `kai_dotprod_gemv`
+  opt-in arm in model-free A/B manifests. Complete-call A/B still requires a model and a Linux
+  dotprod-only host; the candidate remains default-off until that measurement.

@@ -600,6 +600,13 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
 
     /* ---- KleidiAI (Arm) ------------------------------------------------------------ */
     {
+        row(&feats[n++], "kleidi.dotprod_gemv", yn(qwen_kleidi_dotprod_compiled()),
+            yn(qwen_kleidi_dotprod_supported()), "QWEN_KAI_DOTPROD_GEMV",
+            onoff(qwen_kleidi_dotprod_enabled()),
+            !qwen_kleidi_dotprod_compiled() ? "not compiled (needs Arm dotprod)" :
+            !qwen_kleidi_dotprod_supported() ? "compiled, CPU lacks dotprod" :
+            qwen_kleidi_dotprod_enabled() ? "opt-in B=1 Q4/int8 GEMV; separate dotprod packing" :
+            "available, opt-in (i8mm GEMM remains separate)");
         int build =
 #if defined(__ARM_FEATURE_MATMUL_INT8)
             1;
@@ -809,7 +816,9 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             json_str(j, qwen_matmat_family_bf16());
             fprintf(j, ",\n    \"prefill_matmat_active\": %s,\n", prefill_on ? "true" : "false");
             fprintf(j, "    \"prefill_reason\": "); json_str(j, prefill_why ? prefill_why : "unknown");
-            fprintf(j, ",\n    \"kleidi_active\": %s\n", qwen_kleidi_enabled() ? "true" : "false");
+            fprintf(j, ",\n    \"kleidi_active\": %s,\n", qwen_kleidi_enabled() ? "true" : "false");
+            fprintf(j, "    \"kleidi_dotprod_gemv_active\": %s\n",
+                    qwen_kleidi_dotprod_enabled() ? "true" : "false");
             fprintf(j, "  },\n  \"gates\": [\n");
         }
         for (int i = 0; i < ng; i++) {

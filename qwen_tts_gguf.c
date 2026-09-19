@@ -215,7 +215,8 @@ int qwen_gguf_override_talker(qwen_tts_ctx_t *ctx, const char *path, int silent)
                             }
                         }
                         if (!slots[s].fuse) {
-                            if (qwen_kleidi_register_q4(*q4f, raw, slots[s].rows, slots[s].cols))
+                            if (qwen_kleidi_register_q4(*q4f, raw, slots[s].rows, slots[s].cols) &&
+                                qwen_kleidi_supported())
                                 kai_packed++;
                         } else {
                             if (!fused_ggml) {
@@ -228,7 +229,8 @@ int qwen_gguf_override_talker(qwen_tts_ctx_t *ctx, const char *path, int silent)
                                     memcpy(fused_ggml + (size_t)(2 * r + odd) * bpr * 18,
                                            raw + (size_t)r * bpr * 18, (size_t)bpr * 18);
                                 if (odd) {
-                                    if (qwen_kleidi_register_q4(*q4f, fused_ggml, 2 * inter, slots[s].cols))
+                                    if (qwen_kleidi_register_q4(*q4f, fused_ggml, 2 * inter, slots[s].cols) &&
+                                        qwen_kleidi_supported())
                                         kai_packed++;
                                     free(fused_ggml); fused_ggml = NULL; fused_bpr = 0;
                                 }
@@ -416,7 +418,7 @@ int qwen_gguf_override_rest(qwen_tts_ctx_t *ctx, const char *path, int silent) {
                 if (*q4dst) {                                                                       \
                     if (!(FUSE_MODE)) {                                                           \
                         q4_from_ggml(raw, *q4dst, (size_t)(ROWS) * bpr);                            \
-                        if (qwen_kleidi_register_q4(*q4dst, raw, (ROWS), (COLS))) kai_packed++;     \
+                        if (qwen_kleidi_register_q4(*q4dst, raw, (ROWS), (COLS)) && qwen_kleidi_supported()) kai_packed++; \
                     } else {                                                                      \
                         int odd = ((FUSE_MODE) == 2);                                             \
                         for (int r = 0; r < (ROWS); r++)                                          \
@@ -429,7 +431,7 @@ int qwen_gguf_override_rest(qwen_tts_ctx_t *ctx, const char *path, int silent) {
                                 memcpy(*(FUSE_BUF) + (size_t)(2 * r + odd) * bpr * 18,            \
                                        raw + (size_t)r * bpr * 18, (size_t)bpr * 18);             \
                             if (odd) {                                                            \
-                                if (qwen_kleidi_register_q4(*q4dst, *(FUSE_BUF), (FUSE_ROWS), (COLS))) \
+                                if (qwen_kleidi_register_q4(*q4dst, *(FUSE_BUF), (FUSE_ROWS), (COLS)) && qwen_kleidi_supported()) \
                                     kai_packed++;                                                 \
                                 free(*(FUSE_BUF)); *(FUSE_BUF) = NULL;                            \
                             }                                                                     \

@@ -31,7 +31,7 @@
 #include "kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm.h"
-#if defined(__ARM_FEATURE_BF16)
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
 #define QWEN_KLEIDI_BF16_BUILD 1
 #include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_bf16p1x4_f32_neon.h"
 #include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_bf16p8x4_f32_neon.h"
@@ -1145,7 +1145,7 @@ void qwen_kleidi_stats_by_kind(int *n_q4, size_t *b_q4, int *n_i8, size_t *b_i8,
 #else
 
 int qwen_kleidi_register_q4(const void *k, const uint8_t *b, int r, int c) {
-    (void)k; (void)b; (void)r; (void)c; return 0;
+    return qwen_kleidi_dotprod_register_q4(k, b, r, c);
 }
 int qwen_kleidi_matmul_q4(float *Y, const void *k, const float *X, int r, int c, int B) {
     (void)Y; (void)k; (void)X; (void)r; (void)c; (void)B; return 0;
@@ -1167,11 +1167,12 @@ void qwen_kleidi_bf16_region_run(const void *k, float *d, size_t ds, const void 
     (void)k; (void)d; (void)ds; (void)lp; (void)r; (void)c; (void)B; (void)tid; (void)nt;
 }
 int qwen_kleidi_register_i8(const void *k, const int8_t *W, const float *s, int r, int c) {
-    (void)k; (void)W; (void)s; (void)r; (void)c; return 0;
+    return qwen_kleidi_dotprod_register_i8(k, W, s, r, c);
 }
 int qwen_kleidi_register_i8_fam(const void *k, const int8_t *W, const float *s, int r,
                                 int c, int cm, int f) {
-    (void)k; (void)W; (void)s; (void)r; (void)c; (void)cm; (void)f; return 0;
+    (void)cm; (void)f;
+    return qwen_kleidi_dotprod_register_i8(k, W, s, r, c);
 }
 int qwen_kleidi_register_bf16_fam(const void *k, const uint16_t *W, int r, int c,
                                   int cm, int f) {
@@ -1247,6 +1248,10 @@ const char *qwen_kleidi_flag_inert(const char *flag) {
     return NULL;
 #else
     if (!flag) return NULL;
+    if (!strcmp(flag, "QWEN_KAI_DOTPROD_GEMV") && qwen_kleidi_dotprod_compiled())
+        return NULL;
+    if (!strcmp(flag, "QWEN_NO_KLEIDI") && qwen_kleidi_dotprod_compiled())
+        return NULL;
     if (!strncmp(flag, "QWEN_KAI_", 9) || !strcmp(flag, "QWEN_NO_KLEIDI"))
         return "KleidiAI is not compiled into this build (needs an Arm i8mm target)";
     return NULL;
