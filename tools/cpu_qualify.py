@@ -109,6 +109,26 @@ def run_cmd(records: list[dict[str, Any]], name: str, argv: list[str], out: Path
     return rec
 
 
+def mark_optional_skip(rec: dict[str, Any], markers: tuple[str, ...], evidence: str) -> None:
+    """Turn a successful, intentionally unavailable host check into an explicit SKIP.
+
+    Make targets for Rosetta and dotprod are deliberately no-op on hosts that cannot execute
+    them.  Treating their zero exit status as parity would make an x86 qualification artifact
+    claim Arm evidence, so the log marker changes the record to a non-required native limit.
+    A non-zero result is left as a real failure.
+    """
+    if rec.get("returncode") != 0 or rec.get("status") != "PASS":
+        return
+    try:
+        log = Path(str(rec["log"])).read_text(errors="replace")
+    except OSError:
+        return
+    if any(marker in log for marker in markers):
+        rec["status"] = "SKIP"
+        rec["required"] = False
+        rec["evidence"] = evidence
+
+
 def parse_args() -> argparse.Namespace:
     cpu_default = min(8, os.cpu_count() or 1)
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -217,11 +237,16 @@ def make_checks(binary: Path, out: Path, records: list[dict[str, Any]], timeout:
             timeout=timeout, label="COMPILE VERIFIED: available ISA translation units")
     run_cmd(records, "matmat_parity_native", ["make", "check-matmat-parity"], out,
             timeout=timeout, label="PARITY VERIFIED: native matmat reference")
-    run_cmd(records, "matmat_parity_x86_control", ["make", "check-matmat-parity-x86"], out,
-            timeout=timeout, required=False,
-            label="PARITY VERIFIED where Rosetta control is available")
-    run_cmd(records, "kai_dotprod_parity", ["make", "test-kai-dotprod"], out,
-            timeout=timeout, label="PARITY VERIFIED: dotprod-only vendor pack/kernel ABI where available")
+    ros = run_cmd(records, "matmat_parity_x86_control", ["make", "check-matmat-parity-x86"], out,
+                  timeout=timeout, required=False,
+                  label="PARITY VERIFIED where Rosetta control is available")
+    mark_optional_skip(ros, ("Arm Mac only", "needs Rosetta"),
+                       "NATIVE RUNTIME REQUIRED: Rosetta control is unavailable on this host")
+    kai = run_cmd(records, "kai_dotprod_parity", ["make", "test-kai-dotprod"], out,
+                  timeout=timeout,
+                  label="PARITY VERIFIED: dotprod-only vendor pack/kernel ABI where available")
+    mark_optional_skip(kai, ("SKIP: compiler has no Arm dotprod target", "SKIP: dotprod runtime unavailable"),
+                       "NATIVE RUNTIME REQUIRED: Arm dotprod compiler/runtime is unavailable on this host")
     run_cmd(records, "selftest_native", [str(binary), "--self-test"], out,
             timeout=timeout, label="PARITY VERIFIED: dispatched native self-test")
     run_cmd(records, "selftest_fallback", [str(binary), "--self-test"], out,
