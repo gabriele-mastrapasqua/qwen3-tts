@@ -368,3 +368,12 @@ milestone is now present in the working branch (preserved work is committed sepa
 * The current Apple host proves compile and kernel parity only. It cannot execute the x86
   VNNI/AVX2/AVX-512/AMX or Linux Arm KAI branches. Rows marked native qualification therefore
   remain unresolved until the prepared host suite is run.
+* `tools/cpu_qualify.py` and `make cpu-qualify` now package the paid-host procedure. The
+  model-free mode captures hardware/HWCAP/compiler/provenance, `--caps`, `--dispatch-map`,
+  compile checks, native/fallback self-tests, matmat parity, and ISA-candidate A/B logs. With
+  `--model`, it runs the Talker/CP batch oracle at the requested B values; `--serve` adds the
+  C1/C2/C4/C8 wave and fails if the v2 census JSON is not produced. Missing model/server work
+  is labelled `NATIVE RUNTIME REQUIRED` rather than silently treated as passed.
+* The first smoke run exposed a real integration omission: the standalone matmat parity target
+  did not link the new census module. `PARITY_SRC` now includes `qwen_tts_v2_census.c`; native
+  and Rosetta parity both pass again.

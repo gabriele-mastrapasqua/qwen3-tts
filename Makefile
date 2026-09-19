@@ -224,6 +224,8 @@ help:
 	@echo "CPU profiling gate (docs/cpu-profiling.md) — run BEFORE any CPU optimisation:"
 	@echo "  make cpu-check             - 15 s preflight: provenance, hardware, RESOLVED dispatch map, self-test,"
 	@echo "                               expected-vs-observed per ISA class -> profiles/<date>_<host>_<sha8>/"
+	@echo "  make cpu-qualify           - one-command old-CPU/ISA-v2 qualification (hardware, compile/parity,"
+	@echo "                               model-free A/B and optional MODEL+C1/C2/C4/C8 census)"
 	@echo "  make doctor                - first serving preflight: <1 min, no model; on 32-core Arm also"
 	@echo "                               simultaneous 1x8/2x8/4x8 GEMV scaling, then identity + dispatch + draft profile"
 	@echo "  make dispatch-map          - just the resolved dispatch table (./qwen_tts --dispatch-map)"
@@ -833,7 +835,7 @@ bench-suite-full: bench-suite
 
 # qwen_tts_costmap.c is not optional: qwen_tts_thread.c calls qwen_region_begin_/end_, so
 # leaving it out breaks the link, not the measurement.
-PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_thread.c \
+PARITY_SRC = tests/matmat_parity.c qwen_tts_kernels.c qwen_tts_v2_census.c qwen_tts_thread.c \
              qwen_tts_costmap.c qwen_tts_kleidi.c qwen_tts_q8repack.c $(KAI_SRCS) $(KAI_ASM)
 PARITY_CF  = -Wall -Wextra -O2 -Ivendor -I. -I$(INGOT_DIR)/include $(KAI_INC)
 check-matmat-parity: $(INGOT_LIB)
@@ -970,6 +972,19 @@ CPU_MODEL    ?=
 cpu-check: $(TARGET) $(MEMBW_BIN)
 	@MEMBW_BIN=$(MEMBW_BIN) PROFILES_DIR=$(PROFILES_DIR) CPU_PROFILE=$(CPU_PROFILE) \
 	  CPU_MODEL=$(CPU_MODEL) bash tools/cpu_check.sh
+
+# One-command native qualification.  The model-free invocation is safe on a fresh box;
+# add CPU_QUALIFY_MODEL=/path/to/model CPU_QUALIFY_SERVE=1 for the complete-call and v2 wave.
+CPU_QUALIFY_OUT ?= profiles/cpu-qualify/$(shell date +%Y%m%d-%H%M%S)
+CPU_QUALIFY_MODEL ?=
+CPU_QUALIFY_SERVE ?= 0
+CPU_QUALIFY_THREADS ?= $(NPROC)
+CPU_QUALIFY_ARGS ?=
+cpu-qualify: $(TARGET)
+	@python3 tools/cpu_qualify.py --binary ./$(TARGET) --out "$(CPU_QUALIFY_OUT)" \
+	  --threads "$(CPU_QUALIFY_THREADS)" \
+	  $(if $(CPU_QUALIFY_MODEL),--model "$(CPU_QUALIFY_MODEL)",) \
+	  $(if $(filter 1 yes true,$(CPU_QUALIFY_SERVE)),--serve,) $(CPU_QUALIFY_ARGS)
 # doctor: the under-a-minute, model-free FIRST look at a box for the streaming server.
 # Identity + bandwidth (cached per hardware fingerprint in profiles/roofs) + caps + RESOLVED
 # dispatch + model-free matmat shapes, then a PREDICTED W x K / batch cap / quantum / env set
@@ -1452,7 +1467,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: bench-fingerprint bench-topo bench-suite bench-soak bench-suite-full check-flag-registry prefill-bench \
-	cpu-check doctor test-doctor legacy-cpu-screen roof-matvec dispatch-map profile-cpu-check profile-cpu tune-archive
+	cpu-check cpu-qualify doctor test-doctor legacy-cpu-screen roof-matvec dispatch-map profile-cpu-check profile-cpu tune-archive
 .PHONY: server-hw-check box-report membw check-matmat-parity check-matmat-parity-x86 \
 	server-batch-microbench server-batch-microbench-full mini-bench-06b mini-bench-17b \
 	kernel-tune kernel-tune-quick test-decoder-batch-parity server-soak x86-qkv-bench x86-amx-b32-bench x86-b1-gemv-bench
