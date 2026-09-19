@@ -22,8 +22,14 @@ ENGINE="main.c qwen_tts.c qwen_tts_gguf.c qwen_tts_talker.c qwen_tts_code_predic
         qwen_tts_kernels_generic.c qwen_tts_kernels_neon.c qwen_tts_kernels_avx.c qwen_tts_audio.c \
         qwen_tts_emotion.c qwen_tts_compose.c qwen_tts_sampling.c qwen_tts_tokenizer.c \
         qwen_tts_server.c qwen_tts_voice_clone.c qwen_tts_speech_encoder.c qwen_tts_kleidi.c \
-        qwen_tts_q8repack.c qwen_tts_q4export.c"
+        qwen_tts_kleidi_dotprod.c qwen_tts_q8repack.c qwen_tts_q4export.c"
 KAI_SRCS=$(ls $KAI_DIR/kai/ukernels/matmul/pack/*.c $KAI_DIR/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/*.c 2>/dev/null)
+KAI_DOTPROD_SRCS="$KAI_DIR/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi4c32pscalef16_qsu4c32s16s0.c \
+                 $KAI_DIR/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qsi8d32p_f32.c \
+                 $KAI_DIR/kai/ukernels/matmul/matmul_clamp_f32_qsi8d32p_qsi4c32p/kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p4x8_1x4x32_neon_dotprod.c \
+                 $KAI_DIR/kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.c \
+                 $KAI_DIR/kai/ukernels/matmul/pack/kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c \
+                 $KAI_DIR/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod.c"
 UNAME_S=$(uname -s); UNAME_M=$(uname -m)
 FAIL=0
 pass() {  # name  flags...
@@ -43,6 +49,7 @@ if [ "$UNAME_S" = Darwin ]; then
     EXTRA_SRCS=""
     pass x86-avx2-fma -target x86_64-apple-macos -mavx2 -mfma
     pass x86-avx512f-no-vnni -target x86_64-apple-macos -mavx2 -mfma -mavx512f -mavx512bw -mavx512vl
+    EXTRA_SRCS="$KAI_DOTPROD_SRCS"
     pass arm-dotprod-only -target arm64-apple-macos -march=armv8.2-a+dotprod
     EXTRA_SRCS="$KAI_SRCS"
     pass arm-i8mm-bf16 -target arm64-apple-macos -march=armv8.6-a+i8mm+bf16+dotprod
@@ -58,7 +65,7 @@ else
                  pass x86-avx512-vnni-bf16-amx -mavx2 -mfma -mavx512f -mavx512bw -mavx512vl -mavx512dq \
                      -mavx512vnni -mavx512bf16 -mamx-tile -mamx-int8 -mamx-bf16
                  echo "=== arm-dotprod-only/i8mm-bf16: SKIP (needs an aarch64 cross sysroot on this host) ===" ;;
-        aarch64) EXTRA_SRCS=""; pass arm-dotprod-only -march=armv8.2-a+dotprod
+        aarch64) EXTRA_SRCS="$KAI_DOTPROD_SRCS"; pass arm-dotprod-only -march=armv8.2-a+dotprod
                  EXTRA_SRCS="$KAI_SRCS"; pass arm-i8mm-bf16 -march=armv8.6-a+i8mm+bf16+dotprod
                  echo "=== x86: SKIP (needs an x86_64 cross sysroot on this host) ===" ;;
     esac
