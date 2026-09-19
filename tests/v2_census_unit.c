@@ -12,6 +12,10 @@ const char *qwen_path_name(int path) { return path == 20 ? "matmat_bf16" : "test
 const char *qwen_leaf_name(int leaf) { return leaf == 1 ? "vnni" : "none"; }
 
 int main(void) {
+    for (int i = 0; i < QWEN_V2_STAGE_COUNT; i++) assert(qwen_v2_stage_name(i)[0]);
+    for (int i = 0; i < QWEN_V2_WEIGHT_COUNT; i++) assert(qwen_v2_weight_name(i)[0]);
+    for (int i = 0; i < QWEN_V2_OP_COUNT; i++) assert(qwen_v2_op_name(i)[0]);
+    for (int i = 0; i < QWEN_V2_REASON_COUNT; i++) assert(qwen_v2_reason_name(i)[0]);
     for (int b = 1; b <= 32; b++) {
         int p[8] = {0};
         int n = qwen_batch_chunk_plan(b, 16, p, 8);
@@ -33,10 +37,20 @@ int main(void) {
     }
     setenv("QWEN_V2_CENSUS", "1", 1);
     qwen_v2_census_batch_begin(QWEN_V2_STAGE_TALKER, 8, 3, 3, 0);
+    assert(qwen_v2_census_batch_width() == 3);
+    assert(qwen_v2_census_batch_reason(QWEN_V2_REASON_NONE) == QWEN_V2_REASON_RAGGED);
+    assert(qwen_v2_census_batch_reason(QWEN_V2_REASON_DECODER_POLICY) == QWEN_V2_REASON_DECODER_POLICY);
     qwen_v2_census_call_begin(QWEN_V2_STAGE_TALKER, QWEN_V2_WEIGHT_INT8,
                               QWEN_V2_OP_MATMAT, QWEN_V2_REASON_RAGGED, 20, 0);
     qwen_v2_census_note_path(20, 32, 64, 3);
     qwen_v2_census_note_leaf(1);
+    qwen_v2_census_call_end();
+
+    qwen_v2_census_call_begin(QWEN_V2_STAGE_DECODER, QWEN_V2_WEIGHT_INT8,
+                              QWEN_V2_OP_CONV, QWEN_V2_REASON_NONE, 0, 0);
+    qwen_v2_census_call_set_width(17);
+    qwen_v2_census_call_set_reason(QWEN_V2_REASON_DECODER_POLICY);
+    qwen_v2_census_note_path(30, 96, 672, 17);
     qwen_v2_census_call_end();
 
     FILE *f = tmpfile();
@@ -50,5 +64,6 @@ int main(void) {
     fclose(f);
     assert(strstr(buf, "stage,C,runnable,B_eff") != NULL);
     assert(strstr(buf, "v2,talker,8,3,3,0,int8,matmat,matmat_bf16,vnni,ragged,1") != NULL);
+    assert(strstr(buf, "v2,decoder,8,3,17,0,int8,conv,test_path,none,decoder_policy,1") != NULL);
     return 0;
 }
