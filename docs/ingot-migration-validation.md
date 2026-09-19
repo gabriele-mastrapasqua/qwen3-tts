@@ -27,3 +27,13 @@ the numbers are current.
 Extracting an x-vector, and voice design, both need the base checkpoints. Where
 those are absent the end-to-end run fails with "Failed to load model", which is a
 missing directory rather than a defect: the previous loader fails the same way.
+
+## Kernel scope
+
+Ingot is vendored for GGUF/SafeTensors loading, format utilities and their
+validation paths. Its optional AVX2/AVX-512/NEON Q4/Q8/BF16/F16 kernels are
+compiled for the library's own tests and are not the qwen v2 serving backend.
+The production call graph does not dispatch to those entry points. Their
+presence therefore proves neither that a qwen stage reaches them nor that their
+formulation is the best kernel for a serving shape; serving claims must come
+from the qwen dispatcher, v2 census and complete-call qualification.

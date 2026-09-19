@@ -483,6 +483,51 @@ void qwen_caps_report(void *out) {
             __builtin_cpu_supports("avx512vnni") ? " avx512vnni"   : "",
             __builtin_cpu_supports("avx512bf16") ? " avx512bf16"   : "",
             amx_str);
+    /* Keep the less visible x86 extensions explicit.  They are useful for host
+     * qualification, but none of these lines claims that a qwen serving kernel
+     * consumes the extension.  The production call graph still decides that. */
+#if defined(__F16C__)
+    const int build_f16c = 1;
+#else
+    const int build_f16c = 0;
+#endif
+#if defined(__BMI__)
+    const int build_bmi1 = 1;
+#else
+    const int build_bmi1 = 0;
+#endif
+#if defined(__BMI2__)
+    const int build_bmi2 = 1;
+#else
+    const int build_bmi2 = 0;
+#endif
+#if defined(__AVX512VL__)
+    const int build_avx512vl = 1;
+#else
+    const int build_avx512vl = 0;
+#endif
+#if defined(__AVX512DQ__)
+    const int build_avx512dq = 1;
+#else
+    const int build_avx512dq = 0;
+#endif
+#if defined(__AVX512FP16__)
+    const int build_avx512fp16 = 1;
+#else
+    const int build_avx512fp16 = 0;
+#endif
+    fprintf(f, "  x86 extras compile: F16C=%s BMI1=%s BMI2=%s AVX512VL=%s AVX512DQ=%s AVX512FP16=%s\n",
+            build_f16c ? "yes" : "no", build_bmi1 ? "yes" : "no",
+            build_bmi2 ? "yes" : "no", build_avx512vl ? "yes" : "no",
+            build_avx512dq ? "yes" : "no", build_avx512fp16 ? "yes" : "no");
+    fprintf(f, "  x86 extras runtime: F16C=%s BMI1=%s BMI2=%s AVX512VL=%s AVX512DQ=%s AVX512FP16=%s AMXBF16=%s\n",
+            __builtin_cpu_supports("f16c") ? "yes" : "no",
+            __builtin_cpu_supports("bmi") ? "yes" : "no",
+            __builtin_cpu_supports("bmi2") ? "yes" : "no",
+            __builtin_cpu_supports("avx512vl") ? "yes" : "no",
+            __builtin_cpu_supports("avx512dq") ? "yes" : "no",
+            __builtin_cpu_supports("avx512fp16") ? "yes" : "no",
+            __builtin_cpu_supports("amx-bf16") ? "yes" : "no");
     /* The lever is a property of THIS BINARY, not of the CPU: a SIMD=avx512 or SIMD=portable
      * build running on a VNNI host has no VNNI dot to recommend, and used to advertise one. */
     {
@@ -532,10 +577,12 @@ void qwen_caps_report(void *out) {
                    "Rebuild with `make blas SIMD=scalar`.\n");
 #endif
 #elif defined(__aarch64__)
-    int has_dotprod = 0, has_bf16 = 0, has_i8mm = 0, has_sve = 0, has_sve2 = 0, has_sme = 0;
+    int has_fp16 = 0, has_dotprod = 0, has_bf16 = 0, has_i8mm = 0;
+    int has_sve = 0, has_sve2 = 0, has_sme = 0;
 #if defined(__APPLE__)
     { int v; size_t s;
       #define QFEAT(name) (s = sizeof(v), v = 0, sysctlbyname(name, &v, &s, NULL, 0) == 0 && v)
+      has_fp16    = QFEAT("hw.optional.arm.FEAT_FP16");
       has_dotprod = QFEAT("hw.optional.arm.FEAT_DotProd");
       has_bf16    = QFEAT("hw.optional.arm.FEAT_BF16");
       has_i8mm    = QFEAT("hw.optional.arm.FEAT_I8MM");
@@ -544,6 +591,9 @@ void qwen_caps_report(void *out) {
     }
 #elif defined(__linux__)
     { unsigned long h1 = getauxval(AT_HWCAP), h2 = getauxval(AT_HWCAP2);
+      #ifdef HWCAP_ASIMDHP
+      has_fp16 = (h1 & HWCAP_ASIMDHP) != 0;
+      #endif
       #ifdef HWCAP_ASIMDDP
       has_dotprod = (h1 & HWCAP_ASIMDDP) != 0;
       #endif
@@ -565,13 +615,39 @@ void qwen_caps_report(void *out) {
       (void)h1; (void)h2;
     }
 #endif
-    fprintf(f, "  runtime cpu:      NEON%s%s%s%s%s%s\n",
+    fprintf(f, "  runtime cpu:      NEON%s%s%s%s%s%s%s\n",
+            has_fp16    ? " fp16"         : "",
             has_dotprod ? " dotprod/SDOT" : "",
             has_bf16    ? " bf16/BFDOT"   : "",
             has_i8mm    ? " i8mm/SMMLA"   : "",
             has_sve     ? " SVE"          : "",
             has_sve2    ? " SVE2"         : "",
             has_sme     ? " SME"          : "");
+    fprintf(f, "  arm extras build:  FP16=%s DOTPROD=%s I8MM=%s BF16=%s\n",
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            "yes",
+#else
+            "no",
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+            "yes",
+#else
+            "no",
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+            "yes",
+#else
+            "no",
+#endif
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+            "yes"
+#else
+            "no"
+#endif
+    );
+    fprintf(f, "  arm extras runtime: FP16=%s DOTPROD=%s I8MM=%s BF16=%s\n",
+            has_fp16 ? "yes" : "no", has_dotprod ? "yes" : "no",
+            has_i8mm ? "yes" : "no", has_bf16 ? "yes" : "no");
     fprintf(f, "  lever (arm):      %s%s\n",
             has_i8mm ? "i8mm SMMLA + " : (has_dotprod ? "SDOT + " : ""),
             has_bf16 ? "bf16 BFMMLA -> native GEMM batched matmat twins (Graviton3-measured: int8 batch 2.1x, bf16 1.5x)"
