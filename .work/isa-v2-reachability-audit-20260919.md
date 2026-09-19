@@ -388,3 +388,6 @@ milestone is now present in the working branch (preserved work is committed sepa
 * The qualification harness runs the dotprod parity target and includes a `kai_dotprod_gemv`
   opt-in arm in model-free A/B manifests. Complete-call A/B still requires a model and a Linux
   dotprod-only host; the candidate remains default-off until that measurement.
+* `tools/check_isa.sh` now compiles `qwen_tts_kleidi_dotprod.c` and the six dotprod vendor
+  translation units under the Arm dotprod-only profile; the i8mm profile keeps its broader
+  vendor source set. This closes the compile-check blind spot that the first KAI split exposed.
