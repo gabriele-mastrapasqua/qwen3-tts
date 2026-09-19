@@ -134,6 +134,7 @@ SRCS = main.c \
        qwen_tts_code_predictor.c \
        qwen_tts_speech_decoder.c \
        qwen_tts_kernels.c \
+       qwen_tts_v2_census.c \
        qwen_tts_dispatch.c \
        qwen_tts_costmap.c \
        qwen_tts_sd_gemm.c \
@@ -177,7 +178,7 @@ update-ingot:
 clean-ingot:
 	@$(MAKE) -C $(INGOT_DIR) clean
 
-.PHONY: update-ingot clean-ingot
+.PHONY: update-ingot clean-ingot test-v2-census
 
 $(TARGET): $(OBJS) $(INGOT_LIB)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(INGOT_LIB) $(LDLIBS)
@@ -370,6 +371,13 @@ bench-server: $(TARGET)
 
 check-isa:
 	@bash tools/check_isa.sh
+
+test-v2-census: tests/v2_census_unit
+	@QWEN_V2_CENSUS=1 ./tests/v2_census_unit
+	@rm -f tests/v2_census_unit
+
+tests/v2_census_unit: tests/v2_census_unit.c qwen_tts_v2_census.c qwen_tts_v2_census.h
+	$(CC) $(CFLAGS_BASE) -I. -std=gnu11 -o $@ tests/v2_census_unit.c qwen_tts_v2_census.c -lpthread
 
 emotion-para-demo: $(TARGET)
 	@bash tests/emotion_para_demo.sh

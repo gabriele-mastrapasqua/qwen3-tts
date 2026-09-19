@@ -6,6 +6,7 @@
 #include "qwen_tts_costmap.h"
 #include "qwen_tts_thread.h"
 #include "qwen_tts_kleidi.h"
+#include "qwen_tts_v2_census.h"
 #include "ingot/safetensors.h"
 
 #include <stdio.h>
@@ -4533,14 +4534,33 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     int nb = 0;
     for (int i = 0; i < n_items; i++) if (it[i].nframes > 0) idx[nb++] = i;
     if (nb == 0) { free(idx); return 0; }
+    int contiguous = 1;
+    for (int i = 0; i < nb; i++) if (idx[i] != i) { contiguous = 0; break; }
+    const int sd_batch_amx = sd_amx_d_enabled() || sd_amx_bf16_enabled();
+    const int sd_batch_v2 = sd_multislot_slots() >= 2;
+    int decoder_reason = nb == 1 ? QWEN_V2_REASON_SOLO
+                      : !contiguous ? QWEN_V2_REASON_NONCONTIGUOUS
+                      : !sd_exact_stream_enabled() ? QWEN_V2_REASON_DECODER_POLICY
+                      : (sd_int8_enabled() && !sd_batch_amx && !sd_batch_v2)
+                        ? QWEN_V2_REASON_DECODER_POLICY : QWEN_V2_REASON_NONE;
+    qwen_v2_census_batch_begin(QWEN_V2_STAGE_DECODER, n_items, nb, nb, contiguous);
+    const int sd_amx_bf16 = sd_amx_bf16_enabled();
+    qwen_v2_census_call_begin(QWEN_V2_STAGE_DECODER,
+                              sd_int8_enabled() ? QWEN_V2_WEIGHT_INT8
+                              : sd_batch_amx ? QWEN_V2_WEIGHT_BF16 : QWEN_V2_WEIGHT_FP32,
+                              QWEN_V2_OP_CONV, decoder_reason,
+                              sd_amx_bf16 ? QWEN_PATH_DECODER_CONV_AMX_BF16
+                              : sd_batch_amx ? QWEN_PATH_DECODER_CONV_AMX_INT8
+                              : sd_int8_enabled() ? QWEN_PATH_DECODER_CONV_INT8
+                              : QWEN_PATH_DECODER_SGEMM, 0);
     /* INT8 used to force the per-slot fallback because rag_conv1d was BLAS-only.  The
      * decoder-specific AMX panel path now covers the real batched conv shapes, so keep the
      * ragged batch alive when Design D or BF16 is explicitly selected.  Plain INT8/V1 keeps
      * the old fallback until it has an equivalent batched panel implementation. */
-    const int sd_batch_amx = sd_amx_d_enabled() || sd_amx_bf16_enabled();
-    const int sd_batch_v2 = sd_multislot_slots() >= 2;
     if (nb == 1 || !sd_exact_stream_enabled() ||
         (sd_int8_enabled() && !sd_batch_amx && !sd_batch_v2)) {
+        qwen_v2_census_call_end();
+        qwen_v2_census_batch_end();
         free(idx);
         return sd_batch_fallback(ctx, it, n_items);
     }
@@ -4572,7 +4592,11 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     float *bf16_yt = NULL;
 
     int64_t TF = 0;
-    if (rag_alloc(&fr, nb) != 0) { rag_free(&fr); free(idx); return -1; }
+    if (rag_alloc(&fr, nb) != 0) {
+        rag_free(&fr); free(idx);
+        qwen_v2_census_call_end(); qwen_v2_census_batch_end();
+        return -1;
+    }
     sts   = (qwen_sd_stream_state_t **)calloc((size_t)nb, sizeof(*sts));
     tails = (float **)calloc((size_t)nb, sizeof(float *));
     auds  = (float **)calloc((size_t)nb, sizeof(float *));
@@ -4951,6 +4975,8 @@ static int sd_stream_batch_body(qwen_tts_ctx_t *ctx, qwen_sd_batch_item_t *it, i
     SD_PHASE_EMIT("ragged", nb, (int)TF);
 
 done:
+    qwen_v2_census_call_end();
+    qwen_v2_census_batch_end();
     free(idx); rag_free(&fr);
     free(sts); free(tails); free(auds); free(ans);
     free(vq_out); free(cb_sum); free(vq_cf); free(pre_conv_out); free(pre_conv_rm);

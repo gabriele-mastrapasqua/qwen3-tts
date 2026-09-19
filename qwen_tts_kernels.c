@@ -7,6 +7,7 @@
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_kleidi.h"
 #include "qwen_tts_q8repack.h"
+#include "qwen_tts_v2_census.h"
 
 #define MMSTAT(k, r, c, b) do {                                                            \
         if (qwen_matmat_stats_enabled() || qwen_census_enabled())                          \
@@ -336,7 +337,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_CANCEL_ON_DISCONNECT", "QWEN_PREFORK_ELASTIC", "QWEN_TTFA_PRIORITY",
     "QWEN_TTFA_PRIO_STRICT", "QWEN_TTFA_FREEZE_CAP", "QWEN_BATCH_B", "QWEN_BATCH_SEQ",
     "QWEN_BATCH_TALKER", "QWEN_BATCH_DECODER", "QWEN_BATCH_FORCE_MATVEC", "QWEN_BATCH_MAX_FRAMES",
-    "QWEN_BATCH_MAX_PROMPT", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL",
+    "QWEN_BATCH_MAX_PROMPT", "QWEN_BATCH_NO_SOLO", "QWEN_BATCH_NO_BEFF", "QWEN_BATCH_NOMATMUL", "QWEN_BATCH_CHUNK_MAX_B",
     "QWEN_SERVER_ASYNC_OUTPUT", "QWEN_STREAM_OUTPUT_MAX_BYTES",
     "QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS",
     "QWEN_STREAM_LEAD_GATE", "QWEN_STREAM_LEAD_TARGET_MS",
@@ -361,7 +362,7 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_LIFE_TRACE", "QWEN_REQ_TRACE", "QWEN_KERNEL_TIMING", "QWEN_VNNI_PHASE_TIMING", "QWEN_DUMP_CODE0", "QWEN_DUMP_CODES", "QWEN_EXPR_DEBUG",
     "QWEN_SD_DEBUG", "QWEN_SPK_DEBUG", "QWEN_TUNE_JSON", "QWEN_TUNE_QUICK",
     "QWEN_DISPATCH_MAP", "QWEN_DISPATCH_JSON", "QWEN_CENSUS_JSON",
-    "QWEN_COST_MAP", "QWEN_COSTMAP_JSON",
+    "QWEN_COST_MAP", "QWEN_COSTMAP_JSON", "QWEN_V2_CENSUS", "QWEN_V2_CENSUS_JSON",
     NULL
 };
 
@@ -2018,6 +2019,7 @@ const char *qwen_leaf_name(int leaf) {
 }
 void qwen_census_leaf(int leaf) {
     if (leaf <= 0 || leaf >= QWEN_LEAF_COUNT) return;
+    qwen_v2_census_note_leaf(leaf);
     if (atomic_load_explicit(&g_census_on, memory_order_relaxed) <= 0) return;
     if (t_census_cur) atomic_fetch_or_explicit(&t_census_cur->lmask, 1u << leaf, memory_order_relaxed);
 }
@@ -2058,6 +2060,7 @@ void qwen_census_op_len(int path, int rows, int cols, int len) {
     qwen_census_op_impl(path, rows, cols, b, (long long)rows * (long long)cols * (long long)len);
 }
 static void qwen_census_op_impl(int path, int rows, int cols, int B, long long macs) {
+    qwen_v2_census_note_path(path, rows, cols, B);
     if (!qwen_census_enabled() || B <= 0) return;
     const int comp = qwen_tls_tag_get();
     const int n = atomic_load_explicit(&g_census_n, memory_order_acquire);

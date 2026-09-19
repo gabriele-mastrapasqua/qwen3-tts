@@ -6,6 +6,7 @@
 #include "qwen_tts_batch.h"
 #include "qwen_tts_thread.h"
 #include "qwen_tts_kleidi.h"
+#include "qwen_tts_v2_census.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -709,8 +710,13 @@ static void cp_prefill2_body(qwen_tts_ctx_t *ctx, int mode, float *x0, float *x1
     float *xn0 = D2 + 2*cp_h,  *xn1 = xn0 + cp_h;
 
 #define CP_MM2(Y, W8, S8, W4, ROWS, COLS) do {                                   \
+        qwen_v2_census_batch_begin(QWEN_V2_STAGE_CP, 2, 2, 2, 1);                  \
+        qwen_v2_census_call_begin(QWEN_V2_STAGE_CP,                                \
+                                  mode == 1 ? QWEN_V2_WEIGHT_INT8 : QWEN_V2_WEIGHT_Q4,\
+                                  QWEN_V2_OP_MATMAT, QWEN_V2_REASON_NONE, 0, 0);    \
         if (mode == 1) qwen_matmat_int8((Y), (W8), (S8), X2loc, (ROWS), (COLS), 2); \
         else           qwen_matmat_q4_0((Y), (W4), X2loc, (ROWS), (COLS), 2);       \
+        qwen_v2_census_call_end();                                                 \
     } while (0)
 
     float *xs[2] = { x0, x1 };
@@ -770,6 +776,7 @@ static void cp_prefill2_body(qwen_tts_ctx_t *ctx, int mode, float *x0, float *x1
         }
     }
 #undef CP_MM2
+    qwen_v2_census_batch_end();
 }
 
 static void cp_mtp_project(qwen_tts_ctx_t *ctx, float *dst, const float *src) {
@@ -1526,7 +1533,14 @@ static int cp_frame_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const floa
         fprintf(stderr, "[cp] whole decode frame as one parallel region: ON (team %d, BW %d)\n", team, BW);
     }
     qwen_barrier_init(&r.bar, team);
+    qwen_v2_census_call_begin(QWEN_V2_STAGE_CP, QWEN_V2_WEIGHT_INT8,
+                              QWEN_V2_OP_MATMAT,
+                              qwen_v2_census_batch_reason(QWEN_V2_REASON_NONE),
+                              QWEN_PATH_MATMAT_INT8_NATIVE,
+                              cp_region_mode == 2 ? QWEN_LEAF_KLEIDI : QWEN_LEAF_VNNI);
+    qwen_v2_census_call_set_width(BW);
     qwen_parallel((size_t)team, cp_region_frame_task, &r);
+    qwen_v2_census_call_end();
     return 1;
 }
 
@@ -1556,12 +1570,13 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
             ctx->cp_kv_max = bb->cp_kv_max;
             ctx->cp_kv_len = 0;
             memset(out_codes, 0, (size_t)B * 15 * sizeof(int));
+            qwen_batch_pack_active(bb, active);
             int rc = qwen_cp_predict(ctx,
                                      (float *)(uintptr_t)talker_hidden + (size_t)only * h,
                                      code0[only], out_codes + (size_t)only * 15);
             ctx->cp_kv_k = sk; ctx->cp_kv_v = sv;
             ctx->cp_kv_max = smax; ctx->cp_kv_len = slen;
-            qwen_batch_pack_active(bb, active);
+            qwen_v2_census_batch_end();
             qwen_mm_component(prev_comp);
             return rc;
         }
@@ -1581,6 +1596,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
             for (int g = 0; g < 15; g++) out_codes[(size_t)b * 15 + g] = 0;
         }
         qwen_mm_component(prev_comp);
+        qwen_v2_census_batch_end();
         qwen_region_end(QWEN_RGN_CP_DECODE);
         return 0;
     }
@@ -1722,6 +1738,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     }
     if (cpb_on()) { cpb_frames++; if ((cpb_frames % 500) == 0) cpb_report(); }
     qwen_mm_component(prev_comp);
+    qwen_v2_census_batch_end();
     qwen_region_end(QWEN_RGN_CP_DECODE);
     return 0;
 #undef CPB_SKIP

@@ -339,3 +339,32 @@ This validates build/dispatch/parity on the available Arm host. It does not qual
 4. Split KAI dotprod GEMV from i8mm GEMM/region gates; resolve the BF16 macro contract.
 5. Run native-host dispatch and complete-call microbenchmarks, then v2 continuous streaming tests with the same source/feature manifest.
 6. Only after those gates, evaluate P2 AVX2 B1, AVX512-no-VNNI width, QKV, or decoder kernels. Promote nothing from an intrinsic or benchmark-only caller without production reachability evidence.
+
+## N. Implementation update on `feature/old-cpus-simd` (2026-09-19)
+
+The released-main findings above remain the historical baseline. The first implementation
+milestone is now present in the working branch (preserved work is committed separately as
+`76ddee9c`). No production SIMD default was changed.
+
+| Original finding | Current state | Evidence / remaining proof |
+|---|---|---|
+| P0 per-stage v2 reachability was not observable | **INSTRUMENTED — NEEDS NATIVE QUALIFICATION** | `qwen_tts_v2_census.c/.h` adds an off-by-default aggregate census with stage, capacity C, runnable count, B_eff, contiguity, weight, operation, path, leaf, reason, count and MACs. Talker, CP, prefill, decoder, and the Talker/CP region runners are wrapped. `QWEN_V2_CENSUS=1` emits deterministic CSV; `QWEN_V2_CENSUS_JSON` writes a machine-readable artifact. Local unit coverage is in `make test-v2-census`. |
+| B_eff > 16 silently misses optimized gates | **FIXED AS AN EXPLICIT CONTROL; DEFAULT POLICY UNCHANGED** | `QWEN_BATCH_CHUNK_MAX_B=2..16` enables ordered `16+tail` chunking in the existing Talker projection helpers. The default remains unset, so native qualification can compare the prior generic B>16 behavior with the chunked control. Partition tests cover B=1..32; numerical serving parity still needs a model-backed run at B=17/20/24/31/32. |
+| Ordinary VNNI/SDOT decoder batch bypass | **INSTRUMENTED — POLICY STILL OPEN** | The batch entry now records the exact decoder policy and actual AMX-BF16/AMX-INT8 path hint before either the ragged body or the per-item fallback. The released semantic gate is unchanged: plain VNNI/SDOT INT8 remains the control until an equivalent multislot implementation is proven. Native VNNI/SDOT parity and performance are still required before wiring it. |
+| KAI dotprod-only support gap | **DEFERRED — ABI/PACKING REFACTOR REQUIRED** | Static source review confirms the current registration and RHS packing use i8mm-family contracts even when B=1. Compiling the whole KAI block under dotprod alone would therefore be unsafe. The existing dotprod 1x vendor sources remain recorded as a P1 target; no gate was broadened speculatively. |
+| AVX-512 no-VNNI classification | **FIXED IN PRESERVATION COMMIT** | The dispatch/reporting change from the previous work distinguishes `x86_avx512_no_vnni`; the new v2 census keeps the actual AVX2 integer leaf separate from wide FP/helper classification. |
+| First-use environment cache ordering | **OPEN — NEEDS POLICY CONTRACT TEST** | The census does not change cache semantics. Standalone `--caps`/`--dispatch-map` exit before server startup, while server defaults are applied before continuous serving. A dedicated initialization contract test is still needed before changing the existing cached policies. |
+
+### New control and qualification facts
+
+* Chunking is deliberately opt-in and clamps at 16, matching the current optimized gate. It
+  preserves active-slot ordering for both indexed/ragged and contiguous batches; the helper
+  unit test proves partition coverage, while model-backed `--batch-test` remains the numerical
+  oracle.
+* Census hooks run even when the older shape census is disabled. Existing dispatcher path and
+  leaf enums are reused, so a row reports the production leaf rather than a benchmark-only
+  label. Region runners receive an envelope row because their worker kernels do not enter the
+  ordinary dispatcher hooks.
+* The current Apple host proves compile and kernel parity only. It cannot execute the x86
+  VNNI/AVX2/AVX-512/AMX or Linux Arm KAI branches. Rows marked native qualification therefore
+  remain unresolved until the prepared host suite is run.

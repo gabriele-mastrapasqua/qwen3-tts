@@ -50,6 +50,8 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 int qwen_batch_solo_disabled(void);
 
 int qwen_batch_beff_disabled(void);
+int qwen_batch_chunk_limit(void);
+int qwen_batch_chunk_plan(int B, int max_chunk, int *parts, int cap);
 
 void qwen_batch_pack_active(qwen_batch_t *bb, const uint8_t *active);
 

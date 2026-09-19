@@ -6,6 +6,7 @@
 #include "ingot/safetensors.h"
 #include "qwen_tts_batch.h"
 #include "qwen_tts_kleidi.h"
+#include "qwen_tts_v2_census.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -861,6 +862,10 @@ static void prefill_proj_matmat_i8(float *Y, const int8_t *Wi, const float *Ws, 
                                    int seq, int in_dim, int out_dim, float *xT, float *yT) {
     for (int s0 = 0; s0 < seq; s0 += 16) {
         int B = seq - s0; if (B > 16) B = 16;
+        qwen_v2_census_batch_begin(QWEN_V2_STAGE_PREFILL, 1, 1, B, 1);
+        qwen_v2_census_call_begin(QWEN_V2_STAGE_PREFILL, QWEN_V2_WEIGHT_INT8,
+                                  QWEN_V2_OP_MATMAT, B > 16 ? QWEN_V2_REASON_MAX_B : QWEN_V2_REASON_NONE,
+                                  0, 0);
         for (int b = 0; b < B; b++) {
             const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
             for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
@@ -870,26 +875,40 @@ static void prefill_proj_matmat_i8(float *Y, const int8_t *Wi, const float *Ws, 
             float *yr = Y + (int64_t)(s0 + b) * out_dim;
             for (int o = 0; o < out_dim; o++) yr[o] = yT[(int64_t)o * B + b];
         }
+        qwen_v2_census_call_end();
+        qwen_v2_census_batch_end();
     }
 }
 
 static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
                                 int seq, int in_dim, int out_dim,
                                 float *xT, float *yT) {
-    qwen_census_op(QWEN_PATH_PREFILL_BF16_NATIVE, out_dim, in_dim, seq);
-    if (qwen_kleidi_prefill_enabled() &&
-        qwen_kleidi_matmul_bf16_native(Y, W, Xn,
-                                       (size_t)in_dim * sizeof(float),
-                                       (size_t)out_dim * sizeof(float),
-                                       out_dim, in_dim, seq)) {
+    int kai = 0;
+    if (qwen_kleidi_prefill_enabled())
+        kai = qwen_kleidi_matmul_bf16_native(Y, W, Xn,
+                                             (size_t)in_dim * sizeof(float),
+                                             (size_t)out_dim * sizeof(float),
+                                             out_dim, in_dim, seq);
+    if (kai) {
+        qwen_v2_census_batch_begin(QWEN_V2_STAGE_PREFILL, 1, 1, seq, 1);
+        qwen_v2_census_call_begin(QWEN_V2_STAGE_PREFILL, QWEN_V2_WEIGHT_BF16,
+                                  QWEN_V2_OP_MATMAT, QWEN_V2_REASON_NONE,
+                                  QWEN_PATH_PREFILL_BF16_NATIVE, QWEN_LEAF_KLEIDI);
+        qwen_census_op(QWEN_PATH_PREFILL_BF16_NATIVE, out_dim, in_dim, seq);
         if (qwen_matmat_stats_enabled() || qwen_census_enabled())
             qwen_matmat_stats_note(QWEN_MMK_KLEIDI_BF16,
                                    (long long)out_dim * in_dim * seq);
+        qwen_v2_census_call_end();
+        qwen_v2_census_batch_end();
         return;
     }
     const int CH = prefill_chunk_tokens();
     for (int s0 = 0; s0 < seq; s0 += CH) {
         int B = seq - s0; if (B > CH) B = CH;
+        qwen_v2_census_batch_begin(QWEN_V2_STAGE_PREFILL, 1, 1, B, 1);
+        qwen_v2_census_call_begin(QWEN_V2_STAGE_PREFILL, QWEN_V2_WEIGHT_BF16,
+                                  QWEN_V2_OP_MATMAT, B > 16 ? QWEN_V2_REASON_MAX_B : QWEN_V2_REASON_NONE,
+                                  0, 0);
         /* A1: the AVX-512 bf16 kernel wants [B][in_dim]; Xn already is that.
          * Going through qwen_matmat_bf16() would transpose to [in_dim][B] and
          * then undo it while converting, so hand it the rows directly when
@@ -911,6 +930,8 @@ static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
             for (int o = 0; o < out_dim; o++) yr[o] = yT[(int64_t)o * B + b];
         }
         qwen_region_end2(QWEN_RGN_TK_PF_LAYOUT_OUT);
+        qwen_v2_census_call_end();
+        qwen_v2_census_batch_end();
     }
 }
 
@@ -2234,14 +2255,57 @@ static void batch_scatter(float *dst, const float *Yt, int n, int rows, const in
 }
 
 static atomic_int g_batch_nomatmul = -1;
+static atomic_int g_batch_chunk_max = -1;
+int qwen_batch_chunk_limit(void) {
+    int v = atomic_load_explicit(&g_batch_chunk_max, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_BATCH_CHUNK_MAX_B");
+        v = e ? atoi(e) : 0;
+        if (v < 2) v = 0;
+        if (v > 16) v = 16;
+        atomic_store_explicit(&g_batch_chunk_max, v, memory_order_relaxed);
+    }
+    return v;
+}
 void qwen_batch_proj(float *dst, const uint16_t *W, const float *src,
                      int rows, int cols, int srcstride, int B, const int *idx,
                      int force_matvec, float *Xt, float *Yt) {
+    int contig = 1;
+    if (idx) for (int j = 0; j < B; j++) if (idx[j] != j) { contig = 0; break; }
     int nomatmul = atomic_load_explicit(&g_batch_nomatmul, memory_order_relaxed);
     if (nomatmul < 0) {
         nomatmul = getenv("QWEN_BATCH_NOMATMUL") ? 1 : 0;
         atomic_store_explicit(&g_batch_nomatmul, nomatmul, memory_order_relaxed);
     }
+    const int chunk = qwen_batch_chunk_limit();
+    if (!nomatmul && !force_matvec && chunk > 0 && B > chunk) {
+        int parts[64], np = qwen_batch_chunk_plan(B, chunk, parts, 64), off = 0;
+        for (int pi = 0; pi < np; pi++) {
+            int n = parts[pi];
+            if (idx) {
+                qwen_batch_proj(dst, W, src, rows, cols, srcstride, n,
+                                idx + off, force_matvec, Xt, Yt);
+            } else {
+                qwen_batch_proj(dst + (size_t)off * rows, W,
+                                src + (size_t)off * srcstride,
+                                rows, cols, srcstride, n, NULL,
+                                force_matvec, Xt, Yt);
+            }
+            off += n;
+        }
+        return;
+    }
+    int reason = B == 1 ? QWEN_V2_REASON_SOLO
+              : (force_matvec || nomatmul) ? QWEN_V2_REASON_ENV_DISABLED
+              : (B > 16) ? QWEN_V2_REASON_MAX_B
+              : !contig ? QWEN_V2_REASON_NONCONTIGUOUS : QWEN_V2_REASON_NONE;
+    reason = qwen_v2_census_batch_reason(reason);
+    qwen_v2_census_call_begin(qwen_mm_component_get(), QWEN_V2_WEIGHT_BF16,
+                              B == 1 ? QWEN_V2_OP_GEMV : QWEN_V2_OP_MATMAT,
+                              reason, 0, 0);
+    qwen_v2_census_call_set_width(B);
+    if (qwen_v2_census_batch_width() > B)
+        qwen_v2_census_call_set_reason(QWEN_V2_REASON_MAX_B);
     if (nomatmul || force_matvec || B == 1) {
         for (int j = 0; j < B; j++) {
             int b = idx ? idx[j] : j;
@@ -2252,6 +2316,7 @@ void qwen_batch_proj(float *dst, const uint16_t *W, const float *src,
         qwen_matmat_bf16(Yt, W, Xt, rows, cols, B);
         batch_scatter(dst, Yt, B, rows, idx);
     }
+    qwen_v2_census_call_end();
 }
 static void batch_proj(qwen_batch_t *bb, float *dst, const uint16_t *W,
                        const float *src, int rows, int cols, int srcstride) {
@@ -2273,7 +2338,39 @@ void qwen_batch_proj_q(float *dst,
                        const q4_0_block_t *Wq,
                        const float *src, int rows, int cols, int srcstride,
                        int B, const int *idx, int force_matvec, float *Xt, float *Yt) {
+    int contig = 1;
+    if (idx) for (int j = 0; j < B; j++) if (idx[j] != j) { contig = 0; break; }
     if (g_batch_nomatmul < 0) g_batch_nomatmul = getenv("QWEN_BATCH_NOMATMUL") ? 1 : 0;
+    const int chunk = qwen_batch_chunk_limit();
+    if (!g_batch_nomatmul && !force_matvec && chunk > 0 && B > chunk) {
+        int parts[64], np = qwen_batch_chunk_plan(B, chunk, parts, 64), off = 0;
+        for (int pi = 0; pi < np; pi++) {
+            int n = parts[pi];
+            if (idx) {
+                qwen_batch_proj_q(dst, Wb, Wi, Wscale, Wq, src, rows, cols, srcstride,
+                                  n, idx + off, force_matvec, Xt, Yt);
+            } else {
+                qwen_batch_proj_q(dst + (size_t)off * rows, Wb, Wi, Wscale, Wq,
+                                  src + (size_t)off * srcstride,
+                                  rows, cols, srcstride, n, NULL,
+                                  force_matvec, Xt, Yt);
+            }
+            off += n;
+        }
+        return;
+    }
+    int reason = B == 1 ? QWEN_V2_REASON_SOLO
+              : (force_matvec || g_batch_nomatmul) ? QWEN_V2_REASON_ENV_DISABLED
+              : (B > 16) ? QWEN_V2_REASON_MAX_B
+              : !contig ? QWEN_V2_REASON_NONCONTIGUOUS : QWEN_V2_REASON_NONE;
+    reason = qwen_v2_census_batch_reason(reason);
+    qwen_v2_census_call_begin(qwen_mm_component_get(), Wq ? QWEN_V2_WEIGHT_Q4
+                              : Wi ? QWEN_V2_WEIGHT_INT8 : QWEN_V2_WEIGHT_BF16,
+                              B == 1 ? QWEN_V2_OP_GEMV : QWEN_V2_OP_MATMAT,
+                              reason, 0, 0);
+    qwen_v2_census_call_set_width(B);
+    if (qwen_v2_census_batch_width() > B)
+        qwen_v2_census_call_set_reason(QWEN_V2_REASON_MAX_B);
     if (force_matvec || g_batch_nomatmul || B == 1) {
         if (qwen_matmat_stats_enabled() && !(force_matvec || g_batch_nomatmul)) {
             qwen_matmat_stats_note(QWEN_MMK_SOLO, (long long)rows * cols);
@@ -2304,6 +2401,8 @@ void qwen_batch_proj_q(float *dst,
                 if (qwen_matmat_stats_enabled() || qwen_census_enabled())
                     qwen_matmat_stats_note(B > 1 ? QWEN_MMK_KLEIDI_I8 : QWEN_MMK_KLEIDI_I8_GEMV,
                                            (long long)rows * cols * B);
+                qwen_v2_census_note_leaf(QWEN_LEAF_KLEIDI);
+                qwen_v2_census_call_end();
                 return;
             }
             if (!Wq && !Wi && qwen_kleidi_matmul_bf16_native(dst, Wb, src,
@@ -2313,6 +2412,8 @@ void qwen_batch_proj_q(float *dst,
                 if (qwen_matmat_stats_enabled() || qwen_census_enabled())
                     qwen_matmat_stats_note(B > 1 ? QWEN_MMK_KLEIDI_BF16 : QWEN_MMK_KLEIDI_BF16_GEMV,
                                            (long long)rows * cols * B);
+                qwen_v2_census_note_leaf(QWEN_LEAF_KLEIDI);
+                qwen_v2_census_call_end();
                 return;
             }
         }
@@ -2322,6 +2423,7 @@ void qwen_batch_proj_q(float *dst,
         else         qwen_matmat_bf16(Yt, Wb, Xt, rows, cols, B);
         batch_scatter(dst, Yt, B, rows, idx);
     }
+    qwen_v2_census_call_end();
 }
 void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
                          const uint16_t *Wqb, const int8_t *Wqi, const float *Wqs,
@@ -2336,8 +2438,16 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
     if (g_batch_nomatmul < 0) g_batch_nomatmul = getenv("QWEN_BATCH_NOMATMUL") ? 1 : 0;
     int contig = 1;
     if (idx) for (int j = 0; j < B; j++) if (idx[j] != j) { contig = 0; break; }
-    if (B > 1 && contig && !force_matvec && !g_batch_nomatmul &&
+    int qreason = B <= 1 ? QWEN_V2_REASON_SOLO
+               : (force_matvec || g_batch_nomatmul) ? QWEN_V2_REASON_ENV_DISABLED
+               : (B > 16) ? QWEN_V2_REASON_MAX_B
+               : !contig ? QWEN_V2_REASON_NONCONTIGUOUS : QWEN_V2_REASON_NONE;
+    qreason = qwen_v2_census_batch_reason(qreason);
+    if (B > 1 && B <= 16 && contig && !force_matvec && !g_batch_nomatmul &&
         Wqi && Wki && Wvi && !Wqq && !Wkq && !Wvq) {
+        qwen_v2_census_call_begin(qwen_mm_component_get(), QWEN_V2_WEIGHT_INT8,
+                                  QWEN_V2_OP_QKV, qreason,
+                                  QWEN_PATH_MATMAT_INT8_QKV_NATIVE, QWEN_LEAF_KLEIDI);
         if (qwen_kleidi_matmul_i8_qkv_native(dq, dk, dv, Wqi, Wki, Wvi, src,
                                              (size_t)srcstride * sizeof(float),
                                              cols, q_rows, kv_rows, B)) {
@@ -2351,6 +2461,7 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
                     qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
                     qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
             }
+            qwen_v2_census_call_end();
             return;
         }
         batch_gather(Xt, src, B, cols, srcstride, idx);
@@ -2366,11 +2477,16 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
                     qwen_proj_weight_bytes(Wqb, Wqi, Wqq, q_rows, cols) +
                     qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
                     qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
+            qwen_v2_census_call_end();
             return;
         }
+        qwen_v2_census_call_end();
     }
-    if (B > 1 && contig && !force_matvec && !g_batch_nomatmul &&
+    if (B > 1 && B <= 16 && contig && !force_matvec && !g_batch_nomatmul &&
         Wqb && Wkb && Wvb && !Wqq && !Wkq && !Wvq) {
+        qwen_v2_census_call_begin(qwen_mm_component_get(), QWEN_V2_WEIGHT_BF16,
+                                  QWEN_V2_OP_QKV, qreason,
+                                  QWEN_PATH_MATMAT_BF16_QKV, 0);
         batch_gather(Xt, src, B, cols, srcstride, idx);
         if (qwen_matmat_bf16_qkv(Yt, Yt + (size_t)q_rows * B,
                                  Yt + (size_t)(q_rows + kv_rows) * B,
@@ -2383,8 +2499,10 @@ void qwen_batch_proj_qkv(float *dq, float *dk, float *dv,
                     qwen_proj_weight_bytes(Wqb, Wqi, Wqq, q_rows, cols) +
                     qwen_proj_weight_bytes(Wkb, Wki, Wkq, kv_rows, cols) +
                     qwen_proj_weight_bytes(Wvb, Wvi, Wvq, kv_rows, cols));
+            qwen_v2_census_call_end();
             return;
         }
+        qwen_v2_census_call_end();
     }
     qwen_batch_proj_q(dq, Wqb, Wqi, Wqs, Wqq, src, q_rows,  cols, srcstride, B, idx,
                       force_matvec, Xt, Yt);
@@ -2413,6 +2531,9 @@ void qwen_batch_pack_active(qwen_batch_t *bb, const uint8_t *active) {
         n = bb->B;
     }
     bb->B_eff = n;
+    int contiguous = 1;
+    for (int j = 0; j < n; j++) if (bb->act_idx[j] != j) { contiguous = 0; break; }
+    qwen_v2_census_batch_begin(qwen_mm_component_get(), bb->B, n, n, contiguous);
 }
 
 int qwen_batch_beff_disabled(void) {
@@ -2700,7 +2821,14 @@ static int tk_region_run(qwen_tts_ctx_t *ctx, qwen_batch_t *bb, const int *pos_a
     r.scale = scale; r.qx = qx; r.swtmp = swtmp; r.arm_kai = (region_mode == 2);
     int team = qwen_parallel_team();
     qwen_barrier_init(&r.bar, team);
+    qwen_v2_census_call_begin(QWEN_V2_STAGE_TALKER, QWEN_V2_WEIGHT_INT8,
+                              QWEN_V2_OP_MATMAT,
+                              qwen_v2_census_batch_reason(QWEN_V2_REASON_NONE),
+                              QWEN_PATH_MATMAT_INT8_NATIVE,
+                              region_mode == 2 ? QWEN_LEAF_KLEIDI : QWEN_LEAF_VNNI);
+    qwen_v2_census_call_set_width(BW);
     qwen_parallel((size_t)team, tk_region_task, &r);
+    qwen_v2_census_call_end();
     (void)c;
     return 1;
 }
@@ -2786,6 +2914,7 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     #undef POS_B
     #undef ACTIVE_B
     qwen_mm_component(prev_comp);
+    qwen_v2_census_batch_end();
     qwen_region_end(QWEN_RGN_TK_DECODE);
     return 0;
 }
@@ -2855,11 +2984,12 @@ int qwen_batch_talker_step_ragged(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
             ctx->kv_cache_v = bb->kv_v + slot;
             ctx->kv_max = bb->kv_max;
             ctx->kv_len = pos_arr ? pos_arr[only] : bb->kv_len;
+            qwen_batch_pack_active(bb, active);
             int rc = qwen_talker_step(ctx, (float *)(uintptr_t)embeds + (size_t)only * bb->h,
                                       hidden_out + (size_t)only * bb->h);
             ctx->kv_cache_k = sk; ctx->kv_cache_v = sv;
             ctx->kv_max = smax; ctx->kv_len = slen;
-            qwen_batch_pack_active(bb, active);
+            qwen_v2_census_batch_end();
             return rc;
         }
     }
