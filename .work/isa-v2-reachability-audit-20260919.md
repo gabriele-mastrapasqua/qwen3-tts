@@ -333,11 +333,11 @@ This validates build/dispatch/parity on the available Arm host. It does not qual
 
 ## M. Recommended implementation sequence
 
-1. Add the default-off per-stage B_eff/leaf census and make fallback reasons visible.
-2. Fix or explicitly cap/chunk B_eff>16; add tests for C1/C2/C4/C8 with ragged masks.
-3. Decide and wire the decoder VNNI/SDOT batch policy; preserve a per-item control path and parity tests.
-4. Split KAI dotprod GEMV from i8mm GEMM/region gates; resolve the BF16 macro contract.
-5. Run native-host dispatch and complete-call microbenchmarks, then v2 continuous streaming tests with the same source/feature manifest.
+1. **Done locally:** default-off per-stage B_eff/leaf census and fallback reasons are wired; native v2 reachability remains to be captured.
+2. **Done as an opt-in control:** B_eff>16 has ordered chunking and boundary tests; model-backed parity is still required.
+3. **Open by design:** decide and wire the decoder VNNI/SDOT batch policy only after native panel parity; keep the per-item control path.
+4. **Done as an opt-in candidate:** KAI dotprod GEMV is split from i8mm GEMM/regions and the BF16 macro contract is compile-checked.
+5. **Next paid-host action:** run native dispatch, complete-call microbenchmarks, and v2 continuous streaming tests with the same source/feature manifest.
 6. Only after those gates, evaluate P2 AVX2 B1, AVX512-no-VNNI width, QKV, or decoder kernels. Promote nothing from an intrinsic or benchmark-only caller without production reachability evidence.
 
 ## N. Implementation update on `feature/old-cpus-simd` (2026-09-19)

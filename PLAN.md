@@ -18,7 +18,7 @@ F/BW/VL at dispatch and startup. Dotprod Arm uses SDOT; full KleidiAI GEMM/regio
 i8mm, while a separate dotprod-only B=1 GEMV candidate is available behind
 `QWEN_KAI_DOTPROD_GEMV=1`. New candidates stay off pending native-host streaming and performance
 qualification. Detail:
-`.work/legacy-cpu-v2-audit-20260916.md`.
+`.work/isa-v2-reachability-audit-20260919.md` (with the 2026-09-16 work item retained as historical evidence).
 
 ### Completed and validated outcomes
 
