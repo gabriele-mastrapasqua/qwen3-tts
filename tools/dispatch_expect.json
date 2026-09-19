@@ -41,10 +41,30 @@
     "matvec.int8.vnni": "ON",
     "decoder.int8": "ON"
   },
+  "x86_avx512f_no_vnni": {
+    "talker.prefill.matmat_bf16": "OFF",
+    "talker.prefill.f32_blas_fallback": "ON",
+    "gate.int8.avx2": "ON",
+    "gate.q4.avx2": "ON",
+    "matvec.int8.avx512bw-emulated-dot-gemv": "OFF",
+    "matvec.q4.avx512bw-emulated-dot-gemv": "OFF",
+    "matvec.int8.avx2-emulated-dot-gemv": "OFF",
+    "matvec.q4.avx2-emulated-dot-gemv": "OFF",
+    "decoder.int8": "OFF",
+    "decoder.res1_v2": "OFF",
+    "decoder.glue_fused": "OFF"
+  },
   "x86_avx2": {
     "talker.prefill.matmat_bf16": "OFF",
     "gate.int8.avx2": "ON",
-    "gate.q4.avx2": "ON"
+    "gate.q4.avx2": "ON",
+    "matvec.int8.avx2-emulated-dot-gemv": "OFF",
+    "matvec.q4.avx2-emulated-dot-gemv": "OFF",
+    "matvec.int8.avx512bw-emulated-dot-gemv": "OFF",
+    "matvec.q4.avx512bw-emulated-dot-gemv": "OFF",
+    "decoder.int8": "OFF",
+    "decoder.res1_v2": "OFF",
+    "decoder.glue_fused": "OFF"
   },
   "arm_i8mm_bf16": {
     "decoder.res1_v2": "OFF",
@@ -58,12 +78,14 @@
     "gate.bf16.bfmmla": "ON",
     "gate.int8.smmla": "ON",
     "gate.q4.smmla": "ON",
+    "gate.q4.sdot_mm": "OFF",
     "gate.q4.kleidi": "ON",
     "kleidi.enabled": "ON",
     "kleidi.int8": "ON",
     "kleidi.bf16": "ON",
     "matvec.int8.sdot": "ON",
     "gate.int8.sdot_mm": "OFF",
+    "gate.q4.sdot_mm": "OFF",
     "kleidi.qkv_fused": "ON",
     "kleidi.prefill": "ON",
     "q8repack.neon": "ON",
@@ -77,6 +99,7 @@
     "talker.prefill.matmat_bf16": "OFF",
     "matvec.int8.sdot": "ON",
     "gate.int8.sdot_mm": "OFF",
+    "gate.q4.sdot_mm": "OFF",
     "q8repack.neon": "ON",
     "kleidi.enabled": "OFF"
   },
@@ -97,6 +120,7 @@
     "gate.int8.smmla": "OFF",
     "gate.bf16.bfmmla": "OFF",
     "gate.q4.smmla": "ON",
+    "gate.q4.sdot_mm": "OFF",
     "q8repack.neon": "ON",
     "gate.q4.kleidi": "ON",
     "kleidi.enabled": "ON"

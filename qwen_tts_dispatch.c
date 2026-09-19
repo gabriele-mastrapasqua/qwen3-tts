@@ -75,6 +75,16 @@ static feat_t *row(feat_t *f, const char *id, const char *compiled, const char *
 static const char *yn(int v) { return v ? "yes" : "no"; }
 static const char *onoff(int v) { return v ? "ON" : "OFF"; }
 
+#if defined(__x86_64__) || defined(_M_X64)
+static int x86_avx512_profile_available(void) {
+    return __builtin_cpu_supports("avx2") &&
+           __builtin_cpu_supports("fma") &&
+           __builtin_cpu_supports("avx512f") &&
+           __builtin_cpu_supports("avx512bw") &&
+           __builtin_cpu_supports("avx512vl");
+}
+#endif
+
 /* The class a tools/dispatch_expect.json entry is keyed by.  Coarse on purpose: it
  * names the best matrix lever the host+binary pair can use, which is what the
  * expected-vs-observed rules are about. */
@@ -82,10 +92,18 @@ static const char *isa_class(void) {
 #if defined(__x86_64__) || defined(_M_X64)
     if (qwen_amx_int8_available() || qwen_amx_bf16_available()) return "x86_amx";
 #if defined(__AVX512BF16__)
-    if (__builtin_cpu_supports("avx512bf16")) return "x86_avx512bf16";
+    if (x86_avx512_profile_available() && __builtin_cpu_supports("avx512bf16"))
+        return "x86_avx512bf16";
 #endif
 #if defined(__AVX512VNNI__)
-    if (__builtin_cpu_supports("avx512vnni")) return "x86_avx512vnni";
+    if (x86_avx512_profile_available() && __builtin_cpu_supports("avx512vnni"))
+        return "x86_avx512vnni";
+#endif
+#if defined(__AVX512F__)
+    /* SIMD=avx512 deliberately has AVX-512F/BW/VL but no VNNI. Keep it
+     * distinct from the AVX2 build: integer GEMV/matmat still resolve through
+     * AVX2, while this binary also has wider conversion helpers. */
+    if (x86_avx512_profile_available()) return "x86_avx512f_no_vnni";
 #endif
 #if defined(__AVX2__)
     if (__builtin_cpu_supports("avx2")) return "x86_avx2";
@@ -126,6 +144,7 @@ static const char *gate_id(int mmk) {
     case QWEN_MMK_Q4_VNNI:     return "gate.q4.vnni";
     case QWEN_MMK_Q4_AVX2:     return "gate.q4.avx2";
     case QWEN_MMK_Q4_SMMLA:    return "gate.q4.smmla";
+    case QWEN_MMK_Q4_SDOT:     return "gate.q4.sdot_mm";
     case QWEN_MMK_KLEIDI_Q4:   return "gate.q4.kleidi";
     case QWEN_MMK_KLEIDI_I8:   return "gate.int8.kleidi";
     case QWEN_MMK_KLEIDI_BF16: return "gate.bf16.kleidi";
@@ -289,6 +308,31 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
     const char *why = NULL;
     char tmp[64];
 
+    /* AVX-512BW without VNNI gets its own B=1 signed-dot candidates; the
+     * existing B>1 integer matmat family remains AVX2-width. */
+    {
+        const int compiled = qwen_avx512bw_int8_gemv_compiled();
+        const int supported = qwen_avx512bw_int8_gemv_supported();
+        const int enabled = qwen_avx512bw_int8_gemv_enabled();
+        const char *reason = !compiled ? "candidate requires AVX-512F/BW without compiled VNNI"
+                           : !supported ? "compiled, but this CPU lacks AVX-512F/BW/VL or AVX2/FMA"
+                           : enabled ? "experimental AVX-512BW signed-widening GEMV selected before AVX2"
+                                     : "default OFF; set QWEN_AVX512_INT8_GEMV=1 for A/B";
+        row(&feats[n++], "matvec.int8.avx512bw-emulated-dot-gemv", yn(compiled), yn(supported),
+            "QWEN_AVX512_INT8_GEMV", (compiled && supported && enabled) ? "ON" : "OFF", reason);
+    }
+    {
+        const int compiled = qwen_avx512bw_q4_gemv_compiled();
+        const int supported = qwen_avx512bw_q4_gemv_supported();
+        const int enabled = qwen_avx512bw_q4_gemv_enabled();
+        const char *reason = !compiled ? "candidate requires AVX-512F/BW without compiled VNNI"
+                           : !supported ? "compiled, but this CPU lacks AVX-512F/BW/VL or AVX2/FMA"
+                           : enabled ? "experimental AVX-512BW Q4 GEMV selected before AVX2"
+                                     : "default OFF; set QWEN_AVX512_Q4_GEMV=1 for A/B";
+        row(&feats[n++], "matvec.q4.avx512bw-emulated-dot-gemv", yn(compiled), yn(supported),
+            "QWEN_AVX512_Q4_GEMV", (compiled && supported && enabled) ? "ON" : "OFF", reason);
+    }
+
     /* Legacy AVX2 GEMV is a separate policy-controlled candidate, not the
      * existing AVX2 B>1 matmat gate. Keep compiled, runtime support and the
      * opt-in policy visible independently. */
@@ -405,6 +449,8 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             "QWEN_SD_INT8", onoff(qwen_sd_int8_enabled()),
 #if defined(__AVX512VNNI__)
             "default ON with AVX-512 VNNI when the int8 decoder kernels are available"
+#elif defined(__AVX2__)
+            "opt-in AVX2 signed-widening decoder path; default OFF pending AVX2 host qualification"
 #else
             "opt-in on this ISA (measured slower on the first frame elsewhere)"
 #endif
@@ -413,7 +459,7 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
             yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_RES1_V2",
             onoff(qwen_sd_res1_v2_active()),
             qwen_sd_res1_v2_active()
-                ? "direct dilated int8 DL-4 conv (VNNI / Arm dotprod; per-position activation scale, per-(channel,tap) weight scale). Any shape: it serves res1, res2, the rectangular initial/pre convs and wide channels; the in_ch<=768 square-only bound applies to the v1/Design-D paths, not here"
+                ? "direct dilated int8 DL-4 conv (AVX2 signed widening / VNNI / Arm dotprod; per-position activation scale, per-(channel,tap) weight scale). Any shape: it serves res1, res2, the rectangular initial/pre convs and wide channels; the in_ch<=768 square-only bound applies to the v1/Design-D paths, not here"
                 : "opt-in (QWEN_SD_RES1_V2=1); off: the residual convs run on the im2col panel kernel (v1 int8 where the square/768 shape allows, f32 otherwise)");
         row(&feats[n++], "decoder.pre_up_bf16", "yes",
             yn(qwen_avx512_bf16_matmat_available() || qwen_kleidi_bf16_enabled()),
@@ -435,7 +481,7 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
         row(&feats[n++], "decoder.glue_fused", yn(qwen_conv1d_int8_v2_available()),
             yn(qwen_conv1d_int8_v2_available()), "QWEN_SD_GLUE", onoff(qwen_sd_glue_active()),
             qwen_sd_glue_active()
-                ? "residual unit fused on the DL-4 path (VNNI / Arm dotprod): context-aware conv, residual in the epilogue, no ext/full/cut/add passes"
+                ? "residual unit fused on the DL-4 path (AVX2 signed widening / VNNI / Arm dotprod): context-aware conv, residual in the epilogue, no ext/full/cut/add passes"
                 : "opt-in (QWEN_SD_GLUE=1, needs QWEN_SD_RES1_V2=1); off: the control residual unit");
         row(&feats[n++], "decoder.mode", "yes", "yes", "QWEN_DECODER_BATCH",
             qwen_sd_decoder_mode(),
@@ -501,14 +547,16 @@ int qwen_dispatch_map_report(void *out, const char *json_path) {
         row(&feats[n++], "matmat.bf16.family", "-", "-", NULL, "see reason",
             qwen_matmat_family_bf16());
         {
-            /* --batch-size is not clamped to this: above it every batched int8 gate declines
-             * and the step runs one GEMV per slot instead (prefill chunks itself to 16). */
+            /* This is the largest B accepted by any optimized int8 matmat gate for the
+             * standard probe shape. It is not a server batch clamp: the normal B>1 matmat
+             * route falls back to the fixed-B/generic f32 twin, unless matvec is forced. */
             char mb[24]; int ceil_b = qwen_matmat_int8_max_b();
             snprintf(mb, sizeof mb, "%d", ceil_b);
             row(&feats[n++], "matmat.int8.batch_ceiling", "-", "-", NULL, mb,
-                ceil_b ? "largest B the int8 matmat family accepts; --batch-size above it falls "
-                         "back to one GEMV per slot, silently"
-                       : "no batched int8 kernel here at all: every B runs per-slot GEMV");
+                ceil_b ? "max optimized int8 B on 4096x4096 probe; above it B>1 uses fixed-B/"
+                         "generic f32-accum matmat (unless matvec is forced)"
+                       : "no optimized int8 gate on 4096x4096 probe; B>1 uses fixed-B/generic "
+                         "f32-accum matmat (unless matvec is forced)");
         }
         row(&feats[n++], "matvec.q4.native", yn(qwen_q4_gemv_native()),
             yn(qwen_q4_gemv_native()), NULL, onoff(qwen_q4_gemv_native()),

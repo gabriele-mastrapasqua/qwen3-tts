@@ -102,6 +102,14 @@ int main(int argc, char **argv) {
         }
         qwen_matmat_q4_0(Y, Wq4, X, rows, cols, B);
         fail += check("q4_0 matmat", Y, R, rows * B);
+#if defined(__ARM_FEATURE_DOTPROD)
+        if (B >= 2) {
+            qwen_mm_force(QWEN_MMK_Q4_SDOT);
+            qwen_matmat_q4_0(Y, Wq4, X, rows, cols, B);
+            qwen_mm_force(0);
+            fail += check("q4 SDOT fused matmat", Y, R, rows * B);
+        }
+#endif
 
         free(X); free(Y); free(R); free(qXt); free(sx);
     }

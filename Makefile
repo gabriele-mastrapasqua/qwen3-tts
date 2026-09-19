@@ -12,13 +12,18 @@ ifeq ($(SIMD),auto)
                 F=$$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null); \
                 cc_ok() { $(CC) $$1 -E -x c /dev/null >/dev/null 2>&1; }; \
                 has() { echo "$$F" | grep -qw "$$1"; }; \
-                if has amx_int8 && has avx512_bf16 && cc_ok "-mamx-int8 -mamx-bf16 -mamx-tile"; then echo amx; \
-                elif has avx512_bf16 && cc_ok -mavx512bf16; then echo avx512bf16; \
-                elif has avx512_vnni && cc_ok -mavx512vnni; then echo avx512vnni; \
-                elif has avx512f && cc_ok -mavx512f; then echo avx512; \
-                elif has avx2; then echo portable; \
+                avx512_base() { has avx2 && has fma && has avx512f && has avx512bw && has avx512vl; }; \
+                avx512_vnni() { avx512_base && has avx512dq && has avx512_vnni; }; \
+                if avx512_vnni && has avx512_bf16 && has amx_tile && has amx_int8 && has amx_bf16 \
+                    && cc_ok "-mavx2 -mfma -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512bf16 -mamx-tile -mamx-int8 -mamx-bf16"; then echo amx; \
+                elif avx512_vnni && has avx512_bf16 \
+                    && cc_ok "-mavx2 -mfma -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512bf16"; then echo avx512bf16; \
+                elif avx512_vnni \
+                    && cc_ok "-mavx2 -mfma -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni"; then echo avx512vnni; \
+                elif avx512_base && cc_ok "-mavx2 -mfma -mavx512f -mavx512bw -mavx512vl"; then echo avx512; \
+                elif has avx2 && has fma && cc_ok "-mavx2 -mfma"; then echo portable; \
                 else echo scalar; fi)
-            $(info [simd] auto -> $(SIMD)   (make blas SIMD=portable for a binary not tied to this host))
+            $(info [simd] auto -> $(SIMD)   (SIMD=portable is AVX2/Haswell+; use SIMD=scalar for older x86))
         else
             SIMD := portable
         endif

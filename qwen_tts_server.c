@@ -3144,14 +3144,22 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
             max_batch, jq.cap, max_batch + jq.cap,
             g_srv.queue_timeout_ms > 0 ? "on" : "none");
     {
-        /* Say it once at start instead of letting the throughput quietly not happen: above
-         * the batched int8 ceiling every gate declines and a step runs one GEMV per slot. */
+        /* Report the optimized integer matmat limit accurately. qwen_matmat_int8() retains
+         * a fixed-B/generic f32-accumulation matmat fallback when no integer gate accepts. */
         int ceil_b = qwen_matmat_int8_max_b();
         if (ceil_b > 0 && max_batch > ceil_b)
             fprintf(stderr, "[serve] WARNING --batch-size %d is above the batched int8 ceiling "
-                            "(B<=%d on this build): a fuller batch runs one GEMV per slot "
-                            "instead of the batched kernel. See matmat.int8.batch_ceiling in "
-                            "--dispatch-map.\n", max_batch, ceil_b);
+                            "(B<=%d on the 4096x4096 dispatch probe): INT8_BATCH_FALLBACK; "
+                            "when a fuller batch exceeds the optimized gate, INT8 projections "
+                            "on the normal matmat route use fixed-B/generic f32-accum matmat "
+                            "(unless matvec is explicitly forced). See "
+                            "matmat.int8.batch_ceiling in --dispatch-map.\n", max_batch, ceil_b);
+        else if (ceil_b == 0 && max_batch > 1)
+            fprintf(stderr, "[serve] INFO INT8_BATCH_FALLBACK: no optimized batched int8 matmat "
+                            "gate accepts the 4096x4096 dispatch probe; INT8 projections at "
+                            "B>1 on the normal matmat route use the fixed-B/generic f32-accum "
+                            "matmat path (unless matvec is explicitly forced). See "
+                            "matmat.int8.batch_ceiling in --dispatch-map.\n");
     }
     job_queue_t jq_single; jq_init(&jq_single);
 

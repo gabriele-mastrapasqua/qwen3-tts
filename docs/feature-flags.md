@@ -175,6 +175,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_NO_AMX_BF16` · `QWEN_NO_AMX_INT8` · `QWEN_NO_AMX_Q4` | x86 | unset | one AMX consumer each, which is what a measurement needs. On an 8-core Emerald Rapids the two do disjoint jobs: dropping **bf16** costs C=1 TTFA +39% and C=4 p95 +72% while stream RTF barely moves (it is the *prefill*), and dropping **int8** leaves TTFA alone while costing 9% of RTF and 10% of throughput (it is the *decode*) |
 | `QWEN_NO_AVX2MM` | x86 | unset | `=1` drops the AVX2 matmat |
 | `QWEN_INT8_SDOT_MM` | ARM dotprod | unset (off) | enables the in-house SDOT B>1 INT8 matmat candidate; compare it against the fixed-B twin and B×SDOT GEMV, and report kernel B separately from server concurrency C |
+| `QWEN_Q4_SDOT_MM` | ARM dotprod | unset (off) | enables the fused Q4 SDOT B=2..16 matmat candidate; weights are unpacked once for the batch. Parity is covered; measure on the target server before enabling |
 | `QWEN_NO_BF16_MATMUL` | x86 | unset | `=1` drops the AVX-512 bf16 matmat, leaving the per-row twin. Only reachable where AMX is absent or declined |
 | `QWEN_NO_VNNI_TILE` | x86 | unset | `=1` drops the *tiled* VNNI matmat back to one row at a time. It does **not** disable VNNI — that is `QWEN_NO_VNNI` |
 | `QWEN_VNNI_TILE_M4N2` | x86 | unset (off) | `=1` tries the fixed `M4xN2` VNNI tile for observed `B=2` calls. It is an opt-in candidate inspired by the ARM small-B cross-product path; qualify it on the complete server path before enabling it |
@@ -184,6 +185,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_VNNI_TILE_N8` | x86 | unset (off) | `=1` tries the 8-column VNNI tile. Opt-in candidate; qualify on the server path |
 | `QWEN_Q4_VNNI_V3` · `QWEN_Q4_VNNI_V4` | x86 | v3 on | which q4 VNNI microkernel variant runs; `QWEN_Q4_VNNI_V4=1` selects the v4 experiment |
 | `QWEN_AVX2_INT8_GEMV` · `QWEN_AVX2_Q4_GEMV` | x86 AVX2 | off | experimental legacy B=1 integer candidates; each is independently selectable and falls back when its input shape is outside the bounded packed-activation contract |
+| `QWEN_AVX512_INT8_GEMV` · `QWEN_AVX512_Q4_GEMV` | x86 AVX-512F/BW without VNNI | off | experimental B=1 signed-widening candidates using 512-bit integer lanes; they precede the AVX2 candidates when enabled and stay off until a no-VNNI server screen |
 | `QWEN_AMX_PREPACK` | x86 AMX | **off** | `=1` pre-tiles weights once into the AMX tile layout and caches them by source pointer. When off the kernel simply reads the source with stride `cols`: there is NO per-call re-tiling anywhere, and the earlier claim that `=0` re-tiles per call was wrong |
 | `QWEN_AMX_PREPACK_KINDS` | x86 AMX | all | limits the prepack cache to some weight kinds. Recognised values are `int8`, `bf16`, `both`, `all` ONLY - `q4` is not one of them and silently disables ALL prepacking |
 | `QWEN_AMX_PERSIST_CFG` | x86 AMX | on | keeps the AMX tile configuration loaded across calls instead of `ldtilecfg`/`tilerelease` per call |
@@ -196,6 +198,7 @@ wins". These exist to take one away and measure what it was worth.
 | `QWEN_AMX_INT8_QKV_MIN_B` | x86 | inherits `QWEN_AMX_INT8_MIN_B` | additional lower bound for the fused INT8 QKV path only; other INT8 projections keep the normal AMX gate |
 | `QWEN_AMX_INT8_MIN_ROWS_PER_THREAD` | x86 | 256 | AMX INT8 also needs enough output rows PER WORKER (`rows >= N * threads`; the fused QKV counts `q+2kv`). Measured: below ~256 the tile setup and activation pack are not amortised and VNNI wins, and the same projection flips sign with the thread count. 0 disables the rule |
 | `QWEN_BFMMLA_MIN_B` · `QWEN_SMMLA_MIN_B` · `QWEN_KLEIDI_MIN_B` | ARM | 2 · 2 · 1 | the same thresholds on the ARM kernels |
+| `QWEN_INT8_SDOT_MIN_B` · `QWEN_Q4_SDOT_MIN_B` | ARM dotprod | 2 · 2 | independent minimum B thresholds for the experimental fused matmat paths |
 
 The batch gates say *when* a kernel is allowed; these say *how it tiles the output rows* once it is:
 
@@ -271,8 +274,8 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_SD_SGEMM_CENSUS` | off | diagnostic: prints every decoder SGEMM shape with its wall time (every 100 calls and at exit) |
 | `QWEN_STREAM_DECODE_CHUNK` | 8 (max 32) | frames decoded per streaming chunk |
 | `QWEN_STREAM_DECODE_CHUNK_BUSY` | 0 (off) | a different chunk size once more than one slot is busy |
-| `QWEN_SD_RES1_V2` | off | direct dilated int8 conv (DL-4) for the residual convs: per-position activation scale, per-(channel,tap) weight scale, no im2col panel. Leaves for AVX-512 VNNI and Arm dot-product. The DL-4 leaf takes any shape (rectangular and wide included: the activation/weight padding is per `in_ch`), so it serves **res2, the initial/pre convs and every square conv**, not only res1; the flag name understates it. The `in_ch <= 768` square-only bound now applies to the v1 panel and Design-D paths, not to DL-4 |
-| `QWEN_SD_GLUE` | off | fused residual unit on top of `QWEN_SD_RES1_V2`: snake out of place, res1 with its left context passed to the kernel, res2 with the residual in the kernel epilogue (exact, one pass) |
+| `QWEN_SD_RES1_V2` | off | direct dilated int8 conv (DL-4) for the residual convs: per-position activation scale, per-(channel,tap) weight scale, no im2col panel. Leaves exist for AVX-512 VNNI, Arm dot-product and AVX2 signed widening; AVX2 also covers AVX-512F without VNNI and stays default-off pending host qualification. The leaf serves rectangular, wide, initial/pre, res1 and res2 shapes; the `in_ch <= 768` square-only bound applies to the v1 panel and Design-D paths |
+| `QWEN_SD_GLUE` | off | fused residual unit on top of `QWEN_SD_RES1_V2`: snake out of place, res1 with its left context passed to the kernel, res2 with the residual in the kernel epilogue (exact, one pass); AVX2 requires both decoder flags |
 | `QWEN_SD_CONVT_STACK` | off | ConvT as one un-expanded GEMM per layer with a two-tap/carry/bias epilogue (exact); measured neutral on the x86 product quantum, never qualified on Arm |
 | `QWEN_SD_CONVT_I8` | off | the one-GEMM ConvT stack (needs `QWEN_SD_CONVT_STACK=1`) on KleidiAI int8 with per-row weight scales; the exact carry/two-tap/bias epilogue is unchanged and only the GEMM output is transposed back. Numeric change: default off, Arm i8mm only today |
 | `QWEN_SD_CNEXT_I8` | off | the ConvNeXt pointwise pair (4096-wide, the largest f32 weights left in the decoder unit) on KleidiAI int8 with per-row weight scales, built at first use and driven through the prepared-state pair because the unit runs on the lane team. Numeric change: off until a paired audio gate; Arm i8mm only today |
@@ -287,7 +290,7 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_STREAM_LEAD_TARGET_MS` | 250 (range 50–2000) | estimated audio lead target used by `QWEN_STREAM_LEAD_GATE` |
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |
 | `QWEN_DECODER_GANG_MIN` | 2 | smallest gang that is worth forming |
-| `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI and ARM dotprod only; on ARM it is opt-in (`=1`) until the first-frame cost is measured there |
+| `QWEN_SD_INT8` | on where the build has AVX-512 VNNI, off elsewhere | int8 speech-decoder convolutions; `=0` forces fp32. Kernels exist for VNNI, ARM dotprod and AVX2; AVX2 uses direct DL-4 and also requires `QWEN_SD_RES1_V2=1`, with both flags opt-in pending native host qualification |
 | `QWEN_SD_AMX` | off | decoder INT8 AMX control path (V1); requires the AMX INT8 build/capability and `QWEN_SD_INT8=1`, otherwise the decoder falls back to its selected INT8/FP32 path |
 | `QWEN_SD_AMX_D` | off | experimental decoder INT8 Design D; prebuilds immutable AMX B weight tiles at model load and loads the quantised im2col panel directly as AMX A. It supports the real M=96/192/384/768 decoder shapes, reports persistent pack bytes and falls back to V1/INT8 if a shape is unsupported. FAST GCP tests now prove the path under prefork and actual continuous ragged batching; full streaming qualification and production-default selection remain pending |
 | `QWEN_SD_AMX_BF16` | off | experimental decoder AMX BF16 arm; uses real `TDPBF16PS` with activation-as-A and immutable BF16 B packs on the same decoder shapes. It can run with `QWEN_SD_INT8=0`, reports conversion/persistent-pack/tile counters, and is wired into the continuous ragged-batch path. FAST GCP evidence proves execution and parity, but its current C4 STREAM_RTF is behind Design D, so it is not a production default |
@@ -461,12 +464,12 @@ the KleidiAI bf16 matmat on ARM, the AMX one on x86.
 `QWEN_NO_BF16DOT`, `QWEN_NO_BF16_MATMUL`, the AMX/VNNI/AVX2 batch thresholds, and the
 `*_NCHUNK` row-chunk family.
 
-**Both, but opt-in outside VNNI** — `QWEN_SD_INT8` has an int8 decoder conv on Arm
-dot-product too; it is default-on only where AVX-512 VNNI is. `QWEN_SD_RES1_V2` and
-`QWEN_SD_GLUE` have both a VNNI and an Arm dot-product leaf. `QWEN_SD_LANE_SPLIT` /
-`QWEN_SD_LANE_ELASTIC` and `QWEN_SD_CONVT_STACK` carry no ISA guard at all. AVX2 and
-AVX-512F have **no** int8 decoder conv, so there the whole family falls back to f32
-im2col + SGEMM.
+**Both, but opt-in outside VNNI** — `QWEN_SD_INT8` has decoder convolution on Arm
+dot-product and AVX2 too; it is default-on only where AVX-512 VNNI is. `QWEN_SD_RES1_V2`
+and `QWEN_SD_GLUE` have VNNI, Arm dot-product and AVX2 signed-widening leaves. The AVX2
+leaf requires both `QWEN_SD_INT8=1` and `QWEN_SD_RES1_V2=1`, and it serves AVX-512F CPUs
+without VNNI through the same 256-bit kernel. `QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC`
+and `QWEN_SD_CONVT_STACK` carry no ISA guard at all.
 
 **The two sides are not symmetric, and the asymmetry is the point.** `QWEN_KAI_NCHUNK` is on by
 default at 384 because sub-tiling the KleidiAI GEMM was measured to win on ARM. The x86

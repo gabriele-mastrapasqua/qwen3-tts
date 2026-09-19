@@ -1,6 +1,6 @@
 # Legacy CPU and v2 serving architecture audit
 
-Task · Audit the current v2 CPU streaming/server design for graceful performance on older/common x86 and ARM CPUs, and produce an evidence-based implementation plan without changing execution code.
+Task: LEGACY-5 — old-ISA v2 streaming follow-up. Audit the current v2 CPU streaming/server design for graceful performance on older/common x86 and ARM CPUs, and produce an evidence-based implementation plan.
 
 Question · Does the current dispatch, quantization, packing, GEMV/GEMM selection and v2 scheduler degrade usefully from AMX/VNNI/KleidiAI to AVX2, AVX-512 without VNNI, ARM dotprod and plain NEON?
 
@@ -532,9 +532,9 @@ shapes and complete-call `im2col`, quantize, dot, epilogue timings; then design 
 kernel and compare it against the existing BLAS path. Do not gate it on the Talker GEMV
 candidate or alter v2 scheduling.
 
-## 18. AVX-512 without VNNI — no speculative second implementation
+## 18. AVX-512 without VNNI — initial kernel scope
 
-The focused design check found no currently justified complete-call kernel distinct from
+The initial focused design check found no proven complete-call kernel distinct from
 the AVX2 candidate. `SIMD=avx512` supplies AVX-512F/BW/VL plus AVX2/FMA, but the integer
 matrix gate still resolves through the AVX2 implementation; there is no VPDPBUSD-equivalent
 instruction without AVX512-VNNI. Wider staging/quantization and Q4 unpack are possible,
@@ -547,15 +547,16 @@ The safe current behavior is therefore:
 - preserve raw host flags in the qualification manifest, including `avx_vnni`; this
   repository has no AVX-VNNI-specific kernel family and must not label AVX-VNNI as
   AVX512-VNNI;
-- select the AVX2 FMA reference or the explicitly forced AVX2 integer/Q4 candidates;
+- select the AVX2 FMA reference or explicitly forced AVX2/AVX-512BW integer/Q4 B=1 candidates;
 - record the actual leaf, not merely `AVX512`;
-- defer a dedicated AVX-512 implementation until a real no-VNNI host shows a complete-call
-  advantage after frequency and bandwidth are measured.
+- defer promotion until a real no-VNNI host shows a complete-call advantage after frequency
+  and bandwidth are measured. At the user's direction, §26 later added separate opt-in
+  AVX-512BW INT8/Q4 B=1 candidates; B>1 integer matmat remains AVX2-width.
 
 | property | status | evidence / limitation |
 |---|---|---|
-| IMPLEMENTED | NO dedicated path | Existing AVX2 candidate is usable as the controlled fallback. |
-| PARITY VERIFIED | STRUCTURAL | AVX512 source compiles through the AVX2-compatible branches; no hardware execution here. |
+| IMPLEMENTED | AVX-512BW INT8/Q4 B=1 candidates; no dedicated B>1 matrix path | Existing AVX2 B>1 implementation remains the controlled fallback. |
+| PARITY VERIFIED | compile-checked; direct adversarial checks are in `--self-test` | No physical AVX-512 no-VNNI execution was available. |
 | PERFORMANCE VERIFIED | NO | Requires AVX512-no-VNNI hardware and frequency telemetry. |
 | DEFAULT/PROMOTED | NO | No wider path is enabled by ISA name alone. |
 
@@ -700,3 +701,179 @@ made from this screen.
 | PARITY VERIFIED | STRUCTURAL/runtime-safe | zero errors/rejects/timeouts; capability gates selected valid AVX2 fallbacks |
 | PERFORMANCE VERIFIED | NO | two-minute C1 A/B only; playback trade-off is unresolved |
 | DEFAULT/PROMOTED | NO | the bundle is not promoted |
+
+## 23. Old-ISA v2 streaming follow-up (2026-09-18)
+
+> State boundary: §23 records the dispatch/diagnostic audit before the kernels in §24 were
+> implemented. Its missing-kernel statements are historical where §24 supersedes them.
+
+Work is on branch `feature/old-cpus-simd`, created from the clean `main` commit
+`e391ec5467b0218eeb175f4888ad65b259d1e7c7`. The follow-up changes dispatch truth and
+diagnostics; it does not claim new kernel performance.
+
+### AVX-512F without VNNI
+
+The initial `isa_class()` change reported `x86_avx512f_no_vnni` when the build contained
+AVX-512F and the running CPU supported it, before falling back to the AVX2 class. The later
+review hardening in §25 requires the full AVX-512F/BW/VL set and rejects an incompatible
+build at startup. The dispatch expectations for this class require FP32/BLAS prefill, AVX2
+INT8/Q4 matmat gates, and decoder INT8 OFF by default.
+The doctor uses a conservative, unprofiled spin hint and does not associate this class with
+the Turin/VNNI profile. `tools/check_isa.sh` adds AVX-512F/BW/VL without VNNI and an Arm
+dotprod-only compile pass. The synthetic dispatch test and cross-compiles prove build and
+expectation consistency only; no physical no-VNNI server was available.
+
+The v2 Talker/CP path already reaches the shared projection APIs. B=1 takes the GEMV route;
+B>1 gathers active inputs, calls matmat, then scatters. The no-VNNI binary inherits the AVX2
+INT8/Q4 matmat gates. It has no native integer GEMV or decoder INT8, and this follow-up adds
+no AVX-512-width integer emulation. AVX2 B=1 candidates remain opt-in pending parity and
+complete-call evidence on an AVX2 host.
+
+### Dotprod-only Arm and server fallback truth
+
+An Arm dotprod build without i8mm (for example, Neoverse N1) has native SDOT INT8/Q4 GEMV.
+Neoverse V1 is not a dotprod-only example: Arm's V1 documentation lists Armv8.6-A support,
+which includes INT8 matrix multiply extensions. Classify a concrete host from its actual CPU
+feature flags; keep N1 and V1 in separate screen profiles. INT8 B>1 SDOT matmat exists
+behind `QWEN_INT8_SDOT_MM=1`; its default remains off after the measured M1 candidate lost to
+B×SDOT GEMV. Without an eligible optimized integer matmat gate, `qwen_matmat_int8()` still
+uses its fixed-B/generic f32-accumulation matmat twin. The previous dispatch-map and server
+messages incorrectly said this fallback was one GEMV per slot; both now identify the actual
+fallback. The server log reports the 4096x4096 probe ceiling and keeps kernel B distinct from
+configured server concurrency C.
+
+At this audit snapshot, Q4 B>1 on dotprod-only Arm quantized and ran one native Q4 SDOT GEMV
+per batch column; §24 adds a fused candidate. V1 should be screened separately through its
+i8mm-capable path. KleidiAI remains unavailable without the matching build and RHS pack
+contract; changing only the CPU feature check is unsafe.
+
+### Validation and open work
+
+On the local Apple arm64 development host, `make blas`, `./qwen_tts --caps`,
+`./qwen_tts --dispatch-map`, and `./qwen_tts --self-test` pass. `python3 tests/test_doctor.py`,
+`python3 tools/dispatch_gate.py --selftest`, and `bash tools/check_isa.sh` pass; compile checks
+cover AVX-512F/no-VNNI, Arm dotprod-only, Arm i8mm/BF16/KleidiAI, and x86 VNNI/BF16/AMX.
+With `QWEN_INT8_SDOT_MM=1`, the M1 dispatch map selects the SDOT B>1 gate (probe ceiling 16)
+and `./qwen_tts --self-test` still passes. That is runtime parity for this Arm dotprod path,
+not Neoverse/Linux server evidence or a performance promotion. These checks are not runtime
+validation on Zen3/4, an AVX-512-no-VNNI CPU, or a Neoverse host. Older non-v2 Neoverse
+evidence does exist: N1 single-stream results and Graviton3/V1 SMMLA matmat plus B=4
+batched-server tests are summarized in `docs/hardware-testing.md` and
+`docs/serving/cpu-batching.md`. They do not qualify the current v2 streaming scheduler. The
+existing `make legacy-cpu-screen` is x86 AVX2-candidate focused; an Arm screen remains open.
+No candidate default changed and no new performance result was recorded.
+
+Next work, in order:
+
+1. Add an Arm plain-NEON/dotprod model-free screen; run current v2 streams on N1 (or an
+   equivalent dotprod-only host) and on an i8mm-capable V1 host.
+2. Run the AVX2 GEMV candidate screen and complete decoder/stream A/B on a native Zen3/4 or
+   equivalent Linux host; run the AVX-512F-no-VNNI profile on an actual matching host.
+3. On Arm, A/B the opt-in INT8 SDOT and fused Q4 SDOT matmat candidates at representative
+   CP/Talker batch widths, recording kernel B separately from server concurrency C.
+4. Keep all candidates default-off until target-host parity and complete-call streaming gates
+   pass. Preserve the KleidiAI/i8mm packing contract; do not borrow VNNI/KAI/AMX profiles.
+
+## 24. Legacy ISA kernel follow-up (2026-09-18)
+
+Question · Which missing kernels can safely reuse the current v2 projection and decoder data
+flows on AVX2/AVX-512F without VNNI and Arm dotprod without i8mm?
+
+Known facts · The Talker/CP B>1 path already reaches AVX2 INT8/Q4 matmat. B=1 INT8/Q4 candidates
+are present but opt-in. The direct decoder-v2 layout already has VNNI and Arm dotprod leaves;
+the outer panel-kernel guard must remain narrower because its helpers use those instruction
+families.
+
+Files/functions · `qwen_tts_kernels.c` (`qwen_sd_int8_available`, direct DL-4 decoder and
+`qwen_matmat_q4_0`); `qwen_tts_dispatch.c`; `qwen_tts_speech_decoder.c`; `qwen_tts_server.c`;
+`tools/check_isa.sh`; `tests/matmat_parity.c`; CPU backend and feature-flag documentation.
+
+Implementation · The AVX2 direct DL-4 decoder branch now sits outside the VNNI/dotprod panel
+guard and is selected for AVX2 plus AVX-512F-without-VNNI builds. It widens signed activation
+and weight bytes to int16 before multiply/add, avoiding PMADDUBSW saturation. The decoder path
+remains opt-in and requires both `QWEN_SD_INT8=1` and `QWEN_SD_RES1_V2=1`; it handles rectangular
+channels and odd output tails, and leaves multi-slot unavailable. AVX-512F-no-VNNI reuses this
+AVX2-width implementation; no distinct 512-bit kernel was added without a measured advantage.
+
+On Arm DOTPROD, a fused Q4 SDOT matmat candidate now reuses each decoded weight block across
+B=2..16 columns. It is behind `QWEN_Q4_SDOT_MM=1`, has its own gate/census leaf and falls back
+to B×GEMV if its scratch allocation fails. It does not relax KleidiAI's i8mm packing guard.
+Both changes preserve default policy; the known INT8 SDOT matmat candidate remains opt-in.
+
+Evidence · `make check-isa` passed x86 AVX2/FMA, AVX-512F/BW/VL without VNNI, Arm dotprod-only,
+Arm i8mm/BF16/KleidiAI, and x86 VNNI/BF16/AMX compile checks. `make check-matmat-parity-x86`
+linked and passed under Rosetta. An x86-64-v3 Rosetta self-test exercised the AVX2 decoder
+leaf, including `in_ch=67`, `out_ch=5`, short outputs, context/residual and continuation cases;
+all passed against the kernel's own quantized reference. Native M1 `make test-selftest` passed
+both dispatched and no-SDOT/no-VNNI fallback runs. `make check-matmat-parity` forced the Q4
+SDOT candidate at every B=2..16; max absolute error was at most `5.96e-7`. Doctor, dispatch
+gate, capability and dispatch-map checks passed after updating the no-VNNI fixture to expect
+the new compiled-but-default-off decoder leaf.
+
+Unknowns · No native Linux Zen3/4 or AVX-512F-no-VNNI server, Neoverse N1/V1 v2 server, or
+complete-call performance run was available. AVX2 decoder and Arm Q4 SDOT performance remain
+unverified, so neither candidate is promoted. The full `make test-golden` suite passed with a
+temporary NumPy cache directory: 0.6B English, Italian and INT8
+mel-correlation were 1.00000 with exact durations; 1.7B English was 0.99995 with exact
+durations. This verifies current generation parity, not old-ISA host performance.
+
+Next action · Run model-free and complete v2 streaming screens on native AVX2/no-VNNI and
+dotprod/i8mm Arm hosts. Measure complete-call and playback metrics before changing defaults.
+
+## 25. AVX-512 no-VNNI runtime guard and common-control contract (2026-09-18)
+
+The native SIMD review found that the first no-VNNI ISA class checked AVX-512F alone while
+`SIMD=avx512` compiles for AVX-512F/BW/VL, and the startup check only guarded AVX2. It also
+found that `common-control` rejected the new ISA class before checking its serving contract.
+
+`isa_class()` now requires runtime AVX2/FMA plus AVX-512F, BW and VL before reporting the
+no-VNNI class.
+The runtime guard checks every x86 ISA extension selected by the build profile (AVX2/FMA,
+AVX-512F/BW/VL/DQ, VNNI and BF16 as applicable), is compiled for the x86-64 baseline,
+and runs before diagnostic or serving modes. `common-control` now accepts AVX2 and
+AVX-512F-no-VNNI builds with the generic per-item INT8 decoder mode; synthetic parity cases
+cover both classes.
+
+Linux `SIMD=auto` now requires the complete feature set used by each compiler profile: AVX2
+plus FMA; AVX-512F/BW/VL plus AVX2/FMA; DQ/VNNI for the corresponding VNNI profiles; and
+reported AMX tile/INT8/BF16 support plus compiler acceptance before choosing AMX. This avoids
+selecting an AVX-512F-only target that lacks BW/VL, or a target whose compiler flags are not
+accepted. The build message also names `SIMD=portable` as the AVX2/Haswell+ baseline and
+`SIMD=scalar` as the older-x86 option.
+
+Validation · `make check-isa` passes every compiled profile (x86 AVX2, AVX-512F/BW/VL,
+VNNI/BF16/AMX and Arm dotprod/i8mm). A cross-built AVX-512 guard object was inspected and
+its guard path contains only baseline instructions; its Rosetta harness rejects this host
+before the unsupported AVX2/AVX-512 code can run. `tests/test_serving_profile.py` passes the
+new AVX2 and no-VNNI common-control cases, and the doctor/dispatch self-tests pass. The full
+golden test already passed as recorded in §24. No physical AVX-512F-only CPU was available to
+verify rejection specifically for missing BW/VL on hardware. A mocked `/proc/cpuinfo`/compiler
+matrix selected portable for AVX2+FMA, avx512 for AVX-512F/BW/VL without VNNI, successive VNNI,
+BF16 and AMX profiles as features were added, and scalar without AVX2. Compiler-rejection cases
+also fell back from AMX to BF16, BF16 to VNNI, VNNI to no-VNNI AVX-512, AVX-512 to AVX2, and
+AVX2 to scalar.
+
+## 26. AVX-512BW no-VNNI INT8/Q4 GEMV candidates (2026-09-18)
+
+The user asked to implement the missing wider B=1 integer paths. The AVX-512F/BW profile now
+has separate `QWEN_AVX512_INT8_GEMV=1` and `QWEN_AVX512_Q4_GEMV=1` candidates. INT8 sign-extends
+both operands to 16-bit lanes and uses VPMADDWD, avoiding PMADDUBSW saturation. Q4 expands its
+unsigned nibbles, widens them with signed activations, applies the stored `(q-8)` correction,
+and preserves each block scale. Both reuse the established per-item activation quantization,
+reject over-limit or partial-block shapes, run before AVX2 candidates when enabled, and report
+separate census leaves. They compile only in AVX-512F/BW builds without AVX512-VNNI and remain
+off by default.
+
+The B>1 INT8/Q4 matrix continues to use the existing AVX2-width gates. No AVX-512BW B>1 matrix
+candidate was added: that requires separate packed-panel work and a physical no-VNNI server to
+measure frequency, bandwidth, complete-call time and stream effects before implementation is
+justified.
+
+Validation · `make check-isa` compiles the full no-VNNI profile with the new kernels and
+adversarial self-test code. `tests/test_doctor.py`, the dispatch-gate self-test and common-control
+profile tests pass with all four AVX2/AVX-512BW B=1 candidates pinned off. `legacy_cpu_screen.py`
+now runs independent AVX2 and AVX-512BW INT8/Q4 candidate arms and records each resolved leaf.
+The native Arm `make blas` and `--caps`/`--dispatch-map`/`--self-test` checks pass; the map says
+the x86 candidates are not compiled in this profile, as expected. The new AVX-512BW self-test
+cannot be executed on the available host; no physical AVX-512F/BW without-VNNI CPU or v2 server
+was available, so runtime parity and performance remain open.

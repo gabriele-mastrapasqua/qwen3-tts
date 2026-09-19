@@ -117,8 +117,8 @@ binary is not portable to an older CPU.**
 | Arm (Graviton3/4, Axion, Ampere) | `make blas` | KleidiAI compiles in automatically when the compiler defines `__ARM_FEATURE_MATMUL_INT8` |
 | x86 with AMX (Sapphire/Emerald/Granite Rapids) | `make blas SIMD=amx` | or let `auto` find it |
 | x86 Zen4/Zen5 | `make blas SIMD=avx512bf16` | VNNI **plus** native bf16 prefill; `avx512vnni` cannot compile the bf16 prefill and costs ~600 ms per admission on those CPUs |
-| x86 AVX-512 without VNNI | `make blas SIMD=avx512` | no native integer GEMV, no decoder INT8 — see the portability note below |
-| x86 AVX2 only | `make blas SIMD=portable` | despite the name this is the AVX2 baseline, not scalar |
+| x86 AVX-512 without VNNI | `make blas SIMD=avx512` | reported as `x86_avx512f_no_vnni`; B>1 integer matmat and direct decoder use the AVX2-width kernels; opt-in INT8/Q4 GEMV candidates now also have AVX-512BW signed-widening variants |
+| x86 AVX2 only | `make blas SIMD=portable` | despite the name this is the AVX2 baseline, not scalar; direct decoder INT8 is available behind opt-in flags |
 | Apple Silicon | `make blas` | Accelerate; development and correctness, not a serving target |
 
 Then prove the binary does what its name says:
@@ -130,10 +130,27 @@ make cpu-check                # provenance + hardware + self-test + RESOLVED dis
 ./qwen_tts --dispatch-map     # which kernel each stage actually selects
 ```
 
-**The portability cliffs are specific, not "everything falls to scalar".** AVX2 and AVX-512
-without VNNI have no native integer GEMV and no decoder INT8; dotprod-only Arm has a strong GEMV
-but no default SDOT matmat. Those are serving-level differences, not micro-optimisations —
-detail in [`.work/legacy-cpu-v2-audit-20260916.md`](../../.work/legacy-cpu-v2-audit-20260916.md).
+The remaining gaps are specific. AVX2 and AVX-512 without VNNI use the AVX2-width integer
+matmat kernels; B=1 INT8/Q4 candidates and the direct decoder INT8 kernel stay opt-in. The
+no-VNNI profile now has a separate AVX-512BW GEMV candidate, while a wider B>1 integer matmat
+remains a measured follow-up because no physical no-VNNI server was available. Dotprod-only
+Arm uses SDOT GEMV, while INT8 SDOT matmat and the new fused Q4 SDOT matmat stay opt-in. Detail
+and qualification status are in [`.work/legacy-cpu-v2-audit-20260916.md`](../../.work/legacy-cpu-v2-audit-20260916.md).
+
+The v2 stream engine reaches these same kernels through its shared Talker/Code Predictor
+projection APIs. On AVX2 and AVX-512F without VNNI, B>1 INT8/Q4 projections can use the AVX2
+matmat gates; B=1 INT8/Q4 keeps the FMA path by default, with signed-dot GEMV candidates
+explicitly opt-in. The direct AVX2 decoder path uses signed widening and requires both
+`QWEN_SD_INT8=1` and `QWEN_SD_RES1_V2=1`; it is default-off and has no AVX2 host performance
+qualification yet. On a dotprod-only Arm build (for example, Neoverse N1), B=1 INT8/Q4 uses
+SDOT; INT8 SDOT matmat remains opt-in, and `QWEN_Q4_SDOT_MM=1` selects fused Q4 SDOT matmat
+for B=2..16. KleidiAI stays unavailable because its current build and pack path needs i8mm. Arm lists INT8 matrix multiply support for Neoverse V1 in its
+[V1 technical overview](https://community.arm.com/developer/ip-products/processors/b/processors-ip-blog/posts/neoverse-v1-platform-a-new-performance-tier-for-arm).
+Qualify V1 as a separate feature class; do not infer its gates from N1. None of these mappings
+establishes a current v2 streaming capacity claim. Older N1 single-stream and Graviton3/V1
+SMMLA batch measurements are documented, but they predate the current v2 streaming server.
+Set `QWEN_SERVE_PROFILE=1` to write the resolved dispatch map into the server's own startup log;
+use the kernel census during a real workload to prove which leaf ran.
 
 ---
 

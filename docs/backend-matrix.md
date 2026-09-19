@@ -12,7 +12,7 @@ rather than resolved by ISA dispatch, so they are not rows here; see
 | `cp.precision` | follows | follows | follows | follows |
 | `cp.prefill2` | SELECTABLE | SELECTABLE | SELECTABLE | SELECTABLE |
 | `decoder.batch` | SELECTABLE | SELECTABLE | SELECTABLE | SELECTABLE |
-| `decoder.int8` | SELECTABLE | — | EFFECTIVE | EFFECTIVE |
+| `decoder.int8` | SELECTABLE | SELECTABLE | EFFECTIVE | EFFECTIVE |
 | `decoder.pool` | private | private | private | private |
 | `matmat.bf16.family` | see reason | see reason | see reason | see reason |
 | `matmat.int8.batch_ceiling` | 0 | 16 | 16 | 16 |
@@ -51,6 +51,22 @@ rather than resolved by ISA dispatch, so they are not rows here; see
 | `gate.q4.amx` | — | — | — | EFFECTIVE |
 | `gate.q4.avx2` | — | EFFECTIVE | EFFECTIVE | EFFECTIVE |
 | `gate.q4.vnni` | — | — | EFFECTIVE | EFFECTIVE |
+
+## Legacy runtime classes not in the merged host table
+
+The table above is merged from captured per-host dispatch maps and does not yet include a live
+AVX-512F-without-VNNI or dotprod-only Linux server map. The source-derived routing is:
+
+| class | B=1 | B>1 | prefill / decoder | qualification |
+|---|---|---|---|---|
+| `x86_avx512f_no_vnni` | AVX2/FMA GEMV by default; AVX2 and AVX-512BW signed-dot candidates are opt-in | AVX2 INT8/Q4 matmat gates | FP32/BLAS prefill; AVX2 signed-widening decoder INT8 is available with `QWEN_SD_INT8=1 QWEN_SD_RES1_V2=1` and remains default-off | AVX2 leaf parity passed under Rosetta and AVX-512BW compiles; no native no-VNNI server or capacity qualification |
+| `x86_avx2` | AVX2/FMA GEMV by default; signed-dot INT8/Q4 candidates are opt-in | AVX2 INT8/Q4 matmat gates | FP32/BLAS prefill; direct AVX2 decoder INT8 requires both flags and remains default-off | Direct-v2 leaf parity passed under Rosetta; no native Linux complete-call performance qualification (the older Milan decoder candidate A/B was slower) |
+| `arm_dotprod` without i8mm (for example, Neoverse N1) | SDOT INT8/Q4 GEMV | INT8 SDOT matmat is opt-in; fused Q4 SDOT matmat is opt-in with `QWEN_Q4_SDOT_MM=1`; default Q4 remains B x SDOT GEMV. INT8 otherwise uses fixed-B f32-accum matmat on the normal B>1 path (unless matvec is forced). No KleidiAI pack path | FP32/BLAS prefill; decoder INT8 and direct DL-4 are available behind opt-in policy gates | M1 microbench rejects INT8 SDOT matmat promotion; fused Q4 parity is covered but performance remains unmeasured. N1 has older single-stream results; current v2 stream qualification is open. V1 is i8mm-capable ([Arm reference](https://community.arm.com/developer/ip-products/processors/b/processors-ip-blog/posts/neoverse-v1-platform-a-new-performance-tier-for-arm)) and has older SMMLA server tests, but no v2 stream qualification. |
+
+The v2 streaming engine calls the same projection dispatch APIs as other CPU entry points. In a
+server run, `QWEN_SERVE_PROFILE=1` prints the resolved map in that process's startup log; a warm
+kernel census is still needed to confirm the leaf used by each operation. Source audit and exact
+open measurements: [legacy CPU/v2 audit](../.work/legacy-cpu-v2-audit-20260916.md).
 
 ## Present on one family only
 
@@ -96,7 +112,7 @@ the semantic features that are not single dispatch rows.
 | small-B strategy / GEMV-vs-GEMM crossover | EQUIVALENT, measured | INT8 AMX now gated on rows-per-thread and B>=3 (X86-2) |
 | row/block scheduling | EQUIVALENT | both split output rows across the pool; the decoder conv splits columns and now sizes the panel from the work (X86-4b) |
 | pool persistence and spin | DELIBERATELY DIFFERENT | pthread spins (`QWEN_POOL_SPIN`), GCD has no spin loop and now SAYS so via `qwen_pool_flag_inert()` |
-| decoder INT8 conv | DELIBERATELY DIFFERENT | kernels exist for dotprod, VNNI and AVX-512F; default ON with VNNI, opt-in on Arm pending the first-frame measurement (P3.4b) |
+| decoder INT8 conv | DELIBERATELY DIFFERENT | kernels exist for Arm dotprod, x86 AVX-512 VNNI and an AVX2 signed-widening direct-v2 leaf. VNNI is default-on; AVX2 and Arm remain policy-gated |
 | snake / vectorized activation | EQUIVALENT | one `qwen_snake_activation` for every backend |
 | quantization SIMD | EQUIVALENT, contracts differ per platform | NEON and AVX-512 both vectorised; ARM rounds half-to-even, x86 half-away, each internally consistent since P3.11 |
 | gather/scatter avoidance | EQUIVALENT at B=1 | both take the per-slot GEMV branch with no staging matrix |

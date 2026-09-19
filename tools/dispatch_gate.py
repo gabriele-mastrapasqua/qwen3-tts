@@ -166,12 +166,50 @@ def selftest():
     ]}
     _, requested_findings = evaluate(requested_doc, expect)
     requested_ids = {(v, i) for v, i, _ in requested_findings}
+    legacy_no_vnni_doc = {"isa_class": "x86_avx512f_no_vnni", "features": [
+        {"id": "talker.prefill.matmat_bf16", "compiled": "no", "supported": "no",
+         "env": "QWEN_PREFILL_MATMAT", "env_value": "unset", "resolved": "OFF",
+         "reason": "AVX-512 BF16 unit not compiled"},
+        {"id": "talker.prefill.f32_blas_fallback", "compiled": "yes", "supported": "yes",
+         "env": "", "env_value": "", "resolved": "ON", "reason": "f32->SGEMM fallback"},
+        {"id": "decoder.int8", "compiled": "yes", "supported": "yes",
+         "env": "QWEN_SD_INT8", "env_value": "unset", "resolved": "OFF",
+         "reason": "AVX2 decoder candidate pending qualification"},
+        {"id": "decoder.res1_v2", "compiled": "yes", "supported": "yes",
+         "env": "QWEN_SD_RES1_V2", "env_value": "unset", "resolved": "OFF",
+         "reason": "opt-in default OFF"},
+        {"id": "decoder.glue_fused", "compiled": "yes", "supported": "yes",
+         "env": "QWEN_SD_GLUE", "env_value": "unset", "resolved": "OFF",
+         "reason": "opt-in default OFF"},
+        {"id": "matvec.int8.avx512bw-emulated-dot-gemv", "compiled": "yes", "supported": "yes",
+         "env": "QWEN_AVX512_INT8_GEMV", "env_value": "unset", "resolved": "OFF",
+         "reason": "opt-in default OFF"},
+        {"id": "matvec.q4.avx512bw-emulated-dot-gemv", "compiled": "yes", "supported": "yes",
+         "env": "QWEN_AVX512_Q4_GEMV", "env_value": "unset", "resolved": "OFF",
+         "reason": "opt-in default OFF"},
+        {"id": "matvec.int8.avx2-emulated-dot-gemv", "compiled": "yes", "supported": "yes",
+         "env": "QWEN_AVX2_INT8_GEMV", "env_value": "unset", "resolved": "OFF",
+         "reason": "opt-in default OFF"},
+        {"id": "matvec.q4.avx2-emulated-dot-gemv", "compiled": "yes", "supported": "yes",
+         "env": "QWEN_AVX2_Q4_GEMV", "env_value": "unset", "resolved": "OFF",
+         "reason": "opt-in default OFF"},
+    ], "gates": [
+        {"id": "gate.int8.avx2", "kernel": "int8 AVX2 matmat", "compiled": True,
+         "supported": True, "on": True, "off_env": "QWEN_NO_AVX2MM", "on_env": "",
+         "reason": "default ON"},
+        {"id": "gate.q4.avx2", "kernel": "q4 AVX2 matmat", "compiled": True,
+         "supported": True, "on": True, "off_env": "QWEN_NO_AVX2MM", "on_env": "",
+         "reason": "default ON"},
+    ]}
+    _, legacy_no_vnni_findings = evaluate(legacy_no_vnni_doc, expect)
     ok = ("SUSPICIOUS", "talker.prefill.matmat_bf16") in ids \
         and ("SUSPICIOUS", "gate.bf16.avx512") in ids \
         and ("MISMATCH", "decoder.int8") in ids \
         and not any(i == "gate.int8.vnni" for _, i, _ in f) \
-        and ("SUSPICIOUS", "talker.prefill.matmat_bf16") in requested_ids
+        and ("SUSPICIOUS", "talker.prefill.matmat_bf16") in requested_ids \
+        and not legacy_no_vnni_findings
     report(cls, f)
+    print("legacy-no-vnni expectations", "PASS" if not legacy_no_vnni_findings else "FAIL")
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -3,7 +3,7 @@
 
 This is deliberately a screen, not a qualification suite. It records the host and
 resolved dispatch first, then runs the existing bandwidth/roof/matmat tools with the
-experimental AVX2 candidates disabled and enabled in fresh processes. A requested
+experimental AVX2 and AVX-512BW no-VNNI candidates disabled and enabled in fresh processes. A requested
 candidate is only a policy override; compiled/runtime capability checks remain in the
 engine and the dispatch/census output is the authority on what actually ran.
 
@@ -112,7 +112,10 @@ def main() -> int:
     binary = str(Path(a.bin).resolve())
     membw = str(Path(a.membw).resolve())
     roof = str(Path(a.roof).resolve())
-    common = {"QWEN_AVX2_INT8_GEMV": "0", "QWEN_AVX2_Q4_GEMV": "0"}
+    common = {
+        "QWEN_AVX2_INT8_GEMV": "0", "QWEN_AVX2_Q4_GEMV": "0",
+        "QWEN_AVX512_INT8_GEMV": "0", "QWEN_AVX512_Q4_GEMV": "0",
+    }
 
     print(f"legacy CPU screen: {out}")
     print(f"  mode={a.mode} threads={a.threads} cpus={a.cpus or 'process default'}")
@@ -139,6 +142,8 @@ def main() -> int:
     candidate_envs = {
         "int8_candidate": {**common, "QWEN_AVX2_INT8_GEMV": "1"},
         "q4_candidate": {**common, "QWEN_AVX2_Q4_GEMV": "1"},
+        "int8_avx512bw_candidate": {**common, "QWEN_AVX512_INT8_GEMV": "1"},
+        "q4_avx512bw_candidate": {**common, "QWEN_AVX512_Q4_GEMV": "1"},
     }
     for label, env in candidate_envs.items():
         run_one(f"dispatch_{label}", [binary, "--dispatch-map"], out, env,
@@ -157,7 +162,8 @@ def main() -> int:
     print("\nINT8 B1 roof: current FMA versus experimental integer candidate")
     for layers in [int(x) for x in a.roof_layers.split(",") if x.strip()]:
         suffix = f"layers{layers}"
-        for label, env in [("fma", common), ("avx2_integer", candidate_envs["int8_candidate"])]:
+        for label, env in [("fma", common), ("avx2_integer", candidate_envs["int8_candidate"]),
+                           ("avx512bw_integer", candidate_envs["int8_avx512bw_candidate"])]:
             run_one(f"roof_int8_{label}_{suffix}",
                     [roof, "--threads", str(a.threads), "--layers", str(layers),
                      "--reps", str(a.reps)], out, env, a.timeout, a.cpus, records)
@@ -170,6 +176,8 @@ def main() -> int:
         ("reference_fma", common),
         ("int8_integer", candidate_envs["int8_candidate"]),
         ("q4_integer", candidate_envs["q4_candidate"]),
+        ("int8_avx512bw", candidate_envs["int8_avx512bw_candidate"]),
+        ("q4_avx512bw", candidate_envs["q4_avx512bw_candidate"]),
     ]:
         screen_env = {**env, "QWEN_SHAPE_CENSUS": "1"}
         run_one(f"matmat_{label}", bench_base, out, screen_env,

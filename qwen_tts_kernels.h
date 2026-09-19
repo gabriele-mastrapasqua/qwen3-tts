@@ -102,6 +102,7 @@ enum {
     QWEN_MMK_KLEIDI_BF16_GEMV,
     QWEN_MMK_Q8_REPACK_I8MM,
     QWEN_MMK_Q8_REPACK_GEMV,
+    QWEN_MMK_Q4_SDOT,
     QWEN_MMK_COUNT
 };
 enum { QWEN_COMP_OTHER = 0, QWEN_COMP_TALKER, QWEN_COMP_CP, QWEN_COMP_DECODER, QWEN_COMP_COUNT };
@@ -140,6 +141,8 @@ enum {
     QWEN_LEAF_DELEGATED,   /* the entry delegated to per-matrix calls: their rows carry the work */
     QWEN_LEAF_AVX2_INT8_GEMV, /* experimental exact signed widening dot product */
     QWEN_LEAF_AVX2_Q4_GEMV,   /* experimental q4 unsigned-nibble dot product */
+    QWEN_LEAF_AVX512BW_INT8_GEMV, /* experimental no-VNNI signed widening dot product */
+    QWEN_LEAF_AVX512BW_Q4_GEMV,   /* experimental no-VNNI Q4 unsigned-nibble dot product */
     QWEN_LEAF_SDOT_MATMAT,    /* opt-in B>1 in-house ARM dotprod matmat */
     QWEN_LEAF_COUNT
 };
@@ -157,6 +160,15 @@ int qwen_avx2_int8_gemv_enabled(void);
 int qwen_avx2_q4_gemv_compiled(void);
 int qwen_avx2_q4_gemv_supported(void);
 int qwen_avx2_q4_gemv_enabled(void);
+
+/* Experimental AVX-512BW no-VNNI GEMV candidates; each is opt-in for complete-call
+ * screening and is compiled only into an AVX-512F/BW build without AVX512-VNNI. */
+int qwen_avx512bw_int8_gemv_compiled(void);
+int qwen_avx512bw_int8_gemv_supported(void);
+int qwen_avx512bw_int8_gemv_enabled(void);
+int qwen_avx512bw_q4_gemv_compiled(void);
+int qwen_avx512bw_q4_gemv_supported(void);
+int qwen_avx512bw_q4_gemv_enabled(void);
 /* Same as qwen_census_op, but with an explicit MAC count and a bucketed B for the key:
  * the speech decoder's conv/GEMM "B" is the time length and differs on nearly every call,
  * which would fill the 256-row table with one row per length. */

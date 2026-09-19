@@ -5,8 +5,8 @@
 #
 #   make check-isa            # both directions where the toolchain allows it
 #
-# Arm pass  : -march=armv8.6-a+i8mm+bf16 (+dotprod)  -> BFMMLA, SMMLA, SDOT, KleidiAI real section
-# x86 pass  : AVX-512 F/BW/VL/DQ + VNNI + BF16 + AMX  -> VNNI, dpbf16, AMX tiles, x86 wrappers
+# Arm passes: dotprod-only and -march=armv8.6-a+i8mm+bf16 (+dotprod), with and without KAI
+# x86 passes: AVX2/FMA, AVX-512F/BW/VL without VNNI, then VNNI + BF16 + AMX
 # On an Arm Mac both passes run (Apple clang targets x86_64-apple-macos with the same SDK).
 # On Linux x86 only the x86 pass runs natively; the Arm pass needs a cross sysroot (SKIP).
 set -u
@@ -39,8 +39,12 @@ pass() {  # name  flags...
 }
 if [ "$UNAME_S" = Darwin ]; then
     DEFS="$DEFS -DACCELERATE_NEW_LAPACK"
-    EXTRA_SRCS="$KAI_SRCS"
     rm -f /tmp/qwen_check_isa_*.log
+    EXTRA_SRCS=""
+    pass x86-avx2-fma -target x86_64-apple-macos -mavx2 -mfma
+    pass x86-avx512f-no-vnni -target x86_64-apple-macos -mavx2 -mfma -mavx512f -mavx512bw -mavx512vl
+    pass arm-dotprod-only -target arm64-apple-macos -march=armv8.2-a+dotprod
+    EXTRA_SRCS="$KAI_SRCS"
     pass arm-i8mm-bf16 -target arm64-apple-macos -march=armv8.6-a+i8mm+bf16+dotprod
     EXTRA_SRCS=""
     pass x86-avx512-vnni-bf16-amx -target x86_64-apple-macos -mavx2 -mfma -mavx512f -mavx512bw -mavx512vl -mavx512dq \
@@ -49,10 +53,13 @@ else
     DEFS="$DEFS -DUSE_OPENBLAS -I/usr/include/openblas"
     rm -f /tmp/qwen_check_isa_*.log
     case "$UNAME_M" in
-        x86_64)  EXTRA_SRCS=""; pass x86-avx512-vnni-bf16-amx -mavx2 -mfma -mavx512f -mavx512bw -mavx512vl -mavx512dq \
+        x86_64)  EXTRA_SRCS=""; pass x86-avx2-fma -mavx2 -mfma
+                 pass x86-avx512f-no-vnni -mavx2 -mfma -mavx512f -mavx512bw -mavx512vl
+                 pass x86-avx512-vnni-bf16-amx -mavx2 -mfma -mavx512f -mavx512bw -mavx512vl -mavx512dq \
                      -mavx512vnni -mavx512bf16 -mamx-tile -mamx-int8 -mamx-bf16
-                 echo "=== arm-i8mm-bf16: SKIP (needs an aarch64 cross sysroot on this host) ===" ;;
-        aarch64) EXTRA_SRCS="$KAI_SRCS"; pass arm-i8mm-bf16 -march=armv8.6-a+i8mm+bf16+dotprod
+                 echo "=== arm-dotprod-only/i8mm-bf16: SKIP (needs an aarch64 cross sysroot on this host) ===" ;;
+        aarch64) EXTRA_SRCS=""; pass arm-dotprod-only -march=armv8.2-a+dotprod
+                 EXTRA_SRCS="$KAI_SRCS"; pass arm-i8mm-bf16 -march=armv8.6-a+i8mm+bf16+dotprod
                  echo "=== x86: SKIP (needs an x86_64 cross sysroot on this host) ===" ;;
     esac
 fi

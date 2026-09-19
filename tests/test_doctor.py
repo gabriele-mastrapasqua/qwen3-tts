@@ -99,7 +99,10 @@ v, src = D.bw_at(b, 4)
 check("a measured worker-mask roof wins over the host sweep", v == 48.0 and "worker" in src, (v, src))
 
 # ---- env sets: every ISA class resolves, aliases follow, values have no whitespace
-for isa in ("x86_amx", "x86_avx512bf16", "x86_avx512vnni", "x86_avx2", "arm_i8mm_bf16", "apple_i8mm_bf16", "arm_dotprod", "apple_m1", None):
+for isa in (
+    "x86_amx", "x86_avx512bf16", "x86_avx512vnni", "x86_avx512f_no_vnni",
+    "x86_avx2", "arm_i8mm_bf16", "apple_i8mm_bf16", "arm_dotprod", "apple_m1", None,
+):
     rows = D.env_set(isa, set())
     keys = [r["key"] for r in rows]
     check(f"env set for {isa}: unique keys, common set present, no whitespace",
@@ -112,6 +115,23 @@ check("AMX set carries the Design-D streaming reference (SD_AMX_D, fused residua
 check("AMX set pins the x86 spin, not the Arm one", amx["QWEN_POOL_SPIN"]["value"] == "4096")
 arm = {r["key"]: r for r in D.env_set("arm_i8mm_bf16", set())}
 check("Arm set pins the Arm spin and the KleidiAI n-chunk", arm["QWEN_POOL_SPIN"]["value"] == "65536" and arm["QWEN_KAI_NCHUNK"]["value"] == "384")
+legacy_x86 = {r["key"]: r for r in D.env_set("x86_avx512f_no_vnni", set())}
+check("AVX-512F without VNNI gets the conservative x86 pool default, with no measured product claims",
+      legacy_x86["QWEN_POOL_SPIN"]["value"] == "4096"
+      and "has been measured" in legacy_x86["QWEN_POOL_SPIN"]["why"])
+check("AVX2/no-VNNI doctor keeps the new decoder kernel explicitly off",
+      legacy_x86["QWEN_SD_INT8"]["value"] == "0" and legacy_x86["QWEN_SD_INT8"]["label"] == "OFF")
+check("legacy x86 doctor keeps AVX2 and AVX-512BW GEMV candidates off by default",
+      all(legacy_x86[k]["value"] == "0" and legacy_x86[k]["label"] == "OFF" for k in (
+          "QWEN_AVX2_INT8_GEMV", "QWEN_AVX2_Q4_GEMV",
+          "QWEN_AVX512_INT8_GEMV", "QWEN_AVX512_Q4_GEMV")))
+legacy_arm = {r["key"]: r for r in D.env_set("arm_dotprod", set())}
+check("dotprod-only doctor keeps fused Q4 SDOT matmat off until target server qualification",
+      legacy_arm["QWEN_Q4_SDOT_MM"]["value"] == "0" and legacy_arm["QWEN_Q4_SDOT_MM"]["label"] == "OFF")
+legacy_profiles = D.related_profiles("x86_avx512f_no_vnni")
+check("AVX-512F no-VNNI doctor references the Milan diagnostic, not the Turin VNNI product profile",
+      any("gcp-milan-8c-avx2-v2-cross-screen" in p for p in legacy_profiles)
+      and not any("turin-c8a-32c-vnni-product" in p for p in legacy_profiles), legacy_profiles)
 undecl = [r for r in D.env_set("x86_amx", {"QWEN_PREFIX_CACHE"}) if not r["declared"]]
 check("a flag the binary does not declare is flagged NOT-DECLARED, never silently pinned",
       undecl and all(r["label"] == "NOT-DECLARED" for r in undecl) and "QWEN_SD_AMX_D" in [r["key"] for r in undecl])

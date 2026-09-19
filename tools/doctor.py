@@ -117,6 +117,10 @@ COMMON_ENV = [
     ("QWEN_PREFILL_MATMAT", "1", "DEFAULT-PIN", "native bf16 matmat prefill where a matrix unit exists; pinned so a fallback is visible"),
     ("QWEN_DECODER_BATCH", "1", "DEFAULT-PIN", "one decoder pass for all active slots; the server sets it itself, the pin records it"),
     ("QWEN_STREAM_DECODE_CHUNK", "4", "MEASURED-REF", "F1: q4 = best C4 balance (prebuffer p95 201 ms, no 250 ms stalls); q8 = throughput control, q1 rejected"),
+    ("QWEN_AVX2_INT8_GEMV", "0", "OFF", "experimental AVX2 signed-widening B=1 candidate; keep off until a target complete-call/server screen"),
+    ("QWEN_AVX2_Q4_GEMV", "0", "OFF", "experimental AVX2 Q4 B=1 candidate; keep off until a target complete-call/server screen"),
+    ("QWEN_AVX512_INT8_GEMV", "0", "OFF", "experimental AVX-512BW no-VNNI signed-widening B=1 candidate; keep off until target frequency and server screens"),
+    ("QWEN_AVX512_Q4_GEMV", "0", "OFF", "experimental AVX-512BW no-VNNI Q4 B=1 candidate; keep off until target frequency and server screens"),
     ("QWEN_SERVER_ASYNC_OUTPUT", "0", "OFF", "OUT-1/2 implemented, default-off pending longer qualification; C3/C4 wave showed no KPI change"),
     ("QWEN_TTS_STREAM_LAYOUT", "1", "MEASURED-REF", "SL-1: official known-text dual-track layout is the current serving-generation reference; ICL/clone and live incremental text remain out of scope"),
 ]
@@ -142,8 +146,13 @@ ISA_ENV = {
         ("QWEN_BLAS_OWN", "1", "PREDICTED", "common code, qualified on AMX only — verify"),
     ],
     "x86_avx512vnni": "x86_avx512bf16",
+    "x86_avx512f_no_vnni": [
+        ("QWEN_POOL_SPIN", "4096", "DEFAULT-PIN", "x86 compiled default; no AVX-512F-no-VNNI server profile has been measured"),
+        ("QWEN_SD_INT8", "0", "OFF", "AVX2 signed-widening decoder is parity-testable but has no no-VNNI server qualification"),
+    ],
     "x86_avx2": [
         ("QWEN_POOL_SPIN", "4096", "DEFAULT-PIN", "x86 compiled default"),
+        ("QWEN_SD_INT8", "0", "OFF", "direct AVX2 decoder candidate remains default-off pending target complete-call qualification"),
     ],
     "arm_i8mm_bf16": [
         ("QWEN_KAI_NCHUNK", "384", "MEASURED-REF", "KleidiAI GEMM n-tiling: prefill p50 45.0->42.9 ms on Axion; 192/96 worse"),
@@ -153,6 +162,7 @@ ISA_ENV = {
     "apple_i8mm_bf16": "arm_i8mm_bf16",
     "arm_dotprod": [
         ("QWEN_POOL_SPIN", "65536", "PREDICTED", "Linux/aarch64 compiled default"),
+        ("QWEN_Q4_SDOT_MM", "0", "OFF", "fused Q4 SDOT matmat has parity coverage; target complete-call and v2 server performance remain unmeasured"),
     ],
     "apple_m1": [],       # GCD dispatch: no spin knob; the M1 is a compile-check host, not a serving reference
 }
@@ -973,6 +983,7 @@ def env_set(isa_class, known_flags):
 
 
 ISA_PROFILE_HINT = {"x86_amx": ("amx",), "x86_avx512bf16": ("vnni", "avx512"), "x86_avx512vnni": ("vnni", "avx512"),
+                    "x86_avx512f_no_vnni": ("milan", "avx2", "avx512-no-vnni"),
                     "x86_avx2": ("avx2",), "arm_i8mm_bf16": ("axion", "arm", "graviton", "kleidi", "generic"),
                     "apple_i8mm_bf16": ("apple", "arm"), "arm_dotprod": ("arm",), "apple_m1": ("apple",)}
 
@@ -998,7 +1009,7 @@ def related_profiles(isa_class):
         has_amx = "amx" in pid or "amx" in feats
         neutral = str(hw.get("architecture", "")).lower() == "any"
         hit = neutral or any(h in pid for h in hints) or (isa_class == "x86_amx" and has_amx) \
-            or (isa_class.startswith("x86_avx512") and "avx512vnni" in feats)
+            or (isa_class in ("x86_avx512bf16", "x86_avx512vnni") and "avx512vnni" in feats)
         if not hit or (isa_class != "x86_amx" and has_amx and not neutral):
             continue
         status = (d.get("qualification") or {}).get("status") or ("alias" if prof.get("alias_of") else "unspecified")

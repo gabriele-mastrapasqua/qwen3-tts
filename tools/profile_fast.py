@@ -248,8 +248,11 @@ def main():
         findings.append("BLAS_THREAD_ESCAPE (contained) — an env was overridden by engine ownership")
     if "IGNORED" in open(os.path.join(out, "effective-config.txt")).read():
         findings.append("INERT_FLAG — a requested flag is not honoured by this build")
-    if "above the batched int8 ceiling" in srvlog:
-        findings.append("BATCH_LIMIT_FALLBACK — --batch-size above the int8 matmat ceiling")
+    if "INT8_BATCH_FALLBACK" in srvlog:
+        findings.append(
+            "BATCH_LIMIT_FALLBACK — INT8 matmat uses its fixed-B/generic f32-accum "
+            "fallback above the optimized gate ceiling"
+        )
     for line in report.splitlines():
         if "POOL UNDERFILLED" in line:
             findings.append("POOL_UNDERFILL — " + line.strip())

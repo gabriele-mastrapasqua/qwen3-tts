@@ -73,6 +73,12 @@ cases = [
     ("common-control", dispatch_for(
         "x86_amx", "per-item-int8-vnni", batch=0, design=False, fused=False,
         kai=False, prefill=False, talker="INT8 VNNI", q4="Q4 VNNI", bf16="bf16 fixed-B twin")),
+    ("common-control", dispatch_for(
+        "x86_avx512f_no_vnni", "per-item-int8", batch=0, design=False, fused=False,
+        kai=False, prefill=False, talker="INT8 AVX2", q4="Q4 AVX2", bf16="bf16 fixed-B twin")),
+    ("common-control", dispatch_for(
+        "x86_avx2", "per-item-int8", batch=0, design=False, fused=False,
+        kai=False, prefill=False, talker="INT8 AVX2", q4="Q4 AVX2", bf16="bf16 fixed-B twin")),
 ]
 for name, dispatch in cases:
     result = run_case(name, dispatch)

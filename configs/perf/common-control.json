@@ -13,10 +13,10 @@
   },
   "parity": {
     "lane": "common-control",
-    "isa_classes": ["x86_amx", "x86_avx512vnni", "x86_avx512bf16", "arm_i8mm_bf16", "arm_dotprod"],
+    "isa_classes": ["x86_amx", "x86_avx512vnni", "x86_avx512bf16", "x86_avx512f_no_vnni", "x86_avx2", "arm_i8mm_bf16", "arm_dotprod"],
     "decoder": {
       "requested_batch": 0,
-      "expected_modes": ["per-item-int8-vnni", "per-item-int8-dotprod"],
+      "expected_modes": ["per-item-int8-vnni", "per-item-int8-dotprod", "per-item-int8"],
       "precision": "int8",
       "fallback_status": "ACTIVE"
     },
@@ -41,7 +41,7 @@
   },
   "hardware": {
     "architecture": "any",
-    "cpu_family": "x86 AMX/VNNI or Arm Neoverse-V2/KleidiAI campaign host",
+    "cpu_family": "x86 AVX2 through AMX/VNNI or Arm dotprod/i8mm campaign host",
     "logical_cpus": "unspecified",
     "physical_cores": "unspecified",
     "threads_per_core": "unspecified",
@@ -87,6 +87,10 @@
       "QWEN_DECODER_BATCH": {"value": "0", "why": "the only current decoder shape common to all three backend families is per-item decoding"},
       "QWEN_KAI_LHS": {"value": null, "why": "no ISA-specific KAI LHS policy in the common control"},
       "QWEN_KAI_QKV_FUSED": {"value": null, "why": "no ISA-specific KAI QKV policy in the common control"},
+      "QWEN_AVX2_INT8_GEMV": {"value": "0", "why": "keep unqualified AVX2 integer GEMV candidates off in the common control"},
+      "QWEN_AVX2_Q4_GEMV": {"value": "0", "why": "keep unqualified AVX2 Q4 GEMV candidates off in the common control"},
+      "QWEN_AVX512_INT8_GEMV": {"value": "0", "why": "keep unqualified no-VNNI AVX-512 integer GEMV candidates off in the common control"},
+      "QWEN_AVX512_Q4_GEMV": {"value": "0", "why": "keep unqualified no-VNNI AVX-512 Q4 GEMV candidates off in the common control"},
       "QWEN_NO_AMX": {"value": "1", "why": "disable AMX-only generic and decoder paths"},
       "QWEN_NO_AMX_BF16": {"value": "1", "why": "disable AMX-only BF16 path"},
       "QWEN_NO_AMX_INT8": {"value": "1", "why": "disable AMX-only INT8 path"},

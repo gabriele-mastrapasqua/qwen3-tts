@@ -307,11 +307,10 @@ static void causal_conv_transpose1d_naive(float *out, const float *in,
 }
 #endif
 
-/* Policy, split from capability.  The int8 decoder convolutions are compiled for AVX-512
- * VNNI and for ARM dotprod, but only the VNNI one has been qualified end to end, so only it
- * is on by default; on dotprod the first-frame cost was measured worse and it stays opt-in
- * until that is re-measured on an ARM box.  A backend with no kernel at all cannot be
- * enabled by any value of the env.  This is deliberately not symmetry for its own sake. */
+/* Policy, split from capability. The decoder INT8 paths are compiled for AVX-512 VNNI,
+ * AVX2 signed widening, and ARM dotprod. Only VNNI has been qualified end to end, so only it
+ * is on by default; AVX2 has no target-host qualification yet and dotprod's first-frame cost
+ * measured worse, so both remain opt-in. A backend with no kernel cannot be enabled by env. */
 static int sd_int8_default_on(void) {
 #if defined(__AVX512VNNI__)
     return 1;               /* qualified: default on */

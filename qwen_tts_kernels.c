@@ -303,15 +303,16 @@ static const char *const g_qwen_reported_flags[] = {
     "QWEN_PREFILL_ROWPACK", "QWEN_PREFILL_QKV_SHARE",
     "QWEN_AMX_PERSIST_CFG", "QWEN_AMX_PREPACK", "QWEN_AMX_PREPACK_KINDS", "QWEN_AMX_B32", "QWEN_NO_AVX2MM", "QWEN_NO_BF16DOT",
     "QWEN_NO_BF16_MATMUL", "QWEN_NO_SDOT", "QWEN_NO_SMMLA", "QWEN_NO_BFMMLA", "QWEN_ARM_BFDOT",
-    "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
+    "QWEN_APPLE_MMLA", "QWEN_INT8_SDOT_MM", "QWEN_Q4_SDOT_MM", "QWEN_Q4_NAIVE", "QWEN_Q4_VNNI_V3", "QWEN_Q4_VNNI_V4",
     "QWEN_Q6_SCALAR", "QWEN_Q8_SCALAR_ACT", "QWEN_NO_SIMD_QUANT", "QWEN_NO_Q8REPACK", "QWEN_NO_SIN_POLY",
     "QWEN_AVX2_INT8_GEMV", "QWEN_AVX2_Q4_GEMV",
+    "QWEN_AVX512_INT8_GEMV", "QWEN_AVX512_Q4_GEMV",
     /* kernel gates and tiling — when a kernel may run, and how it tiles */
     "QWEN_AMX_MIN_B", "QWEN_AMX_BF16_MIN_B", "QWEN_AMX_INT8_MIN_B", "QWEN_AMX_MIN_ROWS",
     "QWEN_AMX_BF16_MIN_COLS", "QWEN_AMX_INT8_MIN_COLS", "QWEN_AMX_Q4_MIN_COLS",
     "QWEN_AMX_INT8_QKV_MIN_B", "QWEN_AMX_INT8_MIN_ROWS_PER_THREAD", "QWEN_VNNI_MIN_B",
     "QWEN_AVX2MM_MIN_B", "QWEN_BF16_MATMUL_MIN_B", "QWEN_BFMMLA_MIN_B", "QWEN_SMMLA_MIN_B",
-    "QWEN_INT8_SDOT_MIN_B", "QWEN_KLEIDI_MIN_B", "QWEN_X86_NCHUNK", "QWEN_AMX_NCHUNK",
+    "QWEN_INT8_SDOT_MIN_B", "QWEN_Q4_SDOT_MIN_B", "QWEN_KLEIDI_MIN_B", "QWEN_X86_NCHUNK", "QWEN_AMX_NCHUNK",
     "QWEN_VNNI_NCHUNK", "QWEN_AVX512_NCHUNK", "QWEN_KAI_NCHUNK",
     /* ARM KleidiAI */
     "QWEN_NO_KLEIDI", "QWEN_NO_KAI_BF16", "QWEN_NO_KAI_I8", "QWEN_KAI_OPS", "QWEN_KAI_QKV_FUSED",
@@ -590,15 +591,48 @@ void qwen_caps_report(void *out) {
     qwen_kernel_selection_report(f, 0, 0);
 }
 
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+/* Keep the startup guard runnable on any x86-64 CPU, even when the rest of this translation
+ * unit is built with -march=native or a newer explicit ISA. The feature macros below still
+ * describe the build; the function attribute only constrains its generated instructions. */
+__attribute__((target("arch=x86-64"), noinline))
+#endif
 void qwen_check_runtime_isa(void) {
-#if defined(__x86_64__) && defined(__AVX2__)
+#if defined(__x86_64__) || defined(_M_X64)
     __builtin_cpu_init();
-    if (!__builtin_cpu_supports("avx2")) {
-        fprintf(stderr,
-            "qwen-tts: FATAL — this binary was built with AVX2 but the CPU does not "
-            "support it.\n  Rebuild a portable binary with: make blas SIMD=scalar\n");
-        exit(1);
-    }
+#define QWEN_REQUIRE_CPU_FEATURE(feature, label) do { \
+        if (!__builtin_cpu_supports(feature)) { \
+            fprintf(stderr, "qwen-tts: FATAL — this binary was built with %s but the CPU/runtime " \
+                            "does not support it.\n  Rebuild for a compatible target (for example, " \
+                            "make blas SIMD=scalar for CPUs without AVX2).\n", label); \
+            exit(1); \
+        } \
+    } while (0)
+#if defined(__AVX2__)
+    QWEN_REQUIRE_CPU_FEATURE("avx2", "AVX2");
+#endif
+#if defined(__FMA__)
+    QWEN_REQUIRE_CPU_FEATURE("fma", "FMA");
+#endif
+#if defined(__AVX512F__)
+    QWEN_REQUIRE_CPU_FEATURE("avx512f", "AVX-512F");
+#endif
+#if defined(__AVX512BW__)
+    QWEN_REQUIRE_CPU_FEATURE("avx512bw", "AVX-512BW");
+#endif
+#if defined(__AVX512VL__)
+    QWEN_REQUIRE_CPU_FEATURE("avx512vl", "AVX-512VL");
+#endif
+#if defined(__AVX512DQ__)
+    QWEN_REQUIRE_CPU_FEATURE("avx512dq", "AVX-512DQ");
+#endif
+#if defined(__AVX512VNNI__)
+    QWEN_REQUIRE_CPU_FEATURE("avx512vnni", "AVX-512 VNNI");
+#endif
+#if defined(__AVX512BF16__)
+    QWEN_REQUIRE_CPU_FEATURE("avx512bf16", "AVX-512 BF16");
+#endif
+#undef QWEN_REQUIRE_CPU_FEATURE
 #endif
 }
 
@@ -1874,6 +1908,7 @@ static const struct { const char *name; int cls; } g_mmk_info[QWEN_MMK_COUNT] = 
     { "bf16 KleidiAI GEMV",     MMC_GEMV   },
     { "q8_0 repack SMMLA",      MMC_GEMM   },
     { "q8_0 repack GEMV",       MMC_GEMV   },
+    { "q4   SDOT fused matmat",  MMC_GEMM   },
 };
 _Static_assert(sizeof(g_mmk_info) / sizeof(g_mmk_info[0]) == QWEN_MMK_COUNT,
                "g_mmk_info[] is out of sync with the QWEN_MMK_* enum");
@@ -1975,7 +2010,8 @@ int qwen_path_kind(int path) {
 static const char *const g_leaf_name[QWEN_LEAF_COUNT] = {
     "none", "vnni", "dpbf16", "sdot", "avx512f", "avx2", "neon", "scalar", "blas",
     "f32_fused", "kleidi", "amx", "delegated", "avx2-int8-emulated-dot-gemv",
-    "avx2-q4-emulated-dot-gemv", "arm-sdot-matmat"
+    "avx2-q4-emulated-dot-gemv", "avx512bw-int8-emulated-dot-gemv",
+    "avx512bw-q4-emulated-dot-gemv", "arm-sdot-matmat"
 };
 const char *qwen_leaf_name(int leaf) {
     return (leaf > 0 && leaf < QWEN_LEAF_COUNT) ? g_leaf_name[leaf] : "none";
@@ -2340,6 +2376,7 @@ static const qwen_mm_gate_t g_mm_gate[QWEN_MMK_COUNT] QWEN_MAYBE_UNUSED = {
     [QWEN_MMK_Q4_VNNI]     = { "QWEN_NO_VNNI",     NULL,                "QWEN_VNNI_MIN_B",    NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_Q4_AVX2]     = { "QWEN_NO_AVX2MM",   NULL,                "QWEN_AVX2MM_MIN_B",  NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_Q4_SMMLA]    = { "QWEN_NO_SMMLA",    NULL,                "QWEN_SMMLA_MIN_B",   NULL,                NULL,                     2, 16,  0,  0, 0, 0 },
+    [QWEN_MMK_Q4_SDOT]     = { NULL,                "QWEN_Q4_SDOT_MM",  "QWEN_Q4_SDOT_MIN_B", NULL,               NULL,                     2, 16,  0,  0, 0, 0 },
     [QWEN_MMK_KLEIDI_Q4]   = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
     [QWEN_MMK_KLEIDI_I8]   = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
     [QWEN_MMK_KLEIDI_BF16] = { "QWEN_NO_KLEIDI",   NULL,                "QWEN_KLEIDI_MIN_B",  NULL,                NULL,                     1, 64,  0,  0, 0, 0 },
@@ -2481,7 +2518,7 @@ static int qwen_mmk_compiled(int mmk) {
     case QWEN_MMK_INT8_AVX2: case QWEN_MMK_Q4_AVX2: return 1;
 #endif
 #if defined(__ARM_FEATURE_DOTPROD)
-    case QWEN_MMK_INT8_SDOT: return 1;
+    case QWEN_MMK_INT8_SDOT: case QWEN_MMK_Q4_SDOT: return 1;
 #endif
     default: return 0;
     }
@@ -2602,7 +2639,7 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
     if (rows <= 0) rows = 2048;
     if (cols <= 0) cols = 2048;
 
-    int bf16_c[5], int8_c[6], q4_c[6];
+    int bf16_c[5], int8_c[6], q4_c[7];
     int nbf = 0, nint8 = 0, nq4 = 0;
 #if defined(__AMX_BF16__) && defined(__AMX_TILE__)
     if (qwen_amx_bf16_ready()) bf16_c[nbf++] = QWEN_MMK_BF16_AMX;
@@ -2632,13 +2669,17 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
      * qwen_matmat_family_int8() reports.  Without these entries --caps names the
      * in-house SMMLA fallback for shapes KleidiAI serves. */
     int8_c[nint8++] = QWEN_MMK_KLEIDI_I8;  q4_c[nq4++] = QWEN_MMK_KLEIDI_Q4;
-    int8_c[nint8++] = QWEN_MMK_INT8_SMMLA; q4_c[nq4++] = QWEN_MMK_Q4_SMMLA;
+    int8_c[nint8++] = QWEN_MMK_INT8_SMMLA;
 #endif
 #if defined(__AVX2__)
     int8_c[nint8++] = QWEN_MMK_INT8_AVX2;  q4_c[nq4++] = QWEN_MMK_Q4_AVX2;
 #endif
 #if defined(__ARM_FEATURE_DOTPROD)
     int8_c[nint8++] = QWEN_MMK_INT8_SDOT;
+    q4_c[nq4++] = QWEN_MMK_Q4_SDOT;
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    q4_c[nq4++] = QWEN_MMK_Q4_SMMLA;
 #endif
 
     fprintf(f, "  kernel selection (shape %dx%d, asked to the dispatcher):\n", rows, cols);
@@ -2648,6 +2689,13 @@ void qwen_kernel_selection_report(void *out, int rows, int cols) {
 #if defined(__ARM_FEATURE_DOTPROD)
     int8_b1 = getenv("QWEN_NO_SDOT") ? "f32-accum (SDOT off)" : "SDOT vdotq_s32";
     q4_b1 = getenv("QWEN_NO_SDOT") ? "f32 dequant" : "SDOT vdotq_s32";
+#elif defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+    int8_b1 = qwen_avx512bw_int8_gemv_enabled() ? "AVX-512BW signed-widening dot (experimental)" :
+              qwen_avx2_int8_gemv_enabled() ? "AVX2 signed-widening dot (experimental)" :
+              "AVX2 FMA widen/dequant";
+    q4_b1 = qwen_avx512bw_q4_gemv_enabled() ? "AVX-512BW signed-widening Q4 dot (experimental)" :
+            qwen_avx2_q4_gemv_enabled() ? "AVX2 signed-widening Q4 dot (experimental)" :
+            "AVX2 unpack/dequant FMA";
 #elif defined(__AVX512VNNI__)
     int8_b1 = qwen_avx2_int8_gemv_enabled() ? "AVX2 signed-widening dot (experimental)" :
               (getenv("QWEN_NO_VNNI") ? "f32-accum (VNNI off)" : "VNNI vpdpbusd");
@@ -5568,6 +5616,46 @@ static void q4_smmla_task(size_t tid, size_t nt, void *vc) {
 }
 #endif
 
+#if defined(__ARM_FEATURE_DOTPROD)
+static void q4_matmat_sdot_slice(float *Y, const q4_0_block_t *W, const int8_t *qXt,
+                                 const float *sx, int r0, int r1, int cols, int B) {
+    MMSTAT(QWEN_MMK_Q4_SDOT, r1 - r0, cols, B);
+    qwen_ftz_on();
+    const int nb = cols / Q4_0_BLOCK_SIZE;
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+    for (int r = r0; r < r1; r++) {
+        const q4_0_block_t *row = W + (size_t)r * nb;
+        float32x4_t facc[16];
+        for (int b = 0; b < B; b++) facc[b] = vdupq_n_f32(0.0f);
+        for (int bl = 0; bl < nb; bl++) {
+            const uint8x16_t raw = vld1q_u8(row[bl].qs);
+            const uint8x16x2_t z = vzipq_u8(vandq_u8(raw, mask), vshrq_n_u8(raw, 4));
+            const int8x16_t w0 = vsubq_s8(vreinterpretq_s8_u8(z.val[0]), bias);
+            const int8x16_t w1 = vsubq_s8(vreinterpretq_s8_u8(z.val[1]), bias);
+            const float sw = qwen_f16_to_f32(row[bl].scale_f16);
+            for (int b = 0; b < B; b++) {
+                const int8_t *xb = qXt + (size_t)b * cols + (size_t)bl * Q4_0_BLOCK_SIZE;
+                const int8x16_t x0 = vld1q_s8(xb);
+                const int8x16_t x1 = vld1q_s8(xb + 16);
+                int32x4_t dot = vdotq_s32(vdupq_n_s32(0), w0, x0);
+                dot = vdotq_s32(dot, w1, x1);
+                facc[b] = vfmaq_n_f32(facc[b], vcvtq_f32_s32(dot), sw);
+            }
+        }
+        for (int b = 0; b < B; b++) Y[(size_t)r * B + b] = vaddvq_f32(facc[b]) * sx[b];
+    }
+}
+
+typedef struct { float *Y; const q4_0_block_t *W; const int8_t *qXt; const float *sx; int rows, cols, B; } q4_sdot_ctx;
+static void q4_sdot_task(size_t tid, size_t nt, void *vc) {
+    q4_sdot_ctx *c = (q4_sdot_ctx *)vc;
+    const int r0 = (int)(tid * (size_t)c->rows / nt);
+    const int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_matmat_sdot_slice(c->Y, c->W, c->qXt, c->sx, r0, r1, c->cols, c->B);
+}
+#endif
+
 void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                       int rows, int cols, int B) {
     qwen_census_op(QWEN_PATH_MATMAT_Q4_0, rows, cols, B);
@@ -5664,6 +5752,28 @@ void qwen_matmat_q4_0(float *Y, const q4_0_block_t *W, const float *X,
                     qwen_parallel((size_t)nt2, q4_amm_task, &c);
                 } else {
                     q4_matmat_avx2_slice(Y, W, qXt, sx, corr, 0, rows, cols, B);
+                }
+                return;
+            }
+        }
+    }
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    {
+        if (B >= 2 && qwen_mm_use(QWEN_MMK_Q4_SDOT, B, rows, cols) &&
+            cols % Q4_0_BLOCK_SIZE == 0) {
+            int8_t *qXt = mm_scratch_qx((size_t)B * cols);
+            if (qXt) {
+                float sx[16];
+                for (int b = 0; b < B; b++)
+                    sx[b] = quantize_act_int8_col(qXt + (size_t)b * cols, X, cols, B, b);
+                qwen_census_leaf(QWEN_LEAF_SDOT_MATMAT);
+                const int nt = g_n_threads;
+                if (nt > 1 && rows >= 256) {
+                    q4_sdot_ctx c = { Y, W, qXt, sx, rows, cols, B };
+                    qwen_parallel((size_t)nt, q4_sdot_task, &c);
+                } else {
+                    q4_matmat_sdot_slice(Y, W, qXt, sx, 0, rows, cols, B);
                 }
                 return;
             }
@@ -6110,6 +6220,77 @@ int qwen_avx2_int8_gemv_enabled(void) {
         atomic_store_explicit(&enabled, v, memory_order_relaxed);
     }
     return v && qwen_avx2_int8_gemv_compiled() && qwen_avx2_int8_gemv_supported();
+}
+
+/* AVX-512F/BW no-VNNI candidate for the same exact signed INT8 product. It
+ * widens 32 signed bytes from each operand to 16-bit lanes, uses VPMADDWD,
+ * and accumulates pair sums in 32-bit lanes. It is separate from the AVX2
+ * candidate so a no-VNNI host can screen wider execution independently; it
+ * remains opt-in because AVX-512 frequency behavior is workload-dependent. */
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+enum { QWEN_AVX512BW_INT8_GEMV_MAX_COLS = 8192 };
+
+static int32_t avx512bw_int8_dot_exact(const int8_t *w, const int8_t *qx, int cols) {
+    __m512i acc = _mm512_setzero_si512();
+    int k = 0;
+    for (; k + 32 <= cols; k += 32) {
+        __m256i wb = _mm256_loadu_si256((const __m256i *)(w + k));
+        __m256i xb = _mm256_loadu_si256((const __m256i *)(qx + k));
+        __m512i w16 = _mm512_cvtepi8_epi16(wb);
+        __m512i x16 = _mm512_cvtepi8_epi16(xb);
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(w16, x16));
+    }
+    int32_t lanes[16];
+    _mm512_storeu_si512((void *)lanes, acc);
+    int32_t sum = 0;
+    for (int i = 0; i < 16; i++) sum += lanes[i];
+    for (; k < cols; k++) sum += (int32_t)w[k] * (int32_t)qx[k];
+    return sum;
+}
+
+static int int8_matvec_avx512bw_emulated_dot(float *y, const float *x,
+                                              const int8_t *W, const float *scale,
+                                              int in_dim, int out_dim) {
+    if (in_dim <= 0 || in_dim > QWEN_AVX512BW_INT8_GEMV_MAX_COLS) return 0;
+    int8_t qx[QWEN_AVX512BW_INT8_GEMV_MAX_COLS];
+    float sx = quantize_act_int8_col(qx, x, in_dim, 1, 0);
+    qwen_ftz_on();
+    for (int r = 0; r < out_dim; r++) {
+        const int8_t *row = W + (size_t)r * in_dim;
+        int32_t dot = avx512bw_int8_dot_exact(row, qx, in_dim);
+        y[r] = (float)dot * scale[r] * sx;
+    }
+    return 1;
+}
+#endif
+
+int qwen_avx512bw_int8_gemv_compiled(void) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx512bw_int8_gemv_supported(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+           __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+           __builtin_cpu_supports("avx512vl");
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx512bw_int8_gemv_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AVX512_INT8_GEMV");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v && qwen_avx512bw_int8_gemv_compiled() && qwen_avx512bw_int8_gemv_supported();
 }
 
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -6901,6 +7082,14 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
     }
     MMSTAT(QWEN_MMK_INT8_GEMV, rows, cols, 1);
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+    if (qwen_avx512bw_int8_gemv_enabled() &&
+        int8_matvec_avx512bw_emulated_dot(y, x, W, scale, cols, rows)) {
+        qwen_census_leaf(QWEN_LEAF_AVX512BW_INT8_GEMV);
+        goto qwen_matvec_int8_timed_done;
+    }
+#endif
+
 #if defined(__AVX2__)
     if (qwen_avx2_int8_gemv_enabled() &&
         int8_matvec_avx2_emulated_dot(y, x, W, scale, cols, rows)) {
@@ -7312,6 +7501,82 @@ int qwen_avx2_q4_gemv_enabled(void) {
     return v && qwen_avx2_q4_gemv_compiled() && qwen_avx2_q4_gemv_supported();
 }
 
+/* AVX-512BW Q4_0 B=1 candidate. Expand one 32-weight nibble block to signed
+ * 16-bit lanes, form exact pair sums with VPMADDWD, then apply the Q4_0 -8
+ * offset correction. The caller keeps it opt-in until a no-VNNI host screen. */
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+enum { QWEN_AVX512BW_Q4_GEMV_MAX_COLS = 8192 };
+
+static int32_t avx512bw_q4_dot_block(const uint8_t *qs, const int8_t *qx) {
+    const __m128i raw = _mm_loadu_si128((const __m128i *)qs);
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    const __m128i lo = _mm_and_si128(raw, lomask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lomask);
+    const __m256i weight_u8 = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi),
+                                               _mm_unpacklo_epi8(lo, hi));
+    const __m512i weight_i16 = _mm512_cvtepu8_epi16(weight_u8);
+    const __m512i x_i16 = _mm512_cvtepi8_epi16(
+        _mm256_loadu_si256((const __m256i *)qx));
+    const __m512i ones = _mm512_set1_epi16(1);
+    const int32_t dot = _mm512_reduce_add_epi32(_mm512_madd_epi16(weight_i16, x_i16));
+    const int32_t xsum = _mm512_reduce_add_epi32(_mm512_madd_epi16(x_i16, ones));
+    return dot - 8 * xsum;
+}
+
+static void avx512bw_q4_matvec_integer_qx(float *y, const int8_t *qx, float sx,
+                                          const q4_0_block_t *W, int cols, int rows) {
+    const int nb = cols / Q4_0_BLOCK_SIZE;
+    for (int o = 0; o < rows; o++) {
+        const q4_0_block_t *row = W + (size_t)o * nb;
+        float sum = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            sum += qwen_f16_to_f32(row[b].scale_f16) *
+                   (float)avx512bw_q4_dot_block(row[b].qs, qx + b * Q4_0_BLOCK_SIZE);
+        }
+        y[o] = sum * sx;
+    }
+}
+
+static int avx512bw_q4_matvec_integer(float *y, const float *x,
+                                      const q4_0_block_t *W, int cols, int rows) {
+    if (cols <= 0 || cols > QWEN_AVX512BW_Q4_GEMV_MAX_COLS ||
+        cols % Q4_0_BLOCK_SIZE != 0) return 0;
+    int8_t qx[QWEN_AVX512BW_Q4_GEMV_MAX_COLS];
+    const float sx = quantize_act_int8_col(qx, x, cols, 1, 0);
+    avx512bw_q4_matvec_integer_qx(y, qx, sx, W, cols, rows);
+    return 1;
+}
+#endif
+
+int qwen_avx512bw_q4_gemv_compiled(void) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx512bw_q4_gemv_supported(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+           __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+           __builtin_cpu_supports("avx512vl");
+#else
+    return 0;
+#endif
+}
+
+int qwen_avx512bw_q4_gemv_enabled(void) {
+    static atomic_int enabled = -1;
+    int v = atomic_load_explicit(&enabled, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("QWEN_AVX512_Q4_GEMV");
+        v = e && e[0] == '1';
+        atomic_store_explicit(&enabled, v, memory_order_relaxed);
+    }
+    return v && qwen_avx512bw_q4_gemv_compiled() && qwen_avx512bw_q4_gemv_supported();
+}
+
 #if defined(__ARM_FEATURE_DOTPROD)
 static void q4_0_matvec_sdot(float *y, const int8_t *qx, float sx,
                              const q4_0_block_t *W, int cols, int out_dim) {
@@ -7605,6 +7870,13 @@ void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
         return;
     }
     MMSTAT(QWEN_MMK_Q4_GEMV, rows, cols, 1);
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+    if (qwen_avx512bw_q4_gemv_enabled() &&
+        avx512bw_q4_matvec_integer(y, x, W, cols, rows)) {
+        qwen_census_leaf(QWEN_LEAF_AVX512BW_Q4_GEMV);
+        return;
+    }
+#endif
 #if defined(__AVX2__)
     if (qwen_avx2_q4_gemv_enabled() &&
         avx2_q4_matvec_integer(y, x, W, cols, rows)) {
@@ -8823,7 +9095,7 @@ void qwen_bf16_to_f32_vec(float *dst, const uint16_t *src_bf16, int n) {
     }
 }
 
-/* Capability, split from policy.  _available says the int8 decoder-convolution kernels are
+/* Capability, split from policy. _available says an int8 decoder-convolution kernel is
  * compiled for this build; _usable adds the shapes those kernels actually cover, which the
  * decoder used to spell out at its call site (in_ch == out_ch && in_ch <= 768) even though
  * the constraint belongs to the kernel.  Neither answers whether the path is ENABLED --
@@ -8832,6 +9104,8 @@ int qwen_sd_int8_available(void) {
 #if defined(__ARM_FEATURE_DOTPROD)
     return 1;
 #elif defined(__AVX512VNNI__)
+    return 1;
+#elif defined(__AVX2__)
     return 1;
 #else
     return 0;
@@ -8872,20 +9146,20 @@ const char *qwen_matmat_family_int8(void) {
 }
 const char *qwen_matmat_family_q4(void) {
     static const int cand[] = { QWEN_MMK_KLEIDI_Q4, QWEN_MMK_Q4_AMX, QWEN_MMK_Q4_VNNI,
-                                QWEN_MMK_Q4_AVX2, QWEN_MMK_Q4_SMMLA, QWEN_MMK_Q4_BMATVEC };
+                                QWEN_MMK_Q4_AVX2, QWEN_MMK_Q4_SDOT, QWEN_MMK_Q4_SMMLA,
+                                QWEN_MMK_Q4_BMATVEC };
     static char buf[96];
     return mmk_first_available(cand, (int)(sizeof cand / sizeof cand[0]),
                                "q4 generic twin (no q4 GEMM gate on this build)",
                                buf, sizeof buf);
 }
-/* Largest B the int8 matmat family still accepts, probed at the same shape as the family
- * rows.  It matters because --batch-size is NOT clamped to it: every batched int8 gate has
- * max_b = 16, and above that they all decline, so a server started with --batch-size 24
- * steps its slots through one GEMV each -- exactly the work batching was asked to avoid --
- * without a word.  Prefill already chunks itself to 16 (prefill_proj_matmat); the batched
- * decode path passes the live slot count straight through, and chunking it here would move
- * a remainder column onto the B=1 dequant twin, i.e. change its arithmetic.  So this is
- * reported, not silently corrected. */
+/* Largest B accepted by an optimized int8 matmat gate, probed at the same 4096x4096 shape as
+ * the family rows. This is not a --batch-size clamp: above it, the normal B>1 projection route
+ * reaches the fixed-B/generic f32-accumulation matmat twin, not per-slot GEMVs. The caller can
+ * still explicitly force matvec (`QWEN_BATCH_NOMATMUL` / force_matvec). Prefill chunks at 16
+ * independently; chunking the live decode batch here would move a remainder onto the B=1
+ * quantization path and change its arithmetic. Report this limit instead of silently changing
+ * the batch. */
 /* Which in-region int8 runner a build/host can hold, named.  The persistent CP and Talker
  * regions are the largest backend difference we have -- present on VNNI and AMX, absent on
  * AVX2/AVX-512F and (until the gather shape lands) on Arm -- and until now the only place
@@ -8987,12 +9261,9 @@ const char *qwen_matmat_family_bf16(void) {
                                buf, sizeof buf);
 }
 
-/* Does B=1 reach a native integer kernel on this build, or the f32 fused twin?
- * The AVX2 and AVX-512F(-no-VNNI) builds have int8/q4 GEMM but no integer GEMV, so every
- * B=1 call dequantises into the f32 path.  That is a missing kernel, not accidental
- * overhead -- there is no wasted conversion to remove, and reusing the int8 GEMM at B=1
- * would change the arithmetic -- so the honest fix here is to stop being silent about it.
- * These mirror the ladders in qwen_matvec_int8 / qwen_matvec_q4_0, disable envs included. */
+/* Does B=1 reach an automatically selected integer kernel, or the f32 fused twin?
+ * The experimental signed-widening AVX2/AVX-512BW candidates are deliberately reported
+ * separately: they are user-opt-in and not part of the ISA's default kernel family. */
 int qwen_int8_gemv_native(void) {
     if (qwen_mmk_compiled(QWEN_MMK_KLEIDI_I8_GEMV) && qwen_kleidi_i8_enabled()) return 1;
 #if defined(__AVX512VNNI__)
@@ -11130,6 +11401,270 @@ int qwen_conv1d_int8_design_d_range_split(float *out,
 
 #endif  /* x86 VNNI / Arm dot-product decoder kernels */
 
+#if defined(__AVX2__) && !defined(__AVX512VNNI__) && !defined(__ARM_FEATURE_DOTPROD)
+/* ---- x86 legacy: DL-4 direct dilated int8 conv, AVX2 signed widening leaf -----------
+ * AVX2 has no signed-byte dot instruction. Widen each 16-byte half to int16, multiply,
+ * and pairwise accumulate into int32. This avoids the saturation hazard of maddubs for
+ * full-range signed activations and weights. AVX-512F without VNNI uses the same safe
+ * AVX2-width leaf. */
+QWEN_MM_SCRATCH(dcq, int8_t)
+QWEN_MM_SCRATCH(dcs, float)
+QWEN_MM_SCRATCH(dcf, float)
+typedef struct {
+    float *out; const float *in;
+    const int8_t *wq; const float *sw; const int32_t *wsum; const float *bias;
+    int in_ch, out_ch, length, kernel, dilation, Cp, tb;
+    const float *tail; int tail_cols;
+    const float *residual;
+    _Atomic int next; _Atomic int entered; int n_blocks;
+} sd_dconv_job_t;
+
+static inline __m256 sd_dconv_avx2_fmadd_ps(__m256 a, __m256 b, __m256 c) {
+#if defined(__FMA__)
+    return _mm256_fmadd_ps(a, b, c);
+#else
+    return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+#endif
+}
+
+static inline float sd_dconv_avx2_hsum_ps(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+static inline int sd_dconv_avx2_round(float v) {
+    int q = (int)lrintf(v);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+    return q;
+}
+
+/* Emergency path for per-thread scratch allocation failure. It computes the same signed
+ * per-position activation quantization without leaving the caller's output unwritten. */
+static void sd_dconv_avx2_scalar_block(sd_dconv_job_t *j, int t0, int t1) {
+    const int in_ch = j->in_ch, out_ch = j->out_ch, L = j->length;
+    const int K = j->kernel, dil = j->dilation, Cp = j->Cp;
+    const int pad = (K - 1) * dil;
+    for (int m = 0; m < out_ch; m++) {
+        const float bv = j->bias ? j->bias[m] : 0.0f;
+        float *o = j->out + (size_t)m * L;
+        const float *rs = j->residual ? j->residual + (size_t)m * L : NULL;
+        for (int t = t0; t < t1; t++) {
+            float acc = 0.0f;
+            for (int kk = 0; kk < K; kk++) {
+                const int p = t - pad + kk * dil;
+                const float *src = NULL;
+                size_t stride = 0;
+                if (p >= 0 && p < L) { src = j->in + p; stride = (size_t)L; }
+                else if (p < 0 && j->tail && -p <= j->tail_cols) {
+                    src = j->tail + (j->tail_cols + p); stride = (size_t)j->tail_cols;
+                }
+                if (!src) continue;
+                float amax = 0.0f;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float a = fabsf(src[(size_t)ic * stride]);
+                    if (a > amax) amax = a;
+                }
+                const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+                const float inv = 1.0f / scale;
+                const int8_t *w = j->wq + ((size_t)m * K + kk) * Cp;
+                int32_t dot = 0;
+                for (int ic = 0; ic < in_ch; ic++)
+                    dot += (int32_t)w[ic] * sd_dconv_avx2_round(src[(size_t)ic * stride] * inv);
+                acc += (float)dot * (scale * j->sw[(size_t)m * K + kk]);
+            }
+            const float v = acc + bv;
+            o[t] = rs ? v + rs[t] : v;
+        }
+    }
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-associative-math", "no-tree-vectorize")))
+#endif
+static void sd_dconv_worker(void *vj) {
+#if defined(__clang__)
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+#endif
+    sd_dconv_job_t *j = (sd_dconv_job_t *)vj;
+    if (qwen_costmap_level()) atomic_fetch_add(&j->entered, 1);
+    const int in_ch = j->in_ch, out_ch = j->out_ch, Cp = j->Cp;
+    const int K = j->kernel, dil = j->dilation, L = j->length;
+    const int pad = (K - 1) * dil;
+    const int maxrows = j->tb + pad + 4;
+    int8_t *q = mm_scratch_dcq((size_t)maxrows * (size_t)Cp);
+    float *sc = mm_scratch_dcs((size_t)maxrows);
+    float *frow = mm_scratch_dcf((size_t)Cp);
+    const int have_scratch = q && sc && frow;
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    long long claimed = 0;
+    for (;;) {
+        const int b = atomic_fetch_add(&j->next, 1);
+        if (b >= j->n_blocks) break;
+        claimed++;
+        const int t0 = b * j->tb, t1 = (t0 + j->tb < L) ? t0 + j->tb : L;
+        if (!have_scratch) {
+            qwen_census_leaf(QWEN_LEAF_SCALAR);
+            sd_dconv_avx2_scalar_block(j, t0, t1);
+            continue;
+        }
+        const int nrows = (t1 - t0) + pad + 4;
+        for (int r = 0; r < nrows; r++) {
+            const int p = t0 - pad + r;
+            int8_t *qr = q + (size_t)r * Cp;
+            const float *src; size_t sstride;
+            if (p >= 0 && p < L) { src = j->in + p; sstride = (size_t)L; }
+            else if (p < 0 && j->tail && -p <= j->tail_cols) {
+                src = j->tail + (j->tail_cols + p); sstride = (size_t)j->tail_cols;
+            } else { memset(qr, 0, (size_t)Cp); sc[r] = 0.0f; continue; }
+            float amax = 0.0f;
+            for (int ic = 0; ic < in_ch; ic++) {
+                const float v = src[(size_t)ic * sstride];
+                frow[ic] = v;
+                const float a = fabsf(v); if (a > amax) amax = a;
+            }
+            const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+            const float inv = 1.0f / scale;
+            sc[r] = scale;
+            int ic = 0;
+            for (; ic + 8 <= in_ch; ic += 8) {
+                __m256 v = _mm256_mul_ps(_mm256_loadu_ps(frow + ic), _mm256_set1_ps(inv));
+                __m256i qi = _mm256_cvtps_epi32(v);
+                qi = _mm256_max_epi32(_mm256_min_epi32(qi, _mm256_set1_epi32(127)),
+                                      _mm256_set1_epi32(-127));
+                const __m128i lo = _mm256_castsi256_si128(qi);
+                const __m128i hi = _mm256_extracti128_si256(qi, 1);
+                const __m128i q16 = _mm_packs_epi32(lo, hi);
+                const __m128i q8 = _mm_packs_epi16(q16, _mm_setzero_si128());
+                _mm_storel_epi64((__m128i *)(qr + ic), q8);
+            }
+            for (; ic < in_ch; ic++) qr[ic] = (int8_t)sd_dconv_avx2_round(frow[ic] * inv);
+            for (; ic < Cp; ic++) qr[ic] = 0;
+        }
+
+        for (int m0 = 0; m0 < out_ch; m0 += 2) {
+            const int mn = out_ch - m0 < 2 ? out_ch - m0 : 2;
+            for (int t = t0; t < t1; t += 2) {
+                const int tn = t1 - t < 2 ? t1 - t : 2;
+                __m256 facc[2][2];
+                for (int i = 0; i < mn; i++)
+                    for (int jj = 0; jj < 2; jj++) facc[i][jj] = _mm256_setzero_ps();
+                for (int kk = 0; kk < K; kk++) {
+                    __m256i acc[2][2];
+                    for (int i = 0; i < mn; i++)
+                        for (int jj = 0; jj < 2; jj++) acc[i][jj] = _mm256_setzero_si256();
+                    const int r0 = (t - t0) + kk * dil;
+                    const int8_t *x0 = q + (size_t)r0 * Cp;
+                    const int8_t *x1 = x0 + Cp;
+                    const int8_t *w0 = j->wq + ((size_t)(m0 + 0) * K + kk) * Cp;
+                    const int8_t *w1 = mn > 1 ? j->wq + ((size_t)(m0 + 1) * K + kk) * Cp : w0;
+                    for (int k = 0; k < Cp; k += 32) {
+                        const __m128i x00 = _mm_loadu_si128((const __m128i *)(x0 + k));
+                        const __m128i x10 = _mm_loadu_si128((const __m128i *)(x1 + k));
+                        const __m128i x01 = _mm_loadu_si128((const __m128i *)(x0 + k + 16));
+                        const __m128i x11 = _mm_loadu_si128((const __m128i *)(x1 + k + 16));
+                        const __m256i xv00 = _mm256_cvtepi8_epi16(x00);
+                        const __m256i xv10 = _mm256_cvtepi8_epi16(x10);
+                        const __m256i xv01 = _mm256_cvtepi8_epi16(x01);
+                        const __m256i xv11 = _mm256_cvtepi8_epi16(x11);
+                        const __m128i w00 = _mm_loadu_si128((const __m128i *)(w0 + k));
+                        const __m128i w01 = _mm_loadu_si128((const __m128i *)(w0 + k + 16));
+                        const __m256i wv00 = _mm256_cvtepi8_epi16(w00);
+                        const __m256i wv01 = _mm256_cvtepi8_epi16(w01);
+                        __m256i wv10 = wv00, wv11 = wv01;
+                        if (mn > 1) {
+                            wv10 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w1 + k)));
+                            wv11 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w1 + k + 16)));
+                        }
+                        acc[0][0] = _mm256_add_epi32(acc[0][0], _mm256_madd_epi16(_mm256_mullo_epi16(xv00, wv00), ones16));
+                        acc[0][1] = _mm256_add_epi32(acc[0][1], _mm256_madd_epi16(_mm256_mullo_epi16(xv10, wv00), ones16));
+                        acc[0][0] = _mm256_add_epi32(acc[0][0], _mm256_madd_epi16(_mm256_mullo_epi16(xv01, wv01), ones16));
+                        acc[0][1] = _mm256_add_epi32(acc[0][1], _mm256_madd_epi16(_mm256_mullo_epi16(xv11, wv01), ones16));
+                        if (mn > 1) {
+                            acc[1][0] = _mm256_add_epi32(acc[1][0], _mm256_madd_epi16(_mm256_mullo_epi16(xv00, wv10), ones16));
+                            acc[1][1] = _mm256_add_epi32(acc[1][1], _mm256_madd_epi16(_mm256_mullo_epi16(xv10, wv10), ones16));
+                            acc[1][0] = _mm256_add_epi32(acc[1][0], _mm256_madd_epi16(_mm256_mullo_epi16(xv01, wv11), ones16));
+                            acc[1][1] = _mm256_add_epi32(acc[1][1], _mm256_madd_epi16(_mm256_mullo_epi16(xv11, wv11), ones16));
+                        }
+                    }
+                    for (int i = 0; i < mn; i++) {
+                        const float sw = j->sw[(size_t)(m0 + i) * K + kk];
+                        for (int jj = 0; jj < 2; jj++) {
+                            const float g = sc[r0 + jj] * sw;
+                            facc[i][jj] = sd_dconv_avx2_fmadd_ps(
+                                _mm256_cvtepi32_ps(acc[i][jj]), _mm256_set1_ps(g), facc[i][jj]);
+                        }
+                    }
+                }
+                for (int i = 0; i < mn; i++) {
+                    const float bv = j->bias ? j->bias[m0 + i] : 0.0f;
+                    float *o = j->out + (size_t)(m0 + i) * L + t;
+                    const float *rs = j->residual ? j->residual + (size_t)(m0 + i) * L + t : NULL;
+                    for (int jj = 0; jj < tn; jj++) {
+                        const float v = sd_dconv_avx2_hsum_ps(facc[i][jj]) + bv;
+                        o[jj] = rs ? v + rs[jj] : v;
+                    }
+                }
+            }
+        }
+    }
+    qwen_region_units_at(QWEN_RGN_SD_CONV_INT8, claimed);
+}
+
+int qwen_conv1d_int8_v2_available(void) { return 1; }
+void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
+                             const float *residual,
+                             const int8_t *wq, const float *sw, const int32_t *wsum,
+                             const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    if (!out || !in || !wq || !sw || in_ch <= 0 || out_ch <= 0 || length <= 0 ||
+        kernel <= 0 || dilation <= 0 || Cp < in_ch || (Cp & 63)) return;
+    qwen_census_op_len(QWEN_PATH_DECODER_CONV_INT8, in_ch, in_ch * kernel, length);
+    qwen_census_leaf(QWEN_LEAF_AVX2);
+    sd_dconv_job_t job = { .out = out, .in = in, .wq = wq, .sw = sw, .wsum = wsum, .bias = bias,
+                           .in_ch = in_ch, .out_ch = out_ch, .length = length, .kernel = kernel,
+                           .dilation = dilation, .Cp = Cp, .tail = tail,
+                           .tail_cols = tail ? tail_cols : 0, .residual = residual };
+    int nt = sd_pool_threads(); if (nt < 1) nt = 1;
+    int tb = (length + nt * 2 - 1) / (nt * 2);
+    if (tb < 32) tb = 32;
+    if (tb > 256) tb = 256;
+    tb = (tb + 3) & ~3;
+    job.tb = tb; job.n_blocks = (length + tb - 1) / tb;
+    atomic_store(&job.next, 0);
+    qwen_region_pool_at(QWEN_RGN_SD_CONV_INT8, nt, job.n_blocks);
+    atomic_store(&job.entered, 0);
+    sd_pool_run(sd_dconv_worker, &job);
+    qwen_region_workers_at(QWEN_RGN_SD_CONV_INT8, atomic_load(&job.entered));
+}
+void qwen_conv1d_int8_v2(float *out, const float *in,
+                         const int8_t *wq, const float *sw, const int32_t *wsum,
+                         const float *bias, int in_ch, int out_ch, int length, int kernel, int dilation, int Cp) {
+    qwen_conv1d_int8_v2_ctx(out, in, NULL, 0, NULL, wq, sw, wsum, bias,
+                            in_ch, out_ch, length, kernel, dilation, Cp);
+}
+
+int qwen_conv1d_int8_v2_multi_available(void) { return 0; }
+void qwen_conv1d_int8_v2_multi_ctx_strided(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const size_t *in_stride, const size_t *out_stride,
+    const int8_t *wq, const float *sw, const int32_t *wsum, const float *bias,
+    int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)in_stride; (void)out_stride;
+    (void)wq; (void)sw; (void)wsum; (void)bias; (void)in_ch; (void)out_ch; (void)nslots;
+    (void)length; (void)kernel; (void)dilation; (void)Cp;
+}
+void qwen_conv1d_int8_v2_multi_ctx(
+    float *const *out, const float *const *in, const float *const *tail, const int *tail_cols,
+    const float *const *residual, const int8_t *wq, const float *sw, const int32_t *wsum,
+    const float *bias, int in_ch, int out_ch, int nslots, int length, int kernel, int dilation, int Cp) {
+    (void)out; (void)in; (void)tail; (void)tail_cols; (void)residual; (void)wq; (void)sw; (void)wsum;
+    (void)bias; (void)in_ch; (void)out_ch; (void)nslots; (void)length; (void)kernel; (void)dilation; (void)Cp;
+}
+#endif /* AVX2 signed-widening DL-4 decoder */
+
 /* ---- ARM-1(a): moved OUT of the dot-product/VNNI guard ---------------------------------
  * Everything below is ISA-neutral C: the ConvT one-GEMM epilogue, its weight restack and
  * the DL-4 weight quantiser.  It was inside the guard only by position, which made
@@ -11220,7 +11755,7 @@ void qwen_conv1d_int8_v2_pack(int8_t *q2, float *sw2, int32_t *ws2,
  * qwen_tts_dispatch.c (the decoder.res1_v2 / decoder.glue_fused rows) and from
  * qwen_tts_speech_decoder.c.  _available() returning 0 keeps every caller on the control
  * path -- the same contract as the #else that already exists inside the guard. */
-#if !defined(__ARM_FEATURE_DOTPROD) && !defined(__AVX512VNNI__)
+#if !defined(__ARM_FEATURE_DOTPROD) && !defined(__AVX512VNNI__) && !defined(__AVX2__)
 int qwen_conv1d_int8_v2_available(void) { return 0; }
 void qwen_conv1d_int8_v2_ctx(float *out, const float *in, const float *tail, int tail_cols,
                              const float *residual,
@@ -11949,6 +12484,23 @@ int qwen_kernel_selftest(void *out) {
         fprintf(f, "  [avx2-int8-emulated-dot] quantized adversarial GEMV: max_abs=%.2e %s\n",
                 worst, candidate_ok ? "PASS" : "FAIL");
         if (!candidate_ok) failures++;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+        int32_t wide_dot = avx512bw_int8_dot_exact(w, qx, test_cols);
+        float wide_y[test_rows];
+        int wide_ok = (int64_t)wide_dot == expected &&
+            int8_matvec_avx512bw_emulated_dot(wide_y, x, weights, scale,
+                                               test_cols, test_rows);
+        float wide_diff = 0.0f;
+        for (int r = 0; wide_ok && r < test_rows; r++) {
+            float d = fabsf(wide_y[r] - y[r]);
+            if (d > wide_diff) wide_diff = d;
+        }
+        wide_ok = wide_ok && wide_diff <= 1e-6f;
+        fprintf(f, "  [avx512bw-int8-emulated-dot] wide signed GEMV: max_abs=%.2e %s\n",
+                wide_diff, wide_ok ? "PASS" : "FAIL");
+        if (!wide_ok) failures++;
+#endif
     }
 
     /* Q4 candidate coverage: exercise both nibble extremes, two blocks and an
@@ -11997,10 +12549,31 @@ int qwen_kernel_selftest(void *out) {
         fprintf(f, "  [avx2-q4-emulated-dot] nibble/extreme/tail parity: max_abs=%.2e invalid-tail=%s %s\n",
                 worst, invalid_rejected ? "rejected" : "accepted", q4_ok ? "PASS" : "FAIL");
         if (!q4_ok) failures++;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && !defined(__AVX512VNNI__)
+        float wide_y[q4_rows];
+        int wide_invalid_rejected = !avx512bw_q4_matvec_integer(invalid_y, x, wq, 65, q4_rows);
+        int wide_ok = avx512bw_q4_matvec_integer(wide_y, x, wq, q4_cols, q4_rows) &&
+                      wide_invalid_rejected;
+        float wide_diff = 0.0f;
+        for (int r = 0; wide_ok && r < q4_rows; r++) {
+            float d = fabsf(wide_y[r] - y[r]);
+            if (d > wide_diff) wide_diff = d;
+        }
+        wide_ok = wide_ok && wide_diff <= 1e-6f;
+        fprintf(f, "  [avx512bw-q4-emulated-dot] wide nibble GEMV: max_abs=%.2e invalid-tail=%s %s\n",
+                wide_diff, wide_invalid_rejected ? "rejected" : "accepted",
+                wide_ok ? "PASS" : "FAIL");
+        if (!wide_ok) failures++;
+#endif
     }
 #else
     fprintf(f, "  [avx2-int8-emulated-dot] not compiled on this host (skipped)\n");
     fprintf(f, "  [avx2-q4-emulated-dot] not compiled on this host (skipped)\n");
+#endif
+
+#if !defined(__AVX512F__) || !defined(__AVX512BW__) || defined(__AVX512VNNI__)
+    fprintf(f, "  [avx512bw-emulated-dot] not compiled into this profile (skipped)\n");
 #endif
 
     for (int ci = 0; ci < ncases; ci++) {
@@ -12415,9 +12988,10 @@ int qwen_kernel_selftest(void *out) {
     }
 
     if (qwen_conv1d_int8_v2_available()) {
-        /* Rectangular/wide shapes the v1 panel path cannot take: initial (1536/1024 k7) and
-         * pre (512 -> 1024 k3) convs.  Same two oracles as above, no continuation case. */
-        const int rect[][4] = { {1536,1024,7,1}, {512,1024,3,1} };
+        /* Rectangular/wide shapes the v1 panel path cannot take: initial (1536/1024 k7),
+         * pre (512 -> 1024 k3), and an odd 67 -> 5 tail case for padded channels/rows.
+         * Same two oracles as above, no continuation case. */
+        const int rect[][4] = { {1536,1024,7,1}, {512,1024,3,1}, {67,5,3,2} };
         for (int ri = 0; ri < (int)(sizeof(rect)/sizeof(rect[0])); ri++) {
             const int in_ch = rect[ri][0], out_ch = rect[ri][1], kern = rect[ri][2], dil = rect[ri][3];
             const int K = in_ch * kern, Cp = qwen_conv1d_int8_v2_cp(in_ch), L = 33;
@@ -12433,8 +13007,10 @@ int qwen_kernel_selftest(void *out) {
             if (!in || !wf || !bias || !q2 || !sw2 || !ws2 || !outk || !qa || !sa) {
                 fprintf(f, "  [conv1d_int8_v2 rect in=%d out=%d] OOM, skipped\n", in_ch, out_ch);
             } else {
-                for (size_t i = 0; i < (size_t)in_ch * L; i++) in[i] = NEXT_F;
-                for (size_t i = 0; i < (size_t)out_ch * K; i++) wf[i] = NEXT_F;
+                for (size_t i = 0; i < (size_t)in_ch * L; i++)
+                    in[i] = in_ch == 67 ? ((i & 1) ? 1.0f : -1.0f) : NEXT_F;
+                for (size_t i = 0; i < (size_t)out_ch * K; i++)
+                    wf[i] = in_ch == 67 ? ((i & 1) ? 1.0f : -1.0f) : NEXT_F;
                 for (int m = 0; m < out_ch; m++) bias[m] = 0.25f * NEXT_F;
                 qwen_conv1d_int8_v2_pack(q2, sw2, ws2, wf, in_ch, out_ch, kern, Cp);
                 qwen_conv1d_int8_v2(outk, in, q2, sw2, ws2, bias, in_ch, out_ch, L, kern, dil, Cp);

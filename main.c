@@ -738,6 +738,10 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
 }
 
 int main(int argc, char **argv) {
+    /* ISA-specific builds are host-bound. Refuse an incompatible CPU before even
+     * diagnostic modes (caps, self-test, dispatch-map) can reach target code. */
+    qwen_check_runtime_isa();
+
     const char *model_dir = NULL;
     const char *text = NULL;
     const char *output = "output.wav";
@@ -1396,8 +1400,6 @@ int main(int argc, char **argv) {
             }
         }
     }
-
-    qwen_check_runtime_isa();
 
     /* --cpu-mask: EXPLICIT execution domain for a qualification run.  It exists because
        `--prefork 1` never reaches the prefork path and therefore never calls
