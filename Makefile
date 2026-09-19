@@ -1135,6 +1135,11 @@ test-caps: $(TARGET)
 	@grep -q "matvec threads:" $(TEST_DIR)/caps.txt || { echo "FAIL: --caps missing threads line"; exit 1; }
 	@grep -q "int8 dot:" $(TEST_DIR)/caps.txt || { echo "FAIL: --caps missing int8 dot line"; exit 1; }
 	@if grep -q "arch:.*arm64" $(TEST_DIR)/caps.txt; then \
+	   grep -q "arm extras build:" $(TEST_DIR)/caps.txt || { echo "FAIL: --caps missing Arm ISA inventory"; exit 1; }; \
+	 elif grep -q "arch:.*x86-64" $(TEST_DIR)/caps.txt; then \
+	   grep -q "x86 extras compile:" $(TEST_DIR)/caps.txt || { echo "FAIL: --caps missing x86 ISA inventory"; exit 1; }; \
+	 fi
+	@if grep -q "arch:.*arm64" $(TEST_DIR)/caps.txt; then \
 	   grep -q "matvec + attn:    NEON" $(TEST_DIR)/caps.txt || { echo "FAIL: arm64 build must report NEON matvec"; exit 1; }; \
 	 elif grep -q "arch:.*x86-64" $(TEST_DIR)/caps.txt; then \
 	   grep -qE "matvec \+ attn:    (AVX-512|AVX2|scalar)" $(TEST_DIR)/caps.txt || { echo "FAIL: x86 must report AVX-512 (SIMD=avx512/avx512vnni/avx512bf16/amx), AVX2 (portable) or scalar"; exit 1; }; \

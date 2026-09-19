@@ -81,6 +81,7 @@
     "gate.q4.sdot_mm": "OFF",
     "gate.q4.kleidi": "ON",
     "kleidi.enabled": "ON",
+    "kleidi.dotprod_gemv": "OFF",
     "kleidi.int8": "ON",
     "kleidi.bf16": "ON",
     "matvec.int8.sdot": "ON",
@@ -101,14 +102,16 @@
     "gate.int8.sdot_mm": "OFF",
     "gate.q4.sdot_mm": "OFF",
     "q8repack.neon": "ON",
-    "kleidi.enabled": "OFF"
+    "kleidi.enabled": "OFF",
+    "kleidi.dotprod_gemv": "OFF"
   },
   "apple_m1": {
     "talker.prefill.matmat_bf16": "OFF",
     "matvec.int8.sdot": "ON",
     "gate.int8.sdot_mm": "OFF",
     "kleidi.enabled": "OFF",
-    "q8repack.neon": "ON"
+    "q8repack.neon": "ON",
+    "kleidi.dotprod_gemv": "OFF"
   },
   "apple_i8mm_bf16": {
     "decoder.res1_v2": "OFF",
@@ -123,6 +126,7 @@
     "gate.q4.sdot_mm": "OFF",
     "q8repack.neon": "ON",
     "gate.q4.kleidi": "ON",
-    "kleidi.enabled": "ON"
+    "kleidi.enabled": "ON",
+    "kleidi.dotprod_gemv": "OFF"
   }
 }
