@@ -133,6 +133,27 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       the falsified utilization-aware admission, the bimodal configuration measurement, `doctor`,
       and the doubling-ladder lesson.
 
+### Serving lifecycle — cancel on disconnect and session books — detail: `.work/cancel-on-disconnect-20260925.md`
+
+- [x] CD-1 Zombie regression test: `make test-server-faults`, cases discriminating, model work
+      after the disconnect read from `frames_generated`; FAILED on the old default on every path.
+- [x] CD-2 Disconnect cancels on every path (batched, single-job clone, plain server; stream and
+      WAV): reset within one frame, FIN within one chunk, half-close still served.
+- [x] CD-3 `QWEN_CANCEL_ON_DISCONNECT` defaults ON (`=0` for A/B); test passes on the default and
+      fails with `=0`.
+- [x] CD-4 Session books: one close per request on every path, `balanced` in `/v1/health` and
+      `/metrics`; a mixed workload moves them by exactly the workload.
+- [x] CD-5 Fault suite (`make test-server-faults`, 40 invariants) incl. abort-loop memory: no
+      per-abort growth vs a no-abort control (macOS, gross bound in the suite).
+- [ ] CD-6 Run `make test-server-faults` and `tests/cancel_correctness.py` on Linux x86 and Arm,
+      including `--prefork 2` for per-worker books.
+- [ ] CD-7 DECISION: a FIN during a WAV request is not seen until the final write (legal
+      half-close); accept, treat EOF as gone for WAV, or send interim 1xx.
+- [ ] CD-8 Single-job path ignores `--max-request-seconds`; its queue bound follows batched
+      occupancy.
+- [ ] CD-9 A stopped reader blocks the synchronous batched writer up to the send timeout,
+      stalling that worker's other slots (the async writer does not; default-off).
+
 ### OTEL — telemetry endpoint for the streaming server (ANALYSIS FIRST) — detail: `.work/otel-metrics-endpoint-20260917.md`
 
 Goal: let a standard observability reader watch a production CPU streaming server, without
