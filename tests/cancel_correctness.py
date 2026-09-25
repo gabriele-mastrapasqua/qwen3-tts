@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""cancel_correctness.py — K1-K7 for server-side cancellation. Correctness, not performance."""
+"""cancel_correctness.py — K1-K9 for server-side cancellation. Correctness, not performance.
+
+Two arms of the same workload: OFF forces QWEN_CANCEL_ON_DISCONNECT=0 (the old behaviour:
+every request runs to EOS), ON sets it to 1, which has been the default since 2026-09-25.
+The ON arm is therefore the production configuration; the OFF arm is the control that
+proves the workload is discriminating (its aborted requests must generate far more).
+The per-path zombie regression (single-job path, WAV, FIN vs RST, half-close) is
+tests/test_server_faults.sh; this script keeps the K-checks on the batched/prefork path."""
 import argparse, hashlib, json, os, re, socket, subprocess, sys, threading, time
 
 SR = 24000
@@ -197,7 +204,18 @@ def main():
     a.growth = tuple(int(x) for x in a.growth.split(",")) if a.growth else None
 
     longest = None
-    for ln in open(a.corpus, encoding="utf-8"):
+    if a.corpus is None:
+        # Built-in utterance; its duration is ESTIMATED (about 12.5 characters per second of
+        # English speech), which only places the abort points -- K2/K3 compare generated
+        # audio between the arms, never against this estimate.
+        txt = ("The old lighthouse keeper climbed the spiral stairs every evening, counting "
+               "each of the one hundred and twelve steps as his father had taught him. At the "
+               "top he polished the great lens, trimmed the wick, and watched the last ships of "
+               "the day turn toward the harbour. Some nights the fog rolled in so thick that the "
+               "beam seemed to stop a few metres from the glass, and he would sit by the window "
+               "with a cup of tea, listening to the foghorn and thinking about the sailors.")
+        longest = ("builtin", len(txt) / 12.5, txt)
+    for ln in (open(a.corpus, encoding="utf-8") if a.corpus else []):
         if ln.startswith("#") or not ln.strip(): continue
         p = [x.strip() for x in ln.rstrip("\n").split("\t")]
         if len(p) >= 8 and p[1] == a.band:
@@ -263,8 +281,8 @@ def main():
         chk(bad == 0, f"K5 {name}: no memory-error finding (leaks are K9)", f"{bad} found")
     print("K8 disconnect detection latency  ·  ONE clock (CLOCK_MONOTONIC), or nothing")
     rd = {v.get("rdhup") for v in cn.values()} - {None}
-    print(f"    POLLRDHUP compiled into the running binary: "
-          f"{'yes' if rd == {1} else ('no' if rd == {0} else 'NOT REPORTED (old binary)')}")
+    print(f"    detector: "
+          f"{'POLLRDHUP (binary before 2026-09-25: a FIN cancels)' if rd == {1} else ('poll+recv(MSG_PEEK): a reset cancels, a FIN is a legal half-close' if rd == {0} else 'NOT REPORTED (old binary)')}")
     lags = []
     for s_ in ab_seeds:
         c, cl = cn.get(s_), on.get(s_, {})
@@ -333,7 +351,7 @@ def main():
     print()
     if fails:
         print(f"❌ {len(fails)} CHECK(S) FAILED"); return 1
-    print("✅ K1-K7 PASSED"); return 0
+    print("✅ K1-K9 PASSED"); return 0
 
 if __name__ == "__main__":
     sys.exit(main())

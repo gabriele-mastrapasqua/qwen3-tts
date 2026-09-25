@@ -418,6 +418,12 @@ typedef struct qwen_tts_ctx {
     int stream_chunk_frames;
     qwen_tts_audio_cb audio_cb;
     void *audio_cb_userdata;
+    /* Optional per-frame cancellation check of the single-request generator
+     * (qwen_tts_generate): return non-zero to stop at the next frame boundary, before
+     * another Talker step.  NULL = never.  The server sets it for the duration of one
+     * request so a client that disconnected stops costing model work. */
+    int (*cancel_cb)(void *userdata);
+    void *cancel_cb_userdata;
 
     uint32_t seed;
 
@@ -619,6 +625,12 @@ int qwen_tts_resolve_speaker(const qwen_tts_ctx_t *ctx, const char *name);
 void qwen_tts_list_speakers(const qwen_tts_ctx_t *ctx);
 
 void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata);
+
+/* Talker frames this process has generated, all requests and paths together: one per
+ * sampled codec frame (12.5 per second of audio).  Monotonic; one relaxed atomic add per
+ * frame.  It is the server's measure of model work, independent of whether anybody was
+ * still listening -- the quantity a disconnect must stop. */
+unsigned long long qwen_tts_frames_generated(void);
 
 int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text,
                       float **out_samples, int *out_n_samples);

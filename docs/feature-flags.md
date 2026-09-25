@@ -243,6 +243,7 @@ both belong before any number.
 | `QWEN_ADMIT_UTIL_LIMIT_MS` | 60 | recent service-loop interval limit in milliseconds for the transient third-slot predicate; benchmark thresholds must be fixed before an A/B run |
 | `QWEN_ADMIT_UTIL_TRACE` | off | diagnostic `[ADMITUTIL]` decisions: worker, active slots, sample age, recent interval, threshold and admit/reject reason |
 | `QWEN_THP` | off | `=1` advises transparent huge pages over the mapped weights (Linux) |
+| `QWEN_CANCEL_ON_DISCONNECT` | **on** (since 2026-09-25) | a request whose client is gone stops generating at the next frame, on every path (batched slot, single-job clone, plain server, stream and WAV). *Gone* means a reset or socket error seen by a per-frame check, or a write that failed (EPIPE, ECONNRESET) or timed out after `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS`; a FIN alone is a legal HTTP half-close and does **not** cancel, so a client that closed completely is found one written chunk later. `=0` restores the old behaviour (every request runs to EOS for nobody) for A/B only. Evidence: `.work/cancel-on-disconnect-20260925.md` |
 | `QWEN_BATCH_MAX_FRAMES` | server: `--max-request-seconds × 12.5` (750 at the default 60 s); CLI `--batch`: 600 (48 s) | per-request generation ceiling of the batched/server paths in codec frames. Reaching it is **not** an EOS: the request is truncated, a `WARNING: request TRUNCATED after N frames` line goes to stderr and `[REQ]` traces carry `truncated=1`. Before 2026-09-08 the server stopped silently at 600 frames (48 s) while `--max-request-seconds 60` admitted 60 s of text. An explicit value here wins over the derived one; it is clamped to the RoPE cache |
 
 Note that `OPENBLAS_NUM_THREADS` is not in this table because it must be **absent**: the engine
@@ -282,7 +283,7 @@ not be present, and the benchmark suite refuses to run when one is.
 | `QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC` | off | reserve the last N cpus of the worker mask for a private decoder team, and narrow the engine pool only while a decoder unit is in flight. Linux-only, **not ISA-specific** |
 | `QWEN_SERVER_ASYNC_OUTPUT` | off | experimental stream transport isolation: a bounded per-stream PCM queue and detached writer keep inference callbacks off the socket; queue overflow/disconnect fails and closes the stream rather than dropping PCM silently |
 | `QWEN_STREAM_OUTPUT_MAX_BYTES` | 1048576 | byte cap for the experimental per-stream output queue; invalid values fall back to the 1 MiB default |
-| `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS` | 5000 | socket send timeout used by the experimental stream writer; a stalled reader is terminated after the timeout |
+| `QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS` | 5000 | socket send timeout: used by the experimental stream writer, and, with `QWEN_CANCEL_ON_DISCONNECT` on, by every client socket, so a stalled reader is cancelled after the timeout instead of holding a synchronous writer (the scheduler or a decoder lane) forever |
 | `QWEN_STREAM_LEAD_GATE` | off | experimental server policy gate: after first audio, suppresses a stream's next complete Talker/CP frame while estimated delivered-audio lead exceeds the target; this is not decoder preemption |
 | `QWEN_STREAM_LEAD_TARGET_MS` | 250 (range 50–2000) | estimated audio lead target used by `QWEN_STREAM_LEAD_GATE` |
 | `QWEN_DECODER_GANG_LEAD` | 4 | slots from which the decoder gang gets a leader |
@@ -419,7 +420,7 @@ verify them and a log will not show them. Use them for an experiment, not for a 
 (MMLA is opt-in on Apple silicon), `QWEN_PREFORK_ELASTIC` (set by `--prefork-elastic`),
 `QWEN_MAX_REQUEST_S` and `QWEN_MAX_TEXT_CHARS` (also `--max-request-seconds` /
 `--max-text-chars`), `QWEN_QUEUE_UNBOUNDED` (removes the queue bound — the old behaviour, kept
-for A/B only), `QWEN_SERVER_STRICT`, `QWEN_CANCEL_ON_DISCONNECT`, `QWEN_TTFA_FREEZE_CAP`,
+for A/B only), `QWEN_SERVER_STRICT`, `QWEN_TTFA_FREEZE_CAP`,
 `QWEN_TTFA_PRIO_STRICT`, `QWEN_FREE_BF16`, `QWEN_PREFILL_HELPER`, `QWEN_POOL_NARROW`.
 
 Where a CLI flag exists for the same thing, the CLI flag is the one to use: it lands in the
