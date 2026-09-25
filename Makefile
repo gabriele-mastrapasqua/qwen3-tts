@@ -1322,6 +1322,13 @@ test-serve-continuous: $(TARGET)
 test-serve-stream-batch: $(TARGET)
 	@bash tests/serve_stream_batch.sh $(MODEL_SMALL)
 
+# Provoked failures: zombie inference after a disconnect (RST/FIN, batched, single-job and WAV
+# paths, each first proven discriminating), half-close, stopped reader, a neighbour's audio
+# while others die, an abort loop with an RSS bound, and the session books under a mixed
+# workload. ~25 min on an M1 with the 0.6B. FAULT_CASES="zombie" runs a subset.
+test-server-faults: $(TARGET)
+	@sh tests/test_server_faults.sh $(MODEL_SMALL) 8871
+
 MINUTES ?= 30
 LEVEL ?= 2
 
@@ -1446,7 +1453,7 @@ test-it-ryan: test-small-it
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-batch-invariance test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden test-stream-layout test-sd-pool-config golden-update emovoice emo-06b-demo quant-ladder test-modes test-qvoice e2e \
 		test-json-parser \
         emotion-para-demo para-demo \
-        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all \
+        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-stage-policy test-serve-all test-server-faults \
         test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
