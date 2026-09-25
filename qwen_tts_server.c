@@ -96,10 +96,18 @@ typedef struct {
     _Atomic unsigned long long ttfa_over_250ms;
     _Atomic unsigned long long ttfa_over_500ms;
     _Atomic unsigned long long ttfa_over_1s;
+    /* The session books (srv_session_*): written only under g_books_mtx, inside a seqlock
+     * (books_seq odd while an update is in progress) so a reader in another process -- the
+     * prefork parent rendering /metrics -- gets a consistent snapshot or retries. */
+    _Atomic unsigned long long books_seq;
+    _Atomic unsigned long long sessions;
+    _Atomic unsigned long long sessions_active;
     _Atomic unsigned long long term_ok;
     _Atomic unsigned long long term_client_gone;
     _Atomic unsigned long long term_timeout;
     _Atomic unsigned long long term_rejected;
+    _Atomic unsigned long long term_failed;
+    _Atomic unsigned long long books_anomalies;
     _Atomic unsigned long long ttfb_ms_sum;
     _Atomic unsigned long long ttfb_n;
     _Atomic unsigned long long queue_ms_sum;
@@ -123,6 +131,94 @@ static int g_srv_worker_id = -1;
             atomic_fetch_add_explicit(&g_metrics_mine->field, \
                                       (unsigned long long)(v), memory_order_relaxed); \
     } while (0)
+
+/* ---- Session books ------------------------------------------------------------------
+ *
+ * One synthesis request = one session: a POST to /v1/tts, /v1/audio/speech or
+ * /v1/tts/stream that passed the HTTP pre-checks (method, size, content type, a JSON
+ * object).  Every session ends exactly once, in exactly one of the outcomes below, through
+ * srv_session_close() -- whichever path ends it.  Open and close run under one lock, so at
+ * every instant
+ *
+ *     sessions == completed + client_gone + timeout + rejected + failed + active
+ *
+ * and `balanced` says so.  A second close of the same session, or a close of one never
+ * opened, is not counted as an outcome: it is an anomaly, and it unbalances the books. */
+typedef enum {
+    SRV_OUT_COMPLETED = 0,  /* generated and handed to the socket                        */
+    SRV_OUT_CLIENT_GONE,    /* the client disconnected or stopped reading                  */
+    SRV_OUT_TIMEOUT,        /* stopped by the per-request budget (--max-request-seconds)   */
+    SRV_OUT_REJECTED,       /* refused: invalid request, queue full, queued too long, prompt over the cap */
+    SRV_OUT_FAILED,         /* the server could not serve it: generation failure, scheduler or worker down */
+    SRV_OUT_N
+} srv_outcome_t;
+enum { SRV_BOOK_NONE = 0, SRV_BOOK_OPEN = 1, SRV_BOOK_CLOSED = 2 };
+
+typedef struct {
+    unsigned long long sessions, active, out[SRV_OUT_N], anomalies;
+} srv_books_t;
+
+static pthread_mutex_t g_books_mtx = PTHREAD_MUTEX_INITIALIZER;
+static srv_books_t g_books;
+
+static void srv_books_mirror_locked(void) {
+    qwen_metrics_slot_t *m = g_metrics_mine;
+    if (!m) return;
+    const memory_order R = memory_order_relaxed;
+    unsigned long long seq = atomic_load_explicit(&m->books_seq, R);
+    atomic_store_explicit(&m->books_seq, seq + 1, R);
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&m->sessions, g_books.sessions, R);
+    atomic_store_explicit(&m->sessions_active, g_books.active, R);
+    atomic_store_explicit(&m->term_ok, g_books.out[SRV_OUT_COMPLETED], R);
+    atomic_store_explicit(&m->term_client_gone, g_books.out[SRV_OUT_CLIENT_GONE], R);
+    atomic_store_explicit(&m->term_timeout, g_books.out[SRV_OUT_TIMEOUT], R);
+    atomic_store_explicit(&m->term_rejected, g_books.out[SRV_OUT_REJECTED], R);
+    atomic_store_explicit(&m->term_failed, g_books.out[SRV_OUT_FAILED], R);
+    atomic_store_explicit(&m->books_anomalies, g_books.anomalies, R);
+    atomic_store_explicit(&m->books_seq, seq + 2, memory_order_release);
+}
+
+static void srv_session_open(int *book) {
+    pthread_mutex_lock(&g_books_mtx);
+    if (*book != SRV_BOOK_NONE) g_books.anomalies++;
+    else { g_books.sessions++; g_books.active++; *book = SRV_BOOK_OPEN; }
+    srv_books_mirror_locked();
+    pthread_mutex_unlock(&g_books_mtx);
+}
+
+static void srv_session_close(int *book, srv_outcome_t o) {
+    pthread_mutex_lock(&g_books_mtx);
+    if (*book != SRV_BOOK_OPEN || o < 0 || o >= SRV_OUT_N) g_books.anomalies++;
+    else { g_books.out[o]++; g_books.active--; *book = SRV_BOOK_CLOSED; }
+    srv_books_mirror_locked();
+    pthread_mutex_unlock(&g_books_mtx);
+}
+
+static int srv_books_balanced(const srv_books_t *b) {
+    unsigned long long ended = 0;
+    for (int i = 0; i < SRV_OUT_N; i++) ended += b->out[i];
+    return b->anomalies == 0 && b->sessions == ended + b->active;
+}
+
+/* A consistent copy of one worker's books from the shared page (any process). */
+static void srv_books_from_slot(const qwen_metrics_slot_t *m, srv_books_t *b) {
+    const memory_order R = memory_order_relaxed;
+    for (;;) {
+        unsigned long long s0 = atomic_load_explicit(&m->books_seq, memory_order_acquire);
+        if (s0 & 1) continue;
+        b->sessions = atomic_load_explicit(&m->sessions, R);
+        b->active = atomic_load_explicit(&m->sessions_active, R);
+        b->out[SRV_OUT_COMPLETED] = atomic_load_explicit(&m->term_ok, R);
+        b->out[SRV_OUT_CLIENT_GONE] = atomic_load_explicit(&m->term_client_gone, R);
+        b->out[SRV_OUT_TIMEOUT] = atomic_load_explicit(&m->term_timeout, R);
+        b->out[SRV_OUT_REJECTED] = atomic_load_explicit(&m->term_rejected, R);
+        b->out[SRV_OUT_FAILED] = atomic_load_explicit(&m->term_failed, R);
+        b->anomalies = atomic_load_explicit(&m->books_anomalies, R);
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&m->books_seq, R) == s0) return;
+    }
+}
 
 static int qwen_metrics_shared_alloc(int workers) {
     if (workers < 1) workers = 1;
@@ -210,8 +306,10 @@ static int read_request(int fd, char *buf, int buf_size) {
     return total;
 }
 
-static void send_response(int fd, int status, const char *content_type,
-                          const void *body, int body_len) {
+static int write_all_or_gone(int fd, const void *buf, size_t n);
+/* 0 when every byte reached the socket, -1 when the client is gone (or stopped reading). */
+static int send_response(int fd, int status, const char *content_type,
+                         const void *body, int body_len) {
     const char *status_text = (status == 200) ? "OK" :
                               (status == 400) ? "Bad Request" :
                               (status == 404) ? "Not Found" :
@@ -228,12 +326,13 @@ static void send_response(int fd, int status, const char *content_type,
         "Connection: close\r\n"
         "\r\n",
         status, status_text, content_type, body_len);
-    write(fd, header, hlen);
-    if (body && body_len > 0) write(fd, body, body_len);
+    if (write_all_or_gone(fd, header, (size_t)hlen) < 0) return -1;
+    if (body && body_len > 0 && write_all_or_gone(fd, body, (size_t)body_len) < 0) return -1;
+    return 0;
 }
 
 static void send_json(int fd, int status, const char *json) {
-    send_response(fd, status, "application/json", json, (int)strlen(json));
+    (void)send_response(fd, status, "application/json", json, (int)strlen(json));
 }
 
 static void json_escape(char *dst, size_t dstsz, const char *src) {
@@ -1027,7 +1126,19 @@ static void handle_health(int fd) {
     int ready = g_srv.batched ? alive : 1;
     const char *sched = g_srv.batched ? (alive ? "running" : "down") : "none";
     const char *mode  = g_srv.batched ? "batched" : "single";
-    char json[800];
+    srv_books_t bk;
+    pthread_mutex_lock(&g_books_mtx);
+    bk = g_books;
+    pthread_mutex_unlock(&g_books_mtx);
+    char books[400];
+    snprintf(books, sizeof books,
+             "{\"sessions\":%llu,\"completed\":%llu,\"client_gone\":%llu,\"timeout\":%llu,"
+             "\"rejected\":%llu,\"failed\":%llu,\"active\":%llu,\"anomalies\":%llu,"
+             "\"balanced\":%s}",
+             bk.sessions, bk.out[SRV_OUT_COMPLETED], bk.out[SRV_OUT_CLIENT_GONE],
+             bk.out[SRV_OUT_TIMEOUT], bk.out[SRV_OUT_REJECTED], bk.out[SRV_OUT_FAILED],
+             bk.active, bk.anomalies, srv_books_balanced(&bk) ? "true" : "false");
+    char json[1400];
     snprintf(json, sizeof(json),
              "{\"status\":\"%s\",\"mode\":\"%s\",\"scheduler\":\"%s\","
              "\"num_requests_running\":%d,\"num_requests_waiting\":%d,"
@@ -1036,7 +1147,8 @@ static void handle_health(int fd) {
              "\"worker\":%d,\"counters_scope\":\"%s\","
              "\"admitted\":%d,\"done\":%d,"
              "\"rejected_queue_full\":%d,\"rejected_queue_timeout\":%d,"
-             "\"timed_out\":%d,\"frames_generated\":%llu}",
+             "\"timed_out\":%d,\"frames_generated\":%llu,"
+             "\"cancel_on_disconnect\":%s,\"books\":%s}",
              ready ? "ok" : "unavailable", mode, sched,
              atomic_load(&g_srv.running), waiting,
              g_srv.queue_max, g_srv.queue_timeout_ms, g_srv.max_request_ms,
@@ -1046,7 +1158,8 @@ static void handle_health(int fd) {
                                   : "this server",
              atomic_load(&g_srv.admitted), atomic_load(&g_srv.done),
              atomic_load(&g_srv.rejected_full), atomic_load(&g_srv.rejected_stale),
-             atomic_load(&g_srv.timed_out), qwen_tts_frames_generated());
+             atomic_load(&g_srv.timed_out), qwen_tts_frames_generated(),
+             qwen_cancel_on_disconnect() ? "true" : "false", books);
     send_json(fd, ready ? 200 : 503, json);
 }
 
@@ -1258,7 +1371,8 @@ static double server_time_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
-static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
+/* Returns how the request ended, for the session books. */
+static srv_outcome_t handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     float volume = 1.0f, rate = 1.0f;
     g_req_err[0] = '\0';
     char *text = parse_tts_request(ctx, body, &volume, &rate);
@@ -1266,12 +1380,12 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         send_error(fd, 400, g_req_err[0] ? g_req_err
                                          : "missing, empty, or oversized 'text' (max "
                                            QWEN_STR(MAX_TTS_TEXT) " characters)");
-        return;
+        return SRV_OUT_REJECTED;
     }
     if (ctx->voice_design && ctx->config.hidden_size < 2048) {
         send_error(fd, 400, "voice_design requires the 1.7B VoiceDesign model");
         free(text);
-        return;
+        return SRV_OUT_REJECTED;
     }
 
     fprintf(stderr, "[HTTP] TTS: \"%s\" (speaker=%d, lang=%d, seed=%u)\n",
@@ -1299,7 +1413,7 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         if (qwen_compose_parse(text, &spans, &nspans) != 0 || nspans == 0) {
             ctx->cancel_cb = NULL; ctx->cancel_cb_userdata = NULL;
             send_error(fd, 500, "markup parse failed");
-            free(language); free(text); return;
+            free(language); free(text); return SRV_OUT_FAILED;
         }
         fprintf(stderr, "[HTTP] inline markup -> per-sentence compose (%d spans)\n", nspans);
         gen_rc = qwen_compose_render_buffer(ctx, spans, nspans, language, 0.12f, &audio, &n_samples, 1);
@@ -1314,13 +1428,13 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
         fprintf(stderr, "[HTTP] client gone during generation: %d samples generated, nothing sent\n",
                 n_samples);
         free(audio); free(text);
-        return;
+        return SRV_OUT_CLIENT_GONE;
     }
     if (gen_rc != 0 || !audio || n_samples == 0) {
         send_error(fd, 500, "generation failed");
         free(text);
         free(audio);
-        return;
+        return SRV_OUT_FAILED;
     }
 
     if (volume != 1.0f) qwen_audio_apply_gain(audio, n_samples, volume);
@@ -1336,19 +1450,25 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     free(audio);
     free(text);
 
-    send_response(fd, 200, "audio/wav", wav, wav_size);
+    int wrc = send_response(fd, 200, "audio/wav", wav, wav_size);
     free(wav);
 
     double elapsed = server_time_ms() - t0;
     float audio_secs = (float)n_samples / QWEN_TTS_SAMPLE_RATE;
-    fprintf(stderr, "[HTTP] Sent %d bytes WAV (%.2fs audio) in %.1fs (RTF %.2f)\n",
-            wav_size, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs);
+    fprintf(stderr, "[HTTP] Sent %d bytes WAV (%.2fs audio) in %.1fs (RTF %.2f)%s\n",
+            wav_size, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs,
+            wrc < 0 ? " client_gone=1" : "");
+    return wrc < 0 ? SRV_OUT_CLIENT_GONE : SRV_OUT_COMPLETED;
 }
 
-static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
+/* Returns 1 when the detached writer owns the socket; *outcome says how it ended. */
+static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body,
+                             srv_outcome_t *outcome) {
     float volume = 1.0f, rate = 1.0f;
+    g_req_err[0] = '\0';
     char *text = parse_tts_request(ctx, body, &volume, &rate);
     (void)rate;
+    *outcome = SRV_OUT_REJECTED;
     if (!text) {
         send_error(fd, 400, g_req_err[0] ? g_req_err
                                          : "missing, empty, or oversized 'text' (max "
@@ -1409,6 +1529,7 @@ static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     ctx->cancel_cb_userdata = NULL;
     int stream_fd_owned = state.out != NULL;
     if (state.out) {
+        if (stream_output_failed(state.out)) atomic_store(&state.gone, 1);
         stream_output_finish(state.out);
         stream_output_release(state.out); /* release the producer reference */
     } else if (!atomic_load(&state.gone)) {
@@ -1423,6 +1544,7 @@ static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio) in %.1fs (RTF %.2f)%s\n",
             state.total_samples, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs,
             atomic_load(&state.gone) ? " client_gone=1" : "");
+    *outcome = atomic_load(&state.gone) ? SRV_OUT_CLIENT_GONE : SRV_OUT_COMPLETED;
     return stream_fd_owned;
 }
 
@@ -1513,20 +1635,18 @@ static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
     else if (strcmp(path, "/v1/speakers") == 0 && strcmp(method, "GET") == 0) {
         handle_speakers(client_fd);
     }
-    else if (strcmp(path, "/v1/tts") == 0 && strcmp(method, "POST") == 0) {
+    else if ((strcmp(path, "/v1/tts") == 0 || strcmp(path, "/v1/audio/speech") == 0 ||
+              strcmp(path, "/v1/tts/stream") == 0) && strcmp(method, "POST") == 0) {
+        int book = SRV_BOOK_NONE;
+        srv_outcome_t outcome;
+        srv_session_open(&book);
         if (g_serialize_synth) pthread_mutex_lock(&g_synth_lock);
-        handle_tts(ctx, client_fd, body);
+        if (strcmp(path, "/v1/tts/stream") == 0)
+            stream_fd_owned = handle_tts_stream(ctx, client_fd, body, &outcome);
+        else
+            outcome = handle_tts(ctx, client_fd, body);
         if (g_serialize_synth) pthread_mutex_unlock(&g_synth_lock);
-    }
-    else if (strcmp(path, "/v1/tts/stream") == 0 && strcmp(method, "POST") == 0) {
-        if (g_serialize_synth) pthread_mutex_lock(&g_synth_lock);
-        stream_fd_owned = handle_tts_stream(ctx, client_fd, body);
-        if (g_serialize_synth) pthread_mutex_unlock(&g_synth_lock);
-    }
-    else if (strcmp(path, "/v1/audio/speech") == 0 && strcmp(method, "POST") == 0) {
-        if (g_serialize_synth) pthread_mutex_lock(&g_synth_lock);
-        handle_tts(ctx, client_fd, body);
-        if (g_serialize_synth) pthread_mutex_unlock(&g_synth_lock);
+        srv_session_close(&book, outcome);
     }
     else {
         send_error(client_fd, 404, "not found");
@@ -1966,20 +2086,6 @@ static size_t qwen_metrics_render(char *b, size_t cap) {
              "estimate: 1 s is the safe_play_start line, so the useful question is how many "
              "crossed it.",
              offsetof(qwen_metrics_slot_t, ttfa_over_1s), 0},
-            {"qwen_tts_worker_terminated_ok_total", "counter",
-             "Requests that ran to completion and were fully delivered.",
-             offsetof(qwen_metrics_slot_t, term_ok), 0},
-            {"qwen_tts_worker_terminated_client_gone_total", "counter",
-             "Requests where the client disconnected before the audio finished. Ordinary for a "
-             "TTS server -- somebody stopped listening -- and invisible on every other series "
-             "here: the queue stays shallow, nothing is refused, throughput just sags.",
-             offsetof(qwen_metrics_slot_t, term_client_gone), 0},
-            {"qwen_tts_worker_terminated_timeout_total", "counter",
-             "Requests stopped by the per-request budget.",
-             offsetof(qwen_metrics_slot_t, term_timeout), 0},
-            {"qwen_tts_worker_terminated_rejected_total", "counter",
-             "Requests the worker refused after admission, such as a prompt over the token cap.",
-             offsetof(qwen_metrics_slot_t, term_rejected), 0},
             {"qwen_tts_worker_ttfb_seconds_sum", "counter",
              "Sum of time-to-first-byte.",
              offsetof(qwen_metrics_slot_t, ttfb_ms_sum), 1},
@@ -2020,6 +2126,54 @@ static size_t qwen_metrics_render(char *b, size_t cap) {
                     QM_P("%s{worker=\"%d\"} %.3f\n", defs[k].name, w, raw / 1000.0);
                 else
                     QM_P("%s{worker=\"%d\"} %llu\n", defs[k].name, w, raw);
+            }
+        }
+
+        /* The session books, one consistent snapshot per worker (seqlock, see
+           srv_session_close).  Every request that reached the worker is in exactly one of
+           the terminated_* series or in sessions_active, and books_balanced says whether
+           that still holds. */
+        srv_books_t bk[64];
+        const int nb = nw < 64 ? nw : 64;
+        for (int w = 0; w < nb && w < g_metrics_slot_n; w++) srv_books_from_slot(&g_metrics_slots[w], &bk[w]);
+        const struct { const char *name, *type, *help; int idx; } bdefs[] = {
+            {"qwen_tts_worker_sessions_total", "counter",
+             "Synthesis requests this worker took (a POST to a synthesis endpoint that passed the "
+             "HTTP checks). Each ends in exactly one terminated_* series.", -1},
+            {"qwen_tts_worker_terminated_ok_total", "counter",
+             "Requests that ran to completion and were handed to the socket.", SRV_OUT_COMPLETED},
+            {"qwen_tts_worker_terminated_client_gone_total", "counter",
+             "Requests where the client disconnected or stopped reading before the audio finished. "
+             "Ordinary for a TTS server -- somebody stopped listening -- and invisible on every "
+             "other series here: the queue stays shallow, nothing is refused, throughput just sags.",
+             SRV_OUT_CLIENT_GONE},
+            {"qwen_tts_worker_terminated_timeout_total", "counter",
+             "Requests stopped by the per-request budget.", SRV_OUT_TIMEOUT},
+            {"qwen_tts_worker_terminated_rejected_total", "counter",
+             "Requests refused: invalid, queue full, queued too long, or a prompt over the token cap.",
+             SRV_OUT_REJECTED},
+            {"qwen_tts_worker_terminated_failed_total", "counter",
+             "Requests the server could not serve: generation failed, scheduler or worker unavailable.",
+             SRV_OUT_FAILED},
+            {"qwen_tts_worker_books_anomalies_total", "counter",
+             "Sessions closed twice or never opened. Always 0 unless the accounting has a bug.", -2},
+            {"qwen_tts_worker_sessions_active", "gauge",
+             "Sessions taken and not yet ended (queued or running).", -3},
+            {"qwen_tts_worker_books_balanced", "gauge",
+             "1 when sessions_total == the sum of terminated_* + sessions_active and no anomaly "
+             "was recorded; 0 means a request was lost or counted twice.", -4},
+        };
+        for (size_t k = 0; k < sizeof bdefs / sizeof bdefs[0]; k++) {
+            QM_P("# HELP %s %s\n# TYPE %s %s\n", bdefs[k].name, bdefs[k].help,
+                 bdefs[k].name, bdefs[k].type);
+            for (int w = 0; w < nb && w < g_metrics_slot_n; w++) {
+                const srv_books_t *wb = &bk[w];   /* not `b`: QM_P writes to b */
+                unsigned long long v = bdefs[k].idx >= 0 ? wb->out[bdefs[k].idx]
+                                     : bdefs[k].idx == -1 ? wb->sessions
+                                     : bdefs[k].idx == -2 ? wb->anomalies
+                                     : bdefs[k].idx == -3 ? wb->active
+                                     : (unsigned long long)srv_books_balanced(wb);
+                QM_P("%s{worker=\"%d\"} %llu\n", bdefs[k].name, w, v);
             }
         }
     }
@@ -2335,6 +2489,7 @@ typedef struct batch_job {
     _Atomic int client_gone;
     _Atomic int cancelled;
     int timed_out;
+    int book;                   /* srv_session_open/close state: exactly one close per job */
     _Atomic long long audio_ready_samples;
     _Atomic long long first_audio_ready_us;
     double t_abort_detected;
@@ -2561,12 +2716,15 @@ static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_la
     return text;
 }
 
-static void respond_wav(int fd, const float *audio, int n_samples) {
-    if (!audio || n_samples <= 0) { send_error(fd, 500, "generation failed"); return; }
+/* The outcome of a WAV answer: a generation that produced nothing is FAILED, a write
+ * that did not reach the client is CLIENT_GONE. */
+static srv_outcome_t respond_wav(int fd, const float *audio, int n_samples) {
+    if (!audio || n_samples <= 0) { send_error(fd, 500, "generation failed"); return SRV_OUT_FAILED; }
     int wav_size = 0;
     void *wav = build_wav(audio, n_samples, &wav_size);
-    send_response(fd, 200, "audio/wav", wav, wav_size);
+    int rc = send_response(fd, 200, "audio/wav", wav, wav_size);
     free(wav);
+    return rc < 0 ? SRV_OUT_CLIENT_GONE : SRV_OUT_COMPLETED;
 }
 
 typedef struct { qwen_tts_ctx_t *ctx; conn_queue_t *cq; job_queue_t *jq; job_queue_t *jq_single;
@@ -2623,6 +2781,7 @@ static void *reader_main(void *arg) {
             }
             atomic_init(&j->audio_ready_samples, 0);
             atomic_init(&j->first_audio_ready_us, 0);
+            srv_session_open(&j->book);
             j->fd = fd;
             j->t_client_start = f2_client_start_ms(buf);
             j->t_parent_accept = handoff.parent_accept_ms;
@@ -2641,6 +2800,7 @@ static void *reader_main(void *arg) {
                 send_error(fd, 400, rerr[0] ? rerr
                                             : "missing, empty, or oversized 'text' (max "
                                               QWEN_STR(MAX_TTS_TEXT) " characters)");
+                srv_session_close(&j->book, SRV_OUT_REJECTED);
                 srv_conn_close(fd); free(j); free(buf); continue;
             }
             if (needs_single) {
@@ -2650,6 +2810,7 @@ static void *reader_main(void *arg) {
                 if (!jq_push(ra->jq_single, j)) {
                     atomic_fetch_add(&g_srv.rejected_full, 1);
                     send_error(fd, 503, "server at capacity: queue full");
+                    srv_session_close(&j->book, SRV_OUT_REJECTED);
                     srv_conn_close(fd); job_free(j); free(buf); continue;
                 }
             } else {
@@ -2660,6 +2821,7 @@ static void *reader_main(void *arg) {
                 if (!jq_push(ra->jq, j)) {
                     atomic_fetch_add(&g_srv.rejected_full, 1);
                     send_error(fd, 503, "server at capacity: queue full");
+                    srv_session_close(&j->book, SRV_OUT_REJECTED);
                     srv_conn_close(fd); job_free(j); free(buf); continue;
                 }
             }
@@ -2718,6 +2880,7 @@ static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block)
             srv_now_ms() - j->enq_ms > (double)g_srv.queue_timeout_ms) {
             atomic_fetch_add(&g_srv.rejected_stale, 1);
             send_error(j->fd, 503, "server at capacity: queued too long");
+            srv_session_close(&j->book, SRV_OUT_REJECTED);
             srv_conn_close(j->fd); job_free(j);
             continue;
         }
@@ -2726,6 +2889,7 @@ static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block)
              * slot for nobody. */
             fprintf(stderr, "[server] queued request seed=%u: client gone before admission\n",
                     j->req.seed);
+            srv_session_close(&j->book, SRV_OUT_CLIENT_GONE);
             srv_conn_close(j->fd); job_free(j);
             continue;
         }
@@ -2955,13 +3119,9 @@ static void qwen_metrics_request_done(const batch_job_t *j) {
        mid-stream is the most ordinary event a TTS server sees, and until now a wave of them
        looked like nothing at all: the queue stayed shallow, nothing was refused, throughput
        simply sagged. */
-    if (j->timed_out)        QM_ADD(term_timeout, 1);
-    else if (j->client_gone) QM_ADD(term_client_gone, 1);
-    else                     QM_ADD(term_ok, 1);
+    /* How it ENDED is counted by the session books (srv_session_close), once, on every
+       path -- including the rejects and failures that never reach this hook. */
 }
-
-/* The reject path does not go through the timing hook, so it is counted on its own. */
-static void qwen_metrics_request_rejected(void) { QM_ADD(term_rejected, 1); }
 
 static void qwen_life_emit(batch_job_t *j) {
     qwen_metrics_request_done(j);
@@ -3036,10 +3196,10 @@ static void sink_on_reject(void *ud, void *tag, const char *reason) {
     } else if (j->is_stream && j->header_sent) (void)send_chunked_end(j->fd);
     else send_api_error(j->fd, 400, m, "text");
     fprintf(stderr, "[server] rejected seed=%u: %s\n", j->life_seed, reason ? reason : "?");
+    srv_session_close(&j->book, SRV_OUT_REJECTED);
     if (!async_output) srv_conn_close(j->fd);
     job_free(j);
     sc->done++;
-    qwen_metrics_request_rejected();
     atomic_fetch_add(&g_srv.done, 1);
     atomic_fetch_sub(&g_srv.running, 1);
 }
@@ -3048,7 +3208,12 @@ static void sink_on_done(void *ud, void *tag, float *samples, int n_samples) {
     sink_ctx_t *sc = (sink_ctx_t *)ud;
     batch_job_t *j = (batch_job_t *)tag;
     int async_output = j->is_stream && j->out != NULL;
+    /* The outcome is decided after the last write: a final chunk or a WAV that did not
+     * reach the socket is a client that left, not a completed request.  (With the async
+     * writer the tail is still in flight here; a failure after this point is not seen.) */
+    srv_outcome_t outcome = SRV_OUT_COMPLETED;
     if (async_output) {
+        if (stream_output_failed(j->out)) j->client_gone = 1;
         stream_output_finish(j->out);
         stream_output_release(j->out); /* writer drains and closes the socket */
         j->out = NULL;
@@ -3059,20 +3224,23 @@ static void sink_on_done(void *ud, void *tag, float *samples, int n_samples) {
         if (j->client_gone) {
             free(samples);          /* nothing reaches a peer that is gone */
         } else if (j->is_stream) {
-        if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
-        (void)send_chunked_end(j->fd);
+            if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
+            if (send_chunked_end(j->fd) < 0) j->client_gone = 1;
         } else if (j->timed_out && (!samples || n_samples <= 0)) {
-        char m[160];
-        snprintf(m, sizeof(m),
-                 "request exceeded the server's %d ms generation limit and was stopped",
-                 g_srv.max_request_ms);
-        send_error(j->fd, 503, m);
-        free(samples);
+            char m[160];
+            snprintf(m, sizeof(m),
+                     "request exceeded the server's %d ms generation limit and was stopped",
+                     g_srv.max_request_ms);
+            send_error(j->fd, 503, m);
+            free(samples);
         } else {
-            respond_wav(j->fd, samples, n_samples);
+            outcome = respond_wav(j->fd, samples, n_samples);
             free(samples);
         }
     }
+    if (j->timed_out)        outcome = SRV_OUT_TIMEOUT;
+    else if (j->client_gone) outcome = SRV_OUT_CLIENT_GONE;
+    srv_session_close(&j->book, outcome);
     if (!async_output) srv_conn_close(j->fd);
     int streamed = j->is_stream;
     job_free(j);
@@ -3119,6 +3287,7 @@ static void *scheduler_main(void *arg) {
             batch_job_t *j = jq_pop(sa->jq);
             if (!j) break;
             send_error(j->fd, 503, "batch scheduler unavailable (startup failure)");
+            srv_session_close(&j->book, SRV_OUT_FAILED);
             srv_conn_close(j->fd); job_free(j);
         }
     }
@@ -3147,13 +3316,16 @@ static void *single_worker_main(void *arg) {
         if (!j) break;
         if (sw->reject) {
             send_error(j->fd, 503, "single-job worker unavailable (clone alloc failed)");
+            srv_session_close(&j->book, SRV_OUT_FAILED);
             srv_conn_close(j->fd); job_free(j);
             continue;
         }
         sw->ctx->stream = 0; sw->ctx->audio_cb = NULL;
         int stream_fd_owned = 0;
-        if (j->is_stream) stream_fd_owned = handle_tts_stream(sw->ctx, j->fd, j->body);
-        else handle_tts(sw->ctx, j->fd, j->body);
+        srv_outcome_t outcome;
+        if (j->is_stream) stream_fd_owned = handle_tts_stream(sw->ctx, j->fd, j->body, &outcome);
+        else outcome = handle_tts(sw->ctx, j->fd, j->body);
+        srv_session_close(&j->book, outcome);
         if (!stream_fd_owned) srv_conn_close(j->fd);
         job_free(j);
     }

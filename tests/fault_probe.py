@@ -32,6 +32,21 @@ Semantics cases (run by `semantics`):
                    buffer): the blocked write must time out and end the request as gone
                    instead of holding the writer forever
 
+Service cases (run by `service`, on the same server):
+
+  neighbours       a healthy stream runs while three others die around it (RST, FIN, RST on
+                   the first audio): its audio must equal its unloaded reference
+  abort-loop       N mixed aborts (stream / WAV / single-job, RST / FIN / first audio): the
+                   books balance, every abort is one client_gone, RSS does not grow
+
+Books case (`books`, on a server started with QWEN_MAX_REQUEST_S=3, --batch-size 2,
+--max-queue 1 and --metrics-port): a deterministic mixed workload -- completed,
+disconnected, timed out, refused because the queue is full, invalid -- must move the
+outcome counters by exactly the workload, in /v1/health AND in /metrics, and balance.
+
+Every case also checks the session books: the request ends in exactly one outcome
+(sessions +1, that outcome +1, nothing else), active returns to 0, `balanced` holds.
+
 Usage:
   python3 tests/fault_probe.py --port P zombie
 Exit 0 when every case holds, 1 otherwise; one OK/FAIL line per invariant.
@@ -79,6 +94,46 @@ def frames(port: int) -> int:
     return int(v)
 
 
+OUTCOMES = ("completed", "client_gone", "timeout", "rejected", "failed")
+
+
+def books(port: int) -> dict:
+    b = health(port).get("books")
+    if b is None:
+        raise SystemExit("FAIL: /v1/health has no books -- this binary keeps no session books")
+    return b
+
+
+def wait_books_idle(port: int, timeout: float = 60.0) -> dict | None:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        b = books(port)
+        if b.get("active") == 0:
+            return b
+        time.sleep(0.2)
+    return None
+
+
+def books_delta(b0: dict, b1: dict) -> dict:
+    return {k: b1[k] - b0[k] for k in ("sessions",) + OUTCOMES}
+
+
+def check_books(name: str, b0: dict, b1: dict | None, want: dict):
+    """Exactly `want` moved (sessions = its sum), nothing else; idle and balanced."""
+    if b1 is None:
+        check(False, f"{name}: books idle (active back to 0)", "a session never ended")
+        return
+    d = books_delta(b0, b1)
+    exp = {k: want.get(k, 0) for k in OUTCOMES}
+    exp["sessions"] = sum(exp.values())
+    moved = " ".join(f"{k}+{v}" for k, v in d.items() if v)
+    check(d == exp and b1.get("balanced") is True and b1.get("anomalies") == 0,
+          f"{name}: books -- one session per request, one outcome each, balanced",
+          f"moved {moved or 'nothing'}; wanted " +
+          " ".join(f"{k}+{v}" for k, v in exp.items() if v) +
+          f"; balanced={b1.get('balanced')} anomalies={b1.get('anomalies')}")
+
+
 def wait_quiet(port: int, stable_s: float = 1.2, timeout: float = 240.0):
     """Waits until frames_generated stops moving for `stable_s`. Returns the final
     count, or None on timeout. A zombie keeps the counter moving until its EOS, so
@@ -119,6 +174,7 @@ class Stream:
         self.eof = False
         self.complete = False     # terminal chunk seen (stream) / full body (WAV)
         self.clen = None
+        self.body = b""           # first bytes of a non-chunked body (error messages)
 
     def _feed(self, ch: bytes):
         self.buf += ch
@@ -152,6 +208,8 @@ class Stream:
         else:
             self.sha.update(self.buf)
             self.audio += len(self.buf)
+            if len(self.body) < 4096:
+                self.body += self.buf[:4096 - len(self.body)]
             self.buf = b""
             if self.clen is not None and self.audio >= self.clen:
                 self.complete = True
@@ -267,6 +325,7 @@ def zombie_case(port: int, name: str, kind: str, path: str, how: str,
     if wait_quiet(port) is None:
         check(False, f"{name}: server quiet before the case")
         return
+    b0 = books(port)
     f0 = frames(port)
     st = Stream(port, path, body_for(kind, seed))
     if path.endswith("/stream"):
@@ -301,6 +360,7 @@ def zombie_case(port: int, name: str, kind: str, path: str, how: str,
           f"{name}: model work after the disconnect",
           f"{after} frames = {after / FPS:.2f} s (bound {bound_frames} = "
           f"{bound_frames / FPS:.2f} s; {st.audio_s():.2f} s had been delivered)")
+    check_books(name, b0, wait_books_idle(port), {"client_gone": 1})
 
 
 def case_zombie(a):
@@ -336,9 +396,11 @@ def case_semantics(a):
     print("[half-close-ok]", flush=True)
     ref = reference(a.port, "batch", seed)
     ref_bytes, ref_sha = REF_AUDIO[f"batch:{seed}"]
+    b0 = books(a.port)
     st = Stream(a.port, "/v1/tts/stream", body_for("batch", seed))
     st.s.shutdown(socket.SHUT_WR)
     st.read_all()
+    check_books("half-close-ok", b0, wait_books_idle(a.port), {"completed": 1})
     check(st.status == 200 and st.complete,
           "half-close-ok: a client that shut its write side still gets the whole stream",
           f"status {st.status}, complete {st.complete}, {st.audio_s():.1f} s")
@@ -350,6 +412,7 @@ def case_semantics(a):
     if wait_quiet(a.port) is None:
         check(False, "stopped-reader: server quiet before the case")
         return
+    b0 = books(a.port)
     f0 = frames(a.port)
     st = Stream(a.port, "/v1/tts/stream", body_for("batch", seed), rcvbuf=4096)
     st.read_until_audio(1.0)
@@ -368,9 +431,189 @@ def case_semantics(a):
     check(ended is None or after < pending,
           "stopped-reader: generation stopped before the end of the utterance",
           f"{after} frames after the reader stopped, {pending} were pending")
+    check_books("stopped-reader", b0, wait_books_idle(a.port), {"client_gone": 1})
 
 
-CASES = {"zombie": case_zombie, "semantics": case_semantics}
+NEIGHBOUR_TEXT = ("Thank you for calling. Your order left the warehouse this morning and "
+                  "should arrive on Thursday before noon; you will receive a message with "
+                  "the tracking number as soon as the courier scans the parcel.")
+
+
+def rss_kb(pid: int) -> int:
+    import subprocess
+    out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True)
+    return int(out.stdout.strip() or 0)
+
+
+def aborter(port: int, path: str, kind: str, how: str, seed: int, after_s: float,
+            body: dict | None = None):
+    st = Stream(port, path, body if body is not None else body_for(kind, seed))
+    if path.endswith("/stream"):
+        st.read_until_audio(after_s if after_s > 0 else 1.0 / SR)
+    else:
+        time.sleep(after_s)
+    (st.rst if how == "rst" else st.fin)()
+
+
+def case_service(a):
+    import threading
+    nb = {"text": NEIGHBOUR_TEXT, "speaker": "aiden", "language": "English",
+          "seed": 5151, "temperature": 0.0}
+
+    print("[neighbours]", flush=True)
+    wait_quiet(a.port)
+    ref = Stream(a.port, "/v1/tts/stream", nb).read_all()
+    ref_sha = ref.sha.hexdigest()[:16]
+    print(f"  ref  neighbour alone: {ref.audio_s():.2f} s  sha {ref_sha}", flush=True)
+    wait_quiet(a.port)
+    b0 = books(a.port)
+    res = {}
+
+    def neighbour():
+        res["n"] = Stream(a.port, "/v1/tts/stream", nb).read_all()
+    t = threading.Thread(target=neighbour)
+    t.start()
+    time.sleep(0.3)
+    killers = [threading.Thread(target=aborter, args=args) for args in (
+        (a.port, "/v1/tts/stream", "batch", "rst", 6001, 1.0),
+        (a.port, "/v1/tts/stream", "batch", "fin", 6002, 1.5),
+        (a.port, "/v1/tts/stream", "batch", "rst", 6003, 0.0))]
+    for k in killers:
+        k.start()
+    for k in killers:
+        k.join()
+    t.join()
+    n = res["n"]
+    check(n.status == 200 and n.complete, "neighbours: the healthy stream completed",
+          f"status {n.status}, complete {n.complete}")
+    check(n.sha.hexdigest()[:16] == ref_sha and n.audio == ref.audio,
+          "neighbours: its audio is identical to the unloaded reference",
+          f"{n.audio_s():.2f} s sha {n.sha.hexdigest()[:16]} vs {ref.audio_s():.2f} s sha {ref_sha}")
+    check_books("neighbours", b0, wait_books_idle(a.port), {"completed": 1, "client_gone": 3})
+
+    print("[abort-loop]", flush=True)
+    wait_quiet(a.port)
+    rss0 = rss_kb(a.server_pid) if a.server_pid else 0
+    b0 = books(a.port)
+    # Two groups per round, so every request is admitted and none is refused: the batched
+    # slots (4) take the first group at once; the single-job clone serves one request at a
+    # time, and its queue is bounded by the batched occupancy, so it runs on its own.
+    groups = [[("/v1/tts/stream", "batch", "rst", 1.0), ("/v1/tts/stream", "batch", "fin", 1.0),
+               ("/v1/tts/stream", "batch", "rst", 0.0), ("/v1/tts", "batch", "rst", 1.5)],
+              [("/v1/tts/stream", "single", "rst", 1.0), ("/v1/tts/stream", "single", "fin", 1.0)]]
+    n_ab = 0
+    for rnd in range(a.abort_rounds):
+        for gi, plan in enumerate(groups):
+            ts = [threading.Thread(target=aborter,
+                                   args=(a.port, p, k, h, 7000 + rnd * 10 + gi * 5 + i, s))
+                  for i, (p, k, h, s) in enumerate(plan)]
+            for x in ts:
+                x.start()
+            for x in ts:
+                x.join()
+            wait_books_idle(a.port)
+            n_ab += len(plan)
+    b1 = wait_books_idle(a.port)
+    wait_quiet(a.port)
+    rss1 = rss_kb(a.server_pid) if a.server_pid else 0
+    check_books(f"abort-loop ({n_ab} aborts)", b0, b1, {"client_gone": n_ab})
+    if a.server_pid:
+        g = rss1 / rss0 if rss0 else float("inf")
+        check(g <= 1.10, "abort-loop: server RSS does not grow with the aborts",
+              f"{rss0 / 1024:.0f} -> {rss1 / 1024:.0f} MB ({g:.3f}x, bound 1.10x)")
+
+
+def http_json(port: int, path: str, body: dict, timeout: float = 120.0):
+    st = Stream(port, path, body, timeout=timeout).read_all(timeout)
+    return st.status, st
+
+
+def metrics_books(mport: int) -> dict:
+    with urllib.request.urlopen(f"http://127.0.0.1:{mport}/metrics", timeout=10) as r:
+        txt = r.read().decode()
+    names = {"sessions": "qwen_tts_worker_sessions_total",
+             "completed": "qwen_tts_worker_terminated_ok_total",
+             "client_gone": "qwen_tts_worker_terminated_client_gone_total",
+             "timeout": "qwen_tts_worker_terminated_timeout_total",
+             "rejected": "qwen_tts_worker_terminated_rejected_total",
+             "failed": "qwen_tts_worker_terminated_failed_total",
+             "active": "qwen_tts_worker_sessions_active",
+             "balanced": "qwen_tts_worker_books_balanced",
+             "anomalies": "qwen_tts_worker_books_anomalies_total"}
+    out = {}
+    for k, n in names.items():
+        vals = [float(m.group(1)) for m in re.finditer(rf"^{n}{{[^}}]*}} ([0-9.]+)$", txt, re.M)]
+        out[k] = sum(vals) if vals else None
+    return out
+
+
+def case_books(a):
+    """A deterministic mixed workload; the counters must equal it, in both views."""
+    import threading
+    print("[books]", flush=True)
+    wait_quiet(a.port)
+    b0 = books(a.port)
+    m0 = metrics_books(a.metrics_port) if a.metrics_port else None
+    short = lambda i: {"text": "Good morning, everyone.", "speaker": "ryan",
+                       "language": "English", "seed": 100 + i, "temperature": 0.0}
+    mid = {"text": LONG_TEXT[:190], "speaker": "ryan", "language": "English",
+           "seed": 200, "temperature": 0.0}
+
+    # 3 completed
+    for i in range(3):
+        st = Stream(a.port, "/v1/tts/stream", short(i)).read_all()
+        check(st.status == 200 and st.complete, f"books: short request {i} completed",
+              f"status {st.status}")
+    # 2 client_gone: RST on the first audio
+    for i in range(2):
+        aborter(a.port, "/v1/tts/stream", "batch", "rst", 0, 0.0, dict(mid, seed=300 + i))
+    wait_books_idle(a.port)
+    # 2 timeouts: a WAV longer than the 3 s budget -> 503
+    for i in range(2):
+        code, st = http_json(a.port, "/v1/tts", dict(mid, seed=400 + i))
+        check(code == 503, f"books: WAV {i} stopped by the request budget (discriminating)",
+              f"status {code}{' -- the machine finished inside the budget' if code == 200 else ''}")
+    # queue full: 2 running + 1 queued hold the server, the 4th is refused
+    holders = [Stream(a.port, "/v1/tts/stream", dict(mid, seed=500 + i)) for i in range(3)]
+    t_end = time.monotonic() + 30
+    while time.monotonic() < t_end:
+        h = health(a.port)
+        if h.get("num_requests_running") == 2 and h.get("num_requests_waiting") == 1:
+            break
+        time.sleep(0.05)
+    code, st = http_json(a.port, "/v1/tts/stream", short(9))
+    check(code == 503 and b"queue full" in st.body,
+          "books: the request past slots + queue is refused with 503", f"status {code}")
+    hs = [threading.Thread(target=x.read_all) for x in holders]
+    for x in hs:
+        x.start()
+    for x in hs:
+        x.join()
+    # 1 invalid
+    code, _ = http_json(a.port, "/v1/tts", {"text": ""})
+    check(code == 400, "books: an empty text is refused with 400", f"status {code}")
+
+    b1 = wait_books_idle(a.port)
+    # holders: each ran into the 3 s budget (2 at once, then the queued one)
+    check_books("books (mixed workload)", b0, b1,
+                {"completed": 3, "client_gone": 2, "timeout": 2 + 3, "rejected": 2})
+    if a.metrics_port and m0 is not None:
+        m1 = metrics_books(a.metrics_port)
+        missing = [k for k, v in m1.items() if v is None]
+        check(not missing, "books: /metrics exports every books series",
+              f"missing {missing}" if missing else "")
+        if not missing:
+            d = {k: int(m1[k] - m0[k]) for k in ("sessions",) + OUTCOMES}
+            hd = books_delta(b0, b1)
+            check(d == hd, "books: /metrics counters moved exactly like /v1/health",
+                  f"metrics {d} vs health {hd}")
+            check(m1["balanced"] == 1 and m1["active"] == 0 and m1["anomalies"] == 0,
+                  "books: /metrics says balanced, nothing active, no anomaly",
+                  f"balanced={m1['balanced']} active={m1['active']} anomalies={m1['anomalies']}")
+
+
+CASES = {"zombie": case_zombie, "semantics": case_semantics, "service": case_service,
+         "books": case_books}
 
 
 def main():
@@ -380,6 +623,9 @@ def main():
                     help="audio that must still be ungenerated at the disconnect")
     ap.add_argument("--send-timeout-s", type=float, default=5.0,
                     help="the server's send timeout (QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS)")
+    ap.add_argument("--server-pid", type=int, default=0, help="for the RSS bound")
+    ap.add_argument("--metrics-port", type=int, default=0)
+    ap.add_argument("--abort-rounds", type=int, default=3)
     ap.add_argument("cases", nargs="+", choices=sorted(CASES))
     a = ap.parse_args()
     for c in a.cases:

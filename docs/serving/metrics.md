@@ -88,10 +88,15 @@ failure a summed view hides, and the one the soak campaigns kept finding.
 | `qwen_tts_worker_requests_finished_total{worker}` | counter | requests finished, where the timings are taken |
 | `qwen_tts_worker_ttfa_seconds_sum{worker}` / `_count` | counter | time to first audio; `rate(sum)/rate(count)` is the windowed mean |
 | `qwen_tts_worker_ttfa_over_250ms_total{worker}` / `_over_500ms_` / `_over_1s_` | counter | **the shape of the tail** — exact counts past each line, per worker |
-| `qwen_tts_worker_terminated_ok_total{worker}` | counter | ran to completion and was delivered |
-| `qwen_tts_worker_terminated_client_gone_total{worker}` | counter | **client disconnected mid-stream** |
+| `qwen_tts_worker_sessions_total{worker}` | counter | synthesis requests the worker took; each ends in exactly one `terminated_*` below |
+| `qwen_tts_worker_terminated_ok_total{worker}` | counter | ran to completion and was handed to the socket |
+| `qwen_tts_worker_terminated_client_gone_total{worker}` | counter | **client disconnected or stopped reading** |
 | `qwen_tts_worker_terminated_timeout_total{worker}` | counter | stopped by the per-request budget |
-| `qwen_tts_worker_terminated_rejected_total{worker}` | counter | refused after admission |
+| `qwen_tts_worker_terminated_rejected_total{worker}` | counter | refused: invalid, queue full, queued too long, prompt over the cap |
+| `qwen_tts_worker_terminated_failed_total{worker}` | counter | the server could not serve it (generation failed, scheduler or clone worker down) |
+| `qwen_tts_worker_sessions_active{worker}` | gauge | taken and not yet ended (queued or running) |
+| `qwen_tts_worker_books_balanced{worker}` | gauge | 1 while `sessions_total == Σ terminated_* + sessions_active` and no anomaly |
+| `qwen_tts_worker_books_anomalies_total{worker}` | counter | a session closed twice or never opened; always 0 unless the accounting has a bug |
 | `qwen_tts_worker_ttfb_seconds_sum{worker}` / `_count` | counter | time to first byte |
 | `qwen_tts_worker_queue_seconds_sum{worker}` / `_count` | counter | **admission wait** — enqueue to the scheduler taking it |
 | `qwen_tts_worker_stream_gaps_total{worker}` | counter | chunk-to-chunk gaps measured |
@@ -127,6 +132,27 @@ A listener closing the tab mid-stream is the most ordinary event a TTS server se
 these counters it was invisible on every series here: the queue stays shallow, nothing is
 refused, throughput simply sags. `terminated_client_gone` makes a step change in abandonment
 something you can see and alert on, and separates "people are leaving" from "we are failing".
+
+### The session books, and why they must balance
+
+Every synthesis request that reaches a worker (a POST to a synthesis endpoint that passed the
+HTTP checks) opens one session, and every path that ends it -- completion, a client that left,
+the request budget, a refusal (invalid body, queue full, queued too long, prompt over the cap),
+a failure -- closes it through one function, once, under one lock. So at every instant
+
+    sessions_total == ok + client_gone + timeout + rejected + failed + sessions_active
+
+and `books_balanced` is that equation. Before 2026-09-25 the queue-full, queued-too-long and
+invalid refusals, the scheduler's failure drain and the whole single-job path (instruct and
+voice-design requests) ended without touching any `terminated_*` series: a request could
+disappear from the books and nothing said so. `/v1/health` carries the same books under
+`"books"` for the process that answers it. The counters are written inside a seqlock in the
+per-worker shared page, so the prefork parent reads a consistent snapshot per worker; sum across
+workers in PromQL. `tests/test_server_faults.sh` (case `books`) checks that a deterministic mixed
+workload moves them by exactly that workload in both views.
+
+A timed-out **stream** ends with a normal terminal chunk, so the client cannot tell it from a
+complete one; the server books it as `timeout`.
 
 ### Why admission wait is separate from TTFA
 
