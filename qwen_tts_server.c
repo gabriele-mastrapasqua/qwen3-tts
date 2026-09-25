@@ -278,10 +278,23 @@ typedef struct {
     int cancel;                 /* qwen_cancel_on_disconnect(), resolved once per request */
 } stream_http_state_t;
 
+/* ON by default: a request whose client disconnected (reset, or a write that failed or
+ * timed out) stops generating at the next frame.  QWEN_CANCEL_ON_DISCONNECT=0 restores the
+ * old behaviour -- the model runs every request to EOS for nobody -- for A/B only. */
 static int qwen_cancel_on_disconnect(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("QWEN_CANCEL_ON_DISCONNECT"); v = (e && e[0] == '1'); }
+    if (v < 0) { const char *e = getenv("QWEN_CANCEL_ON_DISCONNECT"); v = !(e && e[0] == '0'); }
     return v;
+}
+
+static void server_announce_cancel(void) {
+    if (qwen_cancel_on_disconnect())
+        fprintf(stderr, "[serve] cancel on disconnect ON (default): a request whose client reset "
+                        "or stopped reading stops generating at the next frame -- "
+                        "QWEN_CANCEL_ON_DISCONNECT=0 to opt out\n");
+    else
+        fprintf(stderr, "[serve] WARNING cancel on disconnect OFF (QWEN_CANCEL_ON_DISCONNECT=0): "
+                        "every request runs to the end even when nobody is listening\n");
 }
 
 /* Is the client of `fd` gone?  Non-blocking, one poll() and at most one recv(MSG_PEEK).
@@ -3220,6 +3233,7 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
     server_default_memory_levers(ctx);
     server_default_decoder_batch(ctx);
     qwen_exec_budget_engine_owned("serve");
+    server_announce_cancel();
     server_prewarm(ctx);
 
     int n_readers = max_batch; if (n_readers < 2) n_readers = 2; if (n_readers > 16) n_readers = 16;
@@ -3343,6 +3357,7 @@ int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
     server_default_memory_levers(ctx);
     server_default_decoder_batch(ctx);
     qwen_exec_budget_engine_owned("serve");
+    server_announce_cancel();
     server_prewarm(ctx);
 
     if (n_workers == 1) {
