@@ -974,7 +974,7 @@ static void handle_health(int fd) {
              "\"worker\":%d,\"counters_scope\":\"%s\","
              "\"admitted\":%d,\"done\":%d,"
              "\"rejected_queue_full\":%d,\"rejected_queue_timeout\":%d,"
-             "\"timed_out\":%d}",
+             "\"timed_out\":%d,\"frames_generated\":%llu}",
              ready ? "ok" : "unavailable", mode, sched,
              atomic_load(&g_srv.running), waiting,
              g_srv.queue_max, g_srv.queue_timeout_ms, g_srv.max_request_ms,
@@ -984,7 +984,7 @@ static void handle_health(int fd) {
                                   : "this server",
              atomic_load(&g_srv.admitted), atomic_load(&g_srv.done),
              atomic_load(&g_srv.rejected_full), atomic_load(&g_srv.rejected_stale),
-             atomic_load(&g_srv.timed_out));
+             atomic_load(&g_srv.timed_out), qwen_tts_frames_generated());
     send_json(fd, ready ? 200 : 503, json);
 }
 

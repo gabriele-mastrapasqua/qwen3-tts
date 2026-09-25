@@ -1014,6 +1014,13 @@ void qwen_tts_free_clone(qwen_tts_ctx_t *ctx) {
     free(ctx);
 }
 
+static _Atomic unsigned long long g_frames_generated = 0;
+#define QWEN_COUNT_FRAME() \
+    atomic_fetch_add_explicit(&g_frames_generated, 1, memory_order_relaxed)
+unsigned long long qwen_tts_frames_generated(void) {
+    return atomic_load_explicit(&g_frames_generated, memory_order_relaxed);
+}
+
 void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata) {
     ctx->audio_cb = cb;
     ctx->audio_cb_userdata = userdata;
@@ -1816,6 +1823,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
         memcpy(ctx->codec_codes + (int64_t)ctx->codec_frames * 16, codes, 16 * sizeof(int));
         ctx->codec_frames++;
+        QWEN_COUNT_FRAME();
 
         dt_push_frames(&dt_state, codes, 1);
 
@@ -2188,7 +2196,7 @@ int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                 int frame16[16]; frame16[0] = code0[b];
                 for (int g = 0; g < 15; g++) frame16[g + 1] = cpcodes[(size_t)b * 15 + g];
                 memcpy(chcodes[b] + (size_t)chframes[b] * 16, frame16, 16 * sizeof(int));
-                chframes[b]++;
+                chframes[b]++; QWEN_COUNT_FRAME();
                 lookup_codec_embed(ctx, code0[b], se);
                 for (int g = 0; g < 15; g++) {
                     int cg = frame16[g + 1];
@@ -2380,7 +2388,7 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
                 int frame16[16]; frame16[0] = code0[b];
                 for (int g = 0; g < 15; g++) frame16[g + 1] = cpcodes[(size_t)b * 15 + g];
                 memcpy(chcodes[b] + (size_t)chframes[b] * 16, frame16, 16 * sizeof(int));
-                chframes[b]++;
+                chframes[b]++; QWEN_COUNT_FRAME();
                 lookup_codec_embed(ctx, code0[b], se);
                 for (int g = 0; g < 15; g++) {
                     int cg = frame16[g + 1];
@@ -3510,7 +3518,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
         int _f16[16]; _f16[0] = code0[(b_)];                                                 \
         for (int _g = 0; _g < 15; _g++) _f16[_g + 1] = cpcodes[(size_t)(b_) * 15 + _g];      \
         memcpy(chcodes[(b_)] + (size_t)chframes[(b_)] * 16, _f16, 16 * sizeof(int));         \
-        chframes[(b_)]++;                                                                    \
+        chframes[(b_)]++; QWEN_COUNT_FRAME();                                                \
         lookup_codec_embed(ctx, code0[(b_)], _se);                                           \
         for (int _g = 0; _g < 15; _g++) {                                                    \
             int _cg = _f16[_g + 1];                                                          \

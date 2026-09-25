@@ -620,6 +620,12 @@ void qwen_tts_list_speakers(const qwen_tts_ctx_t *ctx);
 
 void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata);
 
+/* Talker frames this process has generated, all requests and paths together: one per
+ * sampled codec frame (12.5 per second of audio).  Monotonic; one relaxed atomic add per
+ * frame.  It is the server's measure of model work, independent of whether anybody was
+ * still listening -- the quantity a disconnect must stop. */
+unsigned long long qwen_tts_frames_generated(void);
+
 int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text,
                       float **out_samples, int *out_n_samples);
 
