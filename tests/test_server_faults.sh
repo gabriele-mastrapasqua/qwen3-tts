@@ -41,7 +41,7 @@ done
 [ $ready -eq 1 ] || { echo "server-faults FAIL: server never became ready"; tail -30 "$TMP/srv.log"; exit 1; }
 echo "server-faults: server pid $SRV_PID ready, log $TMP/srv.log"
 
-python3 tests/fault_probe.py --port "$PORT" ${FAULT_CASES:-zombie}
+python3 tests/fault_probe.py --port "$PORT" ${FAULT_CASES:-zombie semantics}
 rc=$?
 
 kill -TERM "$SRV_PID" 2>/dev/null

@@ -985,6 +985,7 @@ qwen_tts_ctx_t *qwen_tts_clone_for_worker(const qwen_tts_ctx_t *base) {
     w->instruct = NULL;
     w->tf_ref_codes = NULL;
     w->stream = 0; w->audio_cb = NULL; w->audio_cb_userdata = NULL;
+    w->cancel_cb = NULL; w->cancel_cb_userdata = NULL;
 
     return w;
 }
@@ -1842,6 +1843,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
         if (ctx->stream && ctx->audio_cb && dt_state.cb_aborted) {
             if (!ctx->silent) fprintf(stderr, "\n  Streaming aborted by callback\n");
+            break;
+        }
+        if (ctx->cancel_cb && ctx->cancel_cb(ctx->cancel_cb_userdata)) {
+            /* Nobody is waiting for the rest: no further Talker step, and the decoder
+             * drops the frames it has not decoded yet. */
+            dt_state.cb_aborted = 1;
+            if (!ctx->silent) fprintf(stderr, "\n  Generation cancelled at frame %d\n", frame);
             break;
         }
 

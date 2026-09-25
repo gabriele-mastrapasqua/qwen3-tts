@@ -37,13 +37,6 @@
 #include <signal.h>
 #include <errno.h>
 #include <poll.h>
-#ifndef POLLRDHUP
-#define QWEN_POLL_GONE (POLLHUP | POLLERR | POLLNVAL)
-#define QWEN_HAVE_RDHUP 0
-#else
-#define QWEN_POLL_GONE (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)
-#define QWEN_HAVE_RDHUP 1
-#endif
 #include <sys/time.h>
 #include <time.h>
 #include <fcntl.h>
@@ -279,6 +272,10 @@ typedef struct {
     int total_samples;
     float volume;
     stream_output_t *out;
+    /* Set when a write failed or the peer reset.  Written by the decoder thread (the audio
+     * callback) and by the generator thread (the per-frame cancel check). */
+    _Atomic int gone;
+    int cancel;                 /* qwen_cancel_on_disconnect(), resolved once per request */
 } stream_http_state_t;
 
 static int qwen_cancel_on_disconnect(void) {
@@ -287,10 +284,28 @@ static int qwen_cancel_on_disconnect(void) {
     return v;
 }
 
-static int peer_hung_up(int fd) {
-    struct pollfd p = { .fd = fd, .events = QWEN_POLL_GONE, .revents = 0 };
-    if (poll(&p, 1, 0) > 0 && (p.revents & QWEN_POLL_GONE))
-        return 1;
+/* Is the client of `fd` gone?  Non-blocking, one poll() and at most one recv(MSG_PEEK).
+ *
+ * GONE: a reset or a socket error.  On macOS a RST reads as POLLIN plus a recv() error
+ * (not POLLHUP/POLLERR); on Linux as POLLERR|POLLHUP.  Both end up in the recv() below.
+ *
+ * NOT GONE: end-of-file.  A FIN only says the client shut its WRITE side, and HTTP/1.1
+ * allows that half-close after a complete request: the response is still wanted.  This
+ * is why POLLRDHUP is not used here.  A client that closed its socket completely is
+ * found one write later instead -- its kernel answers our next chunk with a RST, and the
+ * next check (or the write after it) sees it.
+ *
+ * Pipelined bytes after a `Connection: close` request are ignored. */
+static int peer_gone(int fd) {
+    if (fd < 0) return 0;
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (poll(&p, 1, 0) <= 0) return 0;
+    if (p.revents & (POLLERR | POLLNVAL)) return 1;
+    if (!(p.revents & (POLLIN | POLLHUP))) return 0;
+    char c;
+    ssize_t r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r < 0)
+        return !(errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
     return 0;
 }
 
@@ -330,10 +345,16 @@ static int stream_http_callback(const float *samples, int n_samples, void *userd
     if (st->out) {
         int rc = stream_output_enqueue(st->out, samples, n_samples, st->volume);
         if (rc == 0) st->total_samples += n_samples;
+        else atomic_store(&st->gone, 1);
         return rc;
     }
+    /* Generated audio is counted whether or not it reached anybody: this is the log's
+     * record of model work, and a zombie must show up in it. */
+    st->total_samples += n_samples;
+    if (atomic_load(&st->gone)) return st->cancel ? -1 : 0;
     float g = st->volume;
     int16_t *pcm = (int16_t *)malloc(n_samples * sizeof(int16_t));
+    if (!pcm) { atomic_store(&st->gone, 1); return -1; }
     for (int i = 0; i < n_samples; i++) {
         float s = samples[i] * g;
         if (s < -1.0f) s = -1.0f;
@@ -343,12 +364,15 @@ static int stream_http_callback(const float *samples, int n_samples, void *userd
     int data_len = n_samples * 2;
     char chunk_header[32];
     int chlen = snprintf(chunk_header, sizeof(chunk_header), "%x\r\n", data_len);
-    write(st->fd, chunk_header, chlen);
-    write(st->fd, pcm, data_len);
-    write(st->fd, "\r\n", 2);
+    int bad = write_all_or_gone(st->fd, chunk_header, (size_t)chlen) < 0 ||
+              write_all_or_gone(st->fd, pcm, (size_t)data_len) < 0 ||
+              write_all_or_gone(st->fd, "\r\n", 2) < 0;
     free(pcm);
-    st->total_samples += n_samples;
-    return 0;
+    if (!bad) return 0;
+    /* EPIPE, ECONNRESET, or the send timeout (EAGAIN) of a reader that stopped reading:
+     * the listener is gone.  A non-zero return stops the generator at the next frame. */
+    atomic_store(&st->gone, 1);
+    return st->cancel ? -1 : 0;
 }
 
 static int send_chunked_end(int fd) {
@@ -631,6 +655,31 @@ static int stream_output_failed(stream_output_t *out) {
     int failed = out->failed;
     pthread_mutex_unlock(&out->mtx);
     return failed;
+}
+
+/* peer_gone() for a socket the detached writer owns.  Safe against the writer closing
+ * the fd: it closes only after marking the stream failed (under this lock) or after the
+ * producer finished, so while we hold the lock and see neither, the fd is still ours to
+ * look at and cannot have been reused by another connection. */
+static int stream_output_peer_gone(stream_output_t *out) {
+    if (!out) return 0;
+    pthread_mutex_lock(&out->mtx);
+    int gone = out->failed;
+    if (!gone && !out->producer_done) gone = peer_gone(out->fd);
+    pthread_mutex_unlock(&out->mtx);
+    return gone;
+}
+
+/* The single-request generator's per-frame check (ctx->cancel_cb). */
+static int single_request_cancelled(void *ud) {
+    stream_http_state_t *st = (stream_http_state_t *)ud;
+    if (!st->cancel) return 0;
+    if (atomic_load(&st->gone)) return 1;
+    if (st->out ? stream_output_peer_gone(st->out) : peer_gone(st->fd)) {
+        atomic_store(&st->gone, 1);
+        return 1;
+    }
+    return 0;
 }
 
 static int compose_stream_emit(const float *pcm, int n, void *user) {
@@ -1222,23 +1271,39 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     float *audio = NULL;
     int n_samples = 0;
 
+    /* No byte goes out before the WAV is complete, so only the per-frame check can see a
+     * client that reset meanwhile. */
+    stream_http_state_t cst = { .fd = fd, .cancel = qwen_cancel_on_disconnect() };
+    atomic_init(&cst.gone, 0);
+    ctx->cancel_cb = single_request_cancelled;
+    ctx->cancel_cb_userdata = &cst;
+
+    int gen_rc = 0;
     if (qwen_compose_has_markup(text)) {
         char *language = NULL;
         (void)json_extract_string(body, "language", &language, NULL);
         qwen_cspan_t *spans = NULL; int nspans = 0;
         if (qwen_compose_parse(text, &spans, &nspans) != 0 || nspans == 0) {
+            ctx->cancel_cb = NULL; ctx->cancel_cb_userdata = NULL;
             send_error(fd, 500, "markup parse failed");
             free(language); free(text); return;
         }
         fprintf(stderr, "[HTTP] inline markup -> per-sentence compose (%d spans)\n", nspans);
-        int rc = qwen_compose_render_buffer(ctx, spans, nspans, language, 0.12f, &audio, &n_samples, 1);
+        gen_rc = qwen_compose_render_buffer(ctx, spans, nspans, language, 0.12f, &audio, &n_samples, 1);
         qwen_compose_free_spans(spans, nspans);
         free(language);
-        if (rc != 0 || !audio || n_samples == 0) {
-            send_error(fd, 500, "generation failed");
-            free(audio); free(text); return;
-        }
-    } else if (qwen_tts_generate(ctx, text, &audio, &n_samples) != 0 || !audio || n_samples == 0) {
+    } else {
+        gen_rc = qwen_tts_generate(ctx, text, &audio, &n_samples);
+    }
+    ctx->cancel_cb = NULL;
+    ctx->cancel_cb_userdata = NULL;
+    if (atomic_load(&cst.gone)) {
+        fprintf(stderr, "[HTTP] client gone during generation: %d samples generated, nothing sent\n",
+                n_samples);
+        free(audio); free(text);
+        return;
+    }
+    if (gen_rc != 0 || !audio || n_samples == 0) {
         send_error(fd, 500, "generation failed");
         free(text);
         free(audio);
@@ -1287,7 +1352,9 @@ static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
             text, ctx->speaker_id, ctx->language_id, ctx->seed);
     double t0 = server_time_ms();
 
-    stream_http_state_t state = { .fd = fd, .total_samples = 0, .volume = volume, .out = NULL };
+    stream_http_state_t state = { .fd = fd, .total_samples = 0, .volume = volume, .out = NULL,
+                                  .cancel = qwen_cancel_on_disconnect() };
+    atomic_init(&state.gone, 0);
     state.out = stream_output_enabled() ? stream_output_start(fd, ctx->seed) : NULL;
     ctx->stream = 1;
     int chunk_frames = (int)json_extract_number(body, "chunk_frames", 10);
@@ -1295,10 +1362,15 @@ static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     if (chunk_frames > 250) chunk_frames = 250;
     ctx->stream_chunk_frames = chunk_frames;
     qwen_tts_set_audio_callback(ctx, stream_http_callback, &state);
+    ctx->cancel_cb = single_request_cancelled;
+    ctx->cancel_cb_userdata = &state;
 
-    if (!state.out) (void)send_chunked_header(fd);
+    if (!state.out && send_chunked_header(fd) < 0) atomic_store(&state.gone, 1);
 
-    if (qwen_compose_has_markup(text)) {
+    if (state.cancel && atomic_load(&state.gone)) {
+        /* Gone before the first frame: not even a prefill for nobody. */
+        free(text);
+    } else if (qwen_compose_has_markup(text)) {
         char *language = NULL;
         (void)json_extract_string(body, "language", &language, NULL);
         qwen_cspan_t *spans = NULL; int nspans = 0;
@@ -1320,12 +1392,14 @@ static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     free(text);
     }
 
+    ctx->cancel_cb = NULL;
+    ctx->cancel_cb_userdata = NULL;
     int stream_fd_owned = state.out != NULL;
     if (state.out) {
         stream_output_finish(state.out);
         stream_output_release(state.out); /* release the producer reference */
-    } else {
-        (void)send_chunked_end(fd);
+    } else if (!atomic_load(&state.gone)) {
+        if (send_chunked_end(fd) < 0) atomic_store(&state.gone, 1);
     }
 
     ctx->stream = 0;
@@ -1333,8 +1407,9 @@ static int handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
 
     double elapsed = server_time_ms() - t0;
     float audio_secs = (float)state.total_samples / QWEN_TTS_SAMPLE_RATE;
-    fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio) in %.1fs (RTF %.2f)\n",
-            state.total_samples, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs);
+    fprintf(stderr, "[HTTP] Streamed %d samples (%.2fs audio) in %.1fs (RTF %.2f)%s\n",
+            state.total_samples, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs,
+            atomic_load(&state.gone) ? " client_gone=1" : "");
     return stream_fd_owned;
 }
 
@@ -1545,6 +1620,15 @@ static void sigint_handler(int sig) {
 static void set_client_timeout(int fd) {
     struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (qwen_cancel_on_disconnect()) {
+        /* A client that stops reading must not hold a synchronous writer -- the batched
+         * scheduler or a decoder lane -- forever: after this long a blocked write fails with
+         * EAGAIN and the request is cancelled as gone.  Same knob as the async writer's
+         * (QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS, default 5000), which sets its own on top. */
+        int ms = stream_output_timeout_ms();
+        struct timeval st = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &st, sizeof(st));
+    }
 #ifdef TCP_NODELAY
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -2234,8 +2318,9 @@ typedef struct batch_job {
     double enq_adm_ts;
     double enq_last_iter_ms;
     unsigned int life_seed;
-    int client_gone;
-    int cancelled;
+    /* Written by the scheduler (sink_cancelled) and by the decoder lane (sink_on_chunk). */
+    _Atomic int client_gone;
+    _Atomic int cancelled;
     int timed_out;
     _Atomic long long audio_ready_samples;
     _Atomic long long first_audio_ready_us;
@@ -2623,6 +2708,14 @@ static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block)
             srv_conn_close(j->fd); job_free(j);
             continue;
         }
+        if (qwen_cancel_on_disconnect() && peer_gone(j->fd)) {
+            /* The client reset while it waited: admitting it would cost a prefill and a
+             * slot for nobody. */
+            fprintf(stderr, "[server] queued request seed=%u: client gone before admission\n",
+                    j->req.seed);
+            srv_conn_close(j->fd); job_free(j);
+            continue;
+        }
         break;
     }
     atomic_fetch_add(&g_srv.running, 1);
@@ -2687,11 +2780,9 @@ static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
         } else sink_mark_audio_ready(j, n_samples);
         return;
     }
+    if (j->client_gone) return;      /* nothing more reaches a peer that is gone */
     if (j->t_write_attempt == 0.0) j->t_write_attempt = srv_now_ms();
     if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
-    if (!j->client_gone && peer_hung_up(j->fd)) {
-        j->client_gone = 1; j->t_abort_detected = srv_now_ms();
-    }
     int _gone = send_pcm_chunk(j->fd, samples, n_samples);
     if (j->t_write_complete == 0.0 && !_gone) j->t_write_complete = srv_now_ms();
     if (!_gone) sink_mark_audio_ready(j, n_samples);
@@ -2712,8 +2803,10 @@ static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
         }
         j->t_last_chunk_ms = nowms;
     }
-    if (_gone && !j->client_gone) {
-        j->client_gone = 1; j->t_abort_detected = srv_now_ms();
+    if (_gone) {
+        /* EPIPE / ECONNRESET, or the send timeout of a reader that stopped reading. */
+        if (atomic_exchange(&j->client_gone, 1) == 0) j->t_abort_detected = srv_now_ms();
+        if (qwen_cancel_on_disconnect()) j->cancelled = 1;
     }
 }
 
@@ -2740,11 +2833,14 @@ static int sink_cancelled(void *ud, void *tag) {
         return 1;
     }
     if (!qwen_cancel_on_disconnect()) return 0;
-    if (!j->client_gone && j->fd >= 0 && peer_hung_up(j->fd)) {
-        j->client_gone = 1; j->t_abort_detected = srv_now_ms();
+    /* Once per slot per frame: a write that already failed, or a reset seen now. */
+    if (!j->client_gone && (j->out ? stream_output_peer_gone(j->out) : peer_gone(j->fd))) {
+        if (atomic_exchange(&j->client_gone, 1) == 0) j->t_abort_detected = srv_now_ms();
     }
-    if (j->client_gone && j->t_cancel_stop == 0.0) j->t_cancel_stop = srv_now_ms();
-    return j->client_gone;
+    if (!j->client_gone) return 0;
+    j->cancelled = 1;
+    if (j->t_cancel_stop == 0.0) j->t_cancel_stop = srv_now_ms();
+    return 1;
 }
 
 static int sink_step_allowed(void *ud, void *tag, int first_step) {
@@ -2878,7 +2974,7 @@ static void qwen_life_emit(batch_job_t *j) {
                 j->t_cancel_stop > 0 ? j->t_cancel_stop - j->t_recv : -1.0,
                 (j->t_cancel_stop > 0 && j->t_abort_detected > 0)
                     ? j->t_cancel_stop - j->t_abort_detected : -1.0,
-                qwen_cancel_on_disconnect(), QWEN_HAVE_RDHUP,
+                qwen_cancel_on_disconnect(), 0 /* POLLRDHUP no longer used: see peer_gone() */,
                 j->t_abort_detected > 0 ? j->t_abort_detected : -1.0);
     if (getenv("QWEN_TTFA_TRACE"))
         fprintf(stderr, "[PATH] v=2 seed=%u pid=%d clock=CLOCK_MONOTONIC domain=S "
@@ -2947,7 +3043,9 @@ static void sink_on_done(void *ud, void *tag, float *samples, int n_samples) {
         free(samples);
     } else {
         qwen_life_emit(j);
-        if (j->is_stream) {
+        if (j->client_gone) {
+            free(samples);          /* nothing reaches a peer that is gone */
+        } else if (j->is_stream) {
         if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
         (void)send_chunked_end(j->fd);
         } else if (j->timed_out && (!samples || n_samples <= 0)) {

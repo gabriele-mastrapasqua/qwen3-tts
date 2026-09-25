@@ -24,6 +24,14 @@ Zombie cases (run by `zombie`):
   fin-mid-single   worker, handle_tts_stream): RST / FIN mid-stream
   rst-wav          /v1/tts (WAV, no bytes until the end): RST during generation
 
+Semantics cases (run by `semantics`):
+
+  half-close-ok    shutdown(SHUT_WR) right after the request, then read everything: a
+                   half-close is legal HTTP/1.1, so the stream must complete, whole
+  stopped-reader   read ~1 s, then stop reading with the socket open (small receive
+                   buffer): the blocked write must time out and end the request as gone
+                   instead of holding the writer forever
+
 Usage:
   python3 tests/fault_probe.py --port P zombie
 Exit 0 when every case holds, 1 otherwise; one OK/FAIL line per invariant.
@@ -91,11 +99,16 @@ def wait_quiet(port: int, stable_s: float = 1.2, timeout: float = 240.0):
 class Stream:
     """One HTTP request on a raw socket, so a case can choose exactly how it dies."""
 
-    def __init__(self, port: int, path: str, body: dict, timeout: float = 30.0):
+    def __init__(self, port: int, path: str, body: dict, timeout: float = 30.0,
+                 rcvbuf: int = 0):
         data = json.dumps(body).encode()
         req = (f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
                f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode() + data
-        self.s = socket.create_connection(("127.0.0.1", port), timeout)
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if rcvbuf:
+            self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        self.s.settimeout(timeout)
+        self.s.connect(("127.0.0.1", port))
         self.s.sendall(req)
         self.buf = b""
         self.status = None
@@ -223,6 +236,7 @@ def body_for(kind: str, seed: int) -> dict:
 # ------------------------------------------------------------------ zombie cases
 
 REF: dict[str, int] = {}
+REF_AUDIO: dict[str, tuple] = {}
 
 
 def reference(port: int, kind: str, seed: int) -> int:
@@ -240,6 +254,7 @@ def reference(port: int, kind: str, seed: int) -> int:
         raise SystemExit(f"FAIL: reference {kind} did not complete (status {st.status}, "
                          f"complete {st.complete})")
     REF[key] = f1 - f0
+    REF_AUDIO[key] = (st.audio, st.sha.hexdigest()[:16])
     print(f"  ref  {kind:6s} seed {seed}: {REF[key]} frames = {REF[key] / FPS:.1f} s, "
           f"{st.audio_s():.1f} s delivered", flush=True)
     return REF[key]
@@ -301,7 +316,61 @@ def case_zombie(a):
     zombie_case(a.port, "rst-wav", "batch", "/v1/tts", "rst", 2.0, rst_bound, P, 4242)
 
 
-CASES = {"zombie": case_zombie}
+def running(port: int) -> int:
+    h = health(port)
+    return int(h.get("num_requests_running", 0)) + int(h.get("num_requests_waiting", 0))
+
+
+def wait_idle(port: int, timeout: float) -> float | None:
+    """Seconds until the server holds no request (running + waiting == 0), or None."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if running(port) == 0:
+            return time.monotonic() - t0
+        time.sleep(0.2)
+    return None
+
+
+def case_semantics(a):
+    seed = 4242
+    print("[half-close-ok]", flush=True)
+    ref = reference(a.port, "batch", seed)
+    ref_bytes, ref_sha = REF_AUDIO[f"batch:{seed}"]
+    st = Stream(a.port, "/v1/tts/stream", body_for("batch", seed))
+    st.s.shutdown(socket.SHUT_WR)
+    st.read_all()
+    check(st.status == 200 and st.complete,
+          "half-close-ok: a client that shut its write side still gets the whole stream",
+          f"status {st.status}, complete {st.complete}, {st.audio_s():.1f} s")
+    check(st.audio == ref_bytes,
+          "half-close-ok: same audio length as the reference",
+          f"{st.audio} vs {ref_bytes} bytes; sha {'identical' if st.sha.hexdigest()[:16] == ref_sha else 'differs'}")
+
+    print("[stopped-reader]", flush=True)
+    if wait_quiet(a.port) is None:
+        check(False, "stopped-reader: server quiet before the case")
+        return
+    f0 = frames(a.port)
+    st = Stream(a.port, "/v1/tts/stream", body_for("batch", seed), rcvbuf=4096)
+    st.read_until_audio(1.0)
+    f_stop = frames(a.port)
+    t_stop = time.monotonic()
+    ended = wait_idle(a.port, timeout=a.send_timeout_s + 40)
+    f_end = frames(a.port)
+    st.close()
+    wait_quiet(a.port)
+    check(ended is not None,
+          "stopped-reader: the request ends while the client still holds the socket",
+          f"after {ended:.1f} s" if ended is not None else "still held after "
+          f"{a.send_timeout_s + 40:.0f} s")
+    after = f_end - f_stop
+    pending = ref - (f_stop - f0)
+    check(ended is None or after < pending,
+          "stopped-reader: generation stopped before the end of the utterance",
+          f"{after} frames after the reader stopped, {pending} were pending")
+
+
+CASES = {"zombie": case_zombie, "semantics": case_semantics}
 
 
 def main():
@@ -309,6 +378,8 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--min-pending-s", type=float, default=10.0,
                     help="audio that must still be ungenerated at the disconnect")
+    ap.add_argument("--send-timeout-s", type=float, default=5.0,
+                    help="the server's send timeout (QWEN_STREAM_OUTPUT_SEND_TIMEOUT_MS)")
     ap.add_argument("cases", nargs="+", choices=sorted(CASES))
     a = ap.parse_args()
     for c in a.cases:

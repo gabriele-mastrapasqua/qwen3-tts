@@ -418,6 +418,12 @@ typedef struct qwen_tts_ctx {
     int stream_chunk_frames;
     qwen_tts_audio_cb audio_cb;
     void *audio_cb_userdata;
+    /* Optional per-frame cancellation check of the single-request generator
+     * (qwen_tts_generate): return non-zero to stop at the next frame boundary, before
+     * another Talker step.  NULL = never.  The server sets it for the duration of one
+     * request so a client that disconnected stops costing model work. */
+    int (*cancel_cb)(void *userdata);
+    void *cancel_cb_userdata;
 
     uint32_t seed;
 
