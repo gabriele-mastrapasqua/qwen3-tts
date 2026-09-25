@@ -144,6 +144,26 @@ single-job path. After, a reset stops within one frame, a FIN within one written
 - DECISION: a session is a POST to a synthesis endpoint that passed the HTTP
   pre-checks; an invalid body is a session `rejected`, so both server modes count alike.
 
+## Evidence (2026-09-25, Linux Arm, GCP Axion c4a-highcpu-32, branch at 6b90198, `make blas`)
+
+Private raw logs: `.work/evidence/cd-box-20260925/` (build, self-test, dispatch map,
+fault suite, control arm, K-checks).
+
+- `--self-test` rc 0. `make test-server-faults` (default = cancel ON): OK, 4.5 min.
+  Every zombie case discriminating (38.2-40.2 s pending at the disconnect); frames
+  generated after it: rst-mid 0, fin-mid 8, rst-first 0, rst-mid-single 1,
+  fin-mid-single 11, rst-wav 0. Half-close, stopped reader (472 of 490 pending frames
+  generated before `client_gone`), neighbour, abort-loop and the books workload all OK.
+- Control arm `QWEN_CANCEL_ON_DISCONNECT=0 FAULT_CASES=zombie`: FAILS as it must, on all
+  six cases: 482, 482, 502, 497, 497, 478 frames (38.2-40.2 s) after the disconnect.
+- `tests/cancel_correctness.py --prefork 2 --threads 8 --batch 4`: K1-K8 pass (zombie
+  27.2 / 17.6 / 8.6 s OFF vs 0.64 s ON at 20/40/60 %; other streams' audio SHA
+  identical OFF vs ON; lifecycle CANCELLED/COMPLETED, no orphan; FIN -> server noticed
+  112-300 ms; cancel -> generation stop 8.0-12.6 ms). K9 fails as documented: the
+  leak check did not run (plain build; needs ASan/LSan).
+- FACT: on Linux the detector behaves as designed (a reset cancels, a FIN is a legal
+  half-close): the macOS results reproduce.
+
 ## Conclusion
 
 The zombie was the default: on every path, a client that left kept the model
@@ -151,7 +171,7 @@ generating for the rest of the utterance, and the single-job path could not be
 stopped even with the flag. It now stops within one frame on a reset and within one
 chunk on a FIN, on every path, the half-closing client is still served, and every
 request ends exactly once in books that balance in both health and metrics.
-VERDICT: KEEP on this branch; PROMOTE after the Linux run (CD-6).
+VERDICT: KEEP on this branch. Linux Arm passed (CD-6 Arm); x86 and an LSan run remain before promotion to main (user decision).
 
 ## Next action
 

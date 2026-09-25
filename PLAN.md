@@ -145,7 +145,7 @@ Rationale and evidence: `.work/professional-streaming-architecture.md`.
       `/metrics`; a mixed workload moves them by exactly the workload.
 - [x] CD-5 Fault suite (`make test-server-faults`, 40 invariants) incl. abort-loop memory: no
       per-abort growth vs a no-abort control (macOS, gross bound in the suite).
-- [ ] CD-6 Run `make test-server-faults` and `tests/cancel_correctness.py` on Linux x86 and Arm,
+- [~] CD-6 **Arm DONE 2026-09-25** (Axion: fault suite OK, control arm fails as it must, K1-K8 pass, K9 needs an LSan build). Open: x86 and LSan. Run `make test-server-faults` and `tests/cancel_correctness.py` on Linux x86 and Arm,
       including `--prefork 2` for per-worker books.
 - [ ] CD-7 DECISION: a FIN during a WAV request is not seen until the final write (legal
       half-close); accept, treat EOF as gone for WAV, or send interim 1xx.
